@@ -277,6 +277,7 @@ STEP_NAMES = {
     25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
     26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back, CR2 re-checked once) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
     27: "READ-ONLY dump of the endpoint config space (56 dwords of bus 1 dev 0 fn 0 through the CFG window left enabled by S26) + the iATU outbound region 1 reset values (7 reads); 0x8C-0xA8 deliberately not read (0xA4 PCI_BACKPLANE_DATA is a backplane access, 0x90/0x98 interrupt/mailbox), 0xAC kept; explicit --wlan-link=27 only; no write",
+    28: "BAR0/BAR2 sizing (all-ones write, guarded read-back, original written back; Linux __pci_read_base order) then assignment BAR0 0x60000000 / BAR2 0x60400000 through the CFG window (research 33; the FIRST config writes, Command never touched; explicit --wlan-link=28 only; BAR teardown FIRST, before the ATU disable)",
 }
 
 
@@ -616,8 +617,16 @@ def build():
         mac = f"PCIE_ATU_{n}_OUTBOUND1"
         add(27, "read_only", "ATU", ev(mac) - 0x300000, cite=f"{gc(RCH, 'define ' + mac + r'\s+0x3002')} (DBI + 0x300000 + off; unroll stride 0x200: region 1 = +0x200); {ss}; research 32 s.2e", tag=TAG_SRC, note=f"outbound region 1 {what}: reset value (needed for the later restore rows; unobserved so far)", **log)
 
+    # ---- S28 (research 33): BAR sizing + assignment; rows come from draft28() ----
+    for d in draft28():
+        w = d["kind"] in ("wait_eq", "wait_mask")
+        add(28, d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), log=d["kind"] == "read_only")
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
-    # ATU region 0 FIRST (before PERST low): disable it (CR2 := 0, as Linux's poweroff resets atu_ok and re-programs: rc.c:3647), then the reset values observed in run w3a-n25 (CR1 0, bases 0, LIMIT 0xFFF, targets 0)
+    # S28 BAR rows FIRST of all: they need the CFG window, which the ATU disable below closes. Unconditional (idempotent) writes of the originals observed in run w3a-n27 (BAR0 = BAR2 = 0x4, BAR1 = BAR3 = 0)
+    for off, val, key, nm in ((0x10, 4, "BAR0_lo", "BAR0 low"), (0x14, 0, "BAR0_hi", "BAR0 high"), (0x18, 4, "BAR2_lo", "BAR2 low"), (0x1C, 0, "BAR2_hi", "BAR2 high")):
+        add_t(28, "mmio_write", "CFG", off, FULL, val, cite=f"original observed in run w3a-n27 (CFG+{off:#x} = {val:#x}); research 33 s.3 teardown; written by S28", tag="observed", note=f"{nm} back to its observed original (S28 teardown, before the ATU disable)", key=key)
+    # ATU region 0 (before PERST low): disable it (CR2 := 0, as Linux's poweroff resets atu_ok and re-programs: rc.c:3647), then the reset values observed in run w3a-n25 (CR1 0, bases 0, LIMIT 0xFFF, targets 0)
     cr2 = anchor(RC, find_line(RC, r"CR2_OUTBOUND0, 4, EXYNOS_PCIE_ATU_ENABLE", vp), r"EXYNOS_PCIE_ATU_ENABLE")
     add_t(26, "mmio_write", "ATU", 0x004, FULL, 0, cite=f"{cr2} (the enable write, undone); reset value 0 observed (run w3a-n25 ATU+0x004)", tag="observed", note="ATU region 0 DISABLE: the first teardown row", key="atu_cr2_off")
     for off, val, key, nm in ((0x000, 0, "atu_cr1_rst", "CR1"), (0x008, 0, "atu_lbase_rst", "LOWER_BASE"), (0x00C, 0, "atu_ubase_rst", "UPPER_BASE"), (0x010, 0xFFF, "atu_limit_rst", "LIMIT"),
@@ -649,7 +658,7 @@ def build():
 
 
 def draft28():
-    """DRAFT S28 rows (research 33): BAR0/BAR2 sizing + assignment through the CFG window. Printed, NOT added to wlan_seq.json (the shim has no CFG write path yet: goal W-A6b). Usage: --draft28."""
+    """S28 rows (research 33): BAR0/BAR2 sizing + assignment through the CFG window (build() adds them to the table)."""
     LP = REFS2 / "linux_pci_probe.c"	# Linux probe.c of the bluejay android13 5.10 tree (sha256 816b5395d48c...)
     pc = lambda nm: anchor(PCIR, find_line(PCIR, r"define\s+" + nm + r"\s"), nm)
     out, ob = [], {"BAR0": 4, "BAR1": 0, "BAR2": 4, "BAR3": 0}	# originals OBSERVED in run w3a-n27
@@ -664,11 +673,11 @@ def draft28():
         row("mmio_write", lo, FULL, FULL, f"{pc('PCI_BASE_ADDRESS_' + str(lo // 4 - 4))}; {sz}", TAG_SRC, f"{nm} low := 0xFFFFFFFF (sizing)", restore=f"{nm}_lo")
         row("wait_mask", lo, sz_guard, sz_guard, f"{sz}; size = lowest set bit of (read & ~0xF) (probe.c:116-118)", TAG_SRC, f"{nm} low read-back: bits [31:22] all 1 = size <= 4 MiB (the layout of 2b needs it; else STOP, restore)")
         row("read_only", lo, FULL, 0, "same", TAG_SRC, f"log {nm} low sizing readback (decode: size = ~(v & 0xFFFFFFF0) + 1)")
-        row("mmio_write", lo, FULL, ob[nm], f"probe.c:200 (restore the original)", TAG_SRC, f"{nm} low := original")
+        row("mmio_write", lo, FULL, ob[nm], f"probe.c:200 (restore the original)", TAG_SRC, f"{nm} low := original", restore=f"{nm}_lo")
         row("mmio_write", hi, FULL, FULL, f"probe.c:240 (only valid because the type bits read 0x4 = 64-bit: {pc('PCI_BASE_ADDRESS_MEM_TYPE_64')})", TAG_SRC, f"{nm} high := 0xFFFFFFFF (sizing)", restore=f"{nm}_hi")
         row("wait_mask", hi, FULL, FULL, "probe.c:241-243; a high half that is not all ones means size > 4 GiB", TAG_SRC, f"{nm} high read-back must be 0xFFFFFFFF (size < 4 GiB) else STOP, restore")
         row("read_only", hi, FULL, 0, "same", TAG_SRC, f"log {nm} high sizing readback")
-        row("mmio_write", hi, FULL, 0, "probe.c:242", TAG_SRC, f"{nm} high := original (0)")
+        row("mmio_write", hi, FULL, 0, "probe.c:242", TAG_SRC, f"{nm} high := original (0)", restore=f"{nm}_hi")
     for nm, lo, addr in (("BAR0", 0x10, 0x60000000), ("BAR2", 0x18, 0x60400000)):
         row("mmio_write", lo, FULL, addr | 4, "research 33 s.3: PCI address == CPU address (pcie.dtsi:75-76), type bits kept as read", TAG_GUESS, f"{nm} low := {addr:#x} | type bits (0x4)", restore=f"{nm}_lo")
         row("read_only", lo, FULL, 0, "read-back (decode check: address bits [31:4] == written, low nibble 0x4)", TAG_GUESS, f"log {nm} low after assignment (expect {addr | 4:#010x})")
@@ -682,7 +691,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 27, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 28, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 
@@ -704,11 +713,7 @@ def dump(doc):
     return "\n".join(out) + "\n"
 
 
-if __name__ == "__main__" and "--draft28" in sys.argv:
-    build()
-    for i, r in enumerate(draft28()):
-        print(i, json.dumps(r, sort_keys=True))
-elif __name__ == "__main__":
+if __name__ == "__main__":
     text = dump(finish())
     if "--check" in sys.argv:
         if OUT.read_text() != text:

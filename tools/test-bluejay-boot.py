@@ -2791,9 +2791,9 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "b16113383da4a4ad63214a0edd87e0a7c2643efb4b5e5fc949f477843479f9bc"
-_WLAN_SEQ_COUNTS = {"rows": 350, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
-_WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
+_WLAN_SEQ_SHA = "2378e66819e645fb8478c32f59420765530ebd7587a11be3b7cbcae0e3e7be40"
+_WLAN_SEQ_COUNTS = {"rows": 377, "teardown": 39, "write_rows": 265, "distinct_targets": 187}
+_WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "CFG": 4, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
 _WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 0x2000, "IA": 0x1000, "DBI": 0x1000, "PMU": 0x4000, "ATU": 0x1000, "CFG": 0x2000}
@@ -2804,6 +2804,9 @@ _WLAN_S26_TEAR = ((0x004, 0), (0x000, 0), (0x008, 0), (0x00C, 0), (0x010, 0xFFF)
 # S27 (research 32 s.4.2 step A): the endpoint config dwords read through the CFG window (BAR0..5, CardBus, subsystem, cap pointer, int line, capability area 0x40..0x7C, Broadcom window/SPROM registers 0x80/0x84/0x88/0xAC, PCIe capability 0xB0..0xFC, ext header, L1SS LTR, L1SS); 0x8C..0xA8 are deliberately NOT read (0xA4 PCI_BACKPLANE_DATA is a backplane access) and ATU region 1 (+0x200..+0x218)
 _WLAN_S27_CFG = (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C) + tuple(range(0x40, 0x80, 4)) + (0x80, 0x84, 0x88, 0xAC) + tuple(range(0xB0, 0x100, 4)) + (0x100, 0x1B4, 0x240, 0x244, 0x248, 0x24C)
 _WLAN_S27_ATU = (0x200, 0x204, 0x208, 0x20C, 0x210, 0x214, 0x218)
+# S28 (research 33): the only (offset, value) pairs a CFG window write may have (twin of wlanlink.c cfg_ok without the state): all ones (sizing), the observed originals (low 0x4, high 0; sizing restore + teardown), the assigned addresses
+_WLAN_CFG_OK = {(0x10, 0xFFFFFFFF), (0x10, 0x4), (0x10, 0x60000004), (0x14, 0xFFFFFFFF), (0x14, 0), (0x18, 0xFFFFFFFF), (0x18, 0x4), (0x18, 0x60400004), (0x1C, 0xFFFFFFFF), (0x1C, 0)}
+_WLAN_S28_TEAR = ((0x10, 4), (0x14, 0), (0x18, 4), (0x1C, 0))	# the BAR originals observed in run w3a-n27: FIRST in the teardown, before the ATU disable (the CFG window dies with it)
 _WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}
 _WLAN_HDR_ROW = re.compile(r"\{ (\d+)u, WLK_(\w+), WLB_(\w+), (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (\d+)u, (\d+)u \},")
 
@@ -2835,6 +2838,8 @@ def _wlan_row_allowed(blk, off, mask, value=None) -> bool:
         return off == 0x890
     if blk == "ATU":
         return mask == FULL_MASK and (off, value) in _WLAN_ATU_OK
+    if blk == "CFG":
+        return mask == FULL_MASK and (off, value) in _WLAN_CFG_OK
     return False
 
 
@@ -2855,8 +2860,8 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
     # coverage
     steps = sorted({r["step"] for r in rows})
-    if steps != list(range(0, 28)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 27 or doc["default_last_step"] != 19:
-        raise AssertionError(f"{name}: step coverage must be S00..S27 with S22 a documented skip (unknown text kept), last 27, default 19: {steps}")
+    if steps != list(range(0, 29)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 28 or doc["default_last_step"] != 19:
+        raise AssertionError(f"{name}: step coverage must be S00..S28 with S22 a documented skip (unknown text kept), last 28, default 19: {steps}")
     # S22 (RC setup) is a DOCUMENTED SKIP (driver decision 2026-10-23): exactly one row, a 0 us delay, no write, tagged guess, saying so; its blocker text stays in `unknown`
     s22 = [r for r in rows if r["step"] == 22]
     if len(s22) != 1 or s22[0]["kind"] != "delay" or s22[0]["delay_us"] != 0 or s22[0]["tag"] != "guess" or s22[0]["blk"] is not None or "deliberately skipped" not in s22[0].get("note", "") \
@@ -2900,9 +2905,9 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s26_chk = [(r["mask"], r["value"], r["delay_us"], r["polls"]) for r in rows if r["step"] == 26 and r["kind"] == "wait_eq"]
     if s26 != s26_want or s26_chk != [(FULL_MASK, 0x80000000, 0, 1)] or any(r["kind"] == "mmio_write" and r["mask"] != FULL_MASK for r in rows if r["step"] == 26):
         raise AssertionError(f"{name}: S26 must be exactly the 7 ATU full-word writes {[(hex(o), hex(v)) for o, v in _WLAN_S26_WRITES]} each followed by its logged read-back, then ONE one-shot wait_eq ATU CR2 == 0x80000000, then the CFG probe and the CFG reads +0x0/+0x4/+0x8/+0xC, each write restored by the teardown row of its offset: {s26}")
-    # the CFG window and the ATU are written ONLY by those rows and their teardown (the allowlist twin checks offset and value; this checks the place): CFG is never written at all
-    if any(x["blk"] == "CFG" and (x["kind"] != "read_only" or x.get("step", x.get("requires")) not in (26, 27)) for x in rows + tear) or any(x["blk"] == "CFG" for x in tear):
-        raise AssertionError(f"{name}: the CFG window is read-only, only in S26 and S27, never in the teardown")
+    # the CFG window is written ONLY by S28 and its 4 teardown rows (the allowlist twin checks offset and value; this checks the place): S26 and S27 only read it, nothing else touches it
+    if any(x["blk"] == "CFG" and x["kind"] in _WLAN_WRITE_KINDS and (x.get("step", x.get("requires")) != 28 or x["kind"] != "mmio_write") for x in rows + tear) or any(x["blk"] == "CFG" and x["kind"] in ("wait_eq", "wait_mask") and x["step"] != 28 for x in rows) or any(x["blk"] == "CFG" and x.get("step") not in (26, 27, 28) for x in rows) or any(x["blk"] == "CFG" and (x["kind"] != "mmio_write" or x["requires"] != 28) for x in tear):
+        raise AssertionError(f"{name}: the CFG window is read-only except S28 (BAR sizing/assignment) and its 4 BAR teardown rows; only S26-S28 touch it")
     # S27: the READ-ONLY endpoint config dump (explicit --wlan-link=27 only): the pinned CFG window offsets, then ATU outbound region 1 CR1..UPPER_TARGET; every row read_only + log (a = 2, never a probe), no write, no restore, nothing else
     if any(r["step"] == 27 and r["blk"] == "CFG" and 0x8C <= r["off"] <= 0xA8 for r in rows):
         raise AssertionError(f"{name}: no S27 CFG row may lie in 0x8C..0xA8 (0xA4 PCI_BACKPLANE_DATA is a backplane access; 0xAC is allowed)")
@@ -2910,10 +2915,23 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s27_want = [("read_only", "CFG", o, True, None, None) for o in _WLAN_S27_CFG] + [("read_only", "ATU", o, True, None, None) for o in _WLAN_S27_ATU]
     if s27 != s27_want or any(r["kind"] != "read_only" or r["mask"] != FULL_MASK or r["delay_us"] or r["polls"] for r in rows if r["step"] == 27):
         raise AssertionError(f"{name}: S27 must be exactly the {len(_WLAN_S27_CFG)} CFG window reads and the 7 ATU region 1 reads, read_only, logged, no probe, no write, no restore: {s27}")
+    # S28: BAR0/BAR2 sizing + assignment (research 33): Command precondition, then per BAR (low, high): original check, all ones, [guard + log], original back; then the two assignments with logged read-backs. Pinned independently of the generator.
+    BIG = 0xFFFFFFFF
+    s28_want = [("wait_eq", 0x04, 0xFFFF, 0, None)]
+    for lo, orig, guard in ((0x10, 4, 0xFFC00000), (0x18, 4, 0xFFC00000)):
+        hi = lo + 4
+        s28_want += [("wait_eq", lo, BIG, orig, None), ("wait_eq", hi, BIG, 0, None), ("mmio_write", lo, BIG, BIG, lo), ("wait_mask", lo, guard, guard, None), ("read_only", lo, BIG, 0, None), ("mmio_write", lo, BIG, orig, lo),
+                     ("mmio_write", hi, BIG, BIG, hi), ("wait_mask", hi, BIG, BIG, None), ("read_only", hi, BIG, 0, None), ("mmio_write", hi, BIG, 0, hi)]
+    for lo, addr in ((0x10, 0x60000004), (0x18, 0x60400004)):
+        s28_want += [("mmio_write", lo, BIG, addr, lo), ("read_only", lo, BIG, 0, None), ("read_only", lo + 4, BIG, 0, None)]
+    tkey = {t["off"]: t["id"] for t in tear if t["blk"] == "CFG"}
+    s28 = [(r["kind"], r["off"], r["mask"], r["value"], r["restore"]) for r in rows if r["step"] == 28]
+    if s28 != [(k, o, m, v, tkey.get(rs) if rs else None) for k, o, m, v, rs in s28_want] or any(r["blk"] != "CFG" or r.get("probe") or bool(r.get("log")) != (r["kind"] == "read_only") or (r["kind"] in ("wait_eq", "wait_mask")) != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] not in ("wait_eq", "wait_mask") and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 28):
+        raise AssertionError(f"{name}: S28 must be exactly the Command==0 check, the sizing sequence of BAR0 (0x10/0x14) and BAR2 (0x18/0x1C) with their one-shot guards and the two assignments 0x60000004 / 0x60400004, never Command (+0x04) as a write, each all-ones write restored by the teardown BAR row of its offset: {s28}")
     if any(x["blk"] == "ATU" and x["kind"] in _WLAN_WRITE_KINDS and x.get("step", x.get("requires")) != 26 for x in rows + tear):
         raise AssertionError(f"{name}: ATU writes are only for S26 and its teardown")
-    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27)) for r in rows + tear) or any("log" in t for t in tear):
-        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24, S25, S26 and S27")
+    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28)) for r in rows + tear) or any("log" in t for t in tear):
+        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24, S25, S26, S27 and S28")
     if [r["step"] for r in rows] != sorted(r["step"] for r in rows) or [r["id"] for r in rows] != list(range(len(rows))):
         raise AssertionError(f"{name}: rows must be in step order with sequential ids")
     # the default run (N = 19) must not release PERST nor enable the LTSSM
@@ -2943,10 +2961,12 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     if any(x["blk"] in ("PMA", "PCS", "ELBI", "IA", "DBI", "ATU", "CFG") for x in tear[last_t + 1:]):
         raise AssertionError(f"{name}: the isolation clear comes after every PHY/controller access (PMA PCS ELBI IA DBI ATU CFG)")
     # the teardown: the ATU region 0 is disabled FIRST (CR2 := 0), then its registers go back to their reset values, all before PERST low (the first non-ATU row); no ATU row anywhere else
-    n_atu = len(_WLAN_S26_TEAR)
-    if [(t["kind"], t["blk"], t["off"], t["value"], t["mask"], t["requires"]) for t in tear[:n_atu]] != [("mmio_write", "ATU", o, v, FULL_MASK, 26) for o, v in _WLAN_S26_TEAR] or any(t["blk"] == "ATU" for t in tear[n_atu:]):
-        raise AssertionError(f"{name}: the teardown must start with exactly the 7 ATU rows {[(hex(o), hex(v)) for o, v in _WLAN_S26_TEAR]} (CR2 disable first) and have no other ATU row")
-    t_p = tear[n_atu]
+    n_cfg, n_atu = len(_WLAN_S28_TEAR), len(_WLAN_S26_TEAR)
+    if [(t["kind"], t["blk"], t["off"], t["value"], t["mask"], t["requires"]) for t in tear[:n_cfg]] != [("mmio_write", "CFG", o, v, FULL_MASK, 28) for o, v in _WLAN_S28_TEAR] or any(t["blk"] == "CFG" for t in tear[n_cfg:]):
+        raise AssertionError(f"{name}: the teardown must start with exactly the 4 BAR rows {[(hex(o), hex(v)) for o, v in _WLAN_S28_TEAR]} (before the ATU disable: the CFG window dies with it) and have no other CFG row")
+    if [(t["kind"], t["blk"], t["off"], t["value"], t["mask"], t["requires"]) for t in tear[n_cfg:n_cfg + n_atu]] != [("mmio_write", "ATU", o, v, FULL_MASK, 26) for o, v in _WLAN_S26_TEAR] or any(t["blk"] == "ATU" for t in tear[n_cfg + n_atu:]):
+        raise AssertionError(f"{name}: the teardown must start (after the 4 BAR rows) with exactly the 7 ATU rows {[(hex(o), hex(v)) for o, v in _WLAN_S26_TEAR]} (CR2 disable first) and have no other ATU row")
+    t_p = tear[n_cfg + n_atu]
     if (t_p["requires"], t_p["blk"], t_p["off"], t_p["value"], t_p["kind"]) != (20, "GPH2", 4, 0, "gpio_dat"):
         raise AssertionError(f"{name}: the teardown continues with PERST low right after the ATU rows")
     ids = {t["id"] for t in tear}
@@ -3028,7 +3048,7 @@ def wlan_seq_selftest() -> int:
         resha(d)
 
     def f_step_overflow(d):
-        add_row(d, step=28)
+        add_row(d, step=29)
         resha(d)
 
     def first_row(d, step, **sel):
@@ -3088,9 +3108,30 @@ def wlan_seq_selftest() -> int:
             r["id"] = n
         resha(d)
 
+    def f_s28_removed(**sel):
+        def f(d):
+            d["rows"].remove(first_row(d, 28, **sel))
+            for n, r in enumerate(d["rows"]):
+                r["id"] = n
+            resha(d)
+        return f
+
+    def f_tear_reordered(order_fn):	# the teardown rows reordered (ids and restore references renumbered consistently)
+        def f(d):
+            order = order_fn(d["teardown"])
+            new = {x["id"]: f"T{n + 1:02d}" for n, x in enumerate(order)}
+            for x in order:
+                x["id"] = new[x["id"]]
+            d["teardown"] = order
+            for r in d["rows"]:
+                if r["restore"]:
+                    r["restore"] = new.get(r["restore"], "T99")
+            resha(d)
+        return f
+
     def f_pa_first(d):	# PERST low moved to the head of the teardown, ids and restore references renumbered consistently
         t = d["teardown"]
-        order = [t[7]] + t[:7] + t[8:]
+        order = [t[11]] + t[:11] + t[12:]
         new = {x["id"]: f"T{n + 1:02d}" for n, x in enumerate(order)}
         for x in order:
             x["id"] = new[x["id"]]
@@ -3190,6 +3231,28 @@ def wlan_seq_selftest() -> int:
         ("an S25 row turned to ELBI", set_row(25, "blk", "ELBI", blk="ATU", off=0x14), None, "S25 must be exactly"),
         ("log flag on the S25 ATU probe", set_row(25, "log", True, blk="ATU", probe=True), None, "S25 must be exactly"),
         ("an S24 row without the log flag", set_row(24, "log", False, off=0x70), None, "S24 must be exactly"),
+        ("the S28 BAR teardown rows dropped", f_tear_reordered(lambda t: t[4:]), None, "S28 must be exactly"),
+        ("one S28 BAR teardown row dropped (BAR2 high)", f_tear_reordered(lambda t: t[:3] + t[4:]), None, "S28 must be exactly"),
+        ("the S28 BAR teardown after the ATU disable", f_tear_reordered(lambda t: t[4:11] + t[:4] + t[11:]), None, "teardown must start"),
+        ("an S28 BAR teardown value changed (BAR0 left at the assigned address)", lambda d: (next(t for t in d["teardown"] if t["blk"] == "CFG" and t["off"] == 0x10).__setitem__("value", 0x60000004), resha(d)), None, "teardown must start"),
+        ("an S28 BAR teardown row at another offset", lambda d: (next(t for t in d["teardown"] if t["blk"] == "CFG" and t["off"] == 0x10).__setitem__("off", 0x04), resha(d)), None, "S28 must be exactly"),
+        ("an S28 Command write", lambda d: (add_row(d, step=28, blk="CFG", off=0x04, value=2, restore="T01"), resha(d)), None, "S28 must be exactly"),
+        ("an S28 write at another config offset (0x20)", lambda d: (add_row(d, step=28, blk="CFG", off=0x20, value=0xFFFFFFFF, restore="T01"), resha(d)), None, "S28 must be exactly"),
+        ("an S28 write at BAR0 window select (0x80)", lambda d: (add_row(d, step=28, blk="CFG", off=0x80, value=0x18000000, restore="T01"), resha(d)), None, "S28 must be exactly"),
+        ("an S28 assignment moved (BAR0 at 0x60000008)", set_row(28, "value", 0x60000008, kind="mmio_write", off=0x10, value=0x60000004), None, "S28 must be exactly"),
+        ("an S28 assignment overlapping (BAR2 at 0x60000004)", set_row(28, "value", 0x60000004, kind="mmio_write", off=0x18, value=0x60400004), None, "S28 must be exactly"),
+        ("an S28 assignment value outside the allowlist (0x60400000)", set_row(28, "value", 0x60400000, kind="mmio_write", off=0x18, value=0x60400004), None, "S28"),
+        ("an S28 sizing write restored by the wrong BAR row", lambda d: first_row(d, 28, kind="mmio_write", off=0x10, value=0xFFFFFFFF).__setitem__("restore", first_row(d, 28, kind="mmio_write", off=0x18, value=0xFFFFFFFF)["restore"]) or resha(d), None, "S28 must be exactly"),
+        ("the S28 size guard removed (BAR2 low)", f_s28_removed(kind="wait_mask", off=0x18), None, "S28 must be exactly"),
+        ("the S28 high-half guard removed (BAR0 high)", f_s28_removed(kind="wait_mask", off=0x14), None, "S28 must be exactly"),
+        ("the S28 size guard weakened (bits [31:24] only)", set_row(28, "mask", 0xFF000000, kind="wait_mask", off=0x10), None, "S28 must be exactly"),
+        ("the S28 Command precondition removed", f_s28_removed(kind="wait_eq", off=0x04), None, "S28 must be exactly"),
+        ("the S28 Command precondition weakened (MEM bit only)", set_row(28, "mask", 0x2, kind="wait_eq", off=0x04), None, "S28 must be exactly"),
+        ("an S28 guard that polls more than once", set_row(28, "polls", 2, kind="wait_mask", off=0x10), None, "S28 must be exactly"),
+        ("the S28 original written back removed (BAR0 low)", f_s28_removed(kind="mmio_write", off=0x10, value=4), None, "S28 must be exactly"),
+        ("an S28 CFG write in S26", lambda d: (add_row(d, step=26, blk="CFG", off=0x10, value=0xFFFFFFFF, restore="T01"), resha(d)), None, "S26 must be exactly"),
+        ("an S28 wait on a non-CFG block", set_row(28, "blk", "ATU", kind="wait_eq", off=0x04), None, "S28 must be exactly"),
+        ("a CFG wait row outside S28", lambda d: (add_row(d, step=27, kind="wait_eq", blk="CFG", off=0x10, restore=None, polls=1), resha(d)), None, "CFG window is read-only"),
         ("a changed value (hash pin)", lambda d: (d["rows"][7].__setitem__("value", 2), resha(d)), _WLAN_SEQ_SHA, "audited"),
     ]
     caught = 0
@@ -3235,7 +3298,8 @@ _WLANLINK_PINS = {
     "w32_allowed": "if(((old^v)&~mask)!=0u)return0;if(pa>=WLAN_GPP14&&pa<WLAN_GPP14+0x18u)return(mask&~gpio_field_mask((uint32_t)(pa-WLAN_GPP14),1u<<(unsigned)WLAN_GPP14_EN_PIN))==0u&&mask!=0u;"
                    "if(pa>=WLAN_GPH2&&pa<WLAN_GPH2+0x18u)return(mask&~gpio_field_mask((uint32_t)(pa-WLAN_GPH2),(1u<<(unsigned)WLAN_GPH2_PERST_PIN)|2u))==0u&&mask!=0u;"
                    "if(pa>=WLAN_PMA&&pa<WLAN_PMA+0x2000u)return!(pa&3u);if(pa>=WLAN_PCS&&pa<WLAN_PCS+0x1000u)return!(pa&3u);if(pa>=WLAN_IA&&pa<WLAN_IA+0x180u)return!(pa&3u);"
-                   "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;if(pa>=WLAN_ATU&&pa<WLAN_ATU+0x1000u)returnmask==0xFFFFFFFFu&&atu_ok((uint32_t)(pa-WLAN_ATU),v);return0;",
+                   "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;if(pa>=WLAN_ATU&&pa<WLAN_ATU+0x1000u)returnmask==0xFFFFFFFFu&&atu_ok((uint32_t)(pa-WLAN_ATU),v);if(pa>=WLAN_CFG&&pa<WLAN_CFG+0x1000u)returnmask==0xFFFFFFFFu&&cfg_ok((uint32_t)(pa-WLAN_CFG),old,v,cmd);return0;",
+    "cfg_ok": "intlo=(off==0x10u||off==0x18u),hi=(off==0x14u||off==0x1cu);if(!lo&&!hi)return0;if(v==(lo?0x4u:0u))return1;if((cmd&0xFFFFu)!=0u)return0;if(v==0xFFFFFFFFu)returnold==(lo?0x4u:0u);returnlo&&old==0x4u&&v==(off==0x10u?0x60000004u:0x60400004u);",
     "atu_ok": "return(off==0x000u&&(v==0x4u||v==0u))||(off==0x004u&&(v==0x80000000u||v==0u))||(off==0x008u&&(v==(uint32_t)WLAN_CFG||v==0u))||(off==0x00cu&&v==0u)||(off==0x010u&&(v==(uint32_t)WLAN_CFG+0x1fffu||v==0xfffu))||(off==0x014u&&(v==0x01000000u||v==0u))||(off==0x018u&&v==0u);",
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
     "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI||blk==WLB_CFG)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI||blk==WLB_ATU)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
@@ -3245,7 +3309,7 @@ _WLANLINK_PINS = {
 # sha256 of the whitespace-stripped body of each safety-critical function (reviewed text, 2026-10-23). A change needs a new review AND a new pin here: these are what guarantee the teardown runs, a
 # block is probed before it is touched, the address is bounded and the writer's mask rule holds (Opus review H1: the text pins above cover only the allowlist).
 _WLANLINK_BODY_SHA = {
-    "w32": "cb467892742fbe9a64e2338f61fb5f4e6c1a81afc37303e63defcfee49868bce",
+    "w32": "b0d08cb68c5cf9e3f9825eba8207ae75330313b7cc26e2318dfe0dc23d5d7538",
     "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
     "r32": "792e4db6044940877783b0d2e41bbdf33f80c2efadf6af279cbd9b3fa3b7a80b",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
@@ -3289,8 +3353,8 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     wa, wb = _c_function_span(code, "w32")
     w = re.sub(r"\s+", "", code[wa:wb])
     for need in ("if(!get_row(idx,tear,&r))return-2;", "if(r.kind!=WLK_GPIO_DAT&&r.kind!=WLK_GPIO_CON&&r.kind!=WLK_MMIO_RMW&&r.kind!=WLK_MMIO_WRITE)return-2;", "if(!tear&&r.step>WLAN_LINK_N)return-2;",
-                 "pa=pa_of(r.blk,r.off);if(!pa)return-2;", "if(r.kind==WLK_MMIO_WRITE){old=r.val;}elseif(!try_read32(pa,&old)){return-1;}", "v=(old&~r.mask)|(r.val&r.mask);",
-                 "if(!w32_allowed(pa,r.mask,old,v))return-2;", "returntry_write32(pa,v)?0:-1;"):
+                 "pa=pa_of(r.blk,r.off);if(!pa)return-2;", "if(r.kind==WLK_MMIO_WRITE&&r.blk!=WLB_CFG){old=r.val;}elseif(!try_read32(pa,&old)){return-1;}", "if(r.blk==WLB_CFG&&!try_read32(WLAN_CFG+4u,&cmd))cmd=0xFFFFu;", "v=(old&~r.mask)|(r.val&r.mask);",
+                 "if(!w32_allowed(pa,r.mask,old,v,cmd))return-2;", "returntry_write32(pa,v)?0:-1;"):
         if need not in w:
             raise AssertionError(f"{name}: w32 lost '{need}'")
     if "__attribute__((noipa))staticintw32(unsignedidx,inttear)" not in norm:
@@ -3332,7 +3396,7 @@ def wlanlink_source_selftest() -> int:
     cases = [
         ("inline asm store", good.replace(ins, 'static void evil(void) { __asm__ volatile("str wzr, [x0]"); }\n' + ins, 1)),
         ("second write path", good.replace(ins, "static void evil(void) { try_write32(0x14440004UL, 0); }\n" + ins, 1)),
-        ("w32 skips the allowlist", good.replace("if (!w32_allowed(pa, r.mask, old, v))", "if (0)", 1)),
+        ("w32 skips the allowlist", good.replace("if (!w32_allowed(pa, r.mask, old, v, cmd))", "if (0)", 1)),
         ("w32 ignores the step bound", good.replace("if (!tear && r.step > WLAN_LINK_N)", "if (0)", 1)),
         ("w32 takes the row from the caller", good.replace("static int w32(unsigned idx, int tear)", "static int w32(unsigned idx, int tear, uint32_t extra)", 1)),
         ("allowlist: GPP14 any pin", good.replace("1u << (unsigned)WLAN_GPP14_EN_PIN)) == 0u && mask != 0u;", "0xffu)) == 0u && mask != 0u;", 1)),
@@ -3374,6 +3438,20 @@ def wlanlink_source_selftest() -> int:
         ("GPIO read-back removed", good.replace("\t\tif ((v & r.mask) != (r.val & r.mask))\n\t\t\treturn ST_FAULT;", "", 1)),
         ("poll timeout reported as ok", good.replace("\treturn ST_TIMEOUT;\n}", "\treturn ST_OK;\n}", 1)),
         ("teardown stops at the first failure", good.replace("\t\t\ttear_bad++;", "\t\t\ttear_bad++;\n\t\t\tbreak;", 1)),
+        ("allowlist: CFG window wider than 4 KiB", good.replace("pa < WLAN_CFG + 0x1000u", "pa < WLAN_CFG + 0x2000u", 1)),
+        ("allowlist: CFG partial mask", good.replace("return mask == 0xFFFFFFFFu && cfg_ok(", "return cfg_ok(", 1)),
+        ("allowlist: CFG Command offset 0x04", good.replace("int lo = (off == 0x10u || off == 0x18u), hi = (off == 0x14u || off == 0x1cu);", "int lo = (off == 0x10u || off == 0x18u), hi = (off == 0x14u || off == 0x1cu || off == 0x04u);", 1)),
+        ("allowlist: CFG another BAR offset (0x20)", good.replace("(off == 0x10u || off == 0x18u), hi", "(off == 0x10u || off == 0x18u || off == 0x20u), hi", 1)),
+        ("allowlist: CFG restore lets every low value through", good.replace("if (v == (lo ? 0x4u : 0u))\n\t\treturn 1;", "if (v == (lo ? 0x4u : 0u) || lo)\n\t\treturn 1;", 1)),
+        ("allowlist: CFG Command decode not checked", good.replace("if ((cmd & 0xFFFFu) != 0u)\n\t\treturn 0;", "", 1)),
+        ("allowlist: CFG Command check weakened to MEM only", good.replace("(cmd & 0xFFFFu) != 0u", "(cmd & 0x2u) != 0u", 1)),
+        ("allowlist: CFG all ones from any state", good.replace("return old == (lo ? 0x4u : 0u);", "return 1;", 1)),
+        ("allowlist: CFG assignment from any state", good.replace("return lo && old == 0x4u && v ==", "return lo && v ==", 1)),
+        ("allowlist: CFG assignment of another address", good.replace("0x60400004u", "0x60800004u", 1)),
+        ("allowlist: CFG assignment of the high half", good.replace("return lo && old == 0x4u && v ==", "return old == 0x4u && v ==", 1)),
+        ("w32 CFG writes check the table value, not the register", good.replace("if (r.kind == WLK_MMIO_WRITE && r.blk != WLB_CFG) {", "if (r.kind == WLK_MMIO_WRITE) {", 1)),
+        ("w32 does not read Command", good.replace("\tif (r.blk == WLB_CFG && !try_read32(WLAN_CFG + 4u, &cmd))\n\t\tcmd = 0xFFFFu;", "", 1)),
+        ("w32 assumes Command 0 when unreadable", good.replace("cmd = 0xFFFFu;", "cmd = 0u;", 1)),
         ("a raw read of another register", good.replace(ins, "static void evil(uint32_t *v) { (void)try_read32(0x17463EC8UL, v); }\n" + ins, 1)),
     ]
     caught = 0
@@ -3390,7 +3468,7 @@ def wlanlink_source_selftest() -> int:
     return caught
 
 
-def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 27) -> None:
+def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 28) -> None:
     """Build-time policy: an image whose effective step bound N is >= 20 (PERST release, LTSSM enable) is accepted ONLY when the builder typed `--wlan-link=N` with exactly that N; anything without an
     explicit N is the default run (N = default_last_step = 19: no PERST, no LTSSM). `effective` is read from the preprocessed wlanlink.c by shim/build.sh."""
     if not 0 <= effective <= last:
@@ -3429,10 +3507,10 @@ def wlan_link_n_selftest() -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
     src, sh = (root / "shim" / "wlanlink.c").read_text(), (root / "shim" / "build.sh").read_text()
     check_wlan_link_n_sources(src, sh)  # control must pass
-    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24"), (25, "25"), (26, "26"), (27, "27")):
+    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24"), (25, "25"), (26, "26"), (27, "27"), (28, "28")):
         check_wlan_link_n(eff, exp)
     caught = 0
-    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, None), (26, None), (27, None), (28, "28"), (27, "26"), (26, "25"), (25, "24"), (24, "23"), (20, "x"), (22, "019")]
+    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, None), (26, None), (27, None), (28, None), (29, "29"), (27, "26"), (26, "25"), (25, "24"), (24, "23"), (20, "x"), (22, "019")]
     for eff, exp in bad_n:
         try:
             check_wlan_link_n(eff, exp)
@@ -3465,12 +3543,13 @@ def wlan_link_n_selftest() -> int:
 
 _WLANLINK_W32_CONSTS = (r"#0x890\b", r"movk\s+x\d+, #0x1480, lsl #16", r"cmp\s+x\d+, #0x17f\b", r"cmp\s+x\d+, #0xfff\b", r"cmp\s+x\d+, #0x17\b", r"cmp\s+w\d+, #0x54\b", r"cmp\s+w\d+, #0x80\b",
                         r"cmp\s+w\d+, #0x474\b", r"cmp\s+w\d+, #0x3bc\b",
-                        r"mov\s+w\d+, #0x1000000\b", r"mov\s+w\d+, #0x80000000\b", r"movk\s+w\d+, #0x60ff, lsl #16", r"mov\s+w\d+, #0x60ffffff\b")	# the ATU values (S26): LOWER_TARGET, CR2 enable, LOWER_BASE (CFG window), LIMIT
+                        r"mov\s+w\d+, #0x1000000\b", r"mov\s+w\d+, #0x80000000\b", r"movk\s+w\d+, #0x60ff, lsl #16", r"mov\s+w\d+, #0x60ffffff\b",
+                        r"movk\s+w\d+, #0x6040, lsl #16", r"tst\s+w\d+, #0xffff\b")	# the ATU values (S26): LOWER_TARGET, CR2 enable, LOWER_BASE (CFG window), LIMIT; the CFG BAR2 assignment 0x60400004 and the Command mask 0xffff (S28)
 
 
 def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> None:
     """The COMPILED w32 keeps its independent allowlist (review B1 of wlanen: a specialised helper loses its address compare): the window / offset compare constants are in it, there is one
-    try_write32 call and one try_read32 call in it, and w32 is called from exactly one place."""
+    try_write32 call and two try_read32 calls in it (the old value, the CFG Command dword), and w32 is called from exactly one place."""
     blocks = re.split(r"(?m)^(?=[0-9a-f]+ <[^>]+>:$)", disasm)
     w = [b for b in blocks if re.match(r"[0-9a-f]+ <w32>:", b)]
     if len(w) != 1:
@@ -3478,8 +3557,8 @@ def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> Non
     for rx in _WLANLINK_W32_CONSTS:
         if not re.search(rx, w[0]):
             raise AssertionError(f"{name}: the compiled w32 lost the allowlist compare /{rx}/ (specialised away?)")
-    if len(re.findall(r"R_AARCH64_CALL26\s+try_write32", w[0])) != 1 or len(re.findall(r"R_AARCH64_CALL26\s+try_read32", w[0])) != 1:
-        raise AssertionError(f"{name}: w32 has exactly one try_write32 and one try_read32 call")
+    if len(re.findall(r"R_AARCH64_CALL26\s+try_write32", w[0])) != 1 or not 2 <= len(re.findall(r"R_AARCH64_CALL26\s+try_read32", w[0])) <= 3:
+        raise AssertionError(f"{name}: w32 has exactly one try_write32 and two or three try_read32 calls (the old value, the CFG Command dword; the compiler may duplicate the old-value read)")
     callers = [b.splitlines()[0] for b in blocks if b is not w[0] and re.search(r"\bbl\s+[0-9a-f]+ <w32>", b)]
     if len(callers) != 1 or "<run_row" not in callers[0]:
         raise AssertionError(f"{name}: w32 must have exactly one caller, run_row: {callers}")
@@ -3495,8 +3574,10 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("IA window widened", re.sub(r"(cmp\s+x\d+, )#0x17f\b", r"\1#0x1ff", disasm, count=1)),
         ("ELBI offset dropped", re.sub(r"(cmp\s+w\d+, )#0x54\b", r"\1#0x55", disasm, count=1)),
         ("ATU limit value changed", disasm.replace(wblk, wblk.replace("#0x60ffffff", "#0x61ffffff", 1), 1)),
+        ("CFG BAR2 assignment changed", disasm.replace(wblk, wblk.replace("#0x6040", "#0x6080", 1), 1)),
+        ("CFG Command mask narrowed", disasm.replace(wblk, wblk.replace("tst\tw4, #0xffff", "tst\tw4, #0x2", 1), 1)),
         ("ATU CR2 value changed", disasm.replace(wblk, wblk.replace("#0x80000000", "#0x80000001", 1), 1)),
-        ("ATU base (CFG window) changed", disasm.replace(wblk, wblk.replace("#0x60ff, lsl #16", "#0x61ff, lsl #16", 1), 1)),
+        ("ATU base (CFG window) changed", disasm.replace(wblk, wblk.replace("#0x60ff, lsl #16", "#0x61ff, lsl #16"), 1)),
         ("a second try_write32 in w32", disasm.replace("R_AARCH64_CALL26\ttry_write32", "R_AARCH64_CALL26\ttry_write32\n 1fc:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1fc: R_AARCH64_CALL26\ttry_write32", 1)),
         ("a second caller of w32", disasm + "0000000000fff000 <evil>:\n fff000:\t97fffe78 \tbl\t100 <w32>\n fff004:\td65f03c0 \tret\n"),
     ]
@@ -4096,7 +4177,7 @@ def main() -> None:
     wlan_seq_selftest()
     _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
     check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
-    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S27 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
+    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S28 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 8 blocks, all inside the allowlist; every write row has a restore")
     wlanlink_source_selftest()
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())

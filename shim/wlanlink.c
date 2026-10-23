@@ -231,8 +231,26 @@ static int atu_ok(uint32_t off, uint32_t v)
 	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u);
 }
 
-/* v may differ from old only inside mask; pa must be inside one of the seven writable windows, with the per-block rules. */
-static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
+/* Endpoint config BARs through the CFG window (S28, research 33): ONLY offsets 0x10/0x14/0x18/0x1C (never Command 0x04), a full-word write, and only these transitions: the observed original (low 0x4, high 0)
+ * from ANY state (the restore, even if Command is not 0); otherwise Command (cmd) must have MEM/IO decode off, and all ones only from the original, the assigned address only for the low half and only from
+ * the original. Linux sizes with decode off too (probe.c:188-191). */
+static int cfg_ok(uint32_t off, uint32_t old, uint32_t v, uint32_t cmd)
+{
+	int lo = (off == 0x10u || off == 0x18u), hi = (off == 0x14u || off == 0x1cu);
+
+	if (!lo && !hi)
+		return 0;
+	if (v == (lo ? 0x4u : 0u))
+		return 1;
+	if ((cmd & 0xFFFFu) != 0u)
+		return 0;
+	if (v == 0xFFFFFFFFu)
+		return old == (lo ? 0x4u : 0u);
+	return lo && old == 0x4u && v == (off == 0x10u ? 0x60000004u : 0x60400004u);
+}
+
+/* v may differ from old only inside mask; pa must be inside one of the writable windows, with the per-block rules. cmd = the EP Command dword (read by w32 for CFG rows only). */
+static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, uint32_t cmd)
 {
 	if (((old ^ v) & ~mask) != 0u)
 		return 0;
@@ -252,6 +270,8 @@ static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
 		return 1;
 	if (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000u)
 		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v);
+	if (pa >= WLAN_CFG && pa < WLAN_CFG + 0x1000u)
+		return mask == 0xFFFFFFFFu && cfg_ok((uint32_t)(pa - WLAN_CFG), old, v, cmd);
 	return 0;
 }
 
@@ -261,7 +281,7 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 {
 	struct wlan_row r;
 	uintptr_t pa;
-	uint32_t old = 0, v;
+	uint32_t old = 0, v, cmd = 0;
 
 	if (!get_row(idx, tear, &r))
 		return -2;
@@ -274,13 +294,15 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 	pa = pa_of(r.blk, r.off);
 	if (!pa)
 		return -2;
-	if (r.kind == WLK_MMIO_WRITE) {
+	if (r.kind == WLK_MMIO_WRITE && r.blk != WLB_CFG) {
 		old = r.val;
-	} else if (!try_read32(pa, &old)) {
+	} else if (!try_read32(pa, &old)) {		/* CFG writes check the real old value (BAR transitions) */
 		return -1;
 	}
+	if (r.blk == WLB_CFG && !try_read32(WLAN_CFG + 4u, &cmd))
+		cmd = 0xFFFFu;			/* Command unreadable: treat decode as on, only the restores pass */
 	v = (old & ~r.mask) | (r.val & r.mask);
-	if (!w32_allowed(pa, r.mask, old, v))
+	if (!w32_allowed(pa, r.mask, old, v, cmd))
 		return -2;
 	return try_write32(pa, v) ? 0 : -1;
 }
