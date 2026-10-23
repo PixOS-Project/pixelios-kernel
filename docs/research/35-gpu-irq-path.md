@@ -148,3 +148,6 @@ Order matters; each step is its own patch/run.
 5. Driver: ISR body and `sm_thread` rework per s.8 steps 4-5, keeping the 3 s job timeout and hard-stop logic; keep a bit in `sweetmali=` to force polling.
 6. Reset-path check: re-run the malireset1 recipe (`sweetmali=0x22`) with IRQ mode on; same pass criteria as the review's run conditions (second `config before` all zeros, `selftest reset=PASS job-after-reset=PASS`) plus `unhandled=0`.
 7. Write the antipattern/handoff entries; tick the plan task with the run label.
+
+## Addendum (2026-10-24): SPI numbers cross-checked [src]
+A second desk source (postmarketOS gs101 device tree, reported by the driver session) has `gpu@1c500000`, size `0x5000`, interrupts SPI 420 (JOB), 421 (MMU), 419 (GPU), Panfrost enabled. This matches our measured base/size (0x1C500000 / 0x5000, run u1) and the numbers taken from doc 17, so the "numeric SPI values second-hand" open point is reduced to: the INTID = SPI + 32 mapping (451/452/453) is still to be confirmed by the read-only GIC probe on hardware (ISENABLER/ICFGR rows).
