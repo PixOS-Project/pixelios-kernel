@@ -648,6 +648,34 @@ def build():
     return {"steps": {str(k): v for k, v in STEP_NAMES.items()}, "unknown": unknown}
 
 
+def draft28():
+    """DRAFT S28 rows (research 33): BAR0/BAR2 sizing + assignment through the CFG window. Printed, NOT added to wlan_seq.json (the shim has no CFG write path yet: goal W-A6b). Usage: --draft28."""
+    LP = REFS2 / "linux_pci_probe.c"	# Linux probe.c of the bluejay android13 5.10 tree (sha256 816b5395d48c...)
+    pc = lambda nm: anchor(PCIR, find_line(PCIR, r"define\s+" + nm + r"\s"), nm)
+    out, ob = [], {"BAR0": 4, "BAR1": 0, "BAR2": 4, "BAR3": 0}	# originals OBSERVED in run w3a-n27
+    def row(kind, off, mask, value, cite, tag, note, restore=None):
+        out.append({"kind": kind, "blk": "CFG", "off": off, "mask": mask, "value": value, "cite": cite, "tag": tag, "note": note, **({"restore": restore} if restore else {})})
+    sz = "Linux __pci_read_base order: write all ones, read, write original (probe.c:198-200; high half 239-242)"
+    row("wait_eq", 0x04, 0xFFFF, 0, f"{pc('PCI_COMMAND')}; probe.c:188-191 (Linux itself clears the decode bits while sizing); observed command 0x0000 (w3a-n26/27)", TAG_SRC, "precondition: Command == 0 (MEM/IO decode off) before ANY BAR write")
+    for nm, lo, sz_guard in (("BAR0", 0x10, 0xFFC00000), ("BAR2", 0x18, 0xFFC00000)):
+        hi = lo + 4
+        row("wait_eq", lo, FULL, ob[nm], "observed w3a-n27 (BAR0 = BAR2 = 0x00000004)", "observed", f"precondition: {nm} low still holds the observed original")
+        row("wait_eq", hi, FULL, 0, "observed w3a-n27 (BAR1 = BAR3 = 0)", "observed", f"precondition: {nm} high half still 0")
+        row("mmio_write", lo, FULL, FULL, f"{pc('PCI_BASE_ADDRESS_' + str(lo // 4 - 4))}; {sz}", TAG_SRC, f"{nm} low := 0xFFFFFFFF (sizing)", restore=f"{nm}_lo")
+        row("wait_mask", lo, sz_guard, sz_guard, f"{sz}; size = lowest set bit of (read & ~0xF) (probe.c:116-118)", TAG_SRC, f"{nm} low read-back: bits [31:22] all 1 = size <= 4 MiB (the layout of 2b needs it; else STOP, restore)")
+        row("read_only", lo, FULL, 0, "same", TAG_SRC, f"log {nm} low sizing readback (decode: size = ~(v & 0xFFFFFFF0) + 1)")
+        row("mmio_write", lo, FULL, ob[nm], f"probe.c:200 (restore the original)", TAG_SRC, f"{nm} low := original")
+        row("mmio_write", hi, FULL, FULL, f"probe.c:240 (only valid because the type bits read 0x4 = 64-bit: {pc('PCI_BASE_ADDRESS_MEM_TYPE_64')})", TAG_SRC, f"{nm} high := 0xFFFFFFFF (sizing)", restore=f"{nm}_hi")
+        row("wait_mask", hi, FULL, FULL, "probe.c:241-243; a high half that is not all ones means size > 4 GiB", TAG_SRC, f"{nm} high read-back must be 0xFFFFFFFF (size < 4 GiB) else STOP, restore")
+        row("read_only", hi, FULL, 0, "same", TAG_SRC, f"log {nm} high sizing readback")
+        row("mmio_write", hi, FULL, 0, "probe.c:242", TAG_SRC, f"{nm} high := original (0)")
+    for nm, lo, addr in (("BAR0", 0x10, 0x60000000), ("BAR2", 0x18, 0x60400000)):
+        row("mmio_write", lo, FULL, addr | 4, "research 33 s.3: PCI address == CPU address (pcie.dtsi:75-76), type bits kept as read", TAG_GUESS, f"{nm} low := {addr:#x} | type bits (0x4)", restore=f"{nm}_lo")
+        row("read_only", lo, FULL, 0, "read-back (decode check: address bits [31:4] == written, low nibble 0x4)", TAG_GUESS, f"log {nm} low after assignment (expect {addr | 4:#010x})")
+        row("read_only", lo + 4, FULL, 0, "read-back", TAG_GUESS, f"log {nm} high after assignment (expect 0; never written in this step)")
+    return out
+
+
 def finish():
     meta = build()
     srcs = {SRC_NAMES[p]: hashlib.sha256(p.read_bytes()).hexdigest()[:16] for p in SRC_NAMES}
@@ -676,7 +704,11 @@ def dump(doc):
     return "\n".join(out) + "\n"
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--draft28" in sys.argv:
+    build()
+    for i, r in enumerate(draft28()):
+        print(i, json.dumps(r, sort_keys=True))
+elif __name__ == "__main__":
     text = dump(finish())
     if "--check" in sys.argv:
         if OUT.read_text() != text:
