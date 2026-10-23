@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..47e0da9
+index 0000000..ca58bb6
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,365 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -25,6 +25,7 @@ index 0000000..47e0da9
 +#include <IOKit/IOLocks.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <sys/errno.h>
++#include <pexpert/pexpert.h>
 +#include "../../../bsd/dev/sweet_mali.h"
 +
 +#define SWEET_MALI_MAX_BOS      4096
@@ -43,16 +44,19 @@ index 0000000..47e0da9
 +bool
 +SweetMali::start(IOService *provider)
 +{
++	uint32_t mode = 0;
++
++	if (!PE_parse_boot_argn("sweetmali", &mode, sizeof(mode)) || (mode & 3u) == 0) {
++		return false;                        /* not enabled: stay silent */
++	}
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
-+	if (!sweet_mali_ready()) {
-+		IOLog("SWEET MALI: driver core is not up (boot-arg sweetmali=1 and a powered GPU needed), service not registered\n");
-+		return false;
-+	}
++	/* IOKit matches this service BEFORE the driver core is brought up (run mali1: the core logged "up" after four start() attempts), so do not require
++	 * sweet_mali_ready() here; the user client checks it on every open and call. */
 +	setProperty(kIOUserClientClassKey, "SweetMaliUserClient");
 +	registerService();
-+	IOLog("SWEET MALI: SweetMali registered\n");
++	IOLog("SWEET MALI: SweetMali registered (core %s)\n", sweet_mali_ready() ? "up" : "not up yet");
 +	return true;
 +}
 +
