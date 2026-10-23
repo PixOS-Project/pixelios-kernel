@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..a707d7b
+index 0000000..2053823
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,472 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -296,6 +296,11 @@ index 0000000..a707d7b
 +		OSSafeReleaseNULL(s);
 +		return kIOReturnNotFound;
 +	}
++	/* review M4: only kernel-allocated surface buffers; a physical descriptor (the panel framebuffer) would panic flush_dcache64 */
++	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) == NULL) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
 +	uint64_t len = s->memory->getLength();
 +	if (len == 0 || (len & (page_size - 1)) || len > SWEET_MALI_MAX_BO_BYTES) {
 +		s->release();
@@ -305,12 +310,15 @@ index 0000000..a707d7b
 +		s->release();
 +		return kIOReturnVMError;
 +	}
++	IOMemoryDescriptor *md = s->memory;
++	md->retain();       /* review H1: the BO slot releases md at close and the surface owns its own reference */
 +	uint64_t handle = 0, va = 0;
-+	IOReturn ret = mapMemory(s->memory, len, 0, s, &handle, &va);       /* not executable */
++	IOReturn ret = mapMemory(md, len, 0, s, &handle, &va);       /* not executable */
 +	if (ret != kIOReturnSuccess) {
 +		if (ret != kIOReturnIOError && ret != kIOReturnNotReady) {
-+			s->memory->complete();       /* else the GPU may still reach the pages: they stay wired (mapMemory kept an extra surface reference) */
++			md->complete();       /* else the GPU may still reach the pages: they stay wired (mapMemory kept an extra md and surface reference) */
 +		}
++		md->release();
 +		s->release();
 +		return ret;
 +	}

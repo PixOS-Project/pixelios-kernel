@@ -59,10 +59,10 @@ index aaae417..d3c36b9 100644
  {
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
 new file mode 100644
-index 0000000..c494213
+index 0000000..14a51de
 --- /dev/null
 +++ b/bsd/dev/sweet_mali.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,692 @@
 +/*
 + * Mali-G78 (gs101, tBEx r0p1) job-manager driver core for XNU: GPU bring-up (kbase config registers, power), ONE address space (AS0) with a 4 GiB GPU VA window,
 + * in-order job submission to the job slots, a polling completion thread and a seqno fence. The IOKit user client (iokit/Kernel/arm/SweetMali.cpp, patch 0105)
@@ -587,7 +587,7 @@ index 0000000..c494213
 +/* Soft reset (kbase_pm_do_reset, pm_driver.c:4286-4425): unmask RESET_COMPLETED first (Pixel b/290409680), GPU_COMMAND = SOFT_RESET, wait up to 500 ms for the raw bit, else
 + * HARD_RESET and 500 ms more; then redo config + power + AS0 (the page tables are in memory and unchanged). Lock held, no job in flight. 0 = recovered. */
 +static int
-+sm_reset(void)
++sm_reset_do(void)
 +{
 +	int ok;
 +
@@ -596,7 +596,8 @@ index 0000000..c494213
 +	wr(R_JOB_CLEAR, 0xFFFFFFFFu);
 +	wr(R_MMU_CLEAR, 0xFFFFFFFFu);
 +	wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFu);
-+	wr(R_GPU_IRQ_MASK, GPU_IRQ_RESET_COMPLETED);
++	/* review M2: kbase unmasks RESET_COMPLETED here (b/290409680), but nothing in XNU masks or handles SPI 419 and one stuck level interrupt would hang the only CPU; the raw bit is polled, so the mask stays 0 until run malireset1 shows whether the raw bit still sets */
++	wr(R_GPU_IRQ_MASK, 0);
 +	wr(R_GPU_COMMAND, GPU_CMD_SOFT_RESET);
 +	ok = WAITC(rr(R_GPU_IRQ_RAW) & GPU_IRQ_RESET_COMPLETED, 500000);
 +	if (!ok) {
@@ -609,7 +610,6 @@ index 0000000..c494213
 +		return 1;
 +	}
 +	wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFu);
-+	wr(R_GPU_IRQ_MASK, 0);
 +	if (rr(R_SHADER_READY) || rr(R_TILER_READY) || rr(R_L2_READY)) {
 +		printf("SWEET MALI: cores still ready after reset (SHADER=%#x TILER=%#x L2=%#x), refusing to continue\n", rr(R_SHADER_READY), rr(R_TILER_READY), rr(R_L2_READY));
 +		return 1;
@@ -620,6 +620,18 @@ index 0000000..c494213
 +	}
 +	printf("SWEET MALI: GPU reset done, cores back, AS0 re-enabled\n");
 +	return 0;
++}
++
++/* review M1: any failed reset leaves the hardware in an unknown state, so the device is dead */
++static int
++sm_reset(void)
++{
++	int r = sm_reset_do();
++
++	if (r) {
++		sm.dead = 1;
++	}
++	return r;
 +}
 +
 +static int
@@ -716,7 +728,7 @@ index 0000000..c494213
 +		printf("SWEET MALI: selftest reset=%s job-after-reset=%s\n", re ? "FAIL" : "PASS", (e2 == 0 && got2 == (ST_MAGIC0 ^ 0xFFull)) ? "PASS" : "FAIL");
 +	}
 +	printf("SWEET MALI: selftest RESULT js0=%s js1=%s\n", (e0 == 0 && got0 == ST_MAGIC0) ? "PASS" : "FAIL", e1 == -1 ? "skipped" : (e1 == 0 && got1 == ST_MAGIC1) ? "PASS" : "FAIL");
-+	if ((e0 == 0 || e0 == EIO) && (e1 == 0 || e1 == EIO || e1 == -1)) {
++	if (!sm.dead && (e0 == 0 || e0 == EIO) && (e1 == 0 || e1 == EIO || e1 == -1)) {
 +		(void)sweet_mali_unmap(va, 1);
 +	} else {
 +		printf("SWEET MALI: selftest: a job did not finish cleanly, the buffer stays mapped (leaked on purpose)\n");
