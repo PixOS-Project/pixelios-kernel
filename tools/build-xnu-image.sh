@@ -30,6 +30,7 @@ args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress 
 [ "$gui" = 1 ] && args="$args sweetfb_noconsole=1 sweetfb_hz=30"
 case "$qr" in off|0) ;; *[!0-9]*) echo "--qr needs seconds or off" >&2; exit 2 ;; *) args="$args sweetqr=$qr" ;; esac
 [ -n "$restart" ] && args="$args sweetrestart=$restart"
+[ "$handover" = 0 ] || args="$args sweetgpu=0x1C500000"   # patch 0102 reads the GPU; sweetgpujob=1 (patch 0103, WRITES) only via --args
 [ -n "$extra" ] && args="$args $extra"
 railsarg=(); words=""; dvfsarg=(); hoarg=(); [ "$handover" = 0 ] || hoarg=(--gpu-handover)
 [ "$rails" = 0 ] || words=rails

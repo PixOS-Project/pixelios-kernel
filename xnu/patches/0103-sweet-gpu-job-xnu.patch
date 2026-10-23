@@ -11,10 +11,10 @@ index da478bd..73f7856 100644
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/sweet_gpu_gs101.c b/bsd/dev/sweet_gpu_gs101.c
-index d4ef454..ce1fb2c 100644
+index 1735213..5489d5b 100644
 --- a/bsd/dev/sweet_gpu_gs101.c
 +++ b/bsd/dev/sweet_gpu_gs101.c
-@@ -6,7 +6,7 @@
+@@ -7,7 +7,7 @@
   * Register offsets: kbase mali_kbase_regmap_jm_enums.h (GPU_CONTROL / JOB_CONTROL / MMU_CONTROL), same set as shim/gpuprobe.c
   * [read from source, observed readable from EL1 in docs/research/27]. PMU words: soc.json gpu.pmu_g3d_stat / pmu_emb_stat
   * (0x17461E04 / 0x17462004, flexpmu_cal_local_gs101.h), S2MPU: soc.json gpu.s2mpu_g3d0..3 and docs/research/28 section 6.
@@ -23,7 +23,7 @@ index d4ef454..ce1fb2c 100644
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -15,6 +15,7 @@
+@@ -16,6 +16,7 @@
  #include <stdint.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
@@ -31,7 +31,7 @@ index d4ef454..ce1fb2c 100644
  
  #define SG_PMU_G3D_STAT   0x17461E04ull
  #define SG_PMU_EMB_STAT   0x17462004ull
-@@ -97,6 +98,12 @@ sweet_gpu_gs101_init(void)
+@@ -115,6 +116,12 @@ sweet_gpu_gs101_init(void)
  		}
  	}
  	printf("SWEET GPU: probe done (read-only)\n");

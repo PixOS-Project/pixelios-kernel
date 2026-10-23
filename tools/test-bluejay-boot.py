@@ -2055,13 +2055,26 @@ def check_shim_rail_sequence(src: str, name: str = "shim.c") -> None:
     sh = norm.find("gpu_probe_shaders();")
     if not (0 < a < c < p < sh < r) or "else" not in norm[c:p]:
         raise AssertionError(f"{name}: order must be gpu_rail_enable, (skip | gpu_power_cycle), gpu_probe_shaders, gpu_rail_restore")
-    # --gpu-handover (docs/research/30): exactly one more gpu_rail_enable, inside #if GPU_HANDOVER in the BOOT_XNU path before loader_boot, and NO restore there
-    if code.count("gpu_rail_enable()") != 2 or code.count("gpu_rail_restore(") != 1:
-        raise AssertionError(f"{name}: exactly two gpu_rail_enable calls (probe flow + handover) and one gpu_rail_restore")
-    h = code.find("#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)")
+    # --gpu-handover (docs/research/30, review gpu-handover-review-1 M1/L1/L2): inside the BOOT_XNU block, after 'boot XNU' and before loader_boot, ONE extra
+    # gpu_rail_enable whose only restore is for UNVERIFIED/MISMATCH; and after loader_boot returns a restore guarded by RAIL_ON_OK. Nothing else.
+    if code.count("gpu_rail_enable()") != 2 or code.count("gpu_rail_restore(") != 3:
+        raise AssertionError(f"{name}: exactly two gpu_rail_enable calls (probe flow + handover) and three gpu_rail_restore (probe flow, handover unverified, loader_boot failed)")
+    bx = code.find('con_str("SECTION", "boot XNU")')
+    lb = code.find("loader_boot(dtb)", bx)
+    h = code.find("#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)", bx)
     he = code.find("#endif", h)
-    if h < 0 or he < 0 or "gpu_rail_enable()" not in code[h:he] or "gpu_rail_restore" in code[h:he] or not (code.find("#ifdef BOOT_XNU") < h < code.find("loader_boot(dtb)")):
-        raise AssertionError(f"{name}: the handover rail-on must sit in #if GPU_HANDOVER, in BOOT_XNU before loader_boot, with no restore")
+    hb = re.sub(r"\s+", "", code[h:he]) if h >= 0 and he >= 0 else ""
+    if not (0 <= bx < h < he < lb):
+        raise AssertionError(f"{name}: the handover rail-on must sit in the BOOT_XNU block after 'boot XNU' and before loader_boot")
+    if hb.count("gpu_rail_enable()") != 1 or hb.count("gpu_rail_restore(") != 1 or "if(gpu_ho==RAIL_UNVERIFIED||gpu_ho==RAIL_MISMATCH)gpu_rail_restore(gpu_ho,RAIL_POWER_NONE);" not in hb:
+        raise AssertionError(f"{name}: the handover block must restore only for RAIL_UNVERIFIED/RAIL_MISMATCH")
+    if any(w in hb for w in ("for(", "while(", "goto", "#if0", "(*")):
+        raise AssertionError(f"{name}: no loops, goto or indirect calls in the handover block")
+    a2 = code.find("#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)", lb)
+    a2e = code.find("#endif", a2)
+    tb = re.sub(r"\s+", "", code[a2:a2e]) if a2 >= 0 and a2e >= 0 else ""
+    if a2 - lb > 400 or tb != "#ifdefined(GPU_HANDOVER)&&defined(GPU_RAIL_ON)if(gpu_ho==RAIL_ON_OK)gpu_rail_restore(gpu_ho,RAIL_POWER_NONE);":
+        raise AssertionError(f"{name}: after loader_boot returns, the verified handover rail must be restored (RAIL_ON_OK)")
 
 
 def gpurailon_selftest() -> int:
@@ -2078,6 +2091,10 @@ def gpurailon_selftest() -> int:
         ("acpm: no voltage window", check_acpm_s11_writer_source, acpm_src, "xo.value < ACPM_S11_ON_VSEL_MIN || xo.value > ACPM_S11_ON_VSEL_MAX", "0"),
         ("acpm: a retry loop", check_acpm_s11_writer_source, acpm_src, "\treturn xfer(c, XM_PMIC, s11_w0(ACPM_S11_ON_REG), FUNC_UPDATE", "\twhile (0) { }\n\treturn xfer(c, XM_PMIC, s11_w0(ACPM_S11_ON_REG), FUNC_UPDATE"),
         ("acpm: a second FUNC_UPDATE elsewhere", check_acpm_s11_writer_source, acpm_src, "int acpm_s11_rail_set(", "static uint32_t evil_w1(void) { return FUNC_UPDATE | 0x1000u; }\nint acpm_s11_rail_set("),
+        ("shim: handover block after loader_boot", check_shim_rail_sequence, shim_src, "con_str(\"SECTION\", \"GPU handover (rail on, left on)\");", "con_str(\"SECTION\", \"GPU handover (rail on, left on)\");\n\tfor (;;) { }"),
+        ("shim: handover restore for every result", check_shim_rail_sequence, shim_src, "if (gpu_ho == RAIL_UNVERIFIED || gpu_ho == RAIL_MISMATCH)", "if (1)"),
+        ("shim: no restore after loader_boot failed", check_shim_rail_sequence, shim_src, "if (gpu_ho == RAIL_ON_OK)\t/* loader_boot returned", "if (0)\t/* loader_boot returned"),
+        ("shim: handover wrapped in #if 0", check_shim_rail_sequence, shim_src, "int gpu_ho;\n", "int gpu_ho;\n#if 0\n#endif\n"),
         ("on: inline asm", check_gpurailon_source_text, on_src, "static void emit(", 'static void evil(void) { __asm__ volatile("str wzr, [x0]"); }\nstatic void emit('),
         ("on: a raw writer", check_gpurailon_source_text, on_src, "static void emit(", "static void evil(void) { try_write32(0x17610040UL, 1); }\nstatic void emit("),
         ("on: no preflight before the enable", check_gpurailon_source_text, on_src, "if (preflight(&c))\n\t\treturn RAIL_REFUSED;", "if (0)\n\t\treturn RAIL_REFUSED;"),
