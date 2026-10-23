@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..2053823
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,481 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -34,6 +34,8 @@ index 0000000..2053823
 +#include "../../../bsd/dev/sweet_mali.h"
 +
 +extern "C" void flush_dcache64(addr64_t, unsigned, int);
++extern "C" uint64_t gPhysBase;               /* gputest3: panic phystokv_range in IOConnectMapMemory64 -> print the bounds phystokv uses */
++extern "C" unsigned long real_phys_size;
 +
 +#define SWEET_MALI_MAX_BOS      4096
 +#define SWEET_MALI_MAX_BO_BYTES (256ull << 20)
@@ -243,7 +245,7 @@ index 0000000..2053823
 +	}
 +	uint64_t gva = 0;
 +	if (ret == kIOReturnSuccess) {
-+		printf("SWEET MALI: uc map n=%u pa0=%#llx\n", n, pa[0]);       /* gputest2 hung after the query: log each step */
++		printf("SWEET MALI: uc map n=%u pa0=%#llx gPhysBase=%#llx real_phys_size=%#lx\n", n, pa[0], gPhysBase, real_phys_size);       /* gputest2 hung after the query: log each step */
 +		ret = errno_to_ioreturn(sweet_mali_map(pa, n, flags, &gva));
 +		printf("SWEET MALI: uc map -> %#x va=%#llx\n", ret, gva);
 +	}
@@ -386,6 +388,7 @@ index 0000000..2053823
 +	IOReturn ret = kIOReturnNotFound;
 +
 +	IOLockLock(fLock);
++	printf("SWEET MALI: uc clientMemoryForType %u\n", (unsigned)type);
 +	if (type >= 1 && type <= SWEET_MALI_MAX_BOS && fBo[type - 1].md != NULL) {
 +		fBo[type - 1].md->retain();
 +		*memory = fBo[type - 1].md;
