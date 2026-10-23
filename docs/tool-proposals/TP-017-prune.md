@@ -1,14 +1,14 @@
 ---
 id: TP-017
 tool: "tools/tool-proposals prune"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (driver)"
 date: 2026-10-23
 exposed_by: "user review of proposal housekeeping, 2026-10-23: 86 files in tools/, no record of use; TP-015 undecided"
 extends: "tools/tool-proposals"
 related: "TP-007"
 usage: "tools/tool-proposals prune [--stale-days 14] [--unused-days 30]"
-refs: "-"
+refs: "tools/tool-proposals (prune)"
 ---
 
 ## checked

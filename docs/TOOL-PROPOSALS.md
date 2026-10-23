@@ -41,4 +41,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-014 | tools/lint-c | done (amended) |
 | TP-015 | tools/probe-run-timeout | proposed (amended) |
 | TP-016 | tools/phone-lock | done |
-| TP-017 | tools/tool-proposals prune | proposed |
+| TP-017 | tools/tool-proposals prune | done |
