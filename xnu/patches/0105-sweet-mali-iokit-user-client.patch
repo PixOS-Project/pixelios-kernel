@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..2053823
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,478 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -243,7 +243,9 @@ index 0000000..2053823
 +	}
 +	uint64_t gva = 0;
 +	if (ret == kIOReturnSuccess) {
++		printf("SWEET MALI: uc map n=%u pa0=%#llx\n", n, pa[0]);       /* gputest2 hung after the query: log each step */
 +		ret = errno_to_ioreturn(sweet_mali_map(pa, n, flags, &gva));
++		printf("SWEET MALI: uc map -> %#x va=%#llx\n", ret, gva);
 +	}
 +	IOFreeData(pa, n * sizeof(uint64_t));
 +	if (ret != kIOReturnSuccess) {
@@ -439,7 +441,9 @@ index 0000000..2053823
 +			if (!owns(args->scalarInput[0])) {
 +				ret = kIOReturnNotPermitted;
 +			} else {
++				printf("SWEET MALI: uc submit va=%#llx\n", args->scalarInput[0]);
 +				ret = errno_to_ioreturn(sweet_mali_submit(args->scalarInput[0], (uint32_t)args->scalarInput[1] & SWEET_MALI_REQ_FS, &seq));
++				printf("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq);
 +				if (ret == kIOReturnSuccess) {
 +					fLastSeq = seq;
 +					args->scalarOutput[0] = seq;
@@ -452,7 +456,9 @@ index 0000000..2053823
 +	case 4:                         /* wait (no client lock held: other threads may keep working) */
 +		if (args->scalarInputCount == 2) {
 +			uint64_t to = args->scalarInput[1] > 60000000ull ? 60000000ull : args->scalarInput[1];
++			printf("SWEET MALI: uc wait seq=%llu to=%llu us\n", args->scalarInput[0], to);
 +			ret = errno_to_ioreturn(sweet_mali_wait(args->scalarInput[0], to));
++			printf("SWEET MALI: uc wait -> %#x\n", ret);
 +		}
 +		break;
 +	case 5:                         /* importSurface */
