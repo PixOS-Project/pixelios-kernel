@@ -31,3 +31,17 @@ Tags: **[obs]** observed on hardware (docs 27, 28), **[src]** read from source, 
 1. Q5 and the userland build (host only, no phone, no shim writer): this is the long pole and can run while the phone belongs to the Wi-Fi session.
 2. Write the G3a shim option and XNU patch on `wip/gpu-accel`; do not run until the Opus review, and not while the Wi-Fi session holds the phone.
 3. Q3/Q4 ride along on the next batched hardware run.
+
+## 5. Full Google kbase read (2026-10-23, host only)
+Source: `android.googlesource.com/kernel/google-modules/gpu`, branch `android-gs-bluejay-6.1-android16`, commit `696fc02` (local, not in git: `~/pixelios-artifacts/refs/gpu-full`). Closes or narrows doc 28 s.9:
+- [src] `JS_CONFIG_START_MMU` (bit 10) is defined (`hw_access/regmap/mali_kbase_regmap_jm_macros.h:164`) and **never used** anywhere else in kbase: not setting it is what Linux does (doc 28 s.9 item 1 closed).
+- [src] `CONFIG_MALI_PM_RUNTIME_S2MPU_CONTROL` is only added for `CONFIG_SOC_ZUMA` (Pixel 8; `mali_kbase/Kbuild:95-96`), not gs101: Linux does not manage the G3D S2MPU through kbase on the Pixel 6a; with the observed disabled state (doc 28 s.10) DMA is open (item 4 narrowed; whether another driver programs it later is not known).
+- [src] gs101 DT node has no `system-coherency` property (`gs101-gpu.dtsi`), so kbase keeps its default coherency (not read to the default's definition yet: `TODO(verify)` before ever enabling shareable attributes). Keeping non-shareable/non-cacheable GPU mappings plus explicit CPU cache maintenance stays correct either way.
+- [src] GPU_ID 0x92020010 = arch 9.2, product (9,2) = `GPU_ID_PRODUCT_TBEX`, version r0p1 (`mali_kbase_hw.c:206-211`). Features for tBEx: FLUSH_REDUCTION, PROTECTED_DEBUG_MODE, IDVS_GROUP_SIZE, L2_CONFIG, CLEAN_ONLY_SAFE, FLUSH_INV_SHADER_OTHER (`mali_kbase_hwconfig_features.h:95-102`). Errata for r0p1 (`mali_kbase_hwconfig_issues.h:345-`): 9435, TSIX_2033, TTRX_1337, TTRX_2968_TTRX_3162, TTRX_921, TTRX_3414, TTRX_3083, TTRX_3470, TTRX_3464, TITANHW_2710, GPU2022PRO_148, TITANHW_2938 (+ list continues; read the rest before the driver is written). Each needs its workaround located in `mali_kbase*` before the XNU driver can claim to be complete (rule 7).
+- Tooling note: kbase JM job submit/cache-flush/reset paths to port are `backend/gpu/mali_kbase_jm_hw.c` (config bits at :148-205, flush reduction :704), `mmu/mali_kbase_mmu_hw_direct.c`, `mmu/mali_kbase_mmu_mode_aarch64.c`.
+
+## 6. Host-only work queue (no phone)
+1. Finish the r0p1 errata table: for each issue, the kbase file:line of the workaround and whether a bare WRITE_VALUE/compute driver needs it.
+2. Write the G3a shim option and XNU patch (stay local, unrun).
+3. Mesa: Q5 CI job definition; verify `pan_kmod` panfrost-backend ioctls against our user-client surface.
+4. Vendor blob (Pixel `libGLES_mali.so` from the factory image) is not usable on iOS but can be used as a behavioural reference with `tools/rea`: not started, only if Mesa lacks something for tBEx.
