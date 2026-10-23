@@ -45,3 +45,11 @@ Source: `android.googlesource.com/kernel/google-modules/gpu`, branch `android-gs
 2. Write the G3a shim option and XNU patch (stay local, unrun).
 3. Mesa: Q5 CI job definition; verify `pan_kmod` panfrost-backend ioctls against our user-client surface.
 4. Vendor blob (Pixel `libGLES_mali.so` from the factory image) is not usable on iOS but can be used as a behavioural reference with `tools/rea`: not started, only if Mesa lacks something for tBEx.
+
+## 7. RESULT U1: XNU reads the GPU after the shim hand-over (run u1, 2026-10-23, `logs/runs/20261023T121059Z-u1`)
+*Observed on hardware* (kernel sha256 f0990090..., git 51e06f9, `tools/xrun --gpu-handover`, boot-arg `sweetgpu=0x1C500000` added by build-xnu-image, `fastboot boot` only, patch 0102):
+- Q1: **yes, the GPU survives the jump.** `PMU_G3D_STAT=0x1 PMU_EMB_STAT=0x1`, `CMU_MUX_TOP/CORE/STACK=0x10` (selected), `GPU_ID=0x92020010`, `L2_FEATURES=0x8130206`, `MEM_FEATURES=0x301`, `MMU_FEATURES=0x2830`, `AS_PRESENT=0xff`, `JS_PRESENT=0x7`, `SHADER_PRESENT=0x779fff`, `TILER_PRESENT=L2_PRESENT=1`, `GPU_IRQ_RAWSTAT=0x100` (RESET_COMPLETED left over), `JOB/MMU_IRQ_RAWSTAT=0`, `COHERENCY_ENABLE=0` (ACE-Lite reset value, as doc 31 predicted). All readable from EL1 inside XNU with no hang.
+- Q2: **the four G3D S2MPU blocks read `CTRL0=0 FAULT_STATUS=0` in XNU too**: GPU DMA is not blocked.
+- Cores are off by design (`SHADER/TILER/L2_READY=0`): patch 0102 only reads. Whether the shim's BUCK2S rail-on took effect is NOT visible in the USB log (shim lines go to pstore, not pulled): the next run with `sweetgpujob=1` (patch 0103) answers it, shaders either come up or `0103` says so.
+- Not yet shown: any GPU write from XNU. Patch 0103 (power + AS0 + WRITE_VALUE job) is built and gate-clean but has had no Opus review yet.
+- Incidental: worktree runs need the gitignored `tools/third_party` and `.env` linked from the main clone (xrun died at `no CAM_HOST in .env` otherwise): see AP entry.
