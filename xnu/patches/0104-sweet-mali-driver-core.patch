@@ -59,10 +59,10 @@ index aaae417..d3c36b9 100644
  {
 diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
 new file mode 100644
-index 0000000..e477c30
+index 0000000..91433fe
 --- /dev/null
 +++ b/bsd/dev/sweet_mali.c
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,615 @@
 +/*
 + * Mali-G78 (gs101, tBEx r0p1) job-manager driver core for XNU: GPU bring-up (kbase config registers, power), ONE address space (AS0) with a 4 GiB GPU VA window,
 + * in-order job submission to the job slots, a polling completion thread and a seqno fence. The IOKit user client (iokit/Kernel/arm/SweetMali.cpp, patch 0105)
@@ -110,6 +110,9 @@ index 0000000..e477c30
 +#define R_TEX_FEAT0       0x0B0u
 +#define R_AFBC_FEAT       0x04Cu
 +#define R_SHADER_PRESENT  0x100u
++#define R_SHADER_READY    0x140u
++#define R_TILER_READY     0x150u
++#define R_L2_READY        0x160u
 +#define R_COHERENCY_EN    0x304u
 +#define R_JM_CONFIG       0xF00u
 +#define R_SHADER_CONFIG   0xF04u
@@ -168,7 +171,7 @@ index 0000000..e477c30
 +	int busy;                               /* a job is in flight */
 +	unsigned busy_slot;
 +	uint64_t busy_seq, seq_next, seq_done, busy_start_us;
-+	int stopped;
++	int stopped, faulted;
 +	uint64_t fail_seq[32];                  /* ring of failed seqnos (exception in the job status) */
 +	thread_t thread;
 +} sm;
@@ -281,6 +284,12 @@ index 0000000..e477c30
 +	if (failed) {
 +		sm.fail_seq[sm.busy_seq % 32] = sm.busy_seq;
 +	}
++	if (sm.faulted) {
++		/* ponytail: no AS recovery (kbase kills the AS, mmu_jm.c:177-191): after an MMU fault the device is dead until reboot */
++		printf("SWEET MALI: device marked dead after an MMU fault\n");
++		sm.dead = 1;
++		sm.fail_seq[sm.busy_seq % 32] = sm.busy_seq;
++	}
 +	sm.seq_done = sm.busy_seq;
 +	sm.busy = 0;
 +	thread_wakeup((event_t)&sm.seq_done);
@@ -297,9 +306,11 @@ index 0000000..e477c30
 +		printf("SWEET MALI: MMU fault seq=%llu MMU_RAW=%#x AS0_FAULTSTATUS=%#x FAULTADDR=%#x%08x\n", sm.busy_seq, mmu, rr(R_AS0 + AS_FAULTSTATUS),
 +		    rr(R_AS0 + AS_FAULTADDR + 4), rr(R_AS0 + AS_FAULTADDR));
 +		wr(R_MMU_CLEAR, mmu);
++		sm.faulted = 1;
 +		if (!sm.stopped) {
 +			wr(R_JS_BASE(sm.busy_slot) + JS_COMMAND, JS_CMD_HARD_STOP1);
 +			sm.stopped = 1;
++			sm.busy_start_us = now_us();      /* the stop grace period starts now (review M4) */
 +		}
 +	}
 +	if (raw & (bit | fbit)) {
@@ -378,7 +389,8 @@ index 0000000..e477c30
 +	return 0;
 +}
 +
-+/* Map n 16 KB physical pages (given by PA) into the GPU VA window; flags: SWEET_MALI_EXEC. Returns 0 and *va. The caller keeps the pages wired. */
++/* Map n 16 KB physical pages (given by PA) into the GPU VA window; flags: SWEET_MALI_EXEC. Returns 0 and *va. The caller keeps the pages wired.
++ * Contract (review H2): ENOMEM/EINVAL = nothing is mapped. EIO/ENXIO = the mapping may still exist in the GPU, the caller must NOT free the pages (leak them). */
 +int
 +sweet_mali_map(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_out)
 +{
@@ -429,6 +441,8 @@ index 0000000..e477c30
 +	return 0;
 +}
 +
++/* Contract (review H1/H2): the caller may only unmap a range it mapped (0105 tracks that per client). 0 = unmapped and flushed. Any other return (EINVAL: nothing changed;
++ * EIO/ENXIO: the GPU may STILL reach the pages) means the caller must NOT free or reuse the memory. */
 +int
 +sweet_mali_unmap(uint64_t va, uint32_t n)
 +{
@@ -437,14 +451,22 @@ index 0000000..e477c30
 +	if (!sweet_mali_ready()) {
 +		return ENXIO;
 +	}
++	if (n == 0 || n > 0x10000 || (va & (PAGE_SIZE - 1)) || va < MALI_VA_START || va > MALI_VA_END || (uint64_t)n * PAGE_SIZE > MALI_VA_END - va) {
++		return EINVAL;
++	}
 +	lck_mtx_lock(&sm_lock);
++	if (mali_va_free(&sm.va, va, n * 4u)) {        /* not (fully) allocated: touch nothing */
++		lck_mtx_unlock(&sm_lock);
++		return EINVAL;
++	}
 +	for (uint32_t j = 0; j < n * 4u; j++) {
 +		(void)mali_pt_unmap(&sm.pt, va + (uint64_t)j * MALI_PG);
 +	}
-+	e = mali_va_free(&sm.va, va, n * 4u) ? EINVAL : 0;
++	e = 0;
 +	sm_pt_clean(va, (uint64_t)n * PAGE_SIZE);
 +	if (as_flush(va, (uint64_t)n * PAGE_SIZE)) {
 +		sm.dead = 1;
++		printf("SWEET MALI: AS0 flush after unmap did not complete, device marked dead\n");
 +		e = EIO;
 +	}
 +	lck_mtx_unlock(&sm_lock);
@@ -488,6 +510,7 @@ index 0000000..e477c30
 +	sm.busy_seq = ++sm.seq_next;
 +	sm.busy_slot = slot;
 +	sm.stopped = 0;
++	sm.faulted = 0;
 +	sm.busy_start_us = now_us();
 +	wr(R_JS_BASE(slot) + JS_HEAD_NEXT, (uint32_t)jc);
 +	wr(R_JS_BASE(slot) + JS_HEAD_NEXT + 4, (uint32_t)(jc >> 32));
@@ -533,7 +556,7 @@ index 0000000..e477c30
 +/* ---------------- bring-up ---------------- */
 +
 +static int
-+sm_bringup(volatile uint32_t *g, int s2mpu_open)
++sm_bringup(volatile uint32_t *g, int s2mpu_open, int skip_config)
 +{
 +	const char *why = NULL;
 +
@@ -542,11 +565,20 @@ index 0000000..e477c30
 +		printf("SWEET MALI: refused, zero writes: %s\n", why);
 +		return 1;
 +	}
++	/* kbase writes the config registers only with the cores off (review M2), and JS1 must be as clean as JS0 (review M1) */
++	if (rr(R_SHADER_READY) || rr(R_TILER_READY) || rr(R_L2_READY) || rr(R_JS_BASE(1) + JS_COMMAND_NEXT) || rr(R_JS_BASE(1) + JS_STATUS)) {
++		printf("SWEET MALI: refused, zero writes: cores already on or JS1 busy (do not combine with sweetgpujob=1)\n");
++		return 1;
++	}
 +	/* kbase order (research 31 s.5.2): config registers, coherency, then power. IRQ masks stay 0 (we poll); clear leftovers (RESET_COMPLETED from the boot). */
-+	wr(R_JM_CONFIG, rr(R_JM_CONFIG) | IDVS_GROUP);
-+	wr(R_SHADER_CONFIG, rr(R_SHADER_CONFIG) | SC_VAR_ALGORITHM);
-+	wr(R_L2_MMU_CONFIG, rr(R_L2_MMU_CONFIG) & ~((0x3Fu << 5) | (0x1Fu << 12)));   /* kbase clears b10:5 and b16:12 */
-+	wr(R_COHERENCY_EN, COHERENCY_NONE);
++	printf("SWEET MALI: config before JM=%#x SHADER=%#x L2_MMU=%#x COHERENCY=%#x%s\n", rr(R_JM_CONFIG), rr(R_SHADER_CONFIG), rr(R_L2_MMU_CONFIG), rr(R_COHERENCY_EN),
++	    skip_config ? " (config writes skipped: sweetmali bit 4, bisect aid)" : "");
++	if (!skip_config) {
++		wr(R_JM_CONFIG, rr(R_JM_CONFIG) | IDVS_GROUP);
++		wr(R_SHADER_CONFIG, rr(R_SHADER_CONFIG) | SC_VAR_ALGORITHM);
++		wr(R_L2_MMU_CONFIG, rr(R_L2_MMU_CONFIG) & ~((0x3Fu << 5) | (0x1Fu << 12)));   /* kbase clears b10:5 and b16:12 */
++		wr(R_COHERENCY_EN, COHERENCY_NONE);
++	}
 +	wr(R_GPU_IRQ_MASK, 0);
 +	wr(R_JOB_MASK, 0);
 +	wr(R_MMU_MASK, 0);
@@ -573,39 +605,58 @@ index 0000000..e477c30
 +	return 0;
 +}
 +
-+/* sweetmali=2: one WRITE_VALUE job through the public API (the same job as gpujob1: header word 4 = 0x10004, payload at +0x20) */
++/* sweetmali=2: WRITE_VALUE jobs through the public API: first on JS0 (the slot of the proven gpujob1 run), then on JS1 (the slot Mesa uses for vertex/tiler/compute;
++ * JS1_FEATURES bit 2 was 1 in the review's read of the source). Same descriptor as gpujob1 (header word 4 = 0x10004, payload +0x20 address, +0x28 type 7, +0x30 value). */
++#define ST_MAGIC0 0x504958454C494F53ull
++#define ST_MAGIC1 0x4D414C4931534C31ull
++
++static int
++sm_selftest_job(vm_offset_t buf, uint64_t va, uint64_t pa, uint32_t off, uint32_t tgt, uint64_t magic, uint32_t req, uint64_t *got)
++{
++	uint64_t seq = 0;
++	volatile uint32_t *d = (volatile uint32_t *)(buf + off);
++
++	d[0x10 / 4] = 0x10004u;
++	*(volatile uint64_t *)(buf + off + 0x20) = va + tgt;
++	d[0x28 / 4] = 0x7u;
++	*(volatile uint64_t *)(buf + off + 0x30) = magic;
++	*(volatile uint64_t *)(buf + tgt) = 0xa5a5a5a5a5a5a5a5ull;
++	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	int e = sweet_mali_submit(va + off, req, &seq);
++	if (!e) {
++		e = sweet_mali_wait(seq, 4000000);          /* the hard stop comes at 3 s (JOB_TIMEOUT_US) */
++	}
++	flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	*got = *(volatile uint64_t *)(buf + tgt);
++	printf("SWEET MALI: selftest slot=%s submit/wait=%d seq=%llu target=%#llx (%s) header_exc=%#x\n", (req & SWEET_MALI_REQ_FS) ? "JS0" : "JS1", e, seq, *got,
++	    *got == magic ? "MAGIC" : "wrong", d[0]);
++	return e;
++}
++
 +static void
 +sm_selftest(void)
 +{
 +	vm_offset_t buf = 0;
-+	uint64_t pa[1], va = 0, seq = 0;
++	uint64_t pa[1], va = 0, got0 = 0, got1 = 0;
 +
 +	if (kmem_alloc_contig(kernel_map, &buf, PAGE_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("SWEET MALI: selftest: no memory\n");
 +		return;
 +	}
 +	pa[0] = (uint64_t)kvtophys(buf);
-+	volatile uint32_t *d = (volatile uint32_t *)buf;
-+	d[0x10 / 4] = 0x10004u;
-+	*(volatile uint64_t *)(buf + 0x30) = 0x504958454C494F53ull;
-+	*(volatile uint64_t *)(buf + 0x100) = 0xa5a5a5a5a5a5a5a5ull;
 +	int e = sweet_mali_map(pa, 1, SWEET_MALI_EXEC, &va);
 +	if (e) {
 +		printf("SWEET MALI: selftest: map failed %d\n", e);
 +		return;
 +	}
-+	*(volatile uint64_t *)(buf + 0x20) = va + 0x100;
-+	d[0x28 / 4] = 0x7u;
-+	flush_dcache64((addr64_t)pa[0], PAGE_SIZE, TRUE);
-+	e = sweet_mali_submit(va, 0, &seq);
-+	if (!e) {
-+		e = sweet_mali_wait(seq, 1000000);
++	int e0 = sm_selftest_job(buf, va, pa[0], 0x000, 0x100, ST_MAGIC0, SWEET_MALI_REQ_FS, &got0);
++	int e1 = (e0 == 0 && got0 == ST_MAGIC0) ? sm_selftest_job(buf, va, pa[0], 0x200, 0x300, ST_MAGIC1, 0, &got1) : -1;
++	printf("SWEET MALI: selftest RESULT js0=%s js1=%s\n", (e0 == 0 && got0 == ST_MAGIC0) ? "PASS" : "FAIL", e1 == -1 ? "skipped" : (e1 == 0 && got1 == ST_MAGIC1) ? "PASS" : "FAIL");
++	if ((e0 == 0 || e0 == EIO) && (e1 == 0 || e1 == EIO || e1 == -1)) {
++		(void)sweet_mali_unmap(va, 1);
++	} else {
++		printf("SWEET MALI: selftest: a job did not finish cleanly, the buffer stays mapped (leaked on purpose)\n");
 +	}
-+	flush_dcache64((addr64_t)pa[0], PAGE_SIZE, TRUE);
-+	uint64_t target = *(volatile uint64_t *)(buf + 0x100);
-+	printf("SWEET MALI: selftest submit/wait=%d seq=%llu target=%#llx (%s) header_exc=%#x\n", e, seq, target,
-+	    target == 0x504958454C494F53ull ? "MAGIC" : "wrong", d[0]);
-+	(void)sweet_mali_unmap(va, 1);
 +}
 +
 +void
@@ -614,14 +665,14 @@ index 0000000..e477c30
 +	static int started;
 +	uint32_t mode = 0;
 +
-+	if (started || !PE_parse_boot_argn("sweetmali", &mode, sizeof(mode)) || mode == 0) {
-+		return;
++	if (started || !PE_parse_boot_argn("sweetmali", &mode, sizeof(mode)) || (mode & 3u) == 0 || (mode & 3u) == 3) {
++		return;       /* sweetmali = 1 (service) or 2 (service + selftest), | 0x10 skips the kbase config writes */
 +	}
 +	started = 1;
-+	if (sm_bringup(g, s2mpu_open)) {
++	if (sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0)) {
 +		return;
 +	}
-+	if (mode == 2) {
++	if ((mode & 3u) == 2) {
 +		sm_selftest();
 +	}
 +}
@@ -629,10 +680,10 @@ index 0000000..e477c30
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_mali.h b/bsd/dev/sweet_mali.h
 new file mode 100644
-index 0000000..e05f8d7
+index 0000000..8a210f8
 --- /dev/null
 +++ b/bsd/dev/sweet_mali.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,30 @@
 +/* Public interface of the Mali-G78 driver core (bsd/dev/sweet_mali.c) for the IOKit wrapper. */
 +#ifndef SWEET_MALI_H
 +#define SWEET_MALI_H
@@ -647,6 +698,8 @@ index 0000000..e05f8d7
 +	uint64_t va_start, va_end;
 +};
 +
++/* Ownership/failure contract (review gpu-mali-core-review-1 H1/H2): sweet_mali_unmap takes only ranges the caller mapped. For sweet_mali_map and sweet_mali_unmap, EIO or ENXIO means the
++ * GPU may still reach the pages: the caller must leak them, never free or reuse them. EINVAL/ENOMEM mean nothing changed. */
 +#ifdef __cplusplus
 +extern "C" {
 +#endif

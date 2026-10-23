@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..c456305
+index 0000000..47e0da9
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,361 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -144,10 +144,11 @@ index 0000000..c456305
 +		if (fBo[i].md == NULL) {
 +			continue;
 +		}
-+		if (safe) {
-+			(void)sweet_mali_unmap(fBo[i].va, fBo[i].n16k);
++		if (safe && sweet_mali_unmap(fBo[i].va, fBo[i].n16k) == 0) {
 +			fBo[i].md->complete();
 +			fBo[i].md->release();
++		} else {
++			IOLog("SWEET MALI: BO %u could not be unmapped cleanly, leaked on purpose\n", i + 1);
 +		}
 +		fBo[i].md = NULL;
 +	}
@@ -239,7 +240,9 @@ index 0000000..c456305
 +	}
 +	IOFreeData(pa, n * sizeof(uint64_t));
 +	if (ret != kIOReturnSuccess) {
-+		md->release();
++		if (ret != kIOReturnIOError && ret != kIOReturnNotReady) {
++			md->release();      /* nothing was mapped */
++		}                           /* else: the GPU may still reach the pages, leak them (sweet_mali.h contract) */
 +		return ret;
 +	}
 +	fBo[slot].md = md;
@@ -266,12 +269,16 @@ index 0000000..c456305
 +			return errno_to_ioreturn(e);
 +		}
 +	}
-+	(void)sweet_mali_unmap(b->va, b->n16k);
++	int ue = sweet_mali_unmap(b->va, b->n16k);
 +	fWired -= (uint64_t)b->n16k * page_size;
-+	b->md->complete();
-+	b->md->release();
++	if (ue == 0) {
++		b->md->complete();
++		b->md->release();
++	} else {
++		IOLog("SWEET MALI: BO %llu could not be unmapped cleanly (%d), leaked on purpose\n", handle, ue);
++	}
 +	b->md = NULL;
-+	return kIOReturnSuccess;
++	return errno_to_ioreturn(ue);
 +}
 +
 +IOReturn
