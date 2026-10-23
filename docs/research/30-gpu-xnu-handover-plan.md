@@ -53,3 +53,12 @@ Source: `android.googlesource.com/kernel/google-modules/gpu`, branch `android-gs
 - Cores are off by design (`SHADER/TILER/L2_READY=0`): patch 0102 only reads. Whether the shim's BUCK2S rail-on took effect is NOT visible in the USB log (shim lines go to pstore, not pulled): the next run with `sweetgpujob=1` (patch 0103) answers it, shaders either come up or `0103` says so.
 - Not yet shown: any GPU write from XNU. Patch 0103 (power + AS0 + WRITE_VALUE job) is built and gate-clean but has had no Opus review yet.
 - Incidental: worktree runs need the gitignored `tools/third_party` and `.env` linked from the main clone (xrun died at `no CAM_HOST in .env` otherwise): see AP entry.
+
+## 8. RESULT gpujob1: first GPU job executed from XNU (run gpujob1, 2026-10-23, `logs/runs/20261023T124439Z-gpujob1`)
+*Observed on hardware* (kernel sha256 d2aed0f9..., `tools/xrun --gpu-handover --args sweetgpujob=1`, fastboot boot only; patches 0102 + 0103 after Opus reviews gpu-handover-review-1 and gpu-xnu-job-review-1 and their fixes). The 0102 probe lines were identical to run u1 (precheck passed), then:
+`SWEET GPUJOB: submit=ok wait=done JOB_RAW=0x1 MMU_RAW=0 JS0_STATUS=0 AS0_FAULT=0 header_exc=0x1 target=0x504958454c494f53 (MAGIC) as0_off=ok`
+- XNU alone powered the tiler/L2 and the 20 shader cores (TILER_PWRON then SHADER_PWRON; no "did not come up" line), so **the shim's BUCK2S rail-on survived into XNU** (the earlier unknown of s.7).
+- XNU built 4-level 4 KB page tables in `kmem_alloc_contig` memory (CPU-cacheable, `flush_dcache64` clean+invalidate), programmed AS0, ran a WRITE_VALUE job on JS0 and read "PIXELIOS" back through the CPU mapping: the GPU walker and the CPU agree on the memory without COHERENCY_ENABLE, with S2MPU disabled.
+- Cleanup: hard stop not needed (`JS0_STATUS=0`), AS0 unmapped (`as0_off=ok`). The cores were left powered. Phone returned to fastboot with tools/phone.
+- What this does not show: IRQs, more than one job, tiler/fragment jobs, MMU faults handling, soft reset, power-off, 16 KB page support in the GPU VA allocator, voltage/clock scaling.
+Next (host-only until the next phone need): SweetGPU IOService + user client (selectors per research 32), GIC SPI 419/420/421 interrupt path, kbase config registers (SHADER_CONFIG bit 29 erratum TTRX_2968_TTRX_3162 NEEDED, COHERENCY_ENABLE=31, doc 31), VA allocator, then a compute job from a Mesa-built blob (needs the Mesa Darwin build).
