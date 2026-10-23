@@ -21,6 +21,7 @@ gpu_stack=0
 gpu_clk=0
 gpu_rails=0
 gpu_rail_on=0
+gpu_handover=0
 gpu_s2mpu=0
 gpu_job=0
 touch_probe=0
@@ -46,6 +47,7 @@ while [ "$#" -gt 0 ]; do
 		--gpu-job) gpu_job=1; gpu_probe=1; gpu_rails=1; gpu_rail_on=1; gpu_power=1; gpu_s2mpu=1; shift ;;	# G2 stage 2: AS0 + one WRITE_VALUE job inside the powered window (gpujob.c)
 		--gpu-s2mpu) gpu_s2mpu=1; gpu_probe=1; shift ;;	# READ-ONLY dump of the four G3D S2MPU blocks (gpus2mpu.c)
 		--gpu-rail-on) gpu_rail_on=1; gpu_rails=1; gpu_probe=1; shift ;;	# WRITER: S2MPG11 BUCK2S mode on/restore via ACPM (gpurailon.c); implies --gpu-rails
+		--gpu-handover) gpu_handover=1; gpu_rail_on=1; gpu_rails=1; gpu_probe=1; shift ;;	# needs --boot-xnu; WRITER: BUCK2S on BEFORE the jump to XNU and left on (XNU powers the cores itself, docs/research/30)
 		--gpu-rails) gpu_rails=1; gpu_probe=1; shift ;;	# implies --gpu-probe; READ-ONLY S2MPG11 GPU-rail registers via ACPM (gpurails.c)
 		--gpu-clk) gpu_clk=1; gpu_probe=1; shift ;;	# implies --gpu-probe; ACPM DVFS request for G3DL2/G3D (gpuclk.c)
 		--gpu-power=stack) gpu_power=1; gpu_probe=1; gpu_stack=1; shift ;;	# + STACK_PWRON/PWROFF (kbase corestack path)
@@ -192,6 +194,10 @@ if [ "$boot_xnu" = 1 ]; then
 	# Jump into the SWEETXNU payload (ramdisk) right after display setup; bluejay only.
 	[ "$gs101" = 1 ] || { echo "--boot-xnu needs a gs101 board" >&2; exit 2; }
 	CFLAGS="$CFLAGS -DBOOT_XNU"
+fi
+if [ "$gpu_handover" = 1 ]; then
+	[ "$boot_xnu" = 1 ] || { echo "--gpu-handover needs --boot-xnu" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DGPU_HANDOVER"
 fi
 if [ -n "${USB_WINDOW:-}" ]; then
 	CFLAGS="$CFLAGS -DUSB_GADGET_SECONDS=$USB_WINDOW"	# dev: shorter gadget window

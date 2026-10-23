@@ -2055,6 +2055,13 @@ def check_shim_rail_sequence(src: str, name: str = "shim.c") -> None:
     sh = norm.find("gpu_probe_shaders();")
     if not (0 < a < c < p < sh < r) or "else" not in norm[c:p]:
         raise AssertionError(f"{name}: order must be gpu_rail_enable, (skip | gpu_power_cycle), gpu_probe_shaders, gpu_rail_restore")
+    # --gpu-handover (docs/research/30): exactly one more gpu_rail_enable, inside #if GPU_HANDOVER in the BOOT_XNU path before loader_boot, and NO restore there
+    if code.count("gpu_rail_enable()") != 2 or code.count("gpu_rail_restore(") != 1:
+        raise AssertionError(f"{name}: exactly two gpu_rail_enable calls (probe flow + handover) and one gpu_rail_restore")
+    h = code.find("#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)")
+    he = code.find("#endif", h)
+    if h < 0 or he < 0 or "gpu_rail_enable()" not in code[h:he] or "gpu_rail_restore" in code[h:he] or not (code.find("#ifdef BOOT_XNU") < h < code.find("loader_boot(dtb)")):
+        raise AssertionError(f"{name}: the handover rail-on must sit in #if GPU_HANDOVER, in BOOT_XNU before loader_boot, with no restore")
 
 
 def gpurailon_selftest() -> int:

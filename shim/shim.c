@@ -586,6 +586,14 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 		pstore_save();
 	}
 #endif
+#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)
+	/* --boot-xnu --gpu-handover: switch the shader rail BUCK2S on (audited ACPM writer, gpurailon.c: zero writes unless it reads exactly off with OUT1 in the
+	 * window) and LEAVE it on; XNU has no ACPM client and powers the cores itself through the GPU registers (docs/research/30, patch 0102 reads the result).
+	 * A refusal is logged and XNU boots anyway. No gpu_rail_restore on purpose. */
+	con_str("SECTION", "GPU handover (rail on, left on)");
+	con_hex("GPU handover rail (0=on)", (uint32_t)gpu_rail_enable());
+	pstore_save();
+#endif
 	{
 		const char *why = loader_boot(dtb);
 		con_str("BOOT XNU failed", why ? why : "?");
