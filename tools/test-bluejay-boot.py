@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "2378e66819e645fb8478c32f59420765530ebd7587a11be3b7cbcae0e3e7be40"
+_WLAN_SEQ_SHA = "58a64c20e23e4f6c90ae50a1606fb22a04ad5d29ae30ad7b6e1b313f631c4152"
 _WLAN_SEQ_COUNTS = {"rows": 377, "teardown": 39, "write_rows": 265, "distinct_targets": 187}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "CFG": 4, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2923,7 +2923,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
         s28_want += [("wait_eq", lo, BIG, orig, None), ("wait_eq", hi, BIG, 0, None), ("mmio_write", lo, BIG, BIG, lo), ("wait_mask", lo, guard, guard, None), ("read_only", lo, BIG, 0, None), ("mmio_write", lo, BIG, orig, lo),
                      ("mmio_write", hi, BIG, BIG, hi), ("wait_mask", hi, BIG, BIG, None), ("read_only", hi, BIG, 0, None), ("mmio_write", hi, BIG, 0, hi)]
     for lo, addr in ((0x10, 0x60000004), (0x18, 0x60400004)):
-        s28_want += [("mmio_write", lo, BIG, addr, lo), ("read_only", lo, BIG, 0, None), ("read_only", lo + 4, BIG, 0, None)]
+        s28_want += [("mmio_write", lo, BIG, addr, lo), ("wait_eq", lo, BIG, addr, None), ("wait_eq", lo + 4, BIG, 0, None)]
     tkey = {t["off"]: t["id"] for t in tear if t["blk"] == "CFG"}
     s28 = [(r["kind"], r["off"], r["mask"], r["value"], r["restore"]) for r in rows if r["step"] == 28]
     if s28 != [(k, o, m, v, tkey.get(rs) if rs else None) for k, o, m, v, rs in s28_want] or any(r["blk"] != "CFG" or r.get("probe") or bool(r.get("log")) != (r["kind"] == "read_only") or (r["kind"] in ("wait_eq", "wait_mask")) != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] not in ("wait_eq", "wait_mask") and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 28):

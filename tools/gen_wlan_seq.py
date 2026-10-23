@@ -680,8 +680,8 @@ def draft28():
         row("mmio_write", hi, FULL, 0, "probe.c:242", TAG_SRC, f"{nm} high := original (0)", restore=f"{nm}_hi")
     for nm, lo, addr in (("BAR0", 0x10, 0x60000000), ("BAR2", 0x18, 0x60400000)):
         row("mmio_write", lo, FULL, addr | 4, "research 33 s.3: PCI address == CPU address (pcie.dtsi:75-76), type bits kept as read", TAG_GUESS, f"{nm} low := {addr:#x} | type bits (0x4)", restore=f"{nm}_lo")
-        row("read_only", lo, FULL, 0, "read-back (decode check: address bits [31:4] == written, low nibble 0x4)", TAG_GUESS, f"log {nm} low after assignment (expect {addr | 4:#010x})")
-        row("read_only", lo + 4, FULL, 0, "read-back", TAG_GUESS, f"log {nm} high after assignment (expect 0; never written in this step)")
+        row("wait_eq", lo, FULL, addr | 4, "review 9 M2: the assignment must latch (exact for any size <= 4 MiB: address bits below the size are zero); one-shot, else STOP + restore", TAG_GUESS, f"{nm} low read-back must be {addr | 4:#010x}")
+        row("wait_eq", lo + 4, FULL, 0, "review 9 M2: the high half was never written and must still be 0", TAG_GUESS, f"{nm} high read-back must still be 0")
     return out
 
 

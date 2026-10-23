@@ -767,14 +767,14 @@ int main(void)
 		EXPECT(wlan_link_run() == 0 && has("LINK S28 ok rows=27") && !has("!!!") && has("restore=ok"));
 		for (unsigned i = 0; i < nl; i++)
 			nR28 += strstr(lines[i], "LINK R28 ") != NULL;
-		EXPECT(nR28 == 8);									/* per BAR: low + high sizing logs, low + high assignment logs */
-		{	static const char *const want[] = { "rd=0xFFFF8004", "rd=0xFFFFFFFF", "rd=0xFFC00004", "rd=0xFFFFFFFF", "rd=0x60000004", "rd=0x00000000", "rd=0x60400004", "rd=0x00000000" };
+		EXPECT(nR28 == 4);									/* per BAR: low + high sizing logs, low + high assignment logs */
+		{	static const char *const want[] = { "rd=0xFFFF8004", "rd=0xFFFFFFFF", "rd=0xFFC00004", "rd=0xFFFFFFFF" };
 			unsigned k = 0;
 
-			for (unsigned i = 0; i < nl && k < 8; i++)
+			for (unsigned i = 0; i < nl && k < 4; i++)
 				if (strstr(lines[i], "LINK R28 ") && strstr(lines[i], want[k]))
 					k++;
-			EXPECT(k == 8);
+			EXPECT(k == 4);
 		}
 		EXPECT(cfg_writes_unconfigured == 0 && last_ev(EV_W, WLAN_CFG + 4, WLAN_CFG + 8) == 0);		/* Command is never written; every CFG write went through the enabled region 0 */
 		for (unsigned j = 0; j < 4; j++)
