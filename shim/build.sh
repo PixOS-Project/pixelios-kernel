@@ -482,6 +482,8 @@ gcc -O1 -Wall -Wextra -Werror -I. -o out/keys_gs101_host_test keys_gs101_host_te
 # pure FTM5 protocol header of the Pixel 6a touch driver: extracted from xnu patch 0088 so the test sees the kernel's bytes
 awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > out/sweet_ftm5.h
 gcc -O1 -Wall -Wextra -Werror -Iout -o out/ftm5_host_test ftm5_host_test.c && ./out/ftm5_host_test
+awk '$0=="+++ b/bsd/dev/sweet_mali_pt.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0104-sweet-mali-driver-core.patch > out/sweet_mali_pt.h
+gcc -O1 -Wall -Wextra -Werror -Iout -o out/mali_pt_host_test mali_pt_host_test.c && ./out/mali_pt_host_test
 # runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > out/sweet_touch_poke.h
 gcc -O1 -Wall -Wextra -Werror -Iout -o out/touchpoke_host_test touchpoke_host_test.c && ./out/touchpoke_host_test
