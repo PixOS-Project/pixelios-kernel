@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..ca58bb6
+index 0000000..a707d7b
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,464 @@
 +/*
 + * SweetMali: IOKit service + user client for the Mali-G78 driver core (bsd/dev/sweet_mali.c, bring-up with boot-arg sweetmali=1; docs/research/32).
 + * Selectors (IOConnectCallMethod, all scalar except 0):
@@ -13,6 +13,10 @@ index 0000000..ca58bb6
 + *   2 boClose    in: handle
 + *   3 submit     in: job chain GPU VA, requirements (1 = fragment, JS0)   out: seqno. The VA must lie inside a BO of this client.
 + *   4 wait       in: seqno, relative timeout in microseconds
++ *   5 importSurface in: IOSurface id   out: handle, GPU VA, size, bytesPerRow, width, height, pixelFormat. The surface's wired memory is mapped into the GPU VA window like a BO
++ *                (its length must be a multiple of the 16 KB page size and page aligned, else kIOReturnUnsupported). CPU caches are cleaned+invalidated at import.
++ *   6 boCacheSync in: handle   CPU cache clean+invalidate of the BO's pages: call before the GPU reads memory the CPU wrote and after the GPU wrote memory the CPU will read
++ *                (the GPU is not cache-coherent here, COHERENCY_ENABLE = 31); CPU mappings made with kIOMapWriteCombineCache need no sync, surface mappings are the surface's cacheMode.
 + * Ownership: the GPU has ONE address space shared by all BOs, so a job could touch any mapped BO; therefore only one client may be open at a time (ponytail: second
 + * open fails with kIOReturnBusy; per-client address spaces need AS1..AS7 and are not implemented). Closing waits (5 s) for the last submitted job before the
 + * BOs are unmapped and freed; if it does not finish, the memory is leaked on purpose rather than freed under a running job.
@@ -26,7 +30,10 @@ index 0000000..ca58bb6
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <sys/errno.h>
 +#include <pexpert/pexpert.h>
++#include "SweetSurface.h"
 +#include "../../../bsd/dev/sweet_mali.h"
++
++extern "C" void flush_dcache64(addr64_t, unsigned, int);
 +
 +#define SWEET_MALI_MAX_BOS      4096
 +#define SWEET_MALI_MAX_BO_BYTES (256ull << 20)
@@ -61,7 +68,8 @@ index 0000000..ca58bb6
 +}
 +
 +struct sweet_mali_bo {
-+	IOBufferMemoryDescriptor *md;
++	IOMemoryDescriptor *md;         /* IOBufferMemoryDescriptor for BOs, the surface's memory for imports */
++	SweetSurface *surf;             /* retained, imports only */
 +	uint64_t va;
 +	uint32_t n16k;
 +};
@@ -75,6 +83,9 @@ index 0000000..ca58bb6
 +	struct sweet_mali_bo *fBo;      /* SWEET_MALI_MAX_BOS entries, allocated in initWithTask (the class must stay under 16 KB) */
 +
 +	IOReturn boNew(uint64_t size, uint32_t flags, uint64_t *handle, uint64_t *va, uint64_t *allocated);
++	IOReturn importSurface(uint32_t id, IOExternalMethodArguments *args);
++	IOReturn boCacheSync(uint64_t handle);
++	IOReturn mapMemory(IOMemoryDescriptor *md, uint64_t len, uint32_t flags, SweetSurface *surf, uint64_t *handle, uint64_t *va);
 +	IOReturn boClose(uint64_t handle);
 +	bool owns(uint64_t va);
 +	void teardown(void);
@@ -151,10 +162,12 @@ index 0000000..ca58bb6
 +		if (safe && sweet_mali_unmap(fBo[i].va, fBo[i].n16k) == 0) {
 +			fBo[i].md->complete();
 +			fBo[i].md->release();
++			OSSafeReleaseNULL(fBo[i].surf);
 +		} else {
 +			IOLog("SWEET MALI: BO %u could not be unmapped cleanly, leaked on purpose\n", i + 1);
 +		}
 +		fBo[i].md = NULL;
++		fBo[i].surf = NULL;
 +	}
 +}
 +
@@ -201,12 +214,9 @@ index 0000000..ca58bb6
 +}
 +
 +IOReturn
-+SweetMaliUserClient::boNew(uint64_t size, uint32_t flags, uint64_t *handle, uint64_t *va, uint64_t *allocated)
++SweetMaliUserClient::mapMemory(IOMemoryDescriptor *md, uint64_t len, uint32_t flags, SweetSurface *surf, uint64_t *handle, uint64_t *va)
 +{
-+	if (size == 0 || size > SWEET_MALI_MAX_BO_BYTES || (flags & ~SWEET_MALI_EXEC)) {
-+		return kIOReturnBadArgument;
-+	}
-+	uint64_t len = (size + page_size - 1) & ~(uint64_t)(page_size - 1);
++	/* md is prepared (wired) and owned by the caller until this returns kIOReturnSuccess, which takes it over (and the surface reference). Not-mapped errors leave ownership with the caller. */
 +	unsigned slot = SWEET_MALI_MAX_BOS;
 +	for (unsigned i = 0; i < SWEET_MALI_MAX_BOS; i++) {
 +		if (fBo[i].md == NULL) {
@@ -217,23 +227,16 @@ index 0000000..ca58bb6
 +	if (slot == SWEET_MALI_MAX_BOS || fWired + len > SWEET_MALI_MAX_WIRED) {
 +		return kIOReturnNoResources;
 +	}
-+	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut | kIOMemoryKernelUserShared, len, page_size);
-+	if (md == NULL) {
-+		return kIOReturnNoMemory;
-+	}
-+	bzero(md->getBytesNoCopy(), len);
 +	uint32_t n = (uint32_t)(len / page_size);
 +	uint64_t *pa = (uint64_t *)IOMallocData(n * sizeof(uint64_t));
 +	if (pa == NULL) {
-+		md->release();
 +		return kIOReturnNoMemory;
 +	}
 +	IOReturn ret = kIOReturnSuccess;
 +	for (uint32_t i = 0; i < n && ret == kIOReturnSuccess; i++) {
 +		IOByteCount seg = 0;
 +		addr64_t p = md->getPhysicalSegment((IOByteCount)i * page_size, &seg, kIOMemoryMapperNone);
-+		if (p == 0 || seg < page_size) {
++		if (p == 0 || seg < page_size || (p & (page_size - 1))) {
 +			ret = kIOReturnVMError;
 +		}
 +		pa[i] = p;
@@ -244,18 +247,98 @@ index 0000000..ca58bb6
 +	}
 +	IOFreeData(pa, n * sizeof(uint64_t));
 +	if (ret != kIOReturnSuccess) {
-+		if (ret != kIOReturnIOError && ret != kIOReturnNotReady) {
-+			md->release();      /* nothing was mapped */
-+		}                           /* else: the GPU may still reach the pages, leak them (sweet_mali.h contract) */
++		if (ret == kIOReturnIOError || ret == kIOReturnNotReady) {
++			/* the GPU may still reach the pages (sweet_mali.h contract): keep the memory alive forever; the slot stays used */
++			md->retain();
++			if (surf != NULL) {
++				surf->retain();
++			}
++		}
 +		return ret;
 +	}
 +	fBo[slot].md = md;
++	fBo[slot].surf = surf;
 +	fBo[slot].va = gva;
 +	fBo[slot].n16k = n;
 +	fWired += len;
 +	*handle = slot + 1;
 +	*va = gva;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::boNew(uint64_t size, uint32_t flags, uint64_t *handle, uint64_t *va, uint64_t *allocated)
++{
++	if (size == 0 || size > SWEET_MALI_MAX_BO_BYTES || (flags & ~SWEET_MALI_EXEC)) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t len = (size + page_size - 1) & ~(uint64_t)(page_size - 1);
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, len, page_size);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(md->getBytesNoCopy(), len);
++	IOReturn ret = mapMemory(md, len, flags, NULL, handle, va);
++	if (ret != kIOReturnSuccess) {
++		md->release();
++		return ret;
++	}
 +	*allocated = len;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::importSurface(uint32_t id, IOExternalMethodArguments *args)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	uint64_t len = s->memory->getLength();
++	if (len == 0 || (len & (page_size - 1)) || len > SWEET_MALI_MAX_BO_BYTES) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		s->release();
++		return kIOReturnVMError;
++	}
++	uint64_t handle = 0, va = 0;
++	IOReturn ret = mapMemory(s->memory, len, 0, s, &handle, &va);       /* not executable */
++	if (ret != kIOReturnSuccess) {
++		if (ret != kIOReturnIOError && ret != kIOReturnNotReady) {
++			s->memory->complete();       /* else the GPU may still reach the pages: they stay wired (mapMemory kept an extra surface reference) */
++		}
++		s->release();
++		return ret;
++	}
++	args->scalarOutput[0] = handle;
++	args->scalarOutput[1] = va;
++	args->scalarOutput[2] = len;
++	args->scalarOutput[3] = s->bytesPerRow;
++	args->scalarOutput[4] = s->width;
++	args->scalarOutput[5] = s->height;
++	args->scalarOutput[6] = s->pixelFormat;
++	args->scalarOutputCount = 7;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::boCacheSync(uint64_t handle)
++{
++	if (handle == 0 || handle > SWEET_MALI_MAX_BOS || fBo[handle - 1].md == NULL) {
++		return kIOReturnNotFound;
++	}
++	struct sweet_mali_bo *b = &fBo[handle - 1];
++	for (uint32_t i = 0; i < b->n16k; i++) {
++		IOByteCount seg = 0;
++		addr64_t p = b->md->getPhysicalSegment((IOByteCount)i * page_size, &seg, kIOMemoryMapperNone);
++		if (p != 0 && seg >= page_size) {
++			flush_dcache64(p, (unsigned)page_size, TRUE);       /* TRUE = physical address; clean + invalidate */
++		}
++	}
 +	return kIOReturnSuccess;
 +}
 +
@@ -278,10 +361,12 @@ index 0000000..ca58bb6
 +	if (ue == 0) {
 +		b->md->complete();
 +		b->md->release();
++		OSSafeReleaseNULL(b->surf);
 +	} else {
 +		IOLog("SWEET MALI: BO %llu could not be unmapped cleanly (%d), leaked on purpose\n", handle, ue);
 +	}
 +	b->md = NULL;
++	b->surf = NULL;
 +	return errno_to_ioreturn(ue);
 +}
 +
@@ -360,6 +445,20 @@ index 0000000..ca58bb6
 +		if (args->scalarInputCount == 2) {
 +			uint64_t to = args->scalarInput[1] > 60000000ull ? 60000000ull : args->scalarInput[1];
 +			ret = errno_to_ioreturn(sweet_mali_wait(args->scalarInput[0], to));
++		}
++		break;
++	case 5:                         /* importSurface */
++		if (args->scalarInputCount == 1 && args->scalarOutputCount >= 7) {
++			IOLockLock(fLock);
++			ret = importSurface((uint32_t)args->scalarInput[0], args);
++			IOLockUnlock(fLock);
++		}
++		break;
++	case 6:                         /* boCacheSync */
++		if (args->scalarInputCount == 1) {
++			IOLockLock(fLock);
++			ret = boCacheSync(args->scalarInput[0]);
++			IOLockUnlock(fLock);
 +		}
 +		break;
 +	default:
