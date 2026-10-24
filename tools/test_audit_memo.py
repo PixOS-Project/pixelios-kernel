@@ -262,6 +262,7 @@ class Memo(unittest.TestCase):
             finally:
                 sys.modules.pop("shadowme", None)
         sys.path[:0] = [str(A), str(B)]; self.addCleanup(lambda: sys.path.__delitem__(slice(0, 2)))
+        old_dwb = sys.dont_write_bytecode; sys.dont_write_bytecode = True; self.addCleanup(setattr, sys, "dont_write_bytecode", old_dwb)   # a pyc written into B/__pycache__ would change B's listing (a legit miss) and hide the point of this test
         importlib = __import__("importlib"); importlib.invalidate_caches(); importlib.import_module("shadowme"); sys.modules.pop("shadowme")   # fill the FileFinders before the recorder starts
         self.assertEqual(self.go(imp, name="sh")[0], "b")
         k0 = am.key("sh", b"", self.script)
