@@ -1,0 +1,96 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..c368578 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -445,6 +445,77 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...][;NAME2:VAR=VAL...] appends the VAR=VAL strings to the environment of every executable whose
++ * file name is NAME. launchd drops DYLD_* from job EnvironmentVariables (gputest11: backboardd printed nothing from the injected libsweetgl),
++ * so the library insertion for backboardd is done here: sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/libsweetgl.dylib.
++ * Bounded: one boot-arg of 512 bytes, entries of 128 bytes; the space accounting is the one of the envv loop in exec_extract_strings.
++ */
++static int
++sweet_exec_env(struct image_params *imgp, int ptr_size)
++{
++	static char spec[512];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return 0;
++	}
++	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
++	for (const char *c = path; *c; c++) {
++		if (*c == '/') {
++			base = c + 1;
++		}
++	}
++	const char *entry = spec;
++	for (;;) {
++		size_t n = 0;
++		while (entry[n] && entry[n] != ':' && entry[n] != ';') {
++			n++;
++		}
++		if (entry[n] == ':' && strlen(base) == n && strncmp(base, entry, n) == 0) {
++			entry += n + 1;
++			break;
++		}
++		while (*entry && *entry != ';') {
++			entry++;
++		}
++		if (*entry == '\0') {
++			return 0;
++		}
++		entry++;
++	}
++	while (*entry && *entry != ';') {
++		char var[128];
++		size_t len = 0;
++		while (entry[len] && entry[len] != ',' && entry[len] != ';') {
++			len++;
++		}
++		if (len > 0 && len < sizeof(var)) {
++			memcpy(var, entry, len);
++			var[len] = '\0';
++			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++			if (error) {
++				return error;
++			}
++			if (imgp->ip_argspace < ptr_size) {
++				return E2BIG;
++			}
++			imgp->ip_argspace -= ptr_size;
++			imgp->ip_envc++;
++			printf("SWEET ENV: %s += %s\n", base, var);
++		}
++		entry += len;
++		if (*entry == ',') {
++			entry++;
++		}
++	}
++	return 0;
++}
++#endif
++
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+  * in the same fashion as the stack_guard and malloc_entropy keys.
+@@ -5741,6 +5812,13 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	error = sweet_exec_env(imgp, new_ptr_size);
++	if (error) {
++		goto bad;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
