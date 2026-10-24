@@ -4,7 +4,7 @@ Usage: gate_select.py STAMP_FILE   -> prints the steps to run (space separated),
 import pathlib, re, subprocess, sys
 
 ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-gpupower", "build-gpuclk", "build-gpurails", "build-gpurailon", "build-gpujob", "build-touch", "build-udump", "host-tests", "boot-safety",
-       "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate", "shellcheck"]
+       "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate", "rules", "shellcheck"]
 SHIM = ALL[:14]
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BUILD_SH = REPO / "shim" / "build.sh"
@@ -38,8 +38,8 @@ def is_shell(f):
 
 def select(files):
     """Steps needed for this list of changed paths. validate (patch numbering, headers, script syntax) and public-split (every
-    tracked file assigned to a public repo, ~1 s) always run."""
-    need = {"validate", "public-split"}
+    tracked file assigned to a public repo, ~1 s) and rules (tools/check-rules.py, whole-tree lint) always run."""
+    need = {"validate", "public-split", "rules"}
     for f in files:
         if f.startswith(SHIM_PREFIX) and not (f.startswith("shim/") and f.endswith(".md")):
             need.update(SHIM)

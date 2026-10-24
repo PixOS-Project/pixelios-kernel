@@ -6,10 +6,10 @@ import gate_select as g
 
 class Select(unittest.TestCase):
     def test_docs_only(self):
-        self.assertEqual(g.select(["docs/HANDOFF.md", "AGENTS.md"]), ["public-split", "validate"])
+        self.assertEqual(g.select(["docs/HANDOFF.md", "AGENTS.md"]), ["public-split", "validate", "rules"])
 
     def test_xnu_only(self):
-        self.assertEqual(g.select(["xnu/patches/0092-sweet-touch-cmu-top.patch"]), ["public-split", "validate"])
+        self.assertEqual(g.select(["xnu/patches/0092-sweet-touch-cmu-top.patch"]), ["public-split", "validate", "rules"])
 
     def test_xnu_patch_used_by_shim_host_tests(self):
         self.assertIn("host-tests", g.select(["xnu/patches/0088-sweet-gs101-touch.patch"]))
@@ -29,19 +29,19 @@ class Select(unittest.TestCase):
             self.assertNotIn("shellcheck", g.select([f]), f)
 
     def test_shim_markdown_selects_no_build(self):
-        self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate"])
+        self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate", "rules"])
 
     def test_audit_memo_selects_boot_safety(self):
         self.assertIn("boot-safety", g.select(["tools/audit_memo.py"]))
 
     def test_shim(self):
         s = g.select(["shim/ufs.c"])
-        self.assertEqual(s, g.SHIM + ["public-split", "validate"])
+        self.assertEqual(s, g.SHIM + ["public-split", "validate", "rules"])
         self.assertNotIn("unit", s)
 
     def test_tools_and_soc_json(self):
-        self.assertEqual(g.select(["tools/qrmerge.py"]), ["unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"])
-        self.assertEqual(g.select(["soc/google/gs101/soc.json"]), g.SHIM + ["unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"])
+        self.assertEqual(g.select(["tools/qrmerge.py"]), ["unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate", "rules"])
+        self.assertEqual(g.select(["soc/google/gs101/soc.json"]), g.SHIM + ["unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate", "rules"])
 
     def test_missing_stamp_means_full(self):
         with tempfile.TemporaryDirectory() as d:

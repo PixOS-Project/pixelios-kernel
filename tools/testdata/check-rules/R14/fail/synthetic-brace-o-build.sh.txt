@@ -1,0 +1,3 @@
+# fixture source: synthetic (no historic commit has the ${O}/ form); mirrors the $O/ chain of kernel c0c2ad7^
+set -euo pipefail
+gcc -O1 -o ${O}/x_host_test x_host_test.c && ${O}/x_host_test

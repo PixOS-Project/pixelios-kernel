@@ -53,7 +53,7 @@ onint() {
 }
 trap onint INT TERM HUP
 putres "RUNNING $$ $(date +%s)"
-ALL="build build-fast build-usb build-wlan build-gpu build-gpupower build-gpuclk build-gpurails build-gpurailon build-gpujob build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate shellcheck"
+ALL="build build-fast build-usb build-wlan build-gpu build-gpupower build-gpuclk build-gpurails build-gpurailon build-gpujob build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate rules shellcheck"
 want=$ALL; fullnote=
 if [ -n "$quick" ]; then
 	want=$(python3 tools/gate_select.py "$stamp") || finish "GATE FAIL $h gate_select (see $log)" 1
@@ -107,6 +107,7 @@ laneA() {
 }
 laneB() {
 	step B validate     python3 tools/validate-repo.py
+	step B rules        python3 tools/check-rules.py --strict
 	step B shellcheck   bash -c 'command -v shellcheck >/dev/null || { echo "shellcheck is not installed (apt install shellcheck)"; exit 1; }; shellcheck -S warning $(tools/shell-files)'
 	step B public-split needs tools/make-public-tree.py python3 tools/make-public-tree.py --check
 	step B unit         python3 -m unittest discover -s tools -p "test_*.py"
