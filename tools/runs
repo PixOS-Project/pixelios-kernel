@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""runs: read-only index over past hardware runs (TP-023). Never touches the phone.
+
+  tools/runs list [--since YYYY-MM-DD] [--kind xrun|probe] [--all-worktrees]
+  tools/runs show ID [--all-worktrees]
+  tools/runs stats --form REGEX [--kind K] [--all-worktrees] [--json]
+  tools/runs compare A B [--all-worktrees]
+  tools/runs --self-test
+
+Layout (observed): logs/runs/<UTC stamp>-<label>/{report.json,run.json,report.txt} (xrun) and
+logs/probe/<UTC stamp>-<label>/{report.txt,usb.txt,fboot.log} (probe-run, no report.json).
+xrun: verdict = report.json "result", wall = run.json t_end - t_start (else report.json run.waited).
+probe: verdict = first word after "RESULT:" in report.txt, wall = mtime(usb.txt) - mtime(fboot.log)
+  (boot -> last usb line, the TP-015 metric; copies must keep mtimes).
+Label stem = label with trailing "_" removed; --form is a regex searched in the label.
+Last line: RESULT: PASS n=<dirs> unreadable=<k> ; PARTIAL (exit 1) if any dir is unreadable (listed) ; ERROR (exit 2) on bad args.
+Env RUNS_ROOT: use <RUNS_ROOT>/logs instead of the repo's logs/ (tests).
+"""
+import argparse, datetime, difflib, json, os, re, statistics, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+NAME = re.compile(r"^(\d{8})T(\d{6})Z-(.*)$")
+KINDS = {"xrun": "runs", "probe": "probe"}
+
+
+class Bad(Exception):
+    pass
+
+
+def roots(all_wt):
+    base = os.environ.get("RUNS_ROOT")
+    if base:
+        return [base]
+    out = [REPO]
+    if all_wt:
+        r = subprocess.run(["git", "-C", REPO, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+        for ln in r.stdout.splitlines():
+            if ln.startswith("worktree "):
+                p = ln[9:].strip()
+                if p not in out:
+                    out.append(p)
+    return out
+
+
+def scan(all_wt, kind=None):
+    """-> list of (kind, dir) for every run dir under the roots."""
+    found = []
+    for root in roots(all_wt):
+        for k, sub in KINDS.items():
+            if kind and k != kind:
+                continue
+            base = os.path.join(root, "logs", sub)
+            try:
+                names = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for n in names:
+                p = os.path.join(base, n)
+                if NAME.match(n) and os.path.isdir(p):
+                    found.append((k, p))
+    return found
+
+
+def mtime(p):
+    return os.stat(p).st_mtime
+
+
+def load(kind, d):
+    """-> dict(id, kind, dir, stamp, label, verdict, wall, text) or raises (OSError, ValueError, KeyError)."""
+    n = os.path.basename(d)
+    m = NAME.match(n)
+    rec = {"id": n, "kind": kind, "dir": d, "stamp": m.group(1), "label": m.group(3), "wall": None}
+    rec["stem"] = rec["label"].rstrip("_")
+    if kind == "xrun":
+        rep = json.load(open(os.path.join(d, "report.json")))
+        rec["verdict"] = str(rep["result"])
+        rec["reason"] = rep.get("reason", "")
+        rec["git"] = (rep.get("run") or {}).get("git_head")
+        try:
+            rj = json.load(open(os.path.join(d, "run.json")))
+            rec["wall"] = float(rj["t_end"]) - float(rj["t_start"])
+        except (OSError, ValueError, KeyError):
+            w = (rep.get("run") or {}).get("waited")
+            rec["wall"] = float(w) if w is not None else None
+        rec["text"] = open(os.path.join(d, "report.txt")).read() if os.path.exists(os.path.join(d, "report.txt")) else ""
+    else:
+        txt = open(os.path.join(d, "report.txt")).read()
+        m2 = re.match(r"RESULT:\s+([A-Z]+)(.*)", txt)
+        if not m2:
+            raise ValueError("report.txt has no RESULT line")
+        rec["verdict"], rec["reason"], rec["git"], rec["text"] = m2.group(1), m2.group(2).strip(), None, txt
+        u, f = os.path.join(d, "usb.txt"), os.path.join(d, "fboot.log")
+        if os.path.exists(u) and os.path.exists(f):
+            rec["wall"] = max(0.0, mtime(u) - mtime(f))
+    return rec
+
+
+def load_all(all_wt, kind=None, since=None):
+    recs, bad = [], []
+    for k, d in scan(all_wt, kind):
+        if since and NAME.match(os.path.basename(d)).group(1) < since:
+            continue
+        try:
+            recs.append(load(k, d))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            bad.append("%s (%s)" % (os.path.basename(d), str(e).split("\n")[0][:60]))
+    recs.sort(key=lambda r: r["id"])
+    return recs, bad
+
+
+def fw(x):
+    return "-" if x is None else "%.0fs" % x
+
+
+def finish(n, bad):
+    for b in bad:
+        print("unreadable: " + b)
+    print("RESULT: %s n=%d unreadable=%d" % ("PASS" if not bad else "PARTIAL", n, len(bad)))
+    return 0 if not bad else 1
+
+
+def cmd_list(a):
+    since = None
+    if a.since:
+        try:
+            since = datetime.date.fromisoformat(a.since).strftime("%Y%m%d")
+        except ValueError:
+            raise Bad("--since needs YYYY-MM-DD")
+    recs, bad = load_all(a.all_worktrees, a.kind, since)
+    for r in recs:
+        print("%-44s %-5s %-8s %7s" % (r["id"], r["kind"], r["verdict"], fw(r["wall"])))
+    return finish(len(recs) + len(bad), bad)
+
+
+def find(a, ident):
+    recs, bad = load_all(a.all_worktrees)
+    hit = [r for r in recs if r["id"] == ident or r["id"].endswith("-" + ident)]
+    if len(hit) != 1:
+        raise Bad("ID %r matches %d runs (use the full dir name)" % (ident, len(hit)))
+    return hit[0], bad
+
+
+def cmd_show(a):
+    r, bad = find(a, a.id)
+    print("%s  kind=%s verdict=%s wall=%s git=%s" % (r["id"], r["kind"], r["verdict"], fw(r["wall"]), r["git"] or "-"))
+    print("dir: " + r["dir"])
+    print("\n".join(r["text"].splitlines()[:30]))
+    return finish(1, [])
+
+
+def cmd_stats(a):
+    try:
+        rx = re.compile(a.form)
+    except re.error as e:
+        raise Bad("bad --form regex: %s" % e)
+    recs, bad = load_all(a.all_worktrees, a.kind)
+    groups = {}
+    for r in recs:
+        if rx.search(r["label"]):
+            groups.setdefault(r["stem"], []).append(r)
+    rows = []
+    for stem, rs in sorted(groups.items()):
+        c = {"PASS": 0, "FAIL": 0, "HANG": 0, "ERROR": 0, "other": 0}
+        for r in rs:
+            c[r["verdict"] if r["verdict"] in c else "other"] += 1
+        w = sorted(r["wall"] for r in rs if r["wall"] is not None)
+        rows.append({"stem": stem, "n": len(rs), **c, "p50": statistics.median(w) if w else None, "max": w[-1] if w else None})
+    if a.json:
+        print(json.dumps(rows))
+    else:
+        print("%-28s %3s %5s %5s %5s %5s %5s %7s %7s" % ("stem", "n", "PASS", "FAIL", "HANG", "ERROR", "other", "p50", "max"))
+        for x in rows:
+            print("%-28s %3d %5d %5d %5d %5d %5d %7s %7s" % (x["stem"], x["n"], x["PASS"], x["FAIL"], x["HANG"], x["ERROR"], x["other"], fw(x["p50"]), fw(x["max"])))
+    return finish(len(recs) + len(bad), bad)
+
+
+def cmd_compare(a):
+    (x, b1), (y, b2) = find(a, a.a), find(a, a.b)
+    for f in ("id", "kind", "verdict", "wall", "git", "reason"):
+        vx, vy = x.get(f), y.get(f)
+        if f == "wall":
+            vx, vy = fw(vx), fw(vy)
+        print("%-8s %s | %s%s" % (f, str(vx)[:70], str(vy)[:70], "" if vx == vy else "   <-- differs"))
+    d = list(difflib.unified_diff(x["text"].splitlines(), y["text"].splitlines(), x["id"], y["id"], lineterm="", n=0))
+    print("\n".join(l[:160] for l in d[:40]))
+    return finish(2, b1 + b2)
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="runs", add_help=True)
+    p.error = lambda m: (_ for _ in ()).throw(Bad(m))
+    sp = p.add_subparsers(dest="cmd")
+    com = argparse.ArgumentParser(add_help=False)
+    com.add_argument("--all-worktrees", action="store_true")
+    s = sp.add_parser("list", parents=[com]); s.add_argument("--since"); s.add_argument("--kind", choices=list(KINDS))
+    s = sp.add_parser("show", parents=[com]); s.add_argument("id")
+    s = sp.add_parser("stats", parents=[com]); s.add_argument("--form", required=True); s.add_argument("--kind", choices=list(KINDS)); s.add_argument("--json", action="store_true")
+    s = sp.add_parser("compare", parents=[com]); s.add_argument("a"); s.add_argument("b")
+    return p
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "test_runs.py")], capture_output=True, text=True)
+        tail = (r.stderr.strip().splitlines() or [""])[-1]
+        print("self-test %s (%s)" % ("PASS" if r.returncode == 0 else "FAIL", tail))
+        if r.returncode:
+            print(r.stderr[-1500:])
+        print("RESULT: %s self-test" % ("PASS" if r.returncode == 0 else "FAIL"))
+        return 0 if r.returncode == 0 else 1
+    try:
+        a = parser().parse_args(argv)
+        if not a.cmd:
+            raise Bad("a subcommand is required (list|show|stats|compare)")
+        return {"list": cmd_list, "show": cmd_show, "stats": cmd_stats, "compare": cmd_compare}[a.cmd](a)
+    except Bad as e:
+        print("usage error: %s\nRESULT: ERROR bad arguments" % e)
+        return 2
+    except SystemExit as e:
+        if e.code in (0, None):
+            return 0
+        print("RESULT: ERROR bad arguments")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
