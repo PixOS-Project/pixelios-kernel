@@ -417,6 +417,14 @@ tools/phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N] | release -
 tools/phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...     # acquire, run CMD, release in a finally (also SIGTERM/INT/HUP)
 tools/test_phone_lock.py                                              # host test, run by check-all.sh (unittest discover)
 ```
+**Enforcement and queue (TP-020, 2026-10-24).** Take the phone only when you are ready to use it: `xrun` and `probe-run` build the image first and take the lock
+afterwards (`--lock-wait S` waits in line; default fails at once with who holds it). `phone-lock check [--owner N] [--strict]` exits 0 only if the caller
+holds a live lock (owner: `--owner`, `$PHONE_LOCK_OWNER` exported by `run` and by the self-locking tools, `$PHONE_OWNER`; with no owner known a live lock of anyone passes with a
+warning for now, `--strict` refuses). `fboot.sh`, `fflash-userdata.sh` and `phone goto` (not `--dry-run`, not `state`) call it and refuse without the lock. A lock with a pid ends
+only when that pid dies, never by ttl; waiters (`--wait`) are served in arrival order (`$PHONE_LOCK_DIR.queue`, shown by `status`). `tools/phone-guard` is a Claude Code
+PreToolUse hook (wired in the super repo `.claude/settings.json`) that denies hand-typed mutating `fastboot`/`adb` in an agent's Bash call; read-only queries pass; sessions
+pick the hook up at start. Gates and builds never take the lock. Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
+
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)

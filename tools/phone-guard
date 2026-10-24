@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""phone-guard: Claude Code PreToolUse hook for Bash (TP-020). Denies hand-typed device commands.
+
+The tools (xrun, probe-run, fboot.sh, fflash-userdata.sh, phone) hold the phone lock and check bluejay; a raw `fastboot flash ...` or
+`adb reboot ...` in an agent's Bash call skips both. Read-only queries (fastboot devices/getvar, adb devices/get-state) pass.
+Stdin: the hook JSON. Stdout: a deny decision, or nothing (allow). Always exit 0. Test: tools/test_phone_guard.py.
+Wire it in .claude/settings.json: hooks.PreToolUse[{matcher "Bash", command "python3 $CLAUDE_PROJECT_DIR/pixos-project/pixelios-kernel/tools/phone-guard"}].
+"""
+import json, os, re, shlex, sys
+
+READ_ONLY = {"fastboot": {"devices", "getvar", "--version", "version", "help", "--help"},
+             "adb": {"devices", "get-state", "version", "--version", "help", "--help", "start-server", "kill-server", "get-serialno"}}
+WRAP = {"sudo", "env", "command", "exec", "nohup", "time", "timeout", "nice", "stdbuf"}
+FLAG_ARG = {"-s", "-t", "-H", "-P", "-p"}  # global options that take a value
+WHY = ("hand-typed %s: use the built tools (tools/xrun, tools/probe-run, tools/fboot.sh, tools/fflash-userdata.sh, tools/phone) -- they hold the "
+       "phone lock and verify bluejay (AGENTS.md 'Use the tools'). Read-only queries (fastboot devices|getvar, adb devices|get-state) are allowed.")
+
+
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+
+
+def segments(cmd):
+    """command words split at ; && || | & ( ) and newlines; quotes keep their text in one word, heredoc bodies are dropped."""
+    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd).replace("\n", " ; ")
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    seg = []
+    try:
+        for t in lex:
+            if re.fullmatch(r"[;&|()<>]+", t):
+                if t in ("<", ">", ">>", "<<", "&>", ">&", "<<<"):
+                    continue  # redirection operator: the word after it is a file name
+                if seg:
+                    yield seg
+                seg = []
+            else:
+                seg.append(t)
+    except ValueError:
+        pass  # unbalanced quote: judge what was parsed so far
+    if seg:
+        yield seg
+
+
+def offending(cmd):
+    """first raw mutating fastboot/adb invocation in CMD, or None."""
+    for w in segments(cmd):
+        i = 0
+        while i < len(w):
+            t = w[i]
+            if re.match(r"^[A-Za-z_]\w*=", t) or t in WRAP or (t.startswith("-") and i) or (i and re.fullmatch(r"\d+[smhd]?", t)):
+                i += 1
+                continue
+            break
+        if i >= len(w):
+            continue
+        prog = os.path.basename(w[i])
+        if prog not in READ_ONLY:
+            continue
+        rest, sub = w[i + 1:], None
+        j = 0
+        while j < len(rest):
+            if rest[j] in FLAG_ARG:
+                j += 2
+            elif rest[j].startswith("-") and rest[j] not in READ_ONLY[prog]:
+                j += 1
+            else:
+                sub = rest[j]
+                break
+        if sub not in READ_ONLY[prog]:
+            return " ".join([prog] + rest[:3])
+    return None
+
+
+def main():
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    if d.get("tool_name") != "Bash":
+        return 0
+    bad = offending((d.get("tool_input") or {}).get("command", ""))
+    if bad:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                  "permissionDecisionReason": WHY % ("`%s`" % bad)}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

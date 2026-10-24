@@ -121,6 +121,70 @@ class T(unittest.TestCase):
         self.assertIn("RESULT: FAIL owner=a", out)
         self.assertFalse(os.path.exists(self.lock))
 
+    def test_live_pid_beats_ttl(self):
+        # TP-020: a running holder (a 35-minute flash) must not lose the lock because its ttl ran out
+        self.pl("acquire", "--owner", "a", "--ttl", "1", "--pid", str(os.getpid()))
+        time.sleep(1.5)
+        self.assertEqual(self.pl("acquire", "--owner", "b").returncode, 1)
+        self.assertIn("held by a", self.pl("status").stdout)
+
+    def test_check(self):
+        self.assertEqual(self.pl("check", "--owner", "a").returncode, 1)  # no lock
+        self.pl("acquire", "--owner", "a")
+        self.assertEqual(self.pl("check", "--owner", "a").returncode, 0)
+        self.assertEqual(self.pl("check", "--owner", "b").returncode, 1)  # someone else's
+        self.assertEqual(self.pl("check").returncode, 0)  # no owner known: transition rule accepts a live lock, with a warning
+        self.assertIn("owner unknown", self.pl("check").stdout)
+        self.env["PHONE_OWNER"] = "a"
+        self.assertEqual(self.pl("check").returncode, 0)
+        self.env["PHONE_LOCK_OWNER"] = "b"  # PHONE_LOCK_OWNER wins
+        self.assertEqual(self.pl("check").returncode, 1)
+
+    def test_check_stale(self):
+        self.pl("acquire", "--owner", "a", "--ttl", "1")
+        time.sleep(1.5)
+        self.assertEqual(self.pl("check", "--owner", "a").returncode, 1)
+
+    def test_run_exports_owner(self):
+        r = self.pl("run", "--owner", "a", "--", sys.executable, TOOL, "check")  # inner check sees PHONE_LOCK_OWNER=a
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_waiters_served_in_order(self):
+        self.pl("acquire", "--owner", "a")
+        order = os.path.join(self.d.name, "order")
+        ps = []
+        for o in ("b", "c", "d"):
+            ps.append(subprocess.Popen([sys.executable, TOOL, "run", "--owner", o, "--wait", "30", "--", "sh", "-c", "echo %s >> %s" % (o, order)],
+                                       env=self.env, stdout=subprocess.PIPE, text=True))
+            time.sleep(0.4)  # distinct arrival times
+        self.assertIn("queue=b,c,d", self.pl("status").stdout)
+        self.pl("release", "--owner", "a")
+        for p in ps:
+            out, _ = p.communicate(timeout=20)
+            self.assertEqual(p.returncode, 0, out)
+        with open(order) as f:
+            self.assertEqual(f.read().split(), ["b", "c", "d"])
+
+    def test_no_queue_jumping(self):
+        self.pl("acquire", "--owner", "a")
+        w = subprocess.Popen([sys.executable, TOOL, "acquire", "--owner", "b", "--wait", "5"], env=self.env, stdout=subprocess.PIPE, text=True)
+        time.sleep(0.5)
+        self.pl("release", "--owner", "a")
+        # c arrives right after the release but b (queued earlier) must win
+        r = self.pl("acquire", "--owner", "c")
+        out, _ = w.communicate(timeout=10)
+        self.assertEqual(w.returncode, 0, out)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.info()["owner"], "b")
+
+    def test_dead_waiter_dropped(self):
+        self.pl("acquire", "--owner", "a")
+        w = subprocess.Popen([sys.executable, TOOL, "acquire", "--owner", "b", "--wait", "30"], env=self.env, stdout=subprocess.DEVNULL)
+        time.sleep(0.5)
+        w.kill(); w.wait()
+        self.pl("release", "--owner", "a")
+        self.assertEqual(self.pl("acquire", "--owner", "c").returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

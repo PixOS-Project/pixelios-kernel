@@ -4,12 +4,18 @@
   phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N]
   phone-lock release --owner NAME
   phone-lock status                       exit 0 free, 1 held
+  phone-lock check [--owner NAME] [--strict]        exit 0 only if NAME (else $PHONE_LOCK_OWNER, $PHONE_OWNER) holds a live lock: the guard
+                                          that fboot/fflash-userdata/phone goto call before touching the phone (TP-020)
   phone-lock force-release --yes
   phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...   take the lock, run CMD, release (also on signals)
 
+Take the lock only when ready to use the phone (image built, gates done): xrun and probe-run build first and acquire after.
+Waiters (--wait) queue in $PHONE_LOCK_DIR.queue and are served in order; `run` exports PHONE_LOCK_OWNER to CMD.
+
 Lock = directory $PHONE_LOCK_DIR (default ~/pixelios-artifacts/phone.lock), made with os.mkdir (atomic), holding info.json
-{owner, pid, start, ttl, cmd}. Liveness: `run` records its own pid (dead = stale). A bare `acquire` records pid 0 (no pid
-check, only the ttl ends it) because its own process exits at once; pass --pid N to tie it to a process.
+{owner, pid, start, ttl, cmd}. Liveness: a lock with a pid ends when that pid dies and NEVER by ttl (a live flash must not be taken over); the ttl only ends a
+pid-less lock. `run` records its own pid. A bare `acquire` records pid 0 (only the ttl ends it) because its own process exits at
+once; pass --pid N to tie it to a process.
 Owner: --owner, else $PHONE_OWNER, else agent-<pid>. Defaults: ttl 1800, wait 0 (capped at 3600).
 Last line: RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns. Exit 0 ok, 1 busy (or CMD failed: CMD's own code), 2 error.
 """
@@ -17,6 +23,7 @@ import argparse, json, os, shutil, signal, subprocess, sys, time
 
 LOCK = os.environ.get("PHONE_LOCK_DIR") or os.path.expanduser("~/pixelios-artifacts/phone.lock")
 INFO = os.path.join(LOCK, "info.json")
+QUEUE = LOCK + ".queue"
 MAXWAIT = 3600
 
 
@@ -56,7 +63,9 @@ def stale(i):
             return time.time() - os.stat(LOCK).st_mtime > 10
         except OSError:
             return False
-    return time.time() > i["start"] + i["ttl"] or not alive(i["pid"])
+    if i.get("pid"):
+        return not alive(i["pid"])  # a live pid keeps the lock, whatever the ttl
+    return time.time() > i["start"] + i["ttl"]
 
 
 def age(i):
@@ -70,37 +79,95 @@ def write(owner, pid, ttl, cmd):
     os.replace(tmp, INFO)
 
 
-def acquire(owner, wait, ttl, pid, cmd):
-    """(code, message). 0 = lock is held by owner now."""
-    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-    end = time.time() + min(max(wait, 0), MAXWAIT)
-    while True:
+def queue():
+    """live waiting tickets, oldest first: [(name, owner)]; tickets of dead waiters are dropped."""
+    out = []
+    try:
+        names = sorted(os.listdir(QUEUE))
+    except OSError:
+        return out
+    for n in names:
         try:
-            os.mkdir(LOCK)
-            write(owner, pid, ttl, cmd)
-            return 0, None
-        except FileExistsError:
-            pass
-        i = read()
-        if i is None:
-            continue  # released between mkdir and read
-        if i and i["owner"] == owner:
-            write(owner, pid, ttl, cmd)
-            return 0, "refreshed own lock"
-        if stale(i):
-            # rename is atomic: of several takers only one wins, the others fail and retry
-            old = "%s.stale.%d" % (LOCK, os.getpid())
-            try:
-                os.rename(LOCK, old)
-            except OSError:
-                continue
-            shutil.rmtree(old, ignore_errors=True)
-            print("takeover: stale lock of %s (pid %s, age %ds)" % (i.get("owner", "?"), i.get("pid", "?"), age(i)))
+            pid = int(n.split("-")[1])
+        except (IndexError, ValueError):
             continue
-        if time.time() >= end:
-            return 1, "busy: held by %s pid=%s age=%ds ttl=%ds cmd=%s" % (
-                i.get("owner", "?"), i.get("pid", "?"), age(i), i.get("ttl", 0), i.get("cmd", ""))
-        time.sleep(min(0.2, max(0.02, end - time.time())))
+        if alive(pid):
+            out.append((n, n.split("-", 2)[2]))
+        else:
+            try:
+                os.unlink(os.path.join(QUEUE, n))
+            except OSError:
+                pass
+    return out
+
+
+def acquire(owner, wait, ttl, pid, cmd):
+    """(code, message). 0 = lock is held by owner now. Waiters are served in arrival order."""
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    wait = min(max(wait, 0), MAXWAIT)
+    end = time.time() + wait
+    ticket = None
+    if wait > 0:
+        os.makedirs(QUEUE, exist_ok=True)
+        ticket = "%020d-%d-%s" % (time.time_ns(), os.getpid(), owner)
+        open(os.path.join(QUEUE, ticket), "w").close()
+    try:
+        while True:
+            q = queue()
+            my_turn = not q or (ticket is not None and q[0][0] == ticket)
+            if my_turn:
+                try:
+                    os.mkdir(LOCK)
+                    write(owner, pid, ttl, cmd)
+                    return 0, None
+                except FileExistsError:
+                    pass
+            i = read()
+            if i is None:
+                continue  # released between mkdir and read
+            if i and i["owner"] == owner:
+                write(owner, pid, ttl, cmd)
+                return 0, "refreshed own lock"
+            if stale(i):
+                # rename is atomic: of several takers only one wins, the others fail and retry
+                old = "%s.stale.%d" % (LOCK, os.getpid())
+                try:
+                    os.rename(LOCK, old)
+                except OSError:
+                    continue
+                shutil.rmtree(old, ignore_errors=True)
+                print("takeover: stale lock of %s (pid %s, age %ds)" % (i.get("owner", "?"), i.get("pid", "?"), age(i)))
+                continue
+            if time.time() >= end:
+                ahead = [o for n, o in q if n != ticket]
+                return 1, "busy: held by %s pid=%s age=%ds ttl=%ds cmd=%s%s" % (
+                    i.get("owner", "?"), i.get("pid", "?"), age(i), i.get("ttl", 0), i.get("cmd", ""),
+                    " queue=%s" % ",".join(ahead) if ahead else "")
+            time.sleep(min(0.2, max(0.02, end - time.time())))
+    finally:
+        if ticket:
+            try:
+                os.unlink(os.path.join(QUEUE, ticket))
+            except OSError:
+                pass
+
+
+def check(owner, strict=False):
+    """(code, message): 0 only if OWNER holds a live lock."""
+    i = read()
+    if i is None:
+        return 1, "no lock held: take it with tools/phone-lock run/acquire (xrun and probe-run take it themselves)"
+    if stale(i):
+        return 1, "lock of %s is stale" % i.get("owner", "?")
+    if not owner and strict:
+        return 1, "no owner: set PHONE_OWNER or run under tools/phone-lock run"
+    if not owner:  # transition: callers that do not say who they are pass while SOMEONE's live lock exists. Set PHONE_OWNER.
+        return 0, "warning: owner unknown (set PHONE_OWNER), accepting the live lock of %s" % i.get("owner", "?")
+    if i.get("owner") != owner:
+        return 1, "lock is held by %s, not by %s" % (i.get("owner", "?"), owner)
+    if stale(i):
+        return 1, "lock of %s is stale" % owner
+    return 0, None
 
 
 def release(owner, force):
@@ -121,6 +188,7 @@ def run(a):
         return result(code, a.owner, 0)
     t0 = time.time()
     child = None
+    os.environ["PHONE_LOCK_OWNER"] = a.owner  # xrun/probe-run/fboot inside CMD see that the lock is already ours
 
     def fwd(sig, _frame):
         if child and child.poll() is None:
@@ -162,6 +230,9 @@ def main():
         if n == "run":
             s.add_argument("cmd", nargs=argparse.REMAINDER)
     sub.add_parser("status")
+    c = sub.add_parser("check")
+    c.add_argument("--owner", default=os.environ.get("PHONE_LOCK_OWNER") or os.environ.get("PHONE_OWNER") or "")
+    c.add_argument("--strict", action="store_true", help="owner must be known (no transition rule)")
     sub.add_parser("force-release").add_argument("--yes", action="store_true")
     try:
         a = p.parse_args()
@@ -170,12 +241,17 @@ def main():
             return result(code, a.owner, 0, msg)
         if a.op == "release":
             return release(a.owner, False)
+        if a.op == "check":
+            code, msg = check(a.owner, a.strict)
+            return result(code, a.owner or "-", age(read()) if code == 0 else 0, msg)
         if a.op == "status":
             i = read()
+            q = ",".join(o for _, o in queue())
             if i is None:
-                return result(0, "-", 0, "free")
-            return result(1, i.get("owner", "-"), age(i), "held by %s pid=%s age=%ds ttl=%ds%s cmd=%s" % (
-                i.get("owner", "?"), i.get("pid"), age(i), i.get("ttl", 0), " (stale)" if stale(i) else "", i.get("cmd", "")))
+                return result(0, "-", 0, "free" + (" (queued: %s)" % q if q else ""))
+            return result(1, i.get("owner", "-"), age(i), "held by %s pid=%s age=%ds ttl=%ds%s cmd=%s%s" % (
+                i.get("owner", "?"), i.get("pid"), age(i), i.get("ttl", 0), " (stale)" if stale(i) else "", i.get("cmd", ""),
+                " queue=%s" % q if q else ""))
         if a.op == "force-release":
             return release("-", True) if a.yes else result(2, "-", 0, "force-release needs --yes")
         a.cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd

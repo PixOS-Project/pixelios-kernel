@@ -584,6 +584,11 @@ def cmd_goto(args, logger):
         logger.log(f"dry-run: planned {len(trans['steps'])} step(s) to transition {state} -> {target}")
         return make_report(logger, "PASS", state, target, 0, ["dry-run: no commands executed"])
 
+    # TP-020: commands that move the phone need the phone lock (state and --dry-run do not)
+    lk = subprocess.run([os.path.join(REPO_ROOT, "tools", "phone-lock"), "check"], capture_output=True, text=True)
+    if lk.returncode != 0:
+        return make_report(logger, "ERROR", state, target, 0, ["REFUSED: the phone lock is not held by you: " + (lk.stdout.splitlines() or ["?"])[0]])
+
     steps_done = 0
     start_time = time.time()
     seen_state, state_since = None, start_time

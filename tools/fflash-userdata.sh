@@ -1,7 +1,7 @@
 #!/bin/bash
 # Flash the iOS root to userdata, once per image. DESTROYS userdata: pass --yes-erase-userdata after the user confirmed.
 #   tools/fflash-userdata.sh IMG --yes-erase-userdata [--force]
-# Refuses: no IMG.sha256 / hash mismatch, the same image already flashed (state file) unless --force, not bluejay/unlocked.
+# Refuses: a caller that does not hold the phone lock (TP-020), no IMG.sha256 / hash mismatch, the same image already flashed (state file) unless --force, not bluejay/unlocked.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 img=""; yes=0; force=0
@@ -13,6 +13,7 @@ want=$(cut -d' ' -f1 "$img.sha256"); got=$(sha256sum "$img" | cut -d' ' -f1)
 state=${FLASH_STATE:-$HOME/pixelios-artifacts/flashed-userdata.txt}
 if [ "$force" = 0 ] && grep -q "^$got " "$state" 2>/dev/null; then
 	echo "REFUSED: this exact image was already flashed ($(grep "^$got " "$state" | tail -1)); use --force to flash it again" >&2; exit 1; fi
+tools/phone-lock check >&2 || { echo "REFUSED: the phone lock is not held by you (tools/phone-lock run --owner NAME -- CMD, or use tools/xrun / tools/probe-run, which take it after the build)" >&2; exit 1; }
 prod=$(timeout 15 fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
 unl=$(timeout 15 fastboot getvar unlocked 2>&1 | sed -n 's/^unlocked: *//p' | head -1)
 [ "$prod" = bluejay ] && [ "$unl" = yes ] || { echo "REFUSED: product='$prod' unlocked='$unl'" >&2; exit 1; }
