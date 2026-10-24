@@ -11,7 +11,7 @@ Never stored: a .pyc without its source or whose recorded mtime/size differ from
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
 a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat calls (os.path.exists/isfile/isdir, Path.exists) are inputs: stored as (kind, path, exists) and re-checked on a hit (stat by fd/dir_fd is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
-Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
+Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes or any unknown value (warning on stderr; fail safe), or disable(). On: unset, empty, 0|false|no|off (any case, whitespace stripped).
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
 import contextlib, glob, hashlib, io, json, os, pathlib, platform, sys, tempfile
@@ -29,8 +29,15 @@ def disable():
     _off = True
 
 
+_warned = set()
+
+
 def enabled():
-    return not _off and os.environ.get("PIXELIOS_AUDIT_NO_MEMO", "").lower() not in ("1", "true", "yes")
+    v = os.environ.get("PIXELIOS_AUDIT_NO_MEMO", "").strip().lower()
+    if v not in ("", "0", "false", "no", "off", "1", "true", "yes") and v not in _warned:
+        _warned.add(v)
+        print(f"audit_memo: unknown PIXELIOS_AUDIT_NO_MEMO={v!r}: memo DISABLED (use 0/false/no/off to keep it on)", file=sys.stderr)
+    return not _off and v in ("", "0", "false", "no", "off")
 
 
 def cache_dir():

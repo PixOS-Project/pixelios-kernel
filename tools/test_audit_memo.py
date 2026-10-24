@@ -228,10 +228,15 @@ class Memo(unittest.TestCase):
         self.assertEqual(am._dep_path(str(legacy)), str(self.t / "old.py"))
 
     def test_no_memo_env_spellings(self):
-        for v, off in (("1", 1), ("true", 1), ("YES", 1), ("True", 1), ("0", 0), ("", 0), ("no", 0), ("2", 0)):
+        for v, off in (("1", 1), ("true", 1), ("YES", 1), ("True", 1), ("0", 0), ("", 0), ("no", 0), ("off", 0), ("False", 0), ("2", 1), ("on", 1), ("y", 1), (" 1", 1)):
             os.environ["PIXELIOS_AUDIT_NO_MEMO"] = v
             self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)
-            self.assertEqual(am.enabled(), not off, v)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(am.enabled(), not off, v)
+            known = v.strip().lower() in ("", "0", "false", "no", "off", "1", "true", "yes")
+            self.assertEqual("DISABLED" in err.getvalue(), not known, v)   # unknown spellings warn (once)
+            am._warned.clear()
         os.environ.pop("PIXELIOS_AUDIT_NO_MEMO")
 
     def test_no_memo_env(self):
