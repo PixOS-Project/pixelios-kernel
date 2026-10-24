@@ -47,4 +47,9 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-020 | tools/phone-lock | done (amended) |
 | TP-021 | tools/tools-sync | done |
 | TP-022 | tools/patch-numbers | done (amended) |
+| TP-023 | tools/runs | approved (amended) |
+| TP-024 | tools/run-preflight | approved (amended) |
+| TP-025 | tools/fflash-userdata.sh --sparse | approved (amended) |
+| TP-026 | tools/qemu-sweet.py --smoke | approved (amended) |
+| TP-027 | tools/devsh + org.pixelios.devd | approved (amended) |
 | TP-028 | tools/check-all.sh (gate speed + reliability) | approved (amended) |

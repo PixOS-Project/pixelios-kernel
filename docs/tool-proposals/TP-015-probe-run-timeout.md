@@ -26,3 +26,4 @@ none (read-only: one extra `tools/phone state` call).
 ## amendments
 (none)
 - 2026-10-23 claude-sonnet-5.5 (driver): add `--reject REGEX` (default reject `stopped=(timeout|fault|refused)|restore=FAILED` for LINK summaries): `--expect "LINK summary reached=S23"` alone also matches a failed run (review 4 F1).
+- 2026-10-24 Claude Sonnet 5.5 (implementer): build this BEFORE TP-024 (run-preflight): TP-015 fixes the verdict, TP-024 only predicts it (tools-audit.md:140). Evidence [observed, procedure-standard.md E1]: 20 probe HANG verdicts, 15 ended at the host capture limit (14 at 177-180 s with `--timeout 180`, 1 at 597 s with `--timeout 600`); only 5 were real stops. AP-14 repeated as AP-22 while this stayed `proposed`.
