@@ -1,0 +1,108 @@
+sweet-log-timestamps (boot-speed M1, docs/PLAN-BOOT-SPEED.md s4): boot-arg sweetlogts=1 prefixes every console line in the
+persistent log ring (and so the USB replay, sweet_log_copy) with "[SSSSS.mmm] ". INERT without the boot-arg.
+Facts, all read from source on the patched xnu-8796 tree:
+ - sweet_log_append is called from _cnputs for all console output, before any mute (osfmk/console/serial_console.c:285, patch 0065).
+ - Clock: ml_get_hwclock() (osfmk/arm64/machine_routines.c:2082, raw CNTPCT read) over gPEClockFrequencyInfo.timebase_frequency_hz
+   (pexpert/arm/pe_identify_machine.c:68 default 24 MHz, DT override :92-94). mach_continuous_time/mach_absolute_time are NOT used:
+   they read per-CPU data (osfmk/arm64/machine_routines.c:2089) and divide by rtclock_sec_divisor, which is 0 until
+   timebase_callback runs (osfmk/arm/rtclock.c:140). The count starts when the counter started (before the kernel), not at kernel entry.
+ - Frequency 0 (before pe_identify_machine zeroes/sets it): the prefix is "[    ?.???] ".
+ - Boot-args: PE_boot_args() dereferences PE_state.bootArgs (pexpert/arm/pe_bootargs.c:10), which is NULL until PE_init_platform
+   (pexpert/arm/pe_init.c:403); until then the boot-arg is treated as off and re-checked on the next call; the first call after
+   that caches the answer.
+ - Ring accounting: one atomic add of size + nlines*12 reserves prefix + data; every write is reduced mod SWEET_LOG_SIZE like before.
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -731,15 +731,90 @@
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
++/*
++ * Boot-arg sweetlogts=1 (patch 0115): every console line in the ring starts with
++ * "[SSSSS.mmm] " (12 bytes, seconds.millis of the raw generic-timer count, i.e.
++ * since the counter started, not since the kernel entry). Off (and byte-for-byte
++ * the old behaviour) when the boot-arg is absent.
++ * State: 0 = boot-args not readable yet (PE_state.bootArgs is NULL until
++ * PE_init_platform), 1 = off, 2 = on; cached from the first call that can read them.
++ */
++#define SWEET_LOG_TS_LEN        12
++extern uint64_t ml_get_hwclock(void);   /* osfmk/arm64/machine_routines.c:2082; the header declaration (arm/machine_routines.h:758) is not visible from bsd/ */
++static int sweet_log_ts_state;
++static int sweet_log_ts_bol = 1;        /* the next byte starts a line (racy across CPUs: a prefix may land mid-line, never corrupts the ring) */
++
++static int
++sweet_log_ts_on(void)
++{
++	int s = sweet_log_ts_state;
++	if (s == 0) {
++		int v = 0;
++		if (PE_state.bootArgs == NULL) {
++			return 0;
++		}
++		s = (PE_parse_boot_argn("sweetlogts", &v, sizeof(v)) && v != 0) ? 2 : 1;
++		sweet_log_ts_state = s;
++	}
++	return s == 2;
++}
++
+ void
+ sweet_log_append(const char *c, int size)
+ {
+ 	if (size <= 0) {
+ 		return;
+ 	}
+-	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	if (!sweet_log_ts_on()) {
++		uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++		for (int i = 0; i < size; i++) {
++			sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		}
++		return;
++	}
++
++	/* One stamp per chunk; a prefix per line start: now if the last chunk ended in '\n', and after each '\n' that is not the chunk's last byte. */
++	int bol = sweet_log_ts_bol;
++	uint32_t nlines = bol ? 1 : 0;
++	for (int i = 0; i < size - 1; i++) {
++		if (c[i] == '\n') {
++			nlines++;
++		}
++	}
++	sweet_log_ts_bol = (c[size - 1] == '\n');
++
++	char ts[SWEET_LOG_TS_LEN];
++	uint64_t hz = gPEClockFrequencyInfo.timebase_frequency_hz;      /* 0 until pe_identify_machine */
++	if (hz == 0) {
++		memcpy(ts, "[    ?.???] ", SWEET_LOG_TS_LEN);
++	} else {
++		uint64_t ticks = ml_get_hwclock();
++		uint64_t ms = (ticks / hz) * 1000 + ((ticks % hz) * 1000) / hz;
++		uint32_t secs = (uint32_t)((ms / 1000) % 100000);
++		uint32_t frac = (uint32_t)(ms % 1000);
++		ts[0] = '[';
++		for (int i = 5; i >= 1; i--) {
++			ts[i] = (secs || i == 5) ? (char)('0' + secs % 10) : ' ';
++			secs /= 10;
++		}
++		ts[6] = '.';
++		ts[7] = (char)('0' + frac / 100);
++		ts[8] = (char)('0' + frac / 10 % 10);
++		ts[9] = (char)('0' + frac % 10);
++		ts[10] = ']';
++		ts[11] = ' ';
++	}
++
++	/* The total covers prefixes + data in one reservation; every write is reduced mod the ring size. */
++	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size + (uint64_t)nlines * SWEET_LOG_TS_LEN, relaxed);
+ 	for (int i = 0; i < size; i++) {
+-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		if (bol) {
++			for (int k = 0; k < SWEET_LOG_TS_LEN; k++) {
++				sweet_log_ring[at++ % SWEET_LOG_SIZE] = ts[k];
++			}
++		}
++		sweet_log_ring[at++ % SWEET_LOG_SIZE] = c[i];
++		bol = (c[i] == '\n') && (i < size - 1);
+ 	}
+ }
+ 
