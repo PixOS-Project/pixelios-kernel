@@ -85,6 +85,23 @@ class Memo(unittest.TestCase):
         self.addCleanup(setattr, am, "__file__", old)
         self.assertNotEqual(a, am.key("fn", b"", self.script))
 
+    def test_worktrees_share_hits_by_relative_path(self):
+        import json, shutil
+        def worktree(name, text):
+            r = self.t / name; (r / "shim").mkdir(parents=True); (r / "shim/x.c").write_text(text); return r
+        a, b, c = worktree("A", "same"), worktree("B", "same"), worktree("C", "other")
+        old = am.ROOT; self.addCleanup(setattr, am, "ROOT", old)
+        def run_in(root):
+            am.ROOT = root
+            def fn():
+                self.calls += 1; return (root / "shim/x.c").read_text()
+            return self.go(fn, name="wt")[0]
+        self.assertEqual(run_in(a), "same")
+        (e,) = (self.t / "cache").glob("*.json")
+        self.assertEqual([d[0] for d in json.loads(e.read_text())["deps"]], ["shim/x.c"])   # relative, not under A
+        self.assertEqual((run_in(b), self.calls), ("same", 1))    # identical content in another root: hit
+        self.assertEqual((run_in(c), self.calls), ("other", 2))   # same relative path, other content: miss
+
     def test_no_memo_env(self):
         os.environ["PIXELIOS_AUDIT_NO_MEMO"] = "1"
         self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)
