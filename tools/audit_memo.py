@@ -9,7 +9,7 @@ Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), has
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
 Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
-Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken after fn) and re-listed on a hit;
+Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
 a listing by fd or with root_dir/dir_fd is not storable. A failed open of a missing file or an existence check (os.stat) is NOT tracked. Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
 Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
@@ -37,6 +37,19 @@ def cache_dir():
     return pathlib.Path(d) if d else pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "pixelios" / "audit"
 
 
+def _note_list(r, key):
+    """Hash the listing when it happens (a file created later in fn must not end up in the stored hash)."""
+    if r.get("busy"):  # _list_sha itself fires listdir/glob events
+        return
+    r["busy"] = True
+    try:
+        h = _list_sha(*key)
+    finally:
+        r["busy"] = False
+    if r["lists"].setdefault(key, h) != h:
+        r["changed"] = True
+
+
 def _hook(event, args):
     if not _stack:
         return
@@ -50,11 +63,11 @@ def _hook(event, args):
         a = args[0] if args else None
         if event == "glob.glob":
             if isinstance(a, (str, os.PathLike)):
-                r["lists"].add(("glob", os.path.abspath(os.fspath(a)), bool(args[1])))
+                _note_list(r, ("glob", os.path.abspath(os.fspath(a)), bool(args[1])))
             else:
                 r["nolist"] = event
         elif a is None or isinstance(a, (str, bytes, os.PathLike)):
-            r["lists"].add(("dir", os.path.abspath(os.fsdecode("." if a is None else a)), False))
+            _note_list(r, ("dir", os.path.abspath(os.fsdecode("." if a is None else a)), False))
         else:
             r["nolist"] = event
     elif event == "open":
@@ -131,8 +144,10 @@ def _deps(hashes):
 
 
 def _lists(found):
-    """Listings fn did -> sorted [kind, rel path, recursive, sha] (re-listed after fn)."""
-    return sorted([k, _rel(p), rec, _list_sha(k, p, rec)] for k, p, rec in found)
+    """Listings fn did -> sorted [kind, rel path, recursive, sha]; None if any listing differs now from when fn took it."""
+    if any(_list_sha(*key) != h for key, h in found.items()):
+        return None
+    return sorted([k, _rel(p), rec, h] for (k, p, rec), h in found.items())
 
 
 def _load(path, k):
@@ -163,7 +178,7 @@ def run(fn, arg=b"", *, script, name=None):
         for line in e["stdout"].splitlines():
             print(f"{line} (memo {k[:16]})")
         return e["ret"]
-    rec = {"opened": [], "h": {}, "lists": set()}
+    rec = {"opened": [], "h": {}, "lists": {}}
     buf = io.StringIO()
     _stack.append(rec)
     try:
@@ -181,6 +196,8 @@ def run(fn, arg=b"", *, script, name=None):
     if deps is None:
         return ret  # an input changed while fn ran: the result may describe old content
     lists = _lists(rec["lists"])
+    if lists is None:
+        return ret  # a directory changed while fn ran
     try:
         json.dumps(ret)
         entry = {"version": 1, "key": k, "name": name, "deps": deps, "lists": lists, "stdout": buf.getvalue(), "ret": ret}

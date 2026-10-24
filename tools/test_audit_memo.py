@@ -108,6 +108,16 @@ class Memo(unittest.TestCase):
         (self.t / "d" / "new.dat").write_text("x")               # changes only the os.listdir part
         self.go(ls, name="ls"); self.assertEqual(self.calls, 3)
 
+    def test_dir_changed_after_listing_not_stored(self):
+        (self.t / "d").mkdir(); (self.t / "late.src").write_text("x")   # made before the run: a rename is no open event, so only the listing check can see it
+        def ls():
+            self.calls += 1
+            r = sorted(os.listdir(self.t / "d")); os.replace(self.t / "late.src", self.t / "d" / "late"); return r
+        self.go(ls, name="late")
+        os.replace(self.t / "d" / "late", self.t / "late.src"); self.go(ls, name="late")
+        self.assertEqual(self.calls, 2)
+        self.assertFalse(list((self.t / "cache").glob("*.json")))
+
     def test_missing_dir_listing_is_an_input(self):
         def g():
             self.calls += 1
