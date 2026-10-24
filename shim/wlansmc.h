@@ -28,3 +28,7 @@ int wlan_smc_read(void);
  * The helpers smc_priv_rmw_set / smc_priv_rmw_clear take no parameter but the result pointer: fid, register, option, mask and value are constants (audited in the object).
  */
 int wlan_iso_run(void);
+
+/* --wlan-link only (wlansmc_link.o, docs/research/29 section 14): the isolation release / clear of the long chain, same constants and bounded read-backs as wlan_iso_run; see wlansmc.c. */
+int wlan_link_iso_set(uint32_t *rd);
+int wlan_link_iso_clear(uint32_t *rd);

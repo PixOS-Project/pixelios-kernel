@@ -15,6 +15,8 @@ wlan_rails=0
 wlan_en=0
 wlan_smc_read=0
 wlan_iso=0
+wlan_link=0
+wlan_link_n=
 gpu_probe=0
 gpu_power=0
 gpu_stack=0
@@ -42,6 +44,8 @@ while [ "$#" -gt 0 ]; do
 		--wlan-rails) wlan_rails=1; wlan_probe=1; shift ;;	# implies --wlan-probe; READ-ONLY S2MPG10 PCIe-PHY LDOs (ACPM) + CMU_HSI2 + PMU words (wlanrails.c, docs/research/29)
 		--wlan-smc-read) wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-probe; two EL3 SMC_CMD_PRIV_REG READs of PMU 0x17463EC4 / 0x17463EC0 (wlansmc.c, docs/research/29 W2a)
 		--wlan-iso) wlan_iso=1; wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-smc-read --wlan-probe; WRITER via EL3: PCIe1 PHY isolation release + restore (wlansmc.c WLAN_ISO_RUN, docs/research/29 W2c)
+		--wlan-link) wlan_link=1; wlan_probe=1; shift ;;	# implies --wlan-probe; the table-driven power-up chain S00..S19 (default: the last step BEFORE the PERST release) + teardown (wlanlink.c, docs/research/29 section 14)
+		--wlan-link=*) wlan_link=1; wlan_probe=1; wlan_link_n="${1#--wlan-link=}"; shift ;;
 		--wlan-en) wlan_en=1; wlan_probe=1; shift ;;	# implies --wlan-probe; WRITER: WLAN_EN gpp14-2 high for 200 ms and back (wlanen.c, docs/research/29 W2b)
 		--gpu-probe) gpu_probe=1; shift ;;
 		--gpu-job) gpu_job=1; gpu_probe=1; gpu_rails=1; gpu_rail_on=1; gpu_power=1; gpu_s2mpu=1; shift ;;	# G2 stage 2: AS0 + one WRITE_VALUE job inside the powered window (gpujob.c)
@@ -104,6 +108,14 @@ fi
 if [ "$wlan_smc_read" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-smc-read needs a gs101 board" >&2; exit 2; }
 	CFLAGS="$CFLAGS -DWLAN_SMC_READ"
+fi
+if [ "$wlan_link" = 1 ]; then
+	[ "$gs101" = 1 ] || { echo "--wlan-link needs a gs101 board" >&2; exit 2; }
+	[ "$wlan_en" = 0 ] && [ "$wlan_iso" = 0 ] && [ "$wlan_smc_read" = 0 ] || { echo "--wlan-link cannot be combined with --wlan-en / --wlan-iso / --wlan-smc-read (separate reviewed units; the chain contains their steps)" >&2; exit 2; }
+	case "$wlan_link_n" in ''|[0-9]|[0-9][0-9]) ;; *) echo "--wlan-link=N needs a step number 0..32" >&2; exit 2 ;; esac
+	[ -z "$wlan_link_n" ] || [ "$wlan_link_n" -le 32 ] || { echo "--wlan-link=N: N must be <= 32 (the last step of soc/google/gs101/wlan_seq.json)" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DWLAN_LINK_RUN"
+	[ -z "$wlan_link_n" ] || CFLAGS="$CFLAGS -DWLAN_LINK_N=$wlan_link_n"
 fi
 if [ "$wlan_iso" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-iso needs a gs101 board" >&2; exit 2; }
@@ -231,6 +243,7 @@ if [ "$qrlog" = 1 ]; then
 fi
 mkdir -p out
 "$PYTHON" ../tools/boards.py "$board" out/board_config.h
+[ "$gs101" = 1 ] && "$PYTHON" ../tools/boards.py "$board" out/wlan_seq.h --wlan-seq
 for f in start.S shim.c console.c ramlog.c mmu.c fdt.c pstore.c loader.c payload.c ufs.c usbprobe.c; do
 	"$CC" $CFLAGS -c "$f" -o "out/${f%.*}.o"
 done
@@ -259,9 +272,16 @@ done
 # Same for wlanrails.c (read-only rail / CMU / PMU words, docs/research/29); only LINKED with --wlan-rails. Reads only (audited).
 "$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c wlanrails.c -o out/wlanrails.o
 # Same for wlansmc.c (W2a: two SMC READs); built with -DWLAN_SMC_READ on every build so the audit sees the real code (the one smc instruction), only LINKED with --wlan-smc-read.
-"$CC" $CFLAGS -UWLAN_ISO_RUN -DWLAN_SMC_READ -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc.o
+# wlanlink.c (W3a, the table-driven chain; audited every build, linked only with --wlan-link) and wlansmc_link.o = wlansmc.c with the two chain steps (wlan_link_iso_set/clear) INSTEAD of wlan_iso_run
+"$CC" $CFLAGS -DWLAN_LINK_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlanlink.c -o out/wlanlink.o
+if [ "$wlan_link" = 1 ]; then	# the effective step bound N, read from the preprocessed wlanlink.c (its _Static_assert(N <= LAST)); N >= 20 is accepted only for an explicit --wlan-link=N
+	eff_n=$("$CC" $CFLAGS -DWLAN_LINK_RUN -E wlanlink.c | sed -n 's/.*_Static_assert(\([0-9][0-9]*\)u\{0,1\} <= .*/\1/p')
+	"$PYTHON" ../tools/test-bluejay-boot.py --wlan-link-effective "${eff_n:-none}" --wlan-link-explicit "$wlan_link_n"
+fi
+"$CC" $CFLAGS -DWLAN_SMC_READ -DWLAN_ISO_RUN -DWLAN_LINK_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc_link.o
+"$CC" $CFLAGS -UWLAN_ISO_RUN -UWLAN_LINK_RUN -DWLAN_SMC_READ -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc.o
 # and wlansmc_iso.o = the same file with the W2c RMW writer (WLAN_ISO_RUN), audited every build, linked INSTEAD of wlansmc.o with --wlan-iso (an --wlan-smc-read image contains no RMW code)
-"$CC" $CFLAGS -DWLAN_SMC_READ -DWLAN_ISO_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc_iso.o
+"$CC" $CFLAGS -UWLAN_LINK_RUN -DWLAN_SMC_READ -DWLAN_ISO_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc_iso.o
 # Same for wlanen.c (the opt-in WLAN_EN writer); built with -DWLAN_EN_RUN on every build so the audit sees the real code, only LINKED with --wlan-en. Its two writes go through one allowlisted helper (audited).
 "$CC" $CFLAGS -DWLAN_EN_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlanen.c -o out/wlanen.o
 # Same for gpuprobe.c; only LINKED with --gpu-probe. Its name switches must not become
@@ -310,7 +330,9 @@ fi
 if [ "$wlan_rails" = 1 ]; then
 	usb_objs="$usb_objs out/wlanrails.o"
 fi
-if [ "$wlan_iso" = 1 ]; then
+if [ "$wlan_link" = 1 ]; then
+	usb_objs="$usb_objs out/wlanlink.o out/wlansmc_link.o"
+elif [ "$wlan_iso" = 1 ]; then
 	usb_objs="$usb_objs out/wlansmc_iso.o"
 elif [ "$wlan_smc_read" = 1 ]; then
 	usb_objs="$usb_objs out/wlansmc.o"
@@ -346,7 +368,7 @@ fi
 if [ "$touch_rails" = 1 ] || [ "$touch_dvfs" = 1 ] || [ "$gpu_clk" = 1 ] || [ "$gpu_rails" = 1 ] || [ "$wlan_rails" = 1 ]; then
 	usb_objs="$usb_objs out/acpm.o"
 fi
-abs=$("$READELF" -r out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbproto.o out/usbgadget.o out/usbpool.o out/udump.o out/wlanprobe.o out/wlanrails.o out/wlanen.o out/wlansmc.o out/wlansmc_iso.o out/gpuprobe.o out/gpupower.o out/gpupower_stack.o out/gpupower_job.o out/gpujob.o out/gpuclk.o out/gpus2mpu.o out/gpurails.o out/gpurailon.o out/acpm_railon.o out/touchprobe.o out/acpm.o $qr_objs | grep -c ABS64 || true)
+abs=$("$READELF" -r out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbproto.o out/usbgadget.o out/usbpool.o out/udump.o out/wlanprobe.o out/wlanrails.o out/wlanen.o out/wlansmc.o out/wlansmc_iso.o out/wlansmc_link.o out/wlanlink.o out/gpuprobe.o out/gpupower.o out/gpupower_stack.o out/gpupower_job.o out/gpujob.o out/gpuclk.o out/gpus2mpu.o out/gpurails.o out/gpurailon.o out/acpm_railon.o out/touchprobe.o out/acpm.o $qr_objs | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 "$CC" $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
 	out/start.o out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbpool.o $usb_objs $qr_objs -o out/shim.elf
@@ -401,6 +423,12 @@ gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -Iout
 gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -Iout -include out/board_config.h -o out/wlanen_host_test wlanen_host_test.c && ./out/wlanen_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -Iout -include out/board_config.h -o out/wlansmc_host_test wlansmc_host_test.c && ./out/wlansmc_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -Iout -include out/board_config.h -o out/wlaniso_host_test wlaniso_host_test.c && ./out/wlaniso_host_test
+# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (S22 is a documented skip: one 0 us delay row; N=20..32 run in the fake SoC; S24 = read-only link report, S25 = read-only iATU layout, S26 = iATU region 0 programmed + CFG window reads, S27 = read-only endpoint config dump + iATU region 1 reset values, S28 = BAR sizing + assignment, S29 = region 1 + BAR0 window + Command MEM, S30 = the first BAR0 read, S31 = read-only ChipCommon eromptr / clk_ctl_st / capabilities_ext, S32 = BAR0 window move to the EROM page + 896 dword dump)
+chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build (review 2 M2: gcc && test inside a loop did not)
+for n in 7 8 10 19 20 21 22 23 24 25 26 27 28 29 30 31 32; do
+	chk "wlanlink_host_test$n (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DWLAN_LINK_RUN -DWLAN_LINK_N=$n -I. -Iout -include out/board_config.h -o out/wlanlink_host_test$n wlanlink_host_test.c
+	chk "wlanlink_host_test$n" ./out/wlanlink_host_test$n
+done
 gcc -O1 -Wall -Wextra -Werror -I. -o out/gpuprobe_host_test gpuprobe_host_test.c && ./out/gpuprobe_host_test
 gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpuprobe_dump_host_test gpuprobe_dump_host_test.c && ./out/gpuprobe_dump_host_test
 gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpus2mpu_host_test gpus2mpu_host_test.c && ./out/gpus2mpu_host_test

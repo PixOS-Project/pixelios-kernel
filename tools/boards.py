@@ -401,6 +401,58 @@ def c_header(board: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+_WLAN_SEQ_KINDS = ("delay", "read_only", "wait_eq", "wait_mask", "gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso")	# enum WLK_* order of the generated header
+_WLAN_SEQ_BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG", "MEM")					# enum WLB_* order
+
+
+def wlan_seq_header(board: str) -> str:
+    """shim/out/wlan_seq.h for --wlan-link (docs/research/29 section 14): the rows of soc/<vendor>/<soc>/wlan_seq.json as a const table of plain integers (no pointers: build.sh rejects ABS64
+    relocations), plus the table hash. The hash is recomputed here from the rows, so a hand edit of the JSON that keeps the old hash fails the build."""
+    path = os.path.join(ROOT, soc_dir(board), "wlan_seq.json")
+    return wlan_seq_render(json.load(open(path)), path)
+
+
+def wlan_seq_render(doc, path="wlan_seq.json") -> str:
+    """The pure part of wlan_seq_header (also used by the audit's mutation tests)."""
+    import hashlib
+    core = {"rows": doc["rows"], "teardown": doc["teardown"]}
+    sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if sha != doc["table_sha256"]:
+        raise ValueError(f"{path}: table_sha256 {doc['table_sha256']} does not match the rows ({sha}); regenerate with tools/gen_wlan_seq.py")
+    rows, tear = doc["rows"], doc["teardown"]
+    last = int(doc["last_step"])
+    prev = -1
+    for i, r in enumerate(rows):
+        if r["id"] != i or r["kind"] not in _WLAN_SEQ_KINDS or (r["blk"] is not None and r["blk"] not in _WLAN_SEQ_BLOCKS) or not prev <= r["step"] <= last:
+            raise ValueError(f"{path}: row {i} is malformed or out of order")
+        prev = r["step"]
+        if r["kind"] not in ("delay",) and r["blk"] is None:
+            raise ValueError(f"{path}: row {i} needs a block")
+    for i, t in enumerate(tear):
+        if t["id"] != f"T{i + 1:02d}" or t["kind"] not in _WLAN_SEQ_KINDS or t["blk"] not in _WLAN_SEQ_BLOCKS + (None,) or not 0 <= t["requires"] <= last:
+            raise ValueError(f"{path}: teardown row {i} is malformed")
+
+    def cell(r, step):
+        a = r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0)
+        b = r["polls"]
+        blk = "WLB_NONE" if r["blk"] is None else "WLB_" + r["blk"]
+        return f"\t{{ {step}u, WLK_{r['kind'].upper()}, {blk}, {r['off']:#x}u, {r['mask']:#x}u, {r['value']:#x}u, {a}u, {b}u }},"
+
+    out = ["/* Generated from soc/google/gs101/wlan_seq.json by tools/boards.py; do not edit. Plain integers only (no pointers). */", "#pragma once", "#include <stdint.h>", "",
+           f'#define WLAN_SEQ_SHA256 "{sha}"', f"#define WLAN_SEQ_NROWS {len(rows)}u", f"#define WLAN_SEQ_NTEAR {len(tear)}u", f"#define WLAN_SEQ_LAST {last}u",
+           f"#define WLAN_SEQ_DEFAULT_N {int(doc['default_last_step'])}u", "",
+           "enum { " + ", ".join(f"WLK_{k.upper()}" for k in _WLAN_SEQ_KINDS) + " };",
+           "enum { " + ", ".join(f"WLB_{b}" for b in _WLAN_SEQ_BLOCKS) + ", WLB_NONE };", "",
+           "/* kind WLK_*, blk WLB_*; a = delay_us (delay) / poll interval us (wait_*) / read_only: 1 = block probe, 2 = log the value (LINK R line); b = polls. In wlan_tear, step = the step that must have STARTED for the action to run. */",
+           "struct wlan_row { uint16_t step; uint8_t kind, blk; uint32_t off, mask, val, a, b; };", "",
+           "static const struct wlan_row wlan_rows[WLAN_SEQ_NROWS] = {"]
+    out += [cell(r, r["step"]) for r in rows]
+    out += ["};", "", "static const struct wlan_row wlan_tear[WLAN_SEQ_NTEAR] = {"]
+    out += [cell(t, t["requires"]) for t in tear]
+    out += ["};", ""]
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     import argparse
     from pathlib import Path
@@ -408,6 +460,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("board", choices=BOARDS)
     parser.add_argument("output", type=Path, nargs="?")
+    parser.add_argument("--wlan-seq", action="store_true", help="write the --wlan-link table header (soc wlan_seq.json) instead of board_config.h")
     parser.add_argument("--get", metavar="KEY", help="print device_dir | soc_dir | any board value")
     parser.add_argument("--dvfs-check", metavar="K0,K1,K2", help="validate a --dvfs request, print the three values")
     args = parser.parse_args()
@@ -425,5 +478,7 @@ if __name__ == "__main__":
             print(_DEVICES[args.board][2]["soc"])
         else:
             print(BOARDS[args.board][args.get])
+    elif args.wlan_seq:
+        args.output.write_text(wlan_seq_header(args.board))
     else:
         args.output.write_text(c_header(args.board))

@@ -443,3 +443,56 @@ build-time (the shim builds in seconds); an unknown word, `osc` with `top`, or o
   `SWEET TOUCH RESULT: opts=0x.. mux=.. clk=.. F=.. loop=.. rst=.. id=.. moved=F,L,R,I` (F variant F, L loopback, R reset FIFO read,
   I identify; `moved=-` means nothing moved; `id=chip-id-ok` is the FTM5 id).
 - Status: *observed on hardware* (run touch1, 2026-10-22: identify `36 48 03 00` with rails on); the recipe is in XNU patch 0095 and boot-arg `sweettouchcs=1`.
+
+## tools/phone-lock: one lock for the one phone (TP-016)
+
+```
+tools/phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N] | release --owner NAME | status | force-release --yes
+tools/phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...     # acquire, run CMD, release in a finally (also SIGTERM/INT/HUP)
+tools/test_phone_lock.py                                              # host test, run by check-all.sh (unittest discover)
+```
+**Enforcement and queue (TP-020, 2026-10-24; review 11 fixes).** Take the phone only when you are ready to use it: `xrun` and `probe-run` build the image first and take the lock
+afterwards (`--lock-wait S` waits in line; default fails at once with who holds it) and keep it until they exit. Identity is a **token**, not the owner name (the name is only a label):
+`phone-lock run` and the self-locking tools create a token and export `PHONE_LOCK_TOKEN` to everything they start. `phone-lock check [--token T]` exits 0 only if that token is
+the live lock's; `fboot.sh`, `fflash-userdata.sh`, `run-probe.sh`, `pstore-pull.py run` and `phone goto` (not `--dry-run`, not `state`) call it and refuse without it. So a shell that
+did not get the lock from `run`/`xrun`/`probe-run` cannot flash or boot: wrap manual slots as `tools/phone-lock run --owner NAME --wait S -- bash -c '...'`. A lock with a pid ends only
+when that pid is dead and its process group (`run` starts CMD in its own group) is empty, never by ttl; a bare `acquire` without `--pid` is ttl-only and warns. Waiters (`--wait`) are served in
+arrival order (`$PHONE_LOCK_DIR.queue`, shown by `status`). `tools/phone-guard` is a Claude Code PreToolUse hook (wired in the super repo `.claude/settings.json`) that denies hand-typed
+mutating `fastboot`/`adb` (also inside `bash -c`/`eval`); read-only queries and `adb shell getprop` pass; it is a guard rail against accidents, not a sandbox; sessions pick it up at start. Gates and builds never take the lock.
+Not guarded: `sweet-log-pull.sh`, `backup-partitions.sh`, `check-udump.sh` (adb reads, run by the user with root). Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
+
+**Fewer false alarms, no cut tails (TP-020 follow-up, 2026-10-24).** `probe-run` waits up to 120 s (`PR_BACK`) for the phone after a shim run (it leaves USB for about 30 s and returns in recovery: observed by the Wi-Fi agent, HANDOFF session 28, not re-measured) with the
+capture still running; a slow return is a PASS note, a run that hit `--timeout` while the shim was still logging (log younger than 15 s) is a FAIL "raise --timeout", and HANG / "hold Power+VolDown" needs the
+expected lines missing AND no Google USB device on the bus after the window (on the bus but not fastboot/recovery: FAIL pointing at `phone-state`). `xrun` waits up to 120 s (`XRUN_USB_WAIT`) for the phone to
+appear, after it holds the phone lock, before asking for a button hold; a hard timeout shorter than `--restart` is PARTIAL (reset not awaited); when the reset was due but the phone is not back at the hard
+timeout there is a 90 s grace window (`XRUN_GRACE`, so the cap is `--hard-timeout` + 90 s), and if the bluejay itself is then in recovery/fastboot the run is scored PASS as "reset inferred" (not observed).
+`usb_gone` in run.json is when the phone left fastboot for XNU (+2 s), not proof that the reset fired. Log tails (unit-tested on a pty / loopback socket, not yet seen on hardware): `usb-log.py capture` drains the
+tty (bounded to 2 s) after the device node vanishes and keeps a last partial line on SIGTERM; `usbnet-log.py` drains queued datagrams (bounded to 2 s) after the stop file appears. Two 2026-10-22 runs (`dvfs4-all`, `busy2`) were scored FAIL although the reset fired: `report.revised.txt` next to their `report.txt` (wording: reset inferred, not observed).
+
+**One set of phone-path tools for every agent (TP-021).** The agent-independent tools listed in `tools/common-files.txt` (lock, phone, fboot, fflash, xrun, probe-run, log capture, guard hook and their tests) have one
+source of truth: the branch `common-tools` (own worktree `~/.t3/worktrees/common-tools/kernel`; change them there). In any other worktree, at a task boundary and with the phone lock free:
+`tools/tools-sync status` (per file same/differs/missing) and `tools/tools-sync pull` (copies differing files from the ref, skips files with uncommitted changes, refuses while the lock is held; you review and commit). An agent-specific flag in a common file
+must be upstreamed to `common-tools`, or it shows as drift. The gate does not check this (drift is a warning for the agents, not a gate failure).
+
+**Runs that end when the answer is in (boot-speed B1/B2, 2026-10-24).** *Observed on hardware* (run `bl1-remote3`, kernel with patch 0100): `xrun --early --stop-on RX` stops at the pattern and `phone goto fastboot` resets the phone over the USB link (UDP `SWEET-RESET-BL`, boot-arg `sweetremote=1`);
+the phone was in fastboot 95 s later instead of the ~700 s a `--restart 400` run waits. So `--early`/`--stop-on` now switch `--remote-reset` on by default (`--no-remote-reset` to disable), `phone goto` waits 150 s (was 90) before it asks for a button hold,
+and `--fail-on RX` (default with an early stop: `Kernel trap at|panic\(cpu|panic:|Assertion failed`, `--fail-on none` to disable) ends a failing run at once and scores it FAIL, so a failing run no longer waits out the restart window. Observed NOT working (run `bl2-timer`, 2026-10-24): `--restart N,bootloader` alone (timer path) came back at restart+152 s as 18d1:d001, the same as a plain timer reset, not as fastboot (18d1:4ee0); use the remote reset.
+
+**Kernel log timestamps (boot-speed M1, patch 0115 on branch boot-speed-patches; review 17).** With boot-arg `sweetlogts=1` every console line in the persistent/USB log starts with `[SSSSS.mmm] ` (raw timer seconds: includes ABL and shim time, subtract the first stamp for time since kernel entry). The stamp is when the line's first byte reaches the console drain, not the printf time (output printed with preemption disabled is drained later): read a gap as "between drains" and confirm it with a second marker. `tools/xrun_report.py` strips the prefix before matching (merged.log stays raw) and prints `[kernel stamp N.NNN]` on the marker lines. With `sweetfb_noconsole=2` (patch 0116) keep one run without it: a hang that is not a panic shows nothing on screen while the console is muted.
+
+**shim/out and `tools-sync` safety (review 16).** Gates, `xrun` and `probe-run` take `shim/out/.build.lock` around anything that writes `shim/out`; `xrun`/`probe-run` boot a private copy of the image from the run directory and delete it after fboot. Under `phone-lock run` they wait only 60 s for a gate (the phone is held), otherwise up to an hour. `tools/tools-sync pull` refuses while the phone lock is held or unreadable, while that build lock is held, and for a file this branch changed in its own commits (shown with the log; `--force` overrides); it checks out all files in one command. Never edit `tools/xrun`, `probe-run` or `check-all.sh` in a worktree that has a run waiting or running from it (bash reads a script while it runs, AP-18): run hardware from a worktree you do not edit.
+
+**One numbering for `xnu/patches` (TP-022).** Patches stay per branch (a kernel build contains only the patches of the branch that builds it; sharing one stack was tried and rejected by the user on 2026-10-24: every agent's
+experimental patch would enter everyone's kernel and make failures harder to attribute). Branches diverge (GPU holds 0102-0111, everyone else stops at 0101), so a second agent writing "the next patch" would pick a number that is already taken.
+Before writing a patch run `tools/patch-numbers next --owner NAME --name SLUG`: it prints the next free number above every local and remote branch and every reservation, and records the reservation as a git ref
+(`refs/patch-numbers/NNNN`, shared by all worktrees). `tools/patch-numbers status` lists every number, who holds it and CONFLICT lines (same number, different file name on two branches); `tools/patch-numbers check` fails if THIS
+tree uses a number another branch has under a different name; `release NNNN` drops an unused reservation. When the branches are merged, the numbers are already in order. The gate does not run it (another branch's state must not fail
+your gate): run `check` before committing a patch and before a merge. Enforcement (two hooks): `tools/patch-guard` is a Claude Code PreToolUse hook (super repo `.claude/settings.json`) that denies creating a NEW `xnu/patches/NNNN-slug.patch` (Write/Edit tool, or a Bash redirect/cp/mv/tee/git mv) unless `refs/patch-numbers/NNNN` reserves that number for that slug
+(`tools/patch-numbers next ...`; a patch you already wrote: `tools/patch-numbers claim NNNN --owner NAME --name SLUG`); editing an existing patch is always allowed. `.git/hooks/pre-commit` (installed with `tools/patch-numbers install-hook`, shared by every worktree,
+runs the script from the common-tools worktree) refuses a staged NEW patch whose number another branch or reservation holds under a different name, and reserves the number of a clean one so nobody else picks it. Guard rails, not sandboxes, and both fail OPEN: the settings.json commands are wrapped so a missing or broken script exits 1 (non-blocking) and never 2 (which blocks every tool call), the git hook only blocks on a real overlap (exit 3 of `precommit`) and lets the commit through, with a message, on any internal error. The guard looks at the repo the PATH belongs to (last `cd` in the command), not at the session's cwd. `tools/tools-sync` can also sync a directory (manifest line ending in "/"), but no patch directory is in the manifest.
+
+Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
+(owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
+`release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
+unless `--pid N`. Owner default: `$PHONE_OWNER`, else `agent-<pid>`. Last line `RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns`; exit 0 ok, 1 busy after `--wait`
+(max 3600; holder and age printed) or, for `run`, CMD's own exit code, 2 error; `status` exits 0 free / 1 held. Touches no device. Tested on the host only.

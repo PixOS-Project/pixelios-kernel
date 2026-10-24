@@ -234,6 +234,7 @@ static int poll_bit(uint32_t want, uint32_t *v, int *rok)
 	return 0;
 }
 
+#ifndef WLAN_LINK_RUN	/* the --wlan-iso procedure; a --wlan-link image has the two steps below instead */
 static void iso_line(const char *what, uint32_t v1, uint32_t v2)
 {
 	char line[RAMLOG_LINE_MAX];
@@ -363,6 +364,44 @@ int wlan_iso_run(void)
 	iso_summary(rel, rok, after, rest);
 	return rel_ok && rest[0] != 'F' ? 0 : 1;
 }
+#endif	/* !WLAN_LINK_RUN */
+
+#ifdef WLAN_LINK_RUN
+/* --wlan-link (wlanlink.c, docs/research/29 section 14): the same two RMW calls as separate, individually reported steps of the long chain (S05 and the isolation clear that is LAST of the
+ * teardown). 0 = ok, 1 = refused before any RMW was sent (isolation already released / the SMC READ is refused or differs from the MMIO word), 2 = sent but fault / mismatch (the caller runs the
+ * clear anyway). *rd = the last read of the isolation word (0 if unreadable). */
+int wlan_link_iso_set(uint32_t *rd)
+{
+	uint32_t before = 0, iso0 = 0, iso0b = 0, after = 0;
+	struct smc_res r = { 0, 0, 0, 0 }, rs = { 0, 0, 0, 0 };
+	int rok = 0, reached;
+
+	*rd = 0;
+	if (!try_read32(ISO_REG, &before) || !try_read32(WLAN_PMU_PCIE0_ISO, &iso0))
+		return 1;
+	if ((before & 1u) || smc_priv_read(ISO_REG, &r) || (int32_t)(uint32_t)r.a0 < 0 || (uint32_t)r.a0 != before)
+		return 1;
+	smc_priv_rmw_set(&rs);
+	reached = poll_bit(1u, &after, &rok);
+	(void)try_read32(WLAN_PMU_PCIE0_ISO, &iso0b);
+	*rd = rok ? after : 0u;
+	return (rok && reached && (int32_t)(uint32_t)rs.a0 == 0 && ((after ^ before) & ~1u) == 0u && iso0b == iso0) ? 0 : 2;
+}
+
+int wlan_link_iso_clear(uint32_t *rd)
+{
+	uint32_t rb = 0, fin = 0;
+	struct smc_res rc = { 0, 0, 0, 0 };
+	int rok2 = 0, fin_ok;
+
+	smc_priv_rmw_clear(&rc);
+	(void)poll_bit(0u, &rb, &rok2);
+	wait_ticks(counter_freq() / ISO_FINAL_DIV);
+	fin_ok = try_read32(ISO_REG, &fin);
+	*rd = fin_ok ? fin : 0u;
+	return (rok2 && !(rb & 1u) && fin_ok && !(fin & 1u)) ? 0 : 2;
+}
+#endif	/* WLAN_LINK_RUN */
 #endif	/* WLAN_ISO_RUN */
 
 #else	/* not gs101 / --wlan-smc-read not built: refuse, no SMC */

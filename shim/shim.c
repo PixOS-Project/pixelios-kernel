@@ -19,6 +19,7 @@
 #include "wlanrails.h"
 #include "wlanen.h"
 #include "wlansmc.h"
+#include "wlanlink.h"
 #include "gpuprobe.h"
 #include "gpupower.h"
 #include "gpuclk.h"
@@ -698,6 +699,9 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	 * final pstore save/pager so it reaches screen and pstore alike. */
 	usbprobe_report(dtb);
 	pstore_save();			/* checkpoint: USB section */
+#if defined(WLAN_LINK_RUN) && (defined(WLAN_ISO_RUN) || defined(WLAN_EN_RUN) || defined(WLAN_SMC_READ))
+#error "--wlan-link contains the SMC and GPIO steps itself: it must not be combined with --wlan-iso / --wlan-en / --wlan-smc-read (separate reviewed units)"
+#endif
 #if defined(WLAN_ISO_RUN) && defined(WLAN_EN_RUN)
 #error "--wlan-iso and --wlan-en must not be combined: the WLAN_EN writer must never run on a PHY whose isolation may be left released (review 2 F2)"
 #endif
@@ -715,6 +719,14 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	con_clear(0xff000000U);
 	con_str("SECTION", "WLAN rails/cmu");
 	(void)wlan_rails();
+	pstore_save();
+#endif
+#ifdef WLAN_LINK_RUN
+	/* W3a (wlanlink.c, docs/research/29 section 14): the table-driven power-up chain S00..N with the teardown. Writes only through the table-checked w32; level 2 is compiled out of this image. */
+	delay_ms(3000);
+	con_clear(0xff000000U);
+	con_str("SECTION", "WLAN link");
+	(void)wlan_link_run();
 	pstore_save();
 #endif
 #ifdef WLAN_SMC_READ
@@ -744,10 +756,10 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	delay_ms(3000);
 	con_clear(0xff000000U);
 	con_str("SECTION", "WLAN pcie");
-#ifdef WLAN_ISO_RUN
-	/* review 2 F2: a --wlan-iso image never reads the PCIe wrapper (SYSREG/ELBI/DBI/PMA): a bit left set by a failed restore would open the level-2 gate on an unconfigured block, and
+#if defined(WLAN_ISO_RUN) || defined(WLAN_LINK_RUN)
+	/* review 2 F2: a --wlan-iso / --wlan-link image never reads the PCIe wrapper (SYSREG/ELBI/DBI/PMA): a bit left set by a failed restore would open the level-2 gate on an unconfigured block, and
 	 * wlan_probe_l2_group(4) reads DBI/ELBI too. Level 2 belongs to its own reviewed flag. */
-	con_str("WLAN", "l2 skipped: --wlan-iso image");
+	con_str("WLAN", "l2 skipped: --wlan-iso / --wlan-link image");
 #else
 	/* level 2 is gated (wlan_gate, docs/research/20 section 3 D1): the wrapper is read only if the PCIe1 PHY is not isolated and the CMU_HSI2 PCIe mux is
 	 * selected; a pstore checkpoint after every group so the last line of a hang names the block (PMA last) */
@@ -757,7 +769,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 			pstore_save();
 		}
 	wlan_probe_l2_group(4);			/* SUMMARY, also when gated */
-#endif	/* !WLAN_ISO_RUN */
+#endif	/* !(WLAN_ISO_RUN || WLAN_LINK_RUN) */
 	pstore_save();
 #endif
 #ifdef GPU_PROBE
@@ -924,7 +936,7 @@ static void delay_ms(unsigned ms)
 	wait_ticks((counter_freq() / 1000) * ms);
 }
 
-#if defined(TOUCH_PROBE) || defined(GPU_POWER) || defined(GPU_CLK) || defined(GPU_RAILS) || defined(GPU_RAIL_ON) || defined(GPU_JOB) || defined(WLAN_RAILS)
+#if defined(TOUCH_PROBE) || defined(GPU_POWER) || defined(GPU_CLK) || defined(GPU_RAILS) || defined(GPU_RAIL_ON) || defined(GPU_JOB) || defined(WLAN_RAILS) || defined(WLAN_LINK_RUN)
 uint64_t touch_ticks(void)	/* touchprobe.c / gpupower.c: bounded waits (CNTPCT) */
 {
 	return now();

@@ -171,6 +171,18 @@ class Report(unittest.TestCase):
         self.assertEqual(r["result"], "FAIL")
         self.assertIn("failure pattern", r["reason"])
 
+    def test_kernel_timestamp_prefix_does_not_hide_lines(self):
+        # kernel patch 0115 (sweetlogts=1): every console line starts with "[SSSSS.mmm] "; the anchored regexes must still match and the stamp is reported
+        stamped = "".join("[%5d.%03d] %s\n" % (10 + i, 7, ln) for i, ln in enumerate(LOG1.splitlines()))
+        d = self.run_dir("20260101T000800Z-k", snaps=[(30, stamped)], run={"expect": ["SWEET CPU: cpu=0 mpidr"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertTrue(r["expect"][0]["found"] if isinstance(r["expect"], list) else True)
+        cpu = r["markers"]
+        self.assertTrue(any(v.get("k") is not None for v in cpu.values()), cpu)
+        self.assertEqual(xrun_report.kstamp("[   12.345] SWEET CPU: x"), 12.345)
+        self.assertIsNone(xrun_report.kstamp("SWEET CPU: x"))
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")

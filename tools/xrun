@@ -3,7 +3,7 @@
 #   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--gpu-handover] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
 #              [--reader "qr-log.py options"]   (e.g. "--workers 3 --average 3 --tiles 1"; QL2 boot-args go in --args: sweetqr_fmt=1|2 sweetqr_ver sweetqr_ecc sweetqr_tiles sweetqr_ms sweetqr_k sweetqr_red sweetqr_fec sweetqr_hold)
 #              [--expect REGEX]... [--expect-absent REGEX]... [--duration S] [--label NAME] [--no-flash-check]
-#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]...
+#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]... [--overlay DIR]
 #   --remote-reset  adds boot-arg sweetremote=1 (xnu patch 0100): an early stop (--early / --stop-on) then resets the phone into the bootloader over the USB link (tools/phone goto fastboot sends
 #                  UDP SWEET-RESET-BL) instead of waiting for the self-reset timer. --restart N,bootloader (timer path) lands in fastboot directly, not in recovery.
 #                  --early / --stop-on turn --remote-reset ON by default (observed working 2026-10-24, run bl1-remote3: phone in fastboot ~95 s after the stop instead of waiting ~700 s); --no-remote-reset disables it.

@@ -15,6 +15,16 @@ import calendar, glob, json, os, pathlib, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qrmerge  # noqa: E402
 
+# kernel patch 0115 (boot-arg sweetlogts=1) prefixes every console line with "[SSSSS.mmm] " (raw timer seconds, i.e. including ABL + shim time): match on the text without it,
+# keep the stamp for the report (merged.log stays raw)
+KTS = re.compile(r"^\[([ 0-9]{4}[0-9])\.([0-9]{3})\] ")
+
+
+def kstamp(line):
+    m = KTS.match(line)
+    return int(m.group(1)) + int(m.group(2)) / 1000.0 if m else None
+
+
 LISTKEYS = ("expect", "expect_absent", "stop_on", "fail_on")
 BLACK = 25          # mean luma (0-255) under which a camera frame counts as a black screen
 EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 1, "ERROR": 2}
@@ -324,6 +334,8 @@ def build(d, stop_on=None):
         from_boot = True        # guess: the live stream replays the last 64 KiB at link-up and then every line; UDP may drop datagrams
     else:
         ltime = [times[x] if x is not None and times else None for x in sidx]
+    rawlines = lines
+    lines = [KTS.sub("", x, count=1) for x in lines]
     tl = lambda i: ltime[i] - t0 if ltime[i] is not None and t0 else None     # seconds after the boot command
 
     def find(rx):
@@ -358,7 +370,7 @@ def build(d, stop_on=None):
     markers = {}
     for lab, rx in MARKERS:
         h = find(rx)
-        markers[lab] = {"count": len(h), "first": cut(lines[h[0]]) if h else None, "t": tl(h[0]) if h else None}
+        markers[lab] = {"count": len(h), "first": cut(lines[h[0]]) if h else None, "t": tl(h[0]) if h else None, "k": kstamp(rawlines[h[0]]) if h else None}
     swaps = [int(m.group(1)) for ln in lines for m in [re.match(r"SWEET FB: swap (\d+)", ln)] if m]
     markers["FB swaps (max n)"] = {"count": max(swaps) if swaps else 0, "first": None, "t": None}
     listed = {lab: [cut(lines[i]) for i in find(rx)[:cap]] for lab, rx, cap in LISTED}
@@ -466,7 +478,7 @@ def render(r):
     out.append("MARKERS:")
     seen = [(k, v) for k, v in r["markers"].items() if v["count"]]
     for k, v in seen:
-        out.append("  %s: %d%s%s" % (k, v["count"], (" first " + at(v["t"]) if v["t"] is not None else ""), (": " + v["first"]) if v["first"] and k not in ("SpringBoard lines", "backboardd lines") else ""))
+        out.append("  %s: %d%s%s" % (k, v["count"], (" first " + at(v["t"]) if v["t"] is not None else "") + (" [kernel stamp %.3f]" % v["k"] if v.get("k") is not None else ""), (": " + v["first"]) if v["first"] and k not in ("SpringBoard lines", "backboardd lines") else ""))
     out.append("  not seen: " + (", ".join(k for k, v in r["markers"].items() if not v["count"]) or "-"))
     for lab, ls in r["listed"].items():
         if ls:
