@@ -51,6 +51,7 @@ if os.environ.get("STUB_VALIDATE_SLEEP"):
     time.sleep(300)
 S
 	: >tools/test-bluejay-boot.py
+	: >tools/check-rules.py
 	printf 'import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n' >tools/test_ok.py
 	for s in phone-state hang-recover probe-run; do printf '#!/bin/sh\nexit 0\n' >"tools/$s"; chmod +x "tools/$s"; done
 	git add -A && git commit -qm init

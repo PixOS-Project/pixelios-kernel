@@ -1,0 +1,6 @@
+// fixture source: kernel repo commit ab7debb shim/wlanlink_host_test.c lines 945-949 (excerpt), git show once
+#endif
+
+#if WLAN_LINK_N == 27
+	{	/* S27: READ-ONLY endpoint config dump: 56 CFG window dwords then ATU region 1 CR1..UPPER_TARGET (7), every row a logged read (a == 2, never a probe); not one write beyond S26's own */
+		static const uint32_t cfg_offs[56] = { 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C,
