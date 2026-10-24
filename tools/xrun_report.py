@@ -121,8 +121,17 @@ def waitusb(d):
                 print("EARLY")
                 return
         time.sleep(1 if expect_reset else 5)
-    mark(d, ["t_end=%f" % now()] + (["timeout=1"] if hard and now() >= hard else []))
-    print("TIMEOUT" if hard and now() >= hard else "DONE")
+    timed_out = bool(hard and now() >= hard)
+    if timed_out and gone is not None:
+        # the phone left USB (the reset fired) but the hard timeout cut the wait before it re-enumerated (recovery takes 30-60 s): give it a grace window
+        grace_end = now() + float(os.environ.get("XRUN_GRACE", "90"))
+        while now() < grace_end:
+            if usb_present():
+                mark(d, ["usb_back=%f" % now(), "late_back=1"])
+                break
+            time.sleep(1)
+    mark(d, ["t_end=%f" % now()] + (["timeout=1"] if timed_out else []))
+    print("TIMEOUT" if timed_out else "DONE")
 
 
 def prune(d):
@@ -340,7 +349,13 @@ def build(d, stop_on=None):
     back = f("usb_back")
     reset_at = back - t0 if back and t0 else None
     restart = run.get("restart") or ""
-    reset_txt = ("reset observed at +%ds" % reset_at if reset_at is not None else
+    gone = f("usb_gone")
+    restart_s = float(re.match(r"\d+", restart).group(0)) if re.match(r"\d+", restart) else 0.0
+    # the phone left USB and a Google device is on the bus when the run ended: the reset DID fire, it was only late
+    if restart and reset_at is None and gone and "18d1" in str(run.get("phone", "")) and "[none]" not in str(run.get("phone", "")).split("adb")[0]:
+        reset_at = (f("t_end") or now()) - t0 if t0 else None
+        run["late_back"] = "1"
+    reset_txt = ("reset observed at +%ds%s" % (reset_at, " (late: the phone re-enumerated after the wait window)" if run.get("late_back") else "") if reset_at is not None else
                  ("reset NOT observed (waited %ds; the sweetrestart did not fire or the phone hung)" % (waited or 0)) if restart
                  else "no --restart (no reset expected)")
     qr_t = first_snap_t - t0 if first_snap_t and t0 else None
@@ -359,8 +374,14 @@ def build(d, stop_on=None):
         result, reason = "ERROR", run["error"]
     elif markers["panic/hang/watchdog"]["count"]:
         result, reason = "FAIL", "panic/hang/watchdog line in the log: %s" % cut(markers["panic/hang/watchdog"]["first"], 80)
+    elif restart and reset_at is None and run.get("timeout") and waited is not None and waited < restart_s and not (early_txt and not early_txt.startswith("NOT")):
+        result, reason = "PARTIAL", "hard timeout after %ds, before the reset was due (restart %ds): the reset was not awaited" % (waited, restart_s)
     elif restart and reset_at is None and not (early_txt and not early_txt.startswith("NOT")):
-        result, reason = "FAIL", "%ssweetrestart did not fire: phone never re-appeared on USB within %ds" % ("HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
+        if gone:
+            result, reason = "FAIL", "%sthe phone reset (USB gone at +%ds) but did not re-appear within %ds: hold Power+VolDown only if tools/phone-state still shows it absent" % (
+                "HARD TIMEOUT: " if run.get("timeout") else "", gone - t0 if t0 else 0, waited or 0)
+        else:
+            result, reason = "FAIL", "%ssweetrestart did not fire: the phone never left USB within %ds" % ("HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
     elif bad:
         what = "%d of %d expectations failed (first: %s%s)" % (len(bad), len(exp), "absent-violated " if bad[0]["absent"] else "missing ", cut(bad[0]["regex"], 50))
         if incomplete and not all(b["absent"] for b in bad):

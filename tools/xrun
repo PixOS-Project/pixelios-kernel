@@ -50,7 +50,9 @@ $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$res
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
 
 if [ "$check" = 1 ]; then
-	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "needs Power+VolDown hold (no Google USB device 18d1 visible)"
+	# after a previous run the phone is off the bus for 30-60 s while it reboots: wait for it (bounded) before asking for a button hold
+	for _ in $(seq 1 "${XRUN_USB_WAIT:-120}"); do grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && break; sleep 1; done
+	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "no Google USB device (18d1) appeared within ${XRUN_USB_WAIT:-120} s: needs Power+VolDown hold"
 fi
 if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
 tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" \

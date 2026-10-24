@@ -48,6 +48,20 @@ class Listener(unittest.TestCase):
         self.assertEqual([r[1] for r in rows], ["line one", "line two", "last without newline"])
         self.assertTrue(all(abs(float(r[0]) - time.time()) < 10 for r in rows))
 
+    def test_datagrams_queued_at_stop_are_kept(self):
+        # the stop file exists before the loop runs: datagrams already in the socket buffer are the last lines of the run
+        out, stop = os.path.join(self.tmp, "q.log"), os.path.join(self.tmp, "stop2")
+        open(stop, "w").close()
+
+        def ready(port):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            for i in range(5):
+                s.sendto(b"queued %d\n" % i, ("127.0.0.1", port))
+            s.close()
+        ul.run(out_path=out, port=0, duration=10, quiet=True, ready=ready, until_file=stop)
+        rows = [r.split("\t", 1)[1] for r in pathlib.Path(out).read_text().splitlines()]
+        self.assertEqual(rows, ["queued %d" % i for i in range(5)])
+
     def test_cli_stops_on_until_file(self):
         stop, out = os.path.join(self.tmp, "stop"), os.path.join(self.tmp, "u.log")
         p = subprocess.Popen([sys.executable, "-I", str(HERE / "usbnet-log.py"), "--out", out, "--port", "0", "--until-file", stop, "--quiet"],

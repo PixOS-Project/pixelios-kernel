@@ -16,6 +16,7 @@ import errno
 import fcntl
 import os
 import select
+import signal
 import struct
 import sys
 import termios
@@ -153,6 +154,18 @@ class LineTee:
         self.count += len(line)
 
 
+def drain(fd, tee, quiet=0.3):
+    """read what is still buffered in the tty after the device went away (the last lines are the ones that matter)"""
+    while select.select([fd], [], [], quiet)[0]:
+        try:
+            data = os.read(fd, READ_SIZE)
+        except OSError:
+            return
+        if not data:
+            return
+        tee.feed(data)
+
+
 def capture(node, tty_path, out_path, out_stream, poll=DEFAULT_POLL):
     parent = os.path.dirname(out_path)
     if parent:
@@ -162,21 +175,24 @@ def capture(node, tty_path, out_path, out_stream, poll=DEFAULT_POLL):
         setup_tty(fd)
         with open(out_path, "wb") as out_file:
             tee = LineTee(out_file, out_stream)
-            while True:
-                readable, _, _ = select.select([fd], [], [], poll)
-                if readable:
-                    try:
-                        data = os.read(fd, READ_SIZE)
-                    except OSError as exc:
-                        if exc.errno in CLEAN_READ_ERRNOS:
+            try:
+                while True:
+                    readable, _, _ = select.select([fd], [], [], poll)
+                    if readable:
+                        try:
+                            data = os.read(fd, READ_SIZE)
+                        except OSError as exc:
+                            if exc.errno in CLEAN_READ_ERRNOS:
+                                break
+                            raise
+                        if not data:
                             break
-                        raise
-                    if not data:
+                        tee.feed(data)
+                    if node is not None and not os.path.exists(node):
+                        drain(fd, tee)  # the node vanished with data still queued: keep it
                         break
-                    tee.feed(data)
-                if node is not None and not os.path.exists(node):
-                    break
-            tee.finish()
+            finally:
+                tee.finish()  # also on SIGTERM / Ctrl-C: the last partial line is kept
     finally:
         os.close(fd)
     return tee.count
@@ -221,6 +237,7 @@ def main(argv=None):
             return 1
         return 0
 
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # probe-run kills the capture: let capture() flush its last line
     node = wait_for_tty(args.sysfs, args.timeout, args.poll)
     if node is None:
         print("usb-log: timed out after %gs waiting for %s:%s under %s"

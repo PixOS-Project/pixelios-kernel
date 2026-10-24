@@ -91,6 +91,25 @@ class Report(unittest.TestCase):
         self.assertIn("did not fire", r["reason"])
         self.assertEqual(r["diff"]["previous"], "PASS")
 
+    def test_hard_timeout_cases(self):
+        # TP-020 follow-up: a hard timeout is not "the reset did not fire"
+        # 1. timed out before the reset was due -> PARTIAL, no FAIL
+        d = self.run_dir("20260101T000200Z-a", snaps=[(30, LOG1)], run={"restart": "600", "timeout": "1", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PARTIAL")
+        self.assertIn("before the reset was due", r["reason"])
+        # 2. the phone left USB and a Google device is on the bus at the end -> the reset fired, late: PASS
+        d = self.run_dir("20260101T000300Z-b", snaps=[(30, LOG1)], run={"restart": "60", "timeout": "1", "usb_gone": str(T0 + 70), "phone": "usb ids [18d1:d001 ] adb [recovery] fastboot product [no answer]", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("late", r["reason"])
+        # 3. left USB, nothing on the bus -> FAIL, and the text says the reset fired
+        d = self.run_dir("20260101T000400Z-c", snaps=[(30, LOG1)], run={"restart": "60", "timeout": "1", "usb_gone": str(T0 + 70), "t_end": str(T0 + 400), "phone": "usb ids [none] adb [error: no devices/emulators found] fastboot product [no answer]", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertIn("the phone reset", r["reason"])
+        self.assertNotIn("did not fire", r["reason"])
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")

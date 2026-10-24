@@ -46,6 +46,16 @@ def run(out_path, port=5140, until_file=None, duration=None, quiet=False, ready=
             buf, t0 = feed(buf, t0, data, out, time.time())
             if not quiet:
                 sys.stdout.buffer.write(data); sys.stdout.flush()
+        sock.settimeout(0.3)
+        while True:  # datagrams already queued when the stop file appeared are the last lines of the run: keep them
+            try:
+                data, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            n += len(data)
+            buf, t0 = feed(buf, t0, data, out, time.time())
+            if not quiet:
+                sys.stdout.buffer.write(data); sys.stdout.flush()
         if buf:
             out.write(b"%.3f\t%s\n" % (t0, buf.rstrip(b"\r")))
     sock.close()

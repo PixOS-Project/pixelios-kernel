@@ -6,10 +6,12 @@
 # First line: RESULT: PASS|FAIL|HANG|ERROR ...   Exit 0 PASS / 1 FAIL or HANG / 2 ERROR.
 # HANG = expected line never came AND the phone is not back (fastboot/recovery) within 30 s: hold Power+VolDown.
 # The phone legitimately leaves USB for a while when the shim reboots, so "absent" right after the result line is normal.
-# Test hooks (self-test only): PR_PHONE_STATE PR_TO_FASTBOOT PR_FBOOT PR_USBLOG PR_BUILD PR_BACK (seconds to wait for the phone).
+# Test hooks (self-test only): PR_PHONE_STATE PR_TO_FASTBOOT PR_FBOOT PR_USBLOG PR_BUILD PR_BACK (seconds to wait for the phone) PR_USBPRESENT (command: exit 0 if a Google USB device is on the bus).
+# The phone leaves USB for 30-60 s after a shim run and then shows up in recovery: waiting for it is part of the run (default 120 s), and a slow return is
+# reported as such, never as a hang. HANG (hold Power+VolDown) needs: expected lines missing AND no Google USB device at all after the window.
 cd "$(dirname "$0")/.." || exit 2
 PS=${PR_PHONE_STATE:-tools/phone-state}; TOFB=${PR_TO_FASTBOOT:-tools/to-fastboot.sh}; FBOOT=${PR_FBOOT:-tools/fboot.sh}
-USBLOG=${PR_USBLOG:-"python3 tools/usb-log.py"}; BUILD=${PR_BUILD:-./build.sh}; BACK=${PR_BACK:-30}
+USBLOG=${PR_USBLOG:-"python3 tools/usb-log.py"}; BUILD=${PR_BUILD:-./build.sh}; BACK=${PR_BACK:-120}; USBP=${PR_USBPRESENT:-"grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor"}
 . tools/plock.sh   # TP-020: the phone lock is taken after the build, right before the phone is used
 
 usage() { echo "usage: $0 [--touch-probe[=OPTS] | --build-args \"...\"] [--expect REGEX]... [--timeout S] [--label NAME] | --dry-run --from-dir DIR | --self-test" >&2; exit 2; }
@@ -108,10 +110,12 @@ main() {
 	# 7. verdict
 	if [ ${#missing[@]} = 0 ]; then
 		[ $rc = 0 ] && report PASS "all ${#expects[@]} expect(s) found, phone back: $back"
-		report PASS "all ${#expects[@]} expect(s) found, phone not back within ${BACK}s (check tools/phone-state)"
+		$USBP && report PASS "all ${#expects[@]} expect(s) found, phone on USB but not fastboot/recovery yet after ${BACK}s (tools/phone-state)"
+		report PASS "all ${#expects[@]} expect(s) found, phone still rebooting after ${BACK}s (not a failure; tools/phone-state shows it)"
 	fi
 	[ $rc = 0 ] && report FAIL "missing: ${missing[*]} (within ${timeout}s), phone back: $back"
-	report HANG "missing: ${missing[*]} and the phone is not back within ${BACK}s: hold Power+VolDown, then tools/phone-state"
+	$USBP && report FAIL "missing: ${missing[*]} (within ${timeout}s); the phone is on USB but not fastboot/recovery after ${BACK}s: tools/phone-state"
+	report HANG "missing: ${missing[*]} and no Google USB device after ${BACK}s: hold Power+VolDown, then tools/phone-state"
 }
 
 selftest() {
@@ -138,7 +142,7 @@ S
 		rm -rf "$d/cnt" "$d/w" "$d/lock"; mkdir -p "$d/w/tools" "$d/w/shim"; cp "$self" "$d/w/tools/probe-run"
 		cp "$(dirname "$self")/phone-lock" "$(dirname "$self")/plock.sh" "$d/w/tools/"; ( cd "$d/w" && PHONE_LOCK_DIR="$d/lock" eval "$PRE" )
 		out=$(cd "$d/w" && env PHONE_LOCK_DIR="$d/lock" PR_PHONE_STATE="$d/ps" PR_TO_FASTBOOT="$d/tofb" PR_FBOOT="$d/fboot" PR_USBLOG="$d/usblog" \
-			PR_BUILD="$d/build" PR_BACK=3 ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t 2>&1); rc=$?
+			PR_BUILD="$d/build" PR_BACK=3 PR_USBPRESENT=${PR_USBPRESENT:-false} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t 2>&1); rc=$?
 		if [ $rc = "$erc" ] && echo "$out" | head -1 | grep -q "^RESULT: $w" && echo "$out" | grep -q '^dir: logs/probe/' \
 			&& { [ "$w" = ERROR ] || ls "$d"/w/logs/probe/*/report.txt >/dev/null 2>&1; }; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
@@ -148,6 +152,7 @@ S
 	chk expect-missing  1 FAIL  ST_STATE=fastboot 'ST_LOG=noise\n'
 	chk never-back      1 HANG  ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
 	chk start-absent    2 ERROR ST_STATE=absent ST_LOG=
+	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with phone-state advice, not "hold Power+VolDown"
 	PRE='tools/phone-lock acquire --owner other --pid '$$' >/dev/null' chk lock-busy 2 ERROR ST_STATE=fastboot "ST_LOG=$R"   # TP-020: another owner holds the phone
 	PRE=
 	mkdir -p "$d/run"; printf '%b' "$R" >"$d/run/usb.txt"

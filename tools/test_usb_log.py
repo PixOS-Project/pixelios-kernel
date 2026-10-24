@@ -126,6 +126,45 @@ class CaptureTests(UsbLogTest):
             stdout)
 
 
+class TailTests(UsbLogTest):
+    """the last lines of a run are the ones that matter: do not drop them when the device goes away or the capture is killed"""
+
+    def test_node_vanishing_with_data_queued_keeps_all_data(self):
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        node = self.tmp / "node"
+        node.write_text("x")
+        payload = b"".join(b"line %04d ................................\n" % i for i in range(60))
+        os.write(master, payload)
+        node.unlink()  # the device is gone, but its data is still queued in the tty
+        old = usb_log.READ_SIZE
+        usb_log.READ_SIZE = 256  # several reads are needed to empty the queue
+        self.addCleanup(setattr, usb_log, "READ_SIZE", old)
+        out = self.tmp / "tail.txt"
+        usb_log.capture(str(node), os.ttyname(slave), str(out), io.BytesIO(), poll=0.05)
+        self.assertEqual(out.read_bytes(), payload)
+
+    def test_sigterm_keeps_the_last_partial_line(self):
+        make_gadget(self.sysfs)
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        out = self.tmp / "term.txt"
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "--sysfs", str(self.sysfs), "--timeout", "30", "--tty-path", os.ttyname(slave),
+             "capture", "--out", str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 30
+        while not out.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        os.write(master, b"first\nWLAN LINK summary reached=S99")  # no newline: sits in the pending buffer
+        time.sleep(1.0)
+        proc.terminate()
+        proc.communicate(timeout=30)
+        self.assertEqual(out.read_bytes(), b"first\nWLAN LINK summary reached=S99")
+
+
 class ExtractTests(UsbLogTest):
     def test_extract_is_passthrough(self):
         src = self.tmp / "in.txt"

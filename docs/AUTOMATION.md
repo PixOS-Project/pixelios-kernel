@@ -427,6 +427,13 @@ arrival order (`$PHONE_LOCK_DIR.queue`, shown by `status`). `tools/phone-guard` 
 mutating `fastboot`/`adb` (also inside `bash -c`/`eval`); read-only queries and `adb shell getprop` pass; it is a guard rail against accidents, not a sandbox; sessions pick it up at start. Gates and builds never take the lock.
 Not guarded: `sweet-log-pull.sh`, `backup-partitions.sh`, `check-udump.sh` (adb reads, run by the user with root). Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
 
+**Fewer false alarms, no cut tails (TP-020 follow-up, 2026-10-24).** `probe-run` waits up to 120 s (`PR_BACK`) for the phone after a shim run, because it leaves USB for 30-60 s and
+returns in recovery; a slow return is a PASS note ("still rebooting"), and HANG / "hold Power+VolDown" needs the expected lines missing AND no Google USB device on the bus after the window
+(on the bus but not fastboot/recovery is a FAIL pointing at `phone-state`). `xrun` waits up to 120 s (`XRUN_USB_WAIT`) for the phone to appear before asking for a button hold, gives a phone that left USB
+and a hard timeout a 90 s grace window (`XRUN_GRACE`) to re-enumerate, reports a hard timeout shorter than `--restart` as PARTIAL (reset not awaited), and says "the phone reset but did not re-appear"
+(not "did not fire") when USB went away. Log tails: `usb-log.py capture` drains the tty after the device node vanishes and keeps a last partial line on SIGTERM; `usbnet-log.py` drains queued
+datagrams after the stop file appears. Two 2026-10-22 runs (`dvfs4-all`, `busy2`) were scored FAIL although the reset fired: `report.revised.txt` next to their `report.txt`.
+
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
