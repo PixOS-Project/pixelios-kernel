@@ -67,7 +67,7 @@ All [obs-RE] from UIKitCore (`ipsw dyld disass CACHE --image UIKitCore`), symbol
   sweet tweaks (header docstring lines 1-20); grep for `UIKitCore|PrivateFrameworks|exclude|prune` finds no filter. [src]
   `overlay-ios-root.sh` (used for gpu4..inj2) only rewrites `System/Library/xpc/launchd.plist` and adds `/usr/local/bin/*` or `/usr/lib/libsweetgl.dylib`
   (`pixelios-userland/tools/overlay-ios-root.sh:42-79`). [src]
-* Direct check of `ios-root3-inj2.img` itself: RESULT_PLACEHOLDER
+* Direct check of `ios-root3-inj2.img` itself: NOT done. I started `tools/rootless/vm.sh run list` on it (one qemu guest) but the guest and its scratch dir (/tmp/r37g) had vanished when I came back, with no report. Presence in ios-root3-inj2.img is therefore **inferred** (same build tools and plan as the listed image, plan has no filter, overlay touches only launchd.plist and /usr), not measured. To settle: rerun `vm.sh run list -f keys.txt=KEYS -m 1024 ro:IMG report.bin` with the Assets.car path in KEYS and compare its sha256 with `0a53453f...`; ~20+ min under TCG, one heavy job.
 
 ## 3. What CoreUI asks the device (the link to the ADT)
 
@@ -123,7 +123,7 @@ it contradicts nothing there. [obs: demo2 usbnet shows `SBCoverSheetPrimarySlidi
 * That the missing `/product` is THE cause: it fits (CoreUI keys its lookup on those MG answers, the node is absent, SpringBoard probes it and gets "none", the milestone ADT
   had it and SpringBoard did not abort), but I did not trace what `ArtworkTraits` returns without the node, nor CoreUI's key matching. Settles it: fix 1 + one run, grep
   `Failed to load bounding path` = 0 and SpringBoard `exec` count 1 for the whole run (like demo2). A host-only partial check: none exists (CoreUI cannot run on the host).
-* Whether `gputest10` ADT differs from `gputest16/17` ADT in any other way: they all are 12852 bytes; I did not diff the bytes of every one. Settles it: `cmp` them.
+* gputest10 vs gputest17 `A.adt`: same size, 64 bytes differ (probably the random seed; not checked).
 * The numeric `_screenType` of our screen and why `-A` is not appended: not decoded; irrelevant for the fix.
 * Whether `UISDeviceContext` (UIKitServices) supplies a second idiom to UIKit (`-[UIDevice userInterfaceIdiom]` goes through `initialDeviceContext` first, then `MGCopyAnswer(DeviceClassNumber)`,
   0x1891c46b0 / 0x18920e920): it does not reach CoreUI's lookup, which asks MobileGestalt itself, so I did not follow it. If fix 1 fails, this is the next thing to read.
