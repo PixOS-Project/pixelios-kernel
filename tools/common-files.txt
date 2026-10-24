@@ -26,3 +26,4 @@ tools/test_xrun_report.py
 tools/test_tools_sync.py
 tools/patch-numbers
 tools/test_patch_numbers.py
+xnu/patches/

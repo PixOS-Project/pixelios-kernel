@@ -2,7 +2,10 @@
 """tools-sync: keep the phone-path tools identical in every agent worktree (TP-021). Python 3 stdlib only, no prompts.
 
   tools/tools-sync status [--ref common-tools]           per file: same | differs | missing | not-in-ref
-  tools/tools-sync pull   [--ref common-tools] [--force]  copy the differing files from the ref (git checkout REF -- FILE); you commit them
+  tools/tools-sync pull   [--ref common-tools] [--force] [--prune]  copy the differing files from the ref (git checkout REF -- FILE); you commit them
+
+A manifest line ending in "/" is a whole directory (today xnu/patches/): every file of it at the ref, plus files that exist only here (state only-here: upstream them to the ref
+first; `pull --prune` deletes them, never together with uncommitted work unless --force). One shared patch directory means one numbering and one stack for every agent.
 
 The file list is tools/common-files.txt AS OF THE REF. The source of truth is the branch `common-tools`: change a common file there (its own worktree),
 then every other worktree runs `tools/tools-sync pull` at a task boundary. `pull` skips a file with uncommitted local changes and refuses while the
@@ -25,10 +28,24 @@ def manifest(ref):
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
 
 
+def expand(ref, entries):
+    out = []
+    for e in entries:
+        if not e.endswith("/"):
+            out.append(e)
+            continue
+        names = set(git("ls-tree", "-r", "--name-only", ref, "--", e).stdout.split())
+        here = os.path.join(ROOT, e)
+        if os.path.isdir(here):
+            names |= {os.path.join(e, f) for f in os.listdir(here) if os.path.isfile(os.path.join(here, f))}
+        out += sorted(names)
+    return out
+
+
 def state(ref, path):
     r = git("show", "%s:%s" % (ref, path), text=False)
     if r.returncode:
-        return "not-in-ref"
+        return "only-here" if os.path.exists(os.path.join(ROOT, path)) else "not-in-ref"
     try:
         with open(os.path.join(ROOT, path), "rb") as f:
             return "same" if f.read() == r.stdout else "differs"
@@ -52,12 +69,14 @@ def main():
     p.add_argument("op", choices=("status", "pull"))
     p.add_argument("--ref", default="common-tools")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--prune", action="store_true", help="delete files that exist only here (directory entries)")
     a = p.parse_args()
     try:
         files = manifest(a.ref)
     except SystemExit as e:
         print("RESULT: %s" % e.code)
         return 2
+    files = expand(a.ref, files)
     st = {f: state(a.ref, f) for f in files}
     drift = [f for f, s in st.items() if s != "same"]
     if a.op == "status":
@@ -76,7 +95,14 @@ def main():
         return 1
     blocked = []
     for f in drift:
-        if st[f] == "not-in-ref":
+        if st[f] == "only-here":
+            if a.prune and (a.force or not dirty(f)):
+                os.remove(os.path.join(ROOT, f))
+                print("pruned     %s" % f)
+            else:
+                print("blocked    %s (only here: upstream it to %s first%s)" % (f, a.ref, "" if a.prune else ", or --prune"))
+                blocked.append(f)
+        elif st[f] == "not-in-ref":
             print("skip       %s (listed but not in %s)" % (f, a.ref))
             blocked.append(f)
         elif st[f] == "differs" and dirty(f) and not a.force:

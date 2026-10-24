@@ -61,6 +61,27 @@ class T(unittest.TestCase):
         self.assertIn("lock is held", x.stdout)
         self.assertEqual(open(os.path.join(self.r, "tools/a")).read(), "A1\n")
 
+    def test_directory_entry_only_here_and_prune(self):
+        # manifest line "patches/": every file of the dir at the ref; local extras are only-here (blocked until upstreamed or --prune)
+        os.makedirs(os.path.join(self.r, "patches"))
+        self.w("patches/0001-a.patch", "a\n"); self.w("tools/common-files.txt", "tools/a\ntools/b\npatches/\n")
+        self.git("add", "-A"); self.git("commit", "-qm", "dir")
+        self.git("checkout", "-q", "common-tools"); self.git("checkout", "-q", "main", "--", "tools/common-files.txt", "patches")
+        self.w("patches/0002-b.patch", "b\n"); self.git("add", "-A"); self.git("commit", "-qm", "common patches"); self.git("checkout", "-q", "main")
+        self.w("patches/0002-mine.patch", "x\n")  # untracked local extra with the same number
+        x = self.ts("status")
+        self.assertEqual(x.returncode, 1)
+        self.assertIn("only-here  patches/0002-mine.patch", x.stdout)
+        x = self.ts("pull")
+        self.assertEqual(x.returncode, 1)
+        self.assertIn("blocked    patches/0002-mine.patch", x.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.r, "patches/0002-b.patch")))  # the rest was pulled
+        x = self.ts("pull", "--prune")
+        self.assertEqual(x.returncode, 1)  # untracked = uncommitted work: not pruned without --force
+        x = self.ts("pull", "--prune", "--force")
+        self.assertEqual(x.returncode, 0, x.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.r, "patches/0002-mine.patch")))
+
     def test_missing_file_and_missing_ref(self):
         os.remove(os.path.join(self.r, "tools/b"))
         self.assertIn("missing    tools/b", self.ts("status").stdout)
