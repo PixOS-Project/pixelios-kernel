@@ -11,3 +11,4 @@ README.md	path	backticked path does not exist: tools/build-ios-root.sh	2026-10-2
 xnu/patches-archive/README.md	path	backticked path does not exist: bsd/dev/sweet_keys.c	2026-10-24	README not fixed yet
 xnu/patches-archive/README.md	path	backticked path does not exist: bsd/dev/sweet_touch.c	2026-10-24	README not fixed yet
 xnu/patches-archive/README.md	path	backticked path does not exist: docs/HANDOFF.md	2026-10-24	README not fixed yet
+README.md	path	fenced path does not exist: docs/CREDITS.md	2026-10-25	README not fixed yet (K2)
