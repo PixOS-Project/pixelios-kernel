@@ -200,12 +200,22 @@ static int r32(unsigned blk, uint32_t off, uint32_t *v)
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
 	if (blk == WLB_MEM) {		/* BAR0 chip id (S30, research 36): offset 0 only, and only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
-		uint32_t cr2 = 0, cmd = 0;
+		uint32_t cr2 = 0, cmd = 0, r1[4] = { 1, 1, 1, 1 };
 
 		if (off != 0u || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
 			return 0;
+		/* review 10 L1: the window itself (RC-local reads, no TLP): type MEM, base, limit, target as programmed by S29 */
+		if (!try_read32(WLAN_ATU + 0x200u, &r1[0]) || !try_read32(WLAN_ATU + 0x208u, &r1[1]) || !try_read32(WLAN_ATU + 0x210u, &r1[2]) || !try_read32(WLAN_ATU + 0x214u, &r1[3]) ||
+		    r1[0] != 0u || r1[1] != 0x60000000u || r1[2] != 0x6000FFFFu || r1[3] != 0x60000000u)
+			return 0;
 	}
 	return try_read32(pa, v);
+}
+
+/* review 10 M1: BAR0 (MEM) is never written and config space is 4 KiB; w32 refuses these BEFORE its old-value read, so no row (RMW kinds included) can cause a TLP there */
+static int w32_blk_ok(unsigned blk, uint32_t off)
+{
+	return !(blk == WLB_MEM || (blk == WLB_CFG && off >= 0x1000u));
 }
 
 /* ---- the independent write allowlist ---- */
@@ -333,6 +343,8 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 	if (!tear && r.step > WLAN_LINK_N)
 		return -2;
 	if (r.kind == WLK_MMIO_WRITE && r.mask != 0xFFFFFFFFu)	/* a full write has no old value to check the mask rule against: only whole-word rows */
+		return -2;
+	if (!w32_blk_ok(r.blk, r.off))
 		return -2;
 	pa = pa_of(r.blk, r.off);
 	if (!pa)

@@ -3411,6 +3411,7 @@ _WLANLINK_PINS = {
     "atu_ok": "return(off==0x000u&&(v==0x4u||v==0u))||(off==0x004u&&(v==0x80000000u||v==0u))||(off==0x008u&&(v==(uint32_t)WLAN_CFG||v==0u))||(off==0x00cu&&v==0u)||(off==0x010u&&(v==(uint32_t)WLAN_CFG+0x1fffu||v==0xfffu))||(off==0x014u&&(v==0x01000000u||v==0u))||(off==0x018u&&v==0u)||(off==0x204u&&(v==0u||(v==0x80000000u&&r1ok)))||(off==0x208u&&(v==0x60000000u||v==0u))||(off==0x210u&&(v==0x6000FFFFu||v==0xfffu))||(off==0x214u&&(v==0x60000000u||v==0u));",
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
     "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI||blk==WLB_CFG)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI||blk==WLB_ATU||blk==WLB_MEM)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
+    "w32_blk_ok": "return!(blk==WLB_MEM||(blk==WLB_CFG&&off>=0x1000u));",
     "ctx_read": "uint32_tlb=0,lim=0,lt=0;c->cmd=0xFFFFu;c->bar0=0xFFFFFFFFu;c->r1ok=0;if(blk==WLB_CFG){if(!try_read32(WLAN_CFG+4u,&c->cmd))c->cmd=0xFFFFu;if(!try_read32(WLAN_CFG+0x10u,&c->bar0))c->bar0=0xFFFFFFFFu;}if(blk==WLB_ATU)c->r1ok=try_read32(WLAN_ATU+0x208u,&lb)&&try_read32(WLAN_ATU+0x210u,&lim)&&try_read32(WLAN_ATU+0x214u,&lt)&&lb==0x60000000u&&lim==0x6000FFFFu&&lt==0x60000000u;",
     "gpio_field_mask": "uint32_tm=0,w;if(off==0x00u||off==0x08u||off==0x0cu||off==0x14u)w=4u;elseif(off==0x04u)w=1u;elseif(off==0x10u)w=2u;elsereturn0;for(unsignedpin=0;pin<8u;pin++)if(pins&(1u<<pin))m|=((1u<<w)-1u)<<(pin*w);returnm;",
 }
@@ -3418,9 +3419,9 @@ _WLANLINK_PINS = {
 # sha256 of the whitespace-stripped body of each safety-critical function (reviewed text, 2026-10-23). A change needs a new review AND a new pin here: these are what guarantee the teardown runs, a
 # block is probed before it is touched, the address is bounded and the writer's mask rule holds (Opus review H1: the text pins above cover only the allowlist).
 _WLANLINK_BODY_SHA = {
-    "w32": "9850d671391e4bf9d589c9f2ae676009474f3fc042278c1e9f64fbdc4973edca",
+    "w32": "e9f1c334a815a8bb132c5fa29872d85387d429042073acff18b88a6d209b78a3",
     "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
-    "r32": "271fb893121efe6e7eacbd9738524305fe326514ab7f52fa6beab95109d8d419",
+    "r32": "4a093dad27efd5284fe27f97ac69544ef8a91d8139f28fbc97b8677a71a92989",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
     "base_of": "1d9d26d25b5a2af62e1b253d336f131a89e1f98cc80311a38b8477c803292cda",
     "need_probe": "44c0b22ce25cae99db97ca86bcec9e471ebb8fcbfa077005de813f1073652b02",
@@ -3464,7 +3465,7 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     wa, wb = _c_function_span(code, "w32")
     w = re.sub(r"\s+", "", code[wa:wb])
     for need in ("if(!get_row(idx,tear,&r))return-2;", "if(r.kind!=WLK_GPIO_DAT&&r.kind!=WLK_GPIO_CON&&r.kind!=WLK_MMIO_RMW&&r.kind!=WLK_MMIO_WRITE)return-2;", "if(!tear&&r.step>WLAN_LINK_N)return-2;",
-                 "pa=pa_of(r.blk,r.off);if(!pa)return-2;", "if(r.kind==WLK_MMIO_WRITE&&r.blk!=WLB_CFG){old=r.val;}elseif(!try_read32(pa,&old)){return-1;}", "ctx_read(r.blk,&c);", "v=(old&~r.mask)|(r.val&r.mask);",
+                 "if(!w32_blk_ok(r.blk,r.off))return-2;pa=pa_of(r.blk,r.off);if(!pa)return-2;", "if(r.kind==WLK_MMIO_WRITE&&r.blk!=WLB_CFG){old=r.val;}elseif(!try_read32(pa,&old)){return-1;}", "ctx_read(r.blk,&c);", "v=(old&~r.mask)|(r.val&r.mask);",
                  "if(!w32_allowed(pa,r.mask,old,v,&c))return-2;", "returntry_write32(pa,v)?0:-1;"):
         if need not in w:
             raise AssertionError(f"{name}: w32 lost '{need}'")
@@ -3480,7 +3481,7 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
                  "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
                  "if(r.a==1u)*probed|=need_probe(r.blk);", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
-                 "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0;if(off!=0u||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;}",
+                 "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,r1[4]={1,1,1,1};if(off!=0u||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
                  "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
                  "if(need_probe(r.blk)&~probed)continue;", "for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){", "if(!get_row(i,1,&r)||r.step>hi)continue;",
                  "if(!counter_freq()){", "if(stopped==ST_OK)step_line('S',s,\"ok\"", "for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){", "pstore_save();//the lastline"):
@@ -3592,6 +3593,12 @@ def wlanlink_source_selftest() -> int:
         ("MEM read offset check dropped", good.replace("if (off != 0u || !try_read32(WLAN_ATU + 0x204u, &cr2)", "if (!try_read32(WLAN_ATU + 0x204u, &cr2)", 1)),
         ("MEM read without the region 1 guard", good.replace("!try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || ", "", 1)),
         ("MEM read with the region 1 guard weakened", good.replace("cr2 != 0x80000000u", "(cr2 & 0x80000000u) == 0u", 1)),
+        ("w32 without the MEM/config-space refusal", good.replace("\tif (!w32_blk_ok(r.blk, r.off))\n\t\treturn -2;\n", "", 1)),
+        ("w32_blk_ok lets MEM through", good.replace("return !(blk == WLB_MEM || (blk", "return !((blk", 1)),
+        ("w32_blk_ok lets config space above 4 KiB through", good.replace("off >= 0x1000u));", "off >= 0x2000u));", 1)),
+        ("MEM read without the window re-check (limit)", good.replace(" || r1[2] != 0x6000FFFFu", "", 1)),
+        ("MEM read without the window re-check (all)", good.replace("\t\tif (!try_read32(WLAN_ATU + 0x200u, &r1[0])", "\t\tif (0 && !try_read32(WLAN_ATU + 0x200u, &r1[0])", 1)),
+        ("ctx_read touches the ATU for every block", good.replace("if (blk == WLB_ATU)\n\t\tc->r1ok", "if (1)\n\t\tc->r1ok", 1)),
         ("MEM read without the Command guard", good.replace(" || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u", "", 1)),
         ("MEM read with the Command guard weakened (MEM bit only)", good.replace("(cmd & 0xFFFFu) != 0x0002u", "(cmd & 0x2u) != 0x2u", 1)),
         ("a raw read of another register", good.replace(ins, "static void evil(uint32_t *v) { (void)try_read32(0x17463EC8UL, v); }\n" + ins, 1)),

@@ -62,6 +62,7 @@ struct bank { uint32_t con, latch, ext, w[6]; };
 static struct bank gp14, gh2;
 static uint32_t pma[0x2000 / 4], pcs[0x1000 / 4], elbi[0x2000 / 4], ia[0x1000 / 4], dbi[0x1000 / 4], atu[0x1000 / 4], cfgspace[0x2000 / 4];
 static unsigned cfg_reads, cfg_reads_unconfigured, cfg_writes_unconfigured, mem_reads, mem_reads_unready, master_writes;
+static unsigned atu_reads, cfg_dev_reads;
 static int mem_mode;		/* 0 = chip id, 1 = all ones (UR without a fault), 2 = the read faults, 3 = another id */
 static uint32_t bar_sz[2];	/* fake BAR0 / BAR2 size in bytes (power of two) */
 static uint32_t iso1, iso0;
@@ -134,6 +135,8 @@ int try_read32(uintptr_t pa, uint32_t *v)
 
 	if (pa == fault_read_pa || blk_unreadable(pa))
 		return 0;
+	atu_reads += pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000;
+	cfg_dev_reads += pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000;
 	if (pa >= WLAN_MEM && pa < WLAN_MEM + 0x1000) {		/* fake BAR0: an unmapped window (not ready) = a bus abort model: unreadable */
 		mem_reads++;
 		if (!mem_ready()) {
@@ -248,7 +251,7 @@ static void world(void)
 {
 	memset(pma, 0, sizeof(pma)); memset(pcs, 0, sizeof(pcs)); memset(elbi, 0, sizeof(elbi)); memset(ia, 0, sizeof(ia)); memset(dbi, 0, sizeof(dbi)); memset(atu, 0, sizeof(atu)); atu[0x10 / 4] = 0xFFFu; atu[0x210 / 4] = 0xFFFu;		/* ATU regions 0 / 1 at reset (runs w3a-n25 / w3a-n28c): all 0, LIMIT 0xFFF */
 	memset(cfgspace, 0, sizeof(cfgspace)); cfgspace[0] = 0x43DC14E4u; cfgspace[1] = 0x00100000u; cfgspace[2] = 0x02800003u; cfgspace[3] = 0x00010000u; cfgspace[4] = 4u; cfgspace[6] = 4u; cfgspace[0x80 / 4] = 0x18001000u; cfgspace[0x88 / 4] = 0x00080080u; cfgspace[0xBC / 4] = 0x10110000u; cfgspace[0x100 / 4] = 0x13C10001u; bar_sz[0] = 0x10000u; bar_sz[1] = 0x400000u;
-	cfg_reads = cfg_reads_unconfigured = cfg_writes_unconfigured = mem_reads = mem_reads_unready = master_writes = 0; mem_mode = 0;		/* BAR0 64 KiB, BAR2 4 MiB (run w3a-n28c R28 rows 355 / 365) */
+	cfg_reads = cfg_reads_unconfigured = cfg_writes_unconfigured = mem_reads = mem_reads_unready = master_writes = atu_reads = cfg_dev_reads = 0; mem_mode = 0;		/* BAR0 64 KiB, BAR2 4 MiB (run w3a-n28c R28 rows 355 / 365) */
 	memset(&gp14, 0, sizeof(gp14)); memset(&gh2, 0, sizeof(gh2));
 	gp14.con = 0x33; gp14.ext = 0x3;			/* run w1: CON 0x33, DAT 0x3 */
 	gh2.con = 0; gh2.ext = 0x2;				/* PERST input low, CLKREQ high */
@@ -972,6 +975,43 @@ int main(void)
 			atu[0x204 / 4] = 0x80000000u; fault_read_pa = WLAN_CFG + 4;
 			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 1);						/* an unreadable Command is "not ready" */
 			EXPECT(nwrites == 0);
+		}
+		{	/* review 10 M1: the pre-allowlist refusal (no TLP before it) */
+			world();
+			for (uint32_t o = 0; o < 0x1000u; o += 4)
+				EXPECT(!w32_blk_ok(WLB_MEM, o));
+			for (uint32_t o = 0x1000u; o < 0x2000u; o += 4)
+				EXPECT(!w32_blk_ok(WLB_CFG, o));
+			EXPECT(w32_blk_ok(WLB_CFG, 0xFFCu) && w32_blk_ok(WLB_ATU, 0x204u) && w32_blk_ok(WLB_PMA, 0));
+			for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+				if (get_row(i, 0, &r) && r.blk == WLB_MEM)
+					EXPECT(w32(i, 0) == -2);
+			EXPECT(mem_reads == 0 && cfg_dev_reads == 0 && nwrites == 0);
+		}
+		{	/* review 10 L1: the MEM guard re-checks the window itself, each register wrong with CR2 enabled and Command MEM = no read */
+			uint32_t v = 0;
+			static const struct { uint32_t o, bad; } bad[4] = { { 0x200, 4u }, { 0x208, 0x60000004u }, { 0x210, 0x6001FFFFu }, { 0x214, 0x60400000u } };
+
+			for (unsigned j = 0; j < 4; j++) {
+				world();
+				atu[0] = 0x4u; atu[1] = 0x80000000u; atu[2] = 0x60FFE000u; atu[4] = 0x60FFFFFFu; atu[5] = 0x01000000u;
+				cfgspace[4] = 0x60000004u; cfgspace[0x80 / 4] = 0x18000000u; cfgspace[1] = 0x00100002u;
+				atu[0x208 / 4] = 0x60000000u; atu[0x210 / 4] = 0x6000FFFFu; atu[0x214 / 4] = 0x60000000u; atu[0x204 / 4] = 0x80000000u;
+				EXPECT(r32(WLB_MEM, 0, &v) && mem_reads == 1);
+				atu[bad[j].o / 4] = bad[j].bad;
+				EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 1);
+			}
+		}
+		{	/* review 10 L4: ctx_read touches ATU / CFG only for its own blocks (a read of the DBI-ATU window before the controller is up is the research 30 hang class) */
+			struct w32_ctx c;
+
+			world();
+			ctx_read(WLB_PMA, &c); ctx_read(WLB_GPP14, &c); ctx_read(WLB_GPH2, &c); ctx_read(WLB_ELBI, &c); ctx_read(WLB_DBI, &c); ctx_read(WLB_MEM, &c); ctx_read(WLB_NONE, &c);
+			EXPECT(atu_reads == 0 && cfg_dev_reads == 0);
+			ctx_read(WLB_CFG, &c);
+			EXPECT(atu_reads == 0 && cfg_dev_reads == 2);
+			ctx_read(WLB_ATU, &c);
+			EXPECT(atu_reads == 3 && cfg_dev_reads == 2);
 		}
 		{	/* ctx_read: an unreadable word is "not ready" (never the value a rule wants), region 1 is ready only with base AND limit AND target */
 			struct w32_ctx c;
