@@ -5,6 +5,10 @@
   tools/patch-numbers next [--owner NAME] [--name SLUG]   reserve and print the next free number (above every branch and every reservation)
   tools/patch-numbers release NNNN      drop a reservation (the patch was never written)
   tools/patch-numbers check             exit 1 if the CURRENT tree uses a number that another branch or a reservation has under a different name
+  tools/patch-numbers claim NNNN --owner NAME --name SLUG   reserve a SPECIFIC number if it is free (a patch already written without `next`)
+  tools/patch-numbers precommit         git pre-commit hook: refuses a staged NEW xnu/patches/NNNN-*.patch whose number another branch/reservation holds under a different name;
+                                        reserves the number of a clean new patch so nobody else picks it (installed by `tools/patch-numbers install-hook`)
+  tools/patch-numbers install-hook      write .git/hooks/pre-commit (shared by every worktree) that runs `precommit` from the common-tools worktree
 
 Why: GPU, Wi-Fi and tooling worktrees all add patches after 0101 and merge later; "contiguous, applied in order" breaks the moment two of them pick 0102.
 Reservations are git refs (refs/patch-numbers/NNNN -> a blob with owner, name, date): every worktree of the repo shares them, creating one is atomic,
@@ -124,6 +128,74 @@ def cmd_check():
     return 1 if bad else 0
 
 
+def cmd_claim(num, owner, name):
+    n = int(num)
+    used = survey()
+    if n in used and any(not name or name not in k for k in used[n]):
+        print("RESULT: FAIL %04d is committed on a branch as %s" % (n, "; ".join(used[n])))
+        return 1
+    body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+    sha = git("hash-object", "-w", "--stdin", inp=body).stdout.strip()
+    r = git("update-ref", "%s%04d" % (PREFIX, n), sha, "0" * 40)
+    if r.returncode:
+        cur = reservations().get(n, {})
+        print("RESULT: FAIL %04d is already reserved by %s (%s)" % (n, cur.get("owner", "?"), cur.get("name", "?")))
+        return 1
+    print("RESULT: PASS claimed %04d for %s (%s)" % (n, owner, name or "?"))
+    return 0
+
+
+def cmd_precommit():
+    r = git("diff", "--cached", "--name-only", "--diff-filter=A")
+    added = [os.path.basename(x) for x in r.stdout.splitlines() if x.startswith("xnu/patches/") and PAT.match(os.path.basename(x))]
+    if not added:
+        return 0
+    used, res = survey(), reservations()
+    bad = []
+    for f in added:
+        n = int(PAT.match(f).group(1))
+        others = {k: v for k, v in used.get(n, {}).items() if k != f}
+        if others:
+            bad.append("%04d: %s is staged here, but %s on %s" % (n, f, "; ".join(others), ",".join(sum(others.values(), []))))
+        elif n in res and res[n]["name"] not in ("?", "") and res[n]["name"] not in f:
+            bad.append("%04d: %s is staged here, but the number is reserved by %s as '%s'" % (n, f, res[n]["owner"], res[n]["name"]))
+    if bad:
+        print("patch-numbers: commit refused, overlapping xnu patch number(s):")
+        for b in bad:
+            print("  " + b)
+        print("  take a free number with `tools/patch-numbers next --owner NAME --name SLUG` (status shows who holds what), rename the patch, `git add` again")
+        return 1
+    for f in added:  # clean: make the number visible to every worktree now
+        n = int(PAT.match(f).group(1))
+        if n not in res:
+            body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", PAT.match(f).group(2), datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+            git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip(), "0" * 40)
+    return 0
+
+
+HOOK = """#!/bin/sh
+# installed by tools/patch-numbers install-hook (TP-022): xnu patch numbers must not overlap across worktrees
+T=~/.t3/worktrees/common-tools/kernel/tools/patch-numbers
+[ -f "$T" ] || exit 0
+exec python3 "$T" precommit
+"""
+
+
+def cmd_install_hook():
+    common = git("rev-parse", "--git-common-dir").stdout.strip()
+    common = common if os.path.isabs(common) else os.path.join(ROOT, common)
+    path = os.path.join(common, "hooks", "pre-commit")
+    if os.path.exists(path) and "patch-numbers" not in open(path).read():
+        print("RESULT: ERROR %s exists and is not ours; add `python3 .../patch-numbers precommit` to it by hand" % path)
+        return 2
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(HOOK)
+    os.chmod(path, 0o755)
+    print("RESULT: PASS installed %s" % path)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="patch-numbers")
     sub = p.add_subparsers(dest="op", required=True)
@@ -133,9 +205,17 @@ def main():
     n.add_argument("--name", default="")
     sub.add_parser("release").add_argument("num")
     sub.add_parser("check")
+    c = sub.add_parser("claim")
+    c.add_argument("num")
+    c.add_argument("--owner", default=os.environ.get("PHONE_OWNER") or "agent-%d" % os.getpid())
+    c.add_argument("--name", default="")
+    sub.add_parser("precommit")
+    sub.add_parser("install-hook")
     a = p.parse_args()
     try:
-        return {"status": cmd_status, "check": cmd_check}.get(a.op, lambda: cmd_next(a.owner, a.name) if a.op == "next" else cmd_release(a.num))()
+        return {"status": cmd_status, "check": cmd_check, "precommit": cmd_precommit, "install-hook": cmd_install_hook,
+                "next": lambda: cmd_next(a.owner, a.name), "release": lambda: cmd_release(a.num),
+                "claim": lambda: cmd_claim(a.num, a.owner, a.name)}[a.op]()
     except Exception as e:  # noqa: BLE001
         print("RESULT: ERROR %s" % e)
         return 2

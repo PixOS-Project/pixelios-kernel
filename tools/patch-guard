@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""patch-guard: Claude Code PreToolUse hook (TP-022). A NEW xnu/patches/NNNN-slug.patch may only be created with a number from `tools/patch-numbers next`.
+
+Denies Write/Edit/MultiEdit of a non-existing xnu/patches/NNNN-*.patch, and a Bash command that writes one (redirect, cp, mv, tee, install, git mv/checkout),
+unless refs/patch-numbers/NNNN reserves that number for this slug (or the same file name is already committed on some branch). Editing an existing patch is always allowed.
+Guard rail, not a sandbox; the git pre-commit hook (`tools/patch-numbers install-hook`) catches what a tool or script wrote without this hook seeing it.
+Stdin: the hook JSON. Stdout: a deny decision or nothing. Always exit 0. Test: tools/test_patch_guard.py.
+"""
+import importlib.machinery, importlib.util, json, os, re, subprocess, sys
+
+PATCH = re.compile(r"xnu/patches/(\d{4})-([A-Za-z0-9._+-]+)\.patch")
+WRITES = re.compile(r"(>>?\s*\S*xnu/patches/\d{4}-|\b(cp|mv|tee|install)\b[^;|&]*xnu/patches/\d{4}-|\bgit\s+(mv|checkout|restore|apply)\b[^;|&]*xnu/patches/\d{4}-)")
+
+
+def load_pn(path):
+    here = os.path.dirname(os.path.abspath(__file__))
+    ldr = importlib.machinery.SourceFileLoader("pn", os.path.join(here, "patch-numbers"))
+    spec = importlib.util.spec_from_loader("pn", ldr)
+    mod = importlib.util.module_from_spec(spec)
+    ldr.exec_module(mod)
+    # patch-numbers works on the repo that contains ITS file; point it at the repo of PATH (refs are shared by all worktrees)
+    root = subprocess.run(["git", "-C", path if os.path.isdir(path) else os.path.dirname(path) or ".", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    if root:
+        mod.ROOT = root
+    return mod
+
+
+def allowed(pn, num, slug):
+    n, fname = int(num), "%s-%s.patch" % (num, slug)
+    if fname in pn.survey().get(n, {}):
+        return True  # already committed under exactly this name somewhere
+    r = pn.reservations().get(n)
+    return bool(r) and (r["name"] in ("?", "") or r["name"] in fname)
+
+
+def deny(why):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}}))
+
+
+def main():
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    ti = d.get("tool_input") or {}
+    cwd = d.get("cwd") or os.getcwd()
+    targets = []  # (path-or-cwd, number, slug)
+    if d.get("tool_name") in ("Write", "Edit", "MultiEdit"):
+        fp = ti.get("file_path", "")
+        m = PATCH.search(fp)
+        if m and not os.path.exists(fp):
+            targets.append((os.path.dirname(fp), m.group(1), m.group(2)))
+    elif d.get("tool_name") == "Bash":
+        cmd = ti.get("command", "")
+        if WRITES.search(cmd):
+            for m in PATCH.finditer(cmd):
+                if not os.path.exists(os.path.join(cwd, m.group(0))):
+                    targets.append((cwd, m.group(1), m.group(2)))
+    if not targets:
+        return 0
+    try:
+        for where, num, slug in targets:
+            pn = load_pn(where if os.path.exists(where) else cwd)
+            if not allowed(pn, num, slug):
+                deny("new xnu patch %s-%s.patch: the number is not reserved for it. Run `tools/patch-numbers next --owner NAME --name %s` and use the number it prints "
+                     "(branches diverge, so \"the next number\" collides; see docs/AUTOMATION.md 'One numbering for xnu/patches'). Already wrote it? `tools/patch-numbers claim %s --owner NAME --name %s`."
+                     % (num, slug, slug, num, slug))
+                return 0
+    except Exception:  # noqa: BLE001 - a broken guard must not block work
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
