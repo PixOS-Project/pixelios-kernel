@@ -79,6 +79,35 @@ Applies the three stagers and every `xnu/patches/*.patch` in order on a pristine
 stager downloads. FAIL names the first failing patch and prints 10 lines of the `git apply` error. `--only-new 0088`
 still applies everything but states the verdict for that patch. It does not build; CI does.
 
+## Dev overlay: change files in the flashed root without re-flashing (xnu patch 0117, UNREVIEWED, never run on hardware)
+
+```
+tools/xrun --kernel K --overlay DIR [--args "..."] ...          # or: tools/build-xnu-image.sh --overlay DIR
+tools/mkdevoverlay.py DIR OUT.bin [--owner UID:GID]               # the packer alone (default owner 0:0)
+```
+`DIR/usr/lib/libsweetgl.dylib` becomes `/usr/lib/libsweetgl.dylib` on the phone. The image gets the archive as the payload
+RAM disk (`mkpayload.py --ramdisk`) and ` sweetdev=1` in the boot-args (607-byte budget still enforced by mkpayload). Before launchd starts,
+`sweet_devoverlay_run()` (called in `bsd_init` after `vfs_mountroot`) copies the files into the mounted root (`rootrw=1`, i.e. inside `userdata`
+only). Without `sweetdev=` it returns before printing anything; the payload of a normal `xrun` has no RAM disk.
+
+* **Archive** (little-endian, documented in the header of the patch's `bsd/dev/sweet_devoverlay.c`, validated by the kernel and by `mkdevoverlay.parse`):
+  `"SWEETDEV" | u32 version=1 | u32 count` then per entry (16-byte aligned) `u16 pathlen | u16 mode | u32 uid | u32 gid | u32 crc32 | u64 size | path | pad | data | pad`.
+  Every length is checked against the remaining bytes before use; a structural error means nothing is written; a bad crc skips that file.
+* **Allowlist** (anything else: packer error; kernel `SWEET DEV: refused PATH (reason)`): `/usr/lib/`, `/usr/local/`, `/private/var/dev/`,
+  exactly `/System/Library/xpc/launchd.plist`, `/System/Library/LaunchDaemons/org.pixelios.*` (one file name). Also refused: relative paths,
+  `..`, `.`, empty components, control bytes, mode above 0777 (no setuid), names ending `.sweettmp`/`.sweetorig`, symlinks in DIR, more than 64 MiB.
+* **Safety model:** every existing parent component is looked up without following symlinks and must be a directory; directories are created
+  only at or below an allowlisted directory prefix; the target must be absent or a regular file. Per file: identical (size + bytes) -> `skipped`;
+  else write `PATH.sweettmp`, set mode/uid/gid, fsync, rename over the target; the first replaced original is kept as `PATH.sweetorig`.
+  Errors are logged and the loop goes on; no panics, all loops bounded (count <= 4096).
+* **`sweetdev=restore`:** `--overlay DIR --args "sweetdev=restore"` (the overlay still names the paths) renames `PATH.sweetorig` back over `PATH` for every archive entry.
+* **Log lines** (UDP log): `SWEET DEV: wrote|skipped|refused|failed|restored PATH ... N ms` per file, then `SWEET DEV: done: W written, S skipped, R refused/failed, T ms`.
+* **First-run checklist:** (1) the phone already holds a flashed iOS root that has done its first boot (do not use an overlay payload for the DataMigration boot);
+  (2) kernel contains patch 0117 (`--expect "SWEET DEV: done"`); (3) overlay = one new `private/var/dev/hello` + one replaced test binary, check `wrote` lines
+  and the `ms` figures; (4) same run again, expect `skipped`; (5) size ramp for the RAM disk (research 41 U1) before anything over ~20 MiB;
+  (6) a bad launchd.plist leaves the root unbootable: keep the previous plist (`.sweetorig`) and a `sweetdev=restore` image ready.
+* **Tests:** `python3 tools/test_mkdevoverlay.py`, `python3 tools/test_build_overlay_args.py`. Design and unknowns: kernel `docs/research/41-dev-overlay-without-reflash.md`.
+
 ## tools/phone-state: what state is the Pixel in?
 
 ```
