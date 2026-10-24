@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """run-preflight: read-only checks before a hardware run (TP-024). Host only; never touches the phone, no adb/fastboot.
 
-  tools/run-preflight [--json] [--root-sha SHA] [--margin S] -- tools/xrun|tools/probe-run ARGS...
+  tools/run-preflight [--json] [--root-sha SHA] [--margin S] [--writer --changed-vs "LABEL: ONE VARIABLE"] -- tools/xrun|tools/probe-run ARGS...
   tools/run-preflight --gen-bootargs [--check] [--pristine DIR]   regenerate tools/bootargs-known.txt (--check: exit 1 if stale)
   tools/run-preflight --self-test
 
@@ -12,6 +12,8 @@ Checks (each names the antipattern that motivates it; SKIP = not enough verified
   reach     every --expect row is < every accepted stop row (a pattern with "stopped=" and row=N|M) (AP-27)
   timeout   probe-run --timeout (or the tools/probe-run default) >= max earlier wall of runs with the same build-arg option names
             (tools/runs stats --args --all-worktrees; probe-run writes run.args since review B2) + --margin (default 60 s, a guess) (AP-14/AP-22)
+  form      every --expect containing "LINK summary" has "restore=ok" and "stopped=none" or "stopped=... row=N" (CR-08, review W3A-4 F1: a bare
+            "LINK summary reached=S23" also matches stopped=fault|timeout and restore=FAILED); --writer needs --changed-vs "<label>: <variable>" (CR-08)
   gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it) AND the work tree is clean (review B3)
   root      newest line of flashed-userdata.txt has sha256 == --root-sha (SKIP without --root-sha)
   lock      phone lock free or held by the caller (tools/phone-lock status/check)
@@ -183,6 +185,24 @@ def c_reach(tool, o):
     return "PASS", ""
 
 
+def c_form(tool, o, writer, changed_vs):
+    """CR-08. Summary expects must be fault-aware; a writer run (declared with --writer: which build flags write hardware is not derivable here)
+    carries `changed vs <label>: <one variable>`. Source: docs/reviews/W3A-WLAN-LINK-REVIEW-4.md F1 (super repo), docs/CODING-RULES.md CR-08."""
+    for p in o.get("--expect", []):
+        if "LINK summary" not in p:
+            continue
+        if "restore=ok" not in p:
+            return "FAIL", "summary --expect %r lacks restore=ok: it also matches restore=FAILED (CR-08)" % p
+        if not re.search(r"stopped=(none\b|\S+.*\brow=)", p):
+            return "FAIL", "summary --expect %r lacks stopped=none or stopped=<reason> ... row=N: it also matches a stop (CR-08)" % p
+    if writer:
+        m = re.fullmatch(r"\s*(\S[^:]*?)\s*:\s*(\S.*)", changed_vs or "")
+        if not m:
+            return "FAIL", "writer run without --changed-vs \"<last-good label>: <the one variable>\" (CR-08)"
+        return "PASS", ""
+    return "PASS", ""
+
+
 def probe_args(argv):
     """the build args tools/probe-run passes to build.sh, in its own terms (tools/probe-run:main): --touch-probe[=X] adds --pstore-fast, --build-args words."""
     out, i = [], 0
@@ -283,9 +303,10 @@ def skip_notes(tool, o):
     return s
 
 
-def run_checks(tool, argv, root_sha, margin):
+def run_checks(tool, argv, root_sha, margin, writer=False, changed_vs=None):
     o = opts(argv)
     res = [("bootargs",) + c_bootargs(tool, o), ("syntax",) + c_syntax(tool, o), ("reach",) + c_reach(tool, o),
+           ("form",) + c_form(tool, o, writer, changed_vs),
            ("timeout",) + c_timeout(tool, o, margin, argv), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
            ("lock",) + c_lock(tool, o)]
     return res, skip_notes(tool, o)
@@ -313,13 +334,17 @@ def main(argv):
                 f.write(text)
             print("wrote %s (%d names)\nRESULT: PASS" % (KNOWN, text.count("\n")))
             return 0
-        js, root_sha, margin, i = False, None, 60.0, 0
+        js, root_sha, margin, i, writer, changed_vs = False, None, 60.0, 0, False, None
         while i < len(argv) and argv[i] != "--":
             if argv[i] == "--json":
                 js = True; i += 1
-            elif argv[i] in ("--root-sha", "--margin") and i + 1 < len(argv):
+            elif argv[i] == "--writer":
+                writer = True; i += 1
+            elif argv[i] in ("--root-sha", "--margin", "--changed-vs") and i + 1 < len(argv):
                 if argv[i] == "--root-sha":
                     root_sha = argv[i + 1]
+                elif argv[i] == "--changed-vs":
+                    changed_vs = argv[i + 1]
                 else:
                     margin = float(argv[i + 1])
                 i += 2
@@ -329,7 +354,7 @@ def main(argv):
         if i >= len(argv) or not rest or os.path.basename(rest[0]) not in ("xrun", "probe-run"):
             raise Bad("usage: run-preflight [--json] [--root-sha SHA] [--margin S] -- tools/xrun|tools/probe-run ARGS...")
         tool = os.path.basename(rest[0])
-        res, notes = run_checks(tool, rest[1:], root_sha, margin)
+        res, notes = run_checks(tool, rest[1:], root_sha, margin, writer, changed_vs)
     except (Bad, ValueError, IndexError, OSError) as e:
         print("usage/internal error: %s\nRESULT: ERROR %s" % (e, str(e).split("\n")[0][:80]))
         return 2

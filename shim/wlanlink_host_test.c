@@ -735,7 +735,7 @@ int main(void)
 				if (hi && !(ev[i].v & 1u) && !lo) lo = i + 1;
 			}
 		EXPECT(hi && lo > hi);				/* ... and PERST low again, first thing of the teardown (T01) */
-		EXPECT(ev[lo].t == EV_W || ev[lo].t == EV_ISO_CLR || 1);
+		EXPECT(ev[lo].t == EV_W || ev[lo].t == EV_ISO_CLR);
 	}
 #endif
 #if WLAN_LINK_N >= 21

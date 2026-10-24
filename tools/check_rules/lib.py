@@ -23,3 +23,15 @@ def tracked(root, *globs):
 def strip_quotes(s):
     """Blank out '...' and "..." spans of one shell line (good enough for the chain lint: no multi-line strings)."""
     return re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", '""', s)
+
+
+def strip_c_comments(s):
+    """Blank /* ... */ (one line) and // comments of one C line; string literals are not parsed (good enough for the patch lints)."""
+    return re.sub(r"/\*.*?\*/|//.*$", " ", s)
+
+
+def plus_lines(lines):
+    """Added lines of a unified diff / .patch file: (1-based line no, text without the leading '+'), skipping the '+++' header."""
+    for n, l in enumerate(lines, 1):
+        if l.startswith("+") and not l.startswith("+++"):
+            yield n, l[1:]

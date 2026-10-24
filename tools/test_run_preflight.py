@@ -66,6 +66,59 @@ class T(unittest.TestCase):
         rc, out = self.pf("--", "tools/probe-run", "--expect", "LINK R36 row=1397 rd=", "--expect", "summary stopped=refused at=S36 row=(1398|1405)")
         self.assertEqual(rc, 0, out)
 
+    # CR-08: the R4:F1 form (docs/reviews/W3A-WLAN-LINK-REVIEW-4.md:12,186-188 in the super repo) is the FAIL fixture, the fixed form the PASS fixture
+    BAD_FORM = "LINK summary reached=S23"
+    FIXED_FORM = "LINK summary reached=S23 stopped=none restore=ok"
+
+    def form(self, expect, *pre):
+        return self.pf(*pre, "--", "tools/probe-run", "--expect", expect)
+
+    def test_cr08_summary_expect_must_be_fault_aware(self):
+        rc, out = self.form(self.BAD_FORM)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL form:", out)
+        self.assertIn("restore=ok", out)
+        self.assertEqual(self.form(self.FIXED_FORM)[0], 0)
+        rc, out = self.form("LINK summary reached=S23 restore=ok")        # no stopped=
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stopped=", out)
+        self.assertEqual(self.form("LINK summary stopped=none")[0], 1)     # no restore=ok
+        self.assertEqual(self.form("LINK summary stopped=refused at=S36 row=(1398|1405) restore=ok")[0], 0)
+        self.assertEqual(self.form("LINK R36 row=1397 rd=")[0], 0)         # not a summary expect
+
+    def test_cr08_writer_needs_changed_vs(self):
+        rc, out = self.form(self.FIXED_FORM, "--writer")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL form:", out)
+        self.assertEqual(self.form(self.FIXED_FORM, "--writer", "--changed-vs", "last-good")[0], 1)
+        self.assertEqual(self.form(self.FIXED_FORM, "--writer", "--changed-vs", "w3a-n23: HDR_W4 bit 16 only")[0], 0)
+        self.assertEqual(self.form(self.FIXED_FORM)[0], 0)                 # a read-only run needs no field
+
+    def test_cr08_mutants_are_killed(self):
+        """CR-02: each clause of c_form is needed. A mutant of the tool source (every occurrence replaced) must flip one of the form cases."""
+        cases = [(self.BAD_FORM, False, None, "FAIL"), ("LINK summary restore=ok", False, None, "FAIL"), ("LINK summary stopped=none", False, None, "FAIL"),
+                 (self.FIXED_FORM, True, None, "FAIL"), (self.FIXED_FORM, True, "x:", "FAIL"), (self.FIXED_FORM, True, "a: b", "PASS"), (self.FIXED_FORM, False, None, "PASS")]
+        src = open(TOOL).read()
+        muts = [("restore clause", '"restore=ok" not in p', "False"), ("stopped clause", 'if not re.search(r"stopped=(none\\b|\\S+.*\\brow=)", p):', "if False:"),
+                ("writer clause", "if not m:", "if False:"), ("summary filter", 'if "LINK summary" not in p:', "if True:")]
+        def verdicts(text):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "rp")
+                with open(path, "w") as f:
+                    f.write(text)
+                ldr = importlib.machinery.SourceFileLoader("rpm", path)
+                m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rpm", ldr)); ldr.exec_module(m)
+                return [m.c_form("probe-run", {"--expect": [e]}, w, c)[0] for e, w, c, _ in cases]
+        want = [c[3] for c in cases]
+        self.assertEqual(verdicts(src), want)
+        for name, old, new in muts:
+            self.assertGreaterEqual(src.count(old), 1, "mutant target missing: " + name)
+            try:
+                got = verdicts(src.replace(old, new))
+            except Exception:
+                continue   # a mutant that crashes is killed
+            self.assertNotEqual(got, want, "mutant survived: " + name)
+
     def probe_dir(self, name, secs, args):
         d = self.root + "/logs/probe/" + name
         put(d + "/report.txt", "RESULT: PASS x\n"); put(d + "/run.args", args + "\n")
