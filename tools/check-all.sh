@@ -16,44 +16,65 @@ git rev-parse --short HEAD >/dev/null 2>&1 || { echo "GATE ERROR not a git check
 quick=; keep=
 while [ $# -gt 0 ]; do case $1 in --quick) quick=1 ;; --keep-going) keep=1 ;; --no-memo) export PIXELIOS_AUDIT_NO_MEMO=1 ;; -j) shift; GATE_JOBS=${1:-x} ;;
 	*) echo "GATE ERROR usage: check-all.sh [--quick] [--keep-going] [--no-memo] [-j N]"; exit 2 ;; esac; shift; done
-case ${GATE_STEP_TIMEOUT:-1} in *[!0-9]*) echo "GATE ERROR GATE_STEP_TIMEOUT must be seconds"; exit 2 ;; esac
+case ${GATE_STEP_TIMEOUT:-1} in *[!0-9]*) echo "GATE ERROR GATE_STEP_TIMEOUT must be positive seconds"; exit 2 ;; esac
+[ $((10#${GATE_STEP_TIMEOUT:-1})) -gt 0 ] || { echo "GATE ERROR GATE_STEP_TIMEOUT must be positive seconds (0 disables timeout(1))"; exit 2; }
 case ${GATE_JOBS:-1} in ''|*[!0-9]*|0) echo "GATE ERROR GATE_JOBS must be a positive integer"; exit 2 ;; esac
 J=${GATE_JOBS:-8}
 mkdir -p shim/out
 log=shim/out/gate.log; stamp=shim/out/gate.stamp; prog=shim/out/gate.progress; res=shim/out/gate.result; owner=shim/out/.gate.owner
 # one gate per worktree (it owns shim/out/gate, gate.log, gate.result). Not .build.lock: xrun/probe-run builds into shim/out and the gate no longer does.
 # tools-sync also refuses a pull while this lock is held (the gate would see mixed tool versions).
+# gate.result: temp + rename, so a watcher never reads a half line. WAITING (for the lock), RUNNING while the gate runs, then the GATE line + epoch.
+putres() { printf '%s\n' "$1" >"$res.$$" && mv -f "$res.$$" "$res"; }
+finish() { putres "$1 $(date +%s)"; echo "$1"; exit "$2"; }
 exec 9>shim/out/.gate.lock
 if ! flock -n 9; then
 	w="waiting for the gate lock held by $(cat "$owner" 2>/dev/null || echo unknown)"; echo "$w" >&2; echo "$w" >>"$prog"
-	flock -w 3600 9 || { echo "GATE FAIL (another gate in this worktree holds shim/out/.gate.lock for 3600 s)"; exit 1; }
+	# WAITING replaces the previous result (a stale PASS must not stay readable); flock runs in the background so a signal is handled at once
+	putres "WAITING $$ $(date +%s)"
+	trap 'kill "$fp" 2>/dev/null; finish "GATE FAIL interrupted while waiting for the gate lock" 1' INT TERM HUP
+	flock -w 3600 9 & fp=$!
+	wait "$fp" || finish "GATE FAIL lock-timeout (another gate in this worktree holds shim/out/.gate.lock for 3600 s)" 1
+	trap - INT TERM HUP
 fi
 echo "$$ ${USER:-?} check-all $(date +%s)" >"$owner"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"; rm -f "$owner"' EXIT
 : > "$log"; : > "$prog"; rm -rf shim/out/gate; mkdir -p shim/out/gate
-# gate.result: temp + rename, so a watcher never reads a half line. RUNNING while the gate runs, then the GATE line + epoch.
-putres() { printf '%s\n' "$1" >"$res.$$" && mv -f "$res.$$" "$res"; }
-finish() { putres "$1 $(date +%s)"; echo "$1"; exit "$2"; }
-putres "RUNNING $$ $(date +%s)"
+full=$(git rev-parse HEAD)
 h=$(git rev-parse --short HEAD)$([ -n "$(git status --porcelain)" ] && echo "+dirty")
+# Ctrl-C / kill: steps run under `timeout`, i.e. in their own process groups, so kill them (and the lane jobs) explicitly. Lanes also
+# stop at their next step boundary when this shell is gone (step()). The steps' pid files are $tmp/NAME.pid (the timeout pid = its pgid).
+kill_steps() { for f in "$tmp"/*.pid; do [ -e "$f" ] || continue; p=$(cat "$f" 2>/dev/null); [ -n "$p" ] && kill -KILL -- "-$p" "$p" 2>/dev/null; done; return 0; }
+onint() {
+	trap '' INT TERM HUP; : >"$tmp/interrupted"
+	[ -n "${pa:-}" ] && kill "$pa" 2>/dev/null
+	kill_steps; sleep 1; kill_steps   # the 2nd sweep catches a step that was starting during the first
+	finish "GATE FAIL $h interrupted" 1
+}
+trap onint INT TERM HUP
+putres "RUNNING $$ $(date +%s)"
 ALL="build build-fast build-usb build-wlan build-gpu build-gpupower build-gpuclk build-gpurails build-gpurailon build-gpujob build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate"
 want=$ALL; fullnote=
 if [ -n "$quick" ]; then
 	want=$(python3 tools/gate_select.py "$stamp") || finish "GATE FAIL $h gate_select (see $log)" 1
 	[ "$want" = FULL ] && { want=$ALL; quick=; fullnote=" quick: no usable stamp, ran full"; }
 fi
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 # step LANE NAME CMD...: skipped unless selected; a failure marks the lane and skips its remaining steps (and, unless --keep-going,
-# everyone's: they stop at their next step boundary). Each step runs under timeout -k 10 (build* 900 s, others 300 s, env GATE_STEP_TIMEOUT)
+# everyone's: they stop at their next step boundary). Each step runs under timeout -k 10 (build-wlan 1500 s, other build* 900 s, others 300 s, env GATE_STEP_TIMEOUT)
 # and logs to shim/out/gate/NAME.log; steps of one lane may run in parallel (par), so every step writes only its own files.
 step() {
 	l=$1; n=$2; shift 2
 	case " $want " in *" $n "*) ;; *) return 0 ;; esac
+	# the gate was interrupted or is gone: never start another step (exits the lane subshell)
+	{ [ -d "$tmp" ] && [ ! -e "$tmp/interrupted" ] && kill -0 $$ 2>/dev/null; } || exit 1
 	if [ -n "$keep" ]; then [ -e "$tmp/$l.lane" ] && return 0; else compgen -G "$tmp/*.fail" >/dev/null && return 0; fi
-	case $n in build*) b=900 ;; *) b=300 ;; esac; b=${GATE_STEP_TIMEOUT:-$b}
+	case $n in build-wlan) b=1500 ;; build*) b=900 ;; *) b=300 ;; esac; b=${GATE_STEP_TIMEOUT:-$b}
 	echo "START $n $(date +%s)" >>"$prog"; s=$SECONDS
 	# 9>&- below: a step's children (an adb server, a stub sleep) must not keep the gate lock after the gate ends
 	# bash -c re-dispatches so that the exported shell function `needs` can run under timeout
-	timeout -k 10 "$b" bash -c '"$@"' _ "$@" >"shim/out/gate/$n.log" 2>&1 9>&-; rc=$?
+	timeout -k 10 "$b" bash -c '"$@"' _ "$@" >"shim/out/gate/$n.log" 2>&1 9>&- &
+	tp=$!; echo "$tp" >"$tmp/$n.pid"; wait "$tp"; rc=$?; rm -f "$tmp/$n.pid"
+	[ -d "$tmp" ] && [ ! -e "$tmp/interrupted" ] || exit 1
 	if [ $rc = 0 ]; then echo "$n $((SECONDS-s))s" >"$tmp/$n.time"; echo "END $n PASS $((SECONDS-s))" >>"$prog"
 	else
 		r=; { [ $rc = 124 ] || [ $rc = 137 ]; } && r=" (timeout)"
@@ -93,7 +114,7 @@ laneB() {
 	step B probe-run    tools/probe-run --self-test
 	step B rootless     needs tools/build-ios-root-rootless.sh bash -c 'bash -n tools/build-ios-root-rootless.sh && bash -n tools/rootless/vm.sh && bash -n tools/rootless/compare-images.sh && { [ ! -s "${PIXELIOS_VM:-$HOME/pixelios-artifacts/vm}/vmlinuz" ] || ! command -v fakeroot >/dev/null || tools/build-ios-root-rootless.sh --selftest; }'
 }
-laneA & laneB; wait
+laneA & pa=$!; laneB; wait
 # deterministic log: steps in ALL order, then timings
 for n in $ALL; do [ -s "shim/out/gate/$n.log" ] && { echo "== $n"; cat "shim/out/gate/$n.log"; }; done >>"$log"
 { echo "== timings (s)"; for n in $ALL; do cat "$tmp/$n.time" 2>/dev/null; done; } >>"$log"
@@ -102,5 +123,7 @@ total=$(echo $ALL | wc -w); ran=$(echo $want | wc -w)
 if [ -n "$quick" ]; then tag=" quick: ran $ran of $total steps"; [ -n "$fail" ] && tag=" quick: $fail"; else tag=$fullnote; [ -n "$fail" ] && tag="$tag${fullnote:+:} $fail"; fi
 [ -n "$fail" ] && finish "GATE FAIL $h$tag (see $log)" 1
 # stamp only on a clean-tree full PASS (+dirty also covers untracked files): the next --quick diffs against exactly this commit
-[ -z "$quick" ] && [ "${h%+dirty}" = "$h" ] && git rev-parse HEAD >"$stamp"
+# HEAD moving or the tree changing during the run (a commit, an edit) means the PASS covers a state we did not keep: no stamp, +dirty
+if [ "$(git rev-parse HEAD)" != "$full" ] || [ -n "$(git status --porcelain)" ]; then h=${h%+dirty}+dirty; fi
+[ -z "$quick" ] && [ "${h%+dirty}" = "$h" ] && echo "$full" >"$stamp"
 finish "GATE PASS $h$tag" 0
