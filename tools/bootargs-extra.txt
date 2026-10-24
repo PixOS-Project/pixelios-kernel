@@ -1,0 +1,1 @@
+# Boot-arg names parsed OUTSIDE xnu (e.g. by launchd) that tools/run-preflight must accept. One per line: NAME  # citation (rule 7: no citation, no entry).

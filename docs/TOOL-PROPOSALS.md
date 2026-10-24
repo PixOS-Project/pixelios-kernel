@@ -39,7 +39,7 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-012 | tools/xrun --burst-on REGEX | rejected (amended) |
 | TP-013 | tools/mg-key NAME... [--dsc CACHE] | done (amended) |
 | TP-014 | tools/lint-c | done (amended) |
-| TP-015 | tools/probe-run-timeout | proposed (amended) |
+| TP-015 | tools/probe-run-timeout | done (amended) |
 | TP-016 | tools/phone-lock | done |
 | TP-017 | tools/tool-proposals prune | done |
 | TP-018 | tools/phone | proposed |
@@ -47,8 +47,8 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-020 | tools/phone-lock | done (amended) |
 | TP-021 | tools/tools-sync | done |
 | TP-022 | tools/patch-numbers | done (amended) |
-| TP-023 | tools/runs | approved (amended) |
-| TP-024 | tools/run-preflight | approved (amended) |
+| TP-023 | tools/runs | done (amended) |
+| TP-024 | tools/run-preflight | done (amended) |
 | TP-025 | tools/fflash-userdata.sh --sparse | approved (amended) |
 | TP-026 | tools/qemu-sweet.py --smoke | approved (amended) |
 | TP-027 | tools/devsh + org.pixelios.devd | approved (amended) |
