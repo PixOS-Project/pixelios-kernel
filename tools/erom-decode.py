@@ -13,8 +13,8 @@ Format source (read from source, NOT invented): mainline Linux brcmfmac v6.12 `b
   size type 5:4 (0 4K, 1 8K, 2 16K, 3 = a size descriptor follows)) and the walk :812-960 (brcmf_chip_dmp_get_desc / _get_regaddr / _erom_scan). The same hardware format is walked by Broadcom DHD
   aiutils.c:ai_scan (docs/research/37 s.1.3). Core ids: bcma.h:97-159 (wlan-stage3). The base/wrapper choice is brcmfmac's (first 4K/8K slave-kind address = base; first master-wrapper kind if the core
   has a master port descriptor right after its CIB, else slave-wrapper kind = wrapper); `kept` = brcmfmac keeps the core (nmw + nsw != 0, or PMU / GCI).
---require-dump (review 13 M2, the capture-safety check of a hardware run): FAIL (exit 1, `RESULT: FAIL ...`) if ANY dword of the dump span (every logged S32 MEM row of the table, offsets 0..0xDFC)
-is missing from the log, even after an EOT: the 32 KiB ramlog evicts the head of the dump, so only the live USB stream is complete and a run counts only when this passes.
+--require-dump (review 13 M2, W-C1c; the capture-safety check of a hardware run): FAIL (exit 1, `RESULT: FAIL ...`) if ANY dword from index 0 up to and including the first EOT dword (0x0000000F, where the run stops reading,
+observed at 0-based dword 217 in run w3a-n32) is missing from the log; with no 0xF in the log every dword of the dump span (offsets 0..0xDFC) is required. The live USB stream is the complete copy; a run counts only when this passes.
 The log's `LINK table sha=<16 hex>` line (printed at the start of every run) must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2; review 13 L1); a log without that line is decoded with a notice.
 Exit code 0 = decoded to EOT, 1 = truncated / gap / malformed / (--require-dump) a dump dword missing, 2 = usage / no data / table sha mismatch."""
 import argparse
@@ -144,7 +144,10 @@ def dwords_from_log(text, table_rows):
     n = 0
     while n in got:
         n += 1
-    return [got[i] for i in range(n)], sorted(set(idx.values()) - set(got))
+    # W-C1c: the run stops reading at the first dword 0xF (EOT), so only the dwords up to and including it are expected; no 0xF seen = the whole span is expected
+    eot = min((i for i, v in got.items() if v == 0xF), default=None)
+    want = set(idx.values()) if eot is None else {i for i in idx.values() if i <= eot}
+    return [got[i] for i in range(n)], sorted(want - set(got))
 
 
 def check_table_sha(text, table_sha):

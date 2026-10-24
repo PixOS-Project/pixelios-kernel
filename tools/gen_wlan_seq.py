@@ -33,8 +33,13 @@ REFS2 = Path(os.environ.get("WLAN_REFS2", str(REFS.parent / "wlan-stage2")))
 PCICFG = REFS2 / "include_pcicfg.h"
 PCIR = REFS2 / "pci_regs.h"	# copy of the host /usr/include/linux/pci_regs.h, linux-libc-dev 6.12.113-1 (sha-pinned below)
 DHDP, SIU, AIU = REFS2 / "dhd_pcie.c", REFS2 / "siutils.c", REFS2 / "aiutils.c"
+AIDMPH = REFS2 / "aidmp.h"	# Broadcom aidmp.h (research 38, present in wlan-stage2 since 2026-10-24)
+BCHIP = REFS2.parent / "wlan-stage3" / "brcmfmac-chip.c"	# Linux v6.12 brcmfmac (research 38 s.2: SYS_MEM coreinfo)
 HNDSOC, SBCHIPC, BCMDEVS, DHDL = REFS2 / "include_hndsoc.h", REFS2 / "include_sbchipc.h", REFS2 / "include_bcmdevs.h", REFS2 / "dhd_pcie_linux.c"
-SRC_NAMES = {PCIR: "linux/pci_regs.h", PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", HNDSOC: "bcm4389/include_hndsoc.h", SBCHIPC: "bcm4389/include_sbchipc.h", BCMDEVS: "bcm4389/include_bcmdevs.h", DHDL: "bcm4389/dhd_pcie_linux.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
+PCIEC = REFS2 / "include_pcie_core.h"	# research 40: powerctl 0x1E8
+REFS4 = REFS2.parent / "wlan-stage4"	# research 40 `G`: Google's own bcm4389 DHD tree (kerneltoast/android_kernel_google_tensynos@af5c65b9, SOURCE.txt there)
+G4SIUH, G4SBSYS, G4SIU = REFS4 / "g4389-include_siutils.h", REFS4 / "g4389-include_sbsysmem.h", REFS4 / "g4389-siutils.c"
+SRC_NAMES = {PCIEC: "bcm4389/include_pcie_core.h", G4SIUH: "g4389/include_siutils.h", G4SBSYS: "g4389/include_sbsysmem.h", G4SIU: "g4389/siutils.c", AIDMPH: "bcm4389/aidmp.h", BCHIP: "brcmfmac-chip.c", PCIR: "linux/pci_regs.h", PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", HNDSOC: "bcm4389/include_hndsoc.h", SBCHIPC: "bcm4389/include_sbchipc.h", BCMDEVS: "bcm4389/include_bcmdevs.h", DHDL: "bcm4389/dhd_pcie_linux.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
 BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG", "MEM")
 FULL = 0xFFFFFFFF
@@ -286,11 +291,15 @@ STEP_NAMES = {
     29: "iATU outbound region 1 = MEM (CPU 0x60000000..0x6000FFFF -> PCI 0x60000000, BAR0 only; 4 ATU writes, CR2 last), BAR0 window cfg 0x80 := 0x18000000, then Command := MEM only (research 36; the first Command write, MASTER never; explicit --wlan-link=29 only; region 1 disable, Command 0 and the window restore FIRST in the teardown)",
     30: "the FIRST BAR0 read: ChipCommon chipid at MEM 0x60000000 (research 36; one guarded read + logged copy + link/AER logs + one-shot id == 0x4389; explicit --wlan-link=30 only; no write; a bus stall would show as the last line `LINK S30 start`)",
     31: "READ-ONLY on the chip (research 37 s.9.1 run A): ChipCommon eromptr (CC+0xFC), clk_ctl_st (CC+0x1E0) and capabilities_ext (CC+0xAC) through the BAR0 window left at 0x18000000 by S29 (3 logged MEM reads + link/AER logs + one-shot checks: window still 0x18000000, eromptr 4 KiB aligned inside 0x18000000..0x1FFFFFFF, chip id word still 0x10034389; explicit --wlan-link=31 only; no write of any kind, no window move)",
-    32: "research 37 s.9.1 run B: the ONE new chip-facing write, PCI_BAR0_WIN cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31) with a one-shot read-back, then 896 logged READ-ONLY MEM dword reads BAR0+0..0xDFC (the EROM up to ER_REMAPCONTROL 0xE00), a first-dword check, link/AER logs; the window is restored to 0x18000000 FIRST in the teardown (explicit --wlan-link=32 only; no other write)",
+    32: "research 37 s.9.1 run B: the ONE new chip-facing write, PCI_BAR0_WIN cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31) with a one-shot read-back, then logged READ-ONLY MEM dword reads BAR0+0..0xDFC (up to 896, the EROM up to ER_REMAPCONTROL 0xE00) that STOP at the first EOT dword 0xF (none within 896 = refusal), a first-dword check, link/AER logs; the window is restored to 0x18000000 FIRST in the teardown (explicit --wlan-link=32 only; no other write)",
+    33: "research 38 (W-C2), trimmed by research 40 s.1 finding 4: READ-ONLY chip state through three BAR0 window moves (cfg 0x80 := 0x18012000 PMU, 0x18120000 ARM CA7 wrapper, 0x18126000 SYS_MEM wrapper, each only from its predecessor, each read back): PMU caps/control/status/min/max, the IOCTL / RESET_CTL / RESET_ST of the two wrappers, link/AER logs; the SYS_MEM-up gate and the SYS_MEM core page moved to S35 (SYS_MEM is down at power-up, observed run w3a-n33, so a gate here would stop every later step); the window is restored to 0x18000000 FIRST in the teardown by the S32 rows T01/T02 (explicit --wlan-link=33 only; no write except the window moves)",
+    34: "research 40 (W-C3) run 1: the FIRST write into a chip register behind BAR0: SRPWR request for power domain 1 (ARM/BP/SDIO) as DHD does for a MULTIBP chip (4389) before it touches the ARM or SYS_MEM wrapper: cfg 0x80 := 0x18001000 (PCIe core page), powerctl (BAR0+0x1E8) RMW bit 0x200 with read-backs, wait ExtPwrStatus bit 0x20000 (15 ms), logs; nothing is undone on the chip, the window is restored FIRST in the teardown (T01/T02) and the module power is cut at T20/T22 (explicit --wlan-link=34 only)",
+    35: "research 40 (W-C3) run 2 (S34 + this): SYS_MEM wrapper `_ai_core_reset(0, 0)` as DHD (RESET_CTL := 1, IOCTL := FGC|CLK, RESET_CTL := 0, IOCTL := CLK, each with a read-back or wait), the SYS_MEM-up gate (IOCTL & 3 == 1, RESET_CTL & 1 == 0, RESET_ST == 0), cfg 0x80 := 0x18026000, coreinfo read, bankidx := 0 (only if coreinfo says no ROM bank), bankidx / bankinfo logs (explicit --wlan-link=35 only; restore FIRST in the teardown)",
+    36: "research 40 (W-C3) run 3 (S35 + this): ARM CA7 halt as DHD (`si_core_reset(CPUHALT, CPUHALT)` = `_ai_core_reset` with RESET_CTL := 1, IOCTL := 0x23, RESET_CTL := 0, IOCTL := 0x21), the LAST chip write of the series, logged before and after (explicit --wlan-link=36 only; restore FIRST in the teardown)",
 }
 
 
-def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False):
+def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False, eot=0):
     assert kind in KINDS and (blk is None or blk in BLOCKS) and step in STEP_NAMES
     r = {"id": len(rows), "step": step, "kind": kind, "blk": blk, "off": off, "mask": mask & FULL, "value": value & FULL, "delay_us": us, "polls": polls, "restore": restore, "cite": cite, "tag": tag}
     if probe:
@@ -298,6 +307,9 @@ def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="",
     if log:
         assert kind == "read_only" and not probe, "log is for non-probe read_only rows"
         r["log"] = True
+    if eot:
+        assert kind == "read_only" and log and eot in (1, 2), "eot is for logged read_only rows: 1 = stop the dump after a 0xF dword, 2 = also refuse if the dword is not 0xF (the last row)"
+        r["eot"] = eot
     if note:
         r["note"] = note
     rows.append(r)
@@ -634,7 +646,7 @@ def build():
     # ---- S29 / S30 (research 36): region 1, BAR0 window, Command MEM, then the first MEM read; rows come from draft29() ----
     for d in draft29():
         w = d["kind"] in ("wait_eq", "wait_mask")
-        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False))
+        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], us=d.get("us", 0), polls=d.get("polls", 1 if w else 0), cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False), eot=d.get("eot", 0))
 
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     # S29 rows FIRST of all (research 36 s.5.2 R2, s.6): region 1 DISABLE (RC-local, cannot stall), Command := 0, BAR0 window := observed original; unconditional (idempotent); the region 1 resets follow the BAR rows
@@ -710,7 +722,7 @@ def draft28():
 
 
 def draft29():
-    """S29 + S30 rows (research 36 s.6): iATU outbound region 1 = MEM for BAR0, BAR0 window select, Command := MEM, then the first MEM read (build() adds them to the table). Every offset of region 1 comes from the rc.h macros."""
+    """S29..S33 rows (research 36 s.6, 37, 38): iATU outbound region 1 = MEM for BAR0, BAR0 window select, Command := MEM, then the first MEM read (build() adds them to the table). Every offset of region 1 comes from the rc.h macros."""
     an = lambda path, rx, start=1: anchor(path, find_line(path, rx, start), rx)
     O1 = lambda mac: ev(mac) - 0x300000
     vm = find_line(RC, r"static void exynos_pcie_rc_prog_viewport_mem_outbound")
@@ -782,13 +794,138 @@ def draft29():
     row(32, "mmio_write", "CFG", 0x80, FULL, 0x18105000, f"{r37b} step 7; DHD points the window at the EROM with the full erombase: {e_wr}; register {winreg} (BAR0 window = backplane address accessed by BAR0, 4 KiB core pages SI_CORE_SIZE {an(HNDSOC, r'define\s+SI_CORE_SIZE\s+0x1000')}); {obs31}", TAG_SRC, "PCI_BAR0_WIN := 0x18105000 (the EROM page): the only new write of run B", restore="bar0win_s32")
     row(32, "wait_eq", "CFG", 0x80, FULL, 0x18105000, "read-back of the row above (one-shot; our own gate, DHD has none)", TAG_GUESS, "read-back PCI_BAR0_WIN must be 0x18105000, else STOP + restore")
     cia1 = an(AIU, r"cia = get_erom_ent.sih, &eromptr, ER_TAG, ER_CI.", 200)
-    dump_cite = f"{r37b} step 8: EROM dword i at BAR0+4*i, ascending, one 32-bit load each (DHD walk reads eromptr++ from the mapped page: {e_rd.split(':')[0]}:100, eromlim = eromptr + ER_REMAPCONTROL/4 {an(AIU, r'eromlim = eromptr . .ER_REMAPCONTROL', 200)}; ER_REMAPCONTROL = 0xE00: Broadcom aidmp.h {AIDMP} (review 13 M1); 0xE00..0xFFF are EROM-controller / integration-test registers, never read)"
+    dump_cite = f"{r37b} step 8: EROM dword i at BAR0+4*i, ascending, one 32-bit load each (DHD walk reads eromptr++ from the mapped page: {e_rd.split(':')[0]}:100, eromlim = eromptr + ER_REMAPCONTROL/4 {an(AIU, r'eromlim = eromptr . .ER_REMAPCONTROL', 200)}; ER_REMAPCONTROL = 0xE00: Broadcom aidmp.h {AIDMP} (review 13 M1); 0xE00..0xFFF are EROM-controller / integration-test registers, never read); STOP AT EOT: the first dword == 0x0000000F ends the dump (every later dump row is skipped, the window is restored); the table end without an EOT is a refusal. Observed run w3a-n32: EOT 0x0000000F at 0-based dword 217 (offset 0x364, row 637), reads past it returned zeros up to dword 340, then the capture ended: probe-run --timeout 600 expired at fboot+596 s (last usb line), so 'the phone hung' is a GUESS and unlikely, the host timeout is the likely cause (review 14 H1; the console pauses 3 s per 49 lines); the EOT type 0xF: brcmfmac-chip.c:27 DMP_DESC_EOT"
     for i in range(0xE00 // 4):
-        row(32, "read_only", "MEM", 4 * i, FULL, 0, dump_cite if i == 0 else f"{r37b} step 8: EROM dword {i} (BAR0+{4 * i:#x})", TAG_GUESS, f"log EROM dword {i}" + (" (first descriptor: expected COMPONENT CIA)" if i == 0 else ""), log=True)
+        row(32, "read_only", "MEM", 4 * i, FULL, 0, dump_cite if i == 0 else f"{r37b} step 8: EROM dword {i} (BAR0+{4 * i:#x})", TAG_GUESS, f"log EROM dword {i}" + (" (first descriptor: expected COMPONENT CIA)" if i == 0 else "") + " (EOT 0xF ends the dump)", log=True, eot=2 if i == 0xE00 // 4 - 1 else 1)
         if i == 0:
             row(32, "wait_eq", "MEM", 0x0, 0xF, 0x1, f"{r37b} step 9 (review 13 L2): stop on all-ones or zeros (read failure, R36 hazard R1); the first valid EROM entry is a component CIA (low nibble 0x1 = type COMPONENT + valid bit): {cia1}; brcmfmac DMP_DESC_COMPONENT = 0x1 (brcmfmac-chip.c:27-28, :920-929); the spec's zero-run stop is not expressible in a static table", TAG_GUESS, "first EROM dword: low nibble must be 0x1 (a COMPONENT descriptor; refuses all-ones, zeros, any other type), one-shot, else STOP + restore")
     row(32, "read_only", "CFG", 0xBC, FULL, 0, f"{r37b}; as S30", TAG_GUESS, "log EP link control/status after the dump", log=True)
     row(32, "read_only", "CFG", 0x104, FULL, 0, f"{r37b}; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the dump", log=True)
+    # S33 (research 38, W-C2, READ-ONLY chip state): precondition = the S32 end state (window 0x18105000); four window moves, each only from its predecessor (the allowlist twin in wlanlink.c cfg_ok), each read back (one-shot); the exact offsets of research 38 s.3 per
+    # window; the SYS_MEM core page (W4) is entered only after the SYS_MEM wrapper gate rows (core up: IOCTL & 3 == 1 and RESET_CTL & 1 == 0, aiutils.c:936-937) passed. The restore to 0x18000000 is the S32 teardown row T01 (it takes any of the new windows as old value)
+    r38 = "research 38 s.3/s.4"
+    ai = lambda rx: an(AIDMPH, rx)
+    ioc, rcl, rst = ai(r"uint32\s+ioctrl;\s*/\* 0x408"), ai(r"uint32\s+resetctrl;\s*/\* 0x800"), ai(r"uint32\s+resetstatus;\s*/\* 0x804")
+    pmu = lambda rx: an(SBCHIPC, rx, 50)
+    up = f"core up iff (IOCTL & (FGC|CLK)) == CLK and (RESET_CTL & RESET) == 0 ({an(AIU, r'&ai->ioctrl\) & \(SICF_FGC \| SICF_CLOCK_EN\)', 900)}); AIRC_RESET = 1 ({an(AIDMPH, r'define\s+AIRC_RESET\s+1')})"
+    def move(frm, to, nm, cite):
+        row(33, "mmio_write", "CFG", 0x80, FULL, to, f"{r38} (decision s.1: cfg 0x80 = 4 KiB page base, brcmfmac masks addresses the same way); {cite}; only from {frm:#010x}", TAG_GUESS, f"PCI_BAR0_WIN := {to:#010x} ({nm})", restore="bar0win_s32")
+        row(33, "wait_eq", "CFG", 0x80, FULL, to, "read-back of the row above (one-shot; our own gate), else STOP + restore", TAG_GUESS, f"read-back PCI_BAR0_WIN must be {to:#010x}")
+    def rd(off, nm, cite):
+        row(33, "read_only", "MEM", off, FULL, 0, f"{r38}; {nm}: {cite}", TAG_GUESS, f"log {nm} (BAR0+{off:#x})", log=True)
+    row(33, "wait_eq", "CFG", 0x80, FULL, 0x18105000, f"{r38} precondition: S32 leaves cfg 0x80 = 0x18105000 (observed run w3a-n32b, restore only in the teardown)", "observed", "precondition: PCI_BAR0_WIN == 0x18105000 (S32 end state), else STOP + restore")
+    move(0x18105000, 0x18012000, "PMU core", "PMU core base 0x18012000 decoded from the EROM (observed run w3a-n32b, erom-decode)")
+    pc = pmu(r"uint32\s+pmucontrol;\s*/\* 0x600")
+    rd(0x604, "PMU pmucapabilities", f"{pmu(r'uint32\s+pmucapabilities;\s*/\* 0x604')}; low byte = pmurev ({an(SBCHIPC, r'define PCAP_REV_MASK\s+0x000000ff')})")
+    rd(0x600, "PMU pmucontrol", pc)
+    rd(0x608, "PMU pmustatus", f"{pmu(r'uint32\s+pmustatus;\s*/\* 0x608')}; ALPAVAIL 0x8 {an(SBCHIPC, r'define\s+PST_ALPAVAIL\s+0x0008')}, HTAVAIL 0x4 {an(SBCHIPC, r'define\s+PST_HTAVAIL\s+0x0004')}")
+    rd(0x618, "PMU min_res_mask", pmu(r"uint32\s+min_res_mask;\s*/\* 0x618"))
+    rd(0x61C, "PMU max_res_mask", pmu(r"uint32\s+max_res_mask;\s*/\* 0x61C"))
+    row(33, "wait_eq", "MEM", 0x604, 0xFF, 0x28, f"{r38} s.4 step 3: pmurev == the EROM PMU component rev 40 = 0x28 (observed run w3a-n32b, erom-decode) is a GUESS; placed AFTER the logs so a wrong guess loses no data; all ones fails it", TAG_GUESS, "pmucapabilities low byte must be 0x28 (one-shot), else STOP + restore")
+    move(0x18012000, 0x18120000, "ARM CA7 wrapper", "ARM_CA7 wrapper 0x18120000 decoded from the EROM (observed run w3a-n32b)")
+    rd(0x408, "ARM CA7 wrapper IOCTL", ioc)
+    rd(0x800, "ARM CA7 wrapper RESET_CTL", rcl)
+    rd(0x804, "ARM CA7 wrapper RESET_ST", rst)
+    row(33, "wait_eq", "MEM", 0x800, 0xFFFFFFFF, 1, f"{r38} s.4 step 5, tightened by review 16 finding 3: the ARM CA7 must still be HELD IN RESET (RESET_CTL == 1, observed run w3a-n33) before S35 resets SYS_MEM and S36 halts it; a persisted out-of-reset (possibly running) CA7 becomes an S33 stop before any chip write; data already logged ({an(AIDMPH, r'define\s+AIRC_RESET\s+1')})", "observed", "ARM CA7 RESET_CTL must read 1 (held in reset, observed w3a-n33), else STOP + restore")
+    move(0x18120000, 0x18126000, "SYS_MEM wrapper", "SYS_MEM wrapper 0x18126000 decoded from the EROM (observed run w3a-n32b)")
+    rd(0x408, "SYS_MEM wrapper IOCTL", ioc)
+    rd(0x800, "SYS_MEM wrapper RESET_CTL", rcl)
+    rd(0x804, "SYS_MEM wrapper RESET_ST", rst)
+    row(33, "wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, f"{r38} s.4 step 7: as the ARM CA7 RESET_CTL guard", TAG_GUESS, "SYS_MEM RESET_CTL & 0xFFFFFFFE must be 0 (one-shot), else STOP + restore")
+    row(33, "read_only", "CFG", 0xBC, FULL, 0, f"{r38} step 10; as S30", TAG_GUESS, "log EP link control/status after the reads", log=True)
+    row(33, "read_only", "CFG", 0x104, FULL, 0, f"{r38} step 10; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the reads", log=True)
+    # ---- S34..S36 (research 40, W-C3): the first chip register writes. Each step is a strict prefix of the next run (--wlan-link=34|35|36). Every write has a read-back or a wait that stops the run; nothing is undone on the chip (the teardown restores the
+    # window FIRST, T01/T02, and drops PERST at T20 and the module power WLAN_EN at T22: persistence of the chip state across WLAN_EN low is a GUESS, research 40 s.5/U-N5). The allowlist twin is wlanlink.c memw_ok (exact window / offset / value / predecessor tuples). ----
+    r40 = "research 40 s.3/s.4"
+    ai40 = lambda rx, start=1: an(AIU, rx, start)
+    core_reset = {"rst1": ai40(r"W_REG.sii->osh, &ai->resetctrl, AIRC_RESET", 1240), "io1": ai40(r"W_REG.sii->osh, &ai->ioctrl, .bits . resetbits . SICF_FGC . SICF_CLOCK_EN.", 1240), "rst0": ai40(r"W_REG.sii->osh, &ai->resetctrl, 0.;", 1280),
+                  "io2": ai40(r"W_REG.sii->osh, &ai->ioctrl, .bits . SICF_CLOCK_EN.", 1300), "wait": ai40(r"SPINWAIT\(\(R_REG.sii->osh, &ai->resetstatus\) != 0\), 300\);", 1260), "dly10": ai40(r"OSL_DELAY\(10\);", 1240), "dly1": ai40(r"OSL_DELAY\(1\);", 1320)}
+    fgc, clk = an(HNDSOC, r"define\s+SICF_FGC\s+0x0002"), an(HNDSOC, r"define\s+SICF_CLOCK_EN\s+0x0001")
+    halt = an(G4SIUH, r"define\s+SICF_CPUHALT\s+\(0x0020\)")
+
+    def mv(step, frm, to, nm, cite):
+        row(step, "mmio_write", "CFG", 0x80, FULL, to, f"{r40} (window = 4 KiB core page base, as S33); {cite}; only from {frm:#010x} (cfg_ok)", TAG_GUESS, f"PCI_BAR0_WIN := {to:#010x} ({nm})", restore="bar0win_s32")
+        row(step, "wait_eq", "CFG", 0x80, FULL, to, "read-back of the row above (one-shot; our own gate), else STOP + restore", TAG_GUESS, f"read-back PCI_BAR0_WIN must be {to:#010x}")
+
+    def rl(step, off, nm, cite):
+        row(step, "read_only", "MEM", off, FULL, 0, f"{r40}; {nm}: {cite}", TAG_GUESS, f"log {nm} (BAR0+{off:#x})", log=True)
+
+    def lg(step):
+        row(step, "read_only", "CFG", 0xBC, FULL, 0, f"{r40}; as S30", TAG_GUESS, "log EP link control/status after the writes", log=True)
+        row(step, "read_only", "CFG", 0x104, FULL, 0, f"{r40}; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the writes", log=True)
+
+    def wq(step, off, mask, val, why, polls=1, us=0, cite=None, tag=TAG_GUESS, kind="wait_eq"):
+        row(step, kind, "MEM", off, mask, val, cite or f"{r40}: {why}", tag, why, polls=polls, us=us)
+
+    def dly(step, us, cite):
+        row(step, "delay", None, 0, FULL, 0, cite, TAG_SRC, f"delay {us} us (DHD OSL_DELAY)", us=us)
+
+    def ai_reset(step, nm, want, sfx):
+        """DHD _ai_core_reset(bits, resetbits) for the wrapper window selected before (D/aiutils.c:1242-1325): the table unrolls ONE iteration of the release loop (U-N8). want = IOCTL after the assert (bits | resetbits | FGC | CLK), want & ~FGC after the release."""
+        fin = want & ~0x2
+        wq(step, 0x804, FULL, 0, f"{nm} RESET_ST == 0 before the reset assert (SPINWAIT 300 us, our table stops instead of continuing)", polls=30, us=10, cite=f"{r40}; {ai40(r'ensure there are no pending backplane operations', 1240)}")
+        row(step, "mmio_write", "MEM", 0x800, FULL, 1, f"{r40}; _ai_core_reset step 2 {core_reset['rst1']}; AIRC_RESET = 1 ({an(AIDMPH, r'define\s+AIRC_RESET\s+1')}); allowlist: memw_ok", TAG_SRC, f"{nm} RESET_CTL := 1 (put the core into reset)")
+        dly(step, 10, core_reset["dly10"])
+        wq(step, 0x800, 1, 1, f"{nm} RESET_CTL & 1 must read 1 (the write took; one-shot)")
+        wq(step, 0x804, FULL, 0, f"{nm} RESET_ST == 0 after the assert (DHD {core_reset['wait']})", polls=30, us=10)
+        row(step, "mmio_write", "MEM", 0x408, FULL, want, f"{r40}; _ai_core_reset step 5 {core_reset['io1']}; FGC {fgc}; CLK {clk}" + sfx, TAG_SRC, f"{nm} IOCTL := {want:#x} (bits | resetbits | FGC | CLK)")
+        wq(step, 0x408, 0x3FFF, want, f"{nm} IOCTL & 0x3FFF must read {want:#x} (DHD reads it back without a check, :1269; ours stops; one-shot)")
+        wq(step, 0x804, FULL, 0, f"{nm} RESET_ST == 0 (DHD :1279)", polls=30, us=10)
+        wq(step, 0x804, FULL, 0, f"{nm} RESET_ST == 0 before the release (DHD :1288)", polls=30, us=10)
+        row(step, "mmio_write", "MEM", 0x800, FULL, 0, f"{r40}; _ai_core_reset step 7 {core_reset['rst0']} (ONE iteration of the DHD retry loop, U-N8)", TAG_SRC, f"{nm} RESET_CTL := 0 (take the core out of reset)")
+        wq(step, 0x804, FULL, 0, f"{nm} RESET_ST == 0 after the release (DHD :1299)", polls=30, us=10)
+        wq(step, 0x800, 1, 0, f"{nm} RESET_CTL & 1 must clear (poll 10 x 10 us)", polls=10, us=10)
+        row(step, "mmio_write", "MEM", 0x408, FULL, fin, f"{r40}; _ai_core_reset step 8 {core_reset['io2']}; FGC dropped" + sfx, TAG_SRC, f"{nm} IOCTL := {fin:#x} (bits | CLK)")
+        wq(step, 0x408, 0x3FFF, fin, f"{nm} IOCTL & 0x3FFF must read {fin:#x} (one-shot)")
+        dly(step, 1, core_reset["dly1"])
+
+    # S34: SRPWR request for domain 1 (ARM/BP/SDIO) through the PCIe core page
+    srp = f"si_srpwr_request(0x2, 0x2): {an(SIU, r'r = .r . ~mask. . val;', 9300)}; DHD calls it with SRPWR_DMN1_ARMBPSD_MASK for a MULTIBP chip: {an(DHDP, r'mask = SRPWR_DMN1_ARMBPSD_MASK;', 790)}; 4389 is MULTIBP: {an(G4SIUH, r'BCM4389_CHIP.sih->chip.')}, {an(G4SIU, r'sih->_multibp_enable = TRUE;')}"
+    pwr = an(PCIEC, r"uint32\s+powerctl;\s*/\* 0x1E8 \*/")
+    req = an(SBCHIPC, r"define\s+SRPWR_REQON_SHIFT\s+\(8\)")
+    stat = an(SBCHIPC, r"define\s+SRPWR_STATUS_SHIFT\s+\(16\)")
+    row(34, "wait_eq", "CFG", 0x80, FULL, 0x18126000, f"{r40} precondition: S33 ends with cfg 0x80 = 0x18126000 (the SYS_MEM wrapper, observed run w3a-n33 before the trim)", "observed", "precondition: PCI_BAR0_WIN == 0x18126000 (S33 end state), else STOP + restore")
+    mv(34, 0x18126000, 0x18001000, "PCIe core page", f"PCIe core page 0x18001000 decoded from the EROM (observed run w3a-n33, erom-decode); powerctl {pwr} (U-N3: the core page + 0x1E8 is the register DHD reaches via BAR0+0x2000+0x1E8 is a GUESS)")
+    rl(34, 0x1E8, "PCIe powerctl before", f"{pwr}; PowerOnRequest[11:8] {req}, ExtPwrStatus[19:16] {stat}")
+    row(34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, f"{r40}; {srp}; request value 0x2 << 8 = 0x200; allowlist: memw_ok (only bit 0x200, 0 -> 1)", TAG_SRC, "SRPWR domain 1 request: powerctl |= 0x200")
+    wq(34, 0x1E8, 0x200, 0x200, "powerctl & 0x200 must read back 1 (the request write took; one-shot)")
+    wq(34, 0x1E8, 0x20000, 0x20000, f"ExtPwrStatus bit 17 (domain 1 on) within 15 ms (150 x 100 us); DHD SPINWAITs PMU_MAX_TRANSITION_DLY = 15000 us: {an(SBCHIPC, r'define\s+PMU_MAX_TRANSITION_DLY\s+15000')}; a timeout means domain 1 did not power: STOP + restore, no wrapper write follows", polls=150, us=100, kind="wait_mask", tag=TAG_SRC)
+    rl(34, 0x1E8, "PCIe powerctl after", f"{pwr}; status bit 17 set = domain 1 up (U-N3/U-N4)")
+    lg(34)
+    # S35: SYS_MEM wrapper core reset sequence, the up-gate, coreinfo / bankidx / bankinfo
+    sm = "SYS_MEM wrapper"
+    mv(35, 0x18001000, 0x18126000, sm, "SYS_MEM wrapper 0x18126000 decoded from the EROM (observed run w3a-n33)")
+    rl(35, 0x408, f"{sm} IOCTL before", "pre-state 0 (observed run w3a-n33)")
+    rl(35, 0x800, f"{sm} RESET_CTL before", "pre-state 1 (observed run w3a-n33)")
+    rl(35, 0x804, f"{sm} RESET_ST before", "pre-state 0 (observed run w3a-n33)")
+    ai_reset(35, sm, 0x3, "; bits = resetbits = 0 for si_core_reset(sysmem, 0, 0)")
+    rl(35, 0x408, f"{sm} IOCTL after", "expect 0x1")
+    rl(35, 0x800, f"{sm} RESET_CTL after", "expect 0")
+    rl(35, 0x804, f"{sm} RESET_ST after", "expect 0")
+    up = f"core up iff (IOCTL & (FGC|CLK)) == CLK and (RESET_CTL & RESET) == 0 ({an(AIU, r'&ai->ioctrl\) & \(SICF_FGC \| SICF_CLOCK_EN\)', 900)})"
+    wq(35, 0x408, 3, 1, f"SYS_MEM up gate 1/3: IOCTL & 3 == 1 (one-shot), else STOP + restore: the core page is not entered; {up}", tag=TAG_SRC)
+    wq(35, 0x800, 1, 0, f"SYS_MEM up gate 2/3: RESET_CTL & 1 == 0 (one-shot), else STOP + restore; {up}", tag=TAG_SRC)
+    wq(35, 0x804, FULL, 0, "SYS_MEM up gate 3/3: RESET_ST == 0 (one-shot), else STOP + restore (review 15 finding 2)", tag=TAG_SRC)
+    mv(35, 0x18126000, 0x18026000, "SYS_MEM core", "SYS_MEM core base 0x18026000 decoded from the EROM (observed run w3a-n33); entered only after the SYS_MEM up gate")
+    ci = f"{an(G4SBSYS, r'uint32\s+coreinfo;')}; rev 9 < 12 uses the OLD masks nb = coreinfo & 0x1F ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_SRNB_MASK\s+0x1f')}), nrb = (coreinfo & 0x3E0) >> 5 ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_ROMNB_MASK\s+0x3e0')}); {an(SIU, r'if .si_corerev.sih. < 12.', 7030)}; brcmfmac decodes the same word with 0xF0 (U-N2)"
+    rl(35, 0x000, "SYS_MEM coreinfo", ci)
+    row(35, "mmio_write", "MEM", 0x10, FULL, 0, f"{r40}; bankidx := 0 for bank index i + nrb with i = 0 and nrb = 0: {an(SIU, r'W_REG.sii->osh, &regs->bankidx, bankidx.;', 6955)} ({an(G4SBSYS, r'define\s+SYSMEM_BANKIDX_REG\s+0x10')}); allowlist memw_ok: only 0, only if live coreinfo != all ones, nrb == 0 and nb >= 1", TAG_SRC, "bankidx := 0 (select RAM bank 0)")
+    dly(35, 10, an(SIU, r"define SI_BANKINFO_DELAY_USEC\s+10u", 6955))
+    rl(35, 0x10, "SYS_MEM bankidx", "read back, expect 0 (U-N6)")
+    rl(35, 0x40, "SYS_MEM bankinfo (bank 0)", f"{an(G4SBSYS, r'define\s+SYSMEM_BANKINFO_REG\s+0x40')}; banksize = 8192 * ((bankinfo & 0x7F) + 1): {an(G4SBSYS, r'define\s+SYSMEM_BANKINFO_SZMASK\s+0x7f')}, {an(G4SBSYS, r'define\s+SYSMEM_BANKINFO_SZBASE\s+8192')}")
+    wq(35, 0x10, FULL, 0, "bankidx must read back 0 (one-shot; placed AFTER the logs so a mismatch loses no data)")
+    lg(35)
+    # S36: ARM CA7 halt
+    arm = "ARM CA7 wrapper"
+    mv(36, 0x18026000, 0x18120000, arm, "ARM CA7 wrapper 0x18120000 decoded from the EROM (observed run w3a-n33)")
+    rl(36, 0x408, f"{arm} IOCTL before", "pre-state 0 (observed run w3a-n33)")
+    rl(36, 0x800, f"{arm} RESET_CTL before", "pre-state 1 (observed run w3a-n33)")
+    rl(36, 0x804, f"{arm} RESET_ST before", "pre-state 0 (observed run w3a-n33)")
+    ai_reset(36, arm, 0x23, f"; bits = resetbits = SICF_CPUHALT 0x20: {an(DHDP, r'si_core_reset.bus->sih, SICF_CPUHALT, SICF_CPUHALT.', 10100)}; {halt}")
+    rl(36, 0x408, f"{arm} IOCTL after", "expect 0x21 (CPUHALT | CLK); a different word means CPUHALT did not latch (U-N1)")
+    rl(36, 0x800, f"{arm} RESET_CTL after", "expect 0")
+    rl(36, 0x804, f"{arm} RESET_ST after", "expect 0")
+    lg(36)
     return out
 
 
@@ -798,7 +935,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 32, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 36, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

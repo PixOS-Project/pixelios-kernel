@@ -102,11 +102,12 @@ class EromDecode(unittest.TestCase):
         dw, missing = ed.dwords_from_log(lost, rows)
         self.assertEqual((len(dw), missing[0]), (10, 10))
 
-    def _dump_log(self, skip=(), sha="auto"):
+    def _dump_log(self, skip=(), sha="auto", upto=None):
         doc = json.loads(TABLE.read_text())
         dump = [r for r in doc["rows"] if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only" and r.get("log")]
         full = synthetic() + [0] * (896 - len(synthetic()))
-        lines = [f"LINK R32 row={r['id']} rd=0x{full[i]:08X}" for i, r in enumerate(dump) if i not in skip]
+        upto = len(synthetic()) if upto is None else upto		# W-C1c: the run stops at the EOT, so the log ends with it (default: the synthetic EOT is the last dword)
+        lines = [f"LINK R32 row={r['id']} rd=0x{full[i]:08X}" for i, r in enumerate(dump) if i not in skip and i < upto]
         if sha == "auto":
             sha = doc["table_sha256"][:16]
         return ([f"LINK table sha={sha} rows=1318 N=32"] if sha else []) + lines
@@ -122,18 +123,26 @@ class EromDecode(unittest.TestCase):
                 rc = ed.main([d, "--table", str(TABLE), *args])
         return rc, out.getvalue(), err.getvalue()
 
-    def test_require_dump_fails_on_any_missing_dword_even_after_eot(self):
-        # review 13 M2: the synthetic EROM ends with an EOT at dword ~27; losing a dword far behind it must still FAIL with --require-dump (and only then)
-        for skip in ({0}, {5}, {500}, {895}):
+    def test_require_dump_needs_every_dword_up_to_the_eot_only(self):
+        # W-C1c: the run stops at the first EOT dword (0xF): every dword from 0 through it is required (a lost one FAILs), nothing after it is
+        eot_i = len(synthetic()) - 1
+        for skip in ({0}, {5}, {eot_i - 1}, {eot_i}):
             rc, out, err = self._run(self._dump_log(skip), "--require-dump")
             self.assertEqual(rc, 1, skip)
-            self.assertIn("RESULT: FAIL 1 dwords missing", out)
-        rc, out, _ = self._run(self._dump_log({500}))		# without the flag the decode up to the EOT is still usable
+            self.assertIn("RESULT: FAIL", out)
+        rc, out, _ = self._run(self._dump_log({5}))		# without the flag the decode up to the gap is still usable
         self.assertEqual(rc, 1)
         self.assertIn("1 dwords missing", out)
-        rc, out, _ = self._run(self._dump_log(), "--require-dump")
+        rc, out, _ = self._run(self._dump_log(), "--require-dump")		# the log ends at the EOT: 28 lines, none of the 868 later rows
         self.assertEqual(rc, 0)
         self.assertIn("RESULT: PASS 5 components", out)
+        rc, out, _ = self._run(self._dump_log(upto=896), "--require-dump")		# a full-span log (zeros after the EOT) passes too: dwords past the EOT are not required
+        self.assertEqual(rc, 0)
+        rc, out, _ = self._run(self._dump_log({700}, upto=896), "--require-dump")
+        self.assertEqual(rc, 0)
+        rc, out, _ = self._run(self._dump_log(upto=eot_i), "--require-dump")		# the EOT line itself lost: no 0xF in the log, so the whole span is required
+        self.assertEqual(rc, 1)
+        self.assertIn("RESULT: FAIL", out)
 
     def test_table_sha_check(self):
         rc, out, err = self._run(self._dump_log(sha="0123456789abcdef"))
