@@ -102,6 +102,23 @@ class Memo(unittest.TestCase):
         self.assertEqual((run_in(b), self.calls), ("same", 1))    # identical content in another root: hit
         self.assertEqual((run_in(c), self.calls), ("other", 2))   # same relative path, other content: miss
 
+    def test_pyc_dep_maps_to_source(self):
+        self.assertEqual(am._dep_path("/r/tools/__pycache__/boards.cpython-313.pyc"), "/r/tools/boards.py")
+        self.assertEqual(am._dep_path("/r/tools/x.py"), "/r/tools/x.py")
+        # end to end: a function importing a module from a warm __pycache__ stores the .py, never the .pyc
+        m = self.t / "pycmod.py"; m.write_text("X = 1\n")
+        import py_compile; py_compile.compile(str(m), cfile=str(self.t / "__pycache__" / "pycmod.cpython-313.pyc"))
+        def imp():
+            self.calls += 1
+            sys.path.insert(0, str(self.t))
+            try:
+                import importlib; importlib.invalidate_caches(); return importlib.import_module("pycmod").X
+            finally:
+                sys.path.remove(str(self.t)); sys.modules.pop("pycmod", None)
+        self.go(imp, name="imp")
+        deps = [d for e in (self.t / "cache").glob("*.json") for d, _ in __import__("json").loads(e.read_text())["deps"]]
+        self.assertTrue(deps and not any(d.endswith(".pyc") for d in deps), deps)
+
     def test_no_memo_env(self):
         os.environ["PIXELIOS_AUDIT_NO_MEMO"] = "1"
         self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)

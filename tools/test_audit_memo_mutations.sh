@@ -56,6 +56,12 @@ mut audit-gutted "FAILED to catch" tools/test-bluejay-boot.py "def check_wlanlin
 mut data-value "table_sha256|sha256|does not match" soc/google/gs101/wlan_seq.json '"value": 0}' '"value": 1}'
 # 6: dep-tracking mutant: the renderer emits a different header
 mut render-mask "AssertionError|header" tools/boards.py "{r['mask']:#x}u, {r['value']:#x}u" "{r['mask']^1:#x}u, {r['value']:#x}u"
+# 7: warm __pycache__ (the real tree has one; review round 3 F1): a memo built from valid .pyc imports must still depend on the .py
+mutants=$((mutants+1)); rm -rf "$w/memo"; fresh; drive pyc-1; rm -rf "$w/memo"; drive pyc-2   # pyc-2 imports the pycs written by pyc-1
+[ -n "$(ls "$w/run/tools/__pycache__"/boards*.pyc 2>/dev/null)" ] || err "no boards .pyc in the copy (pyc-2)"
+edit tools/boards.py "{r['mask']:#x}u, {r['value']:#x}u" "{r['mask']^1:#x}u, {r['value']:#x}u"; drive pyc-mut
+if [ "$(cat "$logd/pyc-mut.rc")" != 0 ] && grep -q -E "^(AssertionError|ValueError)" "$logd/pyc-mut.log" && ! grep -q "^DRIVER PASS" "$logd/pyc-mut.log"; then caught=$((caught+1)); echo "caught pyc-render-mask"
+else survived="$survived${survived:+,}pyc-render-mask"; echo "SURVIVED pyc-render-mask"; fi
 fresh; drive control-after
 { [ "$(cat "$logd/control-after.rc")" = 0 ] && grep -q "^DRIVER PASS" "$logd/control-after.log"; } || err "unmutated control failed after the mutants (control-after.log)"
 if [ -n "$survived" ]; then echo "RESULT: FAIL survived=$survived (logs $logd)"; exit 1; fi
