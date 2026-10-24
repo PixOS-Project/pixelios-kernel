@@ -32,9 +32,10 @@ Deviations from the draft (each is a draft defect or an unverified contract; all
    the output is simply not cut.
  - E5: RUNNING counts only while its pid is alive (a killed gate leaves RUNNING behind). E8: "another owner" = the lock is held
    (`phone-lock status` exit 1); the hook cannot know the agent's own owner name.
- - Known gaps (review new-tools-review-1 Batch A): E4/E5 track `cd`/`pushd` only along one command line (a `cd` inside `bash -c`,
-   a subshell or a function is not followed; a `cd` into an unknown target makes E4 ask); S5b keys only thread_read by its input;
-   S3b resolves bare names against the hook cwd, not against a `cd` earlier in the same command; A11 (agent_id => S1 off) is a guess
+ - Known gaps (review new-tools-review-1 Batch A): E4/E5 track `cd`/`pushd` only along one command line (a `cd` inside `bash -c`
+   or a function is not followed, and a `cd` inside `( ... )`, `$( ... )` or before `popd` is forgotten at its end, which makes the
+   dir unknown; an unknown dir, -C/--git-dir/remote with `$` makes E4 ask and E5/S3b skip); S5b keys status polls by their input;
+   A11 (agent_id => S1 off) is a guess
    about which transcript a subagent hook sees. `tools/test_agent_guard.py` (run by the gate's unittest step) runs --self-test and
    kills real code mutants (thresholds, parsing, sanitising) on a copy.
  - Settings: python on a missing script exits 2 (= blocking); the snippet therefore wraps the call in sh with exit 1 (non-blocking).
@@ -68,7 +69,7 @@ CHECKS = {"check-all.sh", "validate-repo.py", "probe-run", "xrun"}
 PIPE_FILTERS = {"tail", "head", "grep", "egrep", "fgrep"}
 DELEGATE = ("Agent", "Task")
 PHONE_TOOLS = {"probe-run", "xrun", "fboot.sh", "plock.sh", "phone-lock", "phone", "fflash-userdata.sh"}
-WRAP = {"sudo", "env", "exec", "nohup", "time", "timeout", "nice", "stdbuf", "setsid", "xargs", "watch"}
+WRAP = {"sudo", "env", "exec", "nohup", "time", "timeout", "nice", "stdbuf", "setsid", "xargs", "watch", "command", "builtin"}
 KEYWORDS = {"then", "do", "else", "elif", "while", "until", "if", "!", "{", "}"}
 ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 REDIR = {"<", ">", ">>", "<<", "&>", ">&", "<<<"}
@@ -109,6 +110,8 @@ def parse(cmd):
                     continue
                 if seg:
                     out.append((seg, t))
+                elif out and ")" in t:      # `(cd x;)`: the close follows an empty segment; keep it visible on the last real one
+                    out[-1] = (out[-1][0], out[-1][1] + t)
                 seg = []
             elif skip:
                 skip = False
@@ -274,13 +277,17 @@ def r_s3a(c):
         lim = int(c.i.get("limit") or 0)
     except (TypeError, ValueError):
         lim = 0
-    bad = (not lim and (HOT.search(p) or size > BIG)) or lim > 300
+    bad = (HOT.search(p) or size > BIG) and (not lim or lim > 300)
     return verdict("S3a", True, f"{os.path.basename(p)} is {size // 1000} KB, limit {lim or 'none'}: grep -n KEY first, then Read with offset/limit (<= 300 lines)" if bad else "")
 
 
 def r_s3b(c):
-    hit = [1 for p, a, _, w in c.heads if p in ("cat", "less", "more", "head", "tail", "sed", "bat")
-           and not (p == "sed" and any(x.startswith("-i") or x == "--in-place" for x in a)) and any(rootish(x, c.cwd) for x in a)]
+    hit = []
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if h and wd is not None and h[0] in ("cat", "less", "more", "head", "tail", "sed", "bat") \
+                and not (h[0] == "sed" and any(x.startswith("-i") or x == "--in-place" for x in h[1])) and any(rootish(x, wd) for x in h[1]):
+            hit.append(1)
     return verdict("S3b", bool(c.heads) and any(p in ("cat", "less", "more", "head", "tail", "sed", "bat") for p, *_ in c.heads),
                    "AGENTS.md/CLAUDE.md are already in context; do not re-read them" if hit else "")
 
@@ -330,7 +337,7 @@ def r_s5a(c):
 def r_s5b(c):
     if not re.search(r"(task_status|t3_thread_list|t3_thread_read)$", c.t):
         return None
-    key = hashlib.sha1(json.dumps(c.i, sort_keys=True, default=str).encode()).hexdigest()[:12] if c.t.endswith("t3_thread_read") else ""
+    key = hashlib.sha1(json.dumps(c.i, sort_keys=True, default=str).encode()).hexdigest()[:12]
     f = os.path.join(STATE, re.sub(r"\W", "_", c.h.get("session_id") or "x") + "." + re.sub(r"\W", "_", c.t) + "." + key + ".poll")
     recent = os.path.exists(f) and time.time() - os.path.getmtime(f) < 600
     r = verdict("S5b", True, "status polled < 10 min ago: wait for the completion notification" if recent else "")
@@ -440,40 +447,67 @@ def r_e3b(c):
 
 
 def walk(cmd, cwd):
-    """(words, dir) for every segment, in order; `cd X` / `pushd X` update dir; dir is None once a target is unknown ($, backtick, `-`)."""
-    for p in parses(cmd) if cmd else []:
-        cur = cwd
-        for w, _ in p:
+    """(words, dir) for every segment, in order; `cd X` / `pushd X` update dir; dir is None once a target is unknown ($, backtick, `-`,
+    after `popd`, or after a `( ... )` / `$( ... )` that changed it) and in every bash -c / eval string when the outer line moves at all."""
+    ps = parses(cmd) if cmd else []
+    moved = bool(ps) and any((h := head(w)) and h[0] in ("cd", "pushd", "popd") for w, _ in ps[0])
+    for n, p in enumerate(ps):
+        cur = None if n and moved else cwd
+        for w, op in p:
             h = head(w)
             if h and h[0] in ("cd", "pushd"):
                 t = [x for x in h[1] if not x.startswith("-") or x == "-"]
                 t = t[0] if t else "~"
                 cur = None if cur is None or "$" in t or "`" in t or t == "-" else os.path.normpath(os.path.join(cur, os.path.expanduser(t)))
+            elif h and h[0] == "popd":
+                cur = None
             yield w, cur
+            if ("(" in op or ")" in op) and cur != cwd:
+                cur = None
+
+
+GIT_VAL = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path")
 
 
 def r_e4(c):
     pushes = []
     for w, wd in walk(c.cmd, c.cwd):
-        if os.path.basename(w[0]) != "git":
+        h = head(w)
+        if not h or h[0] != "git":
             continue
-        i, d = 1, None
-        while i < len(w) and w[i].startswith("-"):
-            if w[i] == "-C" and i + 1 < len(w):
-                d = w[i + 1]
-            i += 2 if w[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
-        if i < len(w) and w[i] == "push":
-            pushes.append((w[i + 1:], d, wd))
+        a, i, d, gd, unk = h[1], 0, None, None, False
+        while i < len(a) and a[i].startswith("-"):
+            val = a[i + 1] if i + 1 < len(a) else ""
+            if a[i] == "-C":
+                unk |= "$" in val or "`" in val
+                d = os.path.join(d, os.path.expanduser(val)) if d else os.path.expanduser(val)
+            elif a[i] == "--git-dir":
+                unk |= "$" in val or "`" in val
+                gd = val
+            elif a[i].startswith("--git-dir="):
+                unk |= "$" in a[i] or "`" in a[i]
+                gd = a[i][10:]
+            i += 2 if a[i] in GIT_VAL else 1
+        if i < len(a) and a[i] == "push":
+            pushes.append((a[i + 1:], d, gd, unk, wd))
     why = ""
-    for a, d, wd in pushes:
+    for a, d, gd, unk, wd in pushes:
         pos = [x for x in a if not x.startswith("-")]
         risky = [x for x in a if x.startswith("--force") or x in ("--delete", "--mirror", "--prune") or re.fullmatch(r"-[A-Za-z]*[fd][A-Za-z]*", x)]
         risky += [x for x in pos[1:] if x[:1] in (":", "+")]
         remote = pos[0] if pos else "origin"
+        unk |= "$" in remote or "`" in remote
         cwd = None if wd is None else os.path.join(wd, d) if d else wd
-        url = remote if "://" in remote or ":" in remote else (git(cwd, "remote", "get-url", "--push", remote) or "") if cwd else ""
+        if gd is not None and cwd is not None:
+            gd_args = ("--git-dir", os.path.join(cwd, os.path.expanduser(gd)))
+        else:
+            gd_args = ()
+        if cwd is None or unk or (gd is not None and not gd_args):
+            url, cwd = "", None
+        else:
+            url = remote if "://" in remote or ":" in remote else (git(cwd, *gd_args, "remote", "get-url", "--push", remote) or "")
         if cwd is None and not risky:
-            why = "cannot resolve the push target (cd to an unknown directory): the user decides"
+            why = "cannot resolve the push target (unknown directory, -C/--git-dir or remote): the user decides"
         elif risky:
             why = f"git push with {risky[0]} (force/delete): the user decides"
         elif "pixos-project/" in url.lower():
@@ -503,7 +537,7 @@ def r_e5(c):
                 pass
         elif line[:2] == ["GATE", "PASS"] and len(line) > 2 and "+" not in line[2]:
             # a quick PASS (`quick:` in the line) does not cover the full gate that must pass before a push
-            quick_line, want_quick = "quick:" in line, "--quick" in h[1]
+            quick_line, want_quick = "quick:" in line and "ran full" not in " ".join(line), "--quick" in h[1]
             if line[2] == git(root, "rev-parse", "--short", "HEAD") and git(root, "status", "--porcelain") == "" and (want_quick or not quick_line):
                 bad = f"already PASS {line[2]}: read shim/out/gate.result"
     return verdict("E5", seen, bad) if seen else None
@@ -746,6 +780,20 @@ def fixtures(tmp):
             subprocess.run(["git", "-C", repo, *a], capture_output=True, check=True)
         os.makedirs(os.path.join(repo, "shim/out"), exist_ok=True)
 
+    pubr, privr = os.path.join(tmp, "pubr"), os.path.join(tmp, "privr")
+
+    def mkpair():
+        """two clones whose `origin` is the public / a private remote; privr carries a clean-tree PASS gate result."""
+        if os.path.isdir(os.path.join(privr, ".git")):
+            return
+        for d, url in ((pubr, "https://github.com/PixOS-Project/x.git"), (privr, "git@example.com:me/priv.git")):
+            os.makedirs(d)
+            for a in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"], ["remote", "add", "origin", url]):
+                subprocess.run(["git", "-C", d, *a], capture_output=True, check=True)
+        os.makedirs(os.path.join(privr, "shim/out"))
+        open(os.path.join(privr, ".git/info/exclude"), "w").write("shim/\n")
+        open(os.path.join(privr, "shim/out/gate.result"), "w").write("GATE PASS %s 1\n" % git(privr, "rev-parse", "--short", "HEAD"))
+
     def gate(text):
         def f():
             git(repo, "status")
@@ -788,6 +836,7 @@ def fixtures(tmp):
 
     def build():
         mkrepo()
+        mkpair()
         gp = lambda: gate("RUNNING %d 1" % os.getpid())()  # noqa: E731
         gd = lambda: gate("RUNNING %d 1" % dead_pid())()  # noqa: E731
         sess = lambda n: dict(tool_name="mcp__t3-code__task_status", tool_input={}, session_id=f"s{n}-{time.time()}")  # noqa: E731
@@ -802,6 +851,7 @@ def fixtures(tmp):
         add("Read 50KB .c no limit", dict(tool_name="Read", tool_input={"file_path": big}), "deny:S3a")
         add("Read 60KB png no limit (A5)", dict(tool_name="Read", tool_input={"file_path": png}), "allow")
         add("Read NOTES.md limit 5000 (A5)", dict(tool_name="Read", tool_input={"file_path": notes, "limit": 5000}), "deny:S3a")
+        add("Read small .c limit 400 (A8)", dict(tool_name="Read", tool_input={"file_path": small, "limit": 400}), "allow")
         add("Read small .c", dict(tool_name="Read", tool_input={"file_path": small}), "allow")
         add("cat AGENTS.md", B("cat AGENTS.md", cwd=proj), "deny:S3b")
         add("true && head ./CLAUDE.md", B("true && head -n 5 ./CLAUDE.md", cwd=proj), "deny:S3b")
@@ -828,6 +878,10 @@ def fixtures(tmp):
         add("poll 1st", s1, "allow")
         add("poll 2nd", s1, "deny:S5b")
         add("poll other session", sess(2), "allow")
+        ts = lambda i: dict(tool_name="mcp__t3-code__task_status", tool_input={"taskId": i}, session_id="stask")  # noqa: E731
+        add("task_status A (A5)", ts("A"), "allow")
+        add("task_status B (A5)", ts("B"), "allow")
+        add("task_status A again (A5)", ts("A"), "deny:S5b")
         th = lambda i: dict(tool_name="mcp__t3-code__t3_thread_read", tool_input={"threadId": i}, session_id="sthr")  # noqa: E731
         add("thread_read A (A4)", th("A"), "allow")
         add("thread_read B (A4)", th("B"), "allow")
@@ -889,6 +943,26 @@ def fixtures(tmp):
         add("cd private && push (A2)", B(f"cd {repo} && git push priv main", cwd=tmp), "allow")
         add("cd $X && push (A2)", B('cd "$X" && git push priv main', cwd=repo), "ask:E4")
         add("push private", B("git push priv main", cwd=repo), "allow")
+        for lbl, cmd in (("cd in (...) ends (A1)", "(cd ../privr && git status); git push origin main"),
+                         ("pushd..popd (A1)", "pushd ../privr >/dev/null && git status && popd && git push origin main"),
+                         ("cd in $(...) ends (A1)", "x=$(cd ../privr && pwd); git push origin main"),
+                         ("VAR=1 prefix (A2)", "GIT_TRACE=1 git push origin main"), ("env prefix (A2)", "env GIT_TRACE=1 git push origin main"),
+                         ("sudo (A2)", "sudo git push origin main"), ("timeout (A2)", "timeout 60 git push origin main"),
+                         ("command (A2)", "command git push origin main"), ("if..then (A2)", "if true; then git push origin main; fi"),
+                         ("-C $P (A2)", 'git -C "$P" push origin main'), ("remote $URL (A2)", 'git push "$URL" main')):
+            add("push public from pubr: " + lbl, B(cmd, cwd=pubr), "ask:E4")
+        add("cd in (cd x; ) ends (A1)", B("(cd ../privr; ); git push origin main", cwd=pubr), "ask:E4")
+        add("cd private then push, from pubr", B("cd ../privr && git push origin main", cwd=pubr), "allow")
+        add("push GIT_TRACE=1 private (A2)", B("GIT_TRACE=1 git push origin main", cwd=privr), "allow")
+        add("nested bash -c after cd (A1)", B("cd ../pubr && bash -c 'git push origin main'", cwd=privr), "ask:E4")
+        add("cd sub in (...) then push (A1)", B("(cd sub && make); git push origin main", cwd=privr), "ask:E4")
+        add("--git-dir public from privr (A2)", B("git --git-dir ../pubr/.git push origin main", cwd=privr), "ask:E4")
+        add("--git-dir=public from privr (A2)", B("git --git-dir=../pubr/.git push origin main", cwd=privr), "ask:E4")
+        add("cd - then push (A7)", B("cd - && git push priv main", cwd=repo), "ask:E4")
+        add("(cd ..) then check-all keeps priv result out (A3)", B("(cd ../privr && git log -1); tools/check-all.sh", cwd=pubr), "allow")
+        add("pushd..popd then check-all (A3)", B("pushd ../privr >/dev/null && popd && tools/check-all.sh", cwd=pubr), "allow")
+        add("cd public repo/AGENTS.md of subdir (A4)", B("cd kern && cat AGENTS.md", cwd=proj), "allow")
+        add("cd . && cat AGENTS.md (A4)", B("cd . && cat AGENTS.md", cwd=proj), "deny:S3b")
         add("push -u private", B("git push -u priv main", cwd=repo), "allow")
         add("gate: no result", B("tools/check-all.sh", cwd=repo), "allow", setup=lambda: os.path.exists(os.path.join(repo, "shim/out/gate.result")) and os.remove(os.path.join(repo, "shim/out/gate.result")))
         add("gate RUNNING live", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gp)
@@ -898,6 +972,9 @@ def fixtures(tmp):
         add("gate quick PASS then full (A1)", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS @H quick: ran 3 of 9 steps 1"))
         add("gate quick PASS then --quick (A1)", B("tools/check-all.sh --quick", cwd=repo), "deny:E5", setup=gate("GATE PASS @H quick: ran 3 of 9 steps 1"))
         add("cd repo && check-all, PASS at HEAD (A2)", B(f"cd {repo} && tools/check-all.sh", cwd=tmp), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("gate quick fell back to full (A6)", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gate("GATE PASS @H quick: no usable stamp, ran full 1"))
+        add("abs path check-all from other cwd (A7)", B(os.path.join(repo, "tools/check-all.sh"), cwd=tmp), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("cd $X then check-all (A7)", B('cd "$X" && tools/check-all.sh', cwd=repo), "allow")
         add("gate PASS HEAD dirty", B("tools/check-all.sh", cwd=repo), "allow", setup=dirty)
         add("gate PASS +dirty token", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS @H+dirty 1"))
         add("gate PASS other hash", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS deadbee 1"))
