@@ -169,7 +169,7 @@ full PASS on a clean tree) and runs only the needed steps, selected by `tools/ga
 
 | Changed paths | Steps |
 |---|---|
-| `shim/`, `soc/`, `device/`, `tools/imgmeta*`, `tools/mk*`, `tools/test-bluejay-boot.py`, `tools/check-all.sh`, xnu patches 0087/0088 (the host tests extract headers from them) | 6 builds, host-tests, boot-safety |
+| `shim/`, `soc/`, `device/`, `tools/imgmeta*`, `tools/mk*`, `tools/test-bluejay-boot.py`, `tools/check-all.sh`, the xnu patches `shim/build.sh` references as `../xnu/patches/NNNN` (0087, 0088, 0093, 0104 today; the host tests extract headers from them; read from build.sh, not listed in code); `shim/*.md` selects no build | 6 builds, host-tests, boot-safety |
 | `tools/`, `soc/`, `device/` | unit, phone-state, hang-recover, rootless |
 | `tools/`, `soc/`, `device/` | unit, phone-state, probe-run, rootless |
 | anything (docs, other `xnu/` patches) | validate (patch numbering/header format, script syntax), always |

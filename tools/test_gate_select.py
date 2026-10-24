@@ -14,6 +14,13 @@ class Select(unittest.TestCase):
     def test_xnu_patch_used_by_shim_host_tests(self):
         self.assertIn("host-tests", g.select(["xnu/patches/0088-sweet-gs101-touch.patch"]))
 
+    def test_xnu_patches_referenced_by_build_sh(self):
+        for n in ("0087-x", "0088-x", "0093-sweet-touch-poke", "0104-sweet-mali-driver-core"):
+            self.assertIn("host-tests", g.select(["xnu/patches/%s.patch" % n]), n)
+
+    def test_shim_markdown_selects_no_build(self):
+        self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate"])
+
     def test_shim(self):
         s = g.select(["shim/ufs.c"])
         self.assertEqual(s, g.SHIM + ["public-split", "validate"])

@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """Step selection for `tools/check-all.sh --quick`.
 Usage: gate_select.py STAMP_FILE   -> prints the steps to run (space separated), or FULL when there is no usable stamp."""
-import subprocess, sys
+import pathlib, re, subprocess, sys
 
 ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-gpupower", "build-gpuclk", "build-gpurails", "build-gpurailon", "build-gpujob", "build-touch", "build-udump", "host-tests", "boot-safety",
        "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"]
 SHIM = ALL[:14]
-# build.sh also extracts headers from xnu patches 0087/0088 for its host tests
+BUILD_SH = pathlib.Path(__file__).resolve().parent.parent / "shim" / "build.sh"
+
+
+def shim_patch_prefixes():
+    """build.sh extracts headers from xnu patches for its host tests (`../xnu/patches/NNNN-...`): read them from build.sh itself."""
+    try:
+        text = BUILD_SH.read_text()
+    except OSError:
+        return ()
+    return tuple(sorted({"xnu/patches/" + n for n in re.findall(r"\.\./xnu/patches/(\d{4})", text)}))
+
+
 SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py",
-               "tools/check-all.sh", "tools/gate_select.py", "xnu/patches/0087", "xnu/patches/0088")
+               "tools/check-all.sh", "tools/gate_select.py") + shim_patch_prefixes()
 UNIT_PREFIX = ("tools/", "soc/", "device/", "qrlog/", "xnu/qr/", "xnu/patches/0081", "xnu/patches/0086", "xnu/patches/0094")
 
 
@@ -17,7 +28,7 @@ def select(files):
     tracked file assigned to a public repo, ~1 s) always run."""
     need = {"validate", "public-split"}
     for f in files:
-        if f.startswith(SHIM_PREFIX):
+        if f.startswith(SHIM_PREFIX) and not (f.startswith("shim/") and f.endswith(".md")):
             need.update(SHIM)
         if f.startswith(UNIT_PREFIX):
             need.update(("unit", "phone-state", "hang-recover", "probe-run", "rootless"))
