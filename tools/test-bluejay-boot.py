@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "1459e945e5ade786b5fbfdaba62bfb674c4ab067dfabad73755184d99bad9607"
+_WLAN_SEQ_SHA = "f8823c7e1eaf780a16baa4c5e8f299819ee055218b36f2b72771eba6afe25ed6"
 _WLAN_SEQ_COUNTS = {"rows": 415, "teardown": 45, "write_rows": 277, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2958,7 +2958,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # S31 (research 37 s.9.1 run A, READ-ONLY): the window precondition (cfg 0x80 == 0x18000000, no move), the three logged ChipCommon reads (eromptr 0xFC, clk_ctl_st 0x1E0, capabilities_ext 0xAC), the link / AER logs, then the one-shot
     # eromptr check (4 KiB aligned inside 0x18000000..0x1FFFFFFF: mask 0xF8000FFF == 0x18000000) and the chip id re-check. No write of any kind, no restore, no probe.
     s31_want = [("wait_eq", "CFG", 0x80, BIG, 0x18000000, None, None), ("read_only", "MEM", 0xFC, BIG, 0, None, True), ("read_only", "MEM", 0x1E0, BIG, 0, None, True), ("read_only", "MEM", 0xAC, BIG, 0, None, True),
-                ("read_only", "CFG", 0xBC, BIG, 0, None, True), ("read_only", "CFG", 0x104, BIG, 0, None, True), ("wait_eq", "MEM", 0xFC, 0xF8000FFF, 0x18000000, None, None), ("wait_eq", "MEM", 0, 0xFFFF, 0x4389, None, None)]
+                ("read_only", "CFG", 0xBC, BIG, 0, None, True), ("read_only", "CFG", 0x104, BIG, 0, None, True), ("wait_eq", "MEM", 0xFC, 0xF8000FFF, 0x18000000, None, None), ("wait_eq", "MEM", 0, BIG, 0x10034389, None, None)]
     s31 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log")) for r in rows if r["step"] == 31]
     if s31 != s31_want or any(r["restore"] or r["kind"] in _WLAN_WRITE_KINDS or (r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 31) or any(t["requires"] == 31 for t in tear):
         raise AssertionError(f"{name}: S31 must be exactly the READ-ONLY run A rows (window precondition, MEM reads 0xFC/0x1E0/0xAC, CFG 0xBC/0x104 logs, eromptr and chip id one-shot checks), no write, no restore, no teardown row: {s31}")
@@ -3372,7 +3372,9 @@ def wlan_seq_selftest() -> int:
         ("the S31 eromptr check removed", f_rm(31, kind="wait_eq", blk="MEM", off=0xFC), None, "S31 must be exactly"),
         ("the S31 eromptr check weakened (alignment dropped)", set_row(31, "mask", 0xF8000000, kind="wait_eq", blk="MEM", off=0xFC), None, "S31 must be exactly"),
         ("the S31 eromptr range widened", set_row(31, "mask", 0x00000FFF, kind="wait_eq", blk="MEM", off=0xFC), None, "S31 must be exactly"),
-        ("the S31 chip id re-check removed", f_rm(31, kind="wait_eq", blk="MEM", off=0, value=0x4389), None, "S31 must be exactly"),
+        ("the S31 chip id re-check removed", f_rm(31, kind="wait_eq", blk="MEM", off=0, value=0x10034389), None, "S31 must be exactly"),
+        ("the S31 chip id re-check weakened (mask 0xFFFF)", set_row(31, "mask", 0xFFFF, kind="wait_eq", blk="MEM", off=0), None, "S31 must be exactly"),
+        ("the S31 chip id re-check value changed (low 16 bits only)", set_row(31, "value", 0x4389, kind="wait_eq", blk="MEM", off=0), None, "S31 must be exactly"),
         ("the S31 eromptr log flag removed", set_row(31, "log", False, kind="read_only", blk="MEM", off=0xFC), None, "S31 must be exactly"),
         ("the S31 clk_ctl_st read removed", f_rm(31, kind="read_only", blk="MEM", off=0x1E0), None, "S31 must be exactly"),
         ("the S31 AER log removed", f_rm(31, kind="read_only", blk="CFG", off=0x104), None, "S31 must be exactly"),
@@ -3617,7 +3619,7 @@ def wlanlink_source_selftest() -> int:
         ("MEM base swapped", good.replace("return WLAN_MEM;", "return WLAN_CFG;", 1)),
         ("MEM needs no probe", good.replace(" || blk == WLB_CFG || blk == WLB_MEM) ? 1u << blk : 0u;", " || blk == WLB_CFG) ? 1u << blk : 0u;", 1)),
         ("MEM base assert changed (BAR2)", good.replace("WLAN_MEM == 0x60000000UL", "WLAN_MEM == 0x60400000UL", 1)),
-        ("MEM base assert removed", good.replace('_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only, offset 0 only)");', "", 1)),
+        ("MEM base assert removed", good.replace('_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only, ChipCommon offsets 0/0xAC/0xFC/0x1E0 only)");', "", 1)),
         ("MEM read offset check dropped", good.replace("if ((off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u) || !try_read32(WLAN_ATU + 0x204u, &cr2)", "if (!try_read32(WLAN_ATU + 0x204u, &cr2)", 1)),
         ("MEM read offset 0x100 allowed", good.replace("off != 0x1E0u) || !try_read32", "off != 0x1E0u && off != 0x100u) || !try_read32", 1)),
         ("MEM read offset 0xFC dropped from the allowlist", good.replace(" && off != 0xFCu", "", 1)),
@@ -3748,6 +3750,12 @@ def check_wlanlink_r32_object_text(blocks: list, name: str) -> None:
     # S31 (research 37): the MEM offset allowlist {0x0, 0xAC, 0xFC, 0x1E0} is compiled as compares before the first guard read, then a b.ne back to the refusal
     if not first or not all(re.search(rx, pre) for rx in (r"cmp\s+w\d+, #0xac\b", r"cmp\s+w\d+, #0xfc\b", r"mov\s+w\d+, #0x1e0\b", r"ccmp\s+w\d+, #0x0,")):
         raise AssertionError(f"{name}: the compiled r32 lost the BAR0 offset allowlist (0x0 / 0xAC / 0xFC / 0x1E0) before its first guard read")
+    # review 12 L3: the DIRECTION of the allowlist branches, not only its constants: the last conditional branch before the first guard read is a b.ne to the refusal block (mov w0, #0x0 ... ret),
+    # and the 0xAC / 0x0 hit (cmp #0xac; ccmp #0x0) is a b.eq into the guard, not away from it
+    br = re.findall(r"\bb\.(\w+)\s+([0-9a-f]+) <r32\+0x[0-9a-f]+>", pre)
+    refuse = re.search(r"(?m)^\s*" + br[-1][1] + r":\t[0-9a-f]+ \t[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tmov\s+w0, #0x0\b[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tret\b", t) if br else None
+    if not br or br[-1][0] != "ne" or not refuse or not re.search(r"cmp\s+w\d+, #0xac\n[^\n]*ccmp\s+w\d+, #0x0,[^\n]*\n[^\n]*\tb\.eq\s", pre):
+        raise AssertionError(f"{name}: the compiled r32 allowlist branches changed direction (last branch before the first guard read must be b.ne to the refusal return, the 0xAC / 0x0 hit a b.eq into the guard): {br[-1:] if br else None}")
     if len(re.findall(r"R_AARCH64_CALL26\s+try_read32", t)) != 6 or len(re.findall(r"R_AARCH64_JUMP26\s+try_read32", t)) != 1:
         raise AssertionError(f"{name}: r32 must hold six guard reads (CR2, Command, CR1, base, limit, target) and the load as one tail call")
     for rx in (r"mov\s+w\d+, #0x80000000\b", r"mov\s+x\d+, #0x204\b", r"mov\s+x\d+, #0x200\b", r"mov\s+x\d+, #0x208\b", r"mov\s+x\d+, #0x210\b", r"mov\s+x\d+, #0x214\b",
@@ -3817,6 +3825,8 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("r32 offset-0 check dropped", disasm.replace(rblk, re.sub(r"ccmp\tw(\d+), #0x0,", r"ccmp\tw\1, #0x1,", rblk), 1)),
         ("r32 offset 0xAC changed", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xac\b", r"cmp\tw\1, #0xa8", rblk), 1)),
         ("r32 offset 0xFC changed", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xfc\b", r"cmp\tw\1, #0xf8", rblk), 1)),
+        ("r32 allowlist final b.ne inverted (review 12 L3)", disasm.replace(rblk, re.sub(r"\bb\.ne(\s+[0-9a-f]+ <r32\+0x[0-9a-f]+>)", r"b.eq\1", rblk), 1)),
+        ("r32 allowlist 0xAC / 0x0 b.eq inverted (review 12 L3)", disasm.replace(rblk, re.sub(r"(ccmp\tw\d+, #0x0,[^\n]*\n[^\n]*\t)b\.eq", r"\1b.ne", rblk), 1)),
         ("r32 offset 0x1E0 changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x1e0\b", r"mov\tw\1, #0x1e4", rblk), 1)),
         ("r32 writes", disasm.replace("<r32>:\n", "<r32>:\n 1:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n", 1)),
         ("r32 guard read dropped", disasm.replace(rblk, re.sub(r"R_AARCH64_CALL26\ttry_read32", "R_AARCH64_NONE\ttry_read32", rblk, count=1), 1)),
