@@ -96,6 +96,16 @@ class T(unittest.TestCase):
         rc, out = self.run_tool("stats", "--args=--nothing", "--json")
         self.assertEqual(json.loads(out.splitlines()[0]), [])
 
+    def test_argkey_touch_probe_mode_and_bare_values(self):   # review round 2 B3
+        for n, mode in (("1", "railsr"), ("2", "run")):
+            nm = "20261026T10000%sZ-tp-%s" % (n, mode)
+            probe(self.r, nm, "PASS", 100)
+            put(os.path.join(self.r, "logs", "probe", nm, "run.args"), "--pstore-fast --touch-probe=%s\n" % mode)
+        rc, out = self.run_tool("stats", "--args=--pstore-fast --touch-probe=run", "--json")
+        self.assertEqual([r["n"] for r in json.loads(out.splitlines()[0])], [1], out)
+        rc, out = self.run_tool("stats", "--args=--wlan-link 3 --wlan-probe", "--json")   # a bare value word is not its own key
+        self.assertEqual(json.loads(out.splitlines()[0]), [], out)
+
     def test_xrun_wall_fallback_to_waited(self):   # review B6
         d = os.path.join(self.r, "logs", "runs", "20261027T100000Z-nowall")
         xrun(self.r, "20261027T100000Z-nowall", "PASS", 1, 2)

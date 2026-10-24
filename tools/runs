@@ -65,7 +65,8 @@ def scan(all_wt, kind=None):
 
 
 def argkey(raw):
-    return " ".join(sorted({w.split("=")[0].lstrip("-") for w in raw.split()}))
+    # review round 2 B3: --touch-probe keeps its mode (railsr and run differ a lot in length); bare value words (`--wlan-link 3`) are dropped
+    return " ".join(sorted({w.lstrip("-") if w.startswith("--touch-probe=") else w.split("=")[0].lstrip("-") for w in raw.split() if w.startswith("-")}))
 
 
 def mtime(p):

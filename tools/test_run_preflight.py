@@ -92,6 +92,28 @@ class T(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("RESULT: FAIL timeout:", out)
 
+    def test_timeout_default_wlan_link_600(self):   # review round 2 B4: default_timeout must give 600 for --wlan-link
+        self.probe_dir("20261023T065218Z-w_", 400, "--wlan-link=9")
+        self.assertEqual(self.pf("--", "tools/probe-run", "--build-args", "--wlan-link=9")[0], 0)   # 600 >= 400 + 60 (a 60 s default would FAIL)
+        self.probe_dir("20261023T065219Z-w_", 560, "--wlan-link=9")
+        rc, out = self.pf("--", "tools/probe-run", "--build-args", "--wlan-link=9")   # 600 < 560 + 60
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL timeout:", out)
+
+    def test_timeout_stats_uses_all_worktrees(self):   # review round 2 B4: history lives in other worktrees too
+        ldr = importlib.machinery.SourceFileLoader("rp2", TOOL)
+        m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rp2", ldr)); ldr.exec_module(m)
+        seen = []
+        def fake(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
+        real = m.subprocess.run; m.subprocess.run = fake
+        try:
+            m.c_timeout("probe-run", {}, 60, ["--build-args", "--wlan-link=9"])
+        finally:
+            m.subprocess.run = real
+        self.assertTrue(seen and "--all-worktrees" in seen[0], seen)
+
     def test_stale_gate_hash(self):
         put(self.root + "/shim/out/gate.result", "GATE PASS deadbee 123\n")
         rc, out = self.xrun()
