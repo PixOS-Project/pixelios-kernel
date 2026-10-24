@@ -4,10 +4,10 @@
 #   tools/probe-run --dry-run --from-dir DIR [--expect REGEX]...     (re-read DIR/usb.txt, touches nothing)
 #   tools/probe-run --self-test
 # First line: RESULT: PASS|FAIL|HANG|ERROR ...   Exit 0 PASS / 1 FAIL or HANG / 2 ERROR.
-# HANG = expected line never came AND the phone is not back (fastboot/recovery) within 30 s: hold Power+VolDown.
+# HANG = expected line never came AND the phone is not back (fastboot/recovery) within the wait window (120 s): hold Power+VolDown.
 # The phone legitimately leaves USB for a while when the shim reboots, so "absent" right after the result line is normal.
 # Test hooks (self-test only): PR_PHONE_STATE PR_TO_FASTBOOT PR_FBOOT PR_USBLOG PR_BUILD PR_BACK (seconds to wait for the phone) PR_USBPRESENT (command: exit 0 if a Google USB device is on the bus).
-# The phone leaves USB for 30-60 s after a shim run and then shows up in recovery: waiting for it is part of the run (default 120 s), and a slow return is
+# The phone leaves USB for about 30 s after a shim run and then shows up in recovery (observed by the Wi-Fi agent, HANDOFF session 28; not re-measured): waiting for it is part of the run (default 120 s), and a slow return is
 # reported as such, never as a hang. HANG (hold Power+VolDown) needs: expected lines missing AND no Google USB device at all after the window.
 cd "$(dirname "$0")/.." || exit 2
 PS=${PR_PHONE_STATE:-tools/phone-state}; TOFB=${PR_TO_FASTBOOT:-tools/to-fastboot.sh}; FBOOT=${PR_FBOOT:-tools/fboot.sh}
@@ -97,21 +97,25 @@ main() {
 	$FBOOT --expect probe shim/out/shim-boot-avb.img >"$dir/fboot.log" 2>&1 ||
 		report ERROR "fboot refused/failed (see $dir/fboot.log: $(tail -1 "$dir/fboot.log" | cut -c1-100))"
 	# 5. wait for every expect, bounded
-	local end=$(( $(date +%s) + timeout ))
+	local end=$(( $(date +%s) + timeout )) timed_out=""
 	while :; do
 		check_expects "$log"; [ ${#missing[@]} = 0 ] && break
-		[ "$(date +%s)" -lt "$end" ] || break
-		kill -0 "$cap" 2>/dev/null || { sleep 1; check_expects "$log"; break; }   # capture ends when the phone leaves USB
-		sleep 1
+		[ "$(date +%s)" -lt "$end" ] && { kill -0 "$cap" 2>/dev/null || { sleep 1; check_expects "$log"; break; }; sleep 1; continue; }   # capture ends when the phone leaves USB
+		timed_out=1; break
 	done
-	kill "$cap" 2>/dev/null; cap=""
-	# 6. phone back? (absent right after the result line is normal)
+	# 6. phone back? (absent right after the result line is normal). The capture keeps running meanwhile: a shim still logging at the limit is not a hang
 	local back; back=$(phone_back) && rc=0 || rc=1
+	[ -z "$cap" ] || { kill "$cap" 2>/dev/null; wait "$cap" 2>/dev/null; cap=""; }   # SIGTERM flushes the last partial line
+	check_expects "$log"                                                              # ...and the verdict sees it
+	local age=999; [ -f "$log" ] && age=$(( $(date +%s) - $(stat -c %Y "$log") ))
 	# 7. verdict
+	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ "$age" -lt "${PR_STILL:-15}" ]; then
+		report FAIL "missing: ${missing[*]}; the shim was still logging at the ${timeout}s limit (last line ${age}s ago): raise --timeout, this is not a hang"
+	fi
 	if [ ${#missing[@]} = 0 ]; then
 		[ $rc = 0 ] && report PASS "all ${#expects[@]} expect(s) found, phone back: $back"
 		$USBP && report PASS "all ${#expects[@]} expect(s) found, phone on USB but not fastboot/recovery yet after ${BACK}s (tools/phone-state)"
-		report PASS "all ${#expects[@]} expect(s) found, phone still rebooting after ${BACK}s (not a failure; tools/phone-state shows it)"
+		report PASS "all ${#expects[@]} expect(s) found, phone not back and no Google USB device after ${BACK}s (the lines were found; if tools/phone-state still shows it absent, hold Power+VolDown)"
 	fi
 	[ $rc = 0 ] && report FAIL "missing: ${missing[*]} (within ${timeout}s), phone back: $back"
 	$USBP && report FAIL "missing: ${missing[*]} (within ${timeout}s); the phone is on USB but not fastboot/recovery after ${BACK}s: tools/phone-state"
@@ -142,7 +146,7 @@ S
 		rm -rf "$d/cnt" "$d/w" "$d/lock"; mkdir -p "$d/w/tools" "$d/w/shim"; cp "$self" "$d/w/tools/probe-run"
 		cp "$(dirname "$self")/phone-lock" "$(dirname "$self")/plock.sh" "$d/w/tools/"; ( cd "$d/w" && PHONE_LOCK_DIR="$d/lock" eval "$PRE" )
 		out=$(cd "$d/w" && env PHONE_LOCK_DIR="$d/lock" PR_PHONE_STATE="$d/ps" PR_TO_FASTBOOT="$d/tofb" PR_FBOOT="$d/fboot" PR_USBLOG="$d/usblog" \
-			PR_BUILD="$d/build" PR_BACK=3 PR_USBPRESENT=${PR_USBPRESENT:-false} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t 2>&1); rc=$?
+			PR_BUILD="$d/build" PR_BACK=3 PR_USBPRESENT=${PR_USBPRESENT:-false} PR_STILL=${PR_STILL:-1} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t 2>&1); rc=$?
 		if [ $rc = "$erc" ] && echo "$out" | head -1 | grep -q "^RESULT: $w" && echo "$out" | grep -q '^dir: logs/probe/' \
 			&& { [ "$w" = ERROR ] || ls "$d"/w/logs/probe/*/report.txt >/dev/null 2>&1; }; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
@@ -152,6 +156,8 @@ S
 	chk expect-missing  1 FAIL  ST_STATE=fastboot 'ST_LOG=noise\n'
 	chk never-back      1 HANG  ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
 	chk start-absent    2 ERROR ST_STATE=absent ST_LOG=
+	chk found-usb-present 0 PASS PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 "ST_LOG=$R"
+	chk still-logging   1 FAIL PR_STILL=600 ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # review 13 H3: timed out while the shim was still logging: FAIL "raise --timeout", not HANG
 	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with phone-state advice, not "hold Power+VolDown"
 	PRE='tools/phone-lock acquire --owner other --pid '$$' >/dev/null' chk lock-busy 2 ERROR ST_STATE=fastboot "ST_LOG=$R"   # TP-020: another owner holds the phone
 	PRE=

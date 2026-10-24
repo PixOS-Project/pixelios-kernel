@@ -47,7 +47,8 @@ def run(out_path, port=5140, until_file=None, duration=None, quiet=False, ready=
             if not quiet:
                 sys.stdout.buffer.write(data); sys.stdout.flush()
         sock.settimeout(0.3)
-        while True:  # datagrams already queued when the stop file appeared are the last lines of the run: keep them
+        drain_end = time.time() + 2.0  # bounded: a sender that keeps streaming must not hold xrun (and the phone lock)
+        while time.time() < drain_end:  # datagrams already queued when the stop file appeared are the last lines of the run: keep them
             try:
                 data, _ = sock.recvfrom(65535)
             except socket.timeout:

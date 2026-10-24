@@ -62,6 +62,28 @@ class Listener(unittest.TestCase):
         rows = [r.split("\t", 1)[1] for r in pathlib.Path(out).read_text().splitlines()]
         self.assertEqual(rows, ["queued %d" % i for i in range(5)])
 
+    def test_drain_is_bounded_when_the_sender_keeps_streaming(self):
+        # review 13 M2: a log storm after the stop file must not hold xrun (and the phone lock)
+        out, stop = os.path.join(self.tmp, "s.log"), os.path.join(self.tmp, "stop3")
+        open(stop, "w").close()
+        port, run_stop = [], threading.Event()
+
+        def sender(p):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            while not run_stop.is_set():
+                s.sendto(b"storm\n", ("127.0.0.1", p))
+                time.sleep(0.05)
+            s.close()
+        t0 = time.time()
+        th = threading.Thread(target=lambda: None)
+        ul_thread = threading.Thread(target=ul.run, kwargs=dict(out_path=out, port=0, duration=30, quiet=True, until_file=stop,
+                                                                 ready=lambda p: (port.append(p), threading.Thread(target=sender, args=(p,), daemon=True).start())))
+        ul_thread.start()
+        ul_thread.join(8)
+        run_stop.set()
+        self.assertFalse(ul_thread.is_alive())
+        self.assertLess(time.time() - t0, 5)
+
     def test_cli_stops_on_until_file(self):
         stop, out = os.path.join(self.tmp, "stop"), os.path.join(self.tmp, "u.log")
         p = subprocess.Popen([sys.executable, "-I", str(HERE / "usbnet-log.py"), "--out", out, "--port", "0", "--until-file", stop, "--quiet"],

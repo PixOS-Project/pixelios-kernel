@@ -122,9 +122,16 @@ def waitusb(d):
                 return
         time.sleep(1 if expect_reset else 5)
     timed_out = bool(hard and now() >= hard)
-    if timed_out and gone is not None:
-        # the phone left USB (the reset fired) but the hard timeout cut the wait before it re-enumerated (recovery takes 30-60 s): give it a grace window
-        grace_end = now() + float(os.environ.get("XRUN_GRACE", "90"))
+    m = re.match(r"\d+", str(run.get("restart") or ""))
+    reset_due = bool(m) and now() - t0 >= float(m.group(0))
+    if timed_out and gone is not None and reset_due:
+        # the reset was due but the phone is not back yet when the hard timeout cuts the wait (it returns in recovery after ~30 s or more): short grace window.
+        # usb_gone is when the phone left fastboot for XNU (+2 s), not proof that the reset fired.
+        try:
+            grace = float(os.environ.get("XRUN_GRACE") or 90)
+        except ValueError:
+            grace = 90.0
+        grace_end = now() + grace
         while now() < grace_end:
             if usb_present():
                 mark(d, ["usb_back=%f" % now(), "late_back=1"])
@@ -351,11 +358,13 @@ def build(d, stop_on=None):
     restart = run.get("restart") or ""
     gone = f("usb_gone")
     restart_s = float(re.match(r"\d+", restart).group(0)) if re.match(r"\d+", restart) else 0.0
-    # the phone left USB and a Google device is on the bus when the run ended: the reset DID fire, it was only late
-    if restart and reset_at is None and gone and "18d1" in str(run.get("phone", "")) and "[none]" not in str(run.get("phone", "")).split("adb")[0]:
-        reset_at = (f("t_end") or now()) - t0 if t0 else None
+    # inferred, not observed: the hard timeout ended the wait after the reset was due and the bluejay itself (adb recovery / fastboot product bluejay) is on the bus
+    phone = str(run.get("phone", ""))
+    if (restart and reset_at is None and run.get("timeout") and gone and t0 and (f("t_end") or 0) - t0 >= restart_s
+            and ("adb [recovery]" in phone or "fastboot product [bluejay]" in phone)):
+        reset_at = (f("t_end") or now()) - t0
         run["late_back"] = "1"
-    reset_txt = ("reset observed at +%ds%s" % (reset_at, " (late: the phone re-enumerated after the wait window)" if run.get("late_back") else "") if reset_at is not None else
+    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds" % reset_at) if reset_at is not None else
                  ("reset NOT observed (waited %ds; the sweetrestart did not fire or the phone hung)" % (waited or 0)) if restart
                  else "no --restart (no reset expected)")
     qr_t = first_snap_t - t0 if first_snap_t and t0 else None
@@ -375,13 +384,10 @@ def build(d, stop_on=None):
     elif markers["panic/hang/watchdog"]["count"]:
         result, reason = "FAIL", "panic/hang/watchdog line in the log: %s" % cut(markers["panic/hang/watchdog"]["first"], 80)
     elif restart and reset_at is None and run.get("timeout") and waited is not None and waited < restart_s and not (early_txt and not early_txt.startswith("NOT")):
-        result, reason = "PARTIAL", "hard timeout after %ds, before the reset was due (restart %ds): the reset was not awaited" % (waited, restart_s)
+        result, reason = "PARTIAL", "hard timeout after %ds, before the reset was due (restart %ds): the reset was not awaited%s" % (waited, restart_s, "; %d expectation(s) missing" % len(bad) if bad else "")
     elif restart and reset_at is None and not (early_txt and not early_txt.startswith("NOT")):
-        if gone:
-            result, reason = "FAIL", "%sthe phone reset (USB gone at +%ds) but did not re-appear within %ds: hold Power+VolDown only if tools/phone-state still shows it absent" % (
-                "HARD TIMEOUT: " if run.get("timeout") else "", gone - t0 if t0 else 0, waited or 0)
-        else:
-            result, reason = "FAIL", "%ssweetrestart did not fire: the phone never left USB within %ds" % ("HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
+        result, reason = "FAIL", "%ssweetrestart did not fire or the phone hung: it never re-appeared on USB within %ds (check tools/phone-state before asking for a button hold)" % (
+            "HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
     elif bad:
         what = "%d of %d expectations failed (first: %s%s)" % (len(bad), len(exp), "absent-violated " if bad[0]["absent"] else "missing ", cut(bad[0]["regex"], 50))
         if incomplete and not all(b["absent"] for b in bad):

@@ -9,7 +9,7 @@
 #   --stop-on RX   (repeatable; --early = all --expect patterns) end the capture as soon as every pattern is in the merged log, instead of
 #                  waiting for the self-reset (restart+300 s). Then the phone is put back in fastboot (to-fastboot.sh) if it has reset or is
 #                  reachable; else ONE report line "PHONE: still running; self-reset due in ~Ns / Power+VolDown hold". RESULT PASS + "EARLY: stopped at +Ns (full run would have waited Ms)".
-#   --hard-timeout S  absolute cap (from xrun start) on the whole run; default none (--duration still applies). A FAIL on timeout carries
+#   --hard-timeout S  cap (from xrun start) on the wait for the run, plus up to XRUN_GRACE s (default 90) when the reset was due but the phone is not back yet; default none (--duration still applies). A FAIL on timeout carries
 #                  "PHONE:" from a bounded probe (lsusb, adb get-state, fastboot product; each under its own 5-8 s timeout).
 #   tools/xrun --dry-run --from-dir DIR [--stop-on RX]...   rebuild the report of an existing run dir (no phone); with --stop-on, replay an early stop
 #                                            (rewrites report.txt/merged.log in DIR: copy it first if it must stay untouched)
@@ -49,11 +49,6 @@ $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$res
 	git_head="$head" t_start=@now ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
 
-if [ "$check" = 1 ]; then
-	# after a previous run the phone is off the bus for 30-60 s while it reboots: wait for it (bounded) before asking for a button hold
-	for _ in $(seq 1 "${XRUN_USB_WAIT:-120}"); do grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && break; sleep 1; done
-	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "no Google USB device (18d1) appeared within ${XRUN_USB_WAIT:-120} s: needs Power+VolDown hold"
-fi
 if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
 tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" \
 	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
@@ -64,6 +59,10 @@ cp shim/out/shim-boot-avb.img.meta.json "$D/image.meta.json" 2>/dev/null || true
 # the image is ready: only now take the phone (builds and gates never hold the lock)
 plock_take xrun "$lockwait" || die "phone lock busy: $PLOCK_MSG"
 if [ "$check" = 1 ]; then
+	# we own the phone now: after a previous run it is off the bus for a while while it reboots; wait (bounded) before asking for a button hold
+	uw=${XRUN_USB_WAIT:-120}; [[ $uw =~ ^[0-9]+$ ]] || uw=120
+	for _ in $(seq 1 "$uw"); do grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && break; sleep 1; done
+	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "no Google USB device (18d1) appeared within ${uw} s: needs Power+VolDown hold"
 	tools/to-fastboot.sh 120 >>"$LOG" 2>&1 || {
 		if grep -q REFUSED "$LOG"; then die "device is not bluejay (to-fastboot refused): $(tailog)"; fi
 		die "needs Power+VolDown hold (phone not reachable by fastboot/adb)"; }

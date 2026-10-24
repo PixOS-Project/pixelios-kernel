@@ -156,7 +156,8 @@ class LineTee:
 
 def drain(fd, tee, quiet=0.3):
     """read what is still buffered in the tty after the device went away (the last lines are the ones that matter)"""
-    while select.select([fd], [], [], quiet)[0]:
+    deadline = time.monotonic() + 2.0  # bounded: a device that keeps streaming must not hold the capture
+    while time.monotonic() < deadline and select.select([fd], [], [], quiet)[0]:
         try:
             data = os.read(fd, READ_SIZE)
         except OSError:
