@@ -218,7 +218,7 @@ __attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 		return 0;
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
-	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): 0x18000000 = ChipCommon (S30 chip id, research 36; S31 run A, research 37 s.9.1: eromptr 0xFC, clk_ctl_st 0x1E0, capabilities_ext 0xAC): these four offsets only; 0x18105000 = the EROM page (S32 run B, observed eromptr of run w3a-n31): the EROM dwords below 0xE00 = ER_REMAPCONTROL (aidmp.h, review 13 M1); any other window refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
+	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): the exact offsets per window are in mem_ok (S30-S33); any other window or offset refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
 		uint32_t cr2 = 0, cmd = 0, win = 0, r1[4] = { 1, 1, 1, 1 };
 
 		if (!try_read32(WLAN_CFG + 0x80u, &win) || !mem_ok(win, off) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)

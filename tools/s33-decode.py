@@ -8,7 +8,7 @@ Input: the `LINK R33 row=<id> rd=0x<8 hex>` lines of the run (a file, or a direc
 IOCTL 0x408 / RESET_CTL 0x800 / RESET_ST 0x804 (aidmp.h:168,175,176), SYS_MEM coreinfo +0 (brcmfmac-chip.c:166; offset 0 for DHD is a guess).
 Checks (PASS/FAIL each, research 38 s.3/s.4; E4 is informative): E1 pmurev (pmucapabilities & 0xFF) == 0x28 (the EROM PMU rev 40; a GUESS until this run); E2/E3 wrapper RESET_CTL has no bit above bit 0 set (a GUESS);
 E4 SYS_MEM up = IOCTL & 3 == 1 and RESET_CTL & 1 == 0 (down is an accepted outcome: the run then stops at the gate and no coreinfo row exists); E5 no logged word is 0xFFFFFFFF (no completion); E6 every row
-that should exist did (the SYS_MEM core row only when SYS_MEM is up); E7 the summary says restore=ok. ARM CA7: IOCTL bit 0x20 = CPUHALT is brcmfmac's ARMCR4 value (brcmfmac-chip.c:78), a GUESS for the CA7; only reported.
+that should exist did (the SYS_MEM core row only when SYS_MEM is up); E7 the summary says restore=ok. ARM CA7: IOCTL bit 0x20 = CPUHALT is read from source: brcmfmac applies ARMCR4_BCMA_IOCTL_CPUHALT (brcmfmac-chip.c:78) to BCMA_CORE_ARM_CA7 (:1067-1075, :1358); the DHD value is unknown; only reported.
 The log's `LINK table sha=<16 hex>` line must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2).
 Exit code 0 = all checks pass, 1 = a check failed / rows missing, 2 = usage / no data / table sha mismatch."""
 import argparse
@@ -59,7 +59,7 @@ def check(vals, rows, summary):
         elif label == "pmustatus":
             note = f"ALPAVAIL {int(bool(v & 8))} HTAVAIL {int(bool(v & 4))} SBCLKST {(v >> 4) & 3}"
         elif label == "IOCTL":
-            note = f"CLK {v & 1} FGC {(v >> 1) & 1}" + (f" bit5(CPUHALT, guess) {(v >> 5) & 1}" if w == 0x18120000 else "")
+            note = f"CLK {v & 1} FGC {(v >> 1) & 1}" + (f" bit5(CPUHALT, brcmfmac) {(v >> 5) & 1}" if w == 0x18120000 else "")
         elif label == "RESET_CTL":
             note = f"RESET {v & 1}" + ("  UPPER BITS SET" if v & 0xFFFFFFFE else "")
         lines.append(f"{WINDOWS[w]:<16} +{o:#05x} {label:<16} {v:#010x}  {note}".rstrip())

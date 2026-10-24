@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "8fc7cbb19c525070676df80166a89fef5e8c4c2d57c09dbf02fa720d9cc1ceaa"
-_WLAN_SEQ_COUNTS = {"rows": 1346, "teardown": 47, "write_rows": 283, "distinct_targets": 193}
+_WLAN_SEQ_SHA = "5bf3cb1eb57309337bcac226cf34fe463ea9041e4eff3830551af211c3fc06e6"
+_WLAN_SEQ_COUNTS = {"rows": 1347, "teardown": 47, "write_rows": 283, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2991,13 +2991,13 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     if [r.get("eot", 0) for r in s32_dump] != [1] * (0xE00 // 4 - 1) + [2] or any("eot" in x for x in rows if x["step"] != 32 or x not in s32_dump) or any("eot" in t for t in tear):
         raise AssertionError(f"{name}: the S32 EROM dump rows must carry eot = 1 (stop after a 0xF dword) and the last one eot = 2 (refuse without an EOT); no other row has the flag")
     # S33 (research 38, READ-ONLY chip state): the precondition (window == the S32 end state 0x18105000), then per window of the chain: the move (full word, restored by the S32 teardown row T01) with its one-shot read-back and the exact reads; the pmurev guard
-    # (0x604 & 0xFF == 0x28) AFTER the PMU logs; the RESET_CTL upper-bit guards; the SYS_MEM-up gate (IOCTL & 3 == 1, RESET_CTL & 1 == 0) BEFORE the SYS_MEM core move; the core page read (offset 0) is the last MEM row; the link / AER logs. Pinned independently of the generator.
+    # (0x604 & 0xFF == 0x28) AFTER the PMU logs; the RESET_CTL upper-bit guards; the SYS_MEM-up gate (IOCTL & 3 == 1, RESET_CTL & 1 == 0, RESET_ST == 0: review 15 finding 2) BEFORE the SYS_MEM core move; the core page read (offset 0) is the last MEM row; the link / AER logs. Pinned independently of the generator.
     tw = tear[0]["id"]
     mv = lambda v: [("mmio_write", "CFG", 0x80, BIG, v, None, None, tw), ("wait_eq", "CFG", 0x80, BIG, v, None, None, None)]
     lg = lambda o: ("read_only", "MEM", o, BIG, 0, None, True, None)
     s33_want = [("wait_eq", "CFG", 0x80, BIG, 0x18105000, None, None, None)] + mv(0x18012000) + [lg(o) for o in (0x604, 0x600, 0x608, 0x618, 0x61C)] + [("wait_eq", "MEM", 0x604, 0xFF, 0x28, None, None, None)] + \
                mv(0x18120000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [("wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, None, None, None)] + \
-               mv(0x18126000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [("wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, None, None, None), ("wait_eq", "MEM", 0x408, 3, 1, None, None, None), ("wait_eq", "MEM", 0x800, 1, 0, None, None, None)] + \
+               mv(0x18126000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [("wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, None, None, None), ("wait_eq", "MEM", 0x408, 3, 1, None, None, None), ("wait_eq", "MEM", 0x800, 1, 0, None, None, None), ("wait_eq", "MEM", 0x804, BIG, 0, None, None, None)] + \
                mv(0x18026000) + [lg(0), ("read_only", "CFG", 0xBC, BIG, 0, None, True, None), ("read_only", "CFG", 0x104, BIG, 0, None, True, None)]
     s33 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log"), r["restore"]) for r in rows if r["step"] == 33]
     if s33 != s33_want or any((r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 33) or any(t["requires"] == 33 for t in tear):
@@ -3545,6 +3545,10 @@ def wlan_seq_selftest() -> int:
         ("the S33 SYS_MEM-up gate weakened (RESET_CTL mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x800, mask=1), None, "S33 must be exactly"),
         ("the S33 SYS_MEM-up gate after the core page move", f_swap(33, dict(kind="wait_eq", blk="MEM", off=0x800, mask=1), dict(kind="mmio_write", blk="CFG", value=0x18026000)), None, "BAR0 (MEM)"),
         ("the S33 SYS_MEM-up gate polls many times (a wait loop instead of a stop)", set_row(33, "polls", 20000, kind="wait_eq", blk="MEM", off=0x408), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM RESET_ST gate removed", f_rm(33, kind="wait_eq", blk="MEM", off=0x804), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM RESET_ST gate weakened (mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x804), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM RESET_ST gate expects non-zero", set_row(33, "value", 1, kind="wait_eq", blk="MEM", off=0x804), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM RESET_ST gate after the core page move", f_swap(33, dict(kind="wait_eq", blk="MEM", off=0x804), dict(kind="mmio_write", blk="CFG", value=0x18026000)), None, "BAR0 (MEM)"),
         ("the S33 SYS_MEM core read made a probe", set_row(33, "probe", True, kind="read_only", blk="MEM", off=0), None, "S33 must be exactly"),
         ("the S33 core read without the log flag", set_row(33, "log", False, kind="read_only", blk="MEM", off=0), None, "S33 must be exactly"),
         ("the S33 AER log removed", f_rm(33, kind="read_only", blk="CFG", off=0x104), None, "S33 must be exactly"),
@@ -4024,6 +4028,11 @@ def _a64_call(block: str, args: dict, name: str, fn: str, max_steps: int = 200) 
         o = [x.strip() for x in ops.split(",")]
         nxt = pc + 1
         wide = bool(o) and o[0][:1] == "x"
+        # review 15 findings 3/4: fail closed on any operand form that is not modelled (shifted immediates / registers were silently ignored)
+        n_ops = {"mov": 2, "cmp": 2, "tst": 2, "cset": 2, "and": 3, "orr": 3, "eor": 3, "lsr": 3, "lsl": 3, "csel": 4, "ccmp": 4}
+        if (mn in n_ops and len(o) != n_ops[mn]) or (mn == "movk" and not (len(o) == 2 or (len(o) == 3 and re.fullmatch(r"lsl #(16|32|48)", o[2])))) or \
+           (mn in ("add", "sub") and not (len(o) == 3 or (len(o) == 4 and o[2].startswith("#") and re.fullmatch(r"lsl #(0|12)", o[3])))):
+            raise AssertionError(f"{name}: {fn}: unmodelled operand form `{mn} {ops}` at {addr:x} (the evaluator fails closed)")
         if mn == "ret":
             return rg[0] & M32
         if mn == "mov":
@@ -4076,7 +4085,7 @@ def _wlanlink_mem_ok_model(blocks: list, name: str) -> None:
     for win in wins:
         for off in offs:
             want = off < 0xE00 if win == 0x18105000 else off in exp.get(win, ())
-            got = _a64_call(m[0], {0: win, 1: off & 0xFFFFFFFF}, name, "mem_ok") & 1 if off < 0x100000000 else None
+            got = _a64_call(m[0], {0: win, 1: off & 0xFFFFFFFF}, name, "mem_ok") != 0 if off < 0x100000000 else None
             if got is None:
                 continue
             if bool(got) != want:
@@ -4209,6 +4218,11 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("mem_ok EROM bound narrowed (0xdff -> 0x7ff)", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x7ff", mblk), 1)),
         ("mem_ok EROM bound condition inverted (ls -> hi)", disasm.replace(mblk, re.sub(r"cset\tw(\d+), ls\b", r"cset\tw\1, hi", mblk), 1)),
         ("mem_ok EROM bound compare dropped", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x0", mblk), 1)),
+        # review 15 findings 3/4: any non-zero result is an accept (r32 refuses only on cbz w0); operand forms the evaluator does not model fail closed (AP-16: regex over the whole block, no register numbers)
+        ("mem_ok reject path returns 2 (r32 accepts any non-zero)", disasm.replace(mblk, re.sub(r"mov\tw(\d+), #0x0\b", r"mov\tw\1, #0x2", mblk), 1)),
+        ("mem_ok EROM bound shifted immediate (cmp #0xdff, lsl #12)", disasm.replace(mblk, re.sub(r"(cmp\tw\d+, #0xdff)\b", r"\1, lsl #12", mblk), 1)),
+        ("mem_ok wrapper mask with a shifted register (and w, w, w, lsl #3)", disasm.replace(mblk, re.sub(r"and\tw(\d+), w(\d+), #0xfffffffb\b", r"and\tw\1, w\2, w\2, lsl #3", mblk), 1)),
+        ("mem_ok PMU range with a shifted register (sub w, w, w, lsl #2)", disasm.replace(mblk, re.sub(r"sub\tw(\d+), w(\d+), #0x600\b", r"sub\tw\1, w\2, w\2, lsl #2", mblk), 1)),
         ("mem_ok calls another function", disasm.replace(mblk, mblk.replace("ret", "bl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n  1:\td65f03c0 \tret", 1), 1)),
         ("mem_ok became a load (reads memory)", disasm.replace(mblk, mblk.replace("cmp\tw1, #0xdff", "ldr\tw1, [x1]", 1), 1)),
         ("r32 does not call mem_ok", disasm.replace(rblk, re.sub(r"bl\t([0-9a-f]+) <mem_ok>", r"nop", rblk), 1)),
