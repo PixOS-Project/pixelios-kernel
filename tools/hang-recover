@@ -72,9 +72,11 @@ S
 exit 1
 S
 	chmod +x "$d"/lsusb "$d"/adb "$d"/fastboot "$d"/ping
+	# TP-020: `phone goto` needs the phone lock; the test holds its own in a temp dir (never the real lock)
+	PHONE_LOCK_DIR="$d/lock" "$(dirname "$self")/phone-lock" acquire --owner hr-test --token hr-token --pid $$ >/dev/null || return 1
 	chk() { # name rc grep-pattern seq args...
 		local n=$1 erc=$2 pat=$3 seq=$4 out rc; shift 4; rm -f "$d/n" "$d/cur" "$d/fb"
-		out=$(env PATH="$d:$PATH" HS_DIR="$d" HS_SEQ="$seq" HR_POLL=0.2 PS_TMO=2 "$self" "$@" 2>&1); rc=$?
+		out=$(env PHONE_LOCK_DIR="$d/lock" PHONE_LOCK_TOKEN=hr-token PATH="$d:$PATH" HS_DIR="$d" HS_SEQ="$seq" HR_POLL=0.2 PS_TMO=2 "$self" "$@" 2>&1); rc=$?
 		if [ $rc = "$erc" ] && echo "$out" | grep -q -- "$pat" && ! echo "$out" | grep -q SECRET; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
 	}
