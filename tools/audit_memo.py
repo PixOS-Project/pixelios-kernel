@@ -120,9 +120,10 @@ def _hook(event, args):
                 r["busy"] = True
                 try:
                     d = _dep_path(p)
-                    if p.endswith(".pyc") and not (os.path.isfile(d) and _pyc_ok(p, d)):
+                    if p.endswith(".pyc") and os.path.isfile(p) and not (os.path.isfile(d) and _pyc_ok(p, d)):  # a missing pyc is only a probe
                         r["nolist"] = "sourceless or stale pyc"  # fail closed
-                    _note_exist(r, "stat", p)  # a failed open is an input too (the file may appear)
+                    if not p.endswith(".pyc"):  # a cold import probes a pyc it then writes; the source hash covers it
+                        _note_exist(r, "stat", p)  # a failed open is an input too (the file may appear)
                     if os.path.isfile(d):
                         h = _sha(d)
                         if r["h"].setdefault(d, h) != h:
@@ -184,6 +185,7 @@ def _list_sha(kind, path, rec):
         names = os.listdir(path) if kind == "dir" else [_rel(x) for x in glob.glob(path, recursive=rec)]
     except OSError:
         names = ["\0missing"]  # a missing / unreadable directory is a state too (a miss when it appears)
+    names = [n for n in names if "__pycache__" not in n]  # a cold import creates it; the pyc is covered by its source's hash
     return hashlib.sha256("\n".join(sorted(names)).encode("utf-8", "surrogateescape")).hexdigest()
 
 

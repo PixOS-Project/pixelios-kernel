@@ -145,6 +145,18 @@ class Memo(unittest.TestCase):
         opt.unlink()
         self.assertEqual(self.go(probe, name="pr")[0], [False, "none", False]); self.assertEqual(self.calls, 3)
 
+    def test_cold_import_is_stored(self):
+        (self.t / "m").mkdir(); m = self.t / "m" / "coldmod.py"; m.write_text("X = 1\n")      # no __pycache__ yet: the import probes a missing pyc, then writes it
+        def imp():
+            self.calls += 1
+            sys.path.insert(0, str(self.t / "m"))
+            try:
+                import importlib; importlib.invalidate_caches(); return importlib.import_module("coldmod").X
+            finally:
+                sys.path.remove(str(self.t / "m")); sys.modules.pop("coldmod", None)
+        self.go(imp, name="cold"); self.go(imp, name="cold")
+        self.assertEqual(self.calls, 1)
+
     def test_stat_wrappers_restored(self):
         a, b = os.stat, os.lstat
         self.go()
