@@ -94,6 +94,39 @@ class Memo(unittest.TestCase):
         self.assertEqual(self.calls, 2)
         self.assertFalse(list((self.t / "cache").glob("*.json")))
 
+    def test_listing_and_glob_are_inputs(self):
+        def ls():
+            self.calls += 1
+            return [sorted(os.listdir(self.t / "d")), sorted(pathlib.Path(x).name for x in __import__("glob").glob(str(self.t / "d" / "*.txt")))]
+        (self.t / "d").mkdir()
+        r1, _ = self.go(ls, name="ls"); self.go(ls, name="ls")
+        self.assertEqual(self.calls, 1)                    # unchanged listing: hit
+        (self.t / "d" / "new.txt").write_text("x")               # a new file changes both the listing and the glob
+        r2, _ = self.go(ls, name="ls")
+        self.assertEqual(self.calls, 2)
+        self.assertIn("new.txt", r2[1]); self.assertNotIn("new.txt", r1[1])
+        (self.t / "d" / "new.dat").write_text("x")               # changes only the os.listdir part
+        self.go(ls, name="ls"); self.assertEqual(self.calls, 3)
+
+    def test_missing_dir_listing_is_an_input(self):
+        def g():
+            self.calls += 1
+            return sorted(__import__("glob").glob(str(self.t / "nodir" / "*")))
+        self.go(g, name="g"); self.go(g, name="g"); self.assertEqual(self.calls, 1)
+        (self.t / "nodir").mkdir(); (self.t / "nodir" / "f").write_text("x")
+        r, _ = self.go(g, name="g"); self.assertEqual((self.calls, len(r)), (2, 1))
+
+    def test_listing_by_fd_not_stored(self):
+        def lsfd():
+            self.calls += 1
+            fd = os.open(self.t, os.O_RDONLY)
+            try:
+                return sorted(os.listdir(fd))
+            finally:
+                os.close(fd)
+        self.go(lsfd, name="lsfd"); self.go(lsfd, name="lsfd")
+        self.assertEqual(self.calls, 2)
+
     def test_key_includes_memo_code(self):
         a = am.key("fn", b"", self.script)
         other = self.t / "memo_copy.py"; other.write_text("x")

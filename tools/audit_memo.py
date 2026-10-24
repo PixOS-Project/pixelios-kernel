@@ -8,11 +8,13 @@ Key = sha256 of: bytes of `script` and of this file (any audit or memo edit inva
 Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), hashed at open time and re-hashed after fn (any change = nothing stored), stored as (path, sha256); a hit re-hashes them all.
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
 Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
-file for writing outside __pycache__ (fail closed). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
+file for writing outside __pycache__ (fail closed).
+Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken after fn) and re-listed on a hit;
+a listing by fd or with root_dir/dir_fd is not storable. A failed open of a missing file or an existence check (os.stat) is NOT tracked. Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
 Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
-import contextlib, hashlib, io, json, os, pathlib, platform, sys, tempfile
+import contextlib, glob, hashlib, io, json, os, pathlib, platform, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SPAWN = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty")
@@ -41,6 +43,20 @@ def _hook(event, args):
     r = _stack[-1]
     if event in _SPAWN:
         r["spawn"] = event
+    elif event == "glob.glob/2":  # (pathname, recursive, root_dir, dir_fd)
+        if args[2] is not None or args[3] is not None:
+            r["nolist"] = event
+    elif event in ("os.listdir", "os.scandir", "glob.glob"):
+        a = args[0] if args else None
+        if event == "glob.glob":
+            if isinstance(a, (str, os.PathLike)):
+                r["lists"].add(("glob", os.path.abspath(os.fspath(a)), bool(args[1])))
+            else:
+                r["nolist"] = event
+        elif a is None or isinstance(a, (str, bytes, os.PathLike)):
+            r["lists"].add(("dir", os.path.abspath(os.fsdecode("." if a is None else a)), False))
+        else:
+            r["nolist"] = event
     elif event == "open":
         path, flags = args[0], args[2]
         if not isinstance(path, (str, bytes, os.PathLike)):
@@ -96,6 +112,14 @@ def _dep_path(p):
     return p
 
 
+def _list_sha(kind, path, rec):
+    try:
+        names = os.listdir(path) if kind == "dir" else [_rel(x) for x in glob.glob(path, recursive=rec)]
+    except OSError:
+        names = ["\0missing"]  # a missing / unreadable directory is a state too (a miss when it appears)
+    return hashlib.sha256("\n".join(sorted(names)).encode("utf-8", "surrogateescape")).hexdigest()
+
+
 def _deps(hashes):
     """Open-time hashes -> sorted (rel path, sha); None if any dep changed or vanished while fn ran (TOCTOU: do not store)."""
     try:
@@ -106,6 +130,11 @@ def _deps(hashes):
     return sorted((_rel(p), h) for p, h in hashes.items())
 
 
+def _lists(found):
+    """Listings fn did -> sorted [kind, rel path, recursive, sha] (re-listed after fn)."""
+    return sorted([k, _rel(p), rec, _list_sha(k, p, rec)] for k, p, rec in found)
+
+
 def _load(path, k):
     try:
         e = json.loads(path.read_text())
@@ -113,6 +142,9 @@ def _load(path, k):
             return None
         for p, h in e["deps"]:
             if _sha(_abs(p)) != h:
+                return None
+        for k, p, rec, h in e.get("lists", []):
+            if _list_sha(k, _abs(p), rec) != h:
                 return None
         return e
     except (OSError, ValueError, KeyError, TypeError):
@@ -131,7 +163,7 @@ def run(fn, arg=b"", *, script, name=None):
         for line in e["stdout"].splitlines():
             print(f"{line} (memo {k[:16]})")
         return e["ret"]
-    rec = {"opened": [], "h": {}}
+    rec = {"opened": [], "h": {}, "lists": set()}
     buf = io.StringIO()
     _stack.append(rec)
     try:
@@ -143,14 +175,15 @@ def run(fn, arg=b"", *, script, name=None):
     finally:
         _stack.pop()
     sys.stdout.write(buf.getvalue())
-    if "spawn" in rec or "write" in rec or "changed" in rec:
+    if "spawn" in rec or "write" in rec or "changed" in rec or "nolist" in rec:
         return ret
     deps = _deps(rec["h"])
     if deps is None:
         return ret  # an input changed while fn ran: the result may describe old content
+    lists = _lists(rec["lists"])
     try:
         json.dumps(ret)
-        entry = {"version": 1, "key": k, "name": name, "deps": deps, "stdout": buf.getvalue(), "ret": ret}
+        entry = {"version": 1, "key": k, "name": name, "deps": deps, "lists": lists, "stdout": buf.getvalue(), "ret": ret}
         f.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=f.parent, suffix=".tmp")
         with os.fdopen(fd, "w") as t:

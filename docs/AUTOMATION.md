@@ -539,3 +539,10 @@ Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, o
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
 unless `--pid N`. Owner default: `$PHONE_OWNER`, else `agent-<pid>`. Last line `RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns`; exit 0 ok, 1 busy after `--wait`
 (max 3600; holder and age printed) or, for `run`, CMD's own exit code, 2 error; `status` exits 0 free / 1 held. Touches no device. Tested on the host only.
+
+- **`tools/lint-c` and the gate's build dirs (round 3 F6).** The gate builds into `shim/out/gate/build-*` and no longer refreshes `shim/out/board_config.h`;
+  `tools/lint-c` reads `shim/out` by default (RESULT: ERROR if the header is missing, but an old one is accepted), so after a gate run use
+  `tools/lint-c --out shim/out/gate/build-0`.
+- **Memo limits (round 3 F4/F5).** The memo compares a dependency's hash on every open (an edit + revert during a run stores nothing), records
+  `os.listdir`/`os.scandir`/`glob.glob` results as inputs (hash of the sorted names, re-listed on a hit; by fd or with `root_dir` = not stored),
+  and does NOT track failed opens of missing files or `os.stat`/`Path.exists` checks (a memoized function must not branch on those).
