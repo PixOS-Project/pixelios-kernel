@@ -70,6 +70,21 @@ class Memo(unittest.TestCase):
         self.go(); self.assertEqual(self.calls, 2)
         self.go(); self.assertEqual(self.calls, 2)     # rewritten
 
+    def test_dep_edited_during_run_not_stored(self):
+        new = self.t / "dep.new"; new.write_text("d2")   # created before the run: the edit below is a rename, not an open
+        def edit_mid_run():
+            self.calls += 1; v = self.dep.read_text(); os.replace(new, self.dep); print("PASS " + v); return 1
+        self.go(edit_mid_run, name="e")
+        self.assertFalse(list((self.t / "cache").glob("*.json")))
+        _, o = self.go(name="e"); self.assertEqual((self.calls, o), (2, "line one\nPASS d2\n"))   # recomputed, not replayed
+
+    def test_key_includes_memo_code(self):
+        a = am.key("fn", b"", self.script)
+        other = self.t / "memo_copy.py"; other.write_text("x")
+        old = am.__file__; am.__file__ = str(other)
+        self.addCleanup(setattr, am, "__file__", old)
+        self.assertNotEqual(a, am.key("fn", b"", self.script))
+
     def test_no_memo_env(self):
         os.environ["PIXELIOS_AUDIT_NO_MEMO"] = "1"
         self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)
