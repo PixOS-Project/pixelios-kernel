@@ -1,19 +1,16 @@
 sweet-log-timestamps (boot-speed M1, docs/PLAN-BOOT-SPEED.md s4): boot-arg sweetlogts=1 prefixes every console line in the
-persistent log ring (and so the USB replay, sweet_log_copy) with "[SSSSS.mmm] ". INERT without the boot-arg.
-Facts, all read from source on the patched xnu-8796 tree:
- - sweet_log_append is called from _cnputs for all console output, before any mute (osfmk/console/serial_console.c:285, patch 0065).
- - Clock: ml_get_hwclock() (osfmk/arm64/machine_routines.c:2082, raw CNTPCT read) over gPEClockFrequencyInfo.timebase_frequency_hz
-   (pexpert/arm/pe_identify_machine.c:68 default 24 MHz, DT override :92-94). mach_continuous_time/mach_absolute_time are NOT used:
-   they read per-CPU data (osfmk/arm64/machine_routines.c:2089) and divide by rtclock_sec_divisor, which is 0 until
-   timebase_callback runs (osfmk/arm/rtclock.c:140). The count starts when the counter started (before the kernel), not at kernel entry.
- - Frequency 0 (before pe_identify_machine zeroes/sets it): the prefix is "[    ?.???] ".
- - Boot-args: PE_boot_args() dereferences PE_state.bootArgs (pexpert/arm/pe_bootargs.c:10), which is NULL until PE_init_platform
-   (pexpert/arm/pe_init.c:403); until then the boot-arg is treated as off and re-checked on the next call; the first call after
-   that caches the answer.
- - Ring accounting: one atomic add of size + nlines*12 reserves prefix + data; every write is reduced mod SWEET_LOG_SIZE like before.
+persistent log ring (and so the USB replay) with "[SSSSS.mmm] ". INERT without the boot-arg. Facts [src], details: docs/reviews/17:
+ - sweet_log_append runs from _cnputs for all console output (osfmk/console/serial_console.c:284, patch 0065).
+ - Clock: ml_get_hwclock() (osfmk/arm64/machine_routines.c:2082, CNTVCT_EL0 read :2076) / gPEClockFrequencyInfo.timebase_frequency_hz
+   (pexpert/arm/pe_identify_machine.c:68). mach_continuous_time is not used: per-CPU data (:2095), rtclock_sec_divisor 0 until
+   timebase_callback (osfmk/arm/rtclock.c:140). Counts from counter start: includes ABL + shim; subtract the first stamp.
+ - Stamp = when the line's first byte reaches _cnputs (console-ring drain), not the printf time: read a gap as "between drains".
+ - Frequency 0 early: prefix "[    ?.???] ". Boot-args NULL until PE_init_platform (pe_bootargs.c:10, pe_init.c:403): off until readable, then cached.
+ - Racy by design (bol flag unserialized): a prefix may land mid-line; the ring is never corrupted.
+ - Ring: one atomic add of size + nlines*12 reserves prefix + data; every write is reduced mod SWEET_LOG_SIZE.
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -731,15 +731,90 @@
+@@ -731,15 +731,92 @@
  /* Called for all console output, any context: never blocks. */
  void sweet_log_append(const char *c, int size);
  
@@ -70,26 +67,28 @@ Facts, all read from source on the patched xnu-8796 tree:
 +	}
 +	sweet_log_ts_bol = (c[size - 1] == '\n');
 +
-+	char ts[SWEET_LOG_TS_LEN];
-+	uint64_t hz = gPEClockFrequencyInfo.timebase_frequency_hz;      /* 0 until pe_identify_machine */
-+	if (hz == 0) {
-+		memcpy(ts, "[    ?.???] ", SWEET_LOG_TS_LEN);
-+	} else {
-+		uint64_t ticks = ml_get_hwclock();
-+		uint64_t ms = (ticks / hz) * 1000 + ((ticks % hz) * 1000) / hz;
-+		uint32_t secs = (uint32_t)((ms / 1000) % 100000);
-+		uint32_t frac = (uint32_t)(ms % 1000);
-+		ts[0] = '[';
-+		for (int i = 5; i >= 1; i--) {
-+			ts[i] = (secs || i == 5) ? (char)('0' + secs % 10) : ' ';
-+			secs /= 10;
++	char ts[SWEET_LOG_TS_LEN] = { 0 };
++	if (nlines != 0) {      /* the clock is read only for chunks that start a line */
++		uint64_t hz = gPEClockFrequencyInfo.timebase_frequency_hz;      /* 0 until pe_identify_machine */
++		if (hz == 0) {
++			memcpy(ts, "[    ?.???] ", SWEET_LOG_TS_LEN);
++		} else {
++			uint64_t ticks = ml_get_hwclock();
++			uint64_t ms = (ticks / hz) * 1000 + ((ticks % hz) * 1000) / hz;
++			uint32_t secs = (uint32_t)((ms / 1000) % 100000);
++			uint32_t frac = (uint32_t)(ms % 1000);
++			ts[0] = '[';
++			for (int i = 5; i >= 1; i--) {
++				ts[i] = (secs || i == 5) ? (char)('0' + secs % 10) : ' ';
++				secs /= 10;
++			}
++			ts[6] = '.';
++			ts[7] = (char)('0' + frac / 100);
++			ts[8] = (char)('0' + frac / 10 % 10);
++			ts[9] = (char)('0' + frac % 10);
++			ts[10] = ']';
++			ts[11] = ' ';
 +		}
-+		ts[6] = '.';
-+		ts[7] = (char)('0' + frac / 100);
-+		ts[8] = (char)('0' + frac / 10 % 10);
-+		ts[9] = (char)('0' + frac % 10);
-+		ts[10] = ']';
-+		ts[11] = ' ';
 +	}
 +
 +	/* The total covers prefixes + data in one reservation; every write is reduced mod the ring size. */
@@ -102,7 +101,7 @@ Facts, all read from source on the patched xnu-8796 tree:
 +			}
 +		}
 +		sweet_log_ring[at++ % SWEET_LOG_SIZE] = c[i];
-+		bol = (c[i] == '\n') && (i < size - 1);
++		bol = (c[i] == '\n');
  	}
  }
  
