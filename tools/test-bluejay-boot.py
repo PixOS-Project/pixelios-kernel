@@ -5054,18 +5054,9 @@ def udump_object_selftest() -> int:
     return caught
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("boot_image", type=pathlib.Path, nargs="?")
-    parser.add_argument("--wlan-link-effective", type=int, help="build.sh: the effective WLAN_LINK_N of the wlanlink.o it just built (checked against --wlan-link-explicit, then exit)")
-    parser.add_argument("--wlan-link-explicit", default="", help="build.sh: the N typed as --wlan-link=N ('' = none)")
-    args = parser.parse_args()
-    if args.wlan_link_effective is not None:
-        check_wlan_link_n(args.wlan_link_effective, args.wlan_link_explicit)
-        print(f"PASS wlan-link N: effective N={args.wlan_link_effective} (explicit {args.wlan_link_explicit or 'none: default'})")
-        return
-    assert args.boot_image, "boot_image required"
-    image = args.boot_image.read_bytes()
+def check_boot_header(path: pathlib.Path) -> tuple:
+    """Header checks of one boot image (the tree audit in main() does not read the image, so it runs once for any number of images)."""
+    image = path.read_bytes()
     assert image[:8] == b"ANDROID!", "missing Android boot image magic"
     kernel_size, ramdisk_size, _, header_size = struct.unpack_from("<4I", image, 8)
     header_version, = struct.unpack_from("<I", image, 40)
@@ -5077,6 +5068,21 @@ def main() -> None:
     is_arm64 = len(kernel_data) > 0x3c and kernel_data[0x38:0x3c] == b"ARMd"
     is_lz4 = kernel_data[:4] == bytes([0x04, 0x22, 0x4d, 0x18])
     assert is_arm64 or is_lz4, "kernel is neither an ARM64 Image nor an LZ4-compressed Image"
+    return header_version, kernel_size, ramdisk_size, is_lz4
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("boot_image", type=pathlib.Path, nargs="*", help="one or more boot images: header checks per image, the tree audit once")
+    parser.add_argument("--wlan-link-effective", type=int, help="build.sh: the effective WLAN_LINK_N of the wlanlink.o it just built (checked against --wlan-link-explicit, then exit)")
+    parser.add_argument("--wlan-link-explicit", default="", help="build.sh: the N typed as --wlan-link=N ('' = none)")
+    args = parser.parse_args()
+    if args.wlan_link_effective is not None:
+        check_wlan_link_n(args.wlan_link_effective, args.wlan_link_explicit)
+        print(f"PASS wlan-link N: effective N={args.wlan_link_effective} (explicit {args.wlan_link_explicit or 'none: default'})")
+        return
+    assert args.boot_image, "boot_image required"
+    headers = [check_boot_header(path) for path in args.boot_image]
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     check_ufs_safety(repo_root / "shim" / "ufs.c")
@@ -5255,8 +5261,9 @@ def main() -> None:
             "shim/fdt_host_test.c", "-o", str(fdt_test),
         ], check=True, cwd=repo_root)
         subprocess.run([str(fdt_test)], check=True, cwd=repo_root)
-    fmt = "lz4" if is_lz4 else "raw"
-    print(f"PASS header v{header_version} ({fmt}): kernel={kernel_size} ramdisk={ramdisk_size}; host tests & safety checks passed")
+    for header_version, kernel_size, ramdisk_size, is_lz4 in headers:
+        fmt = "lz4" if is_lz4 else "raw"
+        print(f"PASS header v{header_version} ({fmt}): kernel={kernel_size} ramdisk={ramdisk_size}; host tests & safety checks passed")
 
 
 if __name__ == "__main__":

@@ -516,8 +516,7 @@ gcc -O1 -Wall -Wextra -Werror -Iout -o out/mali_pt_host_test mali_pt_host_test.c
 awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > out/sweet_touch_poke.h
 gcc -O1 -Wall -Wextra -Werror -Iout -o out/touchpoke_host_test touchpoke_host_test.c && ./out/touchpoke_host_test
 if [ "$gs101" = 1 ]; then
-	"$PYTHON" ../tools/test-bluejay-boot.py out/shim-boot.img
-	"$PYTHON" ../tools/test-bluejay-boot.py out/shim-boot-lz4.img
+	"$PYTHON" ../tools/test-bluejay-boot.py out/shim-boot.img out/shim-boot-lz4.img
 fi
 # provenance sidecar for the image fastboot will boot (tools/fboot.sh refuses images without a matching one)
 if [ -f out/shim-boot-avb.img ]; then
