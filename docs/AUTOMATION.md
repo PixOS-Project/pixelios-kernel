@@ -95,18 +95,23 @@ only). Without `sweetdev=` it returns before printing anything; the payload of a
   Every length is checked against the remaining bytes before use; a structural error means nothing is written; a bad crc skips that file.
 * **Allowlist** (anything else: packer error; kernel `SWEET DEV: refused PATH (reason)`): `/usr/lib/`, `/usr/local/`, `/private/var/dev/`,
   exactly `/System/Library/xpc/launchd.plist`, `/System/Library/LaunchDaemons/org.pixelios.*` (one file name). Also refused: relative paths,
-  `..`, `.`, empty components, control bytes, mode above 0777 (no setuid), names ending `.sweettmp`/`.sweetorig`, symlinks in DIR, more than 64 MiB.
+  `..`, `.`, empty components, components over 245 bytes, control bytes, mode above 0777 (no setuid), names ending `.sweettmp`/`.sweetorig` (any case), symlinks and non-regular files in DIR, more than 40 MiB in total (the 64 MiB boot image holds ~16 MiB already).
 * **Safety model:** every existing parent component is looked up without following symlinks and must be a directory; directories are created
   only at or below an allowlisted directory prefix; the target must be absent or a regular file. Per file: identical (size + bytes) -> `skipped`;
   else write `PATH.sweettmp`, set mode/uid/gid, fsync, rename over the target; the first replaced original is kept as `PATH.sweetorig`.
   Errors are logged and the loop goes on; no panics, all loops bounded (count <= 4096).
 * **`sweetdev=restore`:** `--overlay DIR --args "sweetdev=restore"` (the overlay still names the paths) renames `PATH.sweetorig` back over `PATH` for every archive entry.
 * **Log lines** (UDP log): `SWEET DEV: wrote|skipped|refused|failed|restored PATH ... N ms` per file, then `SWEET DEV: done: W written, S skipped, R refused/failed, T ms`.
-* **First-run checklist:** (1) the phone already holds a flashed iOS root that has done its first boot (do not use an overlay payload for the DataMigration boot);
-  (2) kernel contains patch 0117 (`--expect "SWEET DEV: done"`); (3) overlay = one new `private/var/dev/hello` + one replaced test binary, check `wrote` lines
-  and the `ms` figures; (4) same run again, expect `skipped`; (5) size ramp for the RAM disk (research 41 U1) before anything over ~20 MiB;
-  (6) a bad launchd.plist leaves the root unbootable: keep the previous plist (`.sweetorig`) and a `sweetdev=restore` image ready.
-* **Tests:** `python3 tools/test_mkdevoverlay.py`, `python3 tools/test_build_overlay_args.py`. Design and unknowns: kernel `docs/research/41-dev-overlay-without-reflash.md`.
+* **First-run checklist** (review 18, `docs/reviews/18-dev-overlay-0117.md`). Preconditions: host tests below pass; the flashed root has finished its first (DataMigration) boot;
+  the phone lock is held by you and the agent that owns the installed root has been told it gets ONE new file. **Never replace an existing file on the first runs.**
+  1. `DIR/private/var/dev/hello` = `hello\n` (6 bytes), nothing else. `tools/xrun --kernel K --overlay DIR --label dev1 --restart 600 --expect "SWEET DEV: wrote /private/var/dev/hello 6 bytes" --expect "SWEET DEV: done: 1 written, 0 skipped, 0 refused/failed" --fail-on "SWEET DEV: (refused|failed|bad archive|no SWEETDEV|root is not mounted|out of memory)"`.
+     PASS = both expects, no fail-on, and the run still reaches the usual GUI marker of that agent's runs; the shim/loader lines must not say `ramdisk overlaps kernel memory`.
+  2. Same image again: expect `SWEET DEV: skipped /private/var/dev/hello 6 bytes (identical)` and `done: 0 written, 1 skipped` (proves the read-back path and that run 1 reached the disk).
+  3. Only after 1 and 2: a replacement under `/usr/local/` (not `/usr/lib/`), then a `--args "sweetdev=restore"` run for it. Size ramp for the RAM disk (research 41 U1) before anything over ~20 MiB.
+  * **Recovery:** on any `panic`/`Kernel trap` in 1 or 2, boot the previous image WITHOUT `--overlay` (the hook is inert; HFS replays its journal). If that boot does not reach the GUI the root is damaged: stop,
+    tell the agent that owns the image, and re-flash it with `tools/fflash-userdata.sh IMG --yes-erase-userdata` after it confirms which image. A bad `launchd.plist`: `--overlay DIR --args "sweetdev=restore"`
+    (restores `.sweetorig`), else re-flash. Files the overlay CREATED (and created directories) are not removed by `restore`. Never run fsck or write to the root from the host.
+* **Tests:** `python3 tools/test_mkdevoverlay.py`, `python3 tools/test_build_overlay_args.py`, `python3 tools/test_devoverlay_kernel.py` (compiles the kernel's parsing/path functions on the host with ASan/UBSan, differential vs the packer's reader, plus mutants; skipped without gcc). Design and unknowns: kernel `docs/research/41-dev-overlay-without-reflash.md`.
 
 ## tools/phone-state: what state is the Pixel in?
 

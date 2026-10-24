@@ -63,7 +63,7 @@ diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_devoverlay.c
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,519 @@
 +/*
 + * SWEET dev overlay: copy files from the payload into the mounted root before launchd starts.
 + *
@@ -112,6 +112,7 @@ new file mode 100644
 +extern int sweet_vfs_rename(vfs_context_t ctx, const char *from, const char *to);
 +extern int sweet_vfs_mkdir(vfs_context_t ctx, const char *path, int mode);
 +
++/* host-test begin (tools/test_devoverlay_kernel.py compiles everything up to "host-test end" on the host) */
 +#define SD_VERSION   1u
 +#define SD_HDR       16u
 +#define SD_ENT       24u
@@ -134,8 +135,6 @@ new file mode 100644
 +};
 +
 +static uint32_t sd_crc_tab[256];
-+static vfs_context_t sd_ctx;
-+static unsigned sd_nw, sd_ns, sd_nr;
 +
 +static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 +static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -158,14 +157,6 @@ new file mode 100644
 +		c = sd_crc_tab[(c ^ *p++) & 0xff] ^ (c >> 8);
 +	}
 +	return ~c;
-+}
-+
-+static uint64_t
-+now_ms(void)
-+{
-+	uint64_t ns;
-+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-+	return ns / 1000000ull;
 +}
 +
 +/* Parse the entry at *offp (overflow-safe against len); advance *offp. */
@@ -197,6 +188,31 @@ new file mode 100644
 +	return 0;
 +}
 +
++/* Header check: 0 and *count, or EINVAL. */
++static int
++sd_hdr(const uint8_t *b, uint64_t len, uint32_t *count)
++{
++	if (len < SD_HDR || memcmp(b, "SWEETDEV", 8) != 0 || rd32(b + 8) != SD_VERSION || rd32(b + 12) > SD_MAXCOUNT) {
++		return EINVAL;
++	}
++	*count = rd32(b + 12);
++	return 0;
++}
++
++/* Walk every entry once; 0 only if the whole structure fits. */
++static int
++sd_walk(const uint8_t *b, uint64_t len, uint32_t count)
++{
++	uint64_t off = SD_HDR;
++	struct sd_ent e;
++	for (uint32_t i = 0; i < count; i++) {
++		if (sd_next(b, len, &off, &e)) {
++			return EINVAL;
++		}
++	}
++	return 0;
++}
++
 +/* Sanitised copy for logging (the path is untrusted until validated). */
 +static void
 +sd_show(const struct sd_ent *e, char *out, size_t cap)
@@ -209,11 +225,24 @@ new file mode 100644
 +	out[n] = 0;
 +}
 +
++/* Case-insensitive (the root may be case-insensitive HFS+). */
 +static bool
 +sd_has_suffix(const char *s, size_t n, const char *suf)
 +{
 +	size_t k = strlen(suf);
-+	return n >= k && memcmp(s + n - k, suf, k) == 0;
++	if (n < k) {
++		return false;
++	}
++	for (size_t i = 0; i < k; i++) {
++		char c = s[n - k + i];
++		if (c >= 'A' && c <= 'Z') {
++			c = (char)(c + ('a' - 'A'));
++		}
++		if (c != suf[i]) {
++			return false;
++		}
++	}
++	return true;
 +}
 +
 +/* Copy to out (NUL-terminated); return 0 and *mkmin (smallest dir length that may be created), or a reason. */
@@ -243,6 +272,9 @@ new file mode 100644
 +			}
 +			if (len == 2 && out[comp + 1] == '.' && out[comp + 2] == '.') {
 +				return "'..' component";
++			}
++			if (len > 245) {                    /* name.sweetorig must stay within NAME_MAX (255) */
++				return "component longer than 245 bytes";
 +			}
 +			comp = i;
 +		}
@@ -274,6 +306,19 @@ new file mode 100644
 +		return NULL;
 +	}
 +	return "not in allowlist";
++}
++
++/* host-test end */
++
++static vfs_context_t sd_ctx;
++static unsigned sd_nw, sd_ns, sd_nr;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
 +}
 +
 +/* NOFOLLOW stat: 0 and *vt (and *size for VREG), or an errno. */
@@ -359,11 +404,12 @@ new file mode 100644
 +sd_write_tmp(const char *tmp, const struct sd_ent *e)
 +{
 +	vnode_t vp;
-+	int err = vnode_open(tmp, O_CREAT | FWRITE | O_NOFOLLOW, 0600, 0, &vp, sd_ctx);
++	/* A stale tmp (maybe a hard link to something else) must never be written through: remove it, create exclusively. */
++	(void)sd_rm(tmp);
++	int err = vnode_open(tmp, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, sd_ctx);
 +	if (err) {
 +		return err;
 +	}
-+	vnode_setsize(vp, 0, 0, sd_ctx);
 +	for (uint64_t off = 0; off < e->size && !err; ) {
 +		uint32_t n = (uint32_t)MIN(e->size - off, (uint64_t)SD_CHUNK);
 +		int resid = 0;
@@ -389,13 +435,22 @@ new file mode 100644
 +	return err ? err : cerr;
 +}
 +
++/*
++ * Path buffers (about 3.2 KiB) live here, not on the 16 KiB kernel stack: the call chain below sd_one goes through
++ * namei, HFS, the journal and the polled UFS driver. Safe because the hook runs once, single-threaded, in bsd_init
++ * before launchd, and sd_one never recurses.
++ */
++static struct {
++	char shown[160], path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16];
++} sd_w;
++
 +static void
 +sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
 +{
-+	char shown[160], path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16];
++	char *shown = sd_w.shown, *path = sd_w.path, *tmp = sd_w.tmp, *orig = sd_w.orig;
 +	size_t mkmin = 0;
 +	uint64_t t0 = now_ms();
-+	sd_show(e, shown, sizeof(shown));
++	sd_show(e, shown, sizeof(sd_w.shown));
 +	const char *why = sd_path_check(e, path, &mkmin);
 +	if (!why && !restore && e->mode > 0777) {
 +		why = "mode above 0777";
@@ -440,6 +495,11 @@ new file mode 100644
 +		sd_nr++;
 +		return;
 +	}
++	if (serr == 0 && oerr != 0 && oerr != ENOENT) {      /* cannot tell whether a backup exists: do not replace */
++		printf("SWEET DEV: refused %s (cannot check .sweetorig, error %d)\n", shown, oerr);
++		sd_nr++;
++		return;
++	}
 +	if (serr == 0 && sz == e->size && sd_same(path, e, buf)) {
 +		printf("SWEET DEV: skipped %s %llu bytes (identical) %llu ms\n", shown, e->size, now_ms() - t0);
 +		sd_ns++;
@@ -455,11 +515,9 @@ new file mode 100644
 +		err = sweet_vfs_rename(sd_ctx, tmp, path);
 +	}
 +	if (err) {
-+		if (moved) {
-+			(void)sweet_vfs_rename(sd_ctx, orig, path);
-+		}
++		int rb = moved ? sweet_vfs_rename(sd_ctx, orig, path) : 0;
 +		(void)sd_rm(tmp);
-+		printf("SWEET DEV: failed %s write error %d\n", shown, err);
++		printf("SWEET DEV: failed %s write error %d%s\n", shown, err, rb ? " ORIGINAL ONLY AT .sweetorig (rollback failed)" : "");
 +		sd_nr++;
 +		return;
 +	}
@@ -491,18 +549,16 @@ new file mode 100644
 +		printf("SWEET DEV: sweetdev=%s but no SWEETDEV archive in a RAM disk; nothing done\n", arg);
 +		return;
 +	}
-+	uint32_t ver = rd32(b + 8), count = rd32(b + 12);
++	uint32_t count = 0;
 +	uint64_t off = SD_HDR;
 +	struct sd_ent e;
-+	if (ver != SD_VERSION || count > SD_MAXCOUNT) {
-+		printf("SWEET DEV: bad archive header (version %u count %u); nothing done\n", ver, count);
++	if (sd_hdr(b, len, &count)) {
++		printf("SWEET DEV: bad archive header (version %u count %u); nothing done\n", rd32(b + 8), rd32(b + 12));
 +		return;
 +	}
-+	for (uint32_t i = 0; i < count; i++) {
-+		if (sd_next(b, len, &off, &e)) {
-+			printf("SWEET DEV: bad archive (entry %u runs past the end); nothing done\n", i);
-+			return;
-+		}
++	if (sd_walk(b, len, count)) {
++		printf("SWEET DEV: bad archive (an entry runs past the end); nothing done\n");
++		return;
 +	}
 +	vnode_t rv = rootvnode;
 +	if (rv == NULLVP || vfs_isrdonly(vnode_mount(rv))) {

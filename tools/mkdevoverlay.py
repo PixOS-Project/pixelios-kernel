@@ -4,17 +4,17 @@
   tools/mkdevoverlay.py DIR OUT.bin [--owner UID:GID]
 
 File DIR/usr/lib/x becomes /usr/lib/x on the phone. Only paths the kernel allowlist accepts are packed (anything
-else is an error, not a silent skip); symlinks are refused; total data is capped at 64 MiB. Output is deterministic
+else is an error, not a silent skip); symlinks are refused; total data is capped at 40 MiB. Output is deterministic
 (sorted paths, mode = file mode & 0777, one owner, no timestamps). Format (little-endian), the kernel validates it all:
   header: "SWEETDEV" | u32 version=1 | u32 count
   entry (16-byte aligned): u16 pathlen | u16 mode | u32 uid | u32 gid | u32 crc32(data) | u64 size
                            | path | pad16 | data | pad16
 parse() / path_check() below are the Python twins of the kernel checks (used by the tests).
 """
-import argparse, os, struct, sys, zlib
+import argparse, os, stat, struct, sys, zlib
 
 MAGIC, VERSION, HDR, ENT = b'SWEETDEV', 1, 16, 24
-MAX_COUNT, MAX_PATH, MAX_TOTAL = 4096, 1000, 64 << 20
+MAX_COUNT, MAX_PATH, MAX_TOTAL = 4096, 1000, 40 << 20   # 40 MiB: the AVB boot image is 64 MiB and holds ~16 MiB already
 # (prefix, kind): D = directory prefix, X = exact path, N = file name prefix in one directory
 ALLOW = [('/usr/lib/', 'D'), ('/usr/local/', 'D'), ('/private/var/dev/', 'D'),
          ('/System/Library/xpc/launchd.plist', 'X'), ('/System/Library/LaunchDaemons/org.pixelios.', 'N')]
@@ -34,7 +34,9 @@ def path_check(p):
             return "'.' component"
         if comp == b'..':
             return "'..' component"
-    if b.endswith(b'.sweettmp') or b.endswith(b'.sweetorig'):
+        if len(comp) > 245:
+            return 'component longer than 245 bytes'
+    if b.lower().endswith((b'.sweettmp', b'.sweetorig')):
         return 'reserved suffix'
     for pfx, kind in ALLOW:
         pb = pfx.encode()
@@ -107,6 +109,9 @@ def collect(root, uid=0, gid=0):
                 sys.exit('mkdevoverlay: refusing symlink %s' % full)
         for name in sorted(files):
             full = os.path.join(d, name)
+            st = os.lstat(full)                            # never open a FIFO/socket/device (open would block)
+            if not stat.S_ISREG(st.st_mode):
+                sys.exit('mkdevoverlay: not a regular file %s' % full)
             path = '/' + os.path.relpath(full, root).replace(os.sep, '/')
             why = path_check(path)
             if why:
@@ -115,8 +120,10 @@ def collect(root, uid=0, gid=0):
             data = open(full, 'rb').read()
             total += len(data)
             if total > MAX_TOTAL:
-                sys.exit('mkdevoverlay: more than 64 MiB of files')
-            entries.append((path, os.stat(full).st_mode & 0o777, uid, gid, data))
+                sys.exit('mkdevoverlay: more than 40 MiB of files')
+            if uid != 0 and (path.startswith('/usr/lib/') or path.startswith('/System/')):
+                print('mkdevoverlay: WARNING %s will be owned by uid %d, not root' % (path, uid), file=sys.stderr)
+            entries.append((path, st.st_mode & 0o777, uid, gid, data))
     entries.sort(key=lambda e: e[0])
     return entries
 

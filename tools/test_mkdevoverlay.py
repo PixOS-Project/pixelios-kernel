@@ -88,12 +88,41 @@ class Rejects(unittest.TestCase):
         r = run(d, os.path.join(d, 'o.bin'))
         self.assertNotEqual(r.returncode, 0); self.assertIn('symlink', r.stderr)
 
-    def test_packer_refuses_over_64mib(self):
+    def test_packer_refuses_over_40mib(self):
         d = tree({'usr/lib/a': b'', })
         with open(os.path.join(d, 'usr/lib/a'), 'wb') as f:
-            f.truncate(65 << 20)
+            f.truncate(41 << 20)
         r = run(d, os.path.join(d, 'o.bin'))
-        self.assertNotEqual(r.returncode, 0); self.assertIn('64 MiB', r.stderr)
+        self.assertNotEqual(r.returncode, 0); self.assertIn('40 MiB', r.stderr)
+
+
+    def test_control_bytes_case_and_long_names(self):
+        for p in ('/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/' + 'n' * 246):
+            self.assertIsNotNone(m.path_check(p), repr(p))
+        self.assertIsNone(m.path_check('/usr/lib/' + 'n' * 245))
+
+    def test_count_4097_rejected(self):
+        blob = m.pack([('/usr/lib/a', 0o644, 0, 0, b'')] * 4096)
+        self.assertEqual(len(m.parse(blob)), 4096)
+        self.bad(blob[:12] + struct.pack('<I', 4097) + blob[16:])
+        with self.assertRaises(ValueError):
+            m.pack([('/usr/lib/a', 0o644, 0, 0, b'')] * 4097)
+
+    def test_setuid_mode_is_masked(self):
+        d = tree({'usr/lib/a': b'x'}); os.chmod(os.path.join(d, 'usr/lib/a'), 0o4755)
+        o = os.path.join(d, '..', 'o.bin'); self.assertEqual(run(d, o).returncode, 0)
+        with open(o, 'rb') as f:
+            self.assertEqual(m.parse(f.read())[0][1], 0o755)
+
+    def test_packer_refuses_fifo_without_opening(self):
+        d = tree({'usr/lib/a': b'x'}); os.mkfifo(os.path.join(d, 'usr/lib/pipe'))
+        r = subprocess.run([sys.executable, '-I', PACK, d, os.path.join(d, '..', 'o.bin')], capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(r.returncode, 0); self.assertIn('not a regular file', r.stderr)
+
+    def test_owner_warning(self):
+        d = tree({'usr/lib/a': b'x'})
+        r = run(d, os.path.join(d, '..', 'o.bin'), '--owner', '501:501')
+        self.assertEqual(r.returncode, 0); self.assertIn('WARNING', r.stderr)
 
 
 if __name__ == '__main__':
