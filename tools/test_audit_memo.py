@@ -198,7 +198,7 @@ class Memo(unittest.TestCase):
         self.assertEqual(am._dep_path("/r/tools/x.py"), "/r/tools/x.py")
         # end to end: a function importing a module from a warm __pycache__ stores the .py, never the .pyc
         m = self.t / "pycmod.py"; m.write_text("X = 1\n")
-        import py_compile; py_compile.compile(str(m), cfile=str(self.t / "__pycache__" / "pycmod.cpython-313.pyc"))
+        import importlib.util, py_compile; py_compile.compile(str(m), cfile=importlib.util.cache_from_source(str(m)))
         def imp():
             self.calls += 1
             sys.path.insert(0, str(self.t))
@@ -209,6 +209,23 @@ class Memo(unittest.TestCase):
         self.go(imp, name="imp")
         deps = [d for e in (self.t / "cache").glob("*.json") for d, _ in __import__("json").loads(e.read_text())["deps"]]
         self.assertTrue(deps and not any(d.endswith(".pyc") for d in deps), deps)
+
+    def test_sourceless_or_stale_pyc_not_stored(self):
+        import importlib.util, py_compile
+        def reads(path):
+            def f():
+                self.calls += 1; return len(pathlib.Path(path).read_bytes())
+            return f
+        m = self.t / "stale.py"; m.write_text("X = 1\n")
+        c = importlib.util.cache_from_source(str(m)); py_compile.compile(str(m), cfile=c)
+        self.go(reads(c), name="ok"); self.assertEqual(len(list((self.t / "cache").glob("*.json"))), 1)   # fresh pyc: stored
+        m.write_text("X = 22222\n")                                   # stale: different size
+        self.go(reads(c), name="stale"); self.assertEqual(len(list((self.t / "cache").glob("*.json"))), 1)
+        n = self.t / "gone.py"; n.write_text("Y = 1\n"); c2 = importlib.util.cache_from_source(str(n)); py_compile.compile(str(n), cfile=c2); n.unlink()
+        self.go(reads(c2), name="gone"); self.assertEqual(len(list((self.t / "cache").glob("*.json"))), 1)   # no source
+        legacy = self.t / "old.pyc"; py_compile.compile(str(m), cfile=str(legacy)); m.unlink()
+        self.go(reads(str(legacy)), name="legacy"); self.assertEqual(len(list((self.t / "cache").glob("*.json"))), 1)
+        self.assertEqual(am._dep_path(str(legacy)), str(self.t / "old.py"))
 
     def test_no_memo_env_spellings(self):
         for v, off in (("1", 1), ("true", 1), ("YES", 1), ("True", 1), ("0", 0), ("", 0), ("no", 0), ("2", 0)):

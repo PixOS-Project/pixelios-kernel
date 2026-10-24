@@ -7,7 +7,7 @@ run(fn, arg_bytes, script=PATH) calls fn() once per distinct input; a later call
 Key = sha256 of: bytes of `script` and of this file (any audit or memo edit invalidates everything), fn name, arg bytes, sys.version, python implementation.
 Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), hashed at open time and re-hashed after fn (any change = nothing stored), stored as (path, sha256); a hit re-hashes them all.
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
-Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
+Never stored: a .pyc without its source or whose recorded mtime/size differ from it (a same-size edit in the same mtime second cannot be told apart, Python accepts it too), a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
 a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat calls (os.path.exists/isfile/isdir, Path.exists) are inputs: stored as (kind, path, exists) and re-checked on a hit (stat by fd/dir_fd is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
@@ -113,6 +113,8 @@ def _hook(event, args):
                 r["busy"] = True
                 try:
                     d = _dep_path(p)
+                    if p.endswith(".pyc") and not (os.path.isfile(d) and _pyc_ok(p, d)):
+                        r["nolist"] = "sourceless or stale pyc"  # fail closed
                     _note_exist(r, "stat", p)  # a failed open is an input too (the file may appear)
                     if os.path.isfile(d):
                         h = _sha(d)
@@ -151,8 +153,23 @@ def key(fn_name, arg, script):
 
 def _dep_path(p):
     if p.endswith(".pyc"):  # a valid pyc means the source is never opened: depend on the source instead
-        return str(pathlib.Path(p).parent.parent / (p.rsplit("/", 1)[-1].split(".")[0] + ".py"))
+        q = pathlib.Path(p)
+        if q.parent.name != "__pycache__":
+            return p[:-1]  # legacy x.pyc next to x.py
+        return str(q.parent.parent / (q.name.split(".")[0] + ".py"))
     return p
+
+
+def _pyc_ok(pyc, src):
+    """True if pyc is a timestamp pyc whose recorded source mtime/size match src (else fn ran code we did not hash)."""
+    try:
+        with open(pyc, "rb") as f:
+            h = f.read(16)
+        st = _STAT(src)
+        return len(h) == 16 and h[4:8] == b"\0\0\0\0" and int.from_bytes(h[8:12], "little") == int(st.st_mtime) & 0xFFFFFFFF \
+            and int.from_bytes(h[12:16], "little") == st.st_size & 0xFFFFFFFF
+    except OSError:
+        return False
 
 
 def _list_sha(kind, path, rec):
