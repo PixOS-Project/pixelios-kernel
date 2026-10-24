@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Decode the `LINK R33` rows of a `--wlan-link=33` run (docs/research/38, goal W-C2) into named chip registers and check them against the expectations of research 38 s.3/s.4.
+"""Decode the `LINK R33` rows of a `--wlan-link=33` run (docs/research/38, goal W-C2; trimmed by docs/research/40: no SYS_MEM-up gate, no core page) into named chip registers and check them against the expectations of research 38 s.3/s.4.
 
 Usage: tools/s33-decode.py LOG_OR_DIR [--table soc/google/gs101/wlan_seq.json]
 
 Input: the `LINK R33 row=<id> rd=0x<8 hex>` lines of the run (a file, or a directory searched recursively, e.g. a tools/xrun / probe-run log dir) and the `LINK summary ...` line. The row id is mapped to
 (window, register) through the table (rows of step 33, logged; the window is the last cfg 0x80 write before the row). Register layout: PMU AOB `pmuregs_t` (Broadcom include_sbchipc.h:55-62), AI wrapper
-IOCTL 0x408 / RESET_CTL 0x800 / RESET_ST 0x804 (aidmp.h:168,175,176), SYS_MEM coreinfo +0 (brcmfmac-chip.c:166; offset 0 for DHD is a guess).
-Checks (PASS/FAIL each, research 38 s.3/s.4; E4 is informative): E1 pmurev (pmucapabilities & 0xFF) == 0x28 (the EROM PMU rev 40; a GUESS until this run); E2/E3 wrapper RESET_CTL has no bit above bit 0 set (a GUESS);
-E4 SYS_MEM up = IOCTL & 3 == 1 and RESET_CTL & 1 == 0 (down is an accepted outcome: the run then stops at the gate and no coreinfo row exists); E5 no logged word is 0xFFFFFFFF (no completion); E6 every row
-that should exist did (the SYS_MEM core row only when SYS_MEM is up); E7 the summary says restore=ok. ARM CA7: IOCTL bit 0x20 = CPUHALT is read from source: brcmfmac applies ARMCR4_BCMA_IOCTL_CPUHALT (brcmfmac-chip.c:78) to BCMA_CORE_ARM_CA7 (:1067-1075, :1358); the DHD value is unknown; only reported.
-The log's `LINK table sha=<16 hex>` line must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2).
+IOCTL 0x408 / RESET_CTL 0x800 / RESET_ST 0x804 (aidmp.h:168,175,176).
+Checks (PASS/FAIL each, research 38 s.3/s.4; E4 is informative): E1 pmurev (pmucapabilities & 0xFF) == 0x28 (the EROM PMU rev 40; observed run w3a-n33); E2/E3 wrapper RESET_CTL has no bit above bit 0 set (a GUESS);
+E4 SYS_MEM state (informative: UP = IOCTL & 3 == 1 and RESET_CTL & 1 == 0; DOWN is the observed power-on state, run w3a-n33, and no longer stops the run: the SYS_MEM-up gate moved to S35); E5 no logged word is 0xFFFFFFFF (no completion); E6 every row
+that should exist did (11 MEM logs); E7 the summary says restore=ok; E8 the run completed (stopped=none) when all rows exist. ARM CA7: IOCTL bit 0x20 = CPUHALT is read from source (brcmfmac-chip.c:78, DHD include_siutils.h SICF_CPUHALT 0x20); only reported.
+The log's `LINK table sha=<16 hex>` line must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2); logs of runs made with an earlier table (e.g. w3a-n33 on b5b0785) need that table.
 Exit code 0 = all checks pass, 1 = a check failed / rows missing, 2 = usage / no data / table sha mismatch."""
 import argparse
 import importlib.util
@@ -27,7 +27,7 @@ R33_RE = re.compile(r"LINK R33 row=(\d+) rd=0x([0-9A-Fa-f]{8})")
 SUM_RE = re.compile(r"LINK summary reached=S(\d+) stopped=(\w+)(?: at=S(\d+) row=(\d+))? restore=(\w+)")
 PMU = {0x600: "pmucontrol", 0x604: "pmucapabilities", 0x608: "pmustatus", 0x618: "min_res_mask", 0x61C: "max_res_mask"}
 WRAP = {0x408: "IOCTL", 0x800: "RESET_CTL", 0x804: "RESET_ST"}
-WINDOWS = {0x18012000: "PMU", 0x18120000: "ARM_CA7 wrapper", 0x18126000: "SYS_MEM wrapper", 0x18026000: "SYS_MEM core"}
+WINDOWS = {0x18012000: "PMU", 0x18120000: "ARM_CA7 wrapper", 0x18126000: "SYS_MEM wrapper"}
 
 
 def table_rows(doc):
@@ -39,7 +39,7 @@ def table_rows(doc):
         if r["kind"] == "mmio_write" and r["blk"] == "CFG" and r["off"] == 0x80:
             win = r["value"]
         elif r["kind"] == "read_only" and r["blk"] == "MEM" and r.get("log"):
-            label = PMU.get(r["off"]) if win == 0x18012000 else WRAP.get(r["off"]) if win in (0x18120000, 0x18126000) else "coreinfo" if win == 0x18026000 and r["off"] == 0 else None
+            label = PMU.get(r["off"]) if win == 0x18012000 else WRAP.get(r["off"]) if win in (0x18120000, 0x18126000) else None
             out.append((r["id"], win, r["off"], label))
     return out
 
@@ -70,9 +70,9 @@ def check(vals, rows, summary):
         res.append((nm, v is not None and v & 0xFFFFFFFE == 0, f"{v:#010x}" if v is not None else "no row"))
     io, rc = by.get((0x18126000, 0x408)), by.get((0x18126000, 0x800))
     up = io is not None and rc is not None and io & 3 == 1 and rc & 1 == 0
-    res.append(("E4 SYS_MEM up (informative)", True, "UP" if up else "DOWN (a gate stop is the accepted outcome; coreinfo not read)"))
+    res.append(("E4 SYS_MEM state (informative)", True, "UP" if up else "DOWN (the observed power-on state; S35 resets it)"))
     res.append(("E5 no word is 0xFFFFFFFF", all(v != 0xFFFFFFFF for v in vals.values()), ",".join(f"row {i}" for i, v in vals.items() if v == 0xFFFFFFFF) or "ok"))
-    want = [i for i, w, _, _ in rows if up or w != 0x18026000]
+    want = [i for i, _, _, _ in rows]
     missing = [i for i in want if i not in vals]
     res.append(("E6 all expected rows logged", not missing, f"missing rows {missing}" if missing else f"{len(want)} rows"))
     if summary is None:
@@ -80,10 +80,8 @@ def check(vals, rows, summary):
     else:
         reached, stopped, at, row, restore = summary
         res.append(("E7 summary restore=ok", restore == "ok", f"reached=S{reached} stopped={stopped}" + (f" at=S{at} row={row}" if at else "") + f" restore={restore}"))
-        if up and stopped != "none":
-            res.append(("E8 clean stop state", False, f"SYS_MEM is up but the run stopped ({stopped} at S{at} row {row})"))
-        if not up and rc is not None and stopped == "none":
-            res.append(("E8 clean stop state", False, "SYS_MEM is down but the run did not stop at the gate"))
+        if not missing and stopped != "none":
+            res.append(("E8 run completed", False, f"all rows logged but the run stopped ({stopped} at S{at} row {row})"))
     return lines, res
 
 
