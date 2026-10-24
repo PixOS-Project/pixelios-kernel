@@ -159,10 +159,41 @@ reset half of TP-006 is not built (open for the user's decision). Verified with 
 ## tools/check-all.sh: the quality gate
 
 `tools/check-all.sh` (full) is what must print `GATE PASS <hash>` before a push. Output is one line; `shim/out/gate.log` has the
-full log plus a per-step timing table. Two lanes run in parallel (cap of 2 jobs): lane A = the seven bluejay shim builds (they share
-`shim/out`, so they stay serial) + host-tests + boot-safety, lane B = unit, rootless, validate. The log is merged A then B, so it is
-deterministic. Measured on the dev machine (*observed*, 2026-10-22, 01a978f): 50 s serial -> 37 s with lanes; the builds
-(6 x ~6 s) dominate.
+full log (steps in a fixed order) plus a per-step timing table. *Read from source* (`tools/check-all.sh`, this branch; not yet measured on a full gate):
+
+- **Lanes.** Two lanes run in parallel: lane A = shim builds + host-tests + boot-safety, lane B = validate, public-split, unit, phone-state,
+  hang-recover, probe-run, rootless. Lane A runs `build` first and serially (it creates `shim/out/bluejay-testkey.pem`, warms the audit
+  memo and the host-test stamp, and forces the host tests: `PIXELIOS_HOST_TESTS=always`), then the other 11 build steps in parallel,
+  at most `GATE_JOBS` (default 8; `-j N` works too) at a time, then host-tests (the binaries of `build`) and boot-safety (`--out shim/out/gate/build-0`).
+- **No shim/out writes, no `.build.lock`.** Every `build.sh` call gets its own dir `shim/out/gate/<step>-<i>/` (`--out`, below); the gate
+  never overwrites `shim/out/*.img` and does not wait for xrun/probe-run. It takes `shim/out/.gate.lock` instead (one gate per worktree;
+  `tools-sync pull` refuses while it is held). Per-step logs: `shim/out/gate/<step>.log` (live); `gate.log` is rebuilt from them at the end.
+- **Live state.** `shim/out/gate.progress` (`START <step> <epoch>` / `END <step> PASS|FAIL [(timeout)] <s>` lines), `shim/out/gate.result`
+  (atomic: `RUNNING <pid> <epoch>`, then the final `GATE ...` line + epoch). A hash with `+dirty` means `git status --porcelain` was not empty.
+- **Timeouts and failure.** Each step runs under `timeout -k 10`: 900 s for `build*`, 300 s others; `GATE_STEP_TIMEOUT=SECONDS` overrides both;
+  a timeout is a step FAIL `(timeout)`. A failing step stops every other step at its next step boundary (running parallel builds finish);
+  `--keep-going` stops only the failing lane. The reported failure is the first failed step in the fixed step order.
+- **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
+
+**Audit memo (`tools/audit_memo.py`, R2).** The three expensive mutation self-tests of `tools/test-bluejay-boot.py` (`wlan_seq_selftest`,
+`wlanlink_source_selftest`, `wlanlink_object_selftest`) are cached by content. Key = sha256 of the audit script bytes, the function name,
+the argument bytes (the objdump text for the object self-test; objdump itself stays outside), `sys.version` + implementation; the entry also
+records every file the function opened (`sys.addaudithook`, event `open`) with its sha256 and re-hashes them on lookup. Only a PASS is stored;
+a run that started a process or wrote a file is never stored; a corrupt entry is a miss. A hit prints the captured lines with
+`(memo <key16>)` appended. The audit of the real objects/sources (`check_*` on `shim/out/*.o`, `shim/*.c`) is never memoized.
+Cache dir: `$PIXELIOS_AUDIT_MEMO_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/pixelios/audit/` (shared by worktrees; entries store repo paths relative
+to the repo root). Off: `tools/test-bluejay-boot.py --no-memo`, `PIXELIOS_AUDIT_NO_MEMO=1`, `check-all.sh --no-memo`.
+Tests: `tools/test_audit_memo.py` (key parts, dep tracking, FAIL / subprocess / write not stored, corrupt entry, replay) and
+`tools/test_audit_memo_mutations.sh` (ends `RESULT: PASS mutants=N caught=N`; runs from a temp copy with a warm memo and requires each
+mutant of the wlanlink source, the audit script, `wlan_seq.json` and `boards.py` to still FAIL; the object self-test needs an aarch64
+objdump and a built `wlanlink.o` and is not covered by it; logs in `logs/audit-memo-mut/<UTC>/`).
+
+**`shim/build.sh` additions.** `--out DIR` (default `out`; relative to `shim/`; `[A-Za-z0-9._/-]` only) replaces every `out/` path; the AVB test key
+stays `out/bluejay-testkey.pem`. `tools/test-bluejay-boot.py --out DIR` audits that dir (default `shim/out`) and takes one or more boot
+images (header checks per image, the tree audit once). The variant-independent host tests (and the extracted xnu-patch headers) run once per input digest:
+sha256 of `shim/*.c *.h`, `out/board_config.h`, `out/wlan_seq.h`, the `../xnu/patches/NNNN` files `build.sh` references, `gcc -v` and `build.sh`;
+the stamp `${XDG_CACHE_HOME:-~/.cache}/pixelios/host-tests/<digest>.ok` is written only after all of them passed
+(`host tests: cached <digest>` otherwise; `PIXELIOS_HOST_TESTS=always` runs them anyway). The variant `nm` checks always run.
 
 `tools/check-all.sh --quick` is for iterating: it diffs the tree against the commit in `shim/out/gate.stamp` (written only by a
 full PASS on a clean tree) and runs only the needed steps, selected by `tools/gate_select.py` (tested by `tools/test_gate_select.py`):
@@ -175,7 +206,7 @@ full PASS on a clean tree) and runs only the needed steps, selected by `tools/ga
 | anything (docs, other `xnu/` patches) | validate (patch numbering/header format, script syntax), always |
 
 No stamp, or a stamp that is not an ancestor of HEAD: the full gate runs. A quick PASS line says `quick: ran N of 17 steps`;
-it is not a substitute for the full gate before a push.
+it is not a substitute for the full gate before a push. `tools/audit_memo.py` selects the build steps like `tools/test-bluejay-boot.py`.
 
 ## shim --gpu-power: Mali-G78 power on/off cycle (G2 stage 1, opt-in)
 
@@ -480,7 +511,7 @@ and `--fail-on RX` (default with an early stop: `Kernel trap at|panic\(cpu|panic
 
 **Kernel log timestamps (boot-speed M1, patch 0115 on branch boot-speed-patches; review 17).** With boot-arg `sweetlogts=1` every console line in the persistent/USB log starts with `[SSSSS.mmm] ` (raw timer seconds: includes ABL and shim time, subtract the first stamp for time since kernel entry). The stamp is when the line's first byte reaches the console drain, not the printf time (output printed with preemption disabled is drained later): read a gap as "between drains" and confirm it with a second marker. `tools/xrun_report.py` strips the prefix before matching (merged.log stays raw) and prints `[kernel stamp N.NNN]` on the marker lines. With `sweetfb_noconsole=2` (patch 0116) keep one run without it: a hang that is not a panic shows nothing on screen while the console is muted.
 
-**shim/out and `tools-sync` safety (review 16).** Gates, `xrun` and `probe-run` take `shim/out/.build.lock` around anything that writes `shim/out`; `xrun`/`probe-run` boot a private copy of the image from the run directory and delete it after fboot. Under `phone-lock run` they wait only 60 s for a gate (the phone is held), otherwise up to an hour. `tools/tools-sync pull` refuses while the phone lock is held or unreadable, while that build lock is held, and for a file this branch changed in its own commits (shown with the log; `--force` overrides); it checks out all files in one command. Never edit `tools/xrun`, `probe-run` or `check-all.sh` in a worktree that has a run waiting or running from it (bash reads a script while it runs, AP-18): run hardware from a worktree you do not edit.
+**shim/out and `tools-sync` safety (review 16).** `xrun` and `probe-run` take `shim/out/.build.lock` around anything that writes `shim/out` (the gate no longer does: it builds into `shim/out/gate/` and holds `shim/out/.gate.lock`); `xrun`/`probe-run` boot a private copy of the image from the run directory and delete it after fboot. Under `phone-lock run` they wait only 60 s for a gate (the phone is held), otherwise up to an hour. `tools/tools-sync pull` refuses while the phone lock is held or unreadable, while that build lock or the gate lock is held, and for a file this branch changed in its own commits (shown with the log; `--force` overrides); it checks out all files in one command. Never edit `tools/xrun`, `probe-run` or `check-all.sh` in a worktree that has a run waiting or running from it (bash reads a script while it runs, AP-18): run hardware from a worktree you do not edit.
 
 **One numbering for `xnu/patches` (TP-022).** Patches stay per branch (a kernel build contains only the patches of the branch that builds it; sharing one stack was tried and rejected by the user on 2026-10-24: every agent's
 experimental patch would enter everyone's kernel and make failures harder to attribute). Branches diverge (GPU holds 0102-0111, everyone else stops at 0101), so a second agent writing "the next patch" would pick a number that is already taken.

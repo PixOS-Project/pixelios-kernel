@@ -5,15 +5,17 @@
 #   "GATE PASS|FAIL <short-hash> quick: ran N of M steps | <failed step>"   (--quick: only the steps the diff needs)
 # --quick diffs against the commit in shim/out/gate.stamp (written by the last clean full PASS); no usable stamp = full gate.
 # Two lanes run in parallel: A = shim builds + host-tests + boot-safety, B = unit, rootless, validate. Lane A runs `build` first (cold: warms the audit
-# memo and the host-test stamp), then the other build steps at most GATE_JOBS (default 8) at a time. Every build writes its own dir shim/out/gate/<step>-<i>/
+# memo and the host-test stamp), then the other build steps at most GATE_JOBS / -j N (default 8) at a time. Every build writes its own dir shim/out/gate/<step>-<i>/
 # (build.sh --out), so the gate never touches shim/out/*.img and takes no .build.lock (only shim/out/.gate.lock: one gate per worktree).
 # Live state: shim/out/gate.progress (START/END per step), gate.result (RUNNING <pid> <epoch>, then the GATE line + epoch; atomic), shim/out/gate/<step>.log.
 # A failing step stops the rest at their next step boundary (--keep-going: only its own lane). Per-step timeout: GATE_STEP_TIMEOUT s (default 900 build*, 300 others). Exit 0 PASS, 1 FAIL, 2 usage.
+# --no-memo (or PIXELIOS_AUDIT_NO_MEMO=1) disables the audit self-test memo (tools/audit_memo.py) for this run.
 # Reviewers/leads: trust a PASS line whose hash equals `git rev-parse --short HEAD` instead of re-running.
 cd "$(dirname "$0")/.." || exit 2
 git rev-parse --short HEAD >/dev/null 2>&1 || { echo "GATE ERROR not a git checkout"; exit 2; }
 quick=; keep=
-for a in "$@"; do case $a in --quick) quick=1 ;; --keep-going) keep=1 ;; *) echo "GATE ERROR usage: check-all.sh [--quick] [--keep-going]"; exit 2 ;; esac; done
+while [ $# -gt 0 ]; do case $1 in --quick) quick=1 ;; --keep-going) keep=1 ;; --no-memo) export PIXELIOS_AUDIT_NO_MEMO=1 ;; -j) shift; GATE_JOBS=${1:-x} ;;
+	*) echo "GATE ERROR usage: check-all.sh [--quick] [--keep-going] [--no-memo] [-j N]"; exit 2 ;; esac; shift; done
 case ${GATE_STEP_TIMEOUT:-1} in *[!0-9]*) echo "GATE ERROR GATE_STEP_TIMEOUT must be seconds"; exit 2 ;; esac
 case ${GATE_JOBS:-1} in ''|*[!0-9]*|0) echo "GATE ERROR GATE_JOBS must be a positive integer"; exit 2 ;; esac
 J=${GATE_JOBS:-8}
