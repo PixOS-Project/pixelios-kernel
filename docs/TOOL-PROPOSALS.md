@@ -43,3 +43,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-016 | tools/phone-lock | done |
 | TP-017 | tools/tool-proposals prune | done |
 | TP-018 | tools/phone | proposed |
+| TP-019 | tools/check-site | proposed |
