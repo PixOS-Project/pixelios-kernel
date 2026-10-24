@@ -81,7 +81,7 @@ laneA() {
 	par step A build-touch  bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --touch-probe=run,mux,cs,osc,loop,rst,misopu,rails --out out/gate/build-touch-0'
 	par step A build-udump  bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --udump 1 --out out/gate/build-udump-0'
 	wait
-	step A host-tests   bash -c 'cd shim/out/gate/build-0 && ls *_host_test >/dev/null && for t in *_host_test host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'
+	step A host-tests   bash -c 'cd shim/out/gate/build-0 && ls *_host_test >/dev/null && for t in *_host_test host_test; do [ -x "$t" ] && "./$t" || [ ! -x "$t" ] || exit 1; done'
 	step A boot-safety  python3 tools/test-bluejay-boot.py --out shim/out/gate/build-0 shim/out/gate/build-0/shim-boot-avb.img
 }
 laneB() {
