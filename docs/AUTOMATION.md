@@ -169,10 +169,19 @@ full log (steps in a fixed order) plus a per-step timing table. *Read from sourc
   never overwrites `shim/out/*.img` and does not wait for xrun/probe-run. It takes `shim/out/.gate.lock` instead (one gate per worktree;
   `tools-sync pull` refuses while it is held). Per-step logs: `shim/out/gate/<step>.log` (live); `gate.log` is rebuilt from them at the end.
 - **Live state.** `shim/out/gate.progress` (`START <step> <epoch>` / `END <step> PASS|FAIL [(timeout)] <s>` lines), `shim/out/gate.result`
-  (atomic: `RUNNING <pid> <epoch>`, then the final `GATE ...` line + epoch). A hash with `+dirty` means `git status --porcelain` was not empty.
-- **Timeouts and failure.** Each step runs under `timeout -k 10`: 900 s for `build*`, 300 s others; `GATE_STEP_TIMEOUT=SECONDS` overrides both;
+  (atomic: `WAITING <pid> <epoch>` while the gate waits for `.gate.lock` (it replaces the old result; a lock timeout writes `GATE FAIL lock-timeout`),
+  `RUNNING <pid> <epoch>`, then the final `GATE ...` line + epoch). The waiter names the holder from `shim/out/.gate.owner` (removed when a gate ends; `unknown` if empty).
+  A hash with `+dirty` means `git status --porcelain` was not empty at the start, or HEAD moved / the tree changed during the run (read from source: tools/check-all.sh, tools/test_check_all_stub.sh).
+  The stamp is `HEAD` taken at the start, written only by a full (or quick-turned-full) PASS whose HEAD and tree did not change; never after a quick run or any failure.
+- **Interrupt (Ctrl-C, kill).** INT/TERM/HUP kills every step's process group (`timeout` puts each step in its own group, pids in a temp dir), the lane jobs,
+  releases the lock, and writes `GATE FAIL <hash> interrupted <epoch>` to `gate.result` (also printed). A lane never starts a step once the gate is gone or interrupted.
+  Tested with stubs: `bash tools/test_check_all_stub.sh` (~15 s, also run by the `unit` step through `tools/test_check_all_stub.py`).
+- **Timeouts and failure.** Each step runs under `timeout -k 10`: 1500 s for `build-wlan`, 900 s other `build*`, 300 s others; `GATE_STEP_TIMEOUT=SECONDS` (positive integer; `0`, empty-digits or non-numeric values exit 2, since `timeout 0` means no limit) overrides all;
   a timeout is a step FAIL `(timeout)`. A failing step stops every other step at its next step boundary (running parallel builds finish);
   `--keep-going` stops only the failing lane. The reported failure is the first failed step in the fixed step order.
+- **shellcheck step (lane B).** `shellcheck -S warning $(tools/shell-files)`, zero tolerance, over every tracked `*.sh` or sh/bash/dash-shebang script
+  (`tools/shell-files` is the single listing). `--quick` selects it for any changed shell file (`gate_select.is_shell`). Fix findings; `# shellcheck disable=SCxxxx` needs a reason on the same line.
+  `shim/build.sh` carries two such directives (CFLAGS word splitting, host-test hash file lists). Needs `shellcheck` installed (apt).
 - **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
 
 **Audit memo (`tools/audit_memo.py`, R2).** The three expensive mutation self-tests of `tools/test-bluejay-boot.py` (`wlan_seq_selftest`,
