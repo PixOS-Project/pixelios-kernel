@@ -55,8 +55,10 @@ def _hook(event, args):
                 r["busy"] = True
                 try:
                     d = _dep_path(p)
-                    if d not in r["h"] and os.path.isfile(d):
-                        r["h"][d] = _sha(d)
+                    if os.path.isfile(d):
+                        h = _sha(d)
+                        if r["h"].setdefault(d, h) != h:
+                            r["changed"] = True  # edited between two opens (even if reverted later): do not store
                 except OSError:
                     pass
                 finally:
@@ -141,7 +143,7 @@ def run(fn, arg=b"", *, script, name=None):
     finally:
         _stack.pop()
     sys.stdout.write(buf.getvalue())
-    if "spawn" in rec or "write" in rec:
+    if "spawn" in rec or "write" in rec or "changed" in rec:
         return ret
     deps = _deps(rec["h"])
     if deps is None:

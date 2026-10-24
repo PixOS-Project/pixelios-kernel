@@ -78,6 +78,22 @@ class Memo(unittest.TestCase):
         self.assertFalse(list((self.t / "cache").glob("*.json")))
         _, o = self.go(name="e"); self.assertEqual((self.calls, o), (2, "line one\nPASS d2\n"))   # recomputed, not replayed
 
+    def test_dep_edited_and_reverted_between_opens_not_stored(self):
+        # the editor is a process started before run() (git stash/pop during a gate); fn only talks to it over pipes
+        ed = subprocess.Popen([sys.executable, "-c", "import sys\nfor l in sys.stdin:\n    open(sys.argv[1], 'w').write(l.strip()); print('ok', flush=True)", str(self.dep)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (ed.stdin.close(), ed.wait()))
+        def edit(v):
+            ed.stdin.write(v + "\n"); ed.stdin.flush(); ed.stdout.readline()
+        def aba():
+            self.calls += 1
+            a = self.dep.read_text(); edit("d2"); b = self.dep.read_text(); edit("d1")
+            return a + b
+        self.assertEqual(self.go(aba, name="aba")[0], "d1d2")
+        self.go(aba, name="aba")
+        self.assertEqual(self.calls, 2)
+        self.assertFalse(list((self.t / "cache").glob("*.json")))
+
     def test_key_includes_memo_code(self):
         a = am.key("fn", b"", self.script)
         other = self.t / "memo_copy.py"; other.write_text("x")
