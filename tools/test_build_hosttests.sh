@@ -6,8 +6,13 @@
 cd "$(dirname "$0")/.." || exit 2
 T=$(mktemp -d) || exit 2; trap 'rm -rf "$T"' EXIT
 fail=0; bad() { echo "FAIL $*"; fail=1; }
-# any line that builds a *host_test* output or runs a $O/ binary after && without going through chk (any compiler word, any chain form)
-grep -nE -e '-o +"?\$O"?/[A-Za-z0-9_$]*host_test' -e '(&&|;|\|\|) +"?\$O"?/' shim/build.sh | grep -v 'chk ' && bad "build.sh has a host test compile / && run that bypasses chk"
+# any line that builds a *host_test* output or runs a $O/ binary after && / ; / || / `then` without going through chk (any compiler word, $O or ${O})
+guard() { grep -nE -e '-o +"?\$\{?O\}?"?/[A-Za-z0-9_$]*host_test' -e '(&&|;|\|\||then) +"?\$\{?O\}?"?/' "$1" | grep -v 'chk '; }
+guard shim/build.sh && bad "build.sh has a host test compile / && run that bypasses chk"
+for l in 'gcc -o ${O}/x_host_test x.c && ${O}/x_host_test' 'if gcc -o $O/foo x.c; then $O/foo; fi' 'gcc x.c; then ${O}/foo' 'true; "${O}"/foo' 'gcc -o ${O}/y_host_test y.c'; do
+	printf '%s\n' "$l" >"$T/g.txt"; guard "$T/g.txt" >/dev/null || bad "guard misses: $l"
+done
+printf '%s\n' 'chk "x" gcc -o ${O}/x_host_test x.c' 'chk "x" ${O}/x_host_test' >"$T/g.txt"; guard "$T/g.txt" && bad "guard flags a chk line"
 # (2) chk() from build.sh (first definition, up to its closing brace)
 awk '/^chk\(\) \{/{f=1} f{print} f&&/exit 1; fi; \}/{exit}' shim/build.sh >"$T/chk.sh"
 [ -s "$T/chk.sh" ] || bad "chk() not found in build.sh"
