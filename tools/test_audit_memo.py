@@ -119,6 +119,13 @@ class Memo(unittest.TestCase):
         deps = [d for e in (self.t / "cache").glob("*.json") for d, _ in __import__("json").loads(e.read_text())["deps"]]
         self.assertTrue(deps and not any(d.endswith(".pyc") for d in deps), deps)
 
+    def test_no_memo_env_spellings(self):
+        for v, off in (("1", 1), ("true", 1), ("YES", 1), ("True", 1), ("0", 0), ("", 0), ("no", 0), ("2", 0)):
+            os.environ["PIXELIOS_AUDIT_NO_MEMO"] = v
+            self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)
+            self.assertEqual(am.enabled(), not off, v)
+        os.environ.pop("PIXELIOS_AUDIT_NO_MEMO")
+
     def test_no_memo_env(self):
         os.environ["PIXELIOS_AUDIT_NO_MEMO"] = "1"
         self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)

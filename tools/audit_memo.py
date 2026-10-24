@@ -9,7 +9,7 @@ Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), has
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
 Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
-Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1 or disable().
+Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
 import contextlib, hashlib, io, json, os, pathlib, platform, sys, tempfile
@@ -27,7 +27,7 @@ def disable():
 
 
 def enabled():
-    return not _off and os.environ.get("PIXELIOS_AUDIT_NO_MEMO") != "1"
+    return not _off and os.environ.get("PIXELIOS_AUDIT_NO_MEMO", "").lower() not in ("1", "true", "yes")
 
 
 def cache_dir():

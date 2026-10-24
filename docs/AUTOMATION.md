@@ -182,7 +182,7 @@ full log (steps in a fixed order) plus a per-step timing table. *Read from sourc
 - **shellcheck step (lane B).** `shellcheck -S warning $(tools/shell-files)`, zero tolerance, over every tracked `*.sh` or sh/bash/dash-shebang script
   (`tools/shell-files` is the single listing; it also lists untracked-but-not-ignored scripts, so a new script is linted before `git add`). `--quick` selects it for any changed shell file (`gate_select.is_shell`). Fix findings; `# shellcheck disable=SCxxxx` needs a reason on the same line.
   `shim/build.sh` carries two such directives (CFLAGS word splitting, host-test hash file lists). Needs `shellcheck` installed (apt).
-- **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
+- **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`; `1`, `true`, `yes` in any case turn the memo off, any other value keeps it on), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
 
 **Audit memo (`tools/audit_memo.py`, R2).** The three expensive mutation self-tests of `tools/test-bluejay-boot.py` (`wlan_seq_selftest`,
 `wlanlink_source_selftest`, `wlanlink_object_selftest`) are cached by content. Key = sha256 of the audit script bytes, `tools/audit_memo.py` itself, the function name,
