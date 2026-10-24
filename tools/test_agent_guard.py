@@ -20,7 +20,7 @@ MUTANTS = [
     ("E5 quick PASS blocks the full gate", "(want_quick or not quick_line)", "True"),
     ("E4 ignores cd", "cur = None if cur is None", "cur = cwd if True else None if cur is None"),
     ("S3a image skip removed", "if os.path.splitext(p)[1].lower() in NOLIMIT:", "if False:"),
-    ("A1 subshell/$( ) end keeps the cd", 'if ("(" in op or ")" in op) and cur != cwd:', "if False:"),
+    ("A1 subshell/$( ) end keeps the cd", 'if ("(" in op or ")" in op or op == "&") and cur != cwd:', "if False:"),
     ("A1 popd keeps the dir", 'elif h and h[0] == "popd":', 'elif False:'),
     ("A1 nested parse restarts at the hook cwd", "cur = None if n and moved else cwd", "cur = cwd"),
     ("A1 close after an empty segment not seen", 'elif out and ")" in t:', "elif False:"),
@@ -34,16 +34,32 @@ MUTANTS = [
     ("A5 task_status not keyed", 'default=str).encode()).hexdigest()[:12]', 'default=str).encode()).hexdigest()[:12] if c.t.endswith("t3_thread_read") else ""'),
     ("A6 quick fallback counted as quick", ' and "ran full" not in " ".join(line)', ""),
     ("A7 E5 path root ignored", 'if "/" in path else wd', "if False else wd"),
-    ("A7 E5 unknown dir not skipped", " or wd is None:\n            continue\n        seen", ":\n            continue\n        seen"),
+    ("A7 E5 unknown dir not skipped", " or wd is None:\n            continue\n        path", ":\n            continue\n        path"),
     ("A7 cd - treated as a dir", ' or t == "-" else', " else"),
     ("A8 limit 400 on a small file", "(HOT.search(p) or size > BIG) and (not lim or lim > 300)", "(not lim and (HOT.search(p) or size > BIG)) or lim > 300"),
+    ("A1 E5 $ path and missing root both unguarded",
+     '        if "$" in path or "`" in path:\n            continue   # unknown dir, as for wd None (a literal `$K` would join to a non-repo)\n        seen = True\n'
+     '        base = os.path.normpath(os.path.join(wd, os.path.dirname(os.path.dirname(path)))) if "/" in path else wd\n'
+     '        root = git(base, "rev-parse", "--show-toplevel")\n        if not root:\n            continue\n',
+     '        seen = True\n        base = os.path.normpath(os.path.join(wd, os.path.dirname(os.path.dirname(path)))) if "/" in path else wd\n'
+     '        root = git(base, "rev-parse", "--show-toplevel")\n'),
+    ("A1 E5 path not expanduser'd", "os.path.expanduser(next(x for x in w if", "(next(x for x in w if"),
+    ("A1 E5 no repo root not skipped", "        if not root:\n            continue\n", ""),
+    ("A1 pre without per-rule guard", "        except Exception:  # noqa: BLE001 - one crashing rule", "        except KeyboardInterrupt:  # noqa: BLE001 - one crashing rule"),
+    ("A2a push option values not skipped", "            if x in PUSH_VAL:", "            if False:"),
+    ("A2a --repo ignored", 'repo = a[k + 1]', "repo = None"),
+    ("A2b GIT_DIR= prefix ignored", "unk |= any(GITENV.match(x) for x in w[:gi])", "pass"),
+    ("A2b export GIT_DIR ignored", "unk = h[1], 0, None, None, envset", "unk = h[1], 0, None, None, False"),
+    ("A2c background cd kept", 'or op == "&") and cur != cwd', ') and cur != cwd'),
+    ("A2d moved only first parse", "for p in ps for w, _ in p)", "for p in ps[:1] for w, _ in p)"),
     ("S6b case-sensitive", 'lines\\b", p or "", re.I)', 'lines\\b", p or "")'),
 ]
 
 
 class AgentGuard(unittest.TestCase):
     def run_script(self, path):
-        return subprocess.run([sys.executable, "-B", str(path), "--self-test"], capture_output=True, text=True, timeout=300)
+        with tempfile.TemporaryDirectory(prefix="agent-guard-cwd-") as cwd:
+            return subprocess.run([sys.executable, "-B", str(path), "--self-test"], capture_output=True, text=True, timeout=300, cwd=cwd)
 
     def test_self_test_passes(self):
         r = self.run_script(HERE / "agent-guard")
@@ -60,11 +76,11 @@ class AgentGuard(unittest.TestCase):
                 for helper in ("phone-lock", "phone-guard"):
                     (d / f"m{k}" / helper).symlink_to(HERE / helper)
                 (d / f"m{k}" / "agent-guard").write_text(SRC.replace(old, new))
-                return name, self.run_script(d / f"m{k}" / "agent-guard").returncode
+                return name, self.run_script(d / f"m{k}" / "agent-guard").stdout
 
             with concurrent.futures.ThreadPoolExecutor(4) as ex:
-                for name, rc in ex.map(run, range(len(MUTANTS))):
-                    self.assertNotEqual(rc, 0, "mutant survived: " + name)
+                for name, out in ex.map(run, range(len(MUTANTS))):
+                    self.assertIn("RESULT: FAIL", out, "mutant survived: " + name)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

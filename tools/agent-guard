@@ -450,7 +450,7 @@ def walk(cmd, cwd):
     """(words, dir) for every segment, in order; `cd X` / `pushd X` update dir; dir is None once a target is unknown ($, backtick, `-`,
     after `popd`, or after a `( ... )` / `$( ... )` that changed it) and in every bash -c / eval string when the outer line moves at all."""
     ps = parses(cmd) if cmd else []
-    moved = bool(ps) and any((h := head(w)) and h[0] in ("cd", "pushd", "popd") for w, _ in ps[0])
+    moved = any((h := head(w)) and h[0] in ("cd", "pushd", "popd") for p in ps for w, _ in p)
     for n, p in enumerate(ps):
         cur = None if n and moved else cwd
         for w, op in p:
@@ -462,20 +462,26 @@ def walk(cmd, cwd):
             elif h and h[0] == "popd":
                 cur = None
             yield w, cur
-            if ("(" in op or ")" in op) and cur != cwd:
+            if ("(" in op or ")" in op or op == "&") and cur != cwd:   # `a & b`: a runs in a background subshell
                 cur = None
 
 
 GIT_VAL = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path")
+PUSH_VAL = ("-o", "--push-option", "--receive-pack", "--exec", "--repo")   # git push -h: these take a value (observed, review 3 A2)
+GITENV = re.compile(r"^(GIT_DIR|GIT_WORK_TREE|GIT_CONFIG_PARAMETERS)=")
 
 
 def r_e4(c):
     pushes = []
+    # GIT_DIR= & co. in an export / bare-assignment segment redirect every later git: direction unknown
+    envset = any(GITENV.match(x) for p in (parses(c.cmd) if c.cmd else []) for w, _ in p if (head(w) is None or head(w)[0] in ("export", "declare", "typeset")) for x in w)
     for w, wd in walk(c.cmd, c.cwd):
         h = head(w)
         if not h or h[0] != "git":
             continue
-        a, i, d, gd, unk = h[1], 0, None, None, False
+        a, i, d, gd, unk = h[1], 0, None, None, envset
+        gi = next((k for k, x in enumerate(w) if os.path.basename(x) == "git"), len(w))
+        unk |= any(GITENV.match(x) for x in w[:gi])
         while i < len(a) and a[i].startswith("-"):
             val = a[i + 1] if i + 1 < len(a) else ""
             if a[i] == "-C":
@@ -492,10 +498,24 @@ def r_e4(c):
             pushes.append((a[i + 1:], d, gd, unk, wd))
     why = ""
     for a, d, gd, unk, wd in pushes:
-        pos = [x for x in a if not x.startswith("-")]
-        risky = [x for x in a if x.startswith("--force") or x in ("--delete", "--mirror", "--prune") or re.fullmatch(r"-[A-Za-z]*[fd][A-Za-z]*", x)]
-        risky += [x for x in pos[1:] if x[:1] in (":", "+")]
-        remote = pos[0] if pos else "origin"
+        pos, flags, repo, k = [], [], None, 0
+        while k < len(a):
+            x = a[k]
+            if x in PUSH_VAL:
+                if x == "--repo" and k + 1 < len(a):
+                    repo = a[k + 1]
+                k += 2
+                continue
+            if x.startswith("--repo="):
+                repo = x[7:]
+            elif x.startswith("-"):
+                flags.append(x)
+            else:
+                pos.append(x)
+            k += 1
+        risky = [x for x in flags if x.startswith("--force") or x in ("--delete", "--mirror", "--prune") or re.fullmatch(r"-[A-Za-z]*[fd][A-Za-z]*", x)]
+        risky += [x for x in (pos if repo is not None else pos[1:]) if x[:1] in (":", "+")]
+        remote = repo if repo is not None else pos[0] if pos else "origin"
         unk |= "$" in remote or "`" in remote
         cwd = None if wd is None else os.path.join(wd, d) if d else wd
         if gd is not None and cwd is not None:
@@ -521,10 +541,14 @@ def r_e5(c):
         h = head(w)
         if not h or h[0] != "check-all.sh" or wd is None:
             continue
+        path = os.path.expanduser(next(x for x in w if os.path.basename(x) == "check-all.sh"))
+        if "$" in path or "`" in path:
+            continue   # unknown dir, as for wd None (a literal `$K` would join to a non-repo)
         seen = True
-        path = next(x for x in w if os.path.basename(x) == "check-all.sh")
         base = os.path.normpath(os.path.join(wd, os.path.dirname(os.path.dirname(path)))) if "/" in path else wd
         root = git(base, "rev-parse", "--show-toplevel")
+        if not root:
+            continue
         try:
             line = open(os.path.join(root or "", "shim/out/gate.result")).read().split()
         except OSError:
@@ -601,7 +625,10 @@ def pre(h, only=None):
     for name, kind, fn in RULES:
         if only and name not in only:
             continue
-        r = fn(c)
+        try:
+            r = fn(c)
+        except Exception:  # noqa: BLE001 - one crashing rule must not disable the others (review 3 A1)
+            continue
         if r:
             return kind, name, r
     return None
@@ -668,6 +695,8 @@ def self_test():
     global STATE, OUTDIR, SHARED, MUT
     tmp = tempfile.mkdtemp(prefix="agent-guard-test-")
     saved = (STATE, OUTDIR, SHARED, dict(os.environ))
+    me, cwd0 = os.path.abspath(__file__), os.getcwd()
+    os.chdir(tmp)   # fixtures must not read the caller's cwd (AP-39); the hook cwd is each fixture's own `cwd`
     try:
         STATE, OUTDIR = os.path.join(tmp, "state"), os.path.join(tmp, "out")
         SHARED = os.path.join(tmp, "kernel")
@@ -696,10 +725,10 @@ def self_test():
         fails += [f"mutant survived: {s}" for s in surv]
         # CLI contract: fail open, exit 0, JSON shape
         for inp, mode in (("{broken", "--pre"), ("", "--post"), ("[]", "--context")):
-            p = subprocess.run([sys.executable, "-B", __file__, mode], input=inp, capture_output=True, text=True, timeout=20)
+            p = subprocess.run([sys.executable, "-B", me, mode], input=inp, capture_output=True, text=True, timeout=20)
             if p.returncode != 0 or p.stdout:
                 fails.append(f"fail-open {mode} {inp!r}: rc={p.returncode} out={p.stdout!r}")
-        p = subprocess.run([sys.executable, "-B", __file__, "--pre"], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git stash"}}),
+        p = subprocess.run([sys.executable, "-B", me, "--pre"], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git stash"}}),
                            capture_output=True, text=True, timeout=20)
         try:
             o = json.loads(p.stdout)["hookSpecificOutput"]
@@ -712,6 +741,7 @@ def self_test():
             "FAIL" if fails else "PASS", n, len(rules), 2 * len(rules), len(surv), len(fails)))
         return 1 if fails else 0
     finally:
+        os.chdir(cwd0)
         STATE, OUTDIR, SHARED = saved[:3]
         os.environ.clear()
         os.environ.update(saved[3])
@@ -726,7 +756,10 @@ def run_fx(f):
     if pre_hook:
         pre_hook()
     if mode == "--pre":
-        r = pre(h)
+        try:
+            r = pre(h)
+        except Exception as e:  # noqa: BLE001 - a crash is a failed fixture, not a harness error
+            return f"crash:{type(e).__name__}", want
         return (f"{r[0]}:{r[1]}" if r else "allow") + (f["check"]() if f.get("check") else ""), want
     if mode == "--post":
         r = post(h)
@@ -958,12 +991,51 @@ def fixtures(tmp):
         add("cd sub in (...) then push (A1)", B("(cd sub && make); git push origin main", cwd=privr), "ask:E4")
         add("--git-dir public from privr (A2)", B("git --git-dir ../pubr/.git push origin main", cwd=privr), "ask:E4")
         add("--git-dir=public from privr (A2)", B("git --git-dir=../pubr/.git push origin main", cwd=privr), "ask:E4")
+        add("push -o value is not the remote (A2a)", B("git push -o ci.skip origin main", cwd=pubr), "ask:E4")
+        add("push --push-option value (A2a)", B("git push --push-option ci.skip origin main", cwd=pubr), "ask:E4")
+        add("push --repo public (A2a)", B("git push --repo origin main", cwd=pubr), "ask:E4")
+        add("push --repo=public (A2a)", B("git push --repo=origin main", cwd=pubr), "ask:E4")
+        add("push -o value private (A2a)", B("git push -o ci.skip priv main", cwd=repo), "allow")
+        add("GIT_DIR= prefix public (A2b)", B("GIT_DIR=../pubr/.git git push origin main", cwd=privr), "ask:E4")
+        add("export GIT_DIR public (A2b)", B("export GIT_DIR=../pubr/.git; git push origin main", cwd=privr), "ask:E4")
+        add("cd priv in background, push (A2c)", B("cd ../privr && make -s >/dev/null 2>&1 & git push origin main", cwd=pubr), "ask:E4")
+        add("bash -c cd; eval push (A2d)", B("bash -c 'cd ../pubr; eval git push origin main'", cwd=privr), "ask:E4")
+        add("bash -c cd && bash -c push (A2d)", B("bash -c \"cd ../pubr && bash -c 'git push origin main'\"", cwd=privr), "ask:E4")
         add("cd - then push (A7)", B("cd - && git push priv main", cwd=repo), "ask:E4")
         add("(cd ..) then check-all keeps priv result out (A3)", B("(cd ../privr && git log -1); tools/check-all.sh", cwd=pubr), "allow")
         add("pushd..popd then check-all (A3)", B("pushd ../privr >/dev/null && popd && tools/check-all.sh", cwd=pubr), "allow")
         add("cd public repo/AGENTS.md of subdir (A4)", B("cd kern && cat AGENTS.md", cwd=proj), "allow")
         add("cd . && cat AGENTS.md (A4)", B("cd . && cat AGENTS.md", cwd=proj), "deny:S3b")
         add("push -u private", B("git push -u priv main", cwd=repo), "allow")
+        os.makedirs(os.path.join(tmp, "ngit"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "shim/out"), exist_ok=True)
+        open(os.path.join(tmp, "shim/out/gate.result"), "w").write("GATE PASS 1234567 1\n")   # the process cwd (self_test chdirs to tmp) has a PASS result
+
+        def e5_ok(cmd, cwd):
+            def f():
+                try:
+                    r_e5(Ctx(B(cmd, cwd=cwd)))
+                    return ""
+                except Exception:  # noqa: BLE001
+                    return "|e5 crashed"
+            return f
+        k1 = '"$K"/tools/check-all.sh; git push origin main'
+        add("E5 $K path, cwd gate.result, public push (A1)", B(k1, cwd=pubr), "ask:E4", check=e5_ok(k1, pubr))
+        k2 = os.path.join(tmp, "ngit/tools/check-all.sh")
+        add("E5 non-git dir, cwd gate.result (A1)", B(k2, cwd=tmp), "allow", check=e5_ok(k2, tmp))
+        add("E5 ~ path expanded, PASS at HEAD (A1)", B("~/privr/tools/check-all.sh", cwd=pubr), "deny:E5", setup=lambda: os.environ.update(HOME=tmp))
+        def iso():
+            RULES.insert(0, ("XBOOM", "deny", lambda c: 1 // 0))
+            try:
+                r = pre(B("git stash", cwd=repo))
+                return "" if r and r[1] == "E9" else "|crashing rule hid E9"
+            except Exception:  # noqa: BLE001
+                return "|crash escaped pre"
+            finally:
+                RULES.pop(0)
+        add("a crashing rule skips only itself (A1)", B("git stash", cwd=repo), "deny:E9", check=iso)
+        k3 = 'cd "$X" && tools/check-all.sh'
+        add("E5 unknown dir (cd $X) does not crash (A7)", B(k3, cwd=repo), "allow", check=e5_ok(k3, repo))
         add("gate: no result", B("tools/check-all.sh", cwd=repo), "allow", setup=lambda: os.path.exists(os.path.join(repo, "shim/out/gate.result")) and os.remove(os.path.join(repo, "shim/out/gate.result")))
         add("gate RUNNING live", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gp)
         add("gate RUNNING dead pid", B("tools/check-all.sh", cwd=repo), "allow", setup=gd)
