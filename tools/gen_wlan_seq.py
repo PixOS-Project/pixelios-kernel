@@ -286,6 +286,7 @@ STEP_NAMES = {
     29: "iATU outbound region 1 = MEM (CPU 0x60000000..0x6000FFFF -> PCI 0x60000000, BAR0 only; 4 ATU writes, CR2 last), BAR0 window cfg 0x80 := 0x18000000, then Command := MEM only (research 36; the first Command write, MASTER never; explicit --wlan-link=29 only; region 1 disable, Command 0 and the window restore FIRST in the teardown)",
     30: "the FIRST BAR0 read: ChipCommon chipid at MEM 0x60000000 (research 36; one guarded read + logged copy + link/AER logs + one-shot id == 0x4389; explicit --wlan-link=30 only; no write; a bus stall would show as the last line `LINK S30 start`)",
     31: "READ-ONLY on the chip (research 37 s.9.1 run A): ChipCommon eromptr (CC+0xFC), clk_ctl_st (CC+0x1E0) and capabilities_ext (CC+0xAC) through the BAR0 window left at 0x18000000 by S29 (3 logged MEM reads + link/AER logs + one-shot checks: window still 0x18000000, eromptr 4 KiB aligned inside 0x18000000..0x1FFFFFFF, chip id word still 0x10034389; explicit --wlan-link=31 only; no write of any kind, no window move)",
+    32: "research 37 s.9.1 run B: the ONE new chip-facing write, PCI_BAR0_WIN cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31) with a one-shot read-back, then 1024 logged READ-ONLY MEM dword reads BAR0+0..0xFFC, a first-dword check, link/AER logs; the window is restored to 0x18000000 FIRST in the teardown (explicit --wlan-link=32 only; no other write)",
 }
 
 
@@ -638,6 +639,9 @@ def build():
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     # S29 rows FIRST of all (research 36 s.5.2 R2, s.6): region 1 DISABLE (RC-local, cannot stall), Command := 0, BAR0 window := observed original; unconditional (idempotent); the region 1 resets follow the BAR rows
     O1 = lambda mac: ev(mac) - 0x300000
+    # S32 rows FIRST of all (LIFO: the window move is the last chip-facing write): cfg 0x80 := 0x18000000 with a one-shot read-back; the S29 head below still ends with 0x18001000, so a failed read-back here cannot leave the window moved
+    add_t(32, "mmio_write", "CFG", 0x80, FULL, 0x18000000, cite="undoes the S32 window move; 0x18000000 = the window S29 selected (observed run w3a-n30, HO:255); research 37 s.9.1 step 10", tag="observed", note="BAR0 window back to ChipCommon (S32 teardown, first row)", key="bar0win_s32")
+    add_t(32, "wait_eq", "CFG", 0x80, FULL, 0x18000000, polls=1, cite="read-back of the S32 restore (one-shot; a mismatch is reported as restore=FAILED)", tag="guess", note="read-back PCI_BAR0_WIN must be 0x18000000")
     add_t(29, "mmio_write", "ATU", O1("PCIE_ATU_CR2_OUTBOUND1"), FULL, 0, cite="reset value 0 observed (run w3a-n28c R27 row=344); undoes the S29 enable (rc.c:1414); research 36 s.6 T1", tag="observed", note="ATU region 1 DISABLE: the first teardown row of S29 (RC-local)", key="atu1_cr2_off")
     add_t(29, "mmio_write", "CFG", 0x04, FULL, 0, cite="Command 0x0000 observed (run w3a-n28c R26 row=284 = 0x00100000); research 36 s.1; written by S29", tag="observed", note="Command := observed original (MEM decode off); status half 0 cannot clear an RW1C bit", key="cmd_rst")
     add_t(29, "mmio_write", "CFG", 0x80, FULL, 0x18001000, cite="PCI_BAR0_WIN 0x18001000 observed (run w3a-n28c R27 row=313); research 36 s.3; written by S29", tag="observed", note="BAR0 window := observed original", key="bar0win_rst")
@@ -766,6 +770,24 @@ def draft29():
     row(31, "read_only", "CFG", 0x104, FULL, 0, f"{r37} step 6; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the reads", log=True)
     row(31, "wait_eq", "MEM", 0xFC, 0xF8000FFF, 0x18000000, f"{r37} step 2 stop rule: all ones, low 12 bits != 0 or outside 0x18000000..0x1FFFFFFF is a refusal (a re-read of the logged word; the range is a guess: backplane enum range, SI_ENUM_BASE {an(HNDSOC, r'define SI_ENUM_BASE_DEFAULT\s+0x18000000')}; 4 KiB alignment: SI_CORE_SIZE {an(HNDSOC, r'define\s+SI_CORE_SIZE\s+0x1000')})", TAG_GUESS, "eromptr must be 4 KiB aligned inside 0x18000000..0x1FFFFFFF (one-shot; all ones fails it)")
     row(31, "wait_eq", "MEM", 0x0, FULL, 0x10034389, f"{r37} step 1: ChipCommon still answers after the reads, the FULL word as observed (run w3a-n30 R30 rd=0x10034389, HO:255; low 16 bits {an(BCMDEVS, r'define BCM4389_CHIP_ID\s+0x4389')}); any other word (including all ones) is a refusal", "observed", "chip id word must still be 0x10034389 (one-shot)")
+    # S32 (research 37 s.9.1 run B): pin E = the eromptr observed in run w3a-n31 (S31 R31 eromptr word 0x18105000), the ONE new write cfg 0x80 := E (DHD ai_scan writes the full erombase), 1024 read_only MEM dwords, never more
+    r37b = "research 37 s.9.1 run B"
+    e_rd = an(AIU, r"erombase = R_REG.sii->osh, &cc->eromptr.")
+    e_wr = an(AIU, r"OSL_PCI_WRITE_CONFIG.sii->osh, PCI_BAR0_WIN, 4, erombase", 190)
+    winreg = an(PCICFG, r"define\s+PCI_BAR0_WIN\s+0x80")
+    obs31 = "eromptr (CC+0xFC) = 0x18105000 observed in run w3a-n31 (S31 R31 log; low 12 bits 0, inside 0x18000000..0x1FFFFFFF)"
+    row(32, "wait_eq", "CFG", 0x80, FULL, 0x18000000, f"{r37b} step 7 precondition: window still 0x18000000 (S29 wrote and read back it, observed run w3a-n30, HO:255)", "observed", "precondition: PCI_BAR0_WIN == 0x18000000 before the move, else STOP + restore")
+    row(32, "wait_eq", "MEM", 0xFC, FULL, 0x18105000, f"{r37b} step 7: the window is moved only to the value the chip itself reports; {obs31}; DHD reads it at {e_rd}", "observed", "eromptr must still read exactly 0x18105000 through the 0x18000000 window (one-shot), else STOP")
+    row(32, "mmio_write", "CFG", 0x80, FULL, 0x18105000, f"{r37b} step 7; DHD points the window at the EROM with the full erombase: {e_wr}; register {winreg} (BAR0 window = backplane address accessed by BAR0, 4 KiB core pages SI_CORE_SIZE {an(HNDSOC, r'define\s+SI_CORE_SIZE\s+0x1000')}); {obs31}", TAG_SRC, "PCI_BAR0_WIN := 0x18105000 (the EROM page): the only new write of run B", restore="bar0win_s32")
+    row(32, "wait_eq", "CFG", 0x80, FULL, 0x18105000, "read-back of the row above (one-shot; our own gate, DHD has none)", TAG_GUESS, "read-back PCI_BAR0_WIN must be 0x18105000, else STOP + restore")
+    cia1 = an(AIU, r"cia = get_erom_ent.sih, &eromptr, ER_TAG, ER_CI.", 200)
+    dump_cite = f"{r37b} step 8: EROM dword i at BAR0+4*i, ascending, one 32-bit load each (DHD walk reads eromptr++ from the mapped page: {e_rd.split(':')[0]}:100, eromlim = eromptr + ER_REMAPCONTROL/4 {an(AIU, r'eromlim = eromptr . .ER_REMAPCONTROL', 200)}; ER_REMAPCONTROL is not in the refs, research 37 s.1.2: one 4 KiB page is a guess)"
+    for i in range(1024):
+        row(32, "read_only", "MEM", 4 * i, FULL, 0, dump_cite if i == 0 else f"{r37b} step 8: EROM dword {i} (BAR0+{4 * i:#x})", TAG_GUESS, f"log EROM dword {i}" + (" (first descriptor: expected COMPONENT CIA)" if i == 0 else ""), log=True)
+        if i == 0:
+            row(32, "wait_eq", "MEM", 0x0, 0x6, 0, f"{r37b} step 9: stop on all-ones (read failure, R36 hazard R1); the first valid EROM entry is a component CIA (type 1, bit 0 valid): {cia1}; brcmfmac DMP_DESC_COMPONENT = 0x1 (brcmfmac-chip.c:22)", TAG_GUESS, "first EROM dword: bits 2:1 must be 0 (refuses all-ones and a first entry of type 3/5/F), one-shot, else STOP + restore")
+    row(32, "read_only", "CFG", 0xBC, FULL, 0, f"{r37b}; as S30", TAG_GUESS, "log EP link control/status after the dump", log=True)
+    row(32, "read_only", "CFG", 0x104, FULL, 0, f"{r37b}; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the dump", log=True)
     return out
 
 
@@ -775,7 +797,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 31, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 32, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

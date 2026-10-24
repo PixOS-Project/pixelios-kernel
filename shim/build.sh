@@ -110,8 +110,8 @@ fi
 if [ "$wlan_link" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-link needs a gs101 board" >&2; exit 2; }
 	[ "$wlan_en" = 0 ] && [ "$wlan_iso" = 0 ] && [ "$wlan_smc_read" = 0 ] || { echo "--wlan-link cannot be combined with --wlan-en / --wlan-iso / --wlan-smc-read (separate reviewed units; the chain contains their steps)" >&2; exit 2; }
-	case "$wlan_link_n" in ''|[0-9]|[0-9][0-9]) ;; *) echo "--wlan-link=N needs a step number 0..31" >&2; exit 2 ;; esac
-	[ -z "$wlan_link_n" ] || [ "$wlan_link_n" -le 31 ] || { echo "--wlan-link=N: N must be <= 31 (the last step of soc/google/gs101/wlan_seq.json)" >&2; exit 2; }
+	case "$wlan_link_n" in ''|[0-9]|[0-9][0-9]) ;; *) echo "--wlan-link=N needs a step number 0..32" >&2; exit 2 ;; esac
+	[ -z "$wlan_link_n" ] || [ "$wlan_link_n" -le 32 ] || { echo "--wlan-link=N: N must be <= 32 (the last step of soc/google/gs101/wlan_seq.json)" >&2; exit 2; }
 	CFLAGS="$CFLAGS -DWLAN_LINK_RUN"
 	[ -z "$wlan_link_n" ] || CFLAGS="$CFLAGS -DWLAN_LINK_N=$wlan_link_n"
 fi
@@ -417,9 +417,9 @@ gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -Iout
 gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -Iout -include out/board_config.h -o out/wlanen_host_test wlanen_host_test.c && ./out/wlanen_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -Iout -include out/board_config.h -o out/wlansmc_host_test wlansmc_host_test.c && ./out/wlansmc_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -Iout -include out/board_config.h -o out/wlaniso_host_test wlaniso_host_test.c && ./out/wlaniso_host_test
-# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (S22 is a documented skip: one 0 us delay row; N=20..31 run in the fake SoC; S24 = read-only link report, S25 = read-only iATU layout, S26 = iATU region 0 programmed + CFG window reads, S27 = read-only endpoint config dump + iATU region 1 reset values, S28 = BAR sizing + assignment, S29 = region 1 + BAR0 window + Command MEM, S30 = the first BAR0 read, S31 = read-only ChipCommon eromptr / clk_ctl_st / capabilities_ext)
+# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (S22 is a documented skip: one 0 us delay row; N=20..32 run in the fake SoC; S24 = read-only link report, S25 = read-only iATU layout, S26 = iATU region 0 programmed + CFG window reads, S27 = read-only endpoint config dump + iATU region 1 reset values, S28 = BAR sizing + assignment, S29 = region 1 + BAR0 window + Command MEM, S30 = the first BAR0 read, S31 = read-only ChipCommon eromptr / clk_ctl_st / capabilities_ext, S32 = BAR0 window move to the EROM page + 1024 dword dump)
 chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build (review 2 M2: gcc && test inside a loop did not)
-for n in 7 8 10 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+for n in 7 8 10 19 20 21 22 23 24 25 26 27 28 29 30 31 32; do
 	chk "wlanlink_host_test$n (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DWLAN_LINK_RUN -DWLAN_LINK_N=$n -I. -Iout -include out/board_config.h -o out/wlanlink_host_test$n wlanlink_host_test.c
 	chk "wlanlink_host_test$n" ./out/wlanlink_host_test$n
 done
