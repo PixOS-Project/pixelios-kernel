@@ -95,7 +95,7 @@ AVBTOOL=${AVBTOOL:-../tools/third_party/avbtool.py}
 # Marker line identity: git short hash of this worktree (date fallback
 # when detached from git), so the pulled pstore log names its build.
 build_id=$(git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d)
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -march=armv8-a+crc -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -I$O -include $O/board_config.h -DPSTORE_BUILD_ID=\"$build_id\""
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -march=armv8-a+crc -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -Werror -I$O -include $O/board_config.h -DPSTORE_BUILD_ID=\"$build_id\""
 if [ "$usb_gadget" = 1 ]; then
 	# Stage-2 CDC-ACM log gadget (default OFF): bluejay only (needs try_write32).
 	[ "$gs101" = 1 ] || { echo "--usb-gadget needs a gs101 board" >&2; exit 2; }
