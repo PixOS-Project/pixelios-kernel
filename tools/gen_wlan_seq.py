@@ -285,6 +285,7 @@ STEP_NAMES = {
     28: "BAR0/BAR2 sizing (all-ones write, guarded read-back, original written back; Linux __pci_read_base order) then assignment BAR0 0x60000000 / BAR2 0x60400000 through the CFG window (research 33; the FIRST config writes, Command never touched; explicit --wlan-link=28 only; BAR teardown FIRST, before the ATU disable)",
     29: "iATU outbound region 1 = MEM (CPU 0x60000000..0x6000FFFF -> PCI 0x60000000, BAR0 only; 4 ATU writes, CR2 last), BAR0 window cfg 0x80 := 0x18000000, then Command := MEM only (research 36; the first Command write, MASTER never; explicit --wlan-link=29 only; region 1 disable, Command 0 and the window restore FIRST in the teardown)",
     30: "the FIRST BAR0 read: ChipCommon chipid at MEM 0x60000000 (research 36; one guarded read + logged copy + link/AER logs + one-shot id == 0x4389; explicit --wlan-link=30 only; no write; a bus stall would show as the last line `LINK S30 start`)",
+    31: "READ-ONLY on the chip (research 37 s.9.1 run A): ChipCommon eromptr (CC+0xFC), clk_ctl_st (CC+0x1E0) and capabilities_ext (CC+0xAC) through the BAR0 window left at 0x18000000 by S29 (3 logged MEM reads + link/AER logs + one-shot checks: window still 0x18000000, eromptr 4 KiB aligned inside 0x18000000..0x1FFFFFFF, chip id still 0x4389; explicit --wlan-link=31 only; no write of any kind, no window move)",
 }
 
 
@@ -755,6 +756,16 @@ def draft29():
     row(30, "read_only", "CFG", 0xBC, FULL, 0, "link status again (a retrain or a lost link would show here)", TAG_GUESS, "log EP link control/status after the read", log=True)
     row(30, "read_only", "CFG", 0x104, FULL, 0, f"{an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}; UR = bit 20 {an(PCIR, r'define\s+PCI_ERR_UNC_UNSUP\s+0x00100000')}, CTO = bit 14 {an(PCIR, r'define\s+PCI_ERR_UNC_COMP_TIME\s+0x00004000')}", TAG_GUESS, "log EP AER uncorrectable status after the read", log=True)
     row(30, "wait_eq", "MEM", 0x0, 0xFFFF, 0x4389, f"{an(BCMDEVS, r'define BCM4389_CHIP_ID\s+0x4389')}; any other value (including all ones) is a refusal", TAG_GUESS, "chip id must be 0x4389 (one-shot)")
+    # S31 (research 37 s.9.1 run A, READ-ONLY, window stays 0x18000000): the three values first (so the logs exist even when a check stops the run), then the link / AER logs, then the one-shot checks
+    r37 = "research 37 s.9.1 run A"
+    row(31, "wait_eq", "CFG", 0x80, FULL, 0x18000000, f"{r37} precondition: no window move in run A; S29 wrote and read back 0x18000000 (observed run w3a-n30, HO:255; research 37 s.0)", "observed", "precondition: PCI_BAR0_WIN still 0x18000000 (ChipCommon), else STOP + restore")
+    row(31, "read_only", "MEM", 0xFC, FULL, 0, f"{r37} step 2; ChipCommon eromptr: {an(SBCHIPC, r'uint32\s+eromptr;\s*/\* 0xfc')}, {an(SBCHIPC, r'define\s+CC_EROMPTR\s+0xfc')}; DHD reads it at {an(AIU, r'erombase = R_REG.sii->osh, &cc->eromptr.')}", TAG_SRC, "log eromptr = backplane address of the EROM (unknown, research 37 U1)", log=True)
+    row(31, "read_only", "MEM", 0x1E0, FULL, 0, f"{r37} step 4; ChipCommon clk_ctl_st: {an(SBCHIPC, r'uint32\s+clk_ctl_st;\s*/\* 0x1e0')}, {an(HNDSOC, r'define\s+SI_CLK_CTL_ST\s+0x1e0')}; bits {an(HNDSOC, r'define\s+CCS_ALPAVAIL\s+0x00010000')}, {an(HNDSOC, r'define\s+CCS_HTAVAIL\s+0x00020000')}", TAG_SRC, "log clk_ctl_st (bit 16 ALPAVAIL, 17 HTAVAIL, 18/19 backplane on ALP/HT; research 37 U6)", log=True)
+    row(31, "read_only", "MEM", 0xAC, FULL, 0, f"{r37} step 3; ChipCommon capabilities_ext: {an(SBCHIPC, r'uint32\s+capabilities_ext;\s*/\* 0xac')}; AOB_PRESENT (separate PMU core) = bit 0x40: brcmfmac v6.12 bcma_cc.h:226 (wlan-stage3, outside the hashed sources; research 37 s.1.4)", TAG_SRC, "log capabilities_ext (bit 0x40 = AOB present = separate PMU core)", log=True)
+    row(31, "read_only", "CFG", 0xBC, FULL, 0, f"{r37} step 6; as S30", TAG_GUESS, "log EP link control/status after the reads", log=True)
+    row(31, "read_only", "CFG", 0x104, FULL, 0, f"{r37} step 6; {an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}", TAG_GUESS, "log EP AER uncorrectable status after the reads", log=True)
+    row(31, "wait_eq", "MEM", 0xFC, 0xF8000FFF, 0x18000000, f"{r37} step 2 stop rule: all ones, low 12 bits != 0 or outside 0x18000000..0x1FFFFFFF is a refusal (a re-read of the logged word; the range is a guess: backplane enum range, SI_ENUM_BASE {an(HNDSOC, r'define SI_ENUM_BASE_DEFAULT\s+0x18000000')}; 4 KiB alignment: SI_CORE_SIZE {an(HNDSOC, r'define\s+SI_CORE_SIZE\s+0x1000')})", TAG_GUESS, "eromptr must be 4 KiB aligned inside 0x18000000..0x1FFFFFFF (one-shot; all ones fails it)")
+    row(31, "wait_eq", "MEM", 0x0, 0xFFFF, 0x4389, f"{r37} step 1: ChipCommon still answers after the reads ({an(BCMDEVS, r'define BCM4389_CHIP_ID\s+0x4389')}); all ones is a refusal", TAG_GUESS, "chip id must still be 0x4389 (one-shot)")
     return out
 
 
@@ -764,7 +775,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 30, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 31, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 
