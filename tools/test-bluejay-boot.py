@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "0337411be4f8dc9ad865b9aaa11c36f8553f7b3753bcefe43b55796ccd2d6c18"
-_WLAN_SEQ_COUNTS = {"rows": 405, "teardown": 45, "write_rows": 277, "distinct_targets": 193}
+_WLAN_SEQ_SHA = "2017f341c36a04d10444e943bb2bbd2fc13fe9b34575e57f3f87b20a5d68f210"
+_WLAN_SEQ_COUNTS = {"rows": 407, "teardown": 45, "write_rows": 277, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2945,7 +2945,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
                 ("wait_eq", "ATU", 0x204, 0x80000000, 0, None), ("wait_eq", "ATU", 0x200, BIG, 0, None), ("wait_eq", "ATU", 0x20C, BIG, 0, None), ("wait_eq", "ATU", 0x218, BIG, 0, None)]
     for o, v in _WLAN_S29_WRITES:
         s29_want += [("mmio_write", "ATU", o, BIG, v, t29.get(("ATU", o))), ("wait_eq", "ATU", o, BIG, v, None)]
-    s29_want += [("mmio_write", "CFG", 0x80, BIG, 0x18000000, t29.get(("CFG", 0x80))), ("wait_eq", "CFG", 0x80, BIG, 0x18000000, None), ("read_only", "CFG", 0x88, BIG, 0, None), ("read_only", "CFG", 0xBC, BIG, 0, None),
+    s29_want += [("mmio_write", "CFG", 0x80, BIG, 0x18000000, t29.get(("CFG", 0x80))), ("wait_eq", "CFG", 0x80, BIG, 0x18000000, None), ("read_only", "CFG", 0x88, BIG, 0, None), ("wait_eq", "CFG", 0x88, BIG, 0x00080080, None), ("read_only", "CFG", 0xBC, BIG, 0, None), ("wait_eq", "CFG", 0xBC, 0xFFFF0000, 0x10110000, None),
                  ("read_only", "CFG", 0x104, BIG, 0, None), ("mmio_write", "CFG", 0x04, BIG, 0x2, t29.get(("CFG", 0x04))), ("wait_eq", "CFG", 0x04, 0xFFFF, 0x2, None)]
     s29 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["restore"]) for r in rows if r["step"] == 29]
     if s29 != s29_want or any(r.get("probe") or bool(r.get("log")) != (r["kind"] == "read_only") or (r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 29):
@@ -3412,7 +3412,7 @@ _WLANLINK_PINS = {
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
     "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI||blk==WLB_CFG)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI||blk==WLB_ATU||blk==WLB_MEM)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
     "w32_blk_ok": "return!(blk==WLB_MEM||(blk==WLB_CFG&&off>=0x1000u));",
-    "ctx_read": "uint32_tlb=0,lim=0,lt=0;c->cmd=0xFFFFu;c->bar0=0xFFFFFFFFu;c->r1ok=0;if(blk==WLB_CFG){if(!try_read32(WLAN_CFG+4u,&c->cmd))c->cmd=0xFFFFu;if(!try_read32(WLAN_CFG+0x10u,&c->bar0))c->bar0=0xFFFFFFFFu;}if(blk==WLB_ATU)c->r1ok=try_read32(WLAN_ATU+0x208u,&lb)&&try_read32(WLAN_ATU+0x210u,&lim)&&try_read32(WLAN_ATU+0x214u,&lt)&&lb==0x60000000u&&lim==0x6000FFFFu&&lt==0x60000000u;",
+    "ctx_read": "uint32_tlb=0,lim=0,lt=0,cr1=1,ub=1,ut=1;c->cmd=0xFFFFu;c->bar0=0xFFFFFFFFu;c->r1ok=0;if(blk==WLB_CFG){if(!try_read32(WLAN_CFG+4u,&c->cmd))c->cmd=0xFFFFu;if(!try_read32(WLAN_CFG+0x10u,&c->bar0))c->bar0=0xFFFFFFFFu;}if(blk==WLB_ATU)c->r1ok=try_read32(WLAN_ATU+0x208u,&lb)&&try_read32(WLAN_ATU+0x210u,&lim)&&try_read32(WLAN_ATU+0x214u,&lt)&&lb==0x60000000u&&lim==0x6000FFFFu&&lt==0x60000000u&&try_read32(WLAN_ATU+0x200u,&cr1)&&try_read32(WLAN_ATU+0x20Cu,&ub)&&try_read32(WLAN_ATU+0x218u,&ut)&&cr1==0u&&ub==0u&&ut==0u;",
     "gpio_field_mask": "uint32_tm=0,w;if(off==0x00u||off==0x08u||off==0x0cu||off==0x14u)w=4u;elseif(off==0x04u)w=1u;elseif(off==0x10u)w=2u;elsereturn0;for(unsignedpin=0;pin<8u;pin++)if(pins&(1u<<pin))m|=((1u<<w)-1u)<<(pin*w);returnm;",
 }
 
@@ -3436,6 +3436,8 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     check_usbgadget_source_text(src, name, **_WLANLINK_KW)
     code = _strip_c_comments(src)
     norm = re.sub(r"\s+", "", code)
+    if "__attribute__((noipa))staticintr32(" not in norm:
+        raise AssertionError(f"{name}: r32 must be noipa (review 10 L5: the object audit checks the compiled MEM guard)")
     for bad in ("volatile", "__asm__", "asm", "goto", "smc", "hvc"):
         if re.search(r"\b" + bad + r"\b", code):
             raise AssertionError(f"{name}: '{bad}' is banned here (the SMC steps are wlan_link_iso_set/clear in wlansmc.c)")
@@ -3598,6 +3600,11 @@ def wlanlink_source_selftest() -> int:
         ("w32_blk_ok lets config space above 4 KiB through", good.replace("off >= 0x1000u));", "off >= 0x2000u));", 1)),
         ("MEM read without the window re-check (limit)", good.replace(" || r1[2] != 0x6000FFFFu", "", 1)),
         ("MEM read without the window re-check (all)", good.replace("\t\tif (!try_read32(WLAN_ATU + 0x200u, &r1[0])", "\t\tif (0 && !try_read32(WLAN_ATU + 0x200u, &r1[0])", 1)),
+        ("ctx_read: region 1 ready without CR1", good.replace(" && try_read32(WLAN_ATU + 0x200u, &cr1)", "", 1).replace(" && cr1 == 0u", "", 1)),
+        ("ctx_read: region 1 ready with CR1 not checked", good.replace(" && cr1 == 0u", "", 1)),
+        ("ctx_read: region 1 ready with UPPER_BASE not checked", good.replace(" && ub == 0u", "", 1)),
+        ("ctx_read: region 1 ready with UPPER_TARGET not checked", good.replace(" && ut == 0u", "", 1)),
+        ("r32 is not noipa (inlined, unaudited)", good.replace("__attribute__((noipa)) static int r32", "static int r32", 1)),
         ("ctx_read touches the ATU for every block", good.replace("if (blk == WLB_ATU)\n\t\tc->r1ok", "if (1)\n\t\tc->r1ok", 1)),
         ("MEM read without the Command guard", good.replace(" || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u", "", 1)),
         ("MEM read with the Command guard weakened (MEM bit only)", good.replace("(cmd & 0xFFFFu) != 0x0002u", "(cmd & 0x2u) != 0x2u", 1)),
@@ -3698,6 +3705,26 @@ _WLANLINK_W32_CONSTS = (r"#0x890\b", r"movk\s+x\d+, #0x1480, lsl #16", r"cmp\s+x
                         r"movk\s+w\d+, #0x1800, lsl #16", r"movk\s+w\d+, #0x6000, lsl #16")	# the ATU values (S26): LOWER_TARGET, CR2 enable, LOWER_BASE (CFG window), LIMIT; the CFG BAR2 assignment 0x60400004 and the Command mask 0xffff (S28); S29: region 1 offsets 0x204/0x208/0x210/0x214 and values 0x60000000 / 0x6000ffff, the window select 0x18000000 / 0x18001000, the BAR0 state 0x60000004
 
 
+def check_wlanlink_r32_object_text(blocks: list, name: str) -> None:
+    """Review 10 L5: the compiled MEM read guard (r32 is noipa, so it is one function): offset 0 only (a cbnz before the first try_read32), region 1 CR2 == 0x80000000 at ATU+0x204, Command low half == 0x2
+    after a try_read32, the window re-check (offsets 0x200 / 0x208 / 0x210 / 0x214 and the values 0x60000000 / 0x6000ffff), six guard reads plus the load (tail call), never a write."""
+    r = [b for b in blocks if re.match(r"[0-9a-f]+ <r32>:", b)]
+    if len(r) != 1 or "try_write32" in r[0]:
+        raise AssertionError(f"{name}: expected exactly one r32 function that never writes")
+    t = r[0]
+    first = re.search(r"R_AARCH64_CALL26\s+try_read32", t)
+    if not first or not re.search(r"cbnz\s+w\d+, [0-9a-f]+ <r32\+", t[:first.start()]):
+        raise AssertionError(f"{name}: the compiled r32 lost the offset-0 check before its first guard read")
+    if len(re.findall(r"R_AARCH64_CALL26\s+try_read32", t)) != 6 or len(re.findall(r"R_AARCH64_JUMP26\s+try_read32", t)) != 1:
+        raise AssertionError(f"{name}: r32 must hold six guard reads (CR2, Command, CR1, base, limit, target) and the load as one tail call")
+    for rx in (r"mov\s+w\d+, #0x80000000\b", r"mov\s+x\d+, #0x204\b", r"mov\s+x\d+, #0x200\b", r"mov\s+x\d+, #0x208\b", r"mov\s+x\d+, #0x210\b", r"mov\s+x\d+, #0x214\b",
+               r"mov\s+w\d+, #0x60000000\b", r"mov\s+w\d+, #0x6000ffff\b"):
+        if not re.search(rx, t):
+            raise AssertionError(f"{name}: the compiled r32 lost the MEM guard constant /{rx}/")
+    if not re.search(r"R_AARCH64_CALL26\s+try_read32(?:.*\n)*?.*\bcmp\s+w\d+, #0x2\n", t):
+        raise AssertionError(f"{name}: the compiled r32 lost the Command == 0x2 compare after a guard read")
+
+
 def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> None:
     """The COMPILED w32 keeps its independent allowlist (review B1 of wlanen: a specialised helper loses its address compare): the window / offset compare constants are in it, there is one
     try_write32 call and one or two try_read32 calls in it (the old value), one call of ctx_read (the live state for the stateful rules: its own function holds the other guarded reads), and w32 is called from exactly one place."""
@@ -3711,8 +3738,12 @@ def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> Non
     if len(re.findall(r"R_AARCH64_CALL26\s+try_write32", w[0])) != 1 or not 1 <= len(re.findall(r"R_AARCH64_CALL26\s+try_read32", w[0])) <= 2 or len(re.findall(r"\bbl\s+[0-9a-f]+ <ctx_read>", w[0])) != 1:
         raise AssertionError(f"{name}: w32 has exactly one try_write32, one or two try_read32 calls (the old value; the compiler may duplicate it) and one ctx_read call")
     cx = [b for b in blocks if re.match(r"[0-9a-f]+ <ctx_read>:", b)]
-    if len(cx) != 1 or "try_write32" in cx[0] or not 5 <= len(re.findall(r"R_AARCH64_CALL26\s+try_read32", cx[0])) <= 7:
-        raise AssertionError(f"{name}: ctx_read must exist once, never write, and hold the five guarded state reads (Command, BAR0, region 1 base / limit / target)")
+    if len(cx) != 1 or "try_write32" in cx[0] or not 8 <= len(re.findall(r"R_AARCH64_CALL26\s+try_read32", cx[0])) <= 10:
+        raise AssertionError(f"{name}: ctx_read must exist once, never write, and hold the eight guarded state reads (Command, BAR0, region 1 CR1 / base / upper base / limit / target / upper target)")
+    for off in ("200", "208", "20c", "210", "214", "218"):	# review 10 L2: all six region 1 registers are read (CR1, LOWER_BASE, UPPER_BASE, LIMIT, LOWER_TARGET, UPPER_TARGET)
+        if not re.search(r"mov\s+x\d+, #0x" + off + r"\b", cx[0]):
+            raise AssertionError(f"{name}: ctx_read lost the region 1 state read of ATU+0x{off}")
+    check_wlanlink_r32_object_text(blocks, name)
     if [b.splitlines()[0] for b in blocks if b is not w[0] and re.search(r"\bbl\s+[0-9a-f]+ <ctx_read>", b)]:
         raise AssertionError(f"{name}: ctx_read must be called only from w32")
     callers = [b.splitlines()[0] for b in blocks if b is not w[0] and re.search(r"\bbl\s+[0-9a-f]+ <w32>", b)]
@@ -3724,6 +3755,8 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
     disasm = _touch_obj_info(obj_path)[0]
     check_wlanlink_w32_object_text(disasm, "wlanlink selftest")  # control
     wblk = re.search(r"(?ms)^[0-9a-f]+ <w32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
+    rblk = re.search(r"(?ms)^[0-9a-f]+ <r32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
+    cblk = re.search(r"(?ms)^[0-9a-f]+ <ctx_read>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     cases = [
         ("w32 specialised: no compares", disasm.replace(wblk, "0000000000000100 <w32>:\n 100:\ta9bd7bfd \tstp\tx29, x30, [sp, #-48]!\n 104:\t94000000 \tbl\t0 <try_read32>\n\t\t\t104: R_AARCH64_CALL26\ttry_read32\n 108:\t94000000 \tbl\t0 <try_write32>\n\t\t\t108: R_AARCH64_CALL26\ttry_write32\n 10c:\td65f03c0 \tret\n", 1)),
         ("DBI offset changed", disasm.replace("#0x890", "#0x8bc", 1)),
@@ -3742,6 +3775,18 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("a second caller of ctx_read", disasm + "0000000000fff100 <evil2>:\n fff100:\t97fffe78 \tbl\t100 <ctx_read>\n fff104:\td65f03c0 \tret\n"),
         ("ctx_read writes", disasm.replace("<ctx_read>:\n", "<ctx_read>:\n 1:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n", 1)),
         ("ATU base (CFG window) changed", disasm.replace(wblk, wblk.replace("#0x60ff, lsl #16", "#0x61ff, lsl #16"), 1)),
+        ("r32 Command compare weakened", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0x2\n", r"cmp\tw\1, #0x3\n", rblk), 1)),
+        ("r32 CR2 value changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x80000000", r"mov\tw\1, #0x80000001", rblk), 1)),
+        ("r32 CR2 offset changed", disasm.replace(rblk, re.sub(r"mov\tx(\d+), #0x204", r"mov\tx\1, #0x208", rblk), 1)),
+        ("r32 window limit changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x6000ffff", r"mov\tw\1, #0x6001ffff", rblk), 1)),
+        ("r32 window target changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x60000000", r"mov\tw\1, #0x60400000", rblk), 1)),
+        ("r32 CR1 read dropped", disasm.replace(rblk, re.sub(r"mov\tx(\d+), #0x200\b", r"mov\tx\1, #0x2f0", rblk), 1)),
+        ("r32 offset-0 check dropped", disasm.replace(rblk, re.sub(r"cbnz\tw(\d+), ([0-9a-f]+ <r32\+)", r"nop # \2", rblk), 1)),
+        ("r32 writes", disasm.replace("<r32>:\n", "<r32>:\n 1:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n", 1)),
+        ("r32 guard read dropped", disasm.replace(rblk, re.sub(r"R_AARCH64_CALL26\ttry_read32", "R_AARCH64_NONE\ttry_read32", rblk, count=1), 1)),
+        ("ctx_read lost the CR1 read", disasm.replace(cblk, re.sub(r"mov\tx(\d+), #0x200\b", r"mov\tx\1, #0x2f0", cblk), 1)),
+        ("ctx_read lost the UPPER_BASE read", disasm.replace(cblk, re.sub(r"mov\tx(\d+), #0x20c\b", r"mov\tx\1, #0x2fc", cblk), 1)),
+        ("ctx_read lost the UPPER_TARGET read", disasm.replace(cblk, re.sub(r"mov\tx(\d+), #0x218\b", r"mov\tx\1, #0x2f8", cblk), 1)),
         ("a second try_write32 in w32", disasm.replace("R_AARCH64_CALL26\ttry_write32", "R_AARCH64_CALL26\ttry_write32\n 1fc:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1fc: R_AARCH64_CALL26\ttry_write32", 1)),
         ("a second caller of w32", disasm + "0000000000fff000 <evil>:\n fff000:\t97fffe78 \tbl\t100 <w32>\n fff004:\td65f03c0 \tret\n"),
     ]

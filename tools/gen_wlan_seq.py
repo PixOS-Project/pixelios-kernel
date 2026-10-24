@@ -742,7 +742,9 @@ def draft29():
     row(29, "wait_eq", "CFG", 0x80, FULL, 0x18000000, "read-back of the row above (one-shot)", TAG_GUESS, "read-back PCI_BAR0_WIN must be 0x18000000")
     spr = an(DHDP, r"val = OSL_PCI_READ_CONFIG.osh, PCI_SPROM_CONTROL")
     row(29, "read_only", "CFG", 0x88, FULL, 0, f"{spr}: DHD aborts attach if all ones; {ob} 0x00080080 before the window write (R27 row=315)", TAG_SRC, "log PCI_SPROM_CONTROL after the window write (all ones = stop)", log=True)
+    row(29, "wait_eq", "CFG", 0x88, FULL, 0x00080080, f"review 10 L3: research 36 s.3 stop condition, enforced (one-shot): a changed or all-ones PCI_SPROM_CONTROL aborts DHD attach ({spr}); {ob} 0x00080080 (R27 row=315)", "observed", "PCI_SPROM_CONTROL must still read 0x00080080 after the window write, else STOP + restore")
     row(29, "read_only", "CFG", 0xBC, FULL, 0, f"{ob} (R27 row=320: LNKSTA 0x1011 high half)", "observed", "log EP link control/status before the arm", log=True)
+    row(29, "wait_eq", "CFG", 0xBC, 0xFFFF0000, 0x10110000, f"review 10 L3: research 36 R4 stop condition, enforced (one-shot): a changed LNKSTA (high half) means STOP; {ob} (R27 row=320: 0x1011 high half)", "observed", "LNKSTA (0xBE) must still read 0x1011 before the arm, else STOP + restore")
     row(29, "read_only", "CFG", 0x104, FULL, 0, f"{an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')} (AER base 0x100, header {ob} R27 row=337 = 0x13C10001)", TAG_GUESS, "log EP AER uncorrectable status before the arm", log=True)
     # ARM: MEM only
     row(29, "mmio_write", "CFG", 0x04, FULL, 0x00000002, f"{an(PCIR, r'define\s+PCI_COMMAND_MEMORY\s+0x2')}; DHD enables the device before the first BAR0 access ({an(DHDL, r'pci_enable_device', 1940)}); MASTER (0x4) is deliberately NOT set (research 36 s.1.1)", TAG_GUESS, "ARM: Command := MEM only (status half 0)", restore="cmd_rst")

@@ -925,7 +925,7 @@ int main(void)
 				}
 				EXPECT(r.blk != WLB_MEM);			/* S29 never touches BAR0 */
 			}
-		EXPECT(n29 == 23 && nw == 6 && nlog == 3);
+		EXPECT(n29 == 25 && nw == 6 && nlog == 3);
 		/* the stateful allowlist, exhaustively over small state spaces: Command takes 0 from anywhere, 0x2 only from Command low 0 AND BAR0 low at the S28 assignment; never MASTER, never status bits */
 		for (unsigned oi = 0; oi < sizeof vals / sizeof vals[0]; oi++)
 			for (unsigned vi = 0; vi < sizeof vals / sizeof vals[0]; vi++)
@@ -1038,6 +1038,15 @@ int main(void)
 			atu[0x210 / 4] = 0x6000FFFFu; atu[0x214 / 4] = 0x60400000u; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
 			atu[0x214 / 4] = 0x60000000u; fault_read_pa = WLAN_ATU + 0x210; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
 			fault_read_pa = 0; ctx_read(WLB_ATU, &c); EXPECT(c.r1ok);
+			{	/* review 10 L2: CR1 (TYPE), UPPER_BASE and UPPER_TARGET must read 0 too; an unreadable one is "not ready" */
+				static const uint32_t o2[3] = { 0x200u, 0x20Cu, 0x218u };
+
+				for (unsigned j = 0; j < 3; j++) {
+					atu[o2[j] / 4] = 4u; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+					atu[o2[j] / 4] = 0u; fault_read_pa = WLAN_ATU + o2[j]; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+					fault_read_pa = 0; ctx_read(WLB_ATU, &c); EXPECT(c.r1ok);
+				}
+			}
 		}
 		{	/* the writer itself against the live state (not only w32_allowed): the enable only with base / limit / target, the window select only from its original, the arm only from Command 0 with BAR0 assigned */
 			unsigned i_cr2 = 0, i_cmd = 0, i_win = 0;
@@ -1059,6 +1068,13 @@ int main(void)
 			atu[0x208 / 4] = 0x60000000u; atu[0x214 / 4] = 0u;
 			EXPECT(w32(i_cr2, 0) == -2 && nwrites == 0);						/* target wrong */
 			atu[0x214 / 4] = 0x60000000u;
+			atu[0x200 / 4] = 4u;
+			EXPECT(w32(i_cr2, 0) == -2 && atu[0x204 / 4] == 0 && nwrites == 0);						/* review 10 L2: CR1 not MEM */
+			atu[0x200 / 4] = 0u; atu[0x20C / 4] = 1u;
+			EXPECT(w32(i_cr2, 0) == -2 && nwrites == 0);									/* UPPER_BASE not 0 */
+			atu[0x20C / 4] = 0u; atu[0x218 / 4] = 1u;
+			EXPECT(w32(i_cr2, 0) == -2 && nwrites == 0);									/* UPPER_TARGET not 0 */
+			atu[0x218 / 4] = 0u;
 			EXPECT(w32(i_cr2, 0) == 0 && atu[0x204 / 4] == 0x80000000u && nwrites == 1);
 			cfgspace[0x80 / 4] = 0x18000000u;
 			EXPECT(w32(i_win, 0) == -2);								/* not from the observed original */
@@ -1078,7 +1094,7 @@ int main(void)
 		}
 
 		world();
-		EXPECT(wlan_link_run() == 0 && has("LINK S29 ok rows=23") && !has("!!!") && has("restore=ok") && cfg_writes_unconfigured == 0 && master_writes == 0);
+		EXPECT(wlan_link_run() == 0 && has("LINK S29 ok rows=25") && !has("!!!") && has("restore=ok") && cfg_writes_unconfigured == 0 && master_writes == 0);
 #if WLAN_LINK_N == 29
 		EXPECT(mem_reads == 0 && !has("LINK S30"));						/* S29 alone never reads BAR0 */
 #endif
@@ -1100,6 +1116,15 @@ int main(void)
 			EXPECT(has(b));
 		}
 		teardown_tail_is_table_order(WLAN_LINK_N);
+		baseline_restored();
+		/* review 10 L3: the stop conditions are enforced: a changed PCI_SPROM_CONTROL (0x88, all ones = DHD aborts attach) or LNKSTA (0xBC high half) stops BEFORE the Command arm */
+		world(); cfgspace[0x88 / 4] = 0xFFFFFFFFu;
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && !has("!!!") && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && mem_reads == 0);
+		teardown_tail_is_table_order(29);
+		baseline_restored();
+		world(); cfgspace[0xBC / 4] = 0x00110000u;
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && !has("!!!") && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && mem_reads == 0);
+		teardown_tail_is_table_order(29);
 		baseline_restored();
 		/* each latch check REFUSES before the next stage: the Command is never armed unless region 1, window and (own read-back) all latched */
 		world(); cfgspace[0x80 / 4] = 0x18000000u;						/* the window select is not at its observed original: refused in the preconditions, no region 1 write at all */

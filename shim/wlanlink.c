@@ -189,7 +189,7 @@ static uintptr_t pa_of(unsigned blk, uint32_t off)
 	return b + off;
 }
 
-static int r32(unsigned blk, uint32_t off, uint32_t *v)
+__attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 {
 	uintptr_t pa = pa_of(blk, off);
 
@@ -312,7 +312,7 @@ static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, co
 /* The guarded reads behind the stateful rules. CFG rows: Command (0xFFFF = unreadable: only the restores pass) and BAR0 low (0xFFFFFFFF = unreadable); ATU rows: region 1 base / limit / target. Other blocks read nothing. */
 __attribute__((noipa)) static void ctx_read(unsigned blk, struct w32_ctx *c)
 {
-	uint32_t lb = 0, lim = 0, lt = 0;
+	uint32_t lb = 0, lim = 0, lt = 0, cr1 = 1, ub = 1, ut = 1;
 
 	c->cmd = 0xFFFFu;
 	c->bar0 = 0xFFFFFFFFu;
@@ -324,7 +324,9 @@ __attribute__((noipa)) static void ctx_read(unsigned blk, struct w32_ctx *c)
 			c->bar0 = 0xFFFFFFFFu;
 	}
 	if (blk == WLB_ATU)
-		c->r1ok = try_read32(WLAN_ATU + 0x208u, &lb) && try_read32(WLAN_ATU + 0x210u, &lim) && try_read32(WLAN_ATU + 0x214u, &lt) && lb == 0x60000000u && lim == 0x6000FFFFu && lt == 0x60000000u;
+		c->r1ok = try_read32(WLAN_ATU + 0x208u, &lb) && try_read32(WLAN_ATU + 0x210u, &lim) && try_read32(WLAN_ATU + 0x214u, &lt) && lb == 0x60000000u && lim == 0x6000FFFFu && lt == 0x60000000u &&
+			  /* review 10 L2: CR1 (TYPE = MEM), UPPER_BASE and UPPER_TARGET must be 0 too (observed 0 at reset, n28c R27 rows 343/346/349) */
+			  try_read32(WLAN_ATU + 0x200u, &cr1) && try_read32(WLAN_ATU + 0x20Cu, &ub) && try_read32(WLAN_ATU + 0x218u, &ut) && cr1 == 0u && ub == 0u && ut == 0u;
 }
 
 /* The ONLY writer: the row (kind, block, offset, mask, value) comes from the const table by index; GPIO / RMW rows read-modify-write the masked bits, full writes just write. noipa +
