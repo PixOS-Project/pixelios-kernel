@@ -92,7 +92,7 @@ laneA() {
 	step A build        bash -c 'cd shim && PIXELIOS_HOST_TESTS=always ./build.sh --board bluejay --avb --out out/gate/build-0'
 	par step A build-fast   bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --out out/gate/build-fast-0'
 	par step A build-usb    bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --out out/gate/build-usb-0'
-	par step A build-wlan   bash -c 'cd shim && B="./build.sh --board bluejay --avb --usb-gadget --wlan-probe" && $B --out out/gate/build-wlan-0 && $B --wlan-rails --wlan-en --out out/gate/build-wlan-1 && $B --wlan-smc-read --out out/gate/build-wlan-2 && $B --wlan-iso --out out/gate/build-wlan-3 && ! $B --wlan-iso --wlan-en --out out/gate/build-wlan-4'
+	par step A build-wlan   bash -c 'cd shim && B="./build.sh --board bluejay --avb --usb-gadget --wlan-probe" && $B --out out/gate/build-wlan-0 && $B --wlan-rails --wlan-en --out out/gate/build-wlan-1 && $B --wlan-smc-read --out out/gate/build-wlan-2 && $B --wlan-iso --out out/gate/build-wlan-3 && { o=$($B --wlan-iso --wlan-en --out out/gate/build-wlan-4 2>&1) && exit 1; echo "$o"; echo "$o" | grep -q -- "--wlan-iso cannot be combined with --wlan-en"; }'
 	par step A build-gpu    bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --out out/gate/build-gpu-0'
 	par step A build-gpupower bash -c 'cd shim && B="./build.sh --board bluejay --avb --usb-gadget --gpu-probe" && $B --gpu-power --out out/gate/build-gpupower-0 && $B --gpu-power=stack --out out/gate/build-gpupower-1'
 	par step A build-gpuclk bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-clk --gpu-power --out out/gate/build-gpuclk-0'
@@ -102,7 +102,7 @@ laneA() {
 	par step A build-touch  bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --touch-probe=run,mux,cs,osc,loop,rst,misopu,rails --out out/gate/build-touch-0'
 	par step A build-udump  bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --udump 1 --out out/gate/build-udump-0'
 	wait
-	step A host-tests   bash -c 'cd shim && ls out/gate/build-0/*_host_test >/dev/null && for t in out/gate/build-0/*_host_test out/gate/build-0/host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'
+	step A host-tests   bash -c 'cd shim && d=out/gate/build-0 && { [ -s $d/host-tests.list ] || { echo "no $d/host-tests.list (build.sh did not run the host tests)"; exit 1; }; } && while read -r n; do [ -x $d/$n ] || { echo "MISSING host test binary $n"; exit 1; }; $d/$n </dev/null || { echo "FAIL $n"; exit 1; }; done <$d/host-tests.list'
 	step A boot-safety  python3 tools/test-bluejay-boot.py --out shim/out/gate/build-0 shim/out/gate/build-0/shim-boot-avb.img
 }
 laneB() {

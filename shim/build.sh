@@ -403,7 +403,7 @@ else
 		--cmdline "console=null" -o $O/shim-boot-lz4.img
 	if [ "$avb" = 1 ]; then
 		key=out/bluejay-testkey.pem	# shared by every --out dir (read-only for them; the gate creates it in its first build before the parallel ones)
-		mkdir -p out; [ -f "$key" ] || openssl genrsa -out "$key" 2048
+		mkdir -p out; [ -f "$key" ] || { openssl genrsa -out "$key.$$" 2048 && mv -n "$key.$$" "$key"; rm -f "$key.$$"; }
 		cp $O/shim-boot.img $O/shim-boot-avb.img
 		"$PYTHON" "$AVBTOOL" add_hash_footer --image $O/shim-boot-avb.img \
 			--partition_name boot --partition_size "${AVB_PARTITION_SIZE:-67108864}" \
@@ -416,66 +416,99 @@ else
 fi
 # Host tests do not depend on the variant: skip them when the same inputs already passed (stamp written only after all passed).
 # PIXELIOS_HOST_TESTS=always runs them anyway (the gate's first build does) and refreshes the stamp. Inputs: shim/*.c *.h, the generated board/wlan_seq headers, the xnu patches this script extracts headers from, gcc -v, this script.
-chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build
+chk() { local what="$1" prev="" a; shift; for a; do [ "$prev" = -o ] && case $a in *host_test*) echo "${a##*/}" >>"$O/host-tests.list" ;; esac; prev=$a; done	# a failed compile or test must stop the build; every compiled *host_test* output is listed for the gate (check-all.sh host-tests fails if one is missing)
+	if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }
 htdir=${XDG_CACHE_HOME:-$HOME/.cache}/pixelios/host-tests
 # shellcheck disable=SC2046  # intentional word splitting of the file lists (an empty "" argument would break sha256sum)
-ht=$({ sha256sum *.c *.h $O/board_config.h $([ -f $O/wlan_seq.h ] && echo $O/wlan_seq.h) $(grep -o '\.\./xnu/patches/[0-9][0-9]*-[A-Za-z0-9._-]*\.patch' build.sh | sort -u) build.sh; gcc -v 2>&1; } | sha256sum | cut -c1-32)
+htdigest() { { sha256sum *.c *.h $O/board_config.h $([ -f $O/wlan_seq.h ] && echo $O/wlan_seq.h) $(grep -o '\.\./xnu/patches/[0-9][0-9]*-[A-Za-z0-9._-]*\.patch' build.sh | sort -u) build.sh; gcc -v 2>&1; } | sha256sum | cut -c1-32; }
+ht=$(htdigest)
 if [ -e "$htdir/$ht.ok" ] && [ "${PIXELIOS_HOST_TESTS:-}" != always ]; then
 	echo "host tests: cached $ht"
 else
-	gcc -O1 -Wall -o $O/host_test console.c ramlog.c host_test.c && $O/host_test
-	gcc -O1 -Wall -Wextra -o $O/ramlog_host_test ramlog.c ramlog_host_test.c && $O/ramlog_host_test
-	gcc -O1 -Wall -Wextra -I. -o $O/fdt_host_test fdt.c fdt_host_test.c && $O/fdt_host_test
-	gcc -O1 -Wall -Wextra -I. -o $O/pstore_host_test fdt.c pstore.c pstore_host_test.c && $O/pstore_host_test
-	gcc -O1 -Wall -Wextra -I. -o $O/usbprobe_host_test fdt.c usbprobe.c usbprobe_host_test.c && $O/usbprobe_host_test
-	gcc -O1 -Wall -Wextra -I. -o $O/usbproto_host_test usbproto.c usbproto_host_test.c && $O/usbproto_host_test
-	gcc -O1 -Wall -Wextra -I. -o $O/usbgadget_host_test usbproto.c usbgadget.c usbgadget_host_test.c && $O/usbgadget_host_test
-	gcc -O1 -Wall -Wextra -I. -DUSB_DMA_HI_BASE=1 -o $O/usbpool_host_test usbpool.c usbpool_host_test.c && $O/usbpool_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/wlanprobe_host_test wlanprobe_host_test.c && $O/wlanprobe_host_test
+	: >"$O/host-tests.list"
+	chk "host_test (compile)" gcc -O1 -Wall -o $O/host_test console.c ramlog.c host_test.c
+	chk "host_test" $O/host_test $O/host.ppm
+	chk "ramlog_host_test (compile)" gcc -O1 -Wall -Wextra -o $O/ramlog_host_test ramlog.c ramlog_host_test.c
+	chk "ramlog_host_test" $O/ramlog_host_test
+	chk "fdt_host_test (compile)" gcc -O1 -Wall -Wextra -I. -o $O/fdt_host_test fdt.c fdt_host_test.c
+	chk "fdt_host_test" $O/fdt_host_test
+	chk "pstore_host_test (compile)" gcc -O1 -Wall -Wextra -I. -o $O/pstore_host_test fdt.c pstore.c pstore_host_test.c
+	chk "pstore_host_test" $O/pstore_host_test
+	chk "usbprobe_host_test (compile)" gcc -O1 -Wall -Wextra -I. -o $O/usbprobe_host_test fdt.c usbprobe.c usbprobe_host_test.c
+	chk "usbprobe_host_test" $O/usbprobe_host_test
+	chk "usbproto_host_test (compile)" gcc -O1 -Wall -Wextra -I. -o $O/usbproto_host_test usbproto.c usbproto_host_test.c
+	chk "usbproto_host_test" $O/usbproto_host_test
+	chk "usbgadget_host_test (compile)" gcc -O1 -Wall -Wextra -I. -o $O/usbgadget_host_test usbproto.c usbgadget.c usbgadget_host_test.c
+	chk "usbgadget_host_test" $O/usbgadget_host_test
+	chk "usbpool_host_test (compile)" gcc -O1 -Wall -Wextra -I. -DUSB_DMA_HI_BASE=1 -o $O/usbpool_host_test usbpool.c usbpool_host_test.c
+	chk "usbpool_host_test" $O/usbpool_host_test
+	chk "wlanprobe_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/wlanprobe_host_test wlanprobe_host_test.c
+	chk "wlanprobe_host_test" $O/wlanprobe_host_test
 	# --wlan-rails (wlanrails.c) against the fake APM of acpm_host_test.c; --wlan-en (wlanen.c) against a fake GPIO bank. try_write32 is deliberately absent from the rails test (linking fails if wlanrails.c ever writes).
-	gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -I$O -include $O/board_config.h -o $O/wlanrails_host_test wlanrails_host_test.c && $O/wlanrails_host_test
-	gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -I$O -include $O/board_config.h -o $O/wlanen_host_test wlanen_host_test.c && $O/wlanen_host_test
-	gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -I$O -include $O/board_config.h -o $O/wlansmc_host_test wlansmc_host_test.c && $O/wlansmc_host_test
-	gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -I$O -include $O/board_config.h -o $O/wlaniso_host_test wlaniso_host_test.c && $O/wlaniso_host_test
+	chk "wlanrails_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -I$O -include $O/board_config.h -o $O/wlanrails_host_test wlanrails_host_test.c
+	chk "wlanrails_host_test" $O/wlanrails_host_test
+	chk "wlanen_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -I$O -include $O/board_config.h -o $O/wlanen_host_test wlanen_host_test.c
+	chk "wlanen_host_test" $O/wlanen_host_test
+	chk "wlansmc_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -I$O -include $O/board_config.h -o $O/wlansmc_host_test wlansmc_host_test.c
+	chk "wlansmc_host_test" $O/wlansmc_host_test
+	chk "wlaniso_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -I$O -include $O/board_config.h -o $O/wlaniso_host_test wlaniso_host_test.c
+	chk "wlaniso_host_test" $O/wlaniso_host_test
 	# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (S22 is a documented skip: one 0 us delay row; N=20..36 run in the fake SoC; S24 = read-only link report, S25 = read-only iATU layout, S26 = iATU region 0 programmed + CFG window reads, S27 = read-only endpoint config dump + iATU region 1 reset values, S28 = BAR sizing + assignment, S29 = region 1 + BAR0 window + Command MEM, S30 = the first BAR0 read, S31 = read-only ChipCommon eromptr / clk_ctl_st / capabilities_ext, S32 = BAR0 window move to the EROM page + 896 dword dump, S33 = read-only PMU / ARM CA7 wrapper / SYS_MEM wrapper state through three more window moves, S34 = SRPWR request, S35 = SYS_MEM core reset + bank sizing, S36 = ARM CA7 halt: the first BAR0 writes, research 40)
-	chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build (review 2 M2: gcc && test inside a loop did not)
 	for n in 7 8 10 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36; do
 		chk "wlanlink_host_test$n (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DWLAN_LINK_RUN -DWLAN_LINK_N=$n -I. -I$O -include $O/board_config.h -o $O/wlanlink_host_test$n wlanlink_host_test.c
 		chk "wlanlink_host_test$n" $O/wlanlink_host_test$n
 	done
-	gcc -O1 -Wall -Wextra -Werror -I. -o $O/gpuprobe_host_test gpuprobe_host_test.c && $O/gpuprobe_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpuprobe_dump_host_test gpuprobe_dump_host_test.c && $O/gpuprobe_dump_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpus2mpu_host_test gpus2mpu_host_test.c && $O/gpus2mpu_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpujob_host_test gpus2mpu.c gpujob_host_test.c && $O/gpujob_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpupower_host_test gpupower_host_test.c && $O/gpupower_host_test
-	gcc -O1 -Wall -Wextra -Werror -DGPU_POWER_STACK -I. -I$O -include $O/board_config.h -o $O/gpupower_stack_host_test gpupower_host_test.c && $O/gpupower_stack_host_test
+	chk "gpuprobe_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -o $O/gpuprobe_host_test gpuprobe_host_test.c
+	chk "gpuprobe_host_test" $O/gpuprobe_host_test
+	chk "gpuprobe_dump_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpuprobe_dump_host_test gpuprobe_dump_host_test.c
+	chk "gpuprobe_dump_host_test" $O/gpuprobe_dump_host_test
+	chk "gpus2mpu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpus2mpu_host_test gpus2mpu_host_test.c
+	chk "gpus2mpu_host_test" $O/gpus2mpu_host_test
+	chk "gpujob_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpujob_host_test gpus2mpu.c gpujob_host_test.c
+	chk "gpujob_host_test" $O/gpujob_host_test
+	chk "gpupower_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/gpupower_host_test gpupower_host_test.c
+	chk "gpupower_host_test" $O/gpupower_host_test
+	chk "gpupower_stack_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DGPU_POWER_STACK -I. -I$O -include $O/board_config.h -o $O/gpupower_stack_host_test gpupower_host_test.c
+	chk "gpupower_stack_host_test" $O/gpupower_stack_host_test
 	# --gpu-clk (gpuclk.c) against the fake DVFS-channel APM of dvfs_host_test.c; the two gate variants use a copy of the board header with one ACPM gate forced to 0
 	sed 's/^#define ACPM_LAYOUT_VERIFIED 1$/#define ACPM_LAYOUT_VERIFIED 0/' $O/board_config.h > $O/board_config_l0.h
 	sed 's/^#define ACPM_ELEM_UNIT_VERIFIED 1$/#define ACPM_ELEM_UNIT_VERIFIED 0/' $O/board_config.h > $O/board_config_u0.h
 	GCLK="gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DGPU_CLK -I."
-	$GCLK -I$O -include $O/board_config.h -o $O/gpuclk_host_test gpuclk_host_test.c && $O/gpuclk_host_test
-	$GCLK -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpuclk_gate_l_host_test gpuclk_host_test.c && $O/gpuclk_gate_l_host_test
-	$GCLK -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpuclk_gate_u_host_test gpuclk_host_test.c && $O/gpuclk_gate_u_host_test
+	chk "gpuclk_host_test (compile)" $GCLK -I$O -include $O/board_config.h -o $O/gpuclk_host_test gpuclk_host_test.c
+	chk "gpuclk_host_test" $O/gpuclk_host_test
+	chk "gpuclk_gate_l_host_test (compile)" $GCLK -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpuclk_gate_l_host_test gpuclk_host_test.c
+	chk "gpuclk_gate_l_host_test" $O/gpuclk_gate_l_host_test
+	chk "gpuclk_gate_u_host_test (compile)" $GCLK -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpuclk_gate_u_host_test gpuclk_host_test.c
+	chk "gpuclk_gate_u_host_test" $O/gpuclk_gate_u_host_test
 	# --gpu-rails (gpurails.c) against the fake APM of acpm_host_test.c; the gate variants again use the sed'ed headers, a null-config variant drops ACPM_S11_KNOWN
 	GRL="gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I."
-	$GRL -DTOUCH_RAILS_WRITE -I$O -include $O/board_config.h -o $O/gpurails_host_test gpurails_host_test.c && $O/gpurails_host_test
-	$GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpurails_gate_l_host_test gpurails_host_test.c && $O/gpurails_gate_l_host_test
-	$GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpurails_gate_u_host_test gpurails_host_test.c && $O/gpurails_gate_u_host_test
+	chk "gpurails_host_test (compile)" $GRL -DTOUCH_RAILS_WRITE -I$O -include $O/board_config.h -o $O/gpurails_host_test gpurails_host_test.c
+	chk "gpurails_host_test" $O/gpurails_host_test
+	chk "gpurails_gate_l_host_test (compile)" $GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpurails_gate_l_host_test gpurails_host_test.c
+	chk "gpurails_gate_l_host_test" $O/gpurails_gate_l_host_test
+	chk "gpurails_gate_u_host_test (compile)" $GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpurails_gate_u_host_test gpurails_host_test.c
+	chk "gpurails_gate_u_host_test" $O/gpurails_gate_u_host_test
 	sed 's/^#define ACPM_S11_KNOWN 1$/#define ACPM_S11_KNOWN 0/' $O/board_config.h > $O/board_config_s0.h
 	sed 's/^#define ACPM_S11_ON_KNOWN 1$/#define ACPM_S11_ON_KNOWN 0/' $O/board_config.h > $O/board_config_n0.h
-	$GRL -DTOUCH_RAILS_WRITE -DNULL_TEST -I$O -include $O/board_config_s0.h -o $O/gpurails_null_host_test gpurails_host_test.c && $O/gpurails_null_host_test
+	chk "gpurails_null_host_test (compile)" $GRL -DTOUCH_RAILS_WRITE -DNULL_TEST -I$O -include $O/board_config_s0.h -o $O/gpurails_null_host_test gpurails_host_test.c
+	chk "gpurails_null_host_test" $O/gpurails_null_host_test
 	# --gpu-rail-on (gpurailon.c, the S2MPG11 BUCK2S writer) against the same fake APM; gate variants and a null rail_on block
 	GRO="$GRL -DTOUCH_RAILS_WRITE -DGPU_RAIL_ON"
-	$GRO -I$O -include $O/board_config.h -o $O/gpurailon_host_test gpurailon_host_test.c && $O/gpurailon_host_test
-	$GRO -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpurailon_gate_l_host_test gpurailon_host_test.c && $O/gpurailon_gate_l_host_test
-	$GRO -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpurailon_gate_u_host_test gpurailon_host_test.c && $O/gpurailon_gate_u_host_test
-	$GRO -DNULL_TEST -I$O -include $O/board_config_n0.h -o $O/gpurailon_null_host_test gpurailon_host_test.c && $O/gpurailon_null_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/touch_host_test touch_host_test.c && $O/touch_host_test
-	gcc -O1 -Wall -Wextra -Werror -DTOUCH_RAILS_WRITE -I. -I$O -include $O/board_config.h -o $O/acpm_host_test acpm_host_test.c && $O/acpm_host_test
-	for v in 0 1; do gcc -O1 -Wall -Wextra -Werror -DRT_VERIFIED=$v -I. -I$O -include $O/board_config.h -o $O/rails_host_test$v rails_host_test.c && $O/rails_host_test$v; done
+	chk "gpurailon_host_test (compile)" $GRO -I$O -include $O/board_config.h -o $O/gpurailon_host_test gpurailon_host_test.c
+	chk "gpurailon_host_test" $O/gpurailon_host_test
+	chk "gpurailon_gate_l_host_test (compile)" $GRO -DGATE_TEST -I$O -include $O/board_config_l0.h -o $O/gpurailon_gate_l_host_test gpurailon_host_test.c
+	chk "gpurailon_gate_l_host_test" $O/gpurailon_gate_l_host_test
+	chk "gpurailon_gate_u_host_test (compile)" $GRO -DGATE_TEST -DGATE_UNIT -I$O -include $O/board_config_u0.h -o $O/gpurailon_gate_u_host_test gpurailon_host_test.c
+	chk "gpurailon_gate_u_host_test" $O/gpurailon_gate_u_host_test
+	chk "gpurailon_null_host_test (compile)" $GRO -DNULL_TEST -I$O -include $O/board_config_n0.h -o $O/gpurailon_null_host_test gpurailon_host_test.c
+	chk "gpurailon_null_host_test" $O/gpurailon_null_host_test
+	chk "touch_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/touch_host_test touch_host_test.c
+	chk "touch_host_test" $O/touch_host_test
+	chk "acpm_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DTOUCH_RAILS_WRITE -I. -I$O -include $O/board_config.h -o $O/acpm_host_test acpm_host_test.c
+	chk "acpm_host_test" $O/acpm_host_test
+	for v in 0 1; do chk "rails_host_test$v (compile)" gcc -O1 -Wall -Wextra -Werror -DRT_VERIFIED=$v -I. -I$O -include $O/board_config.h -o $O/rails_host_test$v rails_host_test.c; chk "rails_host_test$v" $O/rails_host_test$v; done
 	# ACPM DVFS client (docs/research/25): the fake channel-1 APM; the read-only build has no request tests (no acpm_dvfs_set there).
 	# Every check below FAILS the build (a plain `a && b && echo PASS` chain only skips the PASS line under set -e: review dvfs-1 M1).
-	chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }
 	gcc -O1 -Wall -Wextra -Werror -DTOUCH_DVFS_WRITE -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test dvfs_host_test.c
 	chk "dvfs_host_test (rw)" $O/dvfs_host_test
 	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test_ro dvfs_host_test.c
@@ -497,19 +530,25 @@ else
 	gcc -O1 -w -DGPU_CLK -I. -I$O -include $O/board_config.h -c -o $O/acpm_gpuclk.o acpm.c
 	chk "gpu-clk acpm object has acpm_dvfs_reassert and no acpm_dvfs_set" sh -c 'nm $O/acpm_gpuclk.o | grep -q acpm_dvfs_reassert && ! nm $O/acpm_gpuclk.o | grep -q acpm_dvfs_set'
 	chk "acpm objects built without --gpu-clk have no acpm_dvfs_reassert" sh -c '! nm $O/acpm_ro.o $O/acpm_dvfs_ro.o $O/acpm_dvfs_rw.o | grep -q acpm_dvfs_reassert'
-	gcc -O1 -Wall -Wextra -Werror -I. -o $O/udump_host_test udump.c udump_host_test.c && $O/udump_host_test
+	chk "udump_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -o $O/udump_host_test udump.c udump_host_test.c
+	chk "udump_host_test" $O/udump_host_test
 	# the debounce under test is the header shipped in xnu patch 0087 (new-file hunk: drop the leading "+")
 	awk '/^\+\+\+ b\/bsd\/dev\/sweet_keys_gs101_debounce.h$/{f=1;next} f&&/^diff --git/{exit} f&&/^@@/{next} f{print substr($0,2)}' ../xnu/patches/0087-sweet-gs101-keys.patch > $O/sweet_keys_gs101_debounce.h
-	gcc -O1 -Wall -Wextra -Werror -I. -o $O/keys_gs101_host_test keys_gs101_host_test.c && $O/keys_gs101_host_test
+	chk "keys_gs101_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -o $O/keys_gs101_host_test keys_gs101_host_test.c
+	chk "keys_gs101_host_test" $O/keys_gs101_host_test
 	# pure FTM5 protocol header of the Pixel 6a touch driver: extracted from xnu patch 0088 so the test sees the kernel's bytes
 	awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > $O/sweet_ftm5.h
-	gcc -O1 -Wall -Wextra -Werror -I$O -o $O/ftm5_host_test ftm5_host_test.c && $O/ftm5_host_test
+	chk "ftm5_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/ftm5_host_test ftm5_host_test.c
+	chk "ftm5_host_test" $O/ftm5_host_test
 	awk '$0=="+++ b/bsd/dev/sweet_mali_pt.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0104-sweet-mali-driver-core.patch > $O/sweet_mali_pt.h
-	gcc -O1 -Wall -Wextra -Werror -I$O -o $O/mali_pt_host_test mali_pt_host_test.c && $O/mali_pt_host_test
+	chk "mali_pt_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/mali_pt_host_test mali_pt_host_test.c
+	chk "mali_pt_host_test" $O/mali_pt_host_test
 	# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
 	awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > $O/sweet_touch_poke.h
-	gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c && $O/touchpoke_host_test
-	mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"
+	chk "touchpoke_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/touchpoke_host_test touchpoke_host_test.c
+	chk "touchpoke_host_test" $O/touchpoke_host_test
+	# the inputs may have been edited while the tests ran: stamp only if the digest is unchanged (otherwise the next build runs them again)
+	if [ "$(htdigest)" = "$ht" ]; then mkdir -p "$htdir" && : >"$htdir/$ht.ok.$$" && mv -f "$htdir/$ht.ok.$$" "$htdir/$ht.ok"; else echo "host tests: inputs changed while they ran, no stamp"; fi
 fi
 # and the SHIPPED objects (built with the image's flags above): a read-only dvfs image must not carry the request path at all
 if [ "$touch_dvfs" = 1 ] && [ $((touch_bits & 1024)) = 0 ] && [ "$gpu_clk" = 0 ]; then
