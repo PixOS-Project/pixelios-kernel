@@ -81,7 +81,7 @@ step() {
 		echo "$n$r" >"$tmp/$n.fail"; : >"$tmp/$l.lane"; echo "$n FAILED$r $((SECONDS-s))s" >"$tmp/$n.time"; echo "END $n FAIL$r $((SECONDS-s))" >>"$prog"
 	fi
 }
-# par CMD...: run CMD in the background, at most $J of this lane's jobs at a time
+	step A host-tests   bash -c 'cd shim && ls out/gate/build-0/*_host_test >/dev/null && for t in out/gate/build-0/*_host_test out/gate/build-0/host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'
 par() { while [ "$(jobs -rp | wc -l)" -ge "$J" ]; do wait -n; done; "$@" & }
 # needs FILE CMD...: run CMD only if FILE exists in this repository (the public repos hold different parts of the monorepo)
 needs() { f=$1; shift; [ -e "$f" ] || { echo "skip: $f is not in this repository"; return 0; }; "$@"; }
