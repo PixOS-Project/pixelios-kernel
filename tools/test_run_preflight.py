@@ -20,7 +20,8 @@ class T(unittest.TestCase):
         for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
             subprocess.run(["git", "-C", r, *c], check=True)
         put(r + "/f", "x")
-        subprocess.run(["git", "-C", r, "add", "f"], check=True)
+        put(r + "/.gitignore", "shim/\nlogs/\nlock/\n*.txt\n")
+        subprocess.run(["git", "-C", r, "add", "f", ".gitignore"], check=True)
         subprocess.run(["git", "-C", r, "commit", "-qm", "c"], check=True)
         self.h = subprocess.run(["git", "-C", r, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
         put(r + "/shim/out/gate.result", "GATE PASS %s 123\n" % self.h)
@@ -65,16 +66,31 @@ class T(unittest.TestCase):
         rc, out = self.pf("--", "tools/probe-run", "--expect", "LINK R36 row=1397 rd=", "--expect", "summary stopped=refused at=S36 row=(1398|1405)")
         self.assertEqual(rc, 0, out)
 
-    def test_timeout_too_short_vs_history(self):   # the n9/n10 runs: --timeout 180 against a run that needed ~190 s
-        d = self.root + "/logs/probe/20261023T065219Z-w3a-n10_"
-        put(d + "/report.txt", "RESULT: PASS x\n")
+    def probe_dir(self, name, secs, args):
+        d = self.root + "/logs/probe/" + name
+        put(d + "/report.txt", "RESULT: PASS x\n"); put(d + "/run.args", args + "\n")
         put(d + "/fboot.log", "f"); put(d + "/usb.txt", "u")
-        os.utime(d + "/fboot.log", (1000, 1000)); os.utime(d + "/usb.txt", (1190, 1190))
-        rc, out = self.pf("--", "tools/probe-run", "--label", "w3a-n10", "--timeout", "180")
+        os.utime(d + "/fboot.log", (1000, 1000)); os.utime(d + "/usb.txt", (1000 + secs, 1000 + secs))
+
+    def test_timeout_too_short_vs_history(self):   # review B2: the n9/n10 runs have DIFFERENT labels and the same build args
+        self.probe_dir("20261023T065219Z-w3a-n8_", 178, "--wlan-link=8 --wlan-probe")
+        a = ("--build-args", "--wlan-link=9 --wlan-probe", "--label", "w3a-n9")
+        rc, out = self.pf("--", "tools/probe-run", *a, "--timeout", "180")
         self.assertEqual(rc, 1, out)
         self.assertIn("RESULT: FAIL timeout:", out)
-        self.assertEqual(self.pf("--", "tools/probe-run", "--label", "w3a-n10", "--timeout", "600")[0], 0)
-        self.assertEqual(self.pf("--", "tools/probe-run", "--label", "other", "--timeout", "5")[0], 0)   # no history: SKIP
+        rc, out = self.pf("--", "tools/probe-run", *a, "--timeout", "230")   # between mx (178) and mx + margin (238): still FAIL (B6)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.pf("--", "tools/probe-run", *a, "--timeout", "600")[0], 0)
+        self.assertEqual(self.pf("--", "tools/probe-run", "--build-args", "--other", "--timeout", "5")[0], 0)   # other form: no history, SKIP
+
+    def test_timeout_default_when_omitted(self):   # --wlan-link defaults to 600 in tools/probe-run, --touch-probe to 240, else 60
+        self.probe_dir("20261023T065219Z-x_", 100, "--pstore-fast --touch-probe=run")
+        rc, out = self.pf("--", "tools/probe-run", "--touch-probe=run")   # default 240 >= 100 + 60
+        self.assertEqual(rc, 0, out)
+        self.probe_dir("20261023T065220Z-y_", 200, "--pstore-fast --touch-probe=run")
+        rc, out = self.pf("--", "tools/probe-run", "--touch-probe=run")   # 240 < 200 + 60
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL timeout:", out)
 
     def test_stale_gate_hash(self):
         put(self.root + "/shim/out/gate.result", "GATE PASS deadbee 123\n")
@@ -85,6 +101,30 @@ class T(unittest.TestCase):
         self.assertEqual(self.xrun()[0], 1)
         os.remove(self.root + "/shim/out/gate.result")
         self.assertEqual(self.xrun()[0], 1)
+
+    def test_gate_tree_changed_after_gate(self):   # review B3
+        self.assertEqual(self.xrun()[0], 0)
+        put(self.root + "/f", "changed")
+        rc, out = self.xrun()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL gate: tree changed", out)
+
+    def test_gate_quick_note(self):
+        put(self.root + "/shim/out/gate.result", "GATE PASS %s quick: ran 3 of 9 steps 123\n" % self.h)
+        rc, out = self.xrun()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("quick run", out)
+
+    def test_extra_entry_needs_citation(self):   # review B7
+        put(self.root + "/extra.txt", "nosuchthing\n")
+        rc, out = self.xrun(GOOD + " nosuchthing=1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("without citation", out)
+
+    def test_ap27_expect_equal_to_stop_row(self):   # review B6: late = r >= s
+        rc, out = self.pf("--", "tools/probe-run", "--expect", "LINK R36 row=1398 rd=", "--expect", "summary stopped=refused at=S36 row=(1398|1405)")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL reach:", out)
 
     def test_root_mismatch(self):
         self.assertEqual(self.pf("--root-sha", "9223c0f2", "--", "tools/xrun", "--args", GOOD)[0], 0)

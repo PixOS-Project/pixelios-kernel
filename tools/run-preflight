@@ -10,10 +10,13 @@ Checks (each names the antipattern that motivates it; SKIP = not enough verified
             xnu/patches; tools/bootargs-extra.txt = hand-added names, each with a citation). A grep is a start, not proof.
   syntax    xrun --args: sweettouchpoke= must end with ';' (AP-10, patch 0093)
   reach     every --expect row is < every accepted stop row (a pattern with "stopped=" and row=N|M) (AP-27)
-  timeout   probe-run --timeout >= max earlier wall of the same --label (tools/runs stats) + --margin (default 60 s, a guess) (AP-14/AP-22)
-  gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it)
+  timeout   probe-run --timeout (or the tools/probe-run default) >= max earlier wall of runs with the same build-arg option names
+            (tools/runs stats --args --all-worktrees; probe-run writes run.args since review B2) + --margin (default 60 s, a guess) (AP-14/AP-22)
+  gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it) AND the work tree is clean (review B3)
   root      newest line of flashed-userdata.txt has sha256 == --root-sha (SKIP without --root-sha)
   lock      phone lock free or held by the caller (tools/phone-lock status/check)
+Known gaps (LOW): xrun wall time is not compared; probe runs from before run.args existed have no history; the three userland boot-args (wdt_test,
+ignition_level, launchd_unsecure_cache) FAIL until a cited bootargs-extra.txt entry exists (spec-conformant).
 Not implemented (no verified source yet, listed as SKIP): image meta vs HEAD, --overlay after migration finished, the build's recorded root.
 Last line: RESULT: PASS | FAIL <check>: <reason>   Exit 0 pass / 1 a check failed / 2 bad arguments or internal error.
 Env (tests): PREFLIGHT_ROOT repo root, PREFLIGHT_KNOWN/PREFLIGHT_EXTRA name lists, ARTIFACTS, FLASH_STATE, RUNS_ROOT, PHONE_LOCK_DIR.
@@ -110,6 +113,14 @@ def read_names(path):
         return None
 
 
+def uncited(path):
+    """bootargs-extra.txt rule 'no citation, no entry': names on lines without '# text'"""
+    try:
+        return [l.split("#")[0].strip() for l in open(path) if l.strip() and not l.startswith("#") and not re.search(r"#\s*\S", l)]
+    except OSError:
+        return []
+
+
 # ---- checks (each returns (status, detail), status PASS|FAIL|SKIP) ---------------------------------------------------
 def opts(argv):
     """-> dict name -> list of values for the options this tool cares about (xrun/probe-run); unknown options are ignored."""
@@ -127,6 +138,8 @@ def c_bootargs(tool, o):
     if tool != "xrun" or "--args" not in o:
         return "SKIP", "no xrun --args"
     known, extra = read_names(KNOWN), read_names(EXTRA) or set()
+    if uncited(EXTRA):
+        return "FAIL", "bootargs-extra.txt entry without citation: " + " ".join(uncited(EXTRA))
     if known is None:
         return "FAIL", "%s missing: run tools/run-preflight --gen-bootargs" % KNOWN
     bad = []
@@ -170,16 +183,35 @@ def c_reach(tool, o):
     return "PASS", ""
 
 
-def c_timeout(tool, o, margin):
-    key = "--timeout" if tool == "probe-run" else None
-    if not key or key not in o or "--label" not in o:
-        return "SKIP", "only probe-run with --timeout and --label (xrun wall time has no verified comparison with --hard-timeout)"
+def probe_args(argv):
+    """the build args tools/probe-run passes to build.sh, in its own terms (tools/probe-run:main): --touch-probe[=X] adds --pstore-fast, --build-args words."""
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--touch-probe" or argv[i].startswith("--touch-probe="):
+            out += ["--pstore-fast", argv[i]]
+        elif argv[i] == "--build-args" and i + 1 < len(argv):
+            out += argv[i + 1].split(); i += 1
+        elif argv[i] in ("--expect", "--reject", "--timeout", "--label", "--from-dir", "--lock-wait"):
+            i += 1
+        i += 1
+    return out
+
+
+def default_timeout(args):
+    """tools/probe-run: 60, 240 with --touch-probe, 600 with --wlan-link in the build args"""
+    t = 240 if any(a.startswith("--touch-probe") for a in args) else 60
+    return 600 if any(a.startswith("--wlan-link") for a in args) else t
+
+
+def c_timeout(tool, o, margin, argv=()):
+    args = probe_args(list(argv))
+    if tool != "probe-run" or not args:
+        return "SKIP", "only probe-run with build args (xrun wall time has no verified comparison with --hard-timeout)"
     try:
-        t = float(o[key][-1])
+        t = float(o["--timeout"][-1]) if "--timeout" in o else float(default_timeout(args))
     except ValueError:
         return "FAIL", "--timeout is not a number"
-    label = re.sub(r"[^A-Za-z0-9._-]", "_", o["--label"][-1])
-    r = subprocess.run([sys.executable, os.path.join(HERE, "runs"), "stats", "--form", "^" + re.escape(label) + "_*$", "--kind", "probe", "--json"],
+    r = subprocess.run([sys.executable, os.path.join(HERE, "runs"), "stats", "--args=" + " ".join(args), "--kind", "probe", "--all-worktrees", "--json"],
                        capture_output=True, text=True, env=dict(os.environ))
     try:
         rows_ = json.loads(r.stdout.splitlines()[0])
@@ -187,7 +219,7 @@ def c_timeout(tool, o, margin):
         return "SKIP", "tools/runs stats gave no data"
     mx = max([x["max"] for x in rows_ if x["max"] is not None] or [None]) if rows_ else None
     if mx is None:
-        return "SKIP", "no earlier run of label %s" % label
+        return "SKIP", "no earlier run with the same build args"
     need = mx + margin
     if t < need:
         return "FAIL", "--timeout %.0f < earlier max wall %.0fs + margin %.0fs (AP-14/AP-22)" % (t, mx, margin)
@@ -214,7 +246,10 @@ def c_gate(tool, o):
         return "FAIL", "newest gate result is FAIL " + m.group(2)
     if m.group(2) != h:
         return "FAIL", "newest GATE PASS is %s but HEAD is %s (stale or +dirty)" % (m.group(2), h)
-    return "PASS", ""
+    st = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--untracked-files=normal"], capture_output=True, text=True)
+    if st.returncode != 0 or st.stdout.strip():
+        return "FAIL", "tree changed since the gate (git status not clean): rerun tools/check-all.sh (AP-21)"
+    return "PASS", (" note: the gate was a --quick run" if " quick:" in line else "")
 
 
 def c_root(tool, o, root_sha):
@@ -251,7 +286,7 @@ def skip_notes(tool, o):
 def run_checks(tool, argv, root_sha, margin):
     o = opts(argv)
     res = [("bootargs",) + c_bootargs(tool, o), ("syntax",) + c_syntax(tool, o), ("reach",) + c_reach(tool, o),
-           ("timeout",) + c_timeout(tool, o, margin), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
+           ("timeout",) + c_timeout(tool, o, margin, argv), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
            ("lock",) + c_lock(tool, o)]
     return res, skip_notes(tool, o)
 
