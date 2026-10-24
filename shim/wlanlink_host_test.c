@@ -78,7 +78,7 @@ static unsigned mem_illegal, s33_reads, core_reads;	/* BAR0 reads that the test'
 /* S34..S36 (research 40): the register model of the three cores behind BAR0. Writes are checked by the TEST'S OWN spec (spec_memw, a data table, independent of memw_ok); mem_illegal_w counts writes it rejects (must stay 0) */
 static uint32_t cp_powerctl, sm_io, sm_rc, sm_rs, arm_io, arm_rc, arm_rs, sm_coreinfo, sm_bankidx, sm_bankinfo;
 static unsigned srpwr_cnt, srpwr_after, mem_wr_n, mw_n, mem_illegal_w, mem_wr_unready, mw_log[16];
-static int chip_mode, mw_kind;	/* chip_mode (N >= 34): 1 SRPWR status never set, 2 SYS_MEM RESET_CTL release does not take, 3 SYS_MEM IOCTL write does not take, 4 RESET_ST stuck 1 after the assert, 5 coreinfo all ones, 6 coreinfo nrb = 1, 7 coreinfo nb = 0, 8 ARM RESET_CTL release does not take, 9 ARM IOCTL write does not take, 10 SYS_MEM IOCTL keeps FGC on the final write, 11 SYS_MEM RESET_ST stuck 1 from the start, 12 powerctl dead (all ones), 13 SRPWR already on; mw_kind: 1 = the mw_n-th BAR0 write is swallowed, 2 = it stores a wrong value */
+static int chip_mode, mw_kind;	/* chip_mode (N >= 34): 1 SRPWR status never set, 2 SYS_MEM RESET_CTL release does not take, 3 SYS_MEM IOCTL write does not take, 4 RESET_ST stuck 1 after the assert, 5 coreinfo all ones, 6 coreinfo nrb = 1, 7 coreinfo nb = 0, 8 ARM RESET_CTL release does not take, 9 ARM IOCTL write does not take, 10 SYS_MEM IOCTL keeps FGC on the final write, 11 SYS_MEM RESET_ST stuck 1 from the start, 12 powerctl dead (all ones), 13 SRPWR already on, 14 powerctl PowerDomain id [31:28] = 0 (no SRPWR capability); mw_kind: 1 = the mw_n-th BAR0 write is swallowed, 2 = it stores a wrong value */
 static unsigned link_dead_after;	/* review 13 L3: after this many EROM reads every config read answers all ones (link down mid-dump); 0 = off */
 static uint64_t freq, tick, waited_us;
 static unsigned nsave;
@@ -168,7 +168,7 @@ static uint32_t chip_get(uint32_t win, uint32_t off)	/* the model's register val
 	if (win == 0x18126000u)
 		return off == 0x408u ? sm_io : off == 0x800u ? (s33_mode == 5 ? sm_rc | 0x100u : sm_rc) : (chip_mode == 11 ? 1u : sm_rs);
 	if (win == 0x18001000u)
-		return chip_mode == 12 ? 0xFFFFFFFFu : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | 0x30000000u;	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
+		return chip_mode == 12 ? 0xFFFFFFFFu : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
 	return off == 0u ? sm_coreinfo : off == 0x10u ? sm_bankidx : sm_bankinfo;
 }
 
@@ -181,7 +181,7 @@ static const struct wspec wspecs[] = {
 static uint32_t spec_pred_off(uint32_t off) { return off == 0x800u ? 0x408u : off == 0x408u ? 0x800u : off == 0x10u ? 0u : 0xFFFFFFFFu; }
 static int spec_memw(uint32_t win, uint32_t off, uint32_t old, uint32_t v, uint32_t pred)
 {
-	if (win == 0x18001000u) return off == 0x1E8u && old != 0xFFFFFFFFu && (v & ~0x200u) == (old & ~0x200u) && (v & 0x200u);
+	if (win == 0x18001000u) return off == 0x1E8u && old != 0xFFFFFFFFu && (old >> 28) != 0u && (v & ~0x200u) == (old & ~0x200u) && (v & 0x200u);
 	if (win == 0x18026000u) return off == 0x10u && v == 0u && pred != 0xFFFFFFFFu && (pred & 0x3E0u) == 0u && (pred & 0x1Fu) >= 1u;
 	for (unsigned i = 0; i < sizeof wspecs / sizeof wspecs[0]; i++)
 		if (wspecs[i].win == win && wspecs[i].off == off && wspecs[i].v == v && (pred & wspecs[i].pm) == wspecs[i].pv && (old & wspecs[i].om) == wspecs[i].ov)
@@ -1678,7 +1678,8 @@ int main(void)
 					EXPECT(r.kind == WLK_WAIT_EQ || (r.a == 2u && r.mask == FULL_MASK_T));
 					if (r.kind == WLK_READ_ONLY) { EXPECT(nlog < 16u); logrow[nlog++] = i; nlogs++; }
 					if (win == 0x18012000u && r.kind == WLK_WAIT_EQ) { EXPECT(r.off == 0x604u && r.mask == 0xFFu && r.val == 0x28u); pmug = i; }
-					if (r.kind == WLK_WAIT_EQ && win != 0x18012000u) EXPECT(r.off == 0x800u && r.mask == 0xFFFFFFFEu && r.val == 0u);	/* only the RESET_CTL upper-bit guards; no SYS_MEM-up gate any more */
+					if (r.kind == WLK_WAIT_EQ && win == 0x18120000u) EXPECT(r.off == 0x800u && r.mask == FULL_MASK_T && r.val == 1u);	/* the ARM CA7 must still be held in reset (RESET_CTL == 1; review 16 finding 3) */
+					if (r.kind == WLK_WAIT_EQ && win != 0x18012000u && win != 0x18120000u) EXPECT(r.off == 0x800u && r.mask == 0xFFFFFFFEu && r.val == 0u);	/* the SYS_MEM RESET_CTL upper-bit guard; no SYS_MEM-up gate any more */
 				} else if (r.blk == WLB_CFG && r.kind == WLK_WAIT_EQ) {
 					EXPECT(r.off == 0x80u && r.mask == FULL_MASK_T && r.b == 1u && r.a == 0u);
 					if (!nw) { EXPECT(r.val == 0x18105000u && !pre); pre = i; }
@@ -1740,6 +1741,10 @@ int main(void)
 		world(); s33_mode = 2;						/* ARM RESET_CTL upper bits: refused after its logs, SYS_MEM never reached */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S33") && has("restore=ok") && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, chain[2]) && cfgspace[0x80 / 4] == 0x18001000u);
 		snprintf(b, sizeof b, "LINK R33 row=%u rd=0x00000101", logrow[6]); EXPECT(has(b));
+		baseline_restored();
+		world(); arm_rc = 0u;						/* ARM CA7 RESET_CTL == 0 (out of reset, possibly running; review 16 finding 3): refused at S33 after its logs, SYS_MEM never reached, no chip write */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S33") && has("restore=ok") && !has("!!!") && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, chain[2]) && cfgspace[0x80 / 4] == 0x18001000u && mem_wr_n == 0u && !has("LINK S33 ok"));
+		snprintf(b, sizeof b, "LINK R33 row=%u rd=0x00000000", logrow[6]); EXPECT(has(b));
 		baseline_restored();
 		world(); s33_mode = 5;						/* SYS_MEM RESET_CTL upper bits: the guard refuses (the last guard of S33) */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S33") && has("restore=ok") && !has("!!!") && cfgspace[0x80 / 4] == 0x18001000u && mem_illegal == 0u && !has("LINK S33 ok"));
@@ -1877,7 +1882,7 @@ int main(void)
 		{
 			static const uint32_t wins[] = { 0, 0x18000000u, 0x18001000u, 0x18012000u, 0x18105000u, 0x18120000u, 0x18126000u, 0x18026000u, 0x18027000u, 0x18125000u, 0x18121000u };
 			static const uint32_t offs[] = { 0u, 4u, 0x10u, 0x14u, 0x40u, 0x1E8u, 0x1ECu, 0x400u, 0x404u, 0x408u, 0x40Cu, 0x800u, 0x804u, 0x808u, 0x80Cu };
-			static const uint32_t vals[] = { 0u, 1u, 2u, 3u, 0x5u, 0x20u, 0x21u, 0x23u, 0x25u, 0x2Bu, 0x1Fu, 0x3E0u, 0x200u, 0x201u, 0x20000u, 0x30020200u, 0x30000000u, 0x4000u, 0x8003u, 0xFFFFu, 0xFFFFFFFFu };
+			static const uint32_t vals[] = { 0u, 1u, 2u, 3u, 0x5u, 0x20u, 0x21u, 0x23u, 0x25u, 0x2Bu, 0x1Fu, 0x3E0u, 0x200u, 0x201u, 0x20000u, 0x30020200u, 0x30000000u, 0x10000000u, 0x10000200u, 0x0FFFFFFFu, 0x4000u, 0x8003u, 0xFFFFu, 0xFFFFFFFFu };
 			unsigned allowed = 0;
 
 			for (unsigned wi = 0; wi < sizeof wins / sizeof wins[0]; wi++)
@@ -1895,8 +1900,8 @@ int main(void)
 				EXPECT(memw_pred(offs[oi]) == spec_pred_off(offs[oi]));
 			EXPECT(memw_pred(0x1E8u) == 0xFFFFFFFFu && memw_pred(0x804u) == 0xFFFFFFFFu && memw_pred(0x40u) == 0xFFFFFFFFu);
 			/* the exact tuples, spelled out (not through the spec table): the windows and values nothing else may write */
-			EXPECT(memw_ok(0x18001000u, 0x1E8u, 0u, 0x200u, 0u) && memw_ok(0x18001000u, 0x1E8u, 0x30000000u, 0x30000200u, 0u) && !memw_ok(0x18001000u, 0x1E8u, 0u, 0x100u, 0u) && !memw_ok(0x18001000u, 0x1E8u, 0x200u, 0u, 0u) &&
-			       !memw_ok(0x18001000u, 0x1E8u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0u) && !memw_ok(0x18001000u, 0x1ECu, 0u, 0x200u, 0u) && !memw_ok(0x18000000u, 0x1E8u, 0u, 0x200u, 0u));
+			EXPECT(!memw_ok(0x18001000u, 0x1E8u, 0u, 0x200u, 0u) && memw_ok(0x18001000u, 0x1E8u, 0x30000000u, 0x30000200u, 0u) && !memw_ok(0x18001000u, 0x1E8u, 0x10000000u, 0x10000100u, 0u) && !memw_ok(0x18001000u, 0x1E8u, 0x10000200u, 0x10000000u, 0u) &&
+			       !memw_ok(0x18001000u, 0x1E8u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0u) && !memw_ok(0x18001000u, 0x1E8u, 0x0FFFFFFFu, 0x0FFFFFFFu | 0x200u, 0u) && memw_ok(0x18001000u, 0x1E8u, 0x10000000u, 0x10000200u, 0u) && !memw_ok(0x18001000u, 0x1ECu, 0u, 0x200u, 0u) && !memw_ok(0x18000000u, 0x1E8u, 0u, 0x200u, 0u));
 			EXPECT(memw_ok(0x18126000u, 0x800u, 1u, 1u, 0u) && memw_ok(0x18126000u, 0x800u, 1u, 0u, 3u) && !memw_ok(0x18126000u, 0x800u, 1u, 0u, 1u) && !memw_ok(0x18126000u, 0x800u, 1u, 0u, 0x23u) && !memw_ok(0x18126000u, 0x800u, 1u, 2u, 3u));
 			EXPECT(memw_ok(0x18126000u, 0x408u, 0u, 3u, 1u) && !memw_ok(0x18126000u, 0x408u, 0u, 3u, 0u) && memw_ok(0x18126000u, 0x408u, 3u, 1u, 0u) && !memw_ok(0x18126000u, 0x408u, 3u, 1u, 1u) && !memw_ok(0x18126000u, 0x408u, 1u, 1u, 0u) && !memw_ok(0x18126000u, 0x408u, 0u, 0x23u, 1u) &&
 			       !memw_ok(0x18126000u, 0x408u, 0u, 0x20u, 1u) && !memw_ok(0x18126000u, 0x400u, 0u, 3u, 1u) && !memw_ok(0x18126000u, 0x404u, 0u, 3u, 1u));
@@ -2046,6 +2051,10 @@ int main(void)
 		baseline_restored();
 		world(); chip_mode = 13;					/* SRPWR already on: the status is up at the first poll, the run is clean */
 		EXPECT(wlan_link_run() == 0 && has("restore=ok") && mem_wr_n == nmw);
+		baseline_restored();
+		world(); chip_mode = 14;					/* PowerDomain id [31:28] = 0: no SRPWR capability, the RMW is refused at row 1345 (review 16 finding 2), nothing written */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);
+		teardown_tail_is_table_order(34);
 		baseline_restored();
 		world(); chip_mode = 12;					/* powerctl reads all ones (dead): the RMW is refused (old != 0xFFFFFFFF), nothing written */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);

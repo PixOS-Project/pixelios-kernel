@@ -65,9 +65,9 @@ def check(vals, rows, summary):
         lines.append(f"{WINDOWS[w]:<16} +{o:#05x} {label:<16} {v:#010x}  {note}".rstrip())
     pmu_caps = by.get((0x18012000, 0x604))
     res.append(("E1 pmurev == 0x28", pmu_caps is not None and pmu_caps & 0xFF == 0x28, f"caps {pmu_caps:#010x}" if pmu_caps is not None else "no caps row"))
-    for nm, w in (("E2 ARM_CA7 RESET_CTL upper bits 0", 0x18120000), ("E3 SYS_MEM RESET_CTL upper bits 0", 0x18126000)):
+    for nm, w, ok in (("E2 ARM_CA7 RESET_CTL == 1 (held in reset)", 0x18120000, lambda v: v == 1), ("E3 SYS_MEM RESET_CTL upper bits 0", 0x18126000, lambda v: v & 0xFFFFFFFE == 0)):
         v = by.get((w, 0x800))
-        res.append((nm, v is not None and v & 0xFFFFFFFE == 0, f"{v:#010x}" if v is not None else "no row"))
+        res.append((nm, v is not None and ok(v), f"{v:#010x}" if v is not None else "no row"))
     io, rc = by.get((0x18126000, 0x408)), by.get((0x18126000, 0x800))
     up = io is not None and rc is not None and io & 3 == 1 and rc & 1 == 0
     res.append(("E4 SYS_MEM state (informative)", True, "UP" if up else "DOWN (the observed power-on state; S35 resets it)"))

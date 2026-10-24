@@ -66,6 +66,13 @@ class S33Decode(unittest.TestCase):
             self.assertIn(f"FAIL {nm}", out)
             self.assertIn("UPPER BITS SET", out)
 
+    def test_arm_out_of_reset_fails_e2_only(self):	# review 16 finding 3: ARM RESET_CTL must be exactly 1 (held in reset); SYS_MEM may be 0 (informative)
+        rc, out, _ = run(log({(0x18120000, 0x800): 0}))
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL E2", out)
+        rc, out, _ = run(log({(0x18126000, 0x800): 0}))
+        self.assertEqual(rc, 0, out)
+
     def test_sys_mem_state_is_informative_only(self):
         for over, word in (({(0x18126000, 0x800): 1}, "DOWN"), ({(0x18126000, 0x408): 3}, "DOWN"), ({(0x18126000, 0x408): 1, (0x18126000, 0x800): 0}, "UP")):
             rc, out, _ = run(log(over))

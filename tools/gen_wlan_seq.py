@@ -826,7 +826,7 @@ def draft29():
     rd(0x408, "ARM CA7 wrapper IOCTL", ioc)
     rd(0x800, "ARM CA7 wrapper RESET_CTL", rcl)
     rd(0x804, "ARM CA7 wrapper RESET_ST", rst)
-    row(33, "wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, f"{r38} s.4 step 5: RESET_CTL has only bit 0 defined ({an(AIDMPH, r'define\s+AIRC_RESET\s+1')}); upper bits reading 0 and all ones failing are GUESSES; data already logged", TAG_GUESS, "ARM CA7 RESET_CTL & 0xFFFFFFFE must be 0 (one-shot), else STOP + restore")
+    row(33, "wait_eq", "MEM", 0x800, 0xFFFFFFFF, 1, f"{r38} s.4 step 5, tightened by review 16 finding 3: the ARM CA7 must still be HELD IN RESET (RESET_CTL == 1, observed run w3a-n33) before S35 resets SYS_MEM and S36 halts it; a persisted out-of-reset (possibly running) CA7 becomes an S33 stop before any chip write; data already logged ({an(AIDMPH, r'define\s+AIRC_RESET\s+1')})", "observed", "ARM CA7 RESET_CTL must read 1 (held in reset, observed w3a-n33), else STOP + restore")
     move(0x18120000, 0x18126000, "SYS_MEM wrapper", "SYS_MEM wrapper 0x18126000 decoded from the EROM (observed run w3a-n32b)")
     rd(0x408, "SYS_MEM wrapper IOCTL", ioc)
     rd(0x800, "SYS_MEM wrapper RESET_CTL", rcl)

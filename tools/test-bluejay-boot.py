@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "8b8dadb9ca9ca3ad7860cde37c2baee64bb2f173a66d658dd5a27b532a2db8f5"
+_WLAN_SEQ_SHA = "2ecd5871c3047730c83f08af5d325e554ea61e133089b5752edf144078222e27"
 _WLAN_SEQ_COUNTS = {"rows": 1412, "teardown": 47, "write_rows": 296, "distinct_targets": 197}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "MEM": 4, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -3028,7 +3028,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     cfglogs = [("read_only", "CFG", 0xBC, BIGW, 0, None, True, None, 0, 0), ("read_only", "CFG", 0x104, BIGW, 0, None, True, None, 0, 0)]
     w1 = lambda blk, off, mask, v, us=0, polls=1: ("wait_eq", blk, off, mask, v, None, None, None, us, polls)
     s33_want = [w1("CFG", 0x80, BIGW, 0x18105000)] + mv(0x18012000) + [lg(o) for o in (0x604, 0x600, 0x608, 0x618, 0x61C)] + [w1("MEM", 0x604, 0xFF, 0x28)] + \
-               mv(0x18120000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [w1("MEM", 0x800, 0xFFFFFFFE, 0)] + \
+               mv(0x18120000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [w1("MEM", 0x800, BIGW, 1)] + \
                mv(0x18126000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [w1("MEM", 0x800, 0xFFFFFFFE, 0)] + cfglogs
     key9 = lambda r: (r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log"), r["restore"], r["delay_us"], r["polls"])
     s33 = [key9(r) for r in rows if r["step"] == 33]
@@ -3587,8 +3587,10 @@ def wlan_seq_selftest() -> int:
         ("the S33 pmurev guard weakened (mask 0x0F)", set_row(33, "mask", 0x0F, kind="wait_eq", blk="MEM", off=0x604), None, "S33 must be exactly"),
         ("the S33 pmurev guard value changed (0x27)", set_row(33, "value", 0x27, kind="wait_eq", blk="MEM", off=0x604), None, "S33 must be exactly"),
         ("the S33 pmurev guard before the logs", f_swap(33, dict(kind="wait_eq", blk="MEM", off=0x604), dict(kind="read_only", blk="MEM", off=0x604)), None, "S33 must be exactly"),
-        ("the S33 ARM wrapper RESET_CTL guard removed", f_rm(33, kind="wait_eq", blk="MEM", off=0x800, mask=0xFFFFFFFE), None, "S33 must be exactly"),
-        ("the S33 ARM wrapper RESET_CTL guard weakened (mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x800, mask=0xFFFFFFFE), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard removed", f_rm(33, kind="wait_eq", blk="MEM", off=0x800, value=1), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard weakened (mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x800, value=1), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard back to the upper-bit test (review 16 finding 3: mask 0xFFFFFFFE value 0)", lambda d: ([r.update(mask=0xFFFFFFFE, value=0) for r in d["rows"] if r["step"] == 33 and r["kind"] == "wait_eq" and r["blk"] == "MEM" and r["off"] == 0x800 and r["value"] == 1], resha(d)), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard accepts 0 (value 0)", set_row(33, "value", 0, kind="wait_eq", blk="MEM", off=0x800, value=1), None, "S33 must be exactly"),
         ("the S33 AER log removed", f_rm(33, kind="read_only", blk="CFG", off=0x104), None, "S33 must be exactly"),
         # S33 trimmed + S34..S36 (research 40, W-C3), AP-16: each defect class at the table level (wrong value, extra write, wrong order, missing read-back, restore skipped, window chain broken, bankidx other than 0)
         ("S33 still has a SYS_MEM-up gate row", lambda d: (add_row(d, step=33, kind="wait_eq", blk="MEM", off=0x408, mask=3, value=1, polls=1, restore=None), resha(d)), None, "S33 must be exactly"),
@@ -3728,7 +3730,7 @@ _WLANLINK_PINS = {
                    "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;if(pa>=WLAN_ATU&&pa<WLAN_ATU+0x1000u)returnmask==0xFFFFFFFFu&&atu_ok((uint32_t)(pa-WLAN_ATU),v,c->r1ok);if(pa>=WLAN_CFG&&pa<WLAN_CFG+0x1000u)returnmask==0xFFFFFFFFu&&cfg_ok((uint32_t)(pa-WLAN_CFG),old,v,c);if(pa>=WLAN_MEM&&pa<WLAN_MEM+0x1000u)return!c->tear&&memw_ok(c->win,(uint32_t)(pa-WLAN_MEM),old,v,c->pred);return0;",
     "cfg_ok": "intlo=(off==0x10u||off==0x18u),hi=(off==0x14u||off==0x1cu);if(off==0x04u)returnv==0u||(v==0x2u&&(old&0xFFFFu)==0u&&c->bar0==0x60000004u);if(off==0x80u)return(v==0x18001000u&&(c->tear||(old==0x18126000u&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u)))||(v==0x18000000u&&(old==0x18001000u||(c->tear&&(old==0x18105000u||old==0x18000000u||old==0x18012000u||old==0x18120000u||old==0x18126000u||old==0x18026000u))))||(v==0x18105000u&&!c->tear&&old==0x18000000u&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u)||(!c->tear&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u&&((v==0x18012000u&&old==0x18105000u)||(v==0x18120000u&&old==0x18012000u)||(v==0x18126000u&&old==0x18120000u)||(v==0x18126000u&&old==0x18001000u)||(v==0x18026000u&&old==0x18126000u)||(v==0x18120000u&&old==0x18026000u)));if(!lo&&!hi)return0;if(v==(lo?0x4u:0u))return1;if((c->cmd&0xFFFFu)!=0u)return0;if(v==0xFFFFFFFFu)returnold==(lo?0x4u:0u);returnlo&&old==0x4u&&v==(off==0x10u?0x60000004u:0x60400004u);",
     "mem_ok": "if(win==0x18105000u)returnoff<0xE00u;if(win==0x18000000u)returnoff==0u||off==0xACu||off==0xFCu||off==0x1E0u;if(win==0x18012000u)returnoff==0x600u||off==0x604u||off==0x608u||off==0x618u||off==0x61Cu;if(win==0x18120000u||win==0x18126000u)returnoff==0x408u||off==0x800u||off==0x804u;if(win==0x18001000u)returnoff==0x1E8u;if(win==0x18026000u)returnoff==0u||off==0x10u||off==0x40u;return0;",
-    "memw_ok": "uint32_twant;if(win==0x18001000u)returnoff==0x1E8u&&old!=0xFFFFFFFFu&&v==(old|0x200u);if(win==0x18126000u||win==0x18120000u){want=win==0x18126000u?0x3u:0x23u;if(off==0x800u)returnv==1u||(v==0u&&(pred&0x3FFFu)==want);if(off==0x408u)return(v==want&&(pred&1u)==1u)||(v==(want&~0x2u)&&(pred&1u)==0u&&(old&0x3FFFu)==want);return0;}if(win==0x18026000u)returnoff==0x10u&&v==0u&&pred!=0xFFFFFFFFu&&(pred&0x3E0u)==0u&&(pred&0x1Fu)!=0u;return0;",
+    "memw_ok": "uint32_twant;if(win==0x18001000u)returnoff==0x1E8u&&old!=0xFFFFFFFFu&&(old&0xF0000000u)!=0u&&v==(old|0x200u);if(win==0x18126000u||win==0x18120000u){want=win==0x18126000u?0x3u:0x23u;if(off==0x800u)returnv==1u||(v==0u&&(pred&0x3FFFu)==want);if(off==0x408u)return(v==want&&(pred&1u)==1u)||(v==(want&~0x2u)&&(pred&1u)==0u&&(old&0x3FFFu)==want);return0;}if(win==0x18026000u)returnoff==0x10u&&v==0u&&pred!=0xFFFFFFFFu&&(pred&0x3E0u)==0u&&(pred&0x1Fu)!=0u;return0;",
     "memw_pred": "if(off==0x800u)return0x408u;if(off==0x408u)return0x800u;if(off==0x10u)return0u;return0xFFFFFFFFu;",
     "atu_ok": "return(off==0x000u&&(v==0x4u||v==0u))||(off==0x004u&&(v==0x80000000u||v==0u))||(off==0x008u&&(v==(uint32_t)WLAN_CFG||v==0u))||(off==0x00cu&&v==0u)||(off==0x010u&&(v==(uint32_t)WLAN_CFG+0x1fffu||v==0xfffu))||(off==0x014u&&(v==0x01000000u||v==0u))||(off==0x018u&&v==0u)||(off==0x204u&&(v==0u||(v==0x80000000u&&r1ok)))||(off==0x208u&&(v==0x60000000u||v==0u))||(off==0x210u&&(v==0x6000FFFFu||v==0xfffu))||(off==0x214u&&(v==0x60000000u||v==0u));",
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
@@ -4014,8 +4016,11 @@ def wlanlink_source_selftest() -> int:
         ("teardown row order reversed", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = WLAN_SEQ_NTEAR; started && i-- > 0;) {", 1)),
         # S34-S36 (research 40, W-C3): the first BAR0 writes. AP-16: every defect class as a source mutant (wrong value, extra write, wrong order / missing predecessor, restore skipped, window chain broken, bankidx other than 0, missing guards)
         ("S34: powerctl request writes another bit (0x400)", good.replace("v == (old | 0x200u);", "v == (old | 0x400u);", 1)),
-        ("S34: powerctl request may also clear bits", good.replace("old != 0xFFFFFFFFu && v == (old | 0x200u);", "old != 0xFFFFFFFFu && (v & 0x200u) != 0u;", 1)),
-        ("S34: powerctl request allowed on a dead read (all ones)", good.replace("off == 0x1E8u && old != 0xFFFFFFFFu && v == (old | 0x200u);", "off == 0x1E8u && v == (old | 0x200u);", 1)),
+        ("S34: powerctl request may also clear bits", good.replace("(old & 0xF0000000u) != 0u && v == (old | 0x200u);", "(old & 0xF0000000u) != 0u && (v & 0x200u) != 0u;", 1)),
+        ("S34: powerctl request allowed on a dead read (all ones)", good.replace("off == 0x1E8u && old != 0xFFFFFFFFu && (old & 0xF0000000u) != 0u", "off == 0x1E8u && (old & 0xF0000000u) != 0u", 1)),
+        ("S34: powerctl request without the PowerDomain id check (review 16 finding 2)", good.replace(" && (old & 0xF0000000u) != 0u", "", 1)),
+        ("S34: powerctl PowerDomain id check on the wrong nibble (0x0F000000)", good.replace("(old & 0xF0000000u) != 0u", "(old & 0x0F000000u) != 0u", 1)),
+        ("S34: powerctl PowerDomain id check inverted (id must be 0)", good.replace("(old & 0xF0000000u) != 0u", "(old & 0xF0000000u) == 0u", 1)),
         ("S34: powerctl neighbour offset 0x1EC writable", good.replace("return off == 0x1E8u && old", "return (off == 0x1E8u || off == 0x1ECu) && old", 1)),
         ("S34: powerctl written in the ChipCommon window", good.replace("if (win == 0x18001000u)\t\t/* SRPWR", "if (win == 0x18001000u || win == 0x18000000u)\t\t/* SRPWR", 1)),
         ("S34: powerctl window changed (0x18002000)", good.replace("if (win == 0x18001000u)\t\t/* SRPWR", "if (win == 0x18002000u)\t\t/* SRPWR", 1)),
@@ -4329,8 +4334,8 @@ _MEMW_EXACT = {(0x18126000, 0x800, 1): (0, 0, 0, 0), (0x18126000, 0x800, 0): (0x
 
 
 def _memw_spec(win: int, off: int, old: int, v: int, pred: int) -> bool:
-    if win == 0x18001000:	# SRPWR request: only bit 0x200 set (0 -> 1 or already 1), the other bits as read, not a dead read
-        return off == 0x1E8 and old != 0xFFFFFFFF and v == old | 0x200
+    if win == 0x18001000:	# SRPWR request: only bit 0x200 set (0 -> 1 or already 1), the other bits as read, not a dead read, only when PowerDomain id [31:28] != 0 (si_srpwr_cap)
+        return off == 0x1E8 and old != 0xFFFFFFFF and (old & 0xF0000000) != 0 and v == old | 0x200
     if win == 0x18026000:	# bankidx := 0, only with a live coreinfo: not a dead read, no ROM bank (nrb = (coreinfo & 0x3E0) >> 5 == 0), at least one RAM bank (nb = coreinfo & 0x1F)
         return off == 0x10 and v == 0 and pred != 0xFFFFFFFF and (pred & 0x3E0) == 0 and (pred & 0x1F) >= 1
     r = _MEMW_EXACT.get((win, off, v))
@@ -4368,6 +4373,12 @@ def _wlanlink_memw_model(blocks: list, name: str) -> None:
                         got = _a64_call(m[0], {0: win, 1: off, 2: old, 3: v, 4: pred}, name, "memw_ok") != 0
                         if got != want:
                             raise AssertionError(f"{name}: the compiled memw_ok is wrong: window {win:#x} offset {off:#x} old {old:#x} new {v:#x} predecessor {pred:#x} is {'refused' if want else 'accepted'} (rule: research 40 s.5 write tuples)")
+    for old in (0, 0x200, 0x0FFFFFFF, 0x0FFFFFFF & ~0x200, 0x00020200, 0x10000000, 0x30020000, 0x80000000, 0xF0000200, 0xF0000000, 0xFFFFFFFF):	# SRPWR needs PowerDomain id [31:28] != 0 (review 16 finding 2)
+        for v in (old | 0x200, old, old & ~0x200 & 0xFFFFFFFF, 0x200, 0x10000200, 0xFFFFFFFF):
+            want = _memw_spec(0x18001000, 0x1E8, old, v, 0)
+            got = _a64_call(m[0], {0: 0x18001000, 1: 0x1E8, 2: old, 3: v, 4: 0}, name, "memw_ok") != 0
+            if got != want:
+                raise AssertionError(f"{name}: the compiled memw_ok SRPWR rule is wrong: old {old:#x} new {v:#x} is {'refused' if want else 'accepted'} (needs PowerDomain id [31:28] != 0)")
 
 
 def check_wlanlink_r32_object_text(blocks: list, name: str) -> None:
@@ -4540,7 +4551,10 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("memw_ok powerctl offset moved (0x1e8 -> 0x1ec)", disasm.replace(mwblk, re.sub(r"cmp\tw(\d+), #0x1e8\b", r"cmp\tw\1, #0x1ec", mwblk), 1)),
         ("memw_ok bankidx offset moved (0x10 -> 0x14)", disasm.replace(mwblk, re.sub(r"cmp\tw(\d+), #0x10\b", r"cmp\tw\1, #0x14", mwblk), 1)),
         ("memw_ok powerctl request bit changed (0x200 -> 0x400)", disasm.replace(mwblk, re.sub(r"orr\tw(\d+), w(\d+), #0x200\b", r"orr\tw\1, w\2, #0x400", mwblk), 1)),
-        ("memw_ok powerctl request on a dead read (ccmn #1 -> #2)", disasm.replace(mwblk, re.sub(r"ccmn\tw2, #0x1,", r"ccmn\tw2, #0x2,", mwblk), 1)),
+        # the compiler folded `old != 0xFFFFFFFF && (old & 0xF0000000) != 0` into `old + 0xF0000000 <u 0xEFFFFFFF` (refuse old = 0 and old = all ones): audit the behaviour by changing the constants (AP-16), the evaluator grid decides
+        ("memw_ok powerctl request on a dead read (all ones accepted)", disasm.replace(mwblk, re.sub(r"(mov\tw\d+, )#0xefffffff\b", r"\1#0xf0000000", mwblk), 1)),
+        ("memw_ok powerctl request without the PowerDomain id check (id 0 accepted)", disasm.replace(mwblk, re.sub(r"(mov\tw\d+, )#0xefffffff\b", r"\1#0xfffffffe", mwblk), 1)),
+        ("memw_ok powerctl PowerDomain id on another nibble", disasm.replace(mwblk, re.sub(r"(mov\tw\d+, )#0xf0000000\b", r"\1#0xe0000000", mwblk), 1)),
         ("memw_ok release without the IOCTL predecessor (mask 0x3fff -> 0x3ffe)", disasm.replace(mwblk, re.sub(r"and\tw(\d+), w(\d+), #0x3fff\b", r"and\tw\1, w\2, #0x3ffe", mwblk), 1)),
         ("memw_ok IOCTL mask widened (0x3fff -> 0xffff, the old value check)", disasm.replace(mwblk, re.sub(r"and\tw(\d+), w(\d+), #0x3fff\b", r"and\tw\1, w\2, #0xffff", mwblk), 1)),
         ("memw_ok IOCTL write without the reset asserted (tbnz -> tbz)", disasm.replace(mwblk, re.sub(r"\ttbnz\tw4, #0,", r"\ttbz\tw4, #0,", mwblk), 1)),

@@ -218,8 +218,8 @@ __attribute__((noipa)) static int memw_ok(uint32_t win, uint32_t off, uint32_t o
 {
 	uint32_t want;
 
-	if (win == 0x18001000u)		/* SRPWR domain 1 request: only bit 0x200 of powerctl, 0 -> 1, nothing else, not on a dead read */
-		return off == 0x1E8u && old != 0xFFFFFFFFu && v == (old | 0x200u);
+	if (win == 0x18001000u)		/* SRPWR domain 1 request: only bit 0x200 of powerctl (no-op if already set), nothing else, not on a dead read, only when PowerDomain id [31:28] != 0 (si_srpwr_cap; review 16 finding 2) */
+		return off == 0x1E8u && old != 0xFFFFFFFFu && (old & 0xF0000000u) != 0u && v == (old | 0x200u);
 	if (win == 0x18126000u || win == 0x18120000u) {
 		want = win == 0x18126000u ? 0x3u : 0x23u;
 		if (off == 0x800u)	/* pred = IOCTL: the assert is always fine, the release only after the IOCTL write of the sequence */
