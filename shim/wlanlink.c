@@ -23,7 +23,7 @@
 /* the new blocks: S26 ATU/CFG, S29 MEM: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
 _Static_assert(WLAN_ATU == WLAN_DBI + 0x300000u, "WLAN_ATU must be WLAN_DBI + 0x300000");
 _Static_assert(WLAN_CFG == 0x60FFE000UL, "WLAN_CFG must be the pcie_1 config window 0x60FFE000");
-_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; window 0x18000000: ChipCommon offsets 0/0xAC/0xFC/0x1E0 only; window 0x18105000 (S32): any dword below 0x1000)");
+_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; window 0x18000000: ChipCommon offsets 0/0xAC/0xFC/0x1E0 only; window 0x18105000 (S32): dwords below 0xE00)");
 
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N
@@ -199,10 +199,10 @@ __attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 		return 0;
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
-	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): 0x18000000 = ChipCommon (S30 chip id, research 36; S31 run A, research 37 s.9.1: eromptr 0xFC, clk_ctl_st 0x1E0, capabilities_ext 0xAC): these four offsets only; 0x18105000 = the EROM page (S32 run B, observed eromptr of run w3a-n31): any dword below 0x1000 (pa_of); any other window refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
+	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): 0x18000000 = ChipCommon (S30 chip id, research 36; S31 run A, research 37 s.9.1: eromptr 0xFC, clk_ctl_st 0x1E0, capabilities_ext 0xAC): these four offsets only; 0x18105000 = the EROM page (S32 run B, observed eromptr of run w3a-n31): the EROM dwords below 0xE00 = ER_REMAPCONTROL (aidmp.h, review 13 M1); any other window refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
 		uint32_t cr2 = 0, cmd = 0, win = 0, r1[4] = { 1, 1, 1, 1 };
 
-		if (!try_read32(WLAN_CFG + 0x80u, &win) || (win != 0x18105000u && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u))) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
+		if (!try_read32(WLAN_CFG + 0x80u, &win) || ((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u))) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
 			return 0;
 		/* review 10 L1: the window itself (RC-local reads, no TLP): type MEM, base, limit, target as programmed by S29 */
 		if (!try_read32(WLAN_ATU + 0x200u, &r1[0]) || !try_read32(WLAN_ATU + 0x208u, &r1[1]) || !try_read32(WLAN_ATU + 0x210u, &r1[2]) || !try_read32(WLAN_ATU + 0x214u, &r1[3]) ||

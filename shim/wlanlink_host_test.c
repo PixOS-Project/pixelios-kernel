@@ -71,6 +71,8 @@ static int never_l0, fault_l0_read;
 static uint64_t waited_at_en;
 static int never_pll, unreadable_blk, iso_set_ret, iso_clear_ret, write_fault_n, ignore_pa_set, win_ignore, win_latch;	/* win_ignore: a cfg 0x80 write of 0x18105000 is swallowed; win_latch: it latches 0x18101000 instead */
 static uintptr_t ignore_pa, fault_read_pa;
+static int fault_cfg80_once, clobber_win;	/* review 13 L3: once the 8 MEM reads of S30/S31 are done, the next cfg 0x80 read (the S32 precondition) faults / finds the window moved to 0x18001000 */
+static unsigned link_dead_after;	/* review 13 L3: after this many EROM reads every config read answers all ones (link down mid-dump); 0 = off */
 static uint64_t freq, tick, waited_us;
 static unsigned nsave;
 static char lines[1600][RAMLOG_LINE_MAX + 8];	/* S32 logs ~1030 R lines */
@@ -142,6 +144,10 @@ int try_read32(uintptr_t pa, uint32_t *v)
 
 	if (pa == fault_read_pa || blk_unreadable(pa))
 		return 0;
+	if (pa == WLAN_CFG + 0x80 && mem_reads >= 8u) {
+		if (fault_cfg80_once) { fault_cfg80_once = 0; return 0; }
+		if (clobber_win) { clobber_win = 0; cfgspace[0x80 / 4] = 0x18001000u; }
+	}
 	atu_reads += pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000;
 	cfg_dev_reads += pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000;
 	if (pa >= WLAN_MEM && pa < WLAN_MEM + 0x1000) {		/* fake BAR0: an unmapped window (not ready) = a bus abort model: unreadable */
@@ -180,6 +186,8 @@ int try_read32(uintptr_t pa, uint32_t *v)
 			return 0;
 		}
 		*v = cfgspace[(pa - WLAN_CFG) / 4];
+		if (link_dead_after && erom_reads >= link_dead_after)
+			*v = 0xFFFFFFFFu;
 		return 1;
 	}
 	if (pa == WLAN_PMU_ALIVE + 0x3EC4) { *v = iso1; return 1; }
@@ -286,7 +294,7 @@ static void world(void)
 	pll_after = 3; cdr_after = 2; oc_after = 4; pll_cnt = cdr_cnt = oc_cnt = l0_cnt = l0_polls = 0;
 	l0_after = 3; never_l0 = fault_l0_read = 0; waited_at_en = 0;
 	never_pll = unreadable_blk = iso_set_ret = iso_clear_ret = write_fault_n = ignore_pa_set = win_ignore = win_latch = 0;
-	erom_reads = 0;
+	erom_reads = 0; fault_cfg80_once = clobber_win = 0; link_dead_after = 0;
 	ignore_pa = fault_read_pa = 0;
 	freq = 24576000ull; tick = 1000; waited_us = 0; nsave = 0;
 	nl = nev = nwrites = 0;
@@ -1298,10 +1306,10 @@ int main(void)
 #endif
 
 #if WLAN_LINK_N >= 32
-	/* ---- S32 (research 37 s.9.1 run B): the ONE new write cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31), 1024 read-only EROM dwords, restore FIRST in the teardown on every stop path ---- */
+	/* ---- S32 (research 37 s.9.1 run B): the ONE new write cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31), 896 read-only EROM dwords (BAR0+0..0xDFC, below ER_REMAPCONTROL 0xE00), restore FIRST in the teardown on every stop path ---- */
 	{
 		static const uint32_t wv[] = { 0, 0x18000000u, 0x18001000u, 0x18101000u, 0x18105000u, 0x18105004u, 0x18106000u, 0x18104000u, 0x60000004u, 0xFFFFFFFFu };
-		unsigned n32 = 0, nw32 = 0, i_pre = 0, i_e = 0, i_w = 0, i_rb = 0, i_chk = 0, nd = 0, ncfgl = 0, dump[1024];
+		unsigned n32 = 0, nw32 = 0, i_pre = 0, i_e = 0, i_w = 0, i_rb = 0, i_chk = 0, nd = 0, ncfgl = 0, dump[896];
 		char b[96];
 
 		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
@@ -1311,19 +1319,19 @@ int main(void)
 					EXPECT(r.kind == WLK_MMIO_WRITE && r.blk == WLB_CFG && r.off == 0x80u && r.mask == FULL_MASK_T && r.val == 0x18105000u && !nw32);	/* exactly ONE write row in S32 */
 					nw32++; i_w = i;
 				} else if (r.blk == WLB_MEM && r.kind == WLK_READ_ONLY) {
-					EXPECT(r.a == 2u && nd < 1024u && r.off == 4u * nd);			/* logged, ascending, 4-byte stride, never a probe, below 0x1000 */
+					EXPECT(r.a == 2u && nd < 896u && r.off == 4u * nd);			/* logged, ascending, 4-byte stride, never a probe, below 0xE00 */
 					dump[nd++] = i;
 				} else if (r.blk == WLB_MEM) {
 					EXPECT(r.kind == WLK_WAIT_EQ && r.b == 1u && r.a == 0u);
 					if (r.off == 0xFCu) { EXPECT(r.mask == FULL_MASK_T && r.val == 0x18105000u && !i_e); i_e = i; }
-					else { EXPECT(r.off == 0u && r.mask == 0x6u && r.val == 0u && nd == 1u && !i_chk); i_chk = i; }
+					else { EXPECT(r.off == 0u && r.mask == 0xFu && r.val == 0x1u && nd == 1u && !i_chk); i_chk = i; }
 				} else {
 					EXPECT(r.blk == WLB_CFG && r.off != 0x04u);
 					if (r.kind == WLK_READ_ONLY) { EXPECT(r.a == 2u && (r.off == 0xBC || r.off == 0x104)); ncfgl++; }
 					else { EXPECT(r.kind == WLK_WAIT_EQ && r.off == 0x80u && r.mask == FULL_MASK_T && r.b == 1u && r.a == 0u); if (r.val == 0x18000000u) i_pre = i; else { EXPECT(r.val == 0x18105000u); i_rb = i; } }
 				}
 			}
-		EXPECT(n32 == 1031u && nw32 == 1u && nd == 1024u && ncfgl == 2u && i_pre && i_e > i_pre && i_w > i_e && i_rb > i_w && dump[0] > i_rb && i_chk == dump[0] + 1u);
+		EXPECT(n32 == 903u && nw32 == 1u && nd == 896u && ncfgl == 2u && i_pre && i_e > i_pre && i_w > i_e && i_rb > i_w && dump[0] > i_rb && i_chk == dump[0] + 1u);
 		{	/* the teardown rows of S32: the window restore + its read-back FIRST, and no other row requires S32 */
 			unsigned nt = 0;
 
@@ -1348,7 +1356,7 @@ int main(void)
 							EXPECT(w32_allowed(WLAN_CFG + 0x80, FULL_MASK_T, old, v, &c) == want);
 							EXPECT(!w32_allowed(WLAN_CFG + 0x80, 0xFFFFu, old, (old & 0xFFFF0000u) | (v & 0xFFFFu), &c) || ((old ^ ((old & 0xFFFF0000u) | (v & 0xFFFFu))) & 0xFFFFu) == 0u);	/* a partial mask is never a window write */
 						}
-		/* r32: the live window decides which BAR0 offsets may be read (0x18000000: the four ChipCommon words; 0x18105000: any dword below 0x1000; anything else: no TLP) */
+		/* r32: the live window decides which BAR0 offsets may be read (0x18000000: the four ChipCommon words; 0x18105000: any dword below 0xE00 = ER_REMAPCONTROL; anything else: no TLP) */
 		{
 			uint32_t v = 0;
 
@@ -1361,7 +1369,7 @@ int main(void)
 				cfgspace[0x80 / 4] = wv[wi];
 				for (uint32_t o = 0; o <= 0x1004u; o += 4) {
 					int narrow = o == 0u || o == 0xACu || o == 0xFCu || o == 0x1E0u;
-					int want = (wv[wi] == 0x18000000u && narrow) || (wv[wi] == 0x18105000u && o < 0x1000u);
+					int want = (wv[wi] == 0x18000000u && narrow) || (wv[wi] == 0x18105000u && o < 0xE00u);
 
 					EXPECT(r32(WLB_MEM, o, &v) == want);
 					before += (unsigned)want;
@@ -1372,17 +1380,19 @@ int main(void)
 			cfgspace[0x80 / 4] = 0x18105000u; fault_read_pa = WLAN_CFG + 0x80;
 			EXPECT(!r32(WLB_MEM, 0, &v) && !r32(WLB_MEM, 0x400, &v));			/* an unreadable window select is "not ready" */
 			fault_read_pa = 0;
+			cfgspace[0x80 / 4] = 0x18105000u; unsigned before = mem_reads;
+			EXPECT(r32(WLB_MEM, 0xDFC, &v) && !r32(WLB_MEM, 0xE00, &v) && !r32(WLB_MEM, 0xFFC, &v) && mem_reads == before + 1u);	/* review 13 M1: the last EROM dword, then nothing from ER_REMAPCONTROL on */
 			EXPECT(nwrites == 0);
 		}
 		/* happy path */
 		world();
-		EXPECT(wlan_link_run() == 0 && has("LINK S32 ok rows=1031") && has("LINK summary reached=S32 stopped=none restore=ok") && !has("!!!") && cfg_writes_unconfigured == 0 && master_writes == 0);
-		EXPECT(mem_reads == 3u + 5u + 1u + 1024u + 1u && mem_reads_unready == 0 && erom_reads == 1025u && last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0);	/* S30 3, S31 5, eromptr pin 1, 1024 dwords, the first-dword check */
-		for (unsigned k = 0; k < 1024u; k += (k < 8 ? 1u : 255u)) {
+		EXPECT(wlan_link_run() == 0 && has("LINK S32 ok rows=903") && has("LINK summary reached=S32 stopped=none restore=ok") && !has("!!!") && cfg_writes_unconfigured == 0 && master_writes == 0);
+		EXPECT(mem_reads == 3u + 5u + 1u + 896u + 1u && mem_reads_unready == 0 && erom_reads == 897u && last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0);	/* S30 3, S31 5, eromptr pin 1, 896 dwords, the first-dword check */
+		for (unsigned k = 0; k < 896u; k += (k < 8 ? 1u : 255u)) {
 			snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[k], (unsigned)erom_dw(k));
 			EXPECT(has(b));
 		}
-		snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[1023], (unsigned)erom_dw(1023)); EXPECT(has(b));
+		snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[895], (unsigned)erom_dw(895)); EXPECT(has(b));
 		{	/* the window writes, in order: S29 select, the move, the S32 restore, the S29 teardown restore; nothing else touches cfg 0x80 */
 			uint32_t wseq[8];
 			unsigned nwin = 0;
@@ -1433,15 +1443,25 @@ int main(void)
 		}
 		teardown_tail_is_table_order(32);
 		baseline_restored();
-		for (uint32_t fo = 0x4u; fo <= 0xFFCu; fo += (fo < 0x20u ? 4u : 0x3F8u)) {		/* a read fault anywhere in the dump: stop at that row, the window is restored */
+		for (uint32_t fo = 0x4u; fo <= 0xDFCu; fo += (fo < 0x20u ? 4u : 0x3F8u)) {		/* a read fault anywhere in the dump: stop at that row, the window is restored */
 			world(); fault_read_pa = WLAN_MEM + fo;
 			snprintf(b, sizeof b, "LINK S32 fault row=%u", dump[fo / 4]);
 			EXPECT(wlan_link_run() == 1 && has(b) && has("restore=ok") && !has("!!!") && erom_reads == 1u + 1u + fo / 4u - 1u + 0u + 0u + 0u && wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u));
 			teardown_tail_is_table_order(32);
 			baseline_restored();
 		}
-		world(); fault_read_pa = WLAN_CFG + 0x80;						/* the window select unreadable: the S32 precondition faults, nothing is moved */
-		EXPECT(wlan_link_run() == 1 && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u));
+		world(); fault_cfg80_once = 1;								/* review 13 L3: the S32 precondition read of cfg 0x80 faults (armed after the S30/S31 MEM reads): stop at S32, the window is never moved */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S32") && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u) && erom_reads == 0 && mem_reads == 8 && has("restore=ok") && !has("!!!") && !has("LINK S32 ok"));
+		teardown_tail_is_table_order(32);
+		baseline_restored();
+		world(); clobber_win = 1;								/* review 13 L3: the window was moved away (0x18001000) before the S32 precondition: refused, nothing moved, restore ok */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S32") && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u) && erom_reads == 0 && mem_reads == 8 && has("restore=ok") && !has("!!!"));
+		teardown_tail_is_table_order(32);
+		baseline_restored();
+		world(); link_dead_after = 100u;							/* review 13 L3: the link drops mid-dump (config reads answer all ones): the dump stops at the next dword (fault), the S32 restore is refused from the unknown window (loud), the final restore still writes 0x18001000 */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S32") && erom_reads == 100u && !has("LINK S32 ok") && has("restore=FAILED") && has("!!! RESTORE FAILED") && wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18001000u) && cfgspace[0x80 / 4] == 0x18001000u);
+		world(); fault_read_pa = WLAN_CFG + 0x80;						/* the window select unreadable from the start: S27 stops, S32 never starts, nothing is moved */
+		EXPECT(wlan_link_run() == 1 && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u) && !has("LINK S32 start"));
 		world(); unreadable_blk = 7;
 		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S30") && erom_reads == 0);
 		baseline_restored();

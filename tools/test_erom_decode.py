@@ -89,9 +89,9 @@ class EromDecode(unittest.TestCase):
     def test_log_mapping_uses_the_table_row_ids(self):
         rows = json.loads(TABLE.read_text())["rows"]
         dump = [r for r in rows if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only" and r.get("log")]
-        self.assertEqual([r["off"] for r in dump], [4 * i for i in range(1024)])
+        self.assertEqual([r["off"] for r in dump], [4 * i for i in range(896)])
         eromdw = synthetic()
-        full = eromdw + [0] * (1024 - len(eromdw))
+        full = eromdw + [0] * (896 - len(eromdw))
         text = "noise\n" + "\n".join(f"[ 1.0] WLAN: LINK R32 row={r['id']} rd=0x{full[i]:08X}" for i, r in enumerate(dump)) + "\nLINK R31 row=5 rd=0xDEADBEEF\nLINK R32 row=1 rd=0x00000000\n"
         dw, missing = ed.dwords_from_log(text, rows)
         self.assertEqual((dw, missing), (full, []))
@@ -102,6 +102,50 @@ class EromDecode(unittest.TestCase):
         dw, missing = ed.dwords_from_log(lost, rows)
         self.assertEqual((len(dw), missing[0]), (10, 10))
 
+    def _dump_log(self, skip=(), sha="auto"):
+        doc = json.loads(TABLE.read_text())
+        dump = [r for r in doc["rows"] if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only" and r.get("log")]
+        full = synthetic() + [0] * (896 - len(synthetic()))
+        lines = [f"LINK R32 row={r['id']} rd=0x{full[i]:08X}" for i, r in enumerate(dump) if i not in skip]
+        if sha == "auto":
+            sha = doc["table_sha256"][:16]
+        return ([f"LINK table sha={sha} rows=1318 N=32"] if sha else []) + lines
+
+    def _run(self, lines, *args):
+        import io
+        import contextlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "usb.txt").write_text("\n".join(lines))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = ed.main([d, "--table", str(TABLE), *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_require_dump_fails_on_any_missing_dword_even_after_eot(self):
+        # review 13 M2: the synthetic EROM ends with an EOT at dword ~27; losing a dword far behind it must still FAIL with --require-dump (and only then)
+        for skip in ({0}, {5}, {500}, {895}):
+            rc, out, err = self._run(self._dump_log(skip), "--require-dump")
+            self.assertEqual(rc, 1, skip)
+            self.assertIn("RESULT: FAIL 1 dwords missing", out)
+        rc, out, _ = self._run(self._dump_log({500}))		# without the flag the decode up to the EOT is still usable
+        self.assertEqual(rc, 1)
+        self.assertIn("1 dwords missing", out)
+        rc, out, _ = self._run(self._dump_log(), "--require-dump")
+        self.assertEqual(rc, 0)
+        self.assertIn("RESULT: PASS 5 components", out)
+
+    def test_table_sha_check(self):
+        rc, out, err = self._run(self._dump_log(sha="0123456789abcdef"))
+        self.assertEqual(rc, 2)
+        self.assertIn("RESULT: ERROR table sha mismatch", err)
+        self.assertEqual(out, "")
+        rc, out, err = self._run(self._dump_log(sha=None), "--require-dump")		# no sha line: decoded, with a notice
+        self.assertEqual(rc, 0)
+        self.assertIn("no `LINK table sha=` line", err)
+        mixed = self._dump_log() + ["LINK table sha=0123456789abcdef rows=1 N=7"]	# a second, different table in the same capture
+        self.assertEqual(self._run(mixed)[0], 2)
+
     def test_cli_exit_codes(self):
         import io
         import contextlib
@@ -109,7 +153,7 @@ class EromDecode(unittest.TestCase):
         rows = json.loads(TABLE.read_text())["rows"]
         dump = [r for r in rows if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only" and r.get("log")]
         eromdw = synthetic()
-        full = eromdw + [0] * (1024 - len(eromdw))
+        full = eromdw + [0] * (896 - len(eromdw))
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d) / "usb.txt"
             p.write_text("\n".join(f"LINK R32 row={r['id']} rd=0x{full[i]:08X}" for i, r in enumerate(dump)))

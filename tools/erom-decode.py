@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decode the BCM4389 EROM dump of `--wlan-link=32` (docs/research/37 s.9.1 run B) into a core list.
 
-Usage: tools/erom-decode.py LOG_OR_DIR [--table soc/google/gs101/wlan_seq.json] [--json]
+Usage: tools/erom-decode.py LOG_OR_DIR [--table soc/google/gs101/wlan_seq.json] [--json] [--require-dump]
        tools/erom-decode.py --dwords FILE            (FILE: one hex dword per line / whitespace separated, EROM order)
 
 Input: the `LINK R32 row=<id> rd=0x<8 hex>` lines of the run (a file, or a directory searched recursively, e.g. a tools/xrun log dir). The row id is mapped to the EROM dword index through the table
@@ -13,7 +13,10 @@ Format source (read from source, NOT invented): mainline Linux brcmfmac v6.12 `b
   size type 5:4 (0 4K, 1 8K, 2 16K, 3 = a size descriptor follows)) and the walk :812-960 (brcmf_chip_dmp_get_desc / _get_regaddr / _erom_scan). The same hardware format is walked by Broadcom DHD
   aiutils.c:ai_scan (docs/research/37 s.1.3). Core ids: bcma.h:97-159 (wlan-stage3). The base/wrapper choice is brcmfmac's (first 4K/8K slave-kind address = base; first master-wrapper kind if the core
   has a master port descriptor right after its CIB, else slave-wrapper kind = wrapper); `kept` = brcmfmac keeps the core (nmw + nsw != 0, or PMU / GCI).
-Exit code 0 = decoded to EOT, 1 = truncated / gap / malformed, 2 = usage / no data."""
+--require-dump (review 13 M2, the capture-safety check of a hardware run): FAIL (exit 1, `RESULT: FAIL ...`) if ANY dword of the dump span (every logged S32 MEM row of the table, offsets 0..0xDFC)
+is missing from the log, even after an EOT: the 32 KiB ramlog evicts the head of the dump, so only the live USB stream is complete and a run counts only when this passes.
+The log's `LINK table sha=<16 hex>` line (printed at the start of every run) must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2; review 13 L1); a log without that line is decoded with a notice.
+Exit code 0 = decoded to EOT, 1 = truncated / gap / malformed / (--require-dump) a dump dword missing, 2 = usage / no data / table sha mismatch."""
 import argparse
 import json
 import os
@@ -24,6 +27,7 @@ DESC_MSK, D_COMPONENT, D_MASTER, D_ADDRESS, D_GT32, D_EOT = 0xF, 0x1, 0x3, 0x5, 
 CORE_NAMES = {0x800: "ChipCommon", 0x80E: "INTERNAL_MEM", 0x812: "80211 (D11)", 0x827: "PMU", 0x82A: "ARM_CM3", 0x83C: "PCIE2", 0x83E: "ARM_CR4", 0x840: "GCI", 0x847: "ARM_CA7", 0x849: "SYS_MEM"}
 KIND = ("slave", "bridge", "slave-wrapper", "master-wrapper")
 SIZE = {0: 0x1000, 1: 0x2000, 2: 0x4000}
+SHA_RE = re.compile(r"LINK table sha=([0-9a-f]{16})")
 R32_RE = re.compile(r"LINK R32 row=(\d+) rd=0x([0-9A-Fa-f]{8})")
 
 
@@ -143,6 +147,16 @@ def dwords_from_log(text, table_rows):
     return [got[i] for i in range(n)], sorted(set(idx.values()) - set(got))
 
 
+def check_table_sha(text, table_sha):
+    """Returns (ok, msg): every `LINK table sha=` line of the log must equal table_sha[:16]; None (no line) is ok with a notice (older logs / a lost line)."""
+    found = sorted(set(SHA_RE.findall(text)))
+    if not found:
+        return True, "notice: no `LINK table sha=` line in the log, row ids not checked against the table version"
+    if found != [table_sha[:16]]:
+        return False, f"table sha mismatch: log {','.join(found)}, table {table_sha[:16]} (the row ids of another table version map to the wrong EROM offsets)"
+    return True, None
+
+
 def read_text(path):
     if os.path.isdir(path):
         out = []
@@ -173,6 +187,7 @@ def main(argv=None):
     ap.add_argument("--table", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "soc/google/gs101/wlan_seq.json"))
     ap.add_argument("--dwords", help="a file of hex dwords instead of a log")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--require-dump", action="store_true", help="exit 1 (RESULT: FAIL) unless every dword of the dump span is in the log (review 13 M2)")
     a = ap.parse_args(argv)
     notes = []
     if a.dwords:
@@ -181,8 +196,18 @@ def main(argv=None):
     elif a.log:
         text = read_text(a.log)
         with open(a.table) as fh:
-            rows = json.load(fh)["rows"]
+            tdoc = json.load(fh)
+        rows = tdoc["rows"]
+        ok_sha, msg = check_table_sha(text, tdoc["table_sha256"])
+        if not ok_sha:
+            print(f"RESULT: ERROR {msg}", file=sys.stderr)
+            return 2
+        if msg:
+            print(msg, file=sys.stderr)
         dw, missing = dwords_from_log(text, rows)
+        if a.require_dump and missing:
+            print(f"RESULT: FAIL {len(missing)} dwords missing from the dump span (first missing index {missing[0]}, {len(dw)} contiguous from 0): the run does not count; re-run")
+            return 1
         if missing and dw:
             notes.append(f"{len(missing)} dwords missing from the log (first missing index {missing[0]}): decoded the {len(dw)} dwords before the gap")
     else:
