@@ -596,7 +596,7 @@ new file mode 100644
 +			sd_one(&e, restore, buf);
 +		}
 +	}
-+	if (sd_nw) {                                        /* make the renames durable before launchd starts */
++	if (sd_nw || sd_nr) {                                      /* make the renames durable before launchd starts */
 +		int se = VFS_SYNC(vnode_mount(rootvnode), MNT_WAIT, sd_ctx);
 +		if (se) {
 +			printf("SWEET DEV: sync error %d\n", se);
