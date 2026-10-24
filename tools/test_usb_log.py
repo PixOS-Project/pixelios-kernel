@@ -145,6 +145,19 @@ class TailTests(UsbLogTest):
         usb_log.capture(str(node), os.ttyname(slave), str(out), io.BytesIO(), poll=0.05)
         self.assertEqual(out.read_bytes(), payload)
 
+    def test_times_sidecar_has_one_row_per_line(self):
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        node = self.tmp / "node"
+        node.write_text("x")
+        os.write(master, b"one\ntwo\nthree\n")
+        node.unlink()
+        out = self.tmp / "t.txt"
+        usb_log.capture(str(node), os.ttyname(slave), str(out), io.BytesIO(), poll=0.05)
+        rows = (self.tmp / "t.times").read_text().split("\n")[:-1]
+        self.assertEqual([r.split()[1] for r in rows], ["4", "8", "14"])  # byte offsets of the line ends
+
     def test_sigterm_keeps_the_last_partial_line(self):
         make_gadget(self.sysfs)
         master, slave = os.openpty()

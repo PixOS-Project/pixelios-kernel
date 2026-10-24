@@ -125,7 +125,8 @@ def default_out_path(now=None):
 
 
 class LineTee:
-    def __init__(self, out_file, out_stream):
+    def __init__(self, out_file, out_stream, times_file=None):
+        self.times_file = times_file  # Wi-Fi agent, review 14 M1(d): "<monotonic s> <byte offset of the line end>" per line, next to the log as NAME.times
         self.out_file = out_file
         self.out_stream = out_stream
         self.pending = bytearray()
@@ -152,6 +153,9 @@ class LineTee:
         self.out_stream.write(line)
         self.out_stream.flush()
         self.count += len(line)
+        if self.times_file:
+            self.times_file.write(f"{time.monotonic():.3f} {self.count}\n".encode())
+            self.times_file.flush()
 
 
 def drain(fd, tee, quiet=0.3):
@@ -174,8 +178,8 @@ def capture(node, tty_path, out_path, out_stream, poll=DEFAULT_POLL):
     fd = os.open(tty_path, os.O_RDONLY | os.O_NOCTTY)
     try:
         setup_tty(fd)
-        with open(out_path, "wb") as out_file:
-            tee = LineTee(out_file, out_stream)
+        with open(out_path, "wb") as out_file, open(os.path.splitext(out_path)[0] + ".times", "wb") as times_file:
+            tee = LineTee(out_file, out_stream, times_file)
             try:
                 while True:
                     readable, _, _ = select.select([fd], [], [], poll)
