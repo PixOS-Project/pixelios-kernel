@@ -82,6 +82,27 @@ class T(unittest.TestCase):
         self.assertEqual(x.returncode, 0, x.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.r, "patches/0002-mine.patch")))
 
+    def test_committed_local_change_is_not_overwritten(self):
+        # review 16 H3: a branch that COMMITTED its own change to a common file must not lose it to a pull
+        self.w("tools/b", "B-LOCAL\n"); self.git("commit", "-qam", "local b")
+        x = self.ts("pull")
+        self.assertEqual(x.returncode, 1, x.stdout)
+        self.assertEqual(open(os.path.join(self.r, "tools/b")).read(), "B-LOCAL\n")
+        self.assertEqual(open(os.path.join(self.r, "tools/a")).read(), "A2\n")  # the file only the ref changed IS pulled
+        self.assertEqual(self.ts("pull", "--force").returncode, 0)
+
+    def test_pull_refused_while_a_build_holds_the_shim_out_lock(self):
+        os.makedirs(os.path.join(self.r, "shim/out"))
+        lk = open(os.path.join(self.r, "shim/out/.build.lock"), "w")
+        import fcntl
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            x = self.ts("pull")
+            self.assertEqual(x.returncode, 1)
+            self.assertIn("shim/out/.build.lock", x.stdout)
+        finally:
+            lk.close()
+
     def test_missing_file_and_missing_ref(self):
         os.remove(os.path.join(self.r, "tools/b"))
         self.assertIn("missing    tools/b", self.ts("status").stdout)

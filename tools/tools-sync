@@ -57,7 +57,22 @@ def lock_held():
     lock = os.path.join(ROOT, "tools", "phone-lock")
     if not os.path.exists(lock):
         return False
-    return subprocess.run([sys.executable, lock, "status"], capture_output=True).returncode == 1
+    return subprocess.run([sys.executable, lock, "status"], capture_output=True).returncode != 0  # held (1) or unreadable (2): do not touch the tools
+
+
+def build_busy():
+    """a gate, xrun or probe-run build of THIS worktree holds shim/out/.build.lock (a pull would give that run mixed tool versions)"""
+    lk = os.path.join(ROOT, "shim", "out", ".build.lock")
+    return os.path.exists(lk) and subprocess.run(["flock", "-n", lk, "true"], capture_output=True).returncode != 0
+
+
+def local_commits(ref, f):
+    """True if THIS branch changed f since it forked from REF (a pull would silently drop that work)"""
+    base = git("merge-base", "HEAD", ref).stdout.strip()
+    if not base:
+        return False
+    here, there = git("rev-parse", "HEAD:" + f).stdout.strip(), git("rev-parse", "%s:%s" % (base, f)).stdout.strip()
+    return bool(here) and here != there
 
 
 def dirty(path):
@@ -93,7 +108,10 @@ def main():
     if lock_held() and not a.force:
         print("RESULT: FAIL the phone lock is held (a run may be using these tools); wait, or --force")
         return 1
-    blocked = []
+    if build_busy() and not a.force:
+        print("RESULT: FAIL a gate or build holds shim/out/.build.lock in this worktree (it would see mixed tool versions); wait, or --force")
+        return 1
+    blocked, pull = [], []
     for f in drift:
         if st[f] == "only-here":
             if a.prune and (a.force or not dirty(f)):
@@ -108,12 +126,19 @@ def main():
         elif st[f] == "differs" and dirty(f) and not a.force:
             print("blocked    %s (uncommitted local changes; commit or --force)" % f)
             blocked.append(f)
+        elif st[f] == "differs" and local_commits(a.ref, f) and not a.force:
+            print("blocked    %s (this branch committed changes to it since the fork; upstream them to %s first, or --force):" % (f, a.ref))
+            print("           " + git("log", "--oneline", "-3", "%s..HEAD" % git("merge-base", "HEAD", a.ref).stdout.strip(), "--", f).stdout.strip().replace("\n", "\n           "))
+            blocked.append(f)
         else:
-            r = git("checkout", a.ref, "--", f)
-            if r.returncode:
-                print("ERROR      %s: %s" % (f, r.stderr.strip()))
-                blocked.append(f)
-            else:
+            pull.append(f)
+    if pull:  # one checkout for all, so an error cannot leave a half-updated set
+        r = git("checkout", a.ref, "--", *pull)
+        if r.returncode:
+            print("ERROR      nothing pulled: %s" % r.stderr.strip())
+            blocked += pull
+        else:
+            for f in pull:
                 print("pulled     %s" % f)
     print("RESULT: %s" % ("PASS pulled %d file(s) from %s; review and commit them" % (len(drift), a.ref) if not blocked else
                           "FAIL %d of %d pulled, %d blocked" % (len(drift) - len(blocked), len(drift), len(blocked))))

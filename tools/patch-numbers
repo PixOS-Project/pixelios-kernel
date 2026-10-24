@@ -46,6 +46,8 @@ def reservations():
     r = git("for-each-ref", "--format=%(refname) %(objectname)", PREFIX)
     for ln in r.stdout.splitlines():
         ref, sha = ln.split()
+        if not re.fullmatch(r"\d{4,}", ref[len(PREFIX):]):
+            continue  # a stray ref must not break every commit
         body = git("cat-file", "-p", sha).stdout.strip().splitlines()
         out[int(ref[len(PREFIX):])] = {"owner": body[0] if body else "?", "name": body[1] if len(body) > 1 else "?", "date": body[2] if len(body) > 2 else ""}
     return out
@@ -67,7 +69,7 @@ def conflicts(used, res):
         if n in res:
             slug = res[n]["name"]
             for k in names:
-                if slug not in ("?", "") and slug not in k:
+                if slug not in ("?", "") and PAT.match(k) and PAT.match(k).group(2) != slug:
                     bad.append("%04d reserved by %s as '%s' but committed as %s" % (n, res[n]["owner"], slug, k))
     return bad
 
@@ -120,7 +122,7 @@ def cmd_check():
         others = {k: v for k, v in used.get(n, {}).items() if k != name}
         if others:
             bad.append("%04d is %s here but %s elsewhere" % (n, name, "; ".join("%s on %s" % (k, ",".join(v)) for k, v in others.items())))
-        if n in res and res[n]["name"] not in ("?", "") and res[n]["name"] not in name:
+        if n in res and res[n]["name"] not in ("?", "") and PAT.match(name) and PAT.match(name).group(2) != res[n]["name"]:
             bad.append("%04d is reserved by %s as '%s'" % (n, res[n]["owner"], res[n]["name"]))
     for b in bad:
         print("CONFLICT " + b)
@@ -131,7 +133,7 @@ def cmd_check():
 def cmd_claim(num, owner, name):
     n = int(num)
     used = survey()
-    if n in used and any(not name or name not in k for k in used[n]):
+    if n in used and any(not name or not PAT.match(k) or PAT.match(k).group(2) != name for k in used[n]):
         print("RESULT: FAIL %04d is committed on a branch as %s" % (n, "; ".join(used[n])))
         return 1
     body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
@@ -146,30 +148,42 @@ def cmd_claim(num, owner, name):
 
 
 def cmd_precommit():
-    r = git("diff", "--cached", "--name-only", "--diff-filter=A")
-    added = [os.path.basename(x) for x in r.stdout.splitlines() if x.startswith("xnu/patches/") and PAT.match(os.path.basename(x))]
+    """0 ok, 3 refusal (the hook turns only 3 into a blocked commit), anything else = internal error (the hook lets the commit through with a message)"""
+    names = lambda flt: git("diff", "--cached", "--name-only", "--no-renames", "--diff-filter=" + flt).stdout.splitlines()  # noqa: E731
+    mine = lambda lst: [os.path.basename(x) for x in lst if x.startswith("xnu/patches/") and PAT.match(os.path.basename(x))]  # noqa: E731
+    added, deleted = mine(names("A")), set(mine(names("D")))
     if not added:
         return 0
+    cur = git("symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
     used, res = survey(), reservations()
     bad = []
     for f in added:
-        n = int(PAT.match(f).group(1))
-        others = {k: v for k, v in used.get(n, {}).items() if k != f}
+        m = PAT.match(f)
+        n, slug = int(m.group(1)), m.group(2)
+        # a name this very commit deletes on the committing branch is not "elsewhere" (fixing your own slug)
+        others = {k: v for k, v in used.get(n, {}).items() if k != f and not (k in deleted and set(v) <= {cur, "HEAD"})}
         if others:
             bad.append("%04d: %s is staged here, but %s on %s" % (n, f, "; ".join(others), ",".join(sum(others.values(), []))))
-        elif n in res and res[n]["name"] not in ("?", "") and res[n]["name"] not in f:
+        elif n in res and res[n]["name"] not in ("?", "") and res[n]["name"] != slug:
             bad.append("%04d: %s is staged here, but the number is reserved by %s as '%s'" % (n, f, res[n]["owner"], res[n]["name"]))
     if bad:
         print("patch-numbers: commit refused, overlapping xnu patch number(s):")
-        for b in bad:
-            print("  " + b)
+        for x in bad:
+            print("  " + x)
         print("  take a free number with `tools/patch-numbers next --owner NAME --name SLUG` (status shows who holds what), rename the patch, `git add` again")
-        return 1
+        return 3
     for f in added:  # clean: make the number visible to every worktree now
-        n = int(PAT.match(f).group(1))
-        if n not in res:
-            body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", PAT.match(f).group(2), datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
-            git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip(), "0" * 40)
+        m = PAT.match(f)
+        n = int(m.group(1))
+        if n in res:
+            continue
+        body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", m.group(2), datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+        r = git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip(), "0" * 40)
+        if r.returncode:  # somebody reserved it between our read and now: refuse if for a different slug
+            cur_r = reservations().get(n, {})
+            if cur_r.get("name") not in ("?", "", m.group(2), None):
+                print("patch-numbers: %04d was just reserved by %s as '%s'; take another number" % (n, cur_r.get("owner", "?"), cur_r["name"]))
+                return 3
     return 0
 
 
@@ -177,7 +191,12 @@ HOOK = """#!/bin/sh
 # installed by tools/patch-numbers install-hook (TP-022): xnu patch numbers must not overlap across worktrees
 T=~/.t3/worktrees/common-tools/kernel/tools/patch-numbers
 [ -f "$T" ] || exit 0
-exec python3 "$T" precommit
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "$T" precommit
+rc=$?
+[ $rc = 3 ] && exit 1
+[ $rc = 0 ] || echo "patch-numbers: internal error (rc=$rc), patch numbers NOT checked for this commit" >&2
+exit 0
 """
 
 

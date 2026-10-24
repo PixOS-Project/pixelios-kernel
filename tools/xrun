@@ -27,7 +27,7 @@ lockwait=0; remote=""; nocam=0; dry=0; fromdir=""; exps=(); abs=(); stops=(); ea
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
 	--qr) qr=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) args=$2; shift 2 ;; --duration) duration=$2; shift 2 ;;
-	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; shift 2 ;; --remote-reset) remote=1; shift ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
+	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --remote-reset) remote=1; shift ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
 	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
 	--dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;;
 	*) echo "unknown option $1 (see the header of tools/xrun)" >&2; exit 2 ;; esac; done
@@ -56,13 +56,14 @@ $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$res
 if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
 # shim/out is shared with gates and other builds of this worktree: build under its lock and boot a PRIVATE copy of the image (a gate rebuilding shim/out between build and boot made fboot refuse, 2026-10-24)
 mkdir -p shim/out
-( flock -x -w 3600 9 || { echo "shim/out busy for 3600 s" >&2; exit 98; }
-  tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails $handover "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" &&
+fw=3600; tools/phone-lock check >/dev/null 2>&1 && fw=60   # under `phone-lock run` the phone is already ours: do not hold it for an hour behind a gate
+( flock -x -w $fw 9 || { echo "shim/out busy: a gate or build in this worktree holds shim/out/.build.lock" >&2; exit 98; }
+  tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails $handover "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" 9>&- &&
   cp shim/out/shim-boot-avb.img "$D/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img.meta.json" ) 9>shim/out/.build.lock \
 	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
 [ -z "$usbnet" ] || $R mark "$D" usbnet=1
 $R mark "$D" boot_args="$(sed -n 's/^boot-args: //p' "$D/build.out")"
-cp shim/out/shim-boot-avb.img.meta.json "$D/image.meta.json" 2>/dev/null || true
+cp "$D/shim-boot-avb.img.meta.json" "$D/image.meta.json" 2>/dev/null || true
 
 # the image is ready: only now take the phone (builds and gates never hold the lock)
 plock_take xrun "$lockwait" || die "phone lock busy: $PLOCK_MSG"
@@ -93,6 +94,7 @@ if [ -n "$usbnet" ]; then
 fi
 $R mark "$D" t_boot=@now
 tools/fboot.sh --expect xnu --max-age-min $(( lockwait / 60 + 30 )) "$D/shim-boot-avb.img" >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
+rm -f "$D/shim-boot-avb.img"   # 64 MiB per run; the meta stays
 tb=$(date +%s)
 echo "booted; waiting up to ${duration}s" >>"$LOG"
 how=$($R waitusb "$D" || true)
@@ -110,7 +112,7 @@ EARLY) # every stop pattern seen: recover the phone if it can be reached, else s
 	el=$(( $(date +%s) - tb )); left=$(( ${secs:-0} - el ))
 	if { [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; } && timeout 120 tools/to-fastboot.sh 90 >>"$LOG" 2>&1; then
 		$R mark "$D" phone="back in fastboot (stopped early${remote:+, software reset over the USB link})"
-	elif [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="reachable but to-fastboot failed (see xrun.log); Power+VolDown hold"
+	elif [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="to-fastboot failed${remote:+ after the software reset request} (see xrun.log); check tools/phone-state before a Power+VolDown hold"
 	else $R mark "$D" phone="still running; self-reset due in ~$(( left > 0 ? left : 0 ))s / Power+VolDown hold"; fi ;;
 TIMEOUT) $R mark "$D" phone="$(probe)" ;;
 esac

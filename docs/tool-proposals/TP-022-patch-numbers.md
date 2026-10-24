@@ -26,3 +26,4 @@ No device. Writes only `refs/patch-numbers/*` in the shared git repo (and a blob
 ## amendments
 (none)
 - 2026-10-24 Claude Sonnet 5.5: user asked for enforcement: added `tools/patch-guard` (Claude PreToolUse hook, denies a new patch under an unreserved number), `claim`, `precommit` and `install-hook` (git pre-commit hook shared by all worktrees); the shared patch directory idea was tried and backed out (every build would contain everyone's patches).
+- 2026-10-24 Claude Sonnet 5.5: Opus review 16 (docs/reviews/16-shared-tooling-hooks-and-locks.md, SAFE WITH CONDITIONS) applied: fail-open hooks, patch-guard repo-of-the-path + cd chain + heredoc/word fixes, pre-commit exit 3 only on overlap, --no-renames, own-slug fix allowed, junk refs skipped, slug equality; tools-sync three-way + build-lock + one checkout; shim/out lock fd closed for children.

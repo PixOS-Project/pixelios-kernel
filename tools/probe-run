@@ -57,7 +57,7 @@ main() {
 		--build-args) [ $# -ge 2 ] || usage; read -ra extra <<<"$2"; args+=("${extra[@]}"); shift 2 ;;
 		--expect) [ $# -ge 2 ] || usage; expects+=("$2"); shift 2 ;;
 		--timeout) timeout=${2:-}; shift 2 ;; --label) label=${2:-}; shift 2 ;;
-		--dry-run) dry=1; shift ;; --from-dir) from=${2:-}; shift 2 ;; --lock-wait) lockwait=${2:-0}; shift 2 ;;
+		--dry-run) dry=1; shift ;; --from-dir) from=${2:-}; shift 2 ;; --lock-wait) lockwait=${2:-0}; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;;
 		*) usage ;; esac; done
 	# the shim sends ~12 sections spaced 3 s apart BEFORE the touch/ACPM lines (first seen at ~65 s): 60 s cut them off
 	[ -n "$timeout" ] || { [ -n "$touch" ] && timeout=240 || timeout=60; }
@@ -84,8 +84,10 @@ main() {
 	# 1. build (no phone lock: builds and gates never hold it)
 	# gadget window is only a MINIMUM (shim.c usb_gadget_finish runs after the probe): default 600 s would idle the phone ~10 min before its reset
 	mkdir -p shim/out   # shim/out is shared with gates: build under its lock and boot a private copy (same as xrun)
-	( flock -x -w 3600 9 || exit 98
-	  (cd shim && USB_WINDOW=${USB_WINDOW:-30} $BUILD --board bluejay --avb --usb-gadget "${args[@]}") &&
+	# under `phone-lock run` the phone is already ours: wait only 60 s for a gate that holds shim/out, otherwise up to an hour (the phone is not held)
+	local fw=3600; tools/phone-lock check >/dev/null 2>&1 && fw=60
+	( flock -x -w $fw 9 || { echo "shim/out busy: a gate or build in this worktree holds shim/out/.build.lock" >&2; exit 98; }
+	  (cd shim && USB_WINDOW=${USB_WINDOW:-30} $BUILD --board bluejay --avb --usb-gadget "${args[@]}" 9>&-) &&
 	  { [ ! -f shim/out/shim-boot-avb.img ] || { cp shim/out/shim-boot-avb.img "$dir/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$dir/shim-boot-avb.img.meta.json" 2>/dev/null; true; }; } ) 9>shim/out/.build.lock >"$dir/build.log" 2>&1 ||
 		report ERROR "build failed (see $dir/build.log: $(tail -1 "$dir/build.log" | cut -c1-100))"
 	# 2. take the phone, then check it is in fastboot
@@ -140,7 +142,7 @@ S
 	printf '#!/bin/bash\nmkdir -p out\n' >"$d/build"
 	cat >"$d/usblog" <<'S'
 #!/bin/bash
-[ "$1" = capture ] && { [ -z "$ST_LOG" ] || printf '%b' "$ST_LOG" >"$3"; sleep 100; }
+[ "$1" = capture ] && { [ -z "$ST_LOG" ] || printf '%b' "$ST_LOG" >"$3"; exec sleep 100; }
 S
 	chmod +x "$d"/*
 	local R='SWEET TOUCH: identify: rx\nSWEET TOUCH RESULT: opts=0x1 id=ok\n'

@@ -375,7 +375,7 @@ def build(d, stop_on=None):
             and ("adb [recovery]" in phone or "fastboot product [bluejay]" in phone)):
         reset_at = (f("t_end") or now()) - t0
         run["late_back"] = "1"
-    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds%s" % (reset_at, " (back as %s)" % {"18d1:4ee0": "fastboot", "18d1:d001": "recovery"}.get(run.get("usb_back_id"), run.get("usb_back_id")) if run.get("usb_back_id") else "")) if reset_at is not None else
+    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds%s" % (reset_at, " (back as %s)" % {"18d1:4ee0": "fastboot"}.get(run.get("usb_back_id"), run.get("usb_back_id")) if run.get("usb_back_id") else "")) if reset_at is not None else
                  ("reset NOT observed (waited %ds; the sweetrestart did not fire or the phone hung)" % (waited or 0)) if restart
                  else "no --restart (no reset expected)")
     qr_t = first_snap_t - t0 if first_snap_t and t0 else None

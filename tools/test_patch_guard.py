@@ -56,12 +56,68 @@ class G(unittest.TestCase):
     def test_precommit_blocks_a_collision_and_reserves_a_clean_patch(self):
         self.w("xnu/patches/0102-wlan.patch", "w"); self.git("add", "-A")  # 0102 is 0102-gpu.patch on gpu
         r = self.pn("precommit")
-        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.returncode, 3)
         self.assertIn("overlapping", r.stdout)
         os.remove(os.path.join(self.d, "xnu/patches/0102-wlan.patch")); self.git("rm", "-q", "--cached", "xnu/patches/0102-wlan.patch")
         self.w("xnu/patches/0150-free.patch", "f"); self.git("add", "-A")
         self.assertEqual(self.pn("precommit").returncode, 0)
         self.assertIn("RESERVED by", self.pn("status").stdout.split("0150")[1])  # reserved for everyone by the commit
+
+    def test_cd_chain_absolute_path_foreign_repo_and_heredoc(self):
+        sup = tempfile.mkdtemp(prefix="psuper-"); self.addCleanup(shutil.rmtree, sup)
+        n = self.pn("next", "--owner", "x", "--name", "mine").stdout.splitlines()[0]
+        # session cwd = some other dir, the command cd's into the kernel repo: the reservation of THAT repo counts
+        cmd = "cd %s && cp /tmp/x xnu/patches/%s-mine.patch" % (self.d, n)
+        self.assertEqual(self.hook2(sup, cmd), "allow")
+        self.assertEqual(self.hook2(sup, "cd %s && cp /tmp/x xnu/patches/%s-other.patch" % (self.d, n)), "deny")
+        self.assertEqual(self.hook2(sup, "cp /tmp/x %s/xnu/patches/0190-nores.patch" % self.d), "deny")
+        # a repo without tools/patch-numbers is not guarded
+        tmp = tempfile.mkdtemp(prefix="ptmp-"); self.addCleanup(shutil.rmtree, tmp)
+        subprocess.run(["git", "-C", tmp, "init", "-q"], check=True)
+        self.assertEqual(self.hook2(tmp, "echo a > xnu/patches/0190-nores.patch"), "allow")
+        # heredoc text that merely mentions a write, and a read that contains the word install
+        self.assertEqual(self.hook2(sup, "cat <<'EOF' > /tmp/doc.md\ntee xnu/patches/0120-foo.patch\nEOF"), "allow")
+        self.assertEqual(self.hook2(self.d, "grep -n install xnu/patches/0190-nores.patch"), "allow")
+        self.assertEqual(self.hook2(self.d, "git format-patch -1 --stdout > xnu/patches/0190-nores.patch"), "deny")
+
+    def hook2(self, cwd, cmd):
+        r = subprocess.run([sys.executable, os.path.join(self.d, "tools/patch-guard")], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}),
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else "allow"
+
+    def test_broken_guard_fails_open(self):
+        os.remove(os.path.join(self.d, "tools/patch-numbers"))  # the guard's helper is gone: no decision, exit 0
+        self.assertEqual(self.hook(tool_name="Write", tool_input={"file_path": os.path.join(self.d, "xnu/patches/0190-x.patch")}), "allow")
+
+    def test_precommit_rename_slug_fix_junk_ref_and_internal_error(self):
+        # M2: a rename onto a number another branch holds is refused (git mv shows as R)
+        self.git("checkout", "-qb", "wifi"); self.git("mv", "xnu/patches/0101-vsync.patch", "xnu/patches/0102-vsync.patch")
+        self.assertEqual(self.pn("precommit").returncode, 3)
+        self.git("reset", "-q", "--hard")
+        # M3: fixing the slug of your own committed patch is fine
+        self.git("checkout", "-q", "gpu"); self.git("mv", "xnu/patches/0102-gpu.patch", "xnu/patches/0102-gpu2.patch"); self.w("xnu/patches/0102-gpu2.patch", "changed"); self.git("add", "-A")
+        self.assertEqual(self.pn("precommit").returncode, 0)
+        self.git("reset", "-q", "--hard")
+        # M1: a stray reservation ref must not break the hook
+        blob = self.git("hash-object", "-w", "--stdin").stdout if False else subprocess.run(["git", "-C", self.d, "hash-object", "-w", "--stdin"], input="o\nn\n", env=self.env, capture_output=True, text=True).stdout.strip()
+        self.git("update-ref", "refs/patch-numbers/junk", blob)
+        self.w("xnu/patches/0150-free.patch", "f"); self.git("add", "-A")
+        self.assertEqual(self.pn("precommit").returncode, 0)
+
+    def test_installed_hook_fails_open_but_blocks_a_collision(self):
+        self.pn("install-hook")
+        hook = os.path.join(self.d, ".git/hooks/pre-commit")
+        text = open(hook).read().replace("~/.t3/worktrees/common-tools/kernel/tools/patch-numbers", os.path.join(self.d, "tools/patch-numbers"))
+        open(hook, "w").write(text); os.chmod(hook, 0o755)
+        self.git("checkout", "-qb", "wifi2"); self.w("xnu/patches/0102-wlan.patch", "w"); self.git("add", "-A")
+        r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "x"], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)          # collision with gpu's 0102: blocked
+        self.git("reset", "-q", "--hard")
+        self.w("tools/patch-numbers", "this is not python (");  # a broken helper: internal error, commit goes through
+        self.w("docs.txt", "d"); self.git("add", "docs.txt")
+        r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "doc"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_claim(self):
         self.assertEqual(self.pn("claim", "0140", "--owner", "a", "--name", "foo").returncode, 0)

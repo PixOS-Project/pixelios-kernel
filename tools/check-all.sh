@@ -26,7 +26,8 @@ step() {
 	case " $want " in *" $n "*) ;; *) return 0 ;; esac
 	[ -e "$tmp/$l.fail" ] && return 0
 	echo "== $n" >>"$tmp/$l.log"; s=$SECONDS
-	if "$@" >>"$tmp/$l.log" 2>&1; then echo "$n $((SECONDS-s))s" >>"$tmp/$l.times"
+	# 9>&- below: a step's children (an adb server, a stub sleep) must not keep shim/out locked after the gate ends
+	if "$@" >>"$tmp/$l.log" 2>&1 9>&-; then echo "$n $((SECONDS-s))s" >>"$tmp/$l.times"
 	else echo "$n" >"$tmp/$l.fail"; echo "$n FAILED $((SECONDS-s))s" >>"$tmp/$l.times"; fi
 }
 # needs FILE CMD...: run CMD only if FILE exists in this repository (the public repos hold different parts of the monorepo)
