@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2089,SC2090  # CFLAGS is deliberately one word-split string (its -DPSTORE_BUILD_ID value carries literal quotes); an array would touch every compile line
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -417,6 +418,7 @@ fi
 # PIXELIOS_HOST_TESTS=always runs them anyway (the gate's first build does) and refreshes the stamp. Inputs: shim/*.c *.h, the generated board/wlan_seq headers, the xnu patches this script extracts headers from, gcc -v, this script.
 chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build
 htdir=${XDG_CACHE_HOME:-$HOME/.cache}/pixelios/host-tests
+# shellcheck disable=SC2046  # intentional word splitting of the file lists (an empty "" argument would break sha256sum)
 ht=$({ sha256sum *.c *.h $O/board_config.h $([ -f $O/wlan_seq.h ] && echo $O/wlan_seq.h) $(grep -o '\.\./xnu/patches/[0-9][0-9]*-[A-Za-z0-9._-]*\.patch' build.sh | sort -u) build.sh; gcc -v 2>&1; } | sha256sum | cut -c1-32)
 if [ -e "$htdir/$ht.ok" ] && [ "${PIXELIOS_HOST_TESTS:-}" != always ]; then
 	echo "host tests: cached $ht"

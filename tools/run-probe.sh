@@ -10,7 +10,7 @@
 # USB_WINDOW=90 (see shim/build.sh).
 set -u
 board=${BOARD:-bluejay}	# device codename the safety checks expect (tools/pix devices)
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 img=${1:?usage: tools/run-probe.sh IMAGE [CAPTURE_SECONDS]}
 secs=${2:-300}
 mkdir -p logs

@@ -56,7 +56,7 @@ if ! (cd "$out" && sha256sum -c --quiet SHA256SUMS) >>"$LOG" 2>&1; then     # al
 	rm -f "$out"/kernel.* "$out"/SHA256SUMS
 	gh run download "$run" -n xnu-kernel -D "$out" >>"$LOG" 2>&1 || finish ERROR "artifact xnu-kernel download failed for run $run" "RUN: $run $concl $url"
 fi
-kernel=$out/kernel.development.sweet; [ -f "$kernel" ] || kernel=$(ls "$out"/kernel.* 2>/dev/null | grep -v '\.link$' | head -1 || true)
+kernel=$out/kernel.development.sweet; [ -f "$kernel" ] || kernel=$(compgen -G "$out/kernel.*" | grep -v '\.link$' | head -1 || true)
 [ -f "$kernel" ] || finish ERROR "artifact has no kernel.* file" "RUN: $run $concl $url"
 sums=ok; (cd "$out" && sha256sum -c SHA256SUMS >>"$LOG" 2>&1) || sums=MISMATCH
 lines=("RUN: $run (success) $url" "KERNEL: $kernel | sha256 $(sha256sum "$kernel" | cut -c1-16) | $(stat -c %s "$kernel") bytes | SHA256SUMS $sums")
