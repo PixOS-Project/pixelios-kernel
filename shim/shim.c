@@ -945,6 +945,7 @@ uint64_t touch_ticks(void)	/* touchprobe.c / gpupower.c: bounded waits (CNTPCT) 
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
+	(void)after_s;	/* unused under --pstore-fast */
 #if SOC_GS101
 #ifdef PSTORE_FAST
 	con_str("RESET", "fast: system reset in ~5s");

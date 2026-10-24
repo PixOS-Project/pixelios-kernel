@@ -688,9 +688,11 @@ int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint3
 /* ACPM_DVFS_N = the CPU clusters (what the touch probe iterates, acpm_dvfs_ndom/dom); the tables hold ALL configured domains (CPU + the two GPU
  * clocks G3D = 5 / G3DL2 = 6, whose ceiling is their init level: only --gpu-clk asks them for a rate). */
 static const uint32_t dvfs_idx[ACPM_DVFS_NALL] = { ACPM_DVFS_IDXS };
+#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* only dvfs_rate_ok() reads these three */
 static const uint32_t dvfs_ceil[ACPM_DVFS_NALL] = { ACPM_DVFS_CEILS };
 static const uint32_t dvfs_nr[ACPM_DVFS_NALL] = { ACPM_DVFS_NRS };
 static const uint32_t dvfs_rate[ACPM_DVFS_NALL][ACPM_DVFS_MAXLV] = { ACPM_DVFS_ROWS };
+#endif
 
 int acpm_dvfs_ndom(void)
 {
