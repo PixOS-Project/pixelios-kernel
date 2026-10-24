@@ -10,7 +10,7 @@ Paths under the repo root (parent of tools/) are stored relative to it, so workt
 Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
-a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. A failed open of a missing file or an existence check (os.stat) is NOT tracked. Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
+a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat calls (os.path.exists/isfile/isdir, Path.exists) are inputs: stored as (kind, path, exists) and re-checked on a hit (stat by fd/dir_fd is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
 Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
@@ -19,6 +19,7 @@ import contextlib, glob, hashlib, io, json, os, pathlib, platform, sys, tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SPAWN = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty")
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+_STAT, _LSTAT = os.stat, os.lstat  # the originals: os.stat/os.lstat are wrapped while fn runs
 _stack = []  # active recorders (dicts), innermost last
 _off = False
 
@@ -48,6 +49,32 @@ def _note_list(r, key):
         r["busy"] = False
     if r["lists"].setdefault(key, h) != h:
         r["changed"] = True
+
+
+def _exists(kind, p):
+    try:
+        (_STAT if kind == "stat" else _LSTAT)(p)
+        return True
+    except OSError:
+        return False
+
+
+def _note_exist(r, kind, p):
+    """Record whether p exists now (taken when fn looks); a later difference means fn saw a moving target."""
+    if r.setdefault("exist", {}).setdefault((kind, p), _exists(kind, p)) != _exists(kind, p):
+        r["changed"] = True
+
+
+def _wrap(orig, kind):
+    def f(path, *a, **kw):
+        if _stack and not _stack[-1].get("busy"):
+            r = _stack[-1]
+            if isinstance(path, (str, bytes, os.PathLike)) and kw.get("dir_fd") is None:
+                _note_exist(r, "lstat" if kind == "lstat" or kw.get("follow_symlinks") is False else "stat", os.path.abspath(os.fsdecode(path)))
+            else:
+                r["nolist"] = "stat by fd / dir_fd"
+        return orig(path, *a, **kw)
+    return f
 
 
 def _hook(event, args):
@@ -86,6 +113,7 @@ def _hook(event, args):
                 r["busy"] = True
                 try:
                     d = _dep_path(p)
+                    _note_exist(r, "stat", p)  # a failed open is an input too (the file may appear)
                     if os.path.isfile(d):
                         h = _sha(d)
                         if r["h"].setdefault(d, h) != h:
@@ -145,6 +173,13 @@ def _deps(hashes):
     return sorted((_rel(p), h) for p, h in hashes.items())
 
 
+def _exist_list(found):
+    """Existence facts -> sorted [kind, rel path, exists]; None if any differs now from when fn looked."""
+    if any(_exists(*key) != v for key, v in found.items()):
+        return None
+    return sorted([k, _rel(p), v] for (k, p), v in found.items())
+
+
 def _lists(found):
     """Listings fn did -> sorted [kind, rel path, recursive, sha]; None if any listing differs now from when fn took it."""
     if any(_list_sha(*key) != h for key, h in found.items()):
@@ -155,10 +190,13 @@ def _lists(found):
 def _load(path, k):
     try:
         e = json.loads(path.read_text())
-        if e.get("key") != k or e.get("version") != 1:
+        if e.get("key") != k or e.get("version") != 2:
             return None
         for p, h in e["deps"]:
             if _sha(_abs(p)) != h:
+                return None
+        for k, p, v in e["exist"]:
+            if _exists(k, _abs(p)) != v:
                 return None
         for k, p, rec, h in e.get("lists", []):
             if _list_sha(k, _abs(p), rec) != h:
@@ -183,6 +221,8 @@ def run(fn, arg=b"", *, script, name=None):
     rec = {"opened": [], "h": {}, "lists": {}}
     buf = io.StringIO()
     _stack.append(rec)
+    old_stat, old_lstat = os.stat, os.lstat
+    os.stat, os.lstat = _wrap(old_stat, "stat"), _wrap(old_lstat, "lstat")
     try:
         with contextlib.redirect_stdout(buf):
             ret = fn()
@@ -190,6 +230,7 @@ def run(fn, arg=b"", *, script, name=None):
         sys.stdout.write(buf.getvalue())  # a FAIL is never stored
         raise
     finally:
+        os.stat, os.lstat = old_stat, old_lstat
         _stack.pop()
     sys.stdout.write(buf.getvalue())
     if "spawn" in rec or "write" in rec or "changed" in rec or "nolist" in rec:
@@ -200,9 +241,12 @@ def run(fn, arg=b"", *, script, name=None):
     lists = _lists(rec["lists"])
     if lists is None:
         return ret  # a directory changed while fn ran
+    exist = _exist_list(rec.get("exist", {}))
+    if exist is None:
+        return ret
     try:
         json.dumps(ret)
-        entry = {"version": 1, "key": k, "name": name, "deps": deps, "lists": lists, "stdout": buf.getvalue(), "ret": ret}
+        entry = {"version": 2, "key": k, "name": name, "deps": deps, "lists": lists, "exist": exist, "stdout": buf.getvalue(), "ret": ret}
         f.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=f.parent, suffix=".tmp")
         with os.fdopen(fd, "w") as t:

@@ -127,6 +127,29 @@ class Memo(unittest.TestCase):
         self.assertEqual(self.calls, 2)
         self.assertFalse(list((self.t / "cache").glob("*.json")))
 
+    def test_missing_file_is_an_input(self):
+        opt = self.t / "opt.json"
+        def probe():
+            self.calls += 1
+            a = os.path.exists(opt)
+            try:
+                b = opt.read_text()
+            except FileNotFoundError:
+                b = "none"
+            return [a, b, opt.is_file()]
+        self.assertEqual(self.go(probe, name="pr")[0], [False, "none", False])
+        self.go(probe, name="pr"); self.assertEqual(self.calls, 1)      # still absent: hit
+        opt.write_text("v")
+        self.assertEqual(self.go(probe, name="pr")[0], [True, "v", True]); self.assertEqual(self.calls, 2)
+        self.go(probe, name="pr"); self.assertEqual(self.calls, 2)       # present state is stored too
+        opt.unlink()
+        self.assertEqual(self.go(probe, name="pr")[0], [False, "none", False]); self.assertEqual(self.calls, 3)
+
+    def test_stat_wrappers_restored(self):
+        a, b = os.stat, os.lstat
+        self.go()
+        self.assertIs(os.stat, a); self.assertIs(os.lstat, b)
+
     def test_missing_dir_listing_is_an_input(self):
         def g():
             self.calls += 1
