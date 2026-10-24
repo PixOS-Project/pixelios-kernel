@@ -1,14 +1,14 @@
 ---
 id: TP-019
 tool: "tools/check-site"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (driver)"
 date: 2026-10-24
 exposed_by: "docs-site review 2026-10-24: 11 of 13 pages had stale claims, one dead cross-repo link, found by hand"
 extends: ""
 related: ""
 usage: "tools/check-site [--kernel DIR] [--userland DIR] [--max-age-days N]"
-refs: "-"
+refs: "pixelios-site 9839ef4 (tools/check-site.py, tools/test_check_site.py, .github/workflows/check.yml)"
 ---
 
 ## checked
