@@ -4,22 +4,23 @@
 run(fn, arg_bytes, script=PATH) calls fn() once per distinct input; a later call with the same input prints the captured stdout
 (each line suffixed " (memo <key16>)") and returns the stored result without running fn.
 
-Key = sha256 of: bytes of `script` and of this file (any audit or memo edit invalidates everything), fn name, arg bytes, sys.version, python implementation.
+Key = sha256 of: bytes of `script` and of this file (any audit or memo edit invalidates everything), fn name, arg bytes, sys.path, sys.version, python implementation.
 Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), hashed at open time and re-hashed after fn (any change = nothing stored), stored as (path, sha256); a hit re-hashes them all.
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
 Never stored: a .pyc without its source or whose recorded mtime/size differ from it (a same-size edit in the same mtime second cannot be told apart, Python accepts it too), a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
-a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat calls (os.path.exists/isfile/isdir, Path.exists) are inputs: stored as (kind, path, exists) and re-checked on a hit (stat by fd/dir_fd is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
+a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat/os.access/os.readlink calls (os.path.exists/isfile/isdir/getsize/realpath, Path.exists) are inputs: stored as (kind, path, state) where state is the file type (S_IFMT) plus st_size for a regular file, None if missing (st_mtime is NOT recorded: a gap), the access() bool, or the link target, and re-checked on a hit (stat by fd/dir_fd is not storable; an unreadable opened file is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
 Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes or any unknown value (warning on stderr; fail safe), or disable(). On: unset, empty, 0|false|no|off (any case, whitespace stripped).
+Sys.path is an input: its directories are listed (a new file shadowing a lazily imported module is a miss) and the path list is in the key. A nested run() hands its inputs and flags to the outer recorder.
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
-import contextlib, glob, hashlib, io, json, os, pathlib, platform, sys, tempfile
+import contextlib, glob, hashlib, io, json, os, pathlib, platform, stat, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SPAWN = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty")
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
-_STAT, _LSTAT = os.stat, os.lstat  # the originals: os.stat/os.lstat are wrapped while fn runs
+_STAT, _LSTAT, _ACCESS, _READLINK = os.stat, os.lstat, os.access, os.readlink  # the originals: os.stat/os.lstat are wrapped while fn runs
 _stack = []  # active recorders (dicts), innermost last
 _off = False
 
@@ -59,11 +60,17 @@ def _note_list(r, key):
 
 
 def _exists(kind, p):
+    """State of p as a JSON-able value (compared after a JSON round trip): [S_IFMT, size or None], None if missing; access bool; link target."""
     try:
-        (_STAT if kind == "stat" else _LSTAT)(p)
-        return True
+        if kind == "link":
+            return _READLINK(p)
+        if kind.startswith("access:"):
+            return _ACCESS(p, int(kind[7:]))
+        st = (_STAT if kind == "stat" else _LSTAT)(p)
+        m = stat.S_IFMT(st.st_mode)
+        return [m, st.st_size if m == stat.S_IFREG else None]
     except OSError:
-        return False
+        return None
 
 
 def _note_exist(r, kind, p):
@@ -80,6 +87,30 @@ def _wrap(orig, kind):
                 _note_exist(r, "lstat" if kind == "lstat" or kw.get("follow_symlinks") is False else "stat", os.path.abspath(os.fsdecode(path)))
             else:
                 r["nolist"] = "stat by fd / dir_fd"
+        return orig(path, *a, **kw)
+    return f
+
+
+def _wrap_access(orig):
+    def f(path, mode, *a, **kw):
+        if _stack and not _stack[-1].get("busy"):
+            r = _stack[-1]
+            if isinstance(path, (str, bytes, os.PathLike)) and not a and kw.get("dir_fd") is None and not kw.get("effective_ids") and kw.get("follow_symlinks", True):
+                _note_exist(r, f"access:{int(mode)}", os.path.abspath(os.fsdecode(path)))
+            else:
+                r["nolist"] = "access by fd / dir_fd / flags"
+        return orig(path, mode, *a, **kw)
+    return f
+
+
+def _wrap_readlink(orig):
+    def f(path, *a, **kw):
+        if _stack and not _stack[-1].get("busy"):
+            r = _stack[-1]
+            if isinstance(path, (str, bytes, os.PathLike)) and kw.get("dir_fd") is None:
+                _note_exist(r, "link", os.path.abspath(os.fsdecode(path)))
+            else:
+                r["nolist"] = "readlink by dir_fd"
         return orig(path, *a, **kw)
     return f
 
@@ -129,7 +160,7 @@ def _hook(event, args):
                         if r["h"].setdefault(d, h) != h:
                             r["changed"] = True  # edited between two opens (even if reverted later): do not store
                 except OSError:
-                    pass
+                    r["nolist"] = "unhashable input"  # e.g. chmod 000: fn saw a denial we cannot key on
                 finally:
                     r["busy"] = False
 
@@ -154,7 +185,7 @@ def _abs(p):
 
 def key(fn_name, arg, script):
     h = hashlib.sha256()
-    for part in (pathlib.Path(script).read_bytes(), pathlib.Path(__file__).read_bytes(), fn_name.encode(), arg, sys.version.encode(), platform.python_implementation().encode()):
+    for part in (pathlib.Path(script).read_bytes(), pathlib.Path(__file__).read_bytes(), fn_name.encode(), arg, "\0".join(_rel(os.path.abspath(p or ".")) for p in sys.path).encode(), sys.version.encode(), platform.python_implementation().encode()):
         h.update(len(part).to_bytes(8, "big") + part)
     return h.hexdigest()
 
@@ -169,12 +200,12 @@ def _dep_path(p):
 
 
 def _pyc_ok(pyc, src):
-    """True if pyc is a timestamp pyc whose recorded source mtime/size match src (else fn ran code we did not hash)."""
+    """True if pyc is a timestamp pyc whose recorded source mtime/size match src and that is newer than src (else fn may have run code we did not hash)."""
     try:
         with open(pyc, "rb") as f:
             h = f.read(16)
-        st = _STAT(src)
-        return len(h) == 16 and h[4:8] == b"\0\0\0\0" and int.from_bytes(h[8:12], "little") == int(st.st_mtime) & 0xFFFFFFFF \
+        st, pst = _STAT(src), _STAT(pyc)
+        return st.st_mtime_ns < pst.st_mtime_ns and len(h) == 16 and h[4:8] == b"\0\0\0\0" and int.from_bytes(h[8:12], "little") == int(st.st_mtime) & 0xFFFFFFFF \
             and int.from_bytes(h[12:16], "little") == st.st_size & 0xFFFFFFFF
     except OSError:
         return False
@@ -213,6 +244,17 @@ def _lists(found):
     return sorted([k, _rel(p), rec, h] for (k, p, rec), h in found.items())
 
 
+def _merge(o, h, lists, exist, flags=None):
+    """Hand an inner run's inputs to the outer recorder o (a conflict = fn saw a moving target)."""
+    for src, dst in ((h, o["h"]), (lists, o["lists"]), (exist, o.setdefault("exist", {}))):
+        for kk, v in src.items():
+            if dst.setdefault(kk, v) != v:
+                o["changed"] = True
+    for f in ("spawn", "write", "changed", "nolist"):
+        if flags and f in flags:
+            o[f] = flags[f]
+
+
 def _load(path, k):
     try:
         e = json.loads(path.read_text())
@@ -241,14 +283,18 @@ def run(fn, arg=b"", *, script, name=None):
     f = cache_dir() / (k + ".json")
     e = _load(f, k)
     if e is not None:
+        if _stack:
+            _merge(_stack[-1], {_abs(p): h for p, h in e["deps"]}, {(kd, _abs(p), rc): h for kd, p, rc, h in e["lists"]}, {(kd, _abs(p)): v for kd, p, v in e["exist"]})
         for line in e["stdout"].splitlines():
             print(f"{line} (memo {k[:16]})")
         return e["ret"]
     rec = {"opened": [], "h": {}, "lists": {}}
     buf = io.StringIO()
     _stack.append(rec)
-    old_stat, old_lstat = os.stat, os.lstat
-    os.stat, os.lstat = _wrap(old_stat, "stat"), _wrap(old_lstat, "lstat")
+    for d in sys.path:  # a new file in any sys.path dir can shadow a module imported lazily by fn
+        _note_list(rec, ("dir", os.path.abspath(d or "."), False))
+    old = os.stat, os.lstat, os.access, os.readlink
+    os.stat, os.lstat, os.access, os.readlink = _wrap(old[0], "stat"), _wrap(old[1], "lstat"), _wrap_access(old[2]), _wrap_readlink(old[3])
     try:
         with contextlib.redirect_stdout(buf):
             ret = fn()
@@ -256,8 +302,10 @@ def run(fn, arg=b"", *, script, name=None):
         sys.stdout.write(buf.getvalue())  # a FAIL is never stored
         raise
     finally:
-        os.stat, os.lstat = old_stat, old_lstat
+        os.stat, os.lstat, os.access, os.readlink = old
         _stack.pop()
+        if _stack:
+            _merge(_stack[-1], rec["h"], rec["lists"], rec.get("exist", {}), rec)
     sys.stdout.write(buf.getvalue())
     if "spawn" in rec or "write" in rec or "changed" in rec or "nolist" in rec:
         return ret
