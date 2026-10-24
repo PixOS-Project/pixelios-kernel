@@ -153,6 +153,24 @@ class Report(unittest.TestCase):
         self.assertEqual(r["result"], "PASS", r["reason"])
         self.assertIn("back as fastboot", r["reason"])
 
+    def test_fail_on_ends_the_run_early_and_scores_fail(self):
+        import io, contextlib
+        t = {"v": T0}
+        d = self.run_dir("20260101T000700Z-f", snaps=[(30, LOG1)], run={"restart": "600", "duration": "900", "t_boot": str(T0), "fail_on": ["SWEET CPU: cpu=0 mpidr"], "expect": ["SWEET CPU"]})
+        old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+        xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = (lambda: t["v"]), (lambda x: t.__setitem__("v", t["v"] + x)), (lambda: True)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                xrun_report.waitusb(str(d))
+        finally:
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+        self.assertEqual(out.getvalue().strip(), "EARLY")
+        self.assertLess(t["v"] - T0, 60)   # not the 900 s window
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertIn("failure pattern", r["reason"])
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")

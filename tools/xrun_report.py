@@ -15,7 +15,7 @@ import calendar, glob, json, os, pathlib, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qrmerge  # noqa: E402
 
-LISTKEYS = ("expect", "expect_absent", "stop_on")
+LISTKEYS = ("expect", "expect_absent", "stop_on", "fail_on")
 BLACK = 25          # mean luma (0-255) under which a camera frame counts as a black screen
 EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 1, "ERROR": 2}
 # label -> regex. Counted over the merged log; the first matching line is shown. (touch/keys/cpu lines are listed separately.)
@@ -113,6 +113,7 @@ def waitusb(d):
     end = t0 + float(run.get("duration", 180))
     hard = float(run["t_start"]) + float(run["hard_timeout"]) if run.get("hard_timeout") and run.get("t_start") else None
     stop = run.get("stop_on", [])
+    fails = run.get("fail_on", [])   # any one of these ends the run at once (a failing run must not wait out the restart window)
     expect_reset = bool(run.get("restart"))
     gone = None
     nxt = 0
@@ -125,9 +126,14 @@ def waitusb(d):
         elif gone is None:
             gone = now()
             mark(d, ["usb_gone=%f" % gone])
-        if stop and now() >= nxt:
+        if (stop or fails) and now() >= nxt:
             nxt = now() + 10
-            if stop_seen(d, stop):
+            hit = next((p for p in fails if stop_seen(d, [p])), None)
+            if hit:
+                mark(d, ["early=%f" % now(), "t_end=%f" % now(), "early_fail=%s" % hit])
+                print("EARLY")
+                return
+            if stop and stop_seen(d, stop):
                 mark(d, ["early=%f" % now(), "t_end=%f" % now()])
                 print("EARLY")
                 return
@@ -394,6 +400,8 @@ def build(d, stop_on=None):
         result, reason = "ERROR", run["error"]
     elif markers["panic/hang/watchdog"]["count"]:
         result, reason = "FAIL", "panic/hang/watchdog line in the log: %s" % cut(markers["panic/hang/watchdog"]["first"], 80)
+    elif run.get("early_fail"):
+        result, reason = "FAIL", "stopped early on a failure pattern (%s) at +%ds; the full run would have waited %ss" % (cut(str(run["early_fail"]), 60), waited or 0, run.get("duration"))
     elif restart and reset_at is None and run.get("timeout") and waited is not None and waited < restart_s and not (early_txt and not early_txt.startswith("NOT")):
         result, reason = "PARTIAL", "hard timeout after %ds, before the reset was due (restart %ds): the reset was not awaited%s" % (waited, restart_s, "; %d expectation(s) missing" % len(bad) if bad else "")
     elif restart and reset_at is None and not (early_txt and not early_txt.startswith("NOT")):
