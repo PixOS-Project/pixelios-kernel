@@ -180,20 +180,20 @@ full log (steps in a fixed order) plus a per-step timing table. *Read from sourc
   a timeout is a step FAIL `(timeout)`. A failing step stops every other step at its next step boundary (running parallel builds finish);
   `--keep-going` stops only the failing lane. The reported failure is the first failed step in the fixed step order.
 - **shellcheck step (lane B).** `shellcheck -S warning $(tools/shell-files)`, zero tolerance, over every tracked `*.sh` or sh/bash/dash-shebang script
-  (`tools/shell-files` is the single listing). `--quick` selects it for any changed shell file (`gate_select.is_shell`). Fix findings; `# shellcheck disable=SCxxxx` needs a reason on the same line.
+  (`tools/shell-files` is the single listing; it also lists untracked-but-not-ignored scripts, so a new script is linted before `git add`). `--quick` selects it for any changed shell file (`gate_select.is_shell`). Fix findings; `# shellcheck disable=SCxxxx` needs a reason on the same line.
   `shim/build.sh` carries two such directives (CFLAGS word splitting, host-test hash file lists). Needs `shellcheck` installed (apt).
 - **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
 
 **Audit memo (`tools/audit_memo.py`, R2).** The three expensive mutation self-tests of `tools/test-bluejay-boot.py` (`wlan_seq_selftest`,
-`wlanlink_source_selftest`, `wlanlink_object_selftest`) are cached by content. Key = sha256 of the audit script bytes, the function name,
+`wlanlink_source_selftest`, `wlanlink_object_selftest`) are cached by content. Key = sha256 of the audit script bytes, `tools/audit_memo.py` itself, the function name,
 the argument bytes (the objdump text for the object self-test; objdump itself stays outside), `sys.version` + implementation; the entry also
-records every file the function opened (`sys.addaudithook`, event `open`) with its sha256 and re-hashes them on lookup. Only a PASS is stored;
+records every file the function opened (`sys.addaudithook`, event `open`) with its sha256 taken at open time and re-hashes them on lookup. Only a PASS is stored, and only if every recorded file still has its open-time hash after the run (an edit during the run stores nothing);
 a run that started a process or wrote a file is never stored; a corrupt entry is a miss. A hit prints the captured lines with
 `(memo <key16>)` appended. The audit of the real objects/sources (`check_*` on `shim/out/*.o`, `shim/*.c`) is never memoized.
 Cache dir: `$PIXELIOS_AUDIT_MEMO_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/pixelios/audit/` (shared by worktrees; entries store repo paths relative
 to the repo root). Off: `tools/test-bluejay-boot.py --no-memo`, `PIXELIOS_AUDIT_NO_MEMO=1`, `check-all.sh --no-memo`.
 Tests: `tools/test_audit_memo.py` (key parts, dep tracking, FAIL / subprocess / write not stored, corrupt entry, replay) and
-`tools/test_audit_memo_mutations.sh` (ends `RESULT: PASS mutants=N caught=N`; runs from a temp copy with a warm memo and requires each
+(path normalisation across worktrees, mid-run edit) and `tools/test_audit_memo_mutations.sh` (also run by the `unit` step through `tools/test_audit_memo_mutations.py`, ~30 s; ends `RESULT: PASS mutants=N caught=N`; runs from a temp copy with a warm memo and requires each
 mutant of the wlanlink source, the audit script, `wlan_seq.json` and `boards.py` to still FAIL; the object self-test needs an aarch64
 objdump and a built `wlanlink.o` and is not covered by it; logs in `logs/audit-memo-mut/<UTC>/`).
 
@@ -202,7 +202,10 @@ stays `out/bluejay-testkey.pem`. `tools/test-bluejay-boot.py --out DIR` audits t
 images (header checks per image, the tree audit once). The variant-independent host tests (and the extracted xnu-patch headers) run once per input digest:
 sha256 of `shim/*.c *.h`, `out/board_config.h`, `out/wlan_seq.h`, the `../xnu/patches/NNNN` files `build.sh` references, `gcc -v` and `build.sh`;
 the stamp `${XDG_CACHE_HOME:-~/.cache}/pixelios/host-tests/<digest>.ok` is written only after all of them passed
-(`host tests: cached <digest>` otherwise; `PIXELIOS_HOST_TESTS=always` runs them anyway). The variant `nm` checks always run.
+(`host tests: cached <digest>` otherwise; `PIXELIOS_HOST_TESTS=always` runs them anyway); the digest is recomputed after the tests and no stamp is written if an input changed meanwhile.
+Every host-test compile and run goes through `chk` (a failure stops the build; no stamp), and `chk` lists each compiled `*host_test*` output in `$O/host-tests.list`.
+The gate's `host-tests` step runs exactly that list from `out/gate/build-0` and FAILS on a missing list or binary (no silent skip); `host_test` writes its `.ppm` only to a path given as argv[1].
+`tools/test_build_hosttests.sh` (via `test_build_hosttests.py`) tests this plumbing without a build, and that the `--wlan-iso --wlan-en` build is refused with the intended message. The variant `nm` checks always run.
 
 `tools/check-all.sh --quick` is for iterating: it diffs the tree against the commit in `shim/out/gate.stamp` (written only by a
 full PASS on a clean tree) and runs only the needed steps, selected by `tools/gate_select.py` (tested by `tools/test_gate_select.py`):

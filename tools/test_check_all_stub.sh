@@ -32,8 +32,8 @@ mkrepo() { # DIR: a repo with the files the gate's steps call, all stubs
 # stub: --out DIR creates the files the later steps need; STUB_SLEEP=<step> makes that step hang (grandchild too), recording pids in $STUB_PIDS
 out=; i=; e=
 while [ $# -gt 0 ]; do case $1 in --out) out=$2; shift ;; --wlan-iso) i=1 ;; --wlan-en) e=1 ;; esac; shift; done
-mkdir -p "$out"; touch "$out/shim-boot-avb.img"; printf '#!/bin/sh\nexit 0\n' >"$out/x_host_test"; chmod +x "$out/x_host_test"
-[ "$i$e" = 11 ] && exit 1
+mkdir -p "$out"; touch "$out/shim-boot-avb.img"; printf '#!/bin/sh\nexit 0\n' >"$out/x_host_test"; chmod +x "$out/x_host_test"; echo x_host_test >"$out/host-tests.list"
+[ "$i$e" = 11 ] && { echo "--wlan-iso cannot be combined with --wlan-en (stub)" >&2; exit 2; }
 [ -n "${STUB_FAIL:-}" ] && [[ $out == *"/$STUB_FAIL-"* ]] && exit 1
 # a commit made while the gate runs (HEAD moves)
 [ -n "${STUB_COMMIT:-}" ] && [[ $out == */build-0 ]] && { cd .. && echo x >new.c && git add new.c && git commit -qm moved; cd shim || exit 1; }
