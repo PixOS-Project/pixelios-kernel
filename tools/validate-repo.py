@@ -137,6 +137,17 @@ def validate_proposals(verbose=False):
     return True
 
 
+def validate_readme(verbose=False):
+    res = subprocess.run([sys.executable, '-B', os.path.join(REPO_ROOT, 'tools/check-readme.py'), REPO_ROOT],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        print(red("[-] README gate failed (tools/check-readme.py):"))
+        print(res.stdout.rstrip() or res.stderr.rstrip())
+        return False
+    print(green("[✓] " + res.stdout.strip().splitlines()[-1]))
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description="Validate repository integrity, patches, and scripts.")
     ap.add_argument('-v', '--verbose', action='store_true', help='Show detailed per-file output')
@@ -147,8 +158,9 @@ def main():
     ok_python = validate_python_scripts(a.verbose)
     ok_shell = validate_shell_scripts(a.verbose)
     ok_props = validate_proposals(a.verbose)
+    ok_readme = validate_readme(a.verbose)
 
-    if ok_patches and ok_python and ok_shell and ok_props:
+    if ok_patches and ok_python and ok_shell and ok_props and ok_readme:
         print(bold(green("\nAll repository integrity checks PASSED successfully!")))
         return 0
     else:
