@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """runs: read-only index over past hardware runs (TP-023). Never touches the phone.
 
-  tools/runs list [--since YYYY-MM-DD] [--kind xrun|probe] [--all-worktrees]
+  tools/runs list [--since YYYY-MM-DD] [--kind xrun|probe] [--all-worktrees] [--strict]
   tools/runs show ID [--all-worktrees]
-  tools/runs stats --form REGEX [--kind K] [--all-worktrees] [--json]
+  tools/runs stats (--form REGEX | --args "BUILD ARGS") [--kind K] [--all-worktrees] [--json]
   tools/runs compare A B [--all-worktrees]
   tools/runs --self-test
 
@@ -13,7 +13,9 @@ xrun: verdict = report.json "result", wall = run.json t_end - t_start (else repo
 probe: verdict = first word after "RESULT:" in report.txt, wall = mtime(usb.txt) - mtime(fboot.log)
   (boot -> last usb line, the TP-015 metric; copies must keep mtimes).
 Label stem = label with trailing "_" removed; --form is a regex searched in the label.
-Last line: RESULT: PASS n=<dirs> unreadable=<k> ; PARTIAL (exit 1) if any dir is unreadable (listed) ; ERROR (exit 2) on bad args.
+probe dirs written since review B2 hold run.args (the probe-run build args); --args matches runs whose args have the same option NAMES
+  (--wlan-link=3 and --wlan-link=9 are one form), because labels are unique per run. Older probe dirs have no run.args and never match.
+Last line: RESULT: PASS n=<dirs> unreadable=<k> (unreadable dirs are listed; many never got a report, review B4) ; with --strict PARTIAL (exit 1) if any is unreadable ; ERROR (exit 2) on bad args.
 Env RUNS_ROOT: use <RUNS_ROOT>/logs instead of the repo's logs/ (tests).
 """
 import argparse, datetime, difflib, json, os, re, statistics, subprocess, sys
@@ -62,6 +64,10 @@ def scan(all_wt, kind=None):
     return found
 
 
+def argkey(raw):
+    return " ".join(sorted({w.split("=")[0].lstrip("-") for w in raw.split()}))
+
+
 def mtime(p):
     return os.stat(p).st_mtime
 
@@ -90,6 +96,10 @@ def load(kind, d):
         if not m2:
             raise ValueError("report.txt has no RESULT line")
         rec["verdict"], rec["reason"], rec["git"], rec["text"] = m2.group(1), m2.group(2).strip(), None, txt
+        try:
+            rec["argkey"] = argkey(open(os.path.join(d, "run.args")).read())
+        except OSError:
+            rec["argkey"] = None
         u, f = os.path.join(d, "usb.txt"), os.path.join(d, "fboot.log")
         if os.path.exists(u) and os.path.exists(f):
             rec["wall"] = max(0.0, mtime(u) - mtime(f))
@@ -113,11 +123,12 @@ def fw(x):
     return "-" if x is None else "%.0fs" % x
 
 
-def finish(n, bad):
+def finish(n, bad, strict=False):
     for b in bad:
         print("unreadable: " + b)
-    print("RESULT: %s n=%d unreadable=%d" % ("PASS" if not bad else "PARTIAL", n, len(bad)))
-    return 0 if not bad else 1
+    part = bool(bad) and strict
+    print("RESULT: %s n=%d unreadable=%d" % ("PARTIAL" if part else "PASS", n, len(bad)))
+    return 1 if part else 0
 
 
 def cmd_list(a):
@@ -130,7 +141,7 @@ def cmd_list(a):
     recs, bad = load_all(a.all_worktrees, a.kind, since)
     for r in recs:
         print("%-44s %-5s %-8s %7s" % (r["id"], r["kind"], r["verdict"], fw(r["wall"])))
-    return finish(len(recs) + len(bad), bad)
+    return finish(len(recs) + len(bad), bad, a.strict)
 
 
 def find(a, ident):
@@ -150,18 +161,23 @@ def cmd_show(a):
 
 
 def cmd_stats(a):
+    if a.form is None and a.args is None:
+        raise Bad("stats needs --form or --args")
     try:
-        rx = re.compile(a.form)
+        rx = re.compile(a.form or "")
     except re.error as e:
         raise Bad("bad --form regex: %s" % e)
     recs, bad = load_all(a.all_worktrees, a.kind)
     groups = {}
     for r in recs:
-        if rx.search(r["label"]):
+        if a.args is not None:
+            if r.get("argkey") and r["argkey"] == argkey(a.args):
+                groups.setdefault("args:" + r["argkey"], []).append(r)
+        elif rx.search(r["label"]):
             groups.setdefault(r["stem"], []).append(r)
     rows = []
     for stem, rs in sorted(groups.items()):
-        c = {"PASS": 0, "FAIL": 0, "HANG": 0, "ERROR": 0, "other": 0}
+        c = {"PASS": 0, "FAIL": 0, "HANG": 0, "TIMEOUT": 0, "ERROR": 0, "other": 0}
         for r in rs:
             c[r["verdict"] if r["verdict"] in c else "other"] += 1
         w = sorted(r["wall"] for r in rs if r["wall"] is not None)
@@ -169,10 +185,10 @@ def cmd_stats(a):
     if a.json:
         print(json.dumps(rows))
     else:
-        print("%-28s %3s %5s %5s %5s %5s %5s %7s %7s" % ("stem", "n", "PASS", "FAIL", "HANG", "ERROR", "other", "p50", "max"))
+        print("%-28s %3s %5s %5s %5s %7s %5s %5s %7s %7s" % ("stem", "n", "PASS", "FAIL", "HANG", "TIMEOUT", "ERROR", "other", "p50", "max"))
         for x in rows:
-            print("%-28s %3d %5d %5d %5d %5d %5d %7s %7s" % (x["stem"], x["n"], x["PASS"], x["FAIL"], x["HANG"], x["ERROR"], x["other"], fw(x["p50"]), fw(x["max"])))
-    return finish(len(recs) + len(bad), bad)
+            print("%-28s %3d %5d %5d %5d %7d %5d %5d %7s %7s" % (x["stem"], x["n"], x["PASS"], x["FAIL"], x["HANG"], x["TIMEOUT"], x["ERROR"], x["other"], fw(x["p50"]), fw(x["max"])))
+    return finish(len(recs) + len(bad), bad, a.strict)
 
 
 def cmd_compare(a):
@@ -184,7 +200,7 @@ def cmd_compare(a):
         print("%-8s %s | %s%s" % (f, str(vx)[:70], str(vy)[:70], "" if vx == vy else "   <-- differs"))
     d = list(difflib.unified_diff(x["text"].splitlines(), y["text"].splitlines(), x["id"], y["id"], lineterm="", n=0))
     print("\n".join(l[:160] for l in d[:40]))
-    return finish(2, b1 + b2)
+    return finish(2, b1 + b2, a.strict)
 
 
 def parser():
@@ -193,9 +209,10 @@ def parser():
     sp = p.add_subparsers(dest="cmd")
     com = argparse.ArgumentParser(add_help=False)
     com.add_argument("--all-worktrees", action="store_true")
+    com.add_argument("--strict", action="store_true")
     s = sp.add_parser("list", parents=[com]); s.add_argument("--since"); s.add_argument("--kind", choices=list(KINDS))
     s = sp.add_parser("show", parents=[com]); s.add_argument("id")
-    s = sp.add_parser("stats", parents=[com]); s.add_argument("--form", required=True); s.add_argument("--kind", choices=list(KINDS)); s.add_argument("--json", action="store_true")
+    s = sp.add_parser("stats", parents=[com]); s.add_argument("--form"); s.add_argument("--args"); s.add_argument("--kind", choices=list(KINDS)); s.add_argument("--json", action="store_true")
     s = sp.add_parser("compare", parents=[com]); s.add_argument("a"); s.add_argument("b")
     return p
 

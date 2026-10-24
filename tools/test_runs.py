@@ -77,9 +77,32 @@ class T(unittest.TestCase):
     def test_unreadable(self):
         os.makedirs(os.path.join(self.r, "logs", "runs", "20261025T100000Z-broken"))
         rc, out = self.run_tool("list")
-        self.assertEqual(rc, 1, out)
+        self.assertEqual(rc, 0, out)   # review B4: runs that died before a report never become readable: not a failure by default
         self.assertIn("unreadable: 20261025T100000Z-broken", out)
+        self.assertIn("RESULT: PASS n=4 unreadable=1", out)
+        rc, out = self.run_tool("list", "--strict")
+        self.assertEqual(rc, 1, out)
         self.assertIn("RESULT: PARTIAL n=4 unreadable=1", out)
+
+    def test_stats_args_form_and_timeout_column(self):   # review B2/B5
+        for n, v in (("8", "PASS"), ("9", "TIMEOUT")):
+            probe(self.r, "20261026T10000%sZ-w3a-n%s" % (n, n), v, 100)
+            put(os.path.join(self.r, "logs", "probe", "20261026T10000%sZ-w3a-n%s" % (n, n), "run.args"), "--wlan-link=%s --wlan-probe\n" % n)
+        rc, out = self.run_tool("stats", "--args=--wlan-probe --wlan-link=3", "--json")
+        self.assertEqual(rc, 0, out)
+        rows = json.loads(out.splitlines()[0])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["n"], rows[0]["PASS"], rows[0]["TIMEOUT"], rows[0]["other"]), (2, 1, 1, 0))
+        rc, out = self.run_tool("stats", "--args=--nothing", "--json")
+        self.assertEqual(json.loads(out.splitlines()[0]), [])
+
+    def test_xrun_wall_fallback_to_waited(self):   # review B6
+        d = os.path.join(self.r, "logs", "runs", "20261027T100000Z-nowall")
+        xrun(self.r, "20261027T100000Z-nowall", "PASS", 1, 2)
+        os.remove(d + "/run.json")
+        rc, out = self.run_tool("list", "--kind", "xrun")
+        self.assertIn("nowall", out)
+        self.assertRegex(out, r"nowall\s+xrun\s+PASS\s+1s")
 
     def test_bad_args(self):
         for a in (["stats"], ["bogus"], [], ["list", "--since", "x"], ["stats", "--form", "("]):
