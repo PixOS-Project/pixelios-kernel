@@ -118,6 +118,15 @@ class Memo(unittest.TestCase):
         self.assertEqual(self.calls, 2)
         self.assertFalse(list((self.t / "cache").glob("*.json")))
 
+    def test_pathlib_glob_not_stored(self):
+        (self.t / "d" / "a").mkdir(parents=True)
+        def g():
+            self.calls += 1
+            return [str(x) for x in (self.t / "d").glob("*/board.json")] + [str(x) for x in (self.t / "d").rglob("board.json")]
+        self.go(g, name="pg"); self.go(g, name="pg")
+        self.assertEqual(self.calls, 2)
+        self.assertFalse(list((self.t / "cache").glob("*.json")))
+
     def test_missing_dir_listing_is_an_input(self):
         def g():
             self.calls += 1

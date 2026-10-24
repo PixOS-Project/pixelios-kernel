@@ -10,7 +10,7 @@ Paths under the repo root (parent of tools/) are stored relative to it, so workt
 Never stored: a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
-a listing by fd or with root_dir/dir_fd is not storable. A failed open of a missing file or an existence check (os.stat) is NOT tracked. Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
+a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. A failed open of a missing file or an existence check (os.stat) is NOT tracked. Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
 Cache dir: $PIXELIOS_AUDIT_MEMO_DIR, else ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit. Off: PIXELIOS_AUDIT_NO_MEMO=1|true|yes (any case; anything else keeps the memo on) or disable().
 ponytail: stdlib modules already imported are not recorded as deps (python version is in the key); no cache pruning.
 """
@@ -56,6 +56,8 @@ def _hook(event, args):
     r = _stack[-1]
     if event in _SPAWN:
         r["spawn"] = event
+    elif event in ("pathlib.Path.glob", "pathlib.Path.rglob"):  # existence checks of literal segments are not audited: fail closed
+        r["nolist"] = event
     elif event == "glob.glob/2":  # (pathname, recursive, root_dir, dir_fd)
         if args[2] is not None or args[3] is not None:
             r["nolist"] = event
