@@ -8,7 +8,15 @@ CHECK_ALL=${CHECK_ALL:-$tools/check-all.sh}
 set -m
 T=$(mktemp -d)
 # leftovers of a broken gate (recorded pids only) must not outlive the test
-trap 'for f in "$T"/*.pids/pids; do kill -KILL $(tr -s " \n" "  " <"$f") 2>/dev/null; done; rm -rf "$T"' EXIT
+cleanup() {
+	local f
+	for f in "$T"/*.pids/pids; do
+		# shellcheck disable=SC2046  # the pid list is word-split on purpose
+		kill -KILL $(tr -s " \n" "  " <"$f") 2>/dev/null
+	done
+	rm -rf "$T"
+}
+trap cleanup EXIT
 fail=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
@@ -17,7 +25,7 @@ chk() { if eval "$2"; then ok "$1"; else bad "$1 [$2]"; fi; }
 mkrepo() { # DIR: a repo with the files the gate's steps call, all stubs
 	local d=$1; mkdir -p "$d/tools" "$d/shim"; cd "$d" || exit 2
 	git init -q . && git config user.email t@t && git config user.name t
-	cp "$CHECK_ALL" tools/check-all.sh; cp "$tools/gate_select.py" tools/
+	cp "$CHECK_ALL" tools/check-all.sh; cp "$tools/gate_select.py" "$tools/shell-files" tools/
 	printf 'shim/out/\n__pycache__/\n' >.gitignore
 	cat >shim/build.sh <<'S'
 #!/bin/bash
@@ -49,7 +57,7 @@ S
 	mkdir -p "$STUB_PIDS"
 }
 alive() { local p; for p in $(tr -s ' \n' '  ' <"$STUB_PIDS/pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
-waitfor() { local i; for i in $(seq 100); do eval "$1" && return 0; sleep 0.1; done; return 1; }
+waitfor() { local _; for _ in $(seq 100); do eval "$1" && return 0; sleep 0.1; done; return 1; }
 res() { cat shim/out/gate.result 2>/dev/null; }
 
 interrupt_case() { # NAME SIGNAL(INT = whole process group, TERM = pid only) UP-MARKER env...
@@ -77,6 +85,7 @@ interrupt_case serial TERM build STUB_SLEEP=build
 gate() { bash tools/check-all.sh "$@" >"$T/gate.out" 2>&1; echo $? >"$T/gate.rc"; }
 export STUB_PIDS=$T/st.pids; mkrepo "$T/st"
 gate; chk "full PASS" 'grep -Eq "^GATE PASS [0-9a-f]+$" "$T/gate.out"'
+# shellcheck disable=SC2034  # head1 is read by chk through eval
 head1=$(git rev-parse HEAD)
 chk "full PASS stamps HEAD" '[ "$(cat shim/out/gate.stamp)" = "$head1" ]'
 echo '# doc' >>.gitignore; git commit -qam doc

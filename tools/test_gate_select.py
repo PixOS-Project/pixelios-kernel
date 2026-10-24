@@ -22,6 +22,12 @@ class Select(unittest.TestCase):
         self.assertIn("build", g.select(["tools/boards.py"]))
         self.assertNotIn("build", g.select(["tools/qrmerge.py"]))
 
+    def test_shell_scripts_select_shellcheck(self):
+        for f in ("tools/check-all.sh", "tools/xrun", "xnu/patches/0019-stage-libpthread.sh", "tools/shell-files"):
+            self.assertIn("shellcheck", g.select([f]), f)
+        for f in ("tools/qrmerge.py", "docs/HANDOFF.md", "shim/ufs.c", "tools/gone-away.sh.bak"):
+            self.assertNotIn("shellcheck", g.select([f]), f)
+
     def test_shim_markdown_selects_no_build(self):
         self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate"])
 

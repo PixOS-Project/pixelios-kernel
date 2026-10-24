@@ -4,9 +4,10 @@ Usage: gate_select.py STAMP_FILE   -> prints the steps to run (space separated),
 import pathlib, re, subprocess, sys
 
 ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-gpupower", "build-gpuclk", "build-gpurails", "build-gpurailon", "build-gpujob", "build-touch", "build-udump", "host-tests", "boot-safety",
-       "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"]
+       "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate", "shellcheck"]
 SHIM = ALL[:14]
-BUILD_SH = pathlib.Path(__file__).resolve().parent.parent / "shim" / "build.sh"
+REPO = pathlib.Path(__file__).resolve().parent.parent
+BUILD_SH = REPO / "shim" / "build.sh"
 
 
 def shim_build_inputs():
@@ -23,6 +24,18 @@ SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/t
 UNIT_PREFIX = ("tools/", "soc/", "device/", "qrlog/", "xnu/qr/", "xnu/patches/0081", "xnu/patches/0086", "xnu/patches/0094")
 
 
+def is_shell(f):
+    """Same rule as tools/shell-files: *.sh or a sh/bash/dash shebang on line 1 (the file may be gone: deleted files select nothing)."""
+    if f.endswith(".sh"):
+        return True
+    try:
+        with open(REPO / f, "rb") as fh:
+            first = fh.readline(80)
+    except OSError:
+        return False
+    return re.match(rb"#!\s*(/usr/bin/env\s+)?(/[a-z/]*/)?(ba|da)?sh(\s|$)", first) is not None
+
+
 def select(files):
     """Steps needed for this list of changed paths. validate (patch numbering, headers, script syntax) and public-split (every
     tracked file assigned to a public repo, ~1 s) always run."""
@@ -30,6 +43,8 @@ def select(files):
     for f in files:
         if f.startswith(SHIM_PREFIX) and not (f.startswith("shim/") and f.endswith(".md")):
             need.update(SHIM)
+        if is_shell(f):
+            need.add("shellcheck")
         if f.startswith(UNIT_PREFIX):
             need.update(("unit", "phone-state", "hang-recover", "probe-run", "rootless"))
     return [s for s in ALL if s in need]
