@@ -20,9 +20,10 @@ LEAKS = [
     (re.compile(r"(?<!\d)\d{15}(?!\d)"), "15-digit number (IMEI?)"),
     (re.compile(r"(?i)\bserial(?:no| number)?\s*[:=]\s*[A-Z0-9]{8,}\b"), "device serial"),
     (re.compile(r"pixelios-artifacts"), "private artifacts name"),
-    (re.compile(r"(?<![\w.+-])(?!git@)[\w.+-]+@[\w-]+\.[\w.-]+"), "e-mail address"),
+    (re.compile(r"(?<![\w.+/-])(?!git@)[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b(?![\w/-])"), "e-mail address"),
     (re.compile(r"\.env\b"), ".env file"),
 ]
+IMGEXT = {"png", "jpg", "jpeg", "gif", "svg", "webp"}  # logo@2x.png is an image name, not an address
 LINK = re.compile(r"\]\(\s*<?([^)\s>]+)")
 REFLINK = re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)")
 HTMLREF = re.compile(r"""(?:src|href)=["']([^"']+)["']""")
@@ -160,7 +161,7 @@ def check_file(root, rel, idx, gen, private, off):
             add(run[0][0], "cmd", "shell fence does not parse: " + (r.stderr.strip().splitlines() or ["?"])[0].split(": ", 1)[-1])
         for n, ln in run:
             s = ln.strip().lstrip("$ ").strip()
-            cmdwords = set()
+            cmdwords, cwd = set(), ""
             for seg in SEP.split(s.split(" #")[0] if not s.startswith("#") else ""):
                 ws = seg.split()
                 interp = False
@@ -168,20 +169,28 @@ def check_file(root, rel, idx, gen, private, off):
                     interp = interp or ws[0] in ("python3", "python", "bash", "sh")
                     ws = ws[1:]
                 w = ws[0] if ws else ""
+                if w == "cd" and len(ws) > 1:
+                    cwd = ws[1].strip("'\"")
+                    continue
                 if interp or "/" not in w or w.startswith(("/", "~")) or "=" in w:
                     continue
                 w = w[2:] if w.startswith("./") else w
                 if w in gen or "/out/" in w or w.startswith("-"):
                     continue
                 cmdwords.add(w)
+                if cwd and "$" not in cwd and not cwd.startswith(("/", "~", "-")):
+                    w = os.path.normpath(os.path.join(cwd, w))
+                cmdwords.add(w)
                 if idx.get(w) != "100755":
                     add(n, "cmd", "fenced command is not an executable tracked file: " + w)
             for t in ln.split():  # K2: every word, comments included, must name an existing path
+                if "$" in t:
+                    continue
                 t = t.strip("()[]{}<>,.;:'\"`$")
                 t = t[2:] if t.startswith("./") else t
                 if t in cmdwords or t in gen or "/out/" in t or not PATHTOK.match(t):
                     continue
-                if not present(idx, dirs, t):
+                if not present(idx, dirs, t) and not (cwd and present(idx, dirs, os.path.normpath(os.path.join(cwd, t)))):
                     add(n, "path", "fenced path does not exist: " + t)
     if not private:
         for n, text, li, hw in units(lines):
@@ -190,6 +199,8 @@ def check_file(root, rel, idx, gen, private, off):
         for n, ln, fenced, _ in split(lines):
             for rx, what in LEAKS:
                 for m in rx.finditer(ln):
+                    if what == "e-mail address" and m.group(0).rsplit(".", 1)[-1].lower() in IMGEXT:
+                        continue
                     add(n, "leak", what + ": " + m.group(0)[:40])
     return out
 
@@ -220,7 +231,7 @@ def run(root, private=False, off=frozenset()):
     ents, used, nknown, res = known_entries(root), set(), 0, []
     keys = {}
     for n, f in ents:
-        if f and f[1] != "leak":
+        if f and (f[1] != "leak" or f[2].startswith("e-mail address: ")):
             keys.setdefault((f[0], f[1], f[2]), []).append(n)
     for fnd in found:
         k = (fnd[0], fnd[2], fnd[3])
@@ -233,8 +244,8 @@ def run(root, private=False, off=frozenset()):
         for n, f in ents:
             if f is None:
                 res.append(("tools/check-readme.known", n, "stale", "malformed entry (need file, rule, message, date, reason)"))
-            elif f[1] == "leak":
-                res.append(("tools/check-readme.known", n, "stale", "leak findings cannot be allowlisted, rule 4"))
+            elif f[1] == "leak" and not f[2].startswith("e-mail address: "):
+                res.append(("tools/check-readme.known", n, "stale", "only e-mail address leaks can be allowlisted (exact text), rule 4"))
             elif n not in used:
                 res.append(("tools/check-readme.known", n, "stale", "entry no longer matches a finding: %s %s" % (f[0], f[2])))
     return res, len(files), nknown
@@ -292,6 +303,11 @@ def _fixtures(b):
         "known-once": fx("knownonce", "[c](docs/CASE_STUDY.md)\n[d](docs/CASE_STUDY.md)\n", kn(L)),
         "leak-email": fx("leakemail", "mail a@b.com and c@d.org\n"),
         "leak-known": fx("leakknown", "mail a@b.com\n", kn(("README.md", "leak", "e-mail address: a@b.com", "2026-10-24", "why"))),
+        "leak-fp": fx("leakfp", "see logo@2x.png, uses actions/checkout@v4.1.1 and foo@1.2.3\n"),
+        "leak-path-known": fx("leakpathknown", "see ~/x\n", kn(("README.md", "leak", "local path: ~/", "2026-10-24", "why"))),
+        "link-dotdot": fx("linkdotdot", "[x](../outside.md)\n"),
+        "k2-env": fx("k2env", '```sh\nls "$HOME/pixelios"\n```\n'),
+        "k2-cd": fx("k2cd", "```sh\ncd shim && ./build.sh\n```\n", {"shim/build.sh": "#!/bin/sh\n"}, execs=("tools/ok.sh", "shim/build.sh")),
     }
 
 
@@ -309,9 +325,17 @@ def _tests(fx):
         ("works-undated", ["works"], False), ("k2", ["path"], False), ("cmd-prefix", ["cmd", "cmd", "path"], False),
         ("untracked", ["link", "path"], False), ("known-4col", ["link", "stale"], False),
         ("known-baddate", ["link", "stale"], False), ("known-once", ["link"], False),
-        ("leak-email", ["leak", "leak"], False), ("leak-known", ["leak", "stale"], False),
+        ("leak-email", ["leak", "leak"], False), ("leak-known", [], False),
+        ("leak-fp", [], False), ("leak-path-known", ["leak", "stale"], False), ("link-dotdot", ["link"], False),
+        ("k2-env", [], False), ("k2-cd", [], False),
     ]
-    return [f"{n}{'/private' if p else ''}" for n, w, p in want if rules(n, p) != w]
+    bad = [f"{n}{'/private' if p else ''}" for n, w, p in want if rules(n, p) != w]
+    ms = [f[3] for f in run(fx["leak-email"])[0]]  # C3: the message carries the matched text
+    if ms != ["e-mail address: a@b.com", "e-mail address: c@d.org"]:
+        bad.append("leak-message")
+    if run(fx["leak-known"])[2] != 1:
+        bad.append("leak-known-count")
+    return bad
 
 
 def self_test():
