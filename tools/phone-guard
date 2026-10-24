@@ -3,14 +3,17 @@
 
 The tools (xrun, probe-run, fboot.sh, fflash-userdata.sh, phone) hold the phone lock and check bluejay; a raw `fastboot flash ...` or
 `adb reboot ...` in an agent's Bash call skips both. Read-only queries (fastboot devices/getvar, adb devices/get-state) pass.
+A guard rail against accidents, NOT a sandbox: indirection (variables, $(...), python subprocess) is not followed.
 Stdin: the hook JSON. Stdout: a deny decision, or nothing (allow). Always exit 0. Test: tools/test_phone_guard.py.
 Wire it in .claude/settings.json: hooks.PreToolUse[{matcher "Bash", command "python3 $CLAUDE_PROJECT_DIR/pixos-project/pixelios-kernel/tools/phone-guard"}].
 """
 import json, os, re, shlex, sys
 
 READ_ONLY = {"fastboot": {"devices", "getvar", "--version", "version", "help", "--help"},
-             "adb": {"devices", "get-state", "version", "--version", "help", "--help", "start-server", "kill-server", "get-serialno"}}
-WRAP = {"sudo", "env", "command", "exec", "nohup", "time", "timeout", "nice", "stdbuf"}
+             "adb": {"devices", "get-state", "version", "--version", "help", "--help", "start-server", "kill-server", "get-serialno",
+                     "wait-for-device", "logcat", "pull"}}
+WRAP = {"sudo", "env", "exec", "nohup", "time", "timeout", "nice", "stdbuf", "setsid", "xargs", "watch"}
+KEYWORDS = {"then", "do", "else", "elif", "while", "until", "if", "!", "{", "}"}
 FLAG_ARG = {"-s", "-t", "-H", "-P", "-p"}  # global options that take a value
 WHY = ("hand-typed %s: use the built tools (tools/xrun, tools/probe-run, tools/fboot.sh, tools/fflash-userdata.sh, tools/phone) -- they hold the "
        "phone lock and verify bluejay (AGENTS.md 'Use the tools'). Read-only queries (fastboot devices|getvar, adb devices|get-state) are allowed.")
@@ -41,23 +44,35 @@ def segments(cmd):
         yield seg
 
 
-def offending(cmd):
-    """first raw mutating fastboot/adb invocation in CMD, or None."""
+def offending(cmd, depth=0):
+    """first raw mutating fastboot/adb invocation in CMD (also inside bash -c / eval strings), or None."""
     for w in segments(cmd):
         i = 0
         while i < len(w):
             t = w[i]
-            if re.match(r"^[A-Za-z_]\w*=", t) or t in WRAP or (t.startswith("-") and i) or (i and re.fullmatch(r"\d+[smhd]?", t)):
+            b = os.path.basename(t)
+            if b in KEYWORDS or b in WRAP or re.match(r"^[A-Za-z_]\w*=", t) or (t.startswith("-") and i) or (i and re.fullmatch(r"\d+[smhd]?", t)):
+                if b in ("sudo", "env") and w[i + 1:i + 2] and w[i + 1] in ("-u", "-g", "-C", "-h", "-p", "-U"):
+                    i += 2  # skip the option and its value; the final i += 1 skips the wrapper itself
                 i += 1
                 continue
             break
         if i >= len(w):
             continue
         prog = os.path.basename(w[i])
+        rest = w[i + 1:]
+        if prog in ("bash", "sh", "zsh", "dash", "eval", "ssh") and depth < 3:
+            for k, x in enumerate(rest):
+                if prog == "eval" or x in ("-c", "-lc", "-ic") or (prog == "ssh" and k > 0):
+                    inner = " ".join(rest[k + (prog != "eval"):]) if prog in ("eval", "ssh") else " ".join(rest[k + 1:k + 2])
+                    bad = offending(inner, depth + 1)
+                    if bad:
+                        return bad
+                    break
+            continue
         if prog not in READ_ONLY:
             continue
-        rest, sub = w[i + 1:], None
-        j = 0
+        sub, j = None, 0
         while j < len(rest):
             if rest[j] in FLAG_ARG:
                 j += 2
@@ -66,8 +81,9 @@ def offending(cmd):
             else:
                 sub = rest[j]
                 break
-        if sub not in READ_ONLY[prog]:
-            return " ".join([prog] + rest[:3])
+        if sub in READ_ONLY[prog] or (prog == "adb" and sub == "shell" and rest[j + 1:j + 2] in (["getprop"],)):
+            continue
+        return " ".join([prog] + rest[:3])
     return None
 
 

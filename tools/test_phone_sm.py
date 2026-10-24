@@ -44,9 +44,9 @@ class PhoneStateMachineTest(unittest.TestCase):
         self.env["PHONE_STATE_TEST_DIR"] = self.test_dir
         # TP-020: goto needs the phone lock; the tests hold their own, in a temp dir
         self.env["PHONE_LOCK_DIR"] = os.path.join(self.test_dir, "phone.lock")
-        self.env["PHONE_OWNER"] = "sm-test"
+        self.env["PHONE_LOCK_TOKEN"] = "sm-test-token"
         self.lock_tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phone-lock")
-        subprocess.run([self.lock_tool, "acquire", "--owner", "sm-test"], env=self.env, capture_output=True, check=True)
+        subprocess.run([self.lock_tool, "acquire", "--owner", "sm-test", "--token", "sm-test-token"], env=self.env, capture_output=True, check=True)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -343,7 +343,7 @@ esac
     # 11. TP-020: no lock, no command
     def test_11_goto_needs_the_lock(self):
         self.set_state({"state": "recovery", "product": "bluejay"})
-        subprocess.run([self.lock_tool, "release", "--owner", "sm-test"], env=self.env, capture_output=True, check=True)
+        subprocess.run([self.lock_tool, "release", "--token", "sm-test-token"], env=self.env, capture_output=True, check=True)
         res = self.run_phone("goto", "fastboot", "--timeout", "5")
         self.assertEqual(res.returncode, 2)
         self.assertIn("REFUSED: the phone lock is not held", res.stdout)

@@ -68,11 +68,13 @@ class T(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("takeover", r.stdout)
 
-    def test_same_owner_refresh(self):
-        self.pl("acquire", "--owner", "a", "--ttl", "100")
-        r = self.pl("acquire", "--owner", "a", "--ttl", "200")
+    def test_same_label_is_busy_same_token_refreshes(self):
+        # TP-020 F2: the owner name is a label; two agents sharing it must not both hold the lock
+        self.pl("acquire", "--owner", "a", "--token", "T1", "--pid", str(os.getpid()))
+        self.assertEqual(self.pl("acquire", "--owner", "a", "--pid", str(os.getpid())).returncode, 1)
+        r = self.pl("acquire", "--owner", "a", "--token", "T1", "--pid", str(os.getpid()))
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(self.info()["ttl"], 200)
+        self.assertIn("already held", r.stdout)
 
     def test_wrong_owner_release_and_force(self):
         self.pl("acquire", "--owner", "a")
@@ -129,25 +131,80 @@ class T(unittest.TestCase):
         self.assertIn("held by a", self.pl("status").stdout)
 
     def test_check(self):
-        self.assertEqual(self.pl("check", "--owner", "a").returncode, 1)  # no lock
-        self.pl("acquire", "--owner", "a")
-        self.assertEqual(self.pl("check", "--owner", "a").returncode, 0)
-        self.assertEqual(self.pl("check", "--owner", "b").returncode, 1)  # someone else's
-        self.assertEqual(self.pl("check").returncode, 0)  # no owner known: transition rule accepts a live lock, with a warning
-        self.assertIn("owner unknown", self.pl("check").stdout)
-        self.env["PHONE_OWNER"] = "a"
-        self.assertEqual(self.pl("check").returncode, 0)
-        self.env["PHONE_LOCK_OWNER"] = "b"  # PHONE_LOCK_OWNER wins
-        self.assertEqual(self.pl("check").returncode, 1)
+        env_a = dict(self.env, PHONE_LOCK_TOKEN="TA")
+        self.assertEqual(self.pl("check").returncode, 1)  # no lock
+        self.pl("acquire", "--owner", "a", "--token", "TA", "--pid", str(os.getpid()))
+        r = self.pl("check")  # a shell without the token: the F1 case, must NOT pass while someone holds the lock
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no token", r.stdout)
+        self.assertEqual(self.pl("check", "--token", "TB").returncode, 1)  # wrong token
+        self.assertEqual(self.pl("check", "--token", "TA").returncode, 0)
+        self.env = env_a
+        self.assertEqual(self.pl("check").returncode, 0)  # token from the environment
 
     def test_check_stale(self):
-        self.pl("acquire", "--owner", "a", "--ttl", "1")
+        self.pl("acquire", "--owner", "a", "--ttl", "1", "--token", "TA")
         time.sleep(1.5)
-        self.assertEqual(self.pl("check", "--owner", "a").returncode, 1)
+        self.assertEqual(self.pl("check", "--token", "TA").returncode, 1)
 
-    def test_run_exports_owner(self):
-        r = self.pl("run", "--owner", "a", "--", sys.executable, TOOL, "check")  # inner check sees PHONE_LOCK_OWNER=a
+    def test_run_exports_token(self):
+        r = self.pl("run", "--owner", "a", "--", sys.executable, TOOL, "check")  # inner check sees PHONE_LOCK_TOKEN
         self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(self.pl("check").returncode, 1)  # and a plain shell still does not pass (lock is free here)
+
+    def test_run_inner_cannot_be_impersonated(self):
+        # while `run` holds the lock, a second shell with the same label but no token fails the check
+        p = subprocess.Popen([sys.executable, TOOL, "run", "--owner", "a", "--", "sleep", "30"], env=self.env, stdout=subprocess.PIPE, text=True)
+        for _ in range(100):
+            if os.path.exists(os.path.join(self.lock, "info.json")) and self.info().get("pgid"):
+                break
+            time.sleep(0.05)
+        try:
+            self.env["PHONE_OWNER"] = "a"
+            self.assertEqual(self.pl("check").returncode, 1)
+        finally:
+            p.send_signal(signal.SIGTERM)
+            p.communicate(timeout=10)
+
+    def test_sigkill_of_run_does_not_free_the_phone(self):
+        # TP-020 F3: the child (xrun's fastboot) outlives a SIGKILLed `run`; the lock stays until the group is gone
+        p = subprocess.Popen([sys.executable, TOOL, "run", "--owner", "a", "--", "sleep", "30"], env=self.env, stdout=subprocess.PIPE, text=True)
+        for _ in range(100):
+            if os.path.exists(os.path.join(self.lock, "info.json")) and self.info().get("pgid"):
+                break
+            time.sleep(0.05)
+        pgid = self.info()["pgid"]
+        p.kill(); p.wait()
+        try:
+            self.assertEqual(self.pl("acquire", "--owner", "b").returncode, 1)
+        finally:
+            os.killpg(pgid, signal.SIGKILL)
+        time.sleep(0.3)
+        self.assertEqual(self.pl("acquire", "--owner", "b").returncode, 0)
+
+    def test_free_lock_with_ghost_queue_head_does_not_spin(self):
+        # TP-020 F6: a live-pid ticket that never takes the lock must not hang other acquirers past their wait
+        os.makedirs(self.lock + ".queue")
+        open(os.path.join(self.lock + ".queue", "%020d-%d-ghost" % (time.time_ns(), os.getpid())), "w").close()
+        t = time.time()
+        r = self.pl("acquire", "--owner", "x", "--wait", "1")
+        self.assertEqual(r.returncode, 1)
+        self.assertLess(time.time() - t, 5)
+        self.assertIn("queue head", r.stdout)
+
+    def test_stale_takeover_never_removes_a_different_lock(self):
+        # TP-020 F5: decided stale on an old read, but the lock was replaced by a live one meanwhile
+        os.environ["PHONE_LOCK_DIR"] = self.lock
+        import importlib.machinery
+        pl = importlib.machinery.SourceFileLoader("pl_mod", TOOL).load_module()
+        os.makedirs(self.lock)
+        old = {"owner": "dead", "token": "T0", "pid": 0, "pgid": 0, "start": 1, "ttl": 1, "cmd": "x"}
+        pl.write("new", os.getpid(), 100, "y", "T1")
+        self.assertFalse(pl.take_over_stale(old))
+        self.assertEqual(self.info()["token"], "T1")
+        pl.write("dead", 0, 1, "x", "T0")
+        self.assertTrue(pl.take_over_stale(pl.read()))
+        self.assertFalse(os.path.exists(self.lock))
 
     def test_waiters_served_in_order(self):
         self.pl("acquire", "--owner", "a")
@@ -184,6 +241,27 @@ class T(unittest.TestCase):
         w.kill(); w.wait()
         self.pl("release", "--owner", "a")
         self.assertEqual(self.pl("acquire", "--owner", "c").returncode, 0)
+
+
+    def sh(self, script, *pre):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return subprocess.run([*pre, "bash", "-c", ". tools/plock.sh; " + script], cwd=root, env=self.env, capture_output=True, text=True, timeout=30)
+
+    def test_plock_take_and_drop(self):
+        r = self.sh('plock_take t 0 || exit 9; tools/phone-lock check >/dev/null || exit 8; echo took=$PLOCK_TOOK; plock_drop; test ! -e "$PHONE_LOCK_DIR"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("took=1", r.stdout)
+
+    def test_plock_take_busy_and_under_run(self):
+        self.pl("acquire", "--owner", "other", "--pid", str(os.getpid()))
+        r = self.sh("plock_take t 0; echo rc=$?; echo $PLOCK_MSG")
+        self.assertIn("rc=1", r.stdout)
+        self.assertIn("busy", r.stdout)
+        self.pl("release", "--owner", "other")
+        # already held by an outer run: no second lock, no release of the outer one
+        r = self.pl("run", "--owner", "o", "--", "bash", "-c", '. tools/plock.sh; plock_take t 0; echo took=$PLOCK_TOOK; plock_drop; tools/phone-lock check >/dev/null && echo still-held')
+        self.assertIn("took=0", r.stdout)
+        self.assertIn("still-held", r.stdout)
 
 
 if __name__ == "__main__":

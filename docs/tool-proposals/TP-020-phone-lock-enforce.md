@@ -7,7 +7,7 @@ date: 2026-10-24
 exposed_by: "user request 2026-10-24 after the GPU agent offered the phone and asked for a 35 min slot: the lock was held across builds and nothing enforced it"
 extends: "TP-016"
 related: "TP-018"
-usage: "tools/phone-lock check [--owner N] [--strict]; xrun/probe-run --lock-wait S; tools/phone-guard (hook)"
+usage: "tools/phone-lock check [--token T]; xrun/probe-run --lock-wait S; tools/phone-guard (hook)"
 refs: "-"
 ---
 
@@ -18,10 +18,10 @@ Read `tools/phone-lock`, `probe-run`, `xrun`, `fboot.sh`, `fflash-userdata.sh`, 
 The phone sat locked and idle for the build of every run (a shim build is ~15-70 s, a kernel image build + mkadt more) and for gate runs wrapped in `run`; agents coordinated by message instead of a queue (the GPU agent's 'tell me when a long slot is free'). A live holder could lose the lock after 30 min. Raw device commands bypassed both lock and bluejay check.
 
 ## output
-`phone-lock check` prints the reason and `RESULT: PASS|FAIL owner=N held_for=Ns`, exit 0 only if the caller holds a live lock (with no known owner a live lock of anyone is accepted with a warning during the transition; `--strict` refuses). Guarded tools exit 1/2 with `REFUSED: the phone lock is not held ...`. xrun/probe-run report `ERROR phone lock busy: held by X ... queue=...`. `phone-guard` is a PreToolUse hook: a deny decision with the reason, never an error. Wired in the super repo's `.claude/settings.json`.
+`phone-lock check` prints the reason and `RESULT: PASS|FAIL owner=N held_for=Ns`, exit 0 only if the caller's token (`$PHONE_LOCK_TOKEN`, exported by `run`, xrun and probe-run) is the live lock's; the owner name is only a label (review 11 F1/F2). Guarded tools exit 1/2 with `REFUSED: the phone lock is not held ...`. xrun/probe-run report `ERROR phone lock busy: held by X ... queue=...`. `phone-guard` is a PreToolUse hook: a deny decision with the reason, never an error. Wired in the super repo's `.claude/settings.json`.
 
 ## risks
-No device touched by the lock code. Behaviour changes for other agents: fboot/fflash/phone goto refuse without the lock (set `PHONE_OWNER`); a stuck live pid now keeps the lock until `force-release --yes` (the ttl no longer frees it). The hook blocks hand-typed mutating device commands (quoted text and heredoc bodies are ignored; an unbalanced quote is judged as far as it parses); read-only queries pass. Hooks load at session start: running sessions are not guarded until restarted.
+No device touched by the lock code. Behaviour changes for other agents: fboot/fflash/phone goto/run-probe/pstore-pull run refuse without the token (wrap manual slots in `phone-lock run`); a stuck live pid now keeps the lock until `force-release --yes` (the ttl no longer frees it). The hook blocks hand-typed mutating device commands (quoted text and heredoc bodies are ignored; an unbalanced quote is judged as far as it parses); read-only queries pass. Hooks load at session start: running sessions are not guarded until restarted.
 
 ## amendments
-(none)
+- 2026-10-24 Claude Sonnet 5.5: review 11 (`docs/reviews/11-phone-lock-enforce.md`, UNSAFE on 97f666a: no-owner check passed any live lock, shared owner names, SIGKILLed `run` freed the phone, xrun released early) fixed: token identity, process-group liveness, mutex-verified stale takeover, queue deadline, xrun keeps the lock to exit, guards in run-probe.sh and pstore-pull.py, wider phone-guard. Re-review pending.

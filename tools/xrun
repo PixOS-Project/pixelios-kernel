@@ -36,8 +36,9 @@ D=logs/runs/$(date -u +%Y%m%dT%H%M%SZ)-$label; mkdir -p "$D/snaps" "$D/frames"; 
 secs=${restart%%,*}; [ -n "$duration" ] || duration=$(( ${secs:-60} + 300 ))
 . tools/plock.sh
 cap=""; usbpid=""
-cleanup() { touch "$D/stop"; plock_drop; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
+stop_capture() { touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
 	[ -z "$cap" ] || { sleep 1; kill "$cap" 2>/dev/null || true; wait "$cap" 2>/dev/null || true; }; }
+cleanup() { stop_capture; plock_drop; }
 trap cleanup EXIT
 die() { $R error "$D" "$*" || exit $?; exit 2; }
 tailog() { tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-200; }
@@ -85,7 +86,7 @@ echo "booted; waiting up to ${duration}s" >>"$LOG"
 how=$($R waitusb "$D" || true)
 sleep 3
 $R mark "$D" t_end=@now
-cleanup; cap=""
+stop_capture; cap=""   # the phone lock stays held until exit: the EARLY/TIMEOUT recovery below still talks to the phone
 # bounded probe: every call has its own timeout (never a bare fastboot call)
 probe() { local u a f
 	u=$(timeout 5 lsusb 2>/dev/null | awk '{print $6}' | grep -E '^(18d1|05ac)' | tr '\n' ' ')
