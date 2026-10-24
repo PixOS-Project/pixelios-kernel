@@ -97,9 +97,14 @@ class Rejects(unittest.TestCase):
 
 
     def test_control_bytes_case_and_long_names(self):
-        for p in ('/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/' + 'n' * 246):
+        for p in ('/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/usr/lib/\xe9', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/' + 'n' * 246):
             self.assertIsNotNone(m.path_check(p), repr(p))
         self.assertIsNone(m.path_check('/usr/lib/' + 'n' * 245))
+
+    def test_packer_refuses_case_collision(self):
+        d = tree({'usr/local/Foo': b'1', 'usr/local/foo': b'2'})
+        r = run(d, os.path.join(d, 'o.bin'))
+        self.assertNotEqual(r.returncode, 0); self.assertIn('only by case', r.stderr)
 
     def test_count_4097_rejected(self):
         blob = m.pack([('/usr/lib/a', 0o644, 0, 0, b'')] * 4096)

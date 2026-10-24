@@ -63,7 +63,7 @@ diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_devoverlay.c
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,542 @@
 +/*
 + * SWEET dev overlay: copy files from the payload into the mounted root before launchd starts.
 + *
@@ -255,8 +255,8 @@ new file mode 100644
 +	}
 +	for (size_t i = 0; i < n; i++) {
 +		uint8_t c = e->path[i];
-+		if (c < 0x20 || c == 0x7f) {
-+			return "control byte in path";
++		if (c < 0x20 || c >= 0x7f) {
++			return "control or non-ASCII byte in path";
 +		}
 +		out[i] = (char)c;
 +	}
@@ -306,6 +306,15 @@ new file mode 100644
 +		return NULL;
 +	}
 +	return "not in allowlist";
++}
++
++/* Temp and backup names for path; ENAMETOOLONG if either would be truncated (review 19 C1: pass the real buffer sizes). */
++static int
++sd_names(const char *path, char *tmp, size_t tcap, char *orig, size_t ocap)
++{
++	int a = snprintf(tmp, tcap, "%s.sweettmp", path);
++	int b = snprintf(orig, ocap, "%s.sweetorig", path);
++	return (a < 0 || (size_t)a >= tcap || b < 0 || (size_t)b >= ocap) ? ENAMETOOLONG : 0;
 +}
 +
 +/* host-test end */
@@ -463,8 +472,11 @@ new file mode 100644
 +		sd_nr++;
 +		return;
 +	}
-+	snprintf(tmp, sizeof(tmp), "%s.sweettmp", path);
-+	snprintf(orig, sizeof(orig), "%s.sweetorig", path);
++	if (sd_names(path, tmp, sizeof(sd_w.tmp), orig, sizeof(sd_w.orig))) {
++		printf("SWEET DEV: refused %s (name too long)\n", shown);
++		sd_nr++;
++		return;
++	}
 +	enum vtype vt = VNON, ot = VNON;
 +	uint64_t sz = 0, osz;
 +	int serr = sd_stat(path, &vt, &sz);
@@ -497,6 +509,11 @@ new file mode 100644
 +	}
 +	if (serr == 0 && oerr != 0 && oerr != ENOENT) {      /* cannot tell whether a backup exists: do not replace */
 +		printf("SWEET DEV: refused %s (cannot check .sweetorig, error %d)\n", shown, oerr);
++		sd_nr++;
++		return;
++	}
++	if (serr == 0 && oerr == 0 && ot != VREG) {          /* a directory/symlink backup name: restore could not find the original */
++		printf("SWEET DEV: refused %s (.sweetorig is not a regular file)\n", shown);
 +		sd_nr++;
 +		return;
 +	}
@@ -577,6 +594,12 @@ new file mode 100644
 +	for (uint32_t i = 0; i < count; i++) {
 +		if (sd_next(b, len, &off, &e) == 0) {
 +			sd_one(&e, restore, buf);
++		}
++	}
++	if (sd_nw || sd_nr) {                                      /* make the renames durable before launchd starts */
++		int se = VFS_SYNC(vnode_mount(rootvnode), MNT_WAIT, sd_ctx);
++		if (se) {
++			printf("SWEET DEV: sync error %d\n", se);
 +		}
 +	}
 +	kfree_data(buf, SD_CHUNK);
