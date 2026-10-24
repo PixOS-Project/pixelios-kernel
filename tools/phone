@@ -135,9 +135,9 @@ TRANSITION_TABLE = {
             },
             {
                 "cmd": None,
-                "bound_s": 90,
+                "bound_s": 150,   # observed 2026-10-24 (run bl1-remote3): after the UDP reset the phone is off USB ~90 s before fastboot shows; 90 prompted too early
                 "postcondition": "fastboot",
-                "citation": "tools/hang-recover:10, tools/xrun:83-88, docs/HANDOFF.md:357,365",
+                "citation": "tools/hang-recover:10, tools/xrun:83-88, docs/HANDOFF.md:357,365, logs/runs/*bl1-remote3",
                 "user_action": "NEED USER: hold Power+VolDown",
             }
         ]
