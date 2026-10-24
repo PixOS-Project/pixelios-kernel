@@ -157,3 +157,10 @@ Opened and read: `D/aiutils.c` 60-440, 555-625, 1192-1350; `D/dhd_pcie.c` 795-81
 - U5 [still open]: `MULTIBP_CAP` body not in refs (`D/siutils.c:2824`, `D/dhd_pcie.c:10064` only use it); SRPWR is NOT read in S33 (alias guess, research 38 s.3).
 - U6 [closed, obs+src]: `clk_ctl_st` = `0x02010240`: ALPAVAIL (bit 16) set, HTAVAIL clear; CC `capabilities_ext` = `0x000A044E`, AOB bit 0x40 set => separate PMU core at 0x18012000 (rev 40 per EROM) [obs `w3a-n31`; decode mine].
 - U7 [open, scheduled]: S33 W2 reads CA7 wrapper IOCTL/RESET_CTL/RESET_ST at window `0x18120000` (research 38 s.3 table).
+
+## 12. Update 2026-10-24 (research 40, W-C3 research half; unknown list append)
+- U3 [closed for layout, src]: SYS_MEM rev 9 (`< 12`) uses `nb = coreinfo & 0x1F`, `nrb = (coreinfo & 0x3E0) >> 5`; `bankidx` 0x10, `bankinfo` 0x40, `banksize = 8192 * ((bankinfo & 0x7F) + 1)` (`wlan-stage4/g4389-include_sbsysmem.h:115-118,163-167,181`; `D/siutils.c:6966-6980,7038-7050`). brcmfmac's `0xF0` mask differs: raw word decides (research 40 U-N2). `ramsize` itself still open (needs the banks; research 40 s.4).
+- U5 [closed, src]: `MULTIBP_CAP` includes `BCM4389_CHIP` (`wlan-stage4/g4389-include_siutils.h:963-968`, `g4389-siutils.c:2830-2832`); DHD requests SRPWR domain 1 before the first ARM/SYS_MEM wrapper access (`D/dhd_pcie.c:2203-2215`). Research 40 s.2 plans the request through PCIe core page 0x18001000 + 0x1E8.
+- U7 [closed, obs]: ARM CA7 is in reset with the clock off after PERST (IOCTL 0, RESET_CTL 1, RESET_ST 0, run w3a-n33). CPUHALT = 0x20 also in DHD (`wlan-stage4/g4389-include_siutils.h:306`).
+- U19/U21 [partly closed, obs]: reading both wrappers with the domain unrequested did not stall (w3a-n33); writes remain untested.
+- New refs dir `~/pixelios-artifacts/refs/wlan-stage4/` (pins in `SOURCE.txt`); research 40 U-N1..U-N10 are the new unknowns.
