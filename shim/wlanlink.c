@@ -423,7 +423,7 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 			*probed |= need_probe(r.blk);
 		if (r.a & 2u)		/* log flag (a & 2: a non-probe row whose value is printed) */
 			step_line('R', r.step, "", 1, idx, 1, v, 0, 0);
-		if (r.a & 4u) {		/* EROM dump row (a & 4): the EOT dword 0xF (observed run w3a-n32, dword 218) ends the dump, wlan_link_run skips the later dump rows; the last row (a & 8) must have seen it, else refused */
+		if (r.a & 4u) {		/* EROM dump row (a & 4): the EOT dword 0xF (observed run w3a-n32: 0-based dword 217, offset 0x364, row 637) ends the dump, wlan_link_run skips the later dump rows; the last row (a & 8) must have seen it, else refused */
 			if (v == 0xFu)
 				*probed |= EOT_SEEN;
 			else if (r.a & 8u)
@@ -497,7 +497,7 @@ int wlan_link_run(void)
 			if (!get_row(i, 0, &r) || r.step != s)
 				continue;
 			if ((probed & EOT_SEEN) && r.kind == WLK_READ_ONLY && (r.a & 4u))
-				continue;		/* after the EOT no further EROM dword is read (reads past it hung the phone, run w3a-n32) */
+				continue;		/* after the EOT no further EROM dword is read (reads past it hanging the phone is a GUESS and unlikely: run w3a-n32 was most likely the host --timeout 600 expiring, last usb line at fboot+596 s; review 14 H1) */
 			st = run_row(i, 0, &probed, &rd);
 			if (st != ST_OK) {
 				stopped = st;

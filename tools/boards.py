@@ -443,7 +443,7 @@ def wlan_seq_render(doc, path="wlan_seq.json") -> str:
            f"#define WLAN_SEQ_DEFAULT_N {int(doc['default_last_step'])}u", "",
            "enum { " + ", ".join(f"WLK_{k.upper()}" for k in _WLAN_SEQ_KINDS) + " };",
            "enum { " + ", ".join(f"WLB_{b}" for b in _WLAN_SEQ_BLOCKS) + ", WLB_NONE };", "",
-           "/* kind WLK_*, blk WLB_*; a = delay_us (delay) / poll interval us (wait_*) / read_only: 1 = block probe, 2 = log the value (LINK R line); b = polls. In wlan_tear, step = the step that must have STARTED for the action to run. */",
+           "/* kind WLK_*, blk WLB_*; a = delay_us (delay) / poll interval us (wait_*) / read_only: 1 = block probe, 2 = log the value (LINK R line), 4 = EROM dump row (stop after a 0xF dword), 8 = last dump row (refuse without an EOT); b = polls. In wlan_tear, step = the step that must have STARTED for the action to run. */",
            "struct wlan_row { uint16_t step; uint8_t kind, blk; uint32_t off, mask, val, a, b; };", "",
            "static const struct wlan_row wlan_rows[WLAN_SEQ_NROWS] = {"]
     out += [cell(r, r["step"]) for r in rows]

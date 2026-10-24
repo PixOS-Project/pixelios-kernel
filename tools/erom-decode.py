@@ -14,7 +14,7 @@ Format source (read from source, NOT invented): mainline Linux brcmfmac v6.12 `b
   aiutils.c:ai_scan (docs/research/37 s.1.3). Core ids: bcma.h:97-159 (wlan-stage3). The base/wrapper choice is brcmfmac's (first 4K/8K slave-kind address = base; first master-wrapper kind if the core
   has a master port descriptor right after its CIB, else slave-wrapper kind = wrapper); `kept` = brcmfmac keeps the core (nmw + nsw != 0, or PMU / GCI).
 --require-dump (review 13 M2, W-C1c; the capture-safety check of a hardware run): FAIL (exit 1, `RESULT: FAIL ...`) if ANY dword from index 0 up to and including the first EOT dword (0x0000000F, where the run stops reading,
-observed at dword 218 in run w3a-n32) is missing from the log; with no 0xF in the log every dword of the dump span (offsets 0..0xDFC) is required. The live USB stream is the complete copy; a run counts only when this passes.
+observed at 0-based dword 217 in run w3a-n32) is missing from the log; with no 0xF in the log every dword of the dump span (offsets 0..0xDFC) is required. The live USB stream is the complete copy; a run counts only when this passes.
 The log's `LINK table sha=<16 hex>` line (printed at the start of every run) must equal the table's table_sha256[:16], else `RESULT: ERROR table sha mismatch` (exit 2; review 13 L1); a log without that line is decoded with a notice.
 Exit code 0 = decoded to EOT, 1 = truncated / gap / malformed / (--require-dump) a dump dword missing, 2 = usage / no data / table sha mismatch."""
 import argparse

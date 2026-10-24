@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "c4430698a54ac77a3aae95f740ec6918c98033de1aa47c47b5cd1e43083541ec"
+_WLAN_SEQ_SHA = "ba4805e420429f9c68b1dca52571ec31fc9666e271b4081bf24355e40f129de1"
 _WLAN_SEQ_COUNTS = {"rows": 1318, "teardown": 47, "write_rows": 279, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2975,7 +2975,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s32 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log"), r["restore"]) for r in rows if r["step"] == 32]
     if s32 != s32_want or any((r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 32):
         raise AssertionError(f"{name}: S32 must be exactly the window precondition, the eromptr pin 0x18105000, the ONE window write cfg 0x80 := 0x18105000 (restored by teardown T01) with its one-shot read-back, 896 logged MEM dwords 0..0xDFC ascending with the first-dword check, and the CFG 0xBC/0x104 logs: {[x for x in s32 if x not in s32_want][:3]}")
-    # W-C1c: the dump stops at the first EOT dword 0xF (observed dword 218 in run w3a-n32; reads past it hung the phone): exactly the 896 logged S32 MEM dump rows carry eot = 1 and the LAST one eot = 2 (refuses a dump
+    # W-C1c: the dump stops at the first EOT dword 0xF (observed 0-based dword 217, row 637 in run w3a-n32; that reads past it hung the phone is a guess, the run was most likely the host --timeout 600): exactly the 896 logged S32 MEM dump rows carry eot = 1 and the LAST one eot = 2 (refuses a dump
     # that never reached an EOT), no other row anywhere has the flag
     s32_dump = [r for r in rows if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only"]
     if [r.get("eot", 0) for r in s32_dump] != [1] * (0xE00 // 4 - 1) + [2] or any("eot" in x for x in rows if x["step"] != 32 or x not in s32_dump) or any("eot" in t for t in tear):
@@ -3012,6 +3012,8 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     last_t = max(i for i, x in enumerate(tear) if x["kind"] == "smc_iso")
     if any(x["blk"] in ("PMA", "PCS", "ELBI", "IA", "DBI", "ATU", "CFG") for x in tear[last_t + 1:]):
         raise AssertionError(f"{name}: the isolation clear comes after every PHY/controller access (PMA PCS ELBI IA DBI ATU CFG)")
+    if any(t["kind"] == "read_only" for t in tear):
+        raise AssertionError(f"{name}: no teardown row is read_only (run_row would read its delay_us as the log/eot flag bits, review 14 L2)")
     # the teardown: S29 first (region 1 DISABLE, Command := 0, BAR0 window := the observed original), then the 4 BAR rows (the CFG window dies with the region 0 disable), then the 3 region 1 resets, then the ATU region 0 is disabled (CR2 := 0) and its
     # registers go back to their reset values, all before PERST low (the first non-ATU row); no ATU / CFG row anywhere else
     n32, n_pre, n_cfg, n_a1, n_atu = len(_WLAN_S32_TEAR_HEAD), len(_WLAN_S29_TEAR_HEAD), len(_WLAN_S28_TEAR), len(_WLAN_S29_TEAR_ATU1), len(_WLAN_S26_TEAR)
@@ -3375,6 +3377,7 @@ def wlan_seq_selftest() -> int:
         ("a MEM write in the teardown", tear_append(blk="MEM", off=0, kind="mmio_write", mask=0xFFFFFFFF, value=0, requires=30), None, "BAR0 (MEM)"),
         ("the S30 chip id check removed", f_rm(30, kind="wait_eq"), None, "S30 must be exactly"),
         ("the S30 chip id mask weakened (0xFF)", set_row(30, "mask", 0xFF, kind="wait_eq", blk="MEM"), None, "S30 must be exactly"),
+        ("a teardown row became read_only (delay_us read as flag bits)", lambda d: (next(t for t in d["teardown"] if t["blk"] == "ATU" and t["off"] == 0x0).__setitem__("kind", "read_only"), resha(d)), None, "no teardown row is read_only"),
         ("the S30 chip id value changed (0x4390)", set_row(30, "value", 0x4390, kind="wait_eq", blk="MEM"), None, "S30 must be exactly"),
         ("the S30 chip id check that polls more than once", set_row(30, "polls", 2, kind="wait_eq", blk="MEM"), None, "S30 must be exactly"),
         ("the S30 MEM probe flag removed", set_row(30, "probe", False, kind="read_only", blk="MEM", probe=True), None, "before its probe row"),
