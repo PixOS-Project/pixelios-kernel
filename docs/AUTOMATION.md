@@ -435,6 +435,11 @@ timeout there is a 90 s grace window (`XRUN_GRACE`, so the cap is `--hard-timeou
 `usb_gone` in run.json is when the phone left fastboot for XNU (+2 s), not proof that the reset fired. Log tails (unit-tested on a pty / loopback socket, not yet seen on hardware): `usb-log.py capture` drains the
 tty (bounded to 2 s) after the device node vanishes and keeps a last partial line on SIGTERM; `usbnet-log.py` drains queued datagrams (bounded to 2 s) after the stop file appears. Two 2026-10-22 runs (`dvfs4-all`, `busy2`) were scored FAIL although the reset fired: `report.revised.txt` next to their `report.txt` (wording: reset inferred, not observed).
 
+**One set of phone-path tools for every agent (TP-021).** The agent-independent tools listed in `tools/common-files.txt` (lock, phone, fboot, fflash, xrun, probe-run, log capture, guard hook and their tests) have one
+source of truth: the branch `common-tools` (own worktree `~/.t3/worktrees/common-tools/kernel`; change them there). In any other worktree, at a task boundary and with the phone lock free:
+`tools/tools-sync status` (per file same/differs/missing) and `tools/tools-sync pull` (copies differing files from the ref, skips files with uncommitted changes, refuses while the lock is held; you review and commit). An agent-specific flag in a common file
+must be upstreamed to `common-tools`, or it shows as drift. The gate does not check this (drift is a warning for the agents, not a gate failure).
+
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)

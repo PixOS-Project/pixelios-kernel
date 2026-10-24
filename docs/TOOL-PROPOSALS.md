@@ -45,3 +45,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-018 | tools/phone | proposed |
 | TP-019 | tools/check-site | done |
 | TP-020 | tools/phone-lock | done (amended) |
+| TP-021 | tools/tools-sync | done |
