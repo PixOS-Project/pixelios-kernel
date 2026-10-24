@@ -8,7 +8,7 @@ exposed_by: "docs-site review 2026-10-24: 11 of 13 pages had stale claims, one d
 extends: ""
 related: ""
 usage: "tools/check-site [--kernel DIR] [--userland DIR] [--max-age-days N]"
-refs: "pixelios-site 9839ef4 (tools/check-site.py, tools/test_check_site.py, .github/workflows/check.yml)"
+refs: "pixelios-site f801421 (tools/check-site.py, tools/test_check_site.py), bd88f99 (workflows, local until the gh token has the workflow scope)"
 ---
 
 ## checked
