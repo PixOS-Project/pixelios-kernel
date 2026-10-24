@@ -136,11 +136,11 @@ main() {
 	# 7. verdict
 	# review B1: a reject match is a FAIL whether or not lines are missing; TIMEOUT needs the phone NOT back (rc!=0) and the log still growing at the limit
 	check_rejects "$log"; [ -z "$rejected" ] || report FAIL "reject pattern matched: $rejected"
-	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ $rc != 0 ] && [ "$pstate" = state=shim-probe ] && [ "$age0" -lt "${PR_STILL:-15}" ]; then
+	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ $rc != 0 ] && [ "$pstate" = state=shim-probe ] && [ "$age0" -lt "${PR_STILL:-15}" ] && [ "$age" -lt "${PR_STILL:-15}" ]; then
 		local last=$(( $(stat -c %Y "$log" 2>/dev/null || echo "$t0") - t0 )); [ $last -ge 0 ] || last=0
 		report TIMEOUT "missing: ${missing[*]} shim still running ($pstate), last usb line ${last}s after fboot, ${timeout}s limit: raise --timeout, this is not a hang"
 	fi
-	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ "$age" -lt "${PR_STILL:-15}" ]; then
+	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ $rc != 0 ] && [ "$age" -lt "${PR_STILL:-15}" ]; then
 		report FAIL "missing: ${missing[*]}; the shim was still logging at the ${timeout}s limit (last line ${age}s ago): raise --timeout, this is not a hang"
 	fi
 	if [ ${#missing[@]} = 0 ]; then
@@ -179,11 +179,12 @@ S
 		cp "$(dirname "$self")/phone-lock" "$(dirname "$self")/plock.sh" "$d/w/tools/"; ( cd "$d/w" && PHONE_LOCK_DIR="$d/lock" eval "$PRE" )
 		out=$(cd "$d/w" && env PHONE_LOCK_DIR="$d/lock" PR_PHONE_STATE="$d/ps" PR_TO_FASTBOOT="$d/tofb" PR_FBOOT="$d/fboot" PR_USBLOG="$d/usblog" \
 			PR_BUILD="$d/build" PR_PHONE="$d/ph" PR_BACK=3 PR_USBPRESENT=${PR_USBPRESENT:-false} PR_STILL=${PR_STILL:-1} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t $CHK_ARGS 2>&1); rc=$?
-		if [ $rc = "$erc" ] && echo "$out" | head -1 | grep -q "^RESULT: $w" && echo "$out" | grep -q '^dir: logs/probe/' \
+		if [ $rc = "$erc" ] && echo "$out" | head -1 | grep -Eq "^RESULT: $w" && echo "$out" | grep -q '^dir: logs/probe/' \
 			&& { [ "$w" = ERROR ] || ls "$d"/w/logs/probe/*/report.txt >/dev/null 2>&1; }; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
 	}
 	chk success         0 PASS  ST_STATE=fastboot "ST_LOG=$R"
+	[ "$(cat "$d"/w/logs/probe/*/run.args 2>/dev/null)" = "--pstore-fast --touch-probe=run" ] && echo "ok   run.args" || { echo "FAIL run.args: $(cat "$d"/w/logs/probe/*/run.args 2>&1)"; fail=1; }   # review round 2 B4: tools/runs groups history by this file
 	chk success-gone    0 PASS  ST_STATE=absent ST_GONE=1 "ST_LOG=$R"     # phone absent after the result line: still PASS
 	chk expect-missing  1 FAIL  ST_STATE=fastboot 'ST_LOG=noise\n'
 	chk never-back      1 HANG  ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
@@ -192,9 +193,10 @@ S
 	chk still-logging   1 FAIL PR_STILL=600 ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # review 13 H3: timed out while the shim was still logging: FAIL "raise --timeout", not HANG
 	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with phone-state advice, not "hold Power+VolDown"
 	chk timeout-shim-alive 1 TIMEOUT PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # TP-015: missing lines + shim-probe + log still growing = TIMEOUT
-	chk REV-timeout-but-phone-back 1 FAIL PR_STILL=600 ST_PHONE=shim-probe ST_STATE=fastboot 'ST_LOG=noise\n'   # review B1a: the phone came back: a real FAIL
+	chk REV-timeout-but-phone-back 1 "FAIL missing: .* phone back" PR_STILL=600 ST_PHONE=shim-probe ST_STATE=fastboot 'ST_LOG=noise\n'   # review B1a: the phone came back: a real FAIL
 	CHK_ARGS="--reject bad" chk REV-timeout-reject-matched 1 FAIL PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=bad\n'   # B1b
 	chk REV-shim-listed-but-silent 1 HANG PR_STILL=0 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # B1c: listed but the log is not growing
+	chk REV2-hung-after-limit 1 HANG PR_STILL=6 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # round 2 B2: shim-probe, silent past the limit, phone never back: not TIMEOUT
 	chk timeout-not-shim 1 HANG ST_PHONE=absent ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
 	CHK_ARGS="--reject bad" chk reject-hit 1 FAIL ST_STATE=fastboot "ST_LOG=${R}bad\n"
 	PRE='tools/phone-lock acquire --owner other --pid '$$' >/dev/null' chk lock-busy 2 ERROR ST_STATE=fastboot "ST_LOG=$R"   # TP-020: another owner holds the phone
