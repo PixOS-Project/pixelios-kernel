@@ -33,9 +33,10 @@ REFS2 = Path(os.environ.get("WLAN_REFS2", str(REFS.parent / "wlan-stage2")))
 PCICFG = REFS2 / "include_pcicfg.h"
 PCIR = REFS2 / "pci_regs.h"	# copy of the host /usr/include/linux/pci_regs.h, linux-libc-dev 6.12.113-1 (sha-pinned below)
 DHDP, SIU, AIU = REFS2 / "dhd_pcie.c", REFS2 / "siutils.c", REFS2 / "aiutils.c"
-SRC_NAMES = {PCIR: "linux/pci_regs.h", PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
+HNDSOC, SBCHIPC, BCMDEVS, DHDL = REFS2 / "include_hndsoc.h", REFS2 / "include_sbchipc.h", REFS2 / "include_bcmdevs.h", REFS2 / "dhd_pcie_linux.c"
+SRC_NAMES = {PCIR: "linux/pci_regs.h", PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", HNDSOC: "bcm4389/include_hndsoc.h", SBCHIPC: "bcm4389/include_sbchipc.h", BCMDEVS: "bcm4389/include_bcmdevs.h", DHDL: "bcm4389/dhd_pcie_linux.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
-BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")
+BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG", "MEM")
 FULL = 0xFFFFFFFF
 TAG_SRC, TAG_GUESS = "read from source", "guess"
 
@@ -124,6 +125,10 @@ def check_dt():
     assert re.search(r"0x0\s+0x14800000\s+0x301000\s*/\*\s*DBI base", DT_PCIE.read_text()), "pcie_1 DBI reg is no longer 0x14800000 size 0x301000"
     assert int(soc["atu"], 0) == int(soc["dbi"], 0) + 0x300000, "soc.json wlan atu must be dbi + 0x300000 (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20; inside the 0x301000 DBI reg)"
     assert re.search(r"0x0\s+0x60FFE000\s+0x2000\s*/\*\s*configuration space", DT_PCIE.read_text()), "pcie_1 config reg is no longer 0x60FFE000 size 0x2000"
+    pcie1 = DT_PCIE.read_text()
+    pcie1 = pcie1[pcie1.index("pcie_1:"):]
+    assert re.search(r"ranges = <0x82000000 0 0x60000000 0 0x60000000 0 0xFF0000>", pcie1[:pcie1.index("};")]), "pcie_1 MEM ranges changed (pcie.dtsi:76: CPU window = PCI address 0x60000000)"
+    assert int(soc["mem"], 0) == 0x60000000, "soc.json wlan mem must be the pcie_1 MEM range start 0x60000000 (pcie.dtsi:76)"
     b = dt_blocks()
     assert int(soc["cfg"], 0) == b["configuration space"] == 0x60FFE000, "soc.json wlan cfg must be the pcie_1 'config' reg 0x60FFE000 (pcie.dtsi:62; pcie_0 has 0x40FFE000 at :20)"
     want = {"elbi base": soc["elbi"], "phy base": soc["pma"], "sysreg base": soc["sysreg"], "DBI base": soc["dbi"], "phy pcs base": soc["pcs"], "I/A space": soc["ia"]}
@@ -278,6 +283,8 @@ STEP_NAMES = {
     26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back, CR2 re-checked once) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
     27: "READ-ONLY dump of the endpoint config space (56 dwords of bus 1 dev 0 fn 0 through the CFG window left enabled by S26) + the iATU outbound region 1 reset values (7 reads); 0x8C-0xA8 deliberately not read (0xA4 PCI_BACKPLANE_DATA is a backplane access, 0x90/0x98 interrupt/mailbox), 0xAC kept; explicit --wlan-link=27 only; no write",
     28: "BAR0/BAR2 sizing (all-ones write, guarded read-back, original written back; Linux __pci_read_base order) then assignment BAR0 0x60000000 / BAR2 0x60400000 through the CFG window (research 33; the FIRST config writes, Command never touched; explicit --wlan-link=28 only; BAR teardown FIRST, before the ATU disable)",
+    29: "iATU outbound region 1 = MEM (CPU 0x60000000..0x6000FFFF -> PCI 0x60000000, BAR0 only; 4 ATU writes, CR2 last), BAR0 window cfg 0x80 := 0x18000000, then Command := MEM only (research 36; the first Command write, MASTER never; explicit --wlan-link=29 only; region 1 disable, Command 0 and the window restore FIRST in the teardown)",
+    30: "the FIRST BAR0 read: ChipCommon chipid at MEM 0x60000000 (research 36; one guarded read + logged copy + link/AER logs + one-shot id == 0x4389; explicit --wlan-link=30 only; no write; a bus stall would show as the last line `LINK S30 start`)",
 }
 
 
@@ -622,10 +629,22 @@ def build():
         w = d["kind"] in ("wait_eq", "wait_mask")
         add(28, d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), log=d["kind"] == "read_only")
 
+    # ---- S29 / S30 (research 36): region 1, BAR0 window, Command MEM, then the first MEM read; rows come from draft29() ----
+    for d in draft29():
+        w = d["kind"] in ("wait_eq", "wait_mask")
+        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False))
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
+    # S29 rows FIRST of all (research 36 s.5.2 R2, s.6): region 1 DISABLE (RC-local, cannot stall), Command := 0, BAR0 window := observed original; unconditional (idempotent); the region 1 resets follow the BAR rows
+    O1 = lambda mac: ev(mac) - 0x300000
+    add_t(29, "mmio_write", "ATU", O1("PCIE_ATU_CR2_OUTBOUND1"), FULL, 0, cite="reset value 0 observed (run w3a-n28c R27 row=344); undoes the S29 enable (rc.c:1414); research 36 s.6 T1", tag="observed", note="ATU region 1 DISABLE: the first teardown row of S29 (RC-local)", key="atu1_cr2_off")
+    add_t(29, "mmio_write", "CFG", 0x04, FULL, 0, cite="Command 0x0000 observed (run w3a-n28c R26 row=284 = 0x00100000); research 36 s.1; written by S29", tag="observed", note="Command := observed original (MEM decode off); status half 0 cannot clear an RW1C bit", key="cmd_rst")
+    add_t(29, "mmio_write", "CFG", 0x80, FULL, 0x18001000, cite="PCI_BAR0_WIN 0x18001000 observed (run w3a-n28c R27 row=313); research 36 s.3; written by S29", tag="observed", note="BAR0 window := observed original", key="bar0win_rst")
     # S28 BAR rows FIRST of all: they need the CFG window, which the ATU disable below closes. Unconditional (idempotent) writes of the originals observed in run w3a-n27 (BAR0 = BAR2 = 0x4, BAR1 = BAR3 = 0)
     for off, val, key, nm in ((0x10, 4, "BAR0_lo", "BAR0 low"), (0x14, 0, "BAR0_hi", "BAR0 high"), (0x18, 4, "BAR2_lo", "BAR2 low"), (0x1C, 0, "BAR2_hi", "BAR2 high")):
         add_t(28, "mmio_write", "CFG", off, FULL, val, cite=f"original observed in run w3a-n27 (CFG+{off:#x} = {val:#x}); research 33 s.3 teardown; written by S28", tag="observed", note=f"{nm} back to its observed original (S28 teardown, before the ATU disable)", key=key)
+    for off, val, key, nm in ((O1("PCIE_ATU_LOWER_BASE_OUTBOUND1"), 0, "atu1_lbase_rst", "LOWER_BASE"), (O1("PCIE_ATU_LIMIT_OUTBOUND1"), 0xFFF, "atu1_limit_rst", "LIMIT"), (O1("PCIE_ATU_LOWER_TARGET_OUTBOUND1"), 0, "atu1_ltarget_rst", "LOWER_TARGET")):
+        add_t(29, "mmio_write", "ATU", off, FULL, val, cite=f"reset value observed in run w3a-n28c (R27 ATU region 1 +{off:#x} = {val:#x}); written by the S29 row {nm}", tag="observed", note=f"ATU region 1 {nm} back to its reset value", key=key)
     # ATU region 0 (before PERST low): disable it (CR2 := 0, as Linux's poweroff resets atu_ok and re-programs: rc.c:3647), then the reset values observed in run w3a-n25 (CR1 0, bases 0, LIMIT 0xFFF, targets 0)
     cr2 = anchor(RC, find_line(RC, r"CR2_OUTBOUND0, 4, EXYNOS_PCIE_ATU_ENABLE", vp), r"EXYNOS_PCIE_ATU_ENABLE")
     add_t(26, "mmio_write", "ATU", 0x004, FULL, 0, cite=f"{cr2} (the enable write, undone); reset value 0 observed (run w3a-n25 ATU+0x004)", tag="observed", note="ATU region 0 DISABLE: the first teardown row", key="atu_cr2_off")
@@ -685,13 +704,65 @@ def draft28():
     return out
 
 
+def draft29():
+    """S29 + S30 rows (research 36 s.6): iATU outbound region 1 = MEM for BAR0, BAR0 window select, Command := MEM, then the first MEM read (build() adds them to the table). Every offset of region 1 comes from the rc.h macros."""
+    an = lambda path, rx, start=1: anchor(path, find_line(path, rx, start), rx)
+    O1 = lambda mac: ev(mac) - 0x300000
+    vm = find_line(RC, r"static void exynos_pcie_rc_prog_viewport_mem_outbound")
+    rcm = lambda rx: an(RC, rx, vm)
+    rch = lambda mac: an(RCH, r"define " + mac + r"\s+0x30")
+    out = []
+    ob = "observed in run w3a-n28c"
+
+    def row(step, kind, blk, off, mask, value, cite, tag, note, restore=None, **kw):
+        out.append({"step": step, "kind": kind, "blk": blk, "off": off, "mask": mask, "value": value, "cite": cite, "tag": tag, "note": note, **({"restore": restore} if restore else {}), **kw})
+
+    cr1, cr2, lb, ub, lim, lt, ut = (O1(f"PCIE_ATU_{n}_OUTBOUND1") for n in ("CR1", "CR2", "LOWER_BASE", "UPPER_BASE", "LIMIT", "LOWER_TARGET", "UPPER_TARGET"))
+    assert (cr1, cr2, lb, ub, lim, lt, ut) == (0x200, 0x204, 0x208, 0x20C, 0x210, 0x214, 0x218)
+    # preconditions (reads only)
+    row(29, "wait_eq", "CFG", 0x04, 0xFFFF, 0, f"{ob} (R26 row=284: 0x00100000, Command 0x0000); {an(PCIR, r'define\s+PCI_COMMAND_MEMORY\s+0x2')}", "observed", "precondition: Command == 0 before the arm")
+    row(29, "wait_eq", "CFG", 0x10, FULL, 0x60000004, f"{ob} (S28 assignment read back in-table); research 36 s.0", "observed", "precondition: BAR0 low holds the S28 assignment")
+    row(29, "wait_eq", "CFG", 0x14, FULL, 0, f"{ob} (S28: BAR0 high 0)", "observed", "precondition: BAR0 high still 0")
+    row(29, "wait_eq", "CFG", 0x80, FULL, 0x18001000, f"{ob} (R27 row=313 = 0x18001000); equals the restore constant", "observed", "precondition: PCI_BAR0_WIN still at its observed original")
+    row(29, "wait_eq", "ATU", cr2, 0x80000000, 0, f"{ob} (R27 row=344 = 0); {rch('PCIE_ATU_CR2_OUTBOUND1')}", "observed", "precondition: region 1 disabled")
+    row(29, "wait_eq", "ATU", cr1, FULL, 0, f"{ob} (R27 row=343 = 0); TYPE_MEM = 0: {an(RCH, r'define EXYNOS_PCIE_ATU_TYPE_MEM\s+\(0x0')}; Linux writes it at {rcm(r'CR1_OUTBOUND1, 4, EXYNOS_PCIE_ATU_TYPE_MEM')}", "observed", "precondition: CR1 is already TYPE_MEM (no write)")
+    row(29, "wait_eq", "ATU", ub, FULL, 0, f"{ob} (R27 row=346 = 0); Linux writes res->start >> 32 = 0 at {rcm(r'UPPER_BASE_OUTBOUND1, 4, ')}", "observed", "precondition: UPPER_BASE already 0 (no write)")
+    row(29, "wait_eq", "ATU", ut, FULL, 0, f"{ob} (R27 row=349 = 0); Linux writes upper_32_bits(start - offset) = 0 at {rcm(r'UPPER_TARGET_OUTBOUND1, 4,')}", "observed", "precondition: UPPER_TARGET already 0 (no write)")
+    # region 1 = MEM window over BAR0 (Linux order, rc.c:1402-1414: base, limit, target, enable last; CR1/UPPER_* skipped, already at the written value)
+    for off, val, nm, rx, key, tag, extra in (
+            (lb, 0x60000000, "LOWER_BASE := 0x60000000 (MEM range start, pcie.dtsi:76)", r"LOWER_BASE_OUTBOUND1, 4, entry->res->start", "atu1_lbase_rst", TAG_SRC, ""),
+            (lim, 0x6000FFFF, "LIMIT := 0x6000FFFF (BAR0 = 64 KiB observed, base + 0x10000 - 1; Linux uses start + SZ_2M - 1)", r"LIMIT_OUTBOUND1, 4, entry->res->start \+ SZ_2M - 1", "atu1_limit_rst", TAG_GUESS, "; BAR0 size 64 KiB: sizing readback 0xFFFF0004 (run w3a-n28c R28 row=355)"),
+            (lt, 0x60000000, "LOWER_TARGET := 0x60000000 (PCI address == CPU address; offset 0 is a guess from the equal ranges numbers)", r"LOWER_TARGET_OUTBOUND1, 4,", "atu1_ltarget_rst", TAG_GUESS, "; value S28 wrote into BAR0 (observed)"),
+            (cr2, 0x80000000, "CR2 := EXYNOS_PCIE_ATU_ENABLE (bit 31): region 1 ENABLED, the last ATU write", r"CR2_OUTBOUND1, 4, EXYNOS_PCIE_ATU_ENABLE", "atu1_cr2_off", TAG_SRC, f"; {an(RCH, r'define EXYNOS_PCIE_ATU_ENABLE\s+\(0x1 << 31\)')}")):
+        mac = {lb: "LOWER_BASE", lim: "LIMIT", lt: "LOWER_TARGET", cr2: "CR2"}[off]
+        row(29, "mmio_write", "ATU", off, FULL, val, f"{rcm(rx)}; {rch('PCIE_ATU_' + mac + '_OUTBOUND1')}{extra}; research 36 s.2", tag, nm, restore=key)
+        row(29, "wait_eq", "ATU", off, FULL, val, "read-back of the row above (Linux has none, rc.c:1389-1415; our own gate; one-shot)", TAG_GUESS, f"read-back {nm.split(' ')[0]} must be {val:#010x}")
+    # BAR0 window select -> ChipCommon (DHD does it before the first chip access)
+    row(29, "mmio_write", "CFG", 0x80, FULL, 0x18000000, f"{an(DHDP, r'dhdpcie_bus_cfg_set_bar0_win.bus, si_enum_base.devid.')}; {an(SIU, r'OSL_PCI_WRITE_CONFIG.sii->osh, PCI_BAR0_WIN, 4, SI_ENUM_BASE')}; {an(HNDSOC, r'define SI_ENUM_BASE_DEFAULT\s+0x18000000')}", TAG_SRC, "PCI_BAR0_WIN := 0x18000000 (SI_ENUM_BASE: ChipCommon), as DHD", restore="bar0win_rst")
+    row(29, "wait_eq", "CFG", 0x80, FULL, 0x18000000, "read-back of the row above (one-shot)", TAG_GUESS, "read-back PCI_BAR0_WIN must be 0x18000000")
+    spr = an(DHDP, r"val = OSL_PCI_READ_CONFIG.osh, PCI_SPROM_CONTROL")
+    row(29, "read_only", "CFG", 0x88, FULL, 0, f"{spr}: DHD aborts attach if all ones; {ob} 0x00080080 before the window write (R27 row=315)", TAG_SRC, "log PCI_SPROM_CONTROL after the window write (all ones = stop)", log=True)
+    row(29, "read_only", "CFG", 0xBC, FULL, 0, f"{ob} (R27 row=320: LNKSTA 0x1011 high half)", "observed", "log EP link control/status before the arm", log=True)
+    row(29, "read_only", "CFG", 0x104, FULL, 0, f"{an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')} (AER base 0x100, header {ob} R27 row=337 = 0x13C10001)", TAG_GUESS, "log EP AER uncorrectable status before the arm", log=True)
+    # ARM: MEM only
+    row(29, "mmio_write", "CFG", 0x04, FULL, 0x00000002, f"{an(PCIR, r'define\s+PCI_COMMAND_MEMORY\s+0x2')}; DHD enables the device before the first BAR0 access ({an(DHDL, r'pci_enable_device', 1940)}); MASTER (0x4) is deliberately NOT set (research 36 s.1.1)", TAG_GUESS, "ARM: Command := MEM only (status half 0)", restore="cmd_rst")
+    row(29, "wait_eq", "CFG", 0x04, 0xFFFF, 0x0002, "read-back of the row above (one-shot)", TAG_GUESS, "Command low half must read 0x0002")
+    # S30: the read, in its own step so the pstore checkpoint and the `LINK S30 start` line precede the only risky access
+    row(30, "read_only", "MEM", 0x0, FULL, 0, f"ChipCommon chipid at offset 0: {an(SBCHIPC, r'uint32\s+chipid;\s*/\* 0x0 \*/')}; DHD reads it as {an(SIU, r'w = R_REG.osh, &cc->chipid.')}", TAG_GUESS, "BLOCK PROBE: the first MEM TLP (BAR0+0 = ChipCommon chipid); a fault stops the run; a bus stall would not be recoverable (research 36 s.4)", probe=True)
+    row(30, "read_only", "MEM", 0x0, FULL, 0, f"same; decode {an(SIU, r'sih->chip = w & CID_ID_MASK')}: id = low 16 bits, rev/pkg/cc/type above", TAG_GUESS, "log the chip id word (expect low 16 bits 0x4389; upper bits unpredicted)", log=True)
+    row(30, "read_only", "CFG", 0xBC, FULL, 0, "link status again (a retrain or a lost link would show here)", TAG_GUESS, "log EP link control/status after the read", log=True)
+    row(30, "read_only", "CFG", 0x104, FULL, 0, f"{an(PCIR, r'define PCI_ERR_UNCOR_STATUS\s+0x04')}; UR = bit 20 {an(PCIR, r'define\s+PCI_ERR_UNC_UNSUP\s+0x00100000')}, CTO = bit 14 {an(PCIR, r'define\s+PCI_ERR_UNC_COMP_TIME\s+0x00004000')}", TAG_GUESS, "log EP AER uncorrectable status after the read", log=True)
+    row(30, "wait_eq", "MEM", 0x0, 0xFFFF, 0x4389, f"{an(BCMDEVS, r'define BCM4389_CHIP_ID\s+0x4389')}; any other value (including all ones) is a refusal", TAG_GUESS, "chip id must be 0x4389 (one-shot)")
+    return out
+
+
 def finish():
     meta = build()
     srcs = {SRC_NAMES[p]: hashlib.sha256(p.read_bytes()).hexdigest()[:16] for p in SRC_NAMES}
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 28, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 30, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

@@ -402,7 +402,7 @@ def c_header(board: str) -> str:
 
 
 _WLAN_SEQ_KINDS = ("delay", "read_only", "wait_eq", "wait_mask", "gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso")	# enum WLK_* order of the generated header
-_WLAN_SEQ_BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")						# enum WLB_* order
+_WLAN_SEQ_BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG", "MEM")					# enum WLB_* order
 
 
 def wlan_seq_header(board: str) -> str:

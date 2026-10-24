@@ -15,14 +15,15 @@
 #include "wlansmc.h"
 #include "wlanlink.h"
 
-#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && defined(WLAN_CFG) && \
+#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && defined(WLAN_CFG) && defined(WLAN_MEM) && \
 	defined(WLAN_PMU_ALIVE) && defined(WLAN_GPP14_EN_PIN) && defined(WLAN_GPH2_PERST_PIN)
 
 #include "wlan_seq.h"
 
-/* the two new S26 blocks: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
+/* the new blocks: S26 ATU/CFG, S29 MEM: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
 _Static_assert(WLAN_ATU == WLAN_DBI + 0x300000u, "WLAN_ATU must be WLAN_DBI + 0x300000");
 _Static_assert(WLAN_CFG == 0x60FFE000UL, "WLAN_CFG must be the pcie_1 config window 0x60FFE000");
+_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only, offset 0 only)");
 
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N
@@ -155,6 +156,8 @@ static uintptr_t base_of(unsigned blk)
 		return WLAN_ATU;
 	if (blk == WLB_CFG)
 		return WLAN_CFG;
+	if (blk == WLB_MEM)
+		return WLAN_MEM;
 	return 0;
 }
 
@@ -164,7 +167,7 @@ static uint32_t size_of(unsigned blk)
 		return 0x18u;
 	if (blk == WLB_PMA || blk == WLB_ELBI || blk == WLB_CFG)
 		return 0x2000u;
-	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU)
+	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_MEM)
 		return 0x1000u;
 	if (blk == WLB_PMU)
 		return 0x4000u;
@@ -174,7 +177,7 @@ static uint32_t size_of(unsigned blk)
 /* the blocks that may only be touched after their probe read worked */
 static unsigned need_probe(unsigned blk)
 {
-	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_CFG) ? 1u << blk : 0u;
+	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_CFG || blk == WLB_MEM) ? 1u << blk : 0u;
 }
 
 static uintptr_t pa_of(unsigned blk, uint32_t off)
@@ -196,6 +199,12 @@ static int r32(unsigned blk, uint32_t off, uint32_t *v)
 		return 0;
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
+	if (blk == WLB_MEM) {		/* BAR0 chip id (S30, research 36): offset 0 only, and only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
+		uint32_t cr2 = 0, cmd = 0;
+
+		if (off != 0u || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
+			return 0;
+	}
 	return try_read32(pa, v);
 }
 
@@ -224,33 +233,48 @@ static int elbi_ok(uint32_t off)
 	       off == 0x1400u || off == 0x1404u || off == 0x1408u;
 }
 
-/* ATU outbound region 0 (rc.h:286-292): only the seven registers of S26 and only the values of S26 or its teardown (research 31 s.2.2; reset values observed in run w3a-n25); a full-word write only */
-static int atu_ok(uint32_t off, uint32_t v)
+/* The live register state the stateful allowlist rules need (read by ctx_read, guarded; an unreadable word reads as "not ready" so only the restores pass): cmd = EP Command dword (CFG rows),
+ * bar0 = EP BAR0 low dword (CFG rows), r1ok = ATU region 1 LOWER_BASE / LIMIT / LOWER_TARGET hold the S29 values (ATU rows). */
+struct w32_ctx {
+	uint32_t cmd, bar0;
+	int r1ok;
+};
+
+/* ATU outbound regions (rc.h:286-300): region 0 = the seven registers of S26 (research 31 s.2.2; reset values observed in run w3a-n25), region 1 (S29, research 36 s.2) = exactly 0x204/0x208/0x210/0x214
+ * with the S29 values or the reset values; the region 1 ENABLE only once base, limit and target hold the S29 values; never 0x200/0x20C/0x218, never above 0x218; a full-word write only */
+static int atu_ok(uint32_t off, uint32_t v, int r1ok)
 {
 	return (off == 0x000u && (v == 0x4u || v == 0u)) || (off == 0x004u && (v == 0x80000000u || v == 0u)) || (off == 0x008u && (v == (uint32_t)WLAN_CFG || v == 0u)) ||
-	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u);
+	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u) ||
+	       (off == 0x204u && (v == 0u || (v == 0x80000000u && r1ok))) || (off == 0x208u && (v == 0x60000000u || v == 0u)) || (off == 0x210u && (v == 0x6000FFFFu || v == 0xfffu)) || (off == 0x214u && (v == 0x60000000u || v == 0u));
 }
 
-/* Endpoint config BARs through the CFG window (S28, research 33): ONLY offsets 0x10/0x14/0x18/0x1C (never Command 0x04), a full-word write, and only these transitions: the observed original (low 0x4, high 0)
+/* Endpoint config through the CFG window. S29 (research 36): Command 0x04 takes exactly 0 (from any state) or 0x2 = MEM only (never MASTER/IO, no status bits) and only from Command low half 0 with BAR0 low
+ * at the S28 assignment; PCI_BAR0_WIN 0x80 takes exactly 0x18001000 (the restore, from any state) or 0x18000000 only from 0x18001000; nothing else (never 0x88, never 0x20-0x24).
+ * S28 (research 33): the BARs 0x10/0x14/0x18/0x1C, a full-word write, and only these transitions: the observed original (low 0x4, high 0)
  * from ANY state (the restore, even if Command is not 0); otherwise Command (cmd) must have MEM/IO decode off, and all ones only from the original, the assigned address only for the low half and only from
  * the original. Linux sizes with decode off too (probe.c:188-191). */
-static int cfg_ok(uint32_t off, uint32_t old, uint32_t v, uint32_t cmd)
+static int cfg_ok(uint32_t off, uint32_t old, uint32_t v, const struct w32_ctx *c)
 {
 	int lo = (off == 0x10u || off == 0x18u), hi = (off == 0x14u || off == 0x1cu);
 
+	if (off == 0x04u)
+		return v == 0u || (v == 0x2u && (old & 0xFFFFu) == 0u && c->bar0 == 0x60000004u);
+	if (off == 0x80u)
+		return v == 0x18001000u || (v == 0x18000000u && old == 0x18001000u);
 	if (!lo && !hi)
 		return 0;
 	if (v == (lo ? 0x4u : 0u))
 		return 1;
-	if ((cmd & 0xFFFFu) != 0u)
+	if ((c->cmd & 0xFFFFu) != 0u)
 		return 0;
 	if (v == 0xFFFFFFFFu)
 		return old == (lo ? 0x4u : 0u);
 	return lo && old == 0x4u && v == (off == 0x10u ? 0x60000004u : 0x60400004u);
 }
 
-/* v may differ from old only inside mask; pa must be inside one of the writable windows, with the per-block rules. cmd = the EP Command dword (read by w32 for CFG rows only). */
-static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, uint32_t cmd)
+/* v may differ from old only inside mask; pa must be inside one of the writable windows, with the per-block rules. c = the live state (ctx_read). */
+static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, const struct w32_ctx *c)
 {
 	if (((old ^ v) & ~mask) != 0u)
 		return 0;
@@ -269,10 +293,28 @@ static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, ui
 	if (pa == WLAN_DBI + 0x890u)
 		return 1;
 	if (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000u)
-		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v);
+		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v, c->r1ok);
 	if (pa >= WLAN_CFG && pa < WLAN_CFG + 0x1000u)
-		return mask == 0xFFFFFFFFu && cfg_ok((uint32_t)(pa - WLAN_CFG), old, v, cmd);
+		return mask == 0xFFFFFFFFu && cfg_ok((uint32_t)(pa - WLAN_CFG), old, v, c);
 	return 0;
+}
+
+/* The guarded reads behind the stateful rules. CFG rows: Command (0xFFFF = unreadable: only the restores pass) and BAR0 low (0xFFFFFFFF = unreadable); ATU rows: region 1 base / limit / target. Other blocks read nothing. */
+__attribute__((noipa)) static void ctx_read(unsigned blk, struct w32_ctx *c)
+{
+	uint32_t lb = 0, lim = 0, lt = 0;
+
+	c->cmd = 0xFFFFu;
+	c->bar0 = 0xFFFFFFFFu;
+	c->r1ok = 0;
+	if (blk == WLB_CFG) {
+		if (!try_read32(WLAN_CFG + 4u, &c->cmd))
+			c->cmd = 0xFFFFu;
+		if (!try_read32(WLAN_CFG + 0x10u, &c->bar0))
+			c->bar0 = 0xFFFFFFFFu;
+	}
+	if (blk == WLB_ATU)
+		c->r1ok = try_read32(WLAN_ATU + 0x208u, &lb) && try_read32(WLAN_ATU + 0x210u, &lim) && try_read32(WLAN_ATU + 0x214u, &lt) && lb == 0x60000000u && lim == 0x6000FFFFu && lt == 0x60000000u;
 }
 
 /* The ONLY writer: the row (kind, block, offset, mask, value) comes from the const table by index; GPIO / RMW rows read-modify-write the masked bits, full writes just write. noipa +
@@ -281,7 +323,8 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 {
 	struct wlan_row r;
 	uintptr_t pa;
-	uint32_t old = 0, v, cmd = 0;
+	uint32_t old = 0, v;
+	struct w32_ctx c;
 
 	if (!get_row(idx, tear, &r))
 		return -2;
@@ -299,10 +342,9 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 	} else if (!try_read32(pa, &old)) {		/* CFG writes check the real old value (BAR transitions) */
 		return -1;
 	}
-	if (r.blk == WLB_CFG && !try_read32(WLAN_CFG + 4u, &cmd))
-		cmd = 0xFFFFu;			/* Command unreadable: treat decode as on, only the restores pass */
+	ctx_read(r.blk, &c);			/* Command / BAR0 (CFG rows) or region 1 (ATU rows); unreadable = not ready, only the restores pass */
 	v = (old & ~r.mask) | (r.val & r.mask);
-	if (!w32_allowed(pa, r.mask, old, v, cmd))
+	if (!w32_allowed(pa, r.mask, old, v, &c))
 		return -2;
 	return try_write32(pa, v) ? 0 : -1;
 }

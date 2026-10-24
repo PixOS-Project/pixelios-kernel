@@ -47,6 +47,7 @@
     "pmu_alive": "0x17460000",
     "atu": "0x14B00000",
     "cfg": "0x60FFE000",
+    "mem": "0x60000000",
     "gpp14_en_pin": "0x2",
     "gph2_perst_pin": "0x0"
   },

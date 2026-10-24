@@ -1,8 +1,8 @@
 /* Host test for wlanlink.c (--wlan-link, docs/research/29 section 14) against a FAKE SoC: GPIO banks with Samsung semantics (a pin whose CON field is 1 reads its DAT latch, any other pin the external
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
- * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7..27), see build.sh. Checks: the default run (N = 19) never raises PERST,
+ * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7..30), see build.sh. Checks: the default run (N = 19) never raises PERST,
  * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 adds the documented S22 skip (one 0 us delay row, no write); N = 23 enables the LTSSM and waits for L0 (fake: ELBI 0x2C8 == 0x11
- * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 27 adds S27 (READ-ONLY endpoint config dump: 56 CFG window dwords + the 7 iATU region 1 registers, `LINK R27` lines, no write of any kind); N = 26 adds S26 (iATU region 0 programmed with the 7 allowlisted writes, each read back, then the CFG window probe + 4 reads; the ATU is torn down FIRST); N = 25 adds S25 (read-only iATU layout: DBI words + the ATU block probe + ATU region 0 + ELBI, `LINK R25` lines); N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
+ * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 30 adds S30 (the first BAR0 read: ChipCommon chip id through MEM, read-only, offset 0 only, behind a fake of region 1 / BAR0 window / Command, all-ones, fault and wrong-id mutants); N = 29 adds S29 (iATU outbound region 1, BAR0 window select, Command := MEM only); N = 28 adds S28 (BAR sizing + assignment); N = 27 adds S27 (READ-ONLY endpoint config dump: 56 CFG window dwords + the 7 iATU region 1 registers, `LINK R27` lines, no write of any kind); N = 26 adds S26 (iATU region 0 programmed with the 7 allowlisted writes, each read back, then the CFG window probe + 4 reads; the ATU is torn down FIRST); N = 25 adds S25 (read-only iATU layout: DBI words + the ATU block probe + ATU region 0 + ELBI, `LINK R25` lines); N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
  *   gcc -O1 -Wall -Wextra -Werror -DWLAN_LINK_RUN -DWLAN_LINK_N=19 -I. -Iout -include out/board_config.h -o out/wlanlink_host_test19 wlanlink_host_test.c */
 #include <assert.h>
@@ -23,6 +23,12 @@
 #else
 #define L0X 0u
 #endif
+/* S29 adds teardown rows at the head: region 1 disable, Command 0, BAR0 window, and (after the BAR rows) the region 1 resets */
+#if WLAN_LINK_N >= 29
+#define NTEAR29 6u
+#else
+#define NTEAR29 0u
+#endif
 /* S28 writes the endpoint BARs (sizing + assignment) through the CFG window: 4 teardown rows go FIRST */
 #if WLAN_LINK_N >= 28
 #define NCFGT 4u
@@ -38,6 +44,15 @@
 #define WLAN_LINK_N_STR WLAN_STR(WLAN_LINK_N)
 #include "wlanlink.c"
 
+/* the state-free view of the allowlist (cmd only; BAR0 unreadable, region 1 not ready) and the full one */
+static int walc(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, uint32_t cmd, uint32_t bar0, int r1ok)
+{
+	struct w32_ctx c = { cmd, bar0, r1ok };
+
+	return w32_allowed(pa, mask, old, v, &c);
+}
+#define wal(pa, mask, old, v, cmd) walc(pa, mask, old, v, cmd, 0xFFFFFFFFu, 0)
+
 #if !(SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_PMA))
 #error "needs the bluejay board_config.h and -DWLAN_LINK_RUN"
 #endif
@@ -46,7 +61,8 @@
 struct bank { uint32_t con, latch, ext, w[6]; };
 static struct bank gp14, gh2;
 static uint32_t pma[0x2000 / 4], pcs[0x1000 / 4], elbi[0x2000 / 4], ia[0x1000 / 4], dbi[0x1000 / 4], atu[0x1000 / 4], cfgspace[0x2000 / 4];
-static unsigned cfg_reads, cfg_reads_unconfigured, cfg_writes_unconfigured;
+static unsigned cfg_reads, cfg_reads_unconfigured, cfg_writes_unconfigured, mem_reads, mem_reads_unready, master_writes;
+static int mem_mode;		/* 0 = chip id, 1 = all ones (UR without a fault), 2 = the read faults, 3 = another id */
 static uint32_t bar_sz[2];	/* fake BAR0 / BAR2 size in bytes (power of two) */
 static uint32_t iso1, iso0;
 static unsigned pll_after, cdr_after, oc_after, pll_cnt, cdr_cnt, oc_cnt, l0_after, l0_cnt, l0_polls;
@@ -96,7 +112,20 @@ static int blk_unreadable(uintptr_t pa)
 {
 	return (unreadable_blk == 1 && pa >= WLAN_PMA && pa < WLAN_PMA + 0x2000) || (unreadable_blk == 2 && pa >= WLAN_IA && pa < WLAN_IA + 0x1000) ||
 	       (unreadable_blk == 3 && pa >= WLAN_ELBI && pa < WLAN_ELBI + 0x2000) || (unreadable_blk == 4 && pa >= WLAN_DBI && pa < WLAN_DBI + 0x1000) ||
-	       (unreadable_blk == 5 && pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000) || (unreadable_blk == 6 && pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000);
+	       (unreadable_blk == 5 && pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000) || (unreadable_blk == 6 && pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000) ||
+	       (unreadable_blk == 7 && pa >= WLAN_MEM && pa < WLAN_MEM + 0x1000);
+}
+
+static int region0_ok(void)
+{
+	return atu[0] == 0x4u && atu[1] == 0x80000000u && atu[2] == 0x60FFE000u && atu[3] == 0u && atu[4] == 0x60FFFFFFu && atu[5] == 0x01000000u && atu[6] == 0u;
+}
+
+/* BAR0 is reachable from the CPU only while region 1 is the enabled MEM window over BAR0, the EP decodes MEM (Command.MEM), BAR0 holds the assigned address and the window select points at ChipCommon */
+static int mem_ready(void)
+{
+	return atu[0x200 / 4] == 0u && atu[0x204 / 4] == 0x80000000u && atu[0x208 / 4] == 0x60000000u && atu[0x20C / 4] == 0u && atu[0x210 / 4] == 0x6000FFFFu && atu[0x214 / 4] == 0x60000000u && atu[0x218 / 4] == 0u &&
+	       (cfgspace[1] & 2u) != 0u && cfgspace[4] == 0x60000004u && cfgspace[0x80 / 4] == 0x18000000u;
 }
 
 int try_read32(uintptr_t pa, uint32_t *v)
@@ -105,9 +134,20 @@ int try_read32(uintptr_t pa, uint32_t *v)
 
 	if (pa == fault_read_pa || blk_unreadable(pa))
 		return 0;
+	if (pa >= WLAN_MEM && pa < WLAN_MEM + 0x1000) {		/* fake BAR0: an unmapped window (not ready) = a bus abort model: unreadable */
+		mem_reads++;
+		if (!mem_ready()) {
+			mem_reads_unready++;
+			return 0;
+		}
+		if (mem_mode == 2)
+			return 0;
+		*v = mem_mode == 1 ? 0xFFFFFFFFu : mem_mode == 3 ? 0x00404390u : (pa == WLAN_MEM ? 0x00404389u : 0u);	/* upper 16 bits are a FAKE (rev/pkg/cc/type are not predicted) */
+		return 1;
+	}
 	if (pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000) {		/* the CFG window answers only while outbound region 0 is the enabled CFG0 -> bus 1 window (Linux's values); otherwise a bus abort = unreadable */
 		cfg_reads++;
-		if (atu[0] != 0x4u || atu[1] != 0x80000000u || atu[2] != 0x60FFE000u || atu[3] != 0u || atu[4] != 0x60FFFFFFu || atu[5] != 0x01000000u || atu[6] != 0u) {
+		if (!region0_ok()) {
 			cfg_reads_unconfigured++;
 			return 0;
 		}
@@ -167,10 +207,17 @@ int try_write32(uintptr_t pa, uint32_t v)
 	if (pa >= WLAN_CFG && pa < WLAN_CFG + 0x2000) {		/* the CFG window: only through the configured outbound region 0; the BARs model sizing (low: size mask | type 0x4, high: plain) */
 		unsigned o = (unsigned)(pa - WLAN_CFG);
 
-		if (atu[0] != 0x4u || atu[1] != 0x80000000u || atu[2] != 0x60FFE000u || atu[3] != 0u || atu[4] != 0x60FFFFFFu || atu[5] != 0x01000000u || atu[6] != 0u)
+		if (!region0_ok())
 			cfg_writes_unconfigured++;
-		assert(o >= 0x10 && o < 0x20 && "CFG write outside the BARs");
-		cfgspace[o / 4] = (o & 4u) ? v : ((v & ~(bar_sz[o >= 0x18] - 1u) & 0xFFFFFFF0u) | 4u);
+		assert(((o >= 0x10 && o < 0x20) || o == 0x04 || o == 0x80) && "CFG write outside the BARs / Command / BAR0 window");
+		if (o == 0x04) {		/* Command low half is plain, the status half is RW1C (a zero write clears nothing); MASTER is counted */
+			master_writes += (v & 4u) != 0;
+			cfgspace[1] = (v & 0xFFFFu) | (cfgspace[1] & ~(v & 0xFFFF0000u) & 0xFFFF0000u);
+		} else if (o == 0x80) {
+			cfgspace[o / 4] = v;
+		} else {
+			cfgspace[o / 4] = (o & 4u) ? v : ((v & ~(bar_sz[o >= 0x18] - 1u) & 0xFFFFFFF0u) | 4u);
+		}
 		return 1;
 	}
 	c = cell(pa);
@@ -199,8 +246,9 @@ int wlan_link_iso_clear(uint32_t *rd)
 
 static void world(void)
 {
-	memset(pma, 0, sizeof(pma)); memset(pcs, 0, sizeof(pcs)); memset(elbi, 0, sizeof(elbi)); memset(ia, 0, sizeof(ia)); memset(dbi, 0, sizeof(dbi)); memset(atu, 0, sizeof(atu)); atu[0x10 / 4] = 0xFFFu;		/* ATU region 0 at reset (run w3a-n25): all 0, LIMIT 0xFFF */
-	memset(cfgspace, 0, sizeof(cfgspace)); cfgspace[0] = 0x43DC14E4u; cfgspace[1] = 0x00100000u; cfgspace[2] = 0x02800003u; cfgspace[3] = 0x00010000u; cfgspace[4] = 4u; cfgspace[6] = 4u; bar_sz[0] = 0x8000u; bar_sz[1] = 0x400000u; cfg_reads = cfg_reads_unconfigured = cfg_writes_unconfigured = 0;
+	memset(pma, 0, sizeof(pma)); memset(pcs, 0, sizeof(pcs)); memset(elbi, 0, sizeof(elbi)); memset(ia, 0, sizeof(ia)); memset(dbi, 0, sizeof(dbi)); memset(atu, 0, sizeof(atu)); atu[0x10 / 4] = 0xFFFu; atu[0x210 / 4] = 0xFFFu;		/* ATU regions 0 / 1 at reset (runs w3a-n25 / w3a-n28c): all 0, LIMIT 0xFFF */
+	memset(cfgspace, 0, sizeof(cfgspace)); cfgspace[0] = 0x43DC14E4u; cfgspace[1] = 0x00100000u; cfgspace[2] = 0x02800003u; cfgspace[3] = 0x00010000u; cfgspace[4] = 4u; cfgspace[6] = 4u; cfgspace[0x80 / 4] = 0x18001000u; cfgspace[0x88 / 4] = 0x00080080u; cfgspace[0xBC / 4] = 0x10110000u; cfgspace[0x100 / 4] = 0x13C10001u; bar_sz[0] = 0x10000u; bar_sz[1] = 0x400000u;
+	cfg_reads = cfg_reads_unconfigured = cfg_writes_unconfigured = mem_reads = mem_reads_unready = master_writes = 0; mem_mode = 0;		/* BAR0 64 KiB, BAR2 4 MiB (run w3a-n28c R28 rows 355 / 365) */
 	memset(&gp14, 0, sizeof(gp14)); memset(&gh2, 0, sizeof(gh2));
 	gp14.con = 0x33; gp14.ext = 0x3;			/* run w1: CON 0x33, DAT 0x3 */
 	gh2.con = 0; gh2.ext = 0x2;				/* PERST input low, CLKREQ high */
@@ -280,6 +328,23 @@ static unsigned last_ev(int t, uintptr_t lo, uintptr_t hi)
 	return r;
 }
 
+static unsigned first_ev(uintptr_t pa, uint32_t v)	/* 1 + index of the first write of v to pa, 0 if none */
+{
+	for (unsigned i = 0; i < nev; i++)
+		if (ev[i].t == EV_W && ev[i].pa == pa && ev[i].v == v)
+			return i + 1;
+	return 0;
+}
+
+static unsigned count_w(uintptr_t lo, uintptr_t hi)
+{
+	unsigned n = 0;
+
+	for (unsigned i = 0; i < nev; i++)
+		n += ev[i].t == EV_W && ev[i].pa >= lo && ev[i].pa < hi;
+	return n;
+}
+
 static void baseline_restored(void)
 {
 	EXPECT(gp14.con == 0x33 && (dat_read(&gp14) & 4) == 0 && gh2.con == 0 && (dat_read(&gh2) & 1) == 0 && iso1 == 0);
@@ -335,17 +400,30 @@ static void teardown_tail_is_table_order(unsigned hi)
 		EXPECT(ev[nev - n + j].t == et[j]);
 		EXPECT(et[j] != EV_W || ev[nev - n + j].pa == epa[j]);
 	}
-	if (hi >= 26) {		/* S26 started: the 7 ATU rows are the head of the teardown (after the 4 BAR rows if S28 started: the CFG window dies with the ATU disable), CR2 (region disable) FIRST, all before PERST low */
-		unsigned nc = hi >= 28 ? 4u : 0u;
+	if (hi >= 26) {		/* S26 started: the head of the teardown is (S29: region 1 disable, Command 0, BAR0 window,) (S28: the 4 BAR rows, the CFG window dies with the ATU disable,) (S29: the 3 region 1 resets,) then the 7 region 0 rows
+			 * with CR2 (region disable) FIRST, all before PERST low */
+		unsigned pre = hi >= 29 ? 3u : 0u, nc = hi >= 28 ? 4u : 0u, a1 = hi >= 29 ? 3u : 0u, b0 = (unsigned)(nev - n);
 
+		if (pre) {
+			EXPECT(ev[b0].t == EV_W && ev[b0].pa == WLAN_ATU + 0x204 && ev[b0].v == 0);					/* region 1 disable FIRST (RC-local, cannot stall) */
+			EXPECT(ev[b0 + 1].pa == WLAN_CFG + 4 && ev[b0 + 1].v == 0 && ev[b0 + 2].pa == WLAN_CFG + 0x80 && ev[b0 + 2].v == 0x18001000u);	/* Command := 0, then the window select back */
+		}
 		for (unsigned j = 0; j < nc; j++)
-			EXPECT(ev[nev - n + j].t == EV_W && ev[nev - n + j].pa == WLAN_CFG + 0x10 + 4 * j && ev[nev - n + j].v == ((j & 1u) ? 0u : 4u));
-		EXPECT(ev[nev - n + nc].pa == WLAN_ATU + 4 && ev[nev - n + nc].v == 0);
+			EXPECT(ev[b0 + pre + j].t == EV_W && ev[b0 + pre + j].pa == WLAN_CFG + 0x10 + 4 * j && ev[b0 + pre + j].v == ((j & 1u) ? 0u : 4u));
+		if (a1) {
+			EXPECT(ev[b0 + pre + nc].pa == WLAN_ATU + 0x208 && ev[b0 + pre + nc].v == 0 && ev[b0 + pre + nc + 1].pa == WLAN_ATU + 0x210 && ev[b0 + pre + nc + 1].v == 0xFFFu);
+			EXPECT(ev[b0 + pre + nc + 2].pa == WLAN_ATU + 0x214 && ev[b0 + pre + nc + 2].v == 0);
+		}
+		EXPECT(ev[b0 + pre + nc + a1].pa == WLAN_ATU + 4 && ev[b0 + pre + nc + a1].v == 0);
 		for (unsigned j = 0; j < 7; j++)
-			EXPECT(ev[nev - n + nc + j].t == EV_W && ev[nev - n + nc + j].pa >= WLAN_ATU && ev[nev - n + nc + j].pa < WLAN_ATU + 0x1000);
-		EXPECT(ev[nev - n + nc + 7].pa == WLAN_GPH2 + 4);
+			EXPECT(ev[b0 + pre + nc + a1 + j].t == EV_W && ev[b0 + pre + nc + a1 + j].pa >= WLAN_ATU && ev[b0 + pre + nc + a1 + j].pa < WLAN_ATU + 0x200);
+		EXPECT(ev[b0 + pre + nc + a1 + 7].pa == WLAN_GPH2 + 4);
 		EXPECT(atu[0] == 0 && atu[1] == 0 && atu[2] == 0 && atu[3] == 0 && atu[4] == 0xFFFu && atu[5] == 0 && atu[6] == 0);	/* the registers are back at their reset values */
-		skip = 7 + nc;
+		if (hi >= 29) {
+			EXPECT(atu[0x200 / 4] == 0 && atu[0x204 / 4] == 0 && atu[0x208 / 4] == 0 && atu[0x20C / 4] == 0 && atu[0x210 / 4] == 0xFFFu && atu[0x214 / 4] == 0 && atu[0x218 / 4] == 0);	/* region 1 too */
+			EXPECT(cfgspace[1] == 0x00100000u && cfgspace[0x80 / 4] == 0x18001000u);								/* Command and the window select are back */
+		}
+		skip = pre + nc + a1 + 7;
 	}
 	if (hi >= 20) {		/* T01: PERST low first; T02: LTSSM disable second if the S23 step started; then WLAN_EN low */
 		first_perst_low = nev - n + skip;
@@ -363,15 +441,15 @@ int main(void)
 {
 	struct wlan_row r;
 
-	EXPECT(WLAN_SEQ_LAST == 28 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
+	EXPECT(WLAN_SEQ_LAST == 30 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
 	/* the independent allowlist refuses every other register (a corrupted table / index cannot reach them) */
-	EXPECT(!w32_allowed(WLAN_GPP14 + 4, 1u << 3, 0, 0, 0) && !w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 3, 0) && w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 2, 0));
-	EXPECT(!w32_allowed(WLAN_GPH2 + 4, 1u << 2, 0, 0, 0) && w32_allowed(WLAN_GPH2 + 4, 3u, 0, 1, 0) && !w32_allowed(WLAN_GPH2, 0xf00u, 0, 0, 0) && !w32_allowed(WLAN_GPP14 + 0x18, 1, 0, 0, 0));
-	EXPECT(!w32_allowed(WLAN_GPP14 + 0, 0, 0, 0, 0));		/* an empty mask is not a write */
-	EXPECT(!w32_allowed(WLAN_PMA + 0x2000, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_PMA + 0x1ffe, FULL_MASK_T, 0, 0, 0) && w32_allowed(WLAN_PMA + 0x1ffc, FULL_MASK_T, 0, 0, 0));
-	EXPECT(!w32_allowed(WLAN_ELBI + 0x500, FULL_MASK_T, 0, 0, 0) && w32_allowed(WLAN_ELBI + 0x54, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_ELBI + 0x2c8, FULL_MASK_T, 0, 0, 0));
-	EXPECT(!w32_allowed(WLAN_DBI + 0x8bc, FULL_MASK_T, 0, 0, 0) && w32_allowed(WLAN_DBI + 0x890, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_IA + 0x180, FULL_MASK_T, 0, 0, 0));
-	EXPECT(!w32_allowed(WLAN_PMU_ALIVE + 0x3EC4, FULL_MASK_T, 0, 0, 0) && !w32_allowed(0x17460810UL, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_PCS + 0x1000, FULL_MASK_T, 0, 0, 0));
+	EXPECT(!wal(WLAN_GPP14 + 4, 1u << 3, 0, 0, 0) && !wal(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 3, 0) && wal(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 2, 0));
+	EXPECT(!wal(WLAN_GPH2 + 4, 1u << 2, 0, 0, 0) && wal(WLAN_GPH2 + 4, 3u, 0, 1, 0) && !wal(WLAN_GPH2, 0xf00u, 0, 0, 0) && !wal(WLAN_GPP14 + 0x18, 1, 0, 0, 0));
+	EXPECT(!wal(WLAN_GPP14 + 0, 0, 0, 0, 0));		/* an empty mask is not a write */
+	EXPECT(!wal(WLAN_PMA + 0x2000, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_PMA + 0x1ffe, FULL_MASK_T, 0, 0, 0) && wal(WLAN_PMA + 0x1ffc, FULL_MASK_T, 0, 0, 0));
+	EXPECT(!wal(WLAN_ELBI + 0x500, FULL_MASK_T, 0, 0, 0) && wal(WLAN_ELBI + 0x54, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_ELBI + 0x2c8, FULL_MASK_T, 0, 0, 0));
+	EXPECT(!wal(WLAN_DBI + 0x8bc, FULL_MASK_T, 0, 0, 0) && wal(WLAN_DBI + 0x890, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_IA + 0x180, FULL_MASK_T, 0, 0, 0));
+	EXPECT(!wal(WLAN_PMU_ALIVE + 0x3EC4, FULL_MASK_T, 0, 0, 0) && !wal(0x17460810UL, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_PCS + 0x1000, FULL_MASK_T, 0, 0, 0));
 	world();
 	EXPECT(w32(WLAN_SEQ_NROWS, 0) == -2 && w32(WLAN_SEQ_NTEAR, 1) == -2 && w32(100000u, 0) == -2 && nwrites == 0);	/* index overflow */
 	for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)		/* a row beyond N is refused by the writer itself */
@@ -386,12 +464,12 @@ int main(void)
 
 	/* need_probe is checked by behaviour, not only by its sha pin (review 7 L3, review 6 info 5): a row of a probe-gated block is refused by run_row unless THAT block's probe ran, with no access */
 	{
-		unsigned allb = 0, nprobes[WLB_CFG + 1] = { 0 }, first_probe[WLB_CFG + 1] = { 0 }, first_row[WLB_CFG + 1] = { 0 };
+		unsigned allb = 0, nprobes[WLB_MEM + 1] = { 0 }, first_probe[WLB_MEM + 1] = { 0 }, first_row[WLB_MEM + 1] = { 0 };
 
 		world();
-		for (unsigned b = 0; b <= WLB_CFG; b++)
+		for (unsigned b = 0; b <= WLB_MEM; b++)
 			allb |= need_probe(b);
-		EXPECT(need_probe(WLB_CFG) == 1u << WLB_CFG && need_probe(WLB_ATU) == 1u << WLB_ATU && need_probe(WLB_NONE) == 0);
+		EXPECT(need_probe(WLB_MEM) == 1u << WLB_MEM && need_probe(WLB_CFG) == 1u << WLB_CFG && need_probe(WLB_ATU) == 1u << WLB_ATU && need_probe(WLB_NONE) == 0);
 		for (unsigned t = 0; t < 2; t++)
 			for (unsigned i = 0; i < (t ? WLAN_SEQ_NTEAR : WLAN_SEQ_NROWS); i++) {
 				unsigned probed, rd = 0;
@@ -404,7 +482,7 @@ int main(void)
 				probed = allb & ~need_probe(r.blk);
 				EXPECT(run_row(i, t, &probed, &rd) == ST_REFUSED);
 			}
-		EXPECT(nwrites == 0 && cfg_reads == 0);
+		EXPECT(nwrites == 0 && cfg_reads == 0 && mem_reads == 0);
 		/* the table twin: per probe-gated block exactly one probe row, and it is the block's first row */
 		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++) {
 			EXPECT(get_row(i, 0, &r));
@@ -417,7 +495,7 @@ int main(void)
 				first_probe[r.blk] = i + 1u;
 			}
 		}
-		for (unsigned b = 0; b <= WLB_CFG; b++)
+		for (unsigned b = 0; b <= WLB_MEM; b++)
 			EXPECT(!need_probe(b) || (nprobes[b] == 1 && first_probe[b] == first_row[b]));
 	}
 
@@ -606,7 +684,7 @@ int main(void)
 		EXPECT(k == 7 && nrow == 20 && nprobe == 1 && nwait == 1);
 		EXPECT(wlan_link_run() == 0 && has("LINK S26 ok rows=20") && !has("!!!") && (WLAN_LINK_N >= 28 || cfg_reads == 5u + CFG27) && cfg_reads_unconfigured == 0);	/* all CFG reads (S26: 5, S27: 56) after the region was enabled */
 		for (unsigned i = 0; i < nev; i++)
-			if (ev[i].t == EV_W && ev[i].pa >= WLAN_ATU && ev[i].pa < WLAN_ATU + 0x1000) {
+			if (ev[i].t == EV_W && ev[i].pa >= WLAN_ATU && ev[i].pa < WLAN_ATU + 0x200) {		/* region 0 only (region 1 is S29's) */
 				EXPECT(iw < 14);
 				wpos[iw] = i;
 				if (iw < 7)
@@ -640,7 +718,7 @@ int main(void)
 		baseline_restored();
 		/* the allowlist twin: exactly the 7 offsets with exactly the S26 / reset values, full-word writes only; no CFG address at all */
 		{
-			static const uint32_t vals[] = { 0, 1, 0x4u, 0x5u, 0x80000000u, 0x80000001u, 0x60FFE000u, 0x60FFE004u, 0x60FFFFFFu, 0x60FFFFFEu, 0x01000000u, 0x01000001u, 0xFFFu, 0x1000u, 0xFFFFFFFFu };
+			static const uint32_t vals[] = { 0, 1, 0x4u, 0x5u, 0x80000000u, 0x80000001u, 0x60FFE000u, 0x60FFE004u, 0x60FFFFFFu, 0x60FFFFFEu, 0x01000000u, 0x01000001u, 0xFFFu, 0x1000u, 0xFFFFFFFFu, 0x60000000u, 0x60000001u, 0x6000FFFFu, 0x6000FFFEu };
 
 			for (uint32_t off = 0; off < 0x1000u; off += 4)
 				for (unsigned j = 0; j < sizeof vals / sizeof vals[0]; j++) {
@@ -650,13 +728,16 @@ int main(void)
 						want_ok |= off == sw[m].off && vals[j] == sw[m].v;
 					for (unsigned m = 0; m < 7; m++)
 						want_ok |= off == st[m].off && vals[j] == st[m].v;
-					EXPECT(w32_allowed(WLAN_ATU + off, FULL_MASK_T, 0, vals[j], 0) == want_ok);
-					EXPECT(!w32_allowed(WLAN_ATU + off, 0x7FFFFFFFu, 0, vals[j] & 0x7FFFFFFFu, 0) && !w32_allowed(WLAN_ATU + off, 0, 0, 0, 0));	/* never a partial-mask or empty write */
+					want_ok |= (off == 0x204u && vals[j] == 0u) || (off == 0x208u && (vals[j] == 0x60000000u || vals[j] == 0u)) || (off == 0x210u && (vals[j] == 0x6000FFFFu || vals[j] == 0xFFFu)) ||
+						   (off == 0x214u && (vals[j] == 0x60000000u || vals[j] == 0u));		/* S29 region 1 (research 36 s.7): the S29 values and the resets; the ENABLE only with r1ok */
+					EXPECT(wal(WLAN_ATU + off, FULL_MASK_T, 0, vals[j], 0) == want_ok);
+					EXPECT(walc(WLAN_ATU + off, FULL_MASK_T, 0, vals[j], 0, 0xFFFFFFFFu, 1) == (want_ok || (off == 0x204u && vals[j] == 0x80000000u)));
+					EXPECT(!wal(WLAN_ATU + off, 0x7FFFFFFFu, 0, vals[j] & 0x7FFFFFFFu, 0) && !wal(WLAN_ATU + off, 0, 0, 0, 0));	/* never a partial-mask or empty write */
 				}
 			for (uint32_t off = 0; off < 0x2000u; off += 4)
 				for (unsigned j = 0; j < sizeof vals / sizeof vals[0]; j++)
-					EXPECT(!w32_allowed(WLAN_CFG + off, FULL_MASK_T, 0, vals[j], 0) || (off >= 0x10 && off < 0x20));	/* the BARs 0x10..0x1C are S28's (tested below); everything else in the window is never writable */
-			EXPECT(!w32_allowed(WLAN_CFG - 4, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_ATU + 0x1000, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_ATU - 4, FULL_MASK_T, 0, 0, 0));
+					EXPECT(!wal(WLAN_CFG + off, FULL_MASK_T, 0, vals[j], 0) || (off >= 0x10 && off < 0x20) || (off == 0x04 && vals[j] == 0));	/* the BARs 0x10..0x1C are S28's, Command 0 and the window select are S29's (tested below); everything else in the window is never writable */
+			EXPECT(!wal(WLAN_CFG - 4, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_ATU + 0x1000, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_ATU - 4, FULL_MASK_T, 0, 0, 0));
 		}
 		world(); unreadable_blk = 6;			/* the CFG probe faults: stop at that row, no CFG word printed, ATU torn down (CR2 first) back to reset, restore ok */
 		snprintf(b, sizeof b, "LINK S26 fault row=%u", probe_row);
@@ -744,17 +825,17 @@ int main(void)
 		for (uint32_t off = 0; off < 0x40u; off += 4) {
 			int bar = off >= 0x10u && off < 0x20u;
 
-			EXPECT(w32_allowed(WLAN_CFG + off, FULL_MASK_T, 0xFFFFFFFFu, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFu) == bar);		/* the restore passes even with Command != 0 and any old value */
-			EXPECT(!w32_allowed(WLAN_CFG + off, FULL_MASK_T, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFFFFFu, 2u) && !w32_allowed(WLAN_CFG + off, 0xFFFFFFF0u, 4u, 0xFFFFFFFFu, 0));	/* Command decode on, or a partial mask: never */
-			EXPECT(w32_allowed(WLAN_CFG + off, FULL_MASK_T, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFFFFFu, 0) == bar);	/* sizing from the original, Command 0 */
-			EXPECT(!w32_allowed(WLAN_CFG + off, FULL_MASK_T, 0x12345678u, 0xFFFFFFFFu, 0));						/* sizing only from the original (not from some other state) */
+			EXPECT(wal(WLAN_CFG + off, FULL_MASK_T, 0xFFFFFFFFu, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFu) == (bar || off == 0x04u));		/* the restore passes even with Command != 0 and any old value (Command := 0 is S29's restore) */
+			EXPECT(!wal(WLAN_CFG + off, FULL_MASK_T, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFFFFFu, 2u) && !wal(WLAN_CFG + off, 0xFFFFFFF0u, 4u, 0xFFFFFFFFu, 0));	/* Command decode on, or a partial mask: never */
+			EXPECT(wal(WLAN_CFG + off, FULL_MASK_T, bar ? bars_orig[(off - 0x10u) / 4] : 0u, 0xFFFFFFFFu, 0) == bar);	/* sizing from the original, Command 0 */
+			EXPECT(!wal(WLAN_CFG + off, FULL_MASK_T, 0x12345678u, 0xFFFFFFFFu, 0));						/* sizing only from the original (not from some other state) */
 		}
-		EXPECT(!w32_allowed(WLAN_CFG + 0x04, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_CFG + 0x04, FULL_MASK_T, 0, 2u, 0) && !w32_allowed(WLAN_CFG + 0x20, FULL_MASK_T, 0, 0, 0) && !w32_allowed(WLAN_CFG + 0x80, FULL_MASK_T, 0, 0x18000000u, 0));
-		EXPECT(w32_allowed(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000004u, 0) && w32_allowed(WLAN_CFG + 0x18, FULL_MASK_T, 4u, 0x60400004u, 0));	/* the two assignments, only from the original */
-		EXPECT(!w32_allowed(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60400004u, 0) && !w32_allowed(WLAN_CFG + 0x18, FULL_MASK_T, 4u, 0x60000004u, 0) && !w32_allowed(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000000u, 0));
-		EXPECT(!w32_allowed(WLAN_CFG + 0x10, FULL_MASK_T, 0xFFFF8004u, 0x60000004u, 0) && !w32_allowed(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000004u, 1u));
-		EXPECT(!w32_allowed(WLAN_CFG + 0x14, FULL_MASK_T, 0, 0x60000000u, 0) && !w32_allowed(WLAN_CFG + 0x1C, FULL_MASK_T, 0, 1u, 0));	/* the high halves take only all ones and 0 */
-		EXPECT(!w32_allowed(WLAN_CFG + 0x1000, FULL_MASK_T, 0, 0, 0));
+		EXPECT(wal(WLAN_CFG + 0x04, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_CFG + 0x04, FULL_MASK_T, 0, 2u, 0) && !wal(WLAN_CFG + 0x20, FULL_MASK_T, 0, 0, 0) && !wal(WLAN_CFG + 0x80, FULL_MASK_T, 0, 0x18000000u, 0));	/* Command takes only 0 without the S29 state; the window select only from 0x18001000 */
+		EXPECT(wal(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000004u, 0) && wal(WLAN_CFG + 0x18, FULL_MASK_T, 4u, 0x60400004u, 0));	/* the two assignments, only from the original */
+		EXPECT(!wal(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60400004u, 0) && !wal(WLAN_CFG + 0x18, FULL_MASK_T, 4u, 0x60000004u, 0) && !wal(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000000u, 0));
+		EXPECT(!wal(WLAN_CFG + 0x10, FULL_MASK_T, 0xFFFF8004u, 0x60000004u, 0) && !wal(WLAN_CFG + 0x10, FULL_MASK_T, 4u, 0x60000004u, 1u));
+		EXPECT(!wal(WLAN_CFG + 0x14, FULL_MASK_T, 0, 0x60000000u, 0) && !wal(WLAN_CFG + 0x1C, FULL_MASK_T, 0, 1u, 0));	/* the high halves take only all ones and 0 */
+		EXPECT(!wal(WLAN_CFG + 0x1000, FULL_MASK_T, 0, 0, 0));
 		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
 			if (get_row(i, 0, &r28) && r28.step == 28) {
 				n28++;
@@ -763,12 +844,12 @@ int main(void)
 			}
 		EXPECT(n28 == 27 && nw28 == 10);
 
-		world();							/* the good run: BAR0 32 KiB, BAR2 4 MiB */
+		world();							/* the good run: BAR0 64 KiB (run w3a-n28c), BAR2 4 MiB */
 		EXPECT(wlan_link_run() == 0 && has("LINK S28 ok rows=27") && !has("!!!") && has("restore=ok"));
 		for (unsigned i = 0; i < nl; i++)
 			nR28 += strstr(lines[i], "LINK R28 ") != NULL;
 		EXPECT(nR28 == 4);									/* per BAR: low + high sizing logs, low + high assignment logs */
-		{	static const char *const want[] = { "rd=0xFFFF8004", "rd=0xFFFFFFFF", "rd=0xFFC00004", "rd=0xFFFFFFFF" };
+		{	static const char *const want[] = { "rd=0xFFFF0004", "rd=0xFFFFFFFF", "rd=0xFFC00004", "rd=0xFFFFFFFF" };
 			unsigned k = 0;
 
 			for (unsigned i = 0; i < nl && k < 4; i++)
@@ -776,9 +857,10 @@ int main(void)
 					k++;
 			EXPECT(k == 4);
 		}
-		EXPECT(cfg_writes_unconfigured == 0 && last_ev(EV_W, WLAN_CFG + 4, WLAN_CFG + 8) == 0);		/* Command is never written; every CFG write went through the enabled region 0 */
+		EXPECT(cfg_writes_unconfigured == 0 && (WLAN_LINK_N >= 29 || last_ev(EV_W, WLAN_CFG + 4, WLAN_CFG + 8) == 0));		/* S28 never writes Command (S29 does, tested below); every CFG write went through the enabled region 0 */
 		for (unsigned j = 0; j < 4; j++)
 			EXPECT(cfgspace[4 + j] == bars_orig[j]);						/* the teardown restored the originals */
+#if WLAN_LINK_N == 28
 		{	static const struct { uint32_t o, v; } wseq[] = { { 0x10, 0xFFFFFFFF }, { 0x10, 4 }, { 0x14, 0xFFFFFFFF }, { 0x14, 0 }, { 0x18, 0xFFFFFFFF }, { 0x18, 4 }, { 0x1C, 0xFFFFFFFF }, { 0x1C, 0 }, { 0x10, 0x60000004 }, { 0x18, 0x60400004 },
 				{ 0x10, 4 }, { 0x14, 0 }, { 0x18, 4 }, { 0x1C, 0 } };
 			unsigned k = 0;
@@ -790,7 +872,8 @@ int main(void)
 				}
 			EXPECT(k == 14);
 		}
-		teardown_tail_is_table_order(28);
+#endif
+		teardown_tail_is_table_order(WLAN_LINK_N);
 		baseline_restored();
 
 		world(); bar_sz[1] = 0x800000u;				/* BAR2 8 MiB: the size guard (bits [31:22] all ones) refuses, BAR2 low is restored, nothing is assigned */
@@ -813,6 +896,238 @@ int main(void)
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S28") && !has("!!!"));
 		baseline_restored();
 
+		baseline_restored();
+	}
+#endif
+
+#if WLAN_LINK_N >= 29
+	/* ---- S29 (research 36): iATU outbound region 1 over BAR0, PCI_BAR0_WIN := ChipCommon, Command := MEM only; nothing reads BAR0 yet (S30) ---- */
+	{
+		static const struct { unsigned blk; uint32_t off, v; } w29[6] = { { WLB_ATU, 0x208, 0x60000000u }, { WLB_ATU, 0x210, 0x6000FFFFu }, { WLB_ATU, 0x214, 0x60000000u }, { WLB_ATU, 0x204, 0x80000000u },
+										   { WLB_CFG, 0x80, 0x18000000u }, { WLB_CFG, 0x04, 0x2u } };
+		static const uint32_t vals[] = { 0, 1, 2, 4, 6, 0x10000u, 0x00100002u, 0x18000000u, 0x18001000u, 0x18002000u, 0x60000004u, 0xFFFFFFFFu };
+		unsigned nw = 0, n29 = 0, nlog = 0, lg[8], k;
+		char b[96];
+
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 29) {
+				n29++;
+				if (r.kind == WLK_MMIO_WRITE) {
+					EXPECT(nw < 6 && r.blk == w29[nw].blk && r.off == w29[nw].off && r.val == w29[nw].v && r.mask == FULL_MASK_T);
+					nw++;
+				}
+				if (r.kind == WLK_READ_ONLY) {
+					EXPECT(r.a == 2u && r.blk == WLB_CFG && nlog < 8);
+					lg[nlog++] = i;
+				}
+				EXPECT(r.blk != WLB_MEM);			/* S29 never touches BAR0 */
+			}
+		EXPECT(n29 == 23 && nw == 6 && nlog == 3);
+		/* the stateful allowlist, exhaustively over small state spaces: Command takes 0 from anywhere, 0x2 only from Command low 0 AND BAR0 low at the S28 assignment; never MASTER, never status bits */
+		for (unsigned oi = 0; oi < sizeof vals / sizeof vals[0]; oi++)
+			for (unsigned vi = 0; vi < sizeof vals / sizeof vals[0]; vi++)
+				for (unsigned bi = 0; bi < sizeof vals / sizeof vals[0]; bi++) {
+					uint32_t old = vals[oi], v = vals[vi], bar0 = vals[bi];
+
+					EXPECT(walc(WLAN_CFG + 0x04, FULL_MASK_T, old, v, 0xFFFFu, bar0, 1) == (v == 0u || (v == 2u && (old & 0xFFFFu) == 0u && bar0 == 0x60000004u)));
+					EXPECT(walc(WLAN_CFG + 0x80, FULL_MASK_T, old, v, 0xFFFFu, bar0, 1) == (v == 0x18001000u || (v == 0x18000000u && old == 0x18001000u)));
+					EXPECT(!walc(WLAN_CFG + 0x88, FULL_MASK_T, old, v, 0, bar0, 1) && !walc(WLAN_CFG + 0x84, FULL_MASK_T, old, v, 0, bar0, 1) && !walc(WLAN_CFG + 0x70, FULL_MASK_T, old, v, 0, bar0, 1));
+					EXPECT(!walc(WLAN_CFG + 0x04, 0xFFFFu, old, (old & 0xFFFF0000u) | (v & 0xFFFFu), 0, 0x60000004u, 1) || (v & 0xFFFFu) == 0u);	/* a partial-mask Command write is never allowed (v is only 0 below the mask) */
+				}
+		EXPECT(!walc(WLAN_CFG + 0x04, 0xFFFFu, 0, 2u, 0, 0x60000004u, 1) && !walc(WLAN_CFG + 0x80, 0xFFFFu, 0x18001000u, 0x18000000u, 0, 0, 1));
+		/* the region 1 enable needs base/limit/target at the S29 values (the ctx_read result); 0x200/0x20C/0x218 and anything above are never writable */
+		EXPECT(walc(WLAN_ATU + 0x204, FULL_MASK_T, 0, 0x80000000u, 0, 0, 1) && !walc(WLAN_ATU + 0x204, FULL_MASK_T, 0, 0x80000000u, 0, 0, 0) && walc(WLAN_ATU + 0x204, FULL_MASK_T, 0x80000000u, 0, 0, 0, 0));
+		for (uint32_t off = 0x200; off < 0x1000u; off += 4)
+			for (unsigned vi = 0; vi < sizeof vals / sizeof vals[0]; vi++)
+				if (off == 0x200u || off == 0x20Cu || off >= 0x218u)
+					EXPECT(!walc(WLAN_ATU + off, FULL_MASK_T, 0, vals[vi], 0, 0, 1));
+		/* BAR0 (MEM) is read-only: never writable at any offset, mask or state; offset 0 only for reads */
+		for (uint32_t off = 0; off <= 0x1000u; off += 4)
+			for (unsigned vi = 0; vi < sizeof vals / sizeof vals[0]; vi++)
+				EXPECT(!walc(WLAN_MEM + off, FULL_MASK_T, 0, vals[vi], 2u, 0x60000004u, 1) && !walc(WLAN_MEM + off, 0xFFu, 0, vals[vi] & 0xFFu, 2u, 0x60000004u, 1));
+		world();
+		{	uint32_t v = 0;
+
+			EXPECT(pa_of(WLB_MEM, 0) == WLAN_MEM && pa_of(WLB_MEM, 4) == WLAN_MEM + 4 && pa_of(WLB_MEM, 0x1000) == 0 && !r32(WLB_MEM, 4, &v) && !r32(WLB_MEM, 0x1000, &v) && !r32(WLB_MEM, 0xFFC, &v) && mem_reads == 0);
+			/* r32 refuses BAR0 itself (no TLP) unless region 1 reads enabled and Command reads exactly MEM */
+			atu[0] = 0x4u; atu[1] = 0x80000000u; atu[2] = 0x60FFE000u; atu[4] = 0x60FFFFFFu; atu[5] = 0x01000000u;
+			cfgspace[4] = 0x60000004u; cfgspace[0x80 / 4] = 0x18000000u;
+			atu[0x208 / 4] = 0x60000000u; atu[0x210 / 4] = 0x6000FFFFu; atu[0x214 / 4] = 0x60000000u;
+			cfgspace[1] = 0x00100002u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 0);						/* region 1 not enabled (Command is MEM) */
+			atu[0x204 / 4] = 0x80000000u;
+			cfgspace[1] = 0x00100000u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 0);						/* Command 0 (region 1 enabled) */
+			cfgspace[1] = 0x00100006u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 0);						/* MASTER also set: not the S29 state */
+			cfgspace[1] = 0x00100003u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 0);
+			cfgspace[1] = 0x00100002u;
+			EXPECT(r32(WLB_MEM, 0, &v) && v == 0x00404389u && mem_reads == 1 && mem_reads_unready == 0);
+			EXPECT(!r32(WLB_MEM, 4, &v) && !r32(WLB_MEM, 0x800, &v) && !r32(WLB_MEM, 0xFFC, &v) && !r32(WLB_MEM, 0x1000, &v) && mem_reads == 1);	/* ready, but only offset 0 is ever read */
+			atu[0x204 / 4] = 0u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 1);
+			atu[0x204 / 4] = 0x80000001u;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 1);
+			atu[0x204 / 4] = 0x80000000u; fault_read_pa = WLAN_CFG + 4;
+			EXPECT(!r32(WLB_MEM, 0, &v) && mem_reads == 1);						/* an unreadable Command is "not ready" */
+			EXPECT(nwrites == 0);
+		}
+		{	/* ctx_read: an unreadable word is "not ready" (never the value a rule wants), region 1 is ready only with base AND limit AND target */
+			struct w32_ctx c;
+
+			world();
+			cfgspace[4] = 0x60000004u; cfgspace[1] = 0x00100000u;
+			atu[0] = 0x4u; atu[1] = 0x80000000u; atu[2] = 0x60FFE000u; atu[4] = 0x60FFFFFFu; atu[5] = 0x01000000u;
+			ctx_read(WLB_CFG, &c);
+			EXPECT(c.cmd == 0x00100000u && c.bar0 == 0x60000004u && !c.r1ok);
+			fault_read_pa = WLAN_CFG + 4;
+			ctx_read(WLB_CFG, &c);
+			EXPECT((c.cmd & 0xFFFFu) != 0u && c.bar0 == 0x60000004u);
+			fault_read_pa = WLAN_CFG + 0x10;
+			ctx_read(WLB_CFG, &c);
+			EXPECT(c.bar0 != 0x60000004u && c.cmd == 0x00100000u);
+			fault_read_pa = 0;
+			ctx_read(WLB_PMA, &c);
+			EXPECT(!c.r1ok && (c.cmd & 0xFFFFu) != 0u);					/* other blocks read nothing */
+			atu[0x208 / 4] = 0x60000000u; atu[0x210 / 4] = 0x6000FFFFu; atu[0x214 / 4] = 0x60000000u;
+			ctx_read(WLB_ATU, &c);
+			EXPECT(c.r1ok);
+			atu[0x208 / 4] = 0x60000004u; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+			atu[0x208 / 4] = 0x60000000u; atu[0x210 / 4] = 0x601FFFFFu; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+			atu[0x210 / 4] = 0x6000FFFFu; atu[0x214 / 4] = 0x60400000u; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+			atu[0x214 / 4] = 0x60000000u; fault_read_pa = WLAN_ATU + 0x210; ctx_read(WLB_ATU, &c); EXPECT(!c.r1ok);
+			fault_read_pa = 0; ctx_read(WLB_ATU, &c); EXPECT(c.r1ok);
+		}
+		{	/* the writer itself against the live state (not only w32_allowed): the enable only with base / limit / target, the window select only from its original, the arm only from Command 0 with BAR0 assigned */
+			unsigned i_cr2 = 0, i_cmd = 0, i_win = 0;
+
+			for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+				if (get_row(i, 0, &r) && r.step == 29 && r.kind == WLK_MMIO_WRITE) {
+					if (r.blk == WLB_ATU && r.off == 0x204u) i_cr2 = i;
+					if (r.blk == WLB_CFG && r.off == 0x04u) i_cmd = i;
+					if (r.blk == WLB_CFG && r.off == 0x80u) i_win = i;
+				}
+			EXPECT(i_cr2 && i_cmd && i_win);
+			world();
+			atu[0] = 0x4u; atu[1] = 0x80000000u; atu[2] = 0x60FFE000u; atu[4] = 0x60FFFFFFu; atu[5] = 0x01000000u;
+			EXPECT(w32(i_cr2, 0) == -2 && atu[0x204 / 4] == 0 && nwrites == 0);			/* nothing programmed yet */
+			atu[0x208 / 4] = 0x60000000u; atu[0x214 / 4] = 0x60000000u;
+			EXPECT(w32(i_cr2, 0) == -2);								/* limit still at its reset */
+			atu[0x210 / 4] = 0x6000FFFFu; atu[0x208 / 4] = 0x60000001u;
+			EXPECT(w32(i_cr2, 0) == -2);								/* base wrong */
+			atu[0x208 / 4] = 0x60000000u; atu[0x214 / 4] = 0u;
+			EXPECT(w32(i_cr2, 0) == -2 && nwrites == 0);						/* target wrong */
+			atu[0x214 / 4] = 0x60000000u;
+			EXPECT(w32(i_cr2, 0) == 0 && atu[0x204 / 4] == 0x80000000u && nwrites == 1);
+			cfgspace[0x80 / 4] = 0x18000000u;
+			EXPECT(w32(i_win, 0) == -2);								/* not from the observed original */
+			cfgspace[0x80 / 4] = 0u;
+			EXPECT(w32(i_win, 0) == -2);
+			cfgspace[0x80 / 4] = 0x18001000u;
+			EXPECT(w32(i_win, 0) == 0 && cfgspace[0x80 / 4] == 0x18000000u);
+			cfgspace[1] = 0x00100000u; cfgspace[4] = 0x4u;
+			EXPECT(w32(i_cmd, 0) == -2 && cfgspace[1] == 0x00100000u);				/* BAR0 not assigned */
+			cfgspace[4] = 0x60000004u; cfgspace[1] = 0x00100001u;
+			EXPECT(w32(i_cmd, 0) == -2);								/* Command already holds a bit */
+			cfgspace[1] = 0x00100000u; fault_read_pa = WLAN_CFG + 0x10;
+			EXPECT(w32(i_cmd, 0) == -2);								/* BAR0 unreadable */
+			fault_read_pa = 0;
+			EXPECT(w32(i_cmd, 0) == 0 && (cfgspace[1] & 0xFFFFu) == 2u && master_writes == 0);
+			EXPECT(nwrites == 3);
+		}
+
+		world();
+		EXPECT(wlan_link_run() == 0 && has("LINK S29 ok rows=23") && !has("!!!") && has("restore=ok") && cfg_writes_unconfigured == 0 && master_writes == 0);
+#if WLAN_LINK_N == 29
+		EXPECT(mem_reads == 0 && !has("LINK S30"));						/* S29 alone never reads BAR0 */
+#endif
+		EXPECT(last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0);				/* BAR0 is never written */
+		k = 0;
+		for (unsigned j = 0; j < 4; j++) {							/* the forward order: base, limit, target, ENABLE, window select, Command */
+			unsigned e = first_ev(WLAN_ATU + w29[j].off, w29[j].v);
+
+			EXPECT(e && e > k);
+			k = e;
+		}
+		EXPECT(first_ev(WLAN_CFG + 0x80, 0x18000000u) > k && first_ev(WLAN_CFG + 4, 2u) > first_ev(WLAN_CFG + 0x80, 0x18000000u));
+		EXPECT(count_w(WLAN_ATU + 0x200, WLAN_ATU + 0x1000) == 8 && count_w(WLAN_CFG + 4, WLAN_CFG + 8) == 2 && count_w(WLAN_CFG + 0x80, WLAN_CFG + 0x84) == 2);	/* 4 forward + 4 teardown; Command, window: write + restore */
+		EXPECT(first_ev(WLAN_CFG + 4, 0u) > first_ev(WLAN_CFG + 4, 2u) && first_ev(WLAN_ATU + 0x204, 0u) > first_ev(WLAN_ATU + 0x204, 0x80000000u));
+		EXPECT(count_w(WLAN_CFG + 8, WLAN_CFG + 0x10) == 0 && count_w(WLAN_CFG + 0x20, WLAN_CFG + 0x80) == 0 && count_w(WLAN_CFG + 0x84, WLAN_CFG + 0x2000) == 0);	/* nothing else in the window (bar the BARs) */
+		for (unsigned j = 0; j < nlog; j++) {
+			(void)get_row(lg[j], 0, &r);
+			snprintf(b, sizeof b, "LINK R29 row=%u rd=0x%08X", lg[j], (unsigned)(r.off == 0x88 ? 0x00080080u : r.off == 0xBC ? 0x10110000u : 0u));
+			EXPECT(has(b));
+		}
+		teardown_tail_is_table_order(WLAN_LINK_N);
+		baseline_restored();
+		/* each latch check REFUSES before the next stage: the Command is never armed unless region 1, window and (own read-back) all latched */
+		world(); cfgspace[0x80 / 4] = 0x18000000u;						/* the window select is not at its observed original: refused in the preconditions, no region 1 write at all */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && !has("!!!") && !wrote(WLAN_ATU + 0x208, FULL_MASK_T, 0x60000000u) && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && mem_reads == 0);
+		teardown_tail_is_table_order(29);
+		baseline_restored();
+		world(); ignore_pa_set = 1; ignore_pa = WLAN_ATU + 0x204;				/* the region 1 enable does not take */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18000000u) && mem_reads == 0);
+		baseline_restored();
+		world(); ignore_pa_set = 1; ignore_pa = WLAN_CFG + 0x80;				/* the window select does not take (the fake write is swallowed) */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && mem_reads == 0);
+		baseline_restored();
+		world(); ignore_pa_set = 1; ignore_pa = WLAN_CFG + 4;					/* the Command does not take: refused at the read-back, BAR0 never read */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S29") && has("restore=ok") && mem_reads == 0 && !has("LINK S30"));
+		baseline_restored();
+		world(); fault_read_pa = WLAN_CFG + 0x104;					/* an unreadable AER word (read only in S29) stops S29 (fault) before the arm */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S29") && !wrote(WLAN_CFG + 4, 0xFFFFu, 2u) && mem_reads == 0);
+		baseline_restored();
+	}
+#endif
+
+#if WLAN_LINK_N >= 30
+	/* ---- S30 (research 36): the first BAR0 read, behind a fake of region 1 / window / Command; read-only, offset 0 only ---- */
+	{
+		unsigned n30 = 0, probe_row = 0, wait_row = 0, logrow = 0;
+		char b[96];
+
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 30) {
+				EXPECT(r.kind == WLK_READ_ONLY || r.kind == WLK_WAIT_EQ);
+				if (r.blk == WLB_MEM) {
+					EXPECT(r.off == 0u && (r.kind == WLK_READ_ONLY || (r.kind == WLK_WAIT_EQ && r.mask == 0xFFFFu && r.val == 0x4389u && r.b == 1u && r.a == 0u)));
+					if (r.kind == WLK_READ_ONLY && r.a == 1u)
+						probe_row = i;
+					else if (r.kind == WLK_READ_ONLY)
+						logrow = i;
+					else
+						wait_row = i;
+				} else {
+					EXPECT(r.blk == WLB_CFG && r.kind == WLK_READ_ONLY && r.a == 2u && (r.off == 0xBC || r.off == 0x104));
+				}
+				n30++;
+			}
+		EXPECT(n30 == 5 && probe_row && logrow == probe_row + 1 && wait_row > logrow);
+		world();
+		EXPECT(wlan_link_run() == 0 && has("LINK S30 ok rows=5") && has("LINK summary reached=S30 stopped=none restore=ok") && !has("!!!"));
+		snprintf(b, sizeof b, "LINK R30 row=%u rd=0x00404389", logrow);
+		EXPECT(has(b) && mem_reads == 3 && mem_reads_unready == 0 && last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0 && master_writes == 0);	/* probe + log + one-shot id check, all behind the armed state */
+		EXPECT(!mem_ready());									/* the teardown disarmed everything */
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		world(); mem_mode = 1;									/* UR / completer abort answered with all ones, no fault: the one-shot id check REFUSES */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S30") && has("restore=ok") && !has("!!!") && mem_reads == 3 && master_writes == 0);
+		snprintf(b, sizeof b, "LINK R30 row=%u rd=0xFFFFFFFF", logrow);
+		EXPECT(has(b) && !mem_ready());
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		world(); mem_mode = 2;									/* the read faults: stop at the probe row, nothing logged from BAR0, teardown unchanged */
+		snprintf(b, sizeof b, "LINK S30 fault row=%u", probe_row);
+		EXPECT(wlan_link_run() == 1 && has(b) && has("restore=ok") && !has("!!!") && mem_reads == 1 && !has("LINK R30 row="));
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		world(); mem_mode = 3;									/* another chip id: refused */
+		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S30") && has("restore=ok") && mem_reads == 3);
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		world(); unreadable_blk = 7;								/* the MEM window unreadable (bus abort): fault at the probe */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S30") && has("restore=ok") && !has("LINK R30 row="));
 		baseline_restored();
 	}
 #endif
