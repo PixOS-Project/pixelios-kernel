@@ -440,11 +440,12 @@ source of truth: the branch `common-tools` (own worktree `~/.t3/worktrees/common
 `tools/tools-sync status` (per file same/differs/missing) and `tools/tools-sync pull` (copies differing files from the ref, skips files with uncommitted changes, refuses while the lock is held; you review and commit). An agent-specific flag in a common file
 must be upstreamed to `common-tools`, or it shows as drift. The gate does not check this (drift is a warning for the agents, not a gate failure).
 
-**One shared patch directory (TP-021/TP-022, user idea 2026-10-24).** `xnu/patches/` is a directory entry in `tools/common-files.txt`, so the branch `common-tools` holds THE patch stack for every agent: write a new patch only in the
-common-tools worktree (`~/.t3/worktrees/common-tools/kernel`, `ls xnu/patches | tail -1` is the last number, nobody can pick the same one), commit it there, then `tools/tools-sync pull` in your worktree and build. Your own
-unshared patch files show as `only-here`; upstream them first, or `pull --prune` removes them. Consequence to accept: every kernel build contains everyone's patches, so a patch in the shared stack should be inert unless its boot-arg is
-set (say which in its header) or be a deliberate fix for every build (say so; today 0106 AMFI/dyld policy and 0108 pmap 64-bit PA are not boot-arg gated, 0107/0111 touch only the Mali path); hardware-writing patches still need their review before the first run that sets that boot-arg. `tools/patch-numbers status|next|release|check` (reservations are git refs shared by all worktrees) remains
-for the time a patch is drafted outside the shared directory: `check` fails if your tree uses a number another branch has under a different name. The gate does not run it (another branch's state must not fail your gate).
+**One numbering for `xnu/patches` (TP-022).** Patches stay per branch (a kernel build contains only the patches of the branch that builds it; sharing one stack was tried and rejected by the user on 2026-10-24: every agent's
+experimental patch would enter everyone's kernel and make failures harder to attribute). Branches diverge (GPU holds 0102-0111, everyone else stops at 0101), so a second agent writing "the next patch" would pick a number that is already taken.
+Before writing a patch run `tools/patch-numbers next --owner NAME --name SLUG`: it prints the next free number above every local and remote branch and every reservation, and records the reservation as a git ref
+(`refs/patch-numbers/NNNN`, shared by all worktrees). `tools/patch-numbers status` lists every number, who holds it and CONFLICT lines (same number, different file name on two branches); `tools/patch-numbers check` fails if THIS
+tree uses a number another branch has under a different name; `release NNNN` drops an unused reservation. When the branches are merged, the numbers are already in order. The gate does not run it (another branch's state must not fail
+your gate): run `check` before committing a patch and before a merge. `tools/tools-sync` can also sync a directory (manifest line ending in "/"), but no patch directory is in the manifest.
 
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
