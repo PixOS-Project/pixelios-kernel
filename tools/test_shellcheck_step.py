@@ -17,6 +17,18 @@ class ShellcheckStep(unittest.TestCase):
             self.assertIn(f, files)
         self.assertFalse([f for f in files if f.endswith(".py")])
 
+    def test_untracked_scripts_are_listed_ignored_are_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "tools").mkdir()
+            shutil.copy(TOOLS / "shell-files", d / "tools")
+            subprocess.run(["git", "init", "-q", str(d)], check=True)
+            (d / ".gitignore").write_text("skipped\n")
+            (d / "new.sh").write_text("echo hi\n")
+            (d / "newbang").write_text("#!/bin/bash\n")
+            (d / "skipped").write_text("#!/bin/bash\n")
+            self.assertEqual(sorted(run(str(d / "tools/shell-files")).stdout.split()), ["new.sh", "newbang", "tools/shell-files"])
+
     def test_check_all_and_gate_select_agree(self):
         text = (TOOLS / "check-all.sh").read_text()
         self.assertEqual(re.search(r'^ALL="([^"]*)"', text, re.M).group(1).split(), g.ALL)
