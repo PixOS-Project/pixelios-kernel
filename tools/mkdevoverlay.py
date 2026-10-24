@@ -25,8 +25,8 @@ def path_check(p):
     b = p.encode('utf-8', 'surrogateescape') if isinstance(p, str) else p
     if not b or b[0:1] != b'/':
         return 'not absolute'
-    if any(c < 0x20 or c == 0x7f for c in b):
-        return 'control byte in path'
+    if any(c < 0x20 or c >= 0x7f for c in b):
+        return 'control or non-ASCII byte in path'
     for comp in b[1:].split(b'/'):
         if comp == b'':
             return 'empty component'
@@ -101,6 +101,7 @@ def parse(buf):
 
 def collect(root, uid=0, gid=0):
     entries, total = [], 0
+    seen = {}
     for d, dirs, files in os.walk(root, followlinks=False):
         dirs.sort()
         for name in sorted(dirs + files):
@@ -117,6 +118,9 @@ def collect(root, uid=0, gid=0):
             if why:
                 sys.exit('mkdevoverlay: %s is not allowed on the phone (%s); allowed: %s'
                          % (path, why, ', '.join(p for p, _ in ALLOW)))
+            if path.lower() in seen:                       # the root may be case-insensitive HFS+: both would be one file (review 19 L2)
+                sys.exit('mkdevoverlay: %s and %s differ only by case' % (seen[path.lower()], path))
+            seen[path.lower()] = path
             data = open(full, 'rb').read()
             total += len(data)
             if total > MAX_TOTAL:

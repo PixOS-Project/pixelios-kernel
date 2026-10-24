@@ -29,10 +29,15 @@ int main(void) {
 			uint64_t off = SD_HDR; struct sd_ent e;
 			for (uint32_t i = 0; i < count; i++) {
 				sd_next(b, n, &off, &e);
-				char path[SD_MAXPATH + 1]; size_t mk = 0;
+				char path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16], sh[160]; size_t mk = 0;
 				const char *why = sd_path_check(&e, path, &mk);
-				printf("E %%s|%%u|%%u|%%u|%%llu|%%d\n", why ? why : "ok", e.mode, e.uid, e.gid, (unsigned long long)e.size,
-				    sd_crc32(e.data, e.size) == e.crc);
+				tmp[0] = orig[0] = 0;
+				if (!why && sd_names(path, tmp, sizeof(tmp), orig, sizeof(orig))) why = "names";
+				sd_show(&e, sh, sizeof(sh));                /* exact-size array: ASan sees a one-byte overflow */
+				char t2[40], o2[40];                        /* too-small buffers: sd_names must refuse, never truncate */
+				int small = why ? 0 : sd_names(path, t2, sizeof(t2), o2, sizeof(o2)) != 0;
+				printf("E %%s|%%u|%%u|%%u|%%llu|%%d|%%lld|%%s|%%s|%%d|%%s\n", why ? why : "ok", e.mode, e.uid, e.gid, (unsigned long long)e.size,
+				    sd_crc32(e.data, e.size) == e.crc, why ? 0LL : (long long)mk, tmp, orig, small, sh);
 			}
 		}
 		puts("--"); free(b);
@@ -55,11 +60,9 @@ def build(src, out):
     code = MAIN % src
     c = out + '.c'
     open(c, 'w').write(code)
-    for flags in (['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined'], []):
-        r = subprocess.run([CC, '-O1', '-Wall', '-Werror=implicit-function-declaration', *flags, '-o', out, c], capture_output=True, text=True)
-        if r.returncode == 0:
-            return None
-    return r.stderr[-2000:]
+    flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined']   # no fallback without sanitizers (review 19 M1-new d)
+    r = subprocess.run([CC, '-O1', '-Wall', '-Werror=implicit-function-declaration', *flags, '-o', out, c], capture_output=True, text=True)
+    return None if r.returncode == 0 else (r.stderr[-2000:] or 'sanitizer build failed')
 
 
 def py(blob):
@@ -67,7 +70,21 @@ def py(blob):
         ents = m.parse(blob)
     except ValueError:
         return ['ERR', '--']
-    return ['E %s|%d|%d|%d|%d|%d' % (m.path_check(p) or 'ok', mo, u, g, len(d), int(c)) for p, mo, u, g, d, c in ents] + ['--']
+    return ['E %s|%d|%d|%d|%d|%d|%d|%s|%s|%d|%s' % (m.path_check(p) or 'ok', mo, u, g, len(d), int(c), mkmin(p) if not m.path_check(p) else 0,
+            *(((p + '.sweettmp', p + '.sweetorig') if not m.path_check(p) else ('', ''))), int(len(p) + 10 >= 40 and not m.path_check(p)), shown(p)) for p, mo, u, g, d, c in ents] + ['--']
+
+
+def mkmin(p):
+    """Twin of *mkmin: len(prefix)-1 under a K_DIR prefix, -1 (size_t max) for K_NAME/K_EXACT."""
+    for pfx in ('/usr/lib/', '/usr/local/', '/private/var/dev/'):
+        if p.startswith(pfx):
+            return len(pfx) - 1
+    return -1
+
+
+def shown(p):
+    b = p.encode('utf-8', 'surrogateescape')[:159]            # sd_show with a 160-byte buffer
+    return ''.join(chr(c) if 0x20 <= c < 0x7f else '?' for c in b)
 
 
 def raw(plen, mode, uid, gid, crc, size, path, data=b''):
@@ -86,7 +103,9 @@ def corpus():
     paths = ['/usr/lib/a', '/usr/lib/../x', '/usr/lib//x', '/usr/libx', '/usr/local/a/b', '/private/var/dev/h', '/etc/x',
              '/System/Library/xpc/launchd.plist', '/System/Library/LaunchDaemons/org.pixelios.t', '/System/Library/LaunchDaemons/org.pixelios.d/x',
              '/usr/lib/a.sweetorig', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/a\x00b', '/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/',
-             '/usr/lib/', '/usr/lib/.', '/usr/lib/a/', '/usr/lib/\xe9', '/usr/lib/' + 'n' * 245, '/usr/lib/' + 'n' * 246, '/usr/lib/x/..', '/usr/lib/x/../y']
+             '/usr/lib/', '/usr/lib/.', '/usr/lib/a/', '/usr/lib/\xe9', '/usr/lib/' + 'n' * 245, '/usr/lib/' + 'n' * 246, '/usr/lib/x/..', '/usr/lib/x/../y',
+             '/System/Library/xpc/launchd.plistX', '/System/Library/xpc/launchd.plist/x', '/usr/lib/' + 'a' * 291,
+             '/usr/lib/' + 'b' * 20, '/usr/lib/' + 'b' * 21]   # last: 300 bytes, sd_show cap 160
     out = []
     # crafted: overflow and bound cases
     p = b'/usr/lib/a'
@@ -146,7 +165,6 @@ MUTANTS = [
     ('count max', 'rd32(b + 12) > SD_MAXCOUNT', 'rd32(b + 12) > 0x7fffffffu'),
     ('header len', 'len < SD_HDR || ', ''),
     ('version', 'rd32(b + 8) != SD_VERSION', '0'),
-    ('0x7f byte', ' || c == 0x7f', ''),
     ('control byte', 'c < 0x20 ||', 'c < 0x1f ||'),
     ('NAME slash', "memchr(out + pl, '/', n - pl)", '0'),
     ('dotdot', "len == 2 && out[comp + 1] == '.' && out[comp + 2] == '.'", '0'),
@@ -155,6 +173,16 @@ MUTANTS = [
     ('suffix case', "if (c >= 'A' && c <= 'Z') {", 'if (0) {'),
     ('component 245', 'len > 245', 'len > 255'),
     ('crc poly', '0xedb88320u', '0xedb88321u'),
+    # review 19 M1-new: mutants that survived the first version
+    ('mkmin D', '*mkmin = pl - 1;', '*mkmin = 0;'),
+    ('mkmin NAME', "memchr(out + pl, '/', n - pl)) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t*mkmin = ((size_t)-1);", "memchr(out + pl, '/', n - pl)) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t*mkmin = 0;"),
+    ('EXACT length', 'if (n != pl) {', 'if (0) {'),
+    ('sd_show cap', 'e->plen < cap - 1 ? e->plen : cap - 1', 'e->plen < cap ? e->plen : cap'),
+    ('C1 sizeof(tmp)', 'snprintf(tmp, tcap,', 'snprintf(tmp, sizeof(tmp),'),
+    ('C1 sizeof(orig)', 'snprintf(orig, ocap,', 'snprintf(orig, sizeof(orig),'),
+    ('C1 no truncation check', '(a < 0 || (size_t)a >= tcap || b < 0 || (size_t)b >= ocap)', '0'),
+    # no tmp-only truncation mutant: equivalent, the longer .sweetorig always truncates first
+    ('non-ASCII byte', 'c >= 0x7f', 'c == 0x7f'),
     ('absolute', "e->path[0] != '/'", '0'),
 ]
 
@@ -166,6 +194,12 @@ class KernelTwin(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(); cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
         cls.src = kernel_source()
         cls.blobs = corpus()
+
+    def test_no_sizeof_of_pointer_buffers(self):
+        # review 19 C1: sd_one's buffers are char * into sd_w; sizeof(tmp) etc. is 8
+        t = open(PATCH).read()
+        self.assertIsNone(re.search(r'sizeof\((shown|path|tmp|orig)\)', t[t.index('+++ b/bsd/dev/sweet_devoverlay.c'):].split('host-test end')[1]))
+        self.assertIn('sd_names(path, tmp, sizeof(sd_w.tmp), orig, sizeof(sd_w.orig))', t)
 
     def test_markers_present(self):
         self.assertIn('sd_next', self.src); self.assertIn('sd_path_check', self.src)
