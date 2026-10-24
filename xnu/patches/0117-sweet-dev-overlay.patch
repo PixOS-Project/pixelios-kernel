@@ -1,0 +1,529 @@
+SWEET dev overlay (patch 0117): copies files from a payload RAM disk into the mounted root before launchd.
+Inert unless boot-arg sweetdev=1|restore AND a RAMDisk memdev starts with a SWEETDEV archive. Format, path allowlist and the RAM disk lookup
+(IOKitBSDInit.cpp:753-764 builds the memdev inside vfs_mountroot; mdevgetrange() after it) are documented in the header of bsd/dev/sweet_devoverlay.c below.
+Adds sweet_vfs_rename/sweet_vfs_mkdir wrappers in vfs_syscalls.c (renameat_internal/mkdir1at are static). Hardware-writing path: unreviewed.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_devoverlay.c		standard
+ bsd/dev/sweet_qr.c			standard
+ bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1043,6 +1043,12 @@
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Dev overlay: copy payload files into the root before launchd (bsd/dev/sweet_devoverlay.c; inert without sweetdev=). */
++	extern void sweet_devoverlay_run(void);
++	sweet_devoverlay_run();
++#endif
++
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
+ 
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9900,6 +9900,25 @@
+ 	           UIO_USERSPACE);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Kernel-path rename and mkdir for bsd/dev/sweet_devoverlay.c (kernel strings, no umask). */
++int
++sweet_vfs_rename(vfs_context_t ctx, const char *from, const char *to)
++{
++	return renameat_internal(ctx, AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
++
++int
++sweet_vfs_mkdir(vfs_context_t ctx, const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(ctx, CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)
+diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_devoverlay.c
+@@ -0,0 +1,463 @@
++/*
++ * SWEET dev overlay: copy files from the payload into the mounted root before launchd starts.
++ *
++ * Inert unless boot-arg sweetdev=1 (copy) or sweetdev=restore AND a memory device (the payload's
++ * /chosen/memory-map RAMDisk, tools/mkdevoverlay.py) starts with a valid SWEETDEV archive.
++ *
++ * Archive (little-endian; offsets from the start of the RAM disk; trailing bytes are ignored):
++ *   header 16 bytes: "SWEETDEV" | u32 version (1) | u32 count (<= 4096)
++ *   per entry, starting 16-byte aligned:
++ *     u16 pathlen (1..1000) | u16 mode (<= 0777) | u32 uid | u32 gid | u32 crc32(data) | u64 size
++ *     path (pathlen bytes, no NUL), zero pad to 16, data (size bytes), zero pad to 16
++ * The kernel never trusts the archive: the whole structure is walked first (magic, version, count,
++ * every length against the remaining bytes, no overflow) and nothing is written if that fails.
++ * A bad crc or path only skips that entry.
++ *
++ * Paths: absolute, no NUL/control bytes, no empty, "." or ".." component, not ending in .sweettmp
++ * or .sweetorig, and matching the allowlist below; anything else is logged "refused" and skipped.
++ * Every existing path component is looked up with NOFOLLOW and must be a directory (a symlink
++ * is refused), so nothing can leave the root. Directories are created only at/below an allowlisted
++ * directory prefix. Each file is written to <path>.sweettmp, chmod/chown'ed, then renamed over the
++ * target; the first replaced pre-existing file is kept as <path>.sweetorig; identical files are
++ * skipped. sweetdev=restore renames <path>.sweetorig back over <path> for every archive entry.
++ * A failure on one entry is logged and the loop continues; this never panics and every loop is bounded.
++ *
++ * RAM disk range: IOFindBSDRoot (iokit/bsddev/IOKitBSDInit.cpp:753-764) turns the RAMDisk property into
++ * a memdev (mdevadd) while resolving the root, i.e. inside vfs_mountroot(); so after vfs_mountroot
++ * the kernel-virtual range is available from mdevgetrange() (bsd/dev/memdev.c), same call IOKit uses.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/vnode_internal.h>
++#include <sys/mount_internal.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
++extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg, enum uio_seg segflg, int unlink_flags);
++extern int sweet_vfs_rename(vfs_context_t ctx, const char *from, const char *to);
++extern int sweet_vfs_mkdir(vfs_context_t ctx, const char *path, int mode);
++
++#define SD_VERSION   1u
++#define SD_HDR       16u
++#define SD_ENT       24u
++#define SD_MAXCOUNT  4096u
++#define SD_MAXPATH   1000u
++#define SD_CHUNK     (1u << 20)
++#define SD_MAXDEV    16
++
++enum { K_DIR, K_NAME, K_EXACT };
++static const struct { const char *pfx; int kind; } sd_allow[] = {
++	{ "/usr/lib/", K_DIR }, { "/usr/local/", K_DIR }, { "/private/var/dev/", K_DIR },
++	{ "/System/Library/xpc/launchd.plist", K_EXACT },
++	{ "/System/Library/LaunchDaemons/org.pixelios.", K_NAME },
++};
++
++struct sd_ent {
++	const uint8_t *path, *data;
++	uint32_t plen, mode, uid, gid, crc;
++	uint64_t size;
++};
++
++static uint32_t sd_crc_tab[256];
++static vfs_context_t sd_ctx;
++static unsigned sd_nw, sd_ns, sd_nr;
++
++static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
++
++static uint32_t
++sd_crc32(const uint8_t *p, uint64_t n)
++{
++	uint32_t c = 0xffffffffu;
++	if (!sd_crc_tab[1]) {
++		for (uint32_t i = 0; i < 256; i++) {
++			uint32_t v = i;
++			for (int k = 0; k < 8; k++) {
++				v = (v & 1) ? (v >> 1) ^ 0xedb88320u : v >> 1;
++			}
++			sd_crc_tab[i] = v;
++		}
++	}
++	while (n--) {
++		c = sd_crc_tab[(c ^ *p++) & 0xff] ^ (c >> 8);
++	}
++	return ~c;
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++/* Parse the entry at *offp (overflow-safe against len); advance *offp. */
++static int
++sd_next(const uint8_t *b, uint64_t len, uint64_t *offp, struct sd_ent *e)
++{
++	uint64_t off = *offp;
++	if (off > len || len - off < SD_ENT) {
++		return EINVAL;
++	}
++	const uint8_t *p = b + off;
++	e->plen = rd16(p); e->mode = rd16(p + 2); e->uid = rd32(p + 4); e->gid = rd32(p + 8);
++	e->crc = rd32(p + 12); e->size = rd64(p + 16);
++	off += SD_ENT;
++	if (e->plen == 0 || e->plen > SD_MAXPATH || e->plen > len - off) {
++		return EINVAL;
++	}
++	e->path = b + off;
++	off = (off + e->plen + 15) & ~15ull;           /* off <= len < 2^63: no overflow */
++	if (off > len || e->size > len - off) {
++		return EINVAL;
++	}
++	e->data = b + off;
++	off = (off + e->size + 15) & ~15ull;
++	if (off > len) {
++		return EINVAL;
++	}
++	*offp = off;
++	return 0;
++}
++
++/* Sanitised copy for logging (the path is untrusted until validated). */
++static void
++sd_show(const struct sd_ent *e, char *out, size_t cap)
++{
++	size_t n = e->plen < cap - 1 ? e->plen : cap - 1;
++	for (size_t i = 0; i < n; i++) {
++		uint8_t c = e->path[i];
++		out[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
++	}
++	out[n] = 0;
++}
++
++static bool
++sd_has_suffix(const char *s, size_t n, const char *suf)
++{
++	size_t k = strlen(suf);
++	return n >= k && memcmp(s + n - k, suf, k) == 0;
++}
++
++/* Copy to out (NUL-terminated); return 0 and *mkmin (smallest dir length that may be created), or a reason. */
++static const char *
++sd_path_check(const struct sd_ent *e, char *out, size_t *mkmin)
++{
++	size_t n = e->plen, comp = 0;
++	if (e->path[0] != '/') {
++		return "not absolute";
++	}
++	for (size_t i = 0; i < n; i++) {
++		uint8_t c = e->path[i];
++		if (c < 0x20 || c == 0x7f) {
++			return "control byte in path";
++		}
++		out[i] = (char)c;
++	}
++	out[n] = 0;
++	for (size_t i = 1; i <= n; i++) {          /* components */
++		if (i == n || out[i] == '/') {
++			size_t len = i - comp - 1;
++			if (len == 0) {
++				return "empty component";
++			}
++			if (len == 1 && out[comp + 1] == '.') {
++				return "'.' component";
++			}
++			if (len == 2 && out[comp + 1] == '.' && out[comp + 2] == '.') {
++				return "'..' component";
++			}
++			comp = i;
++		}
++	}
++	if (sd_has_suffix(out, n, ".sweettmp") || sd_has_suffix(out, n, ".sweetorig")) {
++		return "reserved suffix";
++	}
++	for (size_t a = 0; a < sizeof(sd_allow) / sizeof(sd_allow[0]); a++) {
++		size_t pl = strlen(sd_allow[a].pfx);
++		if (n < pl || memcmp(out, sd_allow[a].pfx, pl) != 0) {
++			continue;
++		}
++		if (sd_allow[a].kind == K_EXACT) {
++			if (n != pl) {
++				continue;
++			}
++			*mkmin = ((size_t)-1);
++		} else if (sd_allow[a].kind == K_NAME) {
++			if (n == pl || memchr(out + pl, '/', n - pl)) {
++				continue;
++			}
++			*mkmin = ((size_t)-1);
++		} else {
++			if (n == pl) {
++				continue;
++			}
++			*mkmin = pl - 1;                /* the prefix directory itself may be created */
++		}
++		return NULL;
++	}
++	return "not in allowlist";
++}
++
++/* NOFOLLOW stat: 0 and *vt (and *size for VREG), or an errno. */
++static int
++sd_stat(const char *path, enum vtype *vt, uint64_t *size)
++{
++	vnode_t vp;
++	int err = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, sd_ctx);
++	if (err) {
++		return err;
++	}
++	*vt = vnode_vtype(vp);
++	off_t sz = 0;
++	if (*vt == VREG && (err = vnode_size(vp, &sz, sd_ctx)) == 0) {
++		*size = (uint64_t)sz;
++	}
++	vnode_put(vp);
++	return err;
++}
++
++/* Every existing parent component must be a real directory; missing ones are created if allowed. */
++static const char *
++sd_parents(char *path, size_t mkmin)
++{
++	size_t n = strlen(path);
++	for (size_t i = 1; i < n; i++) {
++		if (path[i] != '/') {
++			continue;
++		}
++		path[i] = 0;
++		enum vtype vt = VNON;
++		uint64_t sz = 0;
++		int err = sd_stat(path, &vt, &sz);
++		const char *why = NULL;
++		if (err == ENOENT) {
++			if (i < mkmin) {
++				why = "parent missing and not creatable";
++			} else if (sweet_vfs_mkdir(sd_ctx, path, 0755) != 0) {
++				why = "mkdir failed";
++			}
++		} else if (err) {
++			why = "parent lookup failed";
++		} else if (vt != VDIR) {
++			why = "parent is not a directory (symlink?)";
++		}
++		path[i] = '/';
++		if (why) {
++			return why;
++		}
++	}
++	return NULL;
++}
++
++static int
++sd_rm(const char *p)
++{
++	return unlink1(sd_ctx, NULLVP, CAST_USER_ADDR_T(p), UIO_SYSSPACE, 0);
++}
++
++/* Does the existing regular file equal e->data? 1 yes, 0 no/unreadable. */
++static int
++sd_same(const char *path, const struct sd_ent *e, uint8_t *buf)
++{
++	vnode_t vp;
++	if (vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, sd_ctx)) {
++		return 0;
++	}
++	int same = 1;
++	for (uint64_t off = 0; off < e->size && same; ) {
++		uint32_t n = (uint32_t)MIN(e->size - off, (uint64_t)SD_CHUNK);
++		int resid = 0;
++		if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, (off_t)off, UIO_SYSSPACE, IO_NOAUTH,
++		    vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx)) || resid || memcmp(buf, e->data + off, n)) {
++			same = 0;
++		}
++		off += n;
++	}
++	vnode_close(vp, FREAD, sd_ctx);
++	return same;
++}
++
++static int
++sd_write_tmp(const char *tmp, const struct sd_ent *e)
++{
++	vnode_t vp;
++	int err = vnode_open(tmp, O_CREAT | FWRITE | O_NOFOLLOW, 0600, 0, &vp, sd_ctx);
++	if (err) {
++		return err;
++	}
++	vnode_setsize(vp, 0, 0, sd_ctx);
++	for (uint64_t off = 0; off < e->size && !err; ) {
++		uint32_t n = (uint32_t)MIN(e->size - off, (uint64_t)SD_CHUNK);
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(e->data + off), (int)n, (off_t)off, UIO_SYSSPACE,
++		    IO_NODELOCKED | IO_UNIT | IO_NOAUTH, vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx));
++		if (!err && resid) {
++			err = EIO;
++		}
++		off += n;
++	}
++	if (!err) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, e->mode);
++		VATTR_SET(&va, va_uid, e->uid);
++		VATTR_SET(&va, va_gid, e->gid);
++		err = vnode_setattr(vp, &va, sd_ctx);
++	}
++	if (!err) {
++		err = VNOP_FSYNC(vp, MNT_WAIT, sd_ctx);
++	}
++	int cerr = vnode_close(vp, FWRITE, sd_ctx);
++	return err ? err : cerr;
++}
++
++static void
++sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
++{
++	char shown[160], path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16];
++	size_t mkmin = 0;
++	uint64_t t0 = now_ms();
++	sd_show(e, shown, sizeof(shown));
++	const char *why = sd_path_check(e, path, &mkmin);
++	if (!why && !restore && e->mode > 0777) {
++		why = "mode above 0777";
++	}
++	if (!why && !restore && sd_crc32(e->data, e->size) != e->crc) {
++		why = "crc mismatch";
++	}
++	if (why) {
++		printf("SWEET DEV: refused %s (%s)\n", shown, why);
++		sd_nr++;
++		return;
++	}
++	snprintf(tmp, sizeof(tmp), "%s.sweettmp", path);
++	snprintf(orig, sizeof(orig), "%s.sweetorig", path);
++	enum vtype vt = VNON, ot = VNON;
++	uint64_t sz = 0, osz;
++	int serr = sd_stat(path, &vt, &sz);
++	int oerr = sd_stat(orig, &ot, &osz);
++	if (restore) {
++		if (oerr || ot != VREG) {
++			printf("SWEET DEV: restore %s: no .sweetorig\n", shown);
++			sd_ns++;
++		} else if ((why = sd_parents(path, ((size_t)-1))) || (serr == 0 && vt != VREG)) {
++			printf("SWEET DEV: refused %s (%s)\n", shown, why ? why : "target is not a regular file");
++			sd_nr++;
++		} else if ((serr = sweet_vfs_rename(sd_ctx, orig, path)) != 0) {
++			printf("SWEET DEV: failed %s restore error %d\n", shown, serr);
++			sd_nr++;
++		} else {
++			printf("SWEET DEV: restored %s %llu ms\n", shown, now_ms() - t0);
++			sd_nw++;
++		}
++		return;
++	}
++	if ((why = sd_parents(path, mkmin)) != NULL || (serr == 0 && vt != VREG)) {
++		printf("SWEET DEV: refused %s (%s)\n", shown, why ? why : "target is not a regular file");
++		sd_nr++;
++		return;
++	}
++	if (serr && serr != ENOENT) {
++		printf("SWEET DEV: failed %s stat error %d\n", shown, serr);
++		sd_nr++;
++		return;
++	}
++	if (serr == 0 && sz == e->size && sd_same(path, e, buf)) {
++		printf("SWEET DEV: skipped %s %llu bytes (identical) %llu ms\n", shown, e->size, now_ms() - t0);
++		sd_ns++;
++		return;
++	}
++	int err = sd_write_tmp(tmp, e);
++	bool moved = false;
++	if (!err && serr == 0 && (oerr == ENOENT)) {       /* first replacement: keep the original */
++		err = sweet_vfs_rename(sd_ctx, path, orig);
++		moved = !err;
++	}
++	if (!err) {
++		err = sweet_vfs_rename(sd_ctx, tmp, path);
++	}
++	if (err) {
++		if (moved) {
++			(void)sweet_vfs_rename(sd_ctx, orig, path);
++		}
++		(void)sd_rm(tmp);
++		printf("SWEET DEV: failed %s write error %d\n", shown, err);
++		sd_nr++;
++		return;
++	}
++	printf("SWEET DEV: wrote %s %llu bytes%s %llu ms\n", shown, e->size, moved ? " (original kept)" : "", now_ms() - t0);
++	sd_nw++;
++}
++
++void
++sweet_devoverlay_run(void)
++{
++	char arg[16] = "";
++	if (!PE_parse_boot_argn("sweetdev", arg, sizeof(arg))) {
++		return;
++	}
++	bool restore = strcmp(arg, "restore") == 0;
++	if (!restore && strcmp(arg, "1") != 0) {
++		return;
++	}
++	const uint8_t *b = NULL;
++	uint64_t len = 0;
++	for (int id = 0; id < SD_MAXDEV && !b; id++) {
++		uint64_t base, size;
++		if (mdevgetrange(id, &base, &size) == 0 && size >= SD_HDR && memcmp((const void *)(uintptr_t)base, "SWEETDEV", 8) == 0) {
++			b = (const uint8_t *)(uintptr_t)base;
++			len = size;
++		}
++	}
++	if (!b) {
++		printf("SWEET DEV: sweetdev=%s but no SWEETDEV archive in a RAM disk; nothing done\n", arg);
++		return;
++	}
++	uint32_t ver = rd32(b + 8), count = rd32(b + 12);
++	uint64_t off = SD_HDR;
++	struct sd_ent e;
++	if (ver != SD_VERSION || count > SD_MAXCOUNT) {
++		printf("SWEET DEV: bad archive header (version %u count %u); nothing done\n", ver, count);
++		return;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		if (sd_next(b, len, &off, &e)) {
++			printf("SWEET DEV: bad archive (entry %u runs past the end); nothing done\n", i);
++			return;
++		}
++	}
++	vnode_t rv = rootvnode;
++	if (rv == NULLVP || vfs_isrdonly(vnode_mount(rv))) {
++		printf("SWEET DEV: root is not mounted read-write (rootrw=1); nothing done\n");
++		return;
++	}
++	uint8_t *buf = kalloc_data(SD_CHUNK, Z_WAITOK);
++	if (!buf) {
++		printf("SWEET DEV: out of memory\n");
++		return;
++	}
++	sd_ctx = vfs_context_kernel();
++	uint64_t t0 = now_ms();
++	printf("SWEET DEV: %s %u entries from a %llu byte archive\n", restore ? "restore" : "copy", count, len);
++	off = SD_HDR;
++	for (uint32_t i = 0; i < count; i++) {
++		if (sd_next(b, len, &off, &e) == 0) {
++			sd_one(&e, restore, buf);
++		}
++	}
++	kfree_data(buf, SD_CHUNK);
++	printf("SWEET DEV: done: %u written, %u skipped, %u refused/failed, %llu ms\n", sd_nw, sd_ns, sd_nr, now_ms() - t0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
