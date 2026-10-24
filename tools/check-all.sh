@@ -7,7 +7,10 @@
 # Two lanes run in parallel (max 2 jobs): A = shim builds (share shim/out) + host-tests + boot-safety, B = unit, rootless, validate.
 # Reviewers/leads: trust a PASS line whose hash equals `git rev-parse --short HEAD` instead of re-running.
 cd "$(dirname "$0")/.." || exit 2
-mkdir -p shim/out; log=shim/out/gate.log; stamp=shim/out/gate.stamp; : > "$log"
+mkdir -p shim/out
+# shim/out is shared by every build in this worktree: one writer at a time (xrun/probe-run take the same lock around their build; they boot a private copy)
+exec 9>shim/out/.build.lock; flock -w 3600 9 || { echo "GATE FAIL (shim/out busy for 3600 s: another build in this worktree holds shim/out/.build.lock)"; exit 1; }
+log=shim/out/gate.log; stamp=shim/out/gate.stamp; : > "$log"
 h=$(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo "+dirty")
 ALL="build build-fast build-usb build-wlan build-gpu build-gpupower build-gpuclk build-gpurails build-gpurailon build-gpujob build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate"
 quick=; [ "$1" = --quick ] && quick=1

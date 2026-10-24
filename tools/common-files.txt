@@ -28,3 +28,4 @@ tools/patch-numbers
 tools/test_patch_numbers.py
 tools/patch-guard
 tools/test_patch_guard.py
+tools/check-all.sh

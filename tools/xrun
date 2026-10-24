@@ -54,7 +54,11 @@ $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$res
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
 
 if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
-tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails $handover "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" \
+# shim/out is shared with gates and other builds of this worktree: build under its lock and boot a PRIVATE copy of the image (a gate rebuilding shim/out between build and boot made fboot refuse, 2026-10-24)
+mkdir -p shim/out
+( flock -x -w 3600 9 || { echo "shim/out busy for 3600 s" >&2; exit 98; }
+  tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails $handover "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" &&
+  cp shim/out/shim-boot-avb.img "$D/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img.meta.json" ) 9>shim/out/.build.lock \
 	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
 [ -z "$usbnet" ] || $R mark "$D" usbnet=1
 $R mark "$D" boot_args="$(sed -n 's/^boot-args: //p' "$D/build.out")"
@@ -88,7 +92,7 @@ if [ -n "$usbnet" ]; then
 	echo "USBNET: run once the phone enumerates (needs root): $(tools/sweet-usbnet.sh --stage)" | tee -a "$LOG" >&2
 fi
 $R mark "$D" t_boot=@now
-tools/fboot.sh --expect xnu shim/out/shim-boot-avb.img >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
+tools/fboot.sh --expect xnu --max-age-min $(( lockwait / 60 + 30 )) "$D/shim-boot-avb.img" >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
 tb=$(date +%s)
 echo "booted; waiting up to ${duration}s" >>"$LOG"
 how=$($R waitusb "$D" || true)
