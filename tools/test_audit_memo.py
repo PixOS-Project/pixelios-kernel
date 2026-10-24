@@ -158,9 +158,14 @@ class Memo(unittest.TestCase):
         self.assertEqual(self.calls, 1)
 
     def test_stat_wrappers_restored(self):
-        a, b = os.stat, os.lstat
+        a, b, c, d = os.stat, os.lstat, os.access, os.readlink
         self.go()
-        self.assertIs(os.stat, a); self.assertIs(os.lstat, b)
+        self.assertIs(os.stat, a); self.assertIs(os.lstat, b); self.assertIs(os.access, c); self.assertIs(os.readlink, d)
+        def boom():
+            raise ValueError("x")
+        with self.assertRaises(ValueError):
+            self.go(boom, name="boom")
+        self.assertIs(os.stat, a); self.assertIs(os.lstat, b); self.assertIs(os.access, c); self.assertIs(os.readlink, d)
 
     def test_missing_dir_listing_is_an_input(self):
         def g():
@@ -262,7 +267,7 @@ class Memo(unittest.TestCase):
             finally:
                 sys.modules.pop("shadowme", None)
         sys.path[:0] = [str(A), str(B)]; self.addCleanup(lambda: sys.path.__delitem__(slice(0, 2)))
-        old_dwb = sys.dont_write_bytecode; sys.dont_write_bytecode = True; self.addCleanup(setattr, sys, "dont_write_bytecode", old_dwb)   # a pyc written into B/__pycache__ would change B's listing (a legit miss) and hide the point of this test
+        old_dwb = sys.dont_write_bytecode; sys.dont_write_bytecode = True; self.addCleanup(setattr, sys, "dont_write_bytecode", old_dwb)   # the pre-fill pyc would get the same mtime_ns tick as shadowme.py; _pyc_ok (<) then refuses it (nolist) and the warm run misses
         importlib = __import__("importlib"); importlib.invalidate_caches(); importlib.import_module("shadowme"); sys.modules.pop("shadowme")   # fill the FileFinders before the recorder starts
         self.assertEqual(self.go(imp, name="sh")[0], "b")
         k0 = am.key("sh", b"", self.script)
@@ -438,6 +443,49 @@ class Memo(unittest.TestCase):
         self.addCleanup(os.environ.pop, "PIXELIOS_AUDIT_NO_MEMO", None)
         self.go(); self.go()
         self.assertEqual(self.calls, 2)
+
+    # ---- round-6 findings ----
+    def _on_path(self, *dirs):
+        sys.path[:0] = [str(d) if d != "" else "" for d in dirs]
+        self.addCleanup(lambda: sys.path.__delitem__(slice(0, len(dirs))))
+
+    def test_zip_on_sys_path_is_hashed_by_bytes(self):             # r6 F1
+        z = self.t / "z.zip"; self._on_path(z)
+        fn = self.fn_probe(lambda: 1)
+        self.go(fn, name="z"); self.go(fn, name="z"); self.assertEqual(self.calls, 1)
+        z.write_bytes(b"PK-one"); self.go(fn, name="z"); self.assertEqual(self.calls, 2)    # appeared: miss
+        self.go(fn, name="z"); self.assertEqual(self.calls, 2)
+        z.write_bytes(b"PK-two"); self.go(fn, name="z"); self.assertEqual(self.calls, 3)    # one byte changed: miss
+
+    def test_empty_sys_path_entry_is_cwd(self):                    # r6 (e)
+        cwd = self.t / "cwd"; cwd.mkdir(); old = os.getcwd(); os.chdir(cwd); self.addCleanup(os.chdir, old)
+        self._on_path("")
+        fn = self.fn_probe(lambda: 1)
+        self.go(fn, name="e"); self.go(fn, name="e"); self.assertEqual(self.calls, 1)
+        (cwd / "shadowme.py").write_text("X = 1\n"); self.go(fn, name="e"); self.assertEqual(self.calls, 2)
+
+    def test_lstat_symlink_vs_dir_same_name_is_a_miss(self):       # r6 (a)
+        p = self.t / "sd"; p.symlink_to(self.t / "nowhere")
+        fn = self.fn_probe(lambda: __import__('stat').S_IFMT(os.lstat(p).st_mode))
+        self.go(fn, name="a"); self.go(fn, name="a"); self.assertEqual(self.calls, 1)
+        p.unlink(); p.mkdir(); self.go(fn, name="a"); self.assertEqual(self.calls, 2)
+
+    def test_readlink_dir_fd_not_stored(self):                     # r6 (b)
+        (self.t / "lk").symlink_to("tgt"); fd = os.open(self.t, os.O_RDONLY); self.addCleanup(os.close, fd)
+        fn = self.fn_probe(lambda: os.readlink("lk", dir_fd=fd))
+        self.go(fn, name="b"); self.assertEqual(self.stored(), 0)
+
+    def test_access_nofollow_not_stored(self):                     # r6 (c)
+        (self.t / "ac").write_text("x")
+        fn = self.fn_probe(lambda: os.access(self.t / "ac", os.F_OK, follow_symlinks=False))
+        self.go(fn, name="c"); self.assertEqual(self.stored(), 0)
+
+    def test_exists_appear_vanish_not_stored(self):                # r6 (f): A-B-A
+        p = self.t / "aba"
+        def fn():
+            self.calls += 1
+            a = os.path.exists(p); os.mkdir(p); b = os.path.exists(p); os.rmdir(p); return [a, b]
+        self.go(fn, name="f"); self.assertEqual(self.stored(), 0)
 
 
 if __name__ == "__main__":

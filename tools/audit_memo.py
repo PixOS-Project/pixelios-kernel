@@ -7,7 +7,7 @@ run(fn, arg_bytes, script=PATH) calls fn() once per distinct input; a later call
 Key = sha256 of: bytes of `script` and of this file (any audit or memo edit invalidates everything), fn name, arg bytes, sys.path, sys.version, python implementation.
 Deps: every file fn opened in the cold run (sys.addaudithook, event `open`), hashed at open time and re-hashed after fn (any change = nothing stored), stored as (path, sha256); a hit re-hashes them all.
 Paths under the repo root (parent of tools/) are stored relative to it, so worktrees sharing the cache never verify each other's files.
-Never stored: a .pyc without its source or whose recorded mtime/size differ from it (a same-size edit in the same mtime second cannot be told apart, Python accepts it too), a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
+Never stored: a .pyc without its source or whose recorded mtime/size differ from it (a same-size edit in the same mtime second cannot be told apart, Python accepts it too; nor can an mtime-preserving copy (cp -p/rsync -a/tar) of a same-size source; a pyc written in the same mtime tick as its source is not stored: coarse kernel timestamps, perf only), a FAIL (exception), a run that started a process (subprocess/os.system/exec/spawn/fork audit events) or opened a
 file for writing outside __pycache__ (fail closed).
 Directory listings (os.listdir/os.scandir) and glob.glob calls are inputs too: stored as (kind, path, sha256 of the sorted names, taken when fn listed it; re-checked after fn, a difference = nothing stored) and re-listed on a hit;
 a listing by fd or with root_dir/dir_fd, and pathlib glob/rglob, is not storable. Failed opens and os.stat/os.lstat/os.access/os.readlink calls (os.path.exists/isfile/isdir/getsize/realpath, Path.exists) are inputs: stored as (kind, path, state) where state is the file type (S_IFMT) plus st_size for a regular file, None if missing (st_mtime is NOT recorded: a gap), the access() bool, or the link target, and re-checked on a hit (stat by fd/dir_fd is not storable; an unreadable opened file is not storable; importlib's own probes use the posix module and are not seen). Corrupt or foreign entries are a miss. Writes are temp file + os.replace.
@@ -20,7 +20,7 @@ import contextlib, glob, hashlib, io, json, os, pathlib, platform, stat, sys, te
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SPAWN = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty")
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
-_STAT, _LSTAT, _ACCESS, _READLINK = os.stat, os.lstat, os.access, os.readlink  # the originals: os.stat/os.lstat are wrapped while fn runs
+_STAT, _LSTAT, _ACCESS, _READLINK = os.stat, os.lstat, os.access, os.readlink  # the originals: os.stat/os.lstat/os.access/os.readlink are wrapped while fn runs
 _stack = []  # active recorders (dicts), innermost last
 _off = False
 
@@ -214,6 +214,11 @@ def _pyc_ok(pyc, src):
 def _list_sha(kind, path, rec):
     try:
         names = os.listdir(path) if kind == "dir" else [_rel(x) for x in glob.glob(path, recursive=rec)]
+    except NotADirectoryError:  # a zip/egg file on sys.path: its bytes are its listing
+        try:
+            names = ["\0file", _sha(path)]
+        except OSError:
+            names = ["\0missing"]
     except OSError:
         names = ["\0missing"]  # a missing / unreadable directory is a state too (a miss when it appears)
     names = [n for n in names if "__pycache__" not in n]  # a cold import creates it; the pyc is covered by its source's hash
