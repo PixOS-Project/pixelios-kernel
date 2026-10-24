@@ -39,7 +39,7 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-012 | tools/xrun --burst-on REGEX | rejected (amended) |
 | TP-013 | tools/mg-key NAME... [--dsc CACHE] | done (amended) |
 | TP-014 | tools/lint-c | done (amended) |
-| TP-015 | tools/probe-run-timeout | proposed (amended) |
+| TP-015 | tools/probe-run-timeout | done (amended) |
 | TP-016 | tools/phone-lock | done |
 | TP-017 | tools/tool-proposals prune | done |
 | TP-018 | tools/phone | proposed |

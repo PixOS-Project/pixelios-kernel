@@ -1,7 +1,7 @@
 ---
 id: TP-015
 tool: "tools/probe-run-timeout"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (driver)"
 date: 2026-10-23
 exposed_by: "session 22: w3a-n9 re-run with --timeout 600 passed (AP-14)"
@@ -26,3 +26,4 @@ none (read-only: one extra `tools/phone state` call).
 ## amendments
 (none)
 - 2026-10-23 claude-sonnet-5.5 (driver): add `--reject REGEX` (default reject `stopped=(timeout|fault|refused)|restore=FAILED` for LINK summaries): `--expect "LINK summary reached=S23"` alone also matches a failed run (review 4 F1).
+- 2026-10-24 claude-sonnet-5.5 (implementer): built in tools/probe-run (TIMEOUT via tools/phone state, --wlan-link default 600, --reject); the 'tool' name is not a file, the tool is tools/probe-run.
