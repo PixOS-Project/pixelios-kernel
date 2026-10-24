@@ -534,7 +534,7 @@ else
 	chk "udump_host_test" $O/udump_host_test
 	# the debounce under test is the header shipped in xnu patch 0087 (new-file hunk: drop the leading "+")
 	awk '/^\+\+\+ b\/bsd\/dev\/sweet_keys_gs101_debounce.h$/{f=1;next} f&&/^diff --git/{exit} f&&/^@@/{next} f{print substr($0,2)}' ../xnu/patches/0087-sweet-gs101-keys.patch > $O/sweet_keys_gs101_debounce.h
-	chk "keys_gs101_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -o $O/keys_gs101_host_test keys_gs101_host_test.c
+	chk "keys_gs101_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I"$O" -o $O/keys_gs101_host_test keys_gs101_host_test.c
 	chk "keys_gs101_host_test" $O/keys_gs101_host_test
 	# pure FTM5 protocol header of the Pixel 6a touch driver: extracted from xnu patch 0088 so the test sees the kernel's bytes
 	awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > $O/sweet_ftm5.h
