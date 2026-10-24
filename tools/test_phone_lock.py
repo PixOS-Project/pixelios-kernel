@@ -61,9 +61,9 @@ class T(unittest.TestCase):
         self.assertEqual(self.pl("acquire", "--owner", "b").returncode, 1)
 
     def test_ttl_takeover(self):
-        self.pl("acquire", "--owner", "a", "--ttl", "1")
+        self.pl("acquire", "--owner", "a", "--ttl", "4")  # generous: the gate runs this test while the machine is busy
         self.assertEqual(self.pl("acquire", "--owner", "b").returncode, 1)
-        time.sleep(1.5)
+        time.sleep(4.5)
         r = self.pl("acquire", "--owner", "b")
         self.assertEqual(r.returncode, 0)
         self.assertIn("takeover", r.stdout)
