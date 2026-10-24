@@ -36,6 +36,7 @@ _Static_assert(WLAN_LINK_N <= WLAN_SEQ_LAST, "--wlan-link=N: N beyond the last s
 #define ST_TIMEOUT	1
 #define ST_FAULT	2
 #define ST_REFUSED	3
+#define EOT_SEEN	(1u << 31)	/* kept in the run's `probed` word (bits 0..7 are block probes): set when an EROM dump row read the EOT dword 0xF */
 
 __attribute__((noipa)) static unsigned put_txt(char *dst, unsigned cap, unsigned pos, const char *s)
 {
@@ -420,8 +421,14 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 		*rd = v;
 		if (r.a == 1u)
 			*probed |= need_probe(r.blk);
-		if (r.a == 2u)		/* log flag (a = 2: a non-probe row whose value is printed) */
+		if (r.a & 2u)		/* log flag (a & 2: a non-probe row whose value is printed) */
 			step_line('R', r.step, "", 1, idx, 1, v, 0, 0);
+		if (r.a & 4u) {		/* EROM dump row (a & 4): the EOT dword 0xF (observed run w3a-n32, dword 218) ends the dump, wlan_link_run skips the later dump rows; the last row (a & 8) must have seen it, else refused */
+			if (v == 0xFu)
+				*probed |= EOT_SEEN;
+			else if (r.a & 8u)
+				return ST_REFUSED;
+		}
 		return ST_OK;
 	}
 	if (r.kind == WLK_WAIT_EQ || r.kind == WLK_WAIT_MASK) {
@@ -489,6 +496,8 @@ int wlan_link_run(void)
 		for (i = 0; i < WLAN_SEQ_NROWS; i++) {
 			if (!get_row(i, 0, &r) || r.step != s)
 				continue;
+			if ((probed & EOT_SEEN) && r.kind == WLK_READ_ONLY && (r.a & 4u))
+				continue;		/* after the EOT no further EROM dword is read (reads past it hung the phone, run w3a-n32) */
 			st = run_row(i, 0, &probed, &rd);
 			if (st != ST_OK) {
 				stopped = st;

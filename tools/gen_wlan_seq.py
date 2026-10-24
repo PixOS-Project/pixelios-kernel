@@ -286,11 +286,11 @@ STEP_NAMES = {
     29: "iATU outbound region 1 = MEM (CPU 0x60000000..0x6000FFFF -> PCI 0x60000000, BAR0 only; 4 ATU writes, CR2 last), BAR0 window cfg 0x80 := 0x18000000, then Command := MEM only (research 36; the first Command write, MASTER never; explicit --wlan-link=29 only; region 1 disable, Command 0 and the window restore FIRST in the teardown)",
     30: "the FIRST BAR0 read: ChipCommon chipid at MEM 0x60000000 (research 36; one guarded read + logged copy + link/AER logs + one-shot id == 0x4389; explicit --wlan-link=30 only; no write; a bus stall would show as the last line `LINK S30 start`)",
     31: "READ-ONLY on the chip (research 37 s.9.1 run A): ChipCommon eromptr (CC+0xFC), clk_ctl_st (CC+0x1E0) and capabilities_ext (CC+0xAC) through the BAR0 window left at 0x18000000 by S29 (3 logged MEM reads + link/AER logs + one-shot checks: window still 0x18000000, eromptr 4 KiB aligned inside 0x18000000..0x1FFFFFFF, chip id word still 0x10034389; explicit --wlan-link=31 only; no write of any kind, no window move)",
-    32: "research 37 s.9.1 run B: the ONE new chip-facing write, PCI_BAR0_WIN cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31) with a one-shot read-back, then 896 logged READ-ONLY MEM dword reads BAR0+0..0xDFC (the EROM up to ER_REMAPCONTROL 0xE00), a first-dword check, link/AER logs; the window is restored to 0x18000000 FIRST in the teardown (explicit --wlan-link=32 only; no other write)",
+    32: "research 37 s.9.1 run B: the ONE new chip-facing write, PCI_BAR0_WIN cfg 0x80 := 0x18105000 (the EROM page, eromptr observed in run w3a-n31) with a one-shot read-back, then logged READ-ONLY MEM dword reads BAR0+0..0xDFC (up to 896, the EROM up to ER_REMAPCONTROL 0xE00) that STOP at the first EOT dword 0xF (none within 896 = refusal), a first-dword check, link/AER logs; the window is restored to 0x18000000 FIRST in the teardown (explicit --wlan-link=32 only; no other write)",
 }
 
 
-def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False):
+def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False, eot=0):
     assert kind in KINDS and (blk is None or blk in BLOCKS) and step in STEP_NAMES
     r = {"id": len(rows), "step": step, "kind": kind, "blk": blk, "off": off, "mask": mask & FULL, "value": value & FULL, "delay_us": us, "polls": polls, "restore": restore, "cite": cite, "tag": tag}
     if probe:
@@ -298,6 +298,9 @@ def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="",
     if log:
         assert kind == "read_only" and not probe, "log is for non-probe read_only rows"
         r["log"] = True
+    if eot:
+        assert kind == "read_only" and log and eot in (1, 2), "eot is for logged read_only rows: 1 = stop the dump after a 0xF dword, 2 = also refuse if the dword is not 0xF (the last row)"
+        r["eot"] = eot
     if note:
         r["note"] = note
     rows.append(r)
@@ -634,7 +637,7 @@ def build():
     # ---- S29 / S30 (research 36): region 1, BAR0 window, Command MEM, then the first MEM read; rows come from draft29() ----
     for d in draft29():
         w = d["kind"] in ("wait_eq", "wait_mask")
-        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False))
+        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], polls=1 if w else 0, cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False), eot=d.get("eot", 0))
 
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     # S29 rows FIRST of all (research 36 s.5.2 R2, s.6): region 1 DISABLE (RC-local, cannot stall), Command := 0, BAR0 window := observed original; unconditional (idempotent); the region 1 resets follow the BAR rows
@@ -782,9 +785,9 @@ def draft29():
     row(32, "mmio_write", "CFG", 0x80, FULL, 0x18105000, f"{r37b} step 7; DHD points the window at the EROM with the full erombase: {e_wr}; register {winreg} (BAR0 window = backplane address accessed by BAR0, 4 KiB core pages SI_CORE_SIZE {an(HNDSOC, r'define\s+SI_CORE_SIZE\s+0x1000')}); {obs31}", TAG_SRC, "PCI_BAR0_WIN := 0x18105000 (the EROM page): the only new write of run B", restore="bar0win_s32")
     row(32, "wait_eq", "CFG", 0x80, FULL, 0x18105000, "read-back of the row above (one-shot; our own gate, DHD has none)", TAG_GUESS, "read-back PCI_BAR0_WIN must be 0x18105000, else STOP + restore")
     cia1 = an(AIU, r"cia = get_erom_ent.sih, &eromptr, ER_TAG, ER_CI.", 200)
-    dump_cite = f"{r37b} step 8: EROM dword i at BAR0+4*i, ascending, one 32-bit load each (DHD walk reads eromptr++ from the mapped page: {e_rd.split(':')[0]}:100, eromlim = eromptr + ER_REMAPCONTROL/4 {an(AIU, r'eromlim = eromptr . .ER_REMAPCONTROL', 200)}; ER_REMAPCONTROL = 0xE00: Broadcom aidmp.h {AIDMP} (review 13 M1); 0xE00..0xFFF are EROM-controller / integration-test registers, never read)"
+    dump_cite = f"{r37b} step 8: EROM dword i at BAR0+4*i, ascending, one 32-bit load each (DHD walk reads eromptr++ from the mapped page: {e_rd.split(':')[0]}:100, eromlim = eromptr + ER_REMAPCONTROL/4 {an(AIU, r'eromlim = eromptr . .ER_REMAPCONTROL', 200)}; ER_REMAPCONTROL = 0xE00: Broadcom aidmp.h {AIDMP} (review 13 M1); 0xE00..0xFFF are EROM-controller / integration-test registers, never read); STOP AT EOT: the first dword == 0x0000000F ends the dump (every later dump row is skipped, the window is restored); the table end without an EOT is a refusal. Observed run w3a-n32: EOT 0x0000000F at dword 218, reads past it returned zeros up to dword 340 and the phone hung (the cause of the hang is a guess); the EOT type 0xF: brcmfmac-chip.c:27 DMP_DESC_EOT"
     for i in range(0xE00 // 4):
-        row(32, "read_only", "MEM", 4 * i, FULL, 0, dump_cite if i == 0 else f"{r37b} step 8: EROM dword {i} (BAR0+{4 * i:#x})", TAG_GUESS, f"log EROM dword {i}" + (" (first descriptor: expected COMPONENT CIA)" if i == 0 else ""), log=True)
+        row(32, "read_only", "MEM", 4 * i, FULL, 0, dump_cite if i == 0 else f"{r37b} step 8: EROM dword {i} (BAR0+{4 * i:#x})", TAG_GUESS, f"log EROM dword {i}" + (" (first descriptor: expected COMPONENT CIA)" if i == 0 else "") + " (EOT 0xF ends the dump)", log=True, eot=2 if i == 0xE00 // 4 - 1 else 1)
         if i == 0:
             row(32, "wait_eq", "MEM", 0x0, 0xF, 0x1, f"{r37b} step 9 (review 13 L2): stop on all-ones or zeros (read failure, R36 hazard R1); the first valid EROM entry is a component CIA (low nibble 0x1 = type COMPONENT + valid bit): {cia1}; brcmfmac DMP_DESC_COMPONENT = 0x1 (brcmfmac-chip.c:27-28, :920-929); the spec's zero-run stop is not expressible in a static table", TAG_GUESS, "first EROM dword: low nibble must be 0x1 (a COMPONENT descriptor; refuses all-ones, zeros, any other type), one-shot, else STOP + restore")
     row(32, "read_only", "CFG", 0xBC, FULL, 0, f"{r37b}; as S30", TAG_GUESS, "log EP link control/status after the dump", log=True)

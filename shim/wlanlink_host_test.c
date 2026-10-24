@@ -132,8 +132,16 @@ static int mem_ready(void)
 }
 
 /* FAKE EROM page (a synthetic dword per offset: dword 0 = a component CIA-like word with bit 0 set and bits 2:1 clear, the rest a pattern), seen only through the window 0x18105000 */
+/* W-C1c: the EOT dword 0xF sits at index eot_idx (default 218 = the index observed in run w3a-n32, where the dump then read zeros up to dword 340 and the phone hung); EOT_NEVER = no EOT in the page.
+ * Every read past the EOT is counted in erom_past_eot and must stay 0 (the interpreter must never issue it). */
+#define EOT_NEVER 0xFFFFFFFFu
+static unsigned eot_idx = 218u, erom_past_eot;
 static uint32_t erom_dw(unsigned i)
 {
+	if (i == eot_idx)
+		return 0xFu;
+	if (eot_idx != EOT_NEVER && i > eot_idx)
+		return 0u;
 	return i == 0 ? 0x4BF80001u : 0x11000000u + i;
 }
 static unsigned erom_reads;
@@ -160,6 +168,7 @@ int try_read32(uintptr_t pa, uint32_t *v)
 			return 0;
 		if (cfgspace[0x80 / 4] == 0x18105000u) {		/* the EROM page: mode 8 = all ones (read failure); every dword offset answers */
 			erom_reads++;
+			erom_past_eot += eot_idx != EOT_NEVER && (unsigned)((pa - WLAN_MEM) / 4) > eot_idx;
 			*v = mem_mode == 8 ? 0xFFFFFFFFu : erom_dw((unsigned)((pa - WLAN_MEM) / 4));
 			return 1;
 		}
@@ -294,7 +303,7 @@ static void world(void)
 	pll_after = 3; cdr_after = 2; oc_after = 4; pll_cnt = cdr_cnt = oc_cnt = l0_cnt = l0_polls = 0;
 	l0_after = 3; never_l0 = fault_l0_read = 0; waited_at_en = 0;
 	never_pll = unreadable_blk = iso_set_ret = iso_clear_ret = write_fault_n = ignore_pa_set = win_ignore = win_latch = 0;
-	erom_reads = 0; fault_cfg80_once = clobber_win = 0; link_dead_after = 0;
+	erom_reads = 0; erom_past_eot = 0; eot_idx = 218u; fault_cfg80_once = clobber_win = 0; link_dead_after = 0;
 	ignore_pa = fault_read_pa = 0;
 	freq = 24576000ull; tick = 1000; waited_us = 0; nsave = 0;
 	nl = nev = nwrites = 0;
@@ -1319,7 +1328,7 @@ int main(void)
 					EXPECT(r.kind == WLK_MMIO_WRITE && r.blk == WLB_CFG && r.off == 0x80u && r.mask == FULL_MASK_T && r.val == 0x18105000u && !nw32);	/* exactly ONE write row in S32 */
 					nw32++; i_w = i;
 				} else if (r.blk == WLB_MEM && r.kind == WLK_READ_ONLY) {
-					EXPECT(r.a == 2u && nd < 896u && r.off == 4u * nd);			/* logged, ascending, 4-byte stride, never a probe, below 0xE00 */
+					EXPECT(r.a == (nd == 895u ? 14u : 6u) && nd < 896u && r.off == 4u * nd);	/* logged (2) + EOT stop (4), the last row also refuses without an EOT (8); ascending, 4-byte stride, never a probe, below 0xE00 */
 					dump[nd++] = i;
 				} else if (r.blk == WLB_MEM) {
 					EXPECT(r.kind == WLK_WAIT_EQ && r.b == 1u && r.a == 0u);
@@ -1384,15 +1393,16 @@ int main(void)
 			EXPECT(r32(WLB_MEM, 0xDFC, &v) && !r32(WLB_MEM, 0xE00, &v) && !r32(WLB_MEM, 0xFFC, &v) && mem_reads == before + 1u);	/* review 13 M1: the last EROM dword, then nothing from ER_REMAPCONTROL on */
 			EXPECT(nwrites == 0);
 		}
-		/* happy path */
+		/* happy path: the EOT (dword 0xF) at index 218 ends the dump; 226 rows run, the 677 later dump rows are skipped, no read past the EOT */
 		world();
-		EXPECT(wlan_link_run() == 0 && has("LINK S32 ok rows=903") && has("LINK summary reached=S32 stopped=none restore=ok") && !has("!!!") && cfg_writes_unconfigured == 0 && master_writes == 0);
-		EXPECT(mem_reads == 3u + 5u + 1u + 896u + 1u && mem_reads_unready == 0 && erom_reads == 897u && last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0);	/* S30 3, S31 5, eromptr pin 1, 896 dwords, the first-dword check */
-		for (unsigned k = 0; k < 896u; k += (k < 8 ? 1u : 255u)) {
+		EXPECT(wlan_link_run() == 0 && has("LINK S32 ok rows=226") && has("LINK summary reached=S32 stopped=none restore=ok") && !has("!!!") && cfg_writes_unconfigured == 0 && master_writes == 0);
+		EXPECT(mem_reads == 3u + 5u + 1u + 219u + 1u && mem_reads_unready == 0 && erom_reads == 220u && erom_past_eot == 0 && last_ev(EV_W, WLAN_MEM, WLAN_MEM + 0x1000) == 0);	/* S30 3, S31 5, eromptr pin 1, dwords 0..218, the first-dword check */
+		for (unsigned k = 0; k <= 218u; k += (k < 8 ? 1u : 105u)) {
 			snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[k], (unsigned)erom_dw(k));
 			EXPECT(has(b));
 		}
-		snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[895], (unsigned)erom_dw(895)); EXPECT(has(b));
+		snprintf(b, sizeof b, "LINK R32 row=%u rd=0x0000000F", dump[218]); EXPECT(has(b));		/* the EOT dword itself is logged */
+		snprintf(b, sizeof b, "LINK R32 row=%u rd=", dump[219]); EXPECT(!has(b));			/* nothing after it */
 		{	/* the window writes, in order: S29 select, the move, the S32 restore, the S29 teardown restore; nothing else touches cfg 0x80 */
 			uint32_t wseq[8];
 			unsigned nwin = 0;
@@ -1443,7 +1453,39 @@ int main(void)
 		}
 		teardown_tail_is_table_order(32);
 		baseline_restored();
-		for (uint32_t fo = 0x4u; fo <= 0xDFCu; fo += (fo < 0x20u ? 4u : 0x3F8u)) {		/* a read fault anywhere in the dump: stop at that row, the window is restored */
+		/* W-C1c: the EOT at the first dword (not a COMPONENT: the first-dword check refuses), mid-dump, at the last dword, and never (the 896-dword cap refuses); never a read past the EOT, the window restored on every path */
+		{
+			static const unsigned eots[] = { 0u, 1u, 2u, 218u, 894u, 895u };
+
+			for (unsigned ei = 0; ei < sizeof eots / sizeof eots[0]; ei++) {
+				unsigned e = eots[ei];
+
+				world(); eot_idx = e;
+				if (e == 0u) {
+					EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S32") && !has("LINK S32 ok") && erom_reads == 2u && mem_reads == 3u + 5u + 1u + 2u);	/* dword 0 and its re-check, nothing more */
+					snprintf(b, sizeof b, "LINK R32 row=%u rd=0x0000000F", dump[0]); EXPECT(has(b));
+				} else {
+					snprintf(b, sizeof b, "LINK S32 ok rows=%u", 4u + (e + 1u) + 1u + 2u);
+					EXPECT(wlan_link_run() == 0 && has(b) && has("stopped=none restore=ok") && erom_reads == e + 2u && mem_reads == 3u + 5u + 1u + (e + 1u) + 1u);
+					snprintf(b, sizeof b, "LINK R32 row=%u rd=0x0000000F", dump[e]); EXPECT(has(b));
+					if (e < 895u) { snprintf(b, sizeof b, "LINK R32 row=%u rd=", dump[e + 1u]); EXPECT(!has(b)); }
+				}
+				EXPECT(erom_past_eot == 0u && has("restore=ok") && !has("!!!") && cfgspace[0x80 / 4] == 0x18001000u && wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18000000u));
+				teardown_tail_is_table_order(32);
+				baseline_restored();
+			}
+		}
+		world(); eot_idx = EOT_NEVER;								/* no EOT within 896 dwords: the last dump row is logged, then refused; the window is restored and reported */
+		snprintf(b, sizeof b, "stopped=refused at=S32 row=%u", dump[895]);
+		EXPECT(wlan_link_run() == 1 && has(b) && !has("LINK S32 ok") && has("restore=ok") && !has("!!!") && erom_reads == 897u && mem_reads == 3u + 5u + 1u + 896u + 1u && erom_past_eot == 0u);
+		snprintf(b, sizeof b, "LINK R32 row=%u rd=0x%08X", dump[895], (unsigned)erom_dw(895)); EXPECT(has(b));
+		EXPECT(cfgspace[0x80 / 4] == 0x18001000u);
+		teardown_tail_is_table_order(32);
+		baseline_restored();
+		for (unsigned fi = 0; fi < 6u; fi++) {							/* a read fault anywhere in the dump (up to the EOT): stop at that row, the window is restored */
+			static const uint32_t fos[] = { 0x4u, 0x8u, 0x1Cu, 0x100u, 0x364u, 0x368u };
+			uint32_t fo = fos[fi];
+
 			world(); fault_read_pa = WLAN_MEM + fo;
 			snprintf(b, sizeof b, "LINK S32 fault row=%u", dump[fo / 4]);
 			EXPECT(wlan_link_run() == 1 && has(b) && has("restore=ok") && !has("!!!") && erom_reads == 1u + 1u + fo / 4u - 1u + 0u + 0u + 0u && wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18105000u));

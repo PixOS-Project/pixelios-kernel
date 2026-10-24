@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "4947f16c353b04a8e1760226856d25bcfabdc139f6471bd826d2bb6e1ac91850"
+_WLAN_SEQ_SHA = "c4430698a54ac77a3aae95f740ec6918c98033de1aa47c47b5cd1e43083541ec"
 _WLAN_SEQ_COUNTS = {"rows": 1318, "teardown": 47, "write_rows": 279, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2862,7 +2862,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # header = table (the allowlist the interpreter uses is exactly the audited table)
     hdr = _WLAN_HDR_ROW.findall(header)
     want = [(str(r["step"]), r["kind"].upper(), r["blk"] or "NONE", hex(r["off"]), hex(r["mask"]), hex(r["value"]),
-             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0)), str(r["polls"])) for r in rows]
+             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0)), str(r["polls"])) for r in rows]
     want += [(str(t["requires"]), t["kind"].upper(), t["blk"] or "NONE", hex(t["off"]), hex(t["mask"]), hex(t["value"]), str(t["delay_us"]), str(t["polls"])) for t in tear]
     if hdr != want or f'WLAN_SEQ_SHA256 "{sha}"' not in header:
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
@@ -2975,6 +2975,11 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s32 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log"), r["restore"]) for r in rows if r["step"] == 32]
     if s32 != s32_want or any((r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 32):
         raise AssertionError(f"{name}: S32 must be exactly the window precondition, the eromptr pin 0x18105000, the ONE window write cfg 0x80 := 0x18105000 (restored by teardown T01) with its one-shot read-back, 896 logged MEM dwords 0..0xDFC ascending with the first-dword check, and the CFG 0xBC/0x104 logs: {[x for x in s32 if x not in s32_want][:3]}")
+    # W-C1c: the dump stops at the first EOT dword 0xF (observed dword 218 in run w3a-n32; reads past it hung the phone): exactly the 896 logged S32 MEM dump rows carry eot = 1 and the LAST one eot = 2 (refuses a dump
+    # that never reached an EOT), no other row anywhere has the flag
+    s32_dump = [r for r in rows if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only"]
+    if [r.get("eot", 0) for r in s32_dump] != [1] * (0xE00 // 4 - 1) + [2] or any("eot" in x for x in rows if x["step"] != 32 or x not in s32_dump) or any("eot" in t for t in tear):
+        raise AssertionError(f"{name}: the S32 EROM dump rows must carry eot = 1 (stop after a 0xF dword) and the last one eot = 2 (refuse without an EOT); no other row has the flag")
     if any(x["blk"] == "ATU" and x["kind"] in _WLAN_WRITE_KINDS and x.get("step", x.get("requires")) not in (26, 29) for x in rows + tear):
         raise AssertionError(f"{name}: ATU writes are only for S26, S29 and their teardown")
     if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28, 29, 30, 31, 32)) for r in rows + tear) or any("log" in t for t in tear):
@@ -3420,6 +3425,11 @@ def wlan_seq_selftest() -> int:
         ("an S32 dump dword dropped", f_rm(32, kind="read_only", blk="MEM", off=0xDFC), None, "S32 must be exactly"),
         ("an S32 dump dword offset changed", set_row(32, "off", 0x40, kind="read_only", blk="MEM", off=0x1C), None, "S32 must be exactly"),
         ("an S32 dump dword without the log flag", set_row(32, "log", False, kind="read_only", blk="MEM", off=0x400), None, "S32 must be exactly"),
+        ("W-C1c: an S32 dump row without the eot flag", set_row(32, "eot", 0, kind="read_only", blk="MEM", off=0x400), None, "eot = 1"),
+        ("W-C1c: the last S32 dump row without eot = 2 (no refusal without an EOT)", set_row(32, "eot", 1, kind="read_only", blk="MEM", off=0xDFC), None, "eot = 1"),
+        ("W-C1c: eot = 2 on a middle S32 dump row", set_row(32, "eot", 2, kind="read_only", blk="MEM", off=0x400), None, "eot = 1"),
+        ("W-C1c: eot flag on an S32 CFG log row", set_row(32, "eot", 1, kind="read_only", blk="CFG", off=0xBC), None, "eot = 1"),
+        ("W-C1c: eot flag on an S31 log row", set_row(31, "eot", 1, kind="read_only", blk="MEM", off=0xFC), None, "eot = 1"),
         ("an S32 dump dword turned into a probe", set_row(32, "probe", True, kind="read_only", blk="MEM", off=0x10), None, "S32 must be exactly"),
         ("the S32 window write to the wrong value (0x18105004)", set_row(32, "value", 0x18105004, kind="mmio_write", blk="CFG", off=0x80), None, "CFG window is read-only"),
         ("the S32 window write to the S29 original (0x18001000)", set_row(32, "value", 0x18001000, kind="mmio_write", blk="CFG", off=0x80), None, "CFG window is read-only"),
@@ -3524,8 +3534,8 @@ _WLANLINK_BODY_SHA = {
     "need_probe": "44c0b22ce25cae99db97ca86bcec9e471ebb8fcbfa077005de813f1073652b02",
     "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
     "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
-    "run_row": "b65add0b34e68bbba31b7a53502b011888083742fef68ef26555a0faa910d57a",
-    "wlan_link_run": "c2af77c8d0da0d28f8e8aeb0f1e8c6a8abc724fd9c3e24d9becca0af39100cd2",
+    "run_row": "03d3e0ed514fba523defc5b89639a8f3f895f3537343f51ba4d2fcbc5e43b96c",
+    "wlan_link_run": "3b3f2e45e3fb2075da616ebe3e1e4463847f8e7b05cee3d6f80c624e93dc08a0",
 }
 
 
@@ -3579,7 +3589,9 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     # pins: constants, probe rule, refusal before the first write, teardown always, bounded loops
     for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
                  "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
-                 "if(r.a==1u)*probed|=need_probe(r.blk);", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
+                 "if(r.a==1u)*probed|=need_probe(r.blk);",
+                 "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}returnST_OK;",
+                 "if((probed&EOT_SEEN)&&r.kind==WLK_READ_ONLY&&(r.a&4u))continue;", "#defineEOT_SEEN(1u<<31)", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
                  "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,win=0,r1[4]={1,1,1,1};if(!try_read32(WLAN_CFG+0x80u,&win)||((win!=0x18105000u||off>=0xE00u)&&(win!=0x18000000u||(off!=0u&&off!=0xACu&&off!=0xFCu&&off!=0x1E0u)))||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
                  "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
                  "if(need_probe(r.blk)&~probed)continue;", "for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){", "if(!get_row(i,1,&r)||r.step>hi)continue;",
@@ -3625,6 +3637,13 @@ def wlanlink_source_selftest() -> int:
         ("a second smc call", good.replace("e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);", "e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);\n\t\t(void)wlan_link_iso_set(rd);", 1)),
         ("a retry loop", good.replace("\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", "\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\twhile (st == ST_TIMEOUT)\n\t\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", 1)),
         ("unbounded poll", good.replace("i < r->b && i < POLL_CAP", "i < r->b", 1)),
+        ("W-C1c: EOT ignored (never recorded)", good.replace("\t\t\t\t*probed |= EOT_SEEN;", "", 1)),
+        ("W-C1c: reads continue past the EOT", good.replace("\t\t\tif ((probed & EOT_SEEN) && r.kind == WLK_READ_ONLY && (r.a & 4u))\n\t\t\t\tcontinue;", "", 1)),
+        ("W-C1c: wrong EOT value (0xE)", good.replace("if (v == 0xFu)\n\t\t\t\t*probed", "if (v == 0xEu)\n\t\t\t\t*probed", 1)),
+        ("W-C1c: EOT is any non-zero dword", good.replace("if (v == 0xFu)\n\t\t\t\t*probed", "if (v != 0u)\n\t\t\t\t*probed", 1)),
+        ("W-C1c: no refusal when the dump ends without an EOT", good.replace("else if (r.a & 8u)\n\t\t\t\treturn ST_REFUSED;", "", 1)),
+        ("W-C1c: restore skipped on the EOT path", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && !(probed & EOT_SEEN) && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("W-C1c: the EOT skip also drops non-dump rows", good.replace("r.kind == WLK_READ_ONLY && (r.a & 4u))\n\t\t\t\tcontinue;", "r.kind == WLK_READ_ONLY)\n\t\t\t\tcontinue;", 1)),
         ("longer delay", good.replace("#define DELAY_MAX_US	250000u", "#define DELAY_MAX_US	2500000u", 1)),
         ("another default N", good.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	WLAN_SEQ_LAST", 1)),
         ("teardown never marked started", good.replace("\t\tstarted = 1;\n", "", 1)),
