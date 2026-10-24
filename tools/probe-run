@@ -4,7 +4,8 @@
 #   tools/probe-run --dry-run --from-dir DIR [--expect REGEX]...     (re-read DIR/usb.txt, touches nothing)
 #   tools/probe-run --self-test
 # First line: RESULT: PASS|FAIL|HANG|TIMEOUT|ERROR ...   Exit 0 PASS / 1 FAIL, HANG or TIMEOUT / 2 ERROR.
-# TIMEOUT (TP-015) = expected line missing at --timeout AND `tools/phone state` says shim-probe (the shim is still running): raise --timeout, not a hang (AP-14).
+# TIMEOUT (TP-015) = expected line missing at --timeout AND the phone did not come back AND `tools/phone state` says shim-probe AND usb.txt was written in the last PR_STILL (15) s: the shim is still running, raise --timeout, not a hang (AP-14).
+# A --reject match is a FAIL even with lines missing. Known gap (review B1 optional): the "last usb line Ns after fboot" figure uses the capture start, not the fboot end.
 # --timeout defaults to 600 when the build args contain --wlan-link (the LINK steps need ~170-190 s, AP-14). --reject REGEX (repeatable; default for "LINK summary" expects: stopped=timeout|fault|refused or restore=FAILED) turns a found run into FAIL (TP-015 amendment).
 # HANG = expected line never came AND the phone is not back (fastboot/recovery) within the wait window (120 s): hold Power+VolDown.
 # The phone legitimately leaves USB for a while when the shim reboots, so "absent" right after the result line is normal.
@@ -93,6 +94,7 @@ main() {
 	fi
 
 	dir=logs/probe/$(date -u +%Y%m%dT%H%M%SZ)-$label log=$dir/usb.txt; mkdir -p "$dir"
+	printf '%s\n' "${args[*]}" >"$dir/run.args"   # review B2: tools/runs groups history by these build args (the form), labels are unique per run
 	trap '[ -z "$cap" ] || kill "$cap" 2>/dev/null; plock_drop' EXIT
 
 	# 1. build (no phone lock: builds and gates never hold it)
@@ -125,14 +127,16 @@ main() {
 	done
 	# 6. phone back? (absent right after the result line is normal). The capture keeps running meanwhile: a shim still logging at the limit is not a hang
 	# TP-015: at the limit with lines missing, ask `tools/phone state` BEFORE waiting for fastboot: shim-probe = the shim is still running
-	local pstate=""
-	[ -z "$timed_out" ] || { check_expects "$log"; [ ${#missing[@]} = 0 ] || pstate=$($PH state 2>/dev/null | grep -o 'state=[a-z-]*' | tail -1); }
+	local pstate="" age0=999
+	[ -z "$timed_out" ] || { check_expects "$log"; [ ${#missing[@]} = 0 ] || { pstate=$($PH state 2>/dev/null | grep -o 'state=[a-z-]*' | tail -1); [ ! -f "$log" ] || age0=$(( $(date +%s) - $(stat -c %Y "$log") )); }; }
 	local back; back=$(phone_back) && rc=0 || rc=1
 	[ -z "$cap" ] || { kill "$cap" 2>/dev/null; wait "$cap" 2>/dev/null; cap=""; }   # SIGTERM flushes the last partial line
 	check_expects "$log"                                                              # ...and the verdict sees it
 	local age=999; [ -f "$log" ] && age=$(( $(date +%s) - $(stat -c %Y "$log") ))
 	# 7. verdict
-	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ "$pstate" = state=shim-probe ]; then
+	# review B1: a reject match is a FAIL whether or not lines are missing; TIMEOUT needs the phone NOT back (rc!=0) and the log still growing at the limit
+	check_rejects "$log"; [ -z "$rejected" ] || report FAIL "reject pattern matched: $rejected"
+	if [ -n "$timed_out" ] && [ ${#missing[@]} != 0 ] && [ $rc != 0 ] && [ "$pstate" = state=shim-probe ] && [ "$age0" -lt "${PR_STILL:-15}" ]; then
 		local last=$(( $(stat -c %Y "$log" 2>/dev/null || echo "$t0") - t0 )); [ $last -ge 0 ] || last=0
 		report TIMEOUT "missing: ${missing[*]} shim still running ($pstate), last usb line ${last}s after fboot, ${timeout}s limit: raise --timeout, this is not a hang"
 	fi
@@ -140,7 +144,6 @@ main() {
 		report FAIL "missing: ${missing[*]}; the shim was still logging at the ${timeout}s limit (last line ${age}s ago): raise --timeout, this is not a hang"
 	fi
 	if [ ${#missing[@]} = 0 ]; then
-		check_rejects "$log"; [ -z "$rejected" ] || report FAIL "all ${#expects[@]} expect(s) found but reject pattern matched: $rejected"
 		[ $rc = 0 ] && report PASS "all ${#expects[@]} expect(s) found, phone back: $back"
 		$USBP && report PASS "all ${#expects[@]} expect(s) found, phone on USB but not fastboot/recovery yet after ${BACK}s (tools/phone-state)"
 		report PASS "all ${#expects[@]} expect(s) found, phone not back and no Google USB device after ${BACK}s (the lines were found; if tools/phone-state still shows it absent, hold Power+VolDown)"
@@ -188,7 +191,10 @@ S
 	chk found-usb-present 0 PASS PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 "ST_LOG=$R"
 	chk still-logging   1 FAIL PR_STILL=600 ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # review 13 H3: timed out while the shim was still logging: FAIL "raise --timeout", not HANG
 	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with phone-state advice, not "hold Power+VolDown"
-	chk timeout-shim-alive 1 TIMEOUT ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # TP-015: missing lines + shim-probe = TIMEOUT
+	chk timeout-shim-alive 1 TIMEOUT PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # TP-015: missing lines + shim-probe + log still growing = TIMEOUT
+	chk REV-timeout-but-phone-back 1 FAIL PR_STILL=600 ST_PHONE=shim-probe ST_STATE=fastboot 'ST_LOG=noise\n'   # review B1a: the phone came back: a real FAIL
+	CHK_ARGS="--reject bad" chk REV-timeout-reject-matched 1 FAIL PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=bad\n'   # B1b
+	chk REV-shim-listed-but-silent 1 HANG PR_STILL=0 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # B1c: listed but the log is not growing
 	chk timeout-not-shim 1 HANG ST_PHONE=absent ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
 	CHK_ARGS="--reject bad" chk reject-hit 1 FAIL ST_STATE=fastboot "ST_LOG=${R}bad\n"
 	PRE='tools/phone-lock acquire --owner other --pid '$$' >/dev/null' chk lock-busy 2 ERROR ST_STATE=fastboot "ST_LOG=$R"   # TP-020: another owner holds the phone
