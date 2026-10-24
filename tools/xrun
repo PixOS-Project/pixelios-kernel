@@ -3,7 +3,10 @@
 #   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--gpu-handover] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
 #              [--reader "qr-log.py options"]   (e.g. "--workers 3 --average 3 --tiles 1"; QL2 boot-args go in --args: sweetqr_fmt=1|2 sweetqr_ver sweetqr_ecc sweetqr_tiles sweetqr_ms sweetqr_k sweetqr_red sweetqr_fec sweetqr_hold)
 #              [--expect REGEX]... [--expect-absent REGEX]... [--duration S] [--label NAME] [--no-flash-check]
-#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S]
+#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset] [--no-camera]
+#   --remote-reset  adds boot-arg sweetremote=1 (xnu patch 0100): an early stop (--early / --stop-on) then resets the phone into the bootloader over the USB link (tools/phone goto fastboot sends
+#                  UDP SWEET-RESET-BL) instead of waiting for the self-reset timer. --restart N,bootloader (timer path) lands in fastboot directly, not in recovery.
+#   --no-camera    do not start the ESP camera capture (saves ~5 s, and works without the camera; the report then has no SCREEN line)
 #   --lock-wait S  the phone lock (tools/phone-lock, TP-020) is taken only AFTER the image is built, right before the phone is touched; wait up to S s
 #                  (queued, in arrival order) for another owner to finish, default 0 = fail at once with who holds it. Under `phone-lock run` it is already held.
 #   --stop-on RX   (repeatable; --early = all --expect patterns) end the capture as soon as every pattern is in the merged log, instead of
@@ -20,17 +23,18 @@ cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
 R="python3 tools/xrun_report.py"   # not -I: PIL lives in the user site-packages
 kernel=""; adt=""; board=bluejay; cpus=1; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; handover=""; dvfs=()
-lockwait=0; dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""
+lockwait=0; remote=""; nocam=0; dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
 	--qr) qr=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) args=$2; shift 2 ;; --duration) duration=$2; shift 2 ;;
-	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; shift 2 ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
+	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; shift 2 ;; --remote-reset) remote=1; shift ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
 	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
 	--dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;;
 	*) echo "unknown option $1 (see the header of tools/xrun)" >&2; exit 2 ;; esac; done
 if [ "$dry" = 1 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
 [ "$early" = 0 ] || [ ${#stops[@]} -gt 0 ] || stops=("${rawexp[@]}")
 [ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
+[ -z "$remote" ] || args="${args:+$args }sweetremote=1"
 label=$(printf %s "$label" | tr -c 'A-Za-z0-9._-' _)
 D=logs/runs/$(date -u +%Y%m%dT%H%M%SZ)-$label; mkdir -p "$D/snaps" "$D/frames"; LOG=$D/xrun.log; : >"$LOG"
 secs=${restart%%,*}; [ -n "$duration" ] || duration=$(( ${secs:-60} + 300 ))
@@ -68,10 +72,12 @@ if [ "$check" = 1 ]; then
 		die "needs Power+VolDown hold (phone not reachable by fastboot/adb)"; }
 fi
 
+if [ "$nocam" = 0 ]; then
 PYTHONPATH="$A/pylib" python3 tools/qr-log.py --esp --keep-going --follow --out "$D/snaps" --save-dir "$D/frames" --save-every 4 --until-file "$D/stop" $reader >"$D/capture.log" 2>&1 &
 cap=$!
 sleep 4
 kill -0 "$cap" 2>/dev/null || { cap=""; die "camera capture died at start: $(tail -n 2 "$D/capture.log" | tr '\n' ' ' | cut -c1-200)"; }
+fi
 
 if [ -n "$usbnet" ]; then
 	# root-free UDP listener (stops on $D/stop); the interface address needs the user's one sudo line
@@ -97,9 +103,9 @@ probe() { local u a f
 case "$how" in
 EARLY) # every stop pattern seen: recover the phone if it can be reached, else say so in one line
 	el=$(( $(date +%s) - tb )); left=$(( ${secs:-0} - el ))
-	if grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && timeout 90 tools/to-fastboot.sh 60 >>"$LOG" 2>&1; then
-		$R mark "$D" phone="back in fastboot (stopped early)"
-	elif grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="reachable but to-fastboot failed (see xrun.log); Power+VolDown hold"
+	if { [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; } && timeout 120 tools/to-fastboot.sh 90 >>"$LOG" 2>&1; then
+		$R mark "$D" phone="back in fastboot (stopped early${remote:+, software reset over the USB link})"
+	elif [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="reachable but to-fastboot failed (see xrun.log); Power+VolDown hold"
 	else $R mark "$D" phone="still running; self-reset due in ~$(( left > 0 ? left : 0 ))s / Power+VolDown hold"; fi ;;
 TIMEOUT) $R mark "$D" phone="$(probe)" ;;
 esac

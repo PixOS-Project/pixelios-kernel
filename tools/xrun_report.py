@@ -86,6 +86,17 @@ def usb_present(vid="18d1"):
     return False
 
 
+def usb_ids(vid="18d1"):
+    """vid:pid of the first Google USB device on the bus (18d1:4ee0 = fastboot, 18d1:d001 = recovery), or ''"""
+    for p in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            if pathlib.Path(p).read_text().strip() == vid:
+                return "%s:%s" % (vid, pathlib.Path(p).with_name("idProduct").read_text().strip())
+        except OSError:
+            pass
+    return ""
+
+
 def stop_seen(d, pats):
     """True when every regex in pats occurs in the merged QR snapshots + usbnet log of run dir d (live early-stop check)."""
     snaps = sorted(glob.glob(os.path.join(d, "snaps", "qr-*.txt")))
@@ -108,7 +119,7 @@ def waitusb(d):
     while now() < min(end, hard or end):
         if usb_present():
             if gone is not None:
-                mark(d, ["usb_back=%f" % now()])
+                mark(d, ["usb_back=%f" % now(), "usb_back_id=%s" % usb_ids()])
                 print("DONE")
                 return
         elif gone is None:
@@ -134,7 +145,7 @@ def waitusb(d):
         grace_end = now() + grace
         while now() < grace_end:
             if usb_present():
-                mark(d, ["usb_back=%f" % now(), "late_back=1"])
+                mark(d, ["usb_back=%f" % now(), "late_back=1", "usb_back_id=%s" % usb_ids()])
                 break
             time.sleep(1)
     mark(d, ["t_end=%f" % now()] + (["timeout=1"] if timed_out else []))
@@ -364,7 +375,7 @@ def build(d, stop_on=None):
             and ("adb [recovery]" in phone or "fastboot product [bluejay]" in phone)):
         reset_at = (f("t_end") or now()) - t0
         run["late_back"] = "1"
-    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds" % reset_at) if reset_at is not None else
+    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds%s" % (reset_at, " (back as %s)" % {"18d1:4ee0": "fastboot", "18d1:d001": "recovery"}.get(run.get("usb_back_id"), run.get("usb_back_id")) if run.get("usb_back_id") else "")) if reset_at is not None else
                  ("reset NOT observed (waited %ds; the sweetrestart did not fire or the phone hung)" % (waited or 0)) if restart
                  else "no --restart (no reset expected)")
     qr_t = first_snap_t - t0 if first_snap_t and t0 else None

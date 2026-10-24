@@ -17,6 +17,9 @@ tools/phone-lock check >&2 || { echo "REFUSED: the phone lock is not held by you
 prod=$(timeout 15 fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
 unl=$(timeout 15 fastboot getvar unlocked 2>&1 | sed -n 's/^unlocked: *//p' | head -1)
 [ "$prod" = bluejay ] && [ "$unl" = yes ] || { echo "REFUSED: product='$prod' unlocked='$unl'" >&2; exit 1; }
-fastboot flash userdata "$img"
+# M7 (docs/PLAN-BOOT-SPEED.md): keep fastboot's own output and print what was really sent, to settle whether holes in the image are skipped
+mkdir -p logs; fl=logs/flash-$(date -u +%Y%m%dT%H%M%SZ).log; t0=$(date +%s)
+fastboot flash userdata "$img" 2>&1 | tee "$fl"
+echo "flash stats: $(grep -c "^Sending sparse" "$fl") sparse part(s) sent of $(grep -o "Sending sparse 'userdata' [0-9]*/[0-9]*" "$fl" | tail -1 | grep -o "/[0-9]*" | tr -d /) , $(( $(date +%s) - t0 )) s, image $(stat -c %s "$img") bytes apparent / $(( $(stat -c %b "$img") * 512 )) allocated (log $fl)"
 echo "$got $(date -u +%FT%TZ) $img" >> "$state"
 echo "flashed; recorded in $state"

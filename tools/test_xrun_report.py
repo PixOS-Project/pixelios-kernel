@@ -146,6 +146,13 @@ class Report(unittest.TestCase):
         self.assertEqual(how, "TIMEOUT")
         self.assertNotIn("late_back", rj)
 
+    def test_reset_text_names_what_the_phone_came_back_as(self):
+        d = self.run_dir("20260101T000600Z-r", snaps=[(30, LOG1)], run={"restart": "60,bootloader", "expect": ["SWEET CPU"]})
+        xrun_report.mark(str(d), ["usb_back=%f" % (T0 + 150), "usb_back_id=18d1:4ee0"])
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("back as fastboot", r["reason"])
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")
