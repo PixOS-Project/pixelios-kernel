@@ -61,9 +61,12 @@ def lock_held():
 
 
 def build_busy():
-    """a gate, xrun or probe-run build of THIS worktree holds shim/out/.build.lock (a pull would give that run mixed tool versions)"""
-    lk = os.path.join(ROOT, "shim", "out", ".build.lock")
-    return os.path.exists(lk) and subprocess.run(["flock", "-n", lk, "true"], capture_output=True).returncode != 0
+    """a gate (shim/out/.gate.lock), xrun or probe-run build (shim/out/.build.lock) of THIS worktree is running (a pull would give that run mixed tool versions)"""
+    for name in (".build.lock", ".gate.lock"):
+        lk = os.path.join(ROOT, "shim", "out", name)
+        if os.path.exists(lk) and subprocess.run(["flock", "-n", lk, "true"], capture_output=True).returncode != 0:
+            return True
+    return False
 
 
 def local_commits(ref, f):
@@ -109,7 +112,7 @@ def main():
         print("RESULT: FAIL the phone lock is held (a run may be using these tools); wait, or --force")
         return 1
     if build_busy() and not a.force:
-        print("RESULT: FAIL a gate or build holds shim/out/.build.lock in this worktree (it would see mixed tool versions); wait, or --force")
+        print("RESULT: FAIL a gate (shim/out/.gate.lock) or build (shim/out/.build.lock) is running in this worktree (it would see mixed tool versions); wait, or --force")
         return 1
     blocked, pull = [], []
     for f in drift:

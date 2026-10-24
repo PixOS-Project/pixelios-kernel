@@ -103,6 +103,18 @@ class T(unittest.TestCase):
         finally:
             lk.close()
 
+    def test_pull_refused_while_a_gate_holds_the_gate_lock(self):
+        os.makedirs(os.path.join(self.r, "shim/out"))
+        lk = open(os.path.join(self.r, "shim/out/.gate.lock"), "w")
+        import fcntl
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            x = self.ts("pull")
+            self.assertEqual(x.returncode, 1)
+            self.assertIn("shim/out/.gate.lock", x.stdout)
+        finally:
+            lk.close()
+
     def test_missing_file_and_missing_ref(self):
         os.remove(os.path.join(self.r, "tools/b"))
         self.assertIn("missing    tools/b", self.ts("status").stdout)
