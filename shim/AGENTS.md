@@ -46,3 +46,5 @@ Bare-metal AArch64 code that runs under `fastboot boot` before XNU (MMU off, EL2
   power-on step: RMW `smc #0` x0 = 0x82000504, x1 = 0x17463EC4, x2 = 2, x3 = 1, x4 = 1, bounded read-back (bit 0 set, every other bit and 0x17463EC0 unchanged), then, after EVERY sent set, the same call with x4 = 0 (x5..x7 = 0 in both), a final read 10 ms later; the SMC READ must equal the MMIO word first. A `--wlan-iso` image compiles out level 2 and refuses `--wlan-en` (build.sh + `#error`). The two RMW
   helpers (`smc_priv_rmw_set/clear`) take no parameter but the result pointer; their constants are audited in the disassembly (`check_wlansmc_object_text(iso=True)`). Never a second set; a plain `--wlan-smc-read` image contains no RMW code.
 
+
+- Coding rules: `docs/CODING-RULES.md` (CR-xx ids; each names its check). Read the rules for this area before editing; `tools/check-rules.py` enforces the lint ones in the gate.
