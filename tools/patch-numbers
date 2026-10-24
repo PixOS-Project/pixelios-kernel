@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""patch-numbers: one numbering for xnu/patches across every agent worktree (TP-022). Python 3 stdlib + git, no prompts.
+
+  tools/patch-numbers status            every number in use on any branch (local + remote) or reserved, and the CONFLICTS (same number, different file name)
+  tools/patch-numbers next [--owner NAME] [--name SLUG]   reserve and print the next free number (above every branch and every reservation)
+  tools/patch-numbers release NNNN      drop a reservation (the patch was never written)
+  tools/patch-numbers check             exit 1 if the CURRENT tree uses a number that another branch or a reservation has under a different name
+  tools/patch-numbers claim NNNN --owner NAME --name SLUG   reserve a SPECIFIC number if it is free (a patch already written without `next`)
+  tools/patch-numbers precommit         git pre-commit hook: refuses a staged NEW xnu/patches/NNNN-*.patch whose number another branch/reservation holds under a different name;
+                                        reserves the number of a clean new patch so nobody else picks it (installed by `tools/patch-numbers install-hook`)
+  tools/patch-numbers install-hook      write .git/hooks/pre-commit (shared by every worktree) that runs `precommit` from the common-tools worktree
+
+Why: GPU, Wi-Fi and tooling worktrees all add patches after 0101 and merge later; "contiguous, applied in order" breaks the moment two of them pick 0102.
+Reservations are git refs (refs/patch-numbers/NNNN -> a blob with owner, name, date): every worktree of the repo shares them, creating one is atomic,
+and nothing is committed. A patch you write under a reserved number keeps the same NNNN; a number someone else committed is never reserved again.
+Last line: RESULT: PASS|FAIL|ERROR ...   Exit 0 ok, 1 conflicts, 2 error.
+"""
+import argparse, datetime, os, re, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PAT = re.compile(r"^(\d{4})-(.+)\.patch$")
+PREFIX = "refs/patch-numbers/"
+
+
+def git(*a, inp=None):
+    return subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, input=inp)
+
+
+def refs():
+    out = git("for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes").stdout.split()
+    return [r for r in out if not r.endswith("/HEAD")]
+
+
+def tree_patches(ref):
+    r = git("ls-tree", "--name-only", ref, "xnu/patches/")
+    names = {}
+    for ln in r.stdout.splitlines():
+        m = PAT.match(os.path.basename(ln))
+        if m:
+            names[int(m.group(1))] = os.path.basename(ln)
+    return names
+
+
+def reservations():
+    out = {}
+    r = git("for-each-ref", "--format=%(refname) %(objectname)", PREFIX)
+    for ln in r.stdout.splitlines():
+        ref, sha = ln.split()
+        if not re.fullmatch(r"\d{4,}", ref[len(PREFIX):]):
+            continue  # a stray ref must not break every commit
+        body = git("cat-file", "-p", sha).stdout.strip().splitlines()
+        out[int(ref[len(PREFIX):])] = {"owner": body[0] if body else "?", "name": body[1] if len(body) > 1 else "?", "date": body[2] if len(body) > 2 else ""}
+    return out
+
+
+def survey():
+    used = {}  # number -> {filename: [refs]}
+    for ref in refs():
+        for n, name in tree_patches(ref).items():
+            used.setdefault(n, {}).setdefault(name, []).append(ref)
+    return used
+
+
+def conflicts(used, res):
+    bad = []
+    for n, names in sorted(used.items()):
+        if len(names) > 1:
+            bad.append("%04d used under %d different names: %s" % (n, len(names), "; ".join("%s on %s" % (k, ",".join(v)) for k, v in names.items())))
+        if n in res:
+            slug = res[n]["name"]
+            for k in names:
+                if slug not in ("?", "") and PAT.match(k) and PAT.match(k).group(2) != slug:
+                    bad.append("%04d reserved by %s as '%s' but committed as %s" % (n, res[n]["owner"], slug, k))
+    return bad
+
+
+def cmd_status():
+    used, res = survey(), reservations()
+    for n in sorted(set(used) | set(res)):
+        if n < 95 and n not in res and len(used.get(n, {})) <= 1:
+            continue  # old shared numbers: keep the table short
+        names = used.get(n, {})
+        line = "%04d  %s" % (n, "; ".join("%s [%s]" % (k, ",".join(v) if len(v) < 4 else "%d refs" % len(v)) for k, v in names.items()) or "(not committed anywhere)")
+        if n in res:
+            line += "   RESERVED by %s (%s)" % (res[n]["owner"], res[n]["name"])
+        print(line)
+    bad = conflicts(used, res)
+    for b in bad:
+        print("CONFLICT " + b)
+    top = max(list(used) + list(res) + [0])
+    print("next free: %04d" % (top + 1))
+    print("RESULT: %s" % ("FAIL %d conflict(s)" % len(bad) if bad else "PASS no overlapping patch numbers across %d refs" % len(refs())))
+    return 1 if bad else 0
+
+
+def cmd_next(owner, name):
+    for _ in range(50):  # another agent may take the number between survey and update-ref
+        used, res = survey(), reservations()
+        n = max(list(used) + list(res) + [0]) + 1
+        body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+        sha = git("hash-object", "-w", "--stdin", inp=body).stdout.strip()
+        r = git("update-ref", "%s%04d" % (PREFIX, n), sha, "0" * 40)  # creates only if absent: atomic
+        if r.returncode == 0:
+            print("%04d" % n)
+            print("RESULT: PASS reserved %04d for %s%s; write xnu/patches/%04d-%s.patch" % (n, owner, " (%s)" % name if name else "", n, name or "<slug>"))
+            return 0
+    print("RESULT: ERROR could not reserve a number")
+    return 2
+
+
+def cmd_release(num):
+    r = git("update-ref", "-d", "%s%04d" % (PREFIX, int(num)))
+    print("RESULT: %s" % ("PASS released %04d" % int(num) if r.returncode == 0 else "ERROR " + r.stderr.strip()))
+    return r.returncode and 2
+
+
+def cmd_check():
+    mine = tree_patches("HEAD")
+    used, res = survey(), reservations()
+    bad = []
+    for n, name in mine.items():
+        others = {k: v for k, v in used.get(n, {}).items() if k != name}
+        if others:
+            bad.append("%04d is %s here but %s elsewhere" % (n, name, "; ".join("%s on %s" % (k, ",".join(v)) for k, v in others.items())))
+        if n in res and res[n]["name"] not in ("?", "") and PAT.match(name) and PAT.match(name).group(2) != res[n]["name"]:
+            bad.append("%04d is reserved by %s as '%s'" % (n, res[n]["owner"], res[n]["name"]))
+    for b in bad:
+        print("CONFLICT " + b)
+    print("RESULT: %s" % ("FAIL %d overlapping number(s): renumber here or ask the other owner (tools/patch-numbers status)" % len(bad) if bad else "PASS this tree's patch numbers do not overlap other branches or reservations"))
+    return 1 if bad else 0
+
+
+def cmd_claim(num, owner, name):
+    n = int(num)
+    used = survey()
+    if n in used and any(not name or not PAT.match(k) or PAT.match(k).group(2) != name for k in used[n]):
+        print("RESULT: FAIL %04d is committed on a branch as %s" % (n, "; ".join(used[n])))
+        return 1
+    body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+    sha = git("hash-object", "-w", "--stdin", inp=body).stdout.strip()
+    r = git("update-ref", "%s%04d" % (PREFIX, n), sha, "0" * 40)
+    if r.returncode:
+        cur = reservations().get(n, {})
+        print("RESULT: FAIL %04d is already reserved by %s (%s)" % (n, cur.get("owner", "?"), cur.get("name", "?")))
+        return 1
+    print("RESULT: PASS claimed %04d for %s (%s)" % (n, owner, name or "?"))
+    return 0
+
+
+def cmd_precommit():
+    """0 ok, 3 refusal (the hook turns only 3 into a blocked commit), anything else = internal error (the hook lets the commit through with a message)"""
+    names = lambda flt: git("diff", "--cached", "--name-only", "--no-renames", "--diff-filter=" + flt).stdout.splitlines()  # noqa: E731
+    mine = lambda lst: [os.path.basename(x) for x in lst if x.startswith("xnu/patches/") and PAT.match(os.path.basename(x))]  # noqa: E731
+    added, deleted = mine(names("A")), set(mine(names("D")))
+    if not added:
+        return 0
+    cur = git("symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
+    used, res = survey(), reservations()
+    bad = []
+    for f in added:
+        m = PAT.match(f)
+        n, slug = int(m.group(1)), m.group(2)
+        # a name this very commit deletes on the committing branch is not "elsewhere" (fixing your own slug)
+        others = {k: v for k, v in used.get(n, {}).items() if k != f and not (k in deleted and set(v) <= {cur, "HEAD"})}
+        if others:
+            bad.append("%04d: %s is staged here, but %s on %s" % (n, f, "; ".join(others), ",".join(sum(others.values(), []))))
+        elif n in res and res[n]["name"] not in ("?", "") and res[n]["name"] != slug:
+            bad.append("%04d: %s is staged here, but the number is reserved by %s as '%s'" % (n, f, res[n]["owner"], res[n]["name"]))
+    if bad:
+        print("patch-numbers: commit refused, overlapping xnu patch number(s):")
+        for x in bad:
+            print("  " + x)
+        print("  take a free number with `tools/patch-numbers next --owner NAME --name SLUG` (status shows who holds what), rename the patch, `git add` again")
+        return 3
+    for f in added:  # clean: make the number visible to every worktree now
+        m = PAT.match(f)
+        n = int(m.group(1))
+        if n in res:
+            continue
+        body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", m.group(2), datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+        r = git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip(), "0" * 40)
+        if r.returncode:  # somebody reserved it between our read and now: refuse if for a different slug
+            cur_r = reservations().get(n, {})
+            if cur_r.get("name") not in ("?", "", m.group(2), None):
+                print("patch-numbers: %04d was just reserved by %s as '%s'; take another number" % (n, cur_r.get("owner", "?"), cur_r["name"]))
+                return 3
+    return 0
+
+
+HOOK = """#!/bin/sh
+# installed by tools/patch-numbers install-hook (TP-022): xnu patch numbers must not overlap across worktrees
+T=~/.t3/worktrees/common-tools/kernel/tools/patch-numbers
+[ -f "$T" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "$T" precommit
+rc=$?
+[ $rc = 3 ] && exit 1
+[ $rc = 0 ] || echo "patch-numbers: internal error (rc=$rc), patch numbers NOT checked for this commit" >&2
+exit 0
+"""
+
+
+def cmd_install_hook():
+    common = git("rev-parse", "--git-common-dir").stdout.strip()
+    common = common if os.path.isabs(common) else os.path.join(ROOT, common)
+    path = os.path.join(common, "hooks", "pre-commit")
+    if os.path.exists(path) and "patch-numbers" not in open(path).read():
+        print("RESULT: ERROR %s exists and is not ours; add `python3 .../patch-numbers precommit` to it by hand" % path)
+        return 2
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(HOOK)
+    os.chmod(path, 0o755)
+    print("RESULT: PASS installed %s" % path)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="patch-numbers")
+    sub = p.add_subparsers(dest="op", required=True)
+    sub.add_parser("status")
+    n = sub.add_parser("next")
+    n.add_argument("--owner", default=os.environ.get("PHONE_OWNER") or "agent-%d" % os.getpid())
+    n.add_argument("--name", default="")
+    sub.add_parser("release").add_argument("num")
+    sub.add_parser("check")
+    c = sub.add_parser("claim")
+    c.add_argument("num")
+    c.add_argument("--owner", default=os.environ.get("PHONE_OWNER") or "agent-%d" % os.getpid())
+    c.add_argument("--name", default="")
+    sub.add_parser("precommit")
+    sub.add_parser("install-hook")
+    a = p.parse_args()
+    try:
+        return {"status": cmd_status, "check": cmd_check, "precommit": cmd_precommit, "install-hook": cmd_install_hook,
+                "next": lambda: cmd_next(a.owner, a.name), "release": lambda: cmd_release(a.num),
+                "claim": lambda: cmd_claim(a.num, a.owner, a.name)}[a.op]()
+    except Exception as e:  # noqa: BLE001
+        print("RESULT: ERROR %s" % e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

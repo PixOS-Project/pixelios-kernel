@@ -1,3 +1,4 @@
+import os
 import contextlib, io, json, os, pathlib, shutil, subprocess, sys, tempfile, time, unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -90,6 +91,85 @@ class Report(unittest.TestCase):
         self.assertEqual(r["result"], "FAIL")
         self.assertIn("did not fire", r["reason"])
         self.assertEqual(r["diff"]["previous"], "PASS")
+
+    def test_hard_timeout_cases(self):
+        # TP-020 follow-up (review 13): a hard timeout is not "the reset did not fire"
+        # 1. timed out before the reset was due -> PARTIAL, no FAIL
+        d = self.run_dir("20260101T000200Z-a", snaps=[(30, LOG1)], run={"restart": "600", "timeout": "1", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PARTIAL")
+        self.assertIn("before the reset was due", r["reason"])
+        # 2. reset due, bluejay in recovery at the end -> PASS, worded as inferred
+        d = self.run_dir("20260101T000300Z-b", snaps=[(30, LOG1)], run={"restart": "60", "timeout": "1", "usb_gone": str(T0 + 2), "t_end": str(T0 + 400), "phone": "usb ids [18d1:d001 ] adb [recovery] fastboot product [no answer]", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("inferred", r["reason"])
+        # 3. some other Google-VID device on the bus, bluejay absent -> NOT a pass
+        d = self.run_dir("20260101T000400Z-c", snaps=[(30, LOG1)], run={"restart": "60", "timeout": "1", "usb_gone": str(T0 + 2), "t_end": str(T0 + 400), "phone": "usb ids [18d1:4ee7 ] adb [error: no devices/emulators found] fastboot product [no answer]", "expect": ["SWEET CPU"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertNotIn("the phone reset", r["reason"])
+        self.assertIn("phone-state", r["reason"])
+
+    def test_waitusb_grace_only_when_reset_due(self):
+        import io, contextlib
+        calls = {"n": 0}
+        t = {"v": T0}
+
+        def fake_now():
+            return t["v"]
+
+        def fake_sleep(x):
+            t["v"] += x
+
+        def fake_present():
+            calls["n"] += 1
+            return calls["n"] > 3 and t["v"] > T0 + 70  # the phone is gone, and shows up 3 polls into the grace window
+
+        def run(restart):
+            d = self.run_dir("2026010100%d500Z-g" % len(restart), snaps=[], run={"restart": restart, "hard_timeout": "50", "t_start": str(T0), "t_boot": str(T0), "duration": "500"})
+            xrun_report.mark(str(d), ["usb_gone=%f" % (T0 + 2)])
+            calls["n"] = 0; t["v"] = T0
+            old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = fake_now, fake_sleep, fake_present
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    xrun_report.waitusb(str(d))
+            finally:
+                xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+            return out.getvalue().strip(), xrun_report.load(os.path.join(str(d), "run.json"), {})
+        how, rj = run("30")      # reset due at +30, hard timeout at +50: grace runs and sees the phone return
+        self.assertEqual(how, "TIMEOUT")
+        self.assertIn("late_back", rj)
+        how, rj = run("600")     # reset not due: no grace window
+        self.assertEqual(how, "TIMEOUT")
+        self.assertNotIn("late_back", rj)
+
+    def test_reset_text_names_what_the_phone_came_back_as(self):
+        d = self.run_dir("20260101T000600Z-r", snaps=[(30, LOG1)], run={"restart": "60,bootloader", "expect": ["SWEET CPU"]})
+        xrun_report.mark(str(d), ["usb_back=%f" % (T0 + 150), "usb_back_id=18d1:4ee0"])
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("back as fastboot", r["reason"])
+
+    def test_fail_on_ends_the_run_early_and_scores_fail(self):
+        import io, contextlib
+        t = {"v": T0}
+        d = self.run_dir("20260101T000700Z-f", snaps=[(30, LOG1)], run={"restart": "600", "duration": "900", "t_boot": str(T0), "fail_on": ["SWEET CPU: cpu=0 mpidr"], "expect": ["SWEET CPU"]})
+        old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+        xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = (lambda: t["v"]), (lambda x: t.__setitem__("v", t["v"] + x)), (lambda: True)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                xrun_report.waitusb(str(d))
+        finally:
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+        self.assertEqual(out.getvalue().strip(), "EARLY")
+        self.assertLess(t["v"] - T0, 60)   # not the 900 s window
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertIn("failure pattern", r["reason"])
 
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
