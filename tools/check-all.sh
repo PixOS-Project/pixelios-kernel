@@ -81,7 +81,7 @@ step() {
 		echo "$n$r" >"$tmp/$n.fail"; : >"$tmp/$l.lane"; echo "$n FAILED$r $((SECONDS-s))s" >"$tmp/$n.time"; echo "END $n FAIL$r $((SECONDS-s))" >>"$prog"
 	fi
 }
-	step A host-tests   bash -c 'cd shim && ls out/gate/build-0/*_host_test >/dev/null && for t in out/gate/build-0/*_host_test out/gate/build-0/host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'
+# par CMD...: run CMD in the background, at most $J of this lane's jobs at a time
 par() { while [ "$(jobs -rp | wc -l)" -ge "$J" ]; do wait -n; done; "$@" & }
 # needs FILE CMD...: run CMD only if FILE exists in this repository (the public repos hold different parts of the monorepo)
 needs() { f=$1; shift; [ -e "$f" ] || { echo "skip: $f is not in this repository"; return 0; }; "$@"; }
@@ -102,7 +102,7 @@ laneA() {
 	par step A build-touch  bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --touch-probe=run,mux,cs,osc,loop,rst,misopu,rails --out out/gate/build-touch-0'
 	par step A build-udump  bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --udump 1 --out out/gate/build-udump-0'
 	wait
-	step A host-tests   bash -c 'cd shim/out/gate/build-0 && ls *_host_test >/dev/null && for t in *_host_test host_test; do [ -x "$t" ] && "./$t" || [ ! -x "$t" ] || exit 1; done'
+	step A host-tests   bash -c 'cd shim && ls out/gate/build-0/*_host_test >/dev/null && for t in out/gate/build-0/*_host_test out/gate/build-0/host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'
 	step A boot-safety  python3 tools/test-bluejay-boot.py --out shim/out/gate/build-0 shim/out/gate/build-0/shim-boot-avb.img
 }
 laneB() {
