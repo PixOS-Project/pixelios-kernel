@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do case "$1" in
 	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
 args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweetusb=0 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1"
-[ "$usbnet" = 1 ] && args=${args/sweetusb=0/sweetusb=2}   # replace, never add: the first match wins in PE_parse_boot_argn
+[ "$usbnet" = 1 ] && args=${args/sweetusb=0/sweetusb=2}   # replace, never add: a duplicate key is ambiguous (review 17 L5: for key=value the LAST one wins in PE_parse_boot_argn, so `--gui --args sweetfb_noconsole=2` gives 2)
 [ "$usbdma" = 1 ] && args="$args sweetusbdma=1"
 [ "$rw" = 1 ] && args="$args ufsrw=1 rootrw=1"
 [ "$gui" = 1 ] && args="$args sweetfb_noconsole=1 sweetfb_hz=30"
