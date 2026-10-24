@@ -440,6 +440,11 @@ source of truth: the branch `common-tools` (own worktree `~/.t3/worktrees/common
 `tools/tools-sync status` (per file same/differs/missing) and `tools/tools-sync pull` (copies differing files from the ref, skips files with uncommitted changes, refuses while the lock is held; you review and commit). An agent-specific flag in a common file
 must be upstreamed to `common-tools`, or it shows as drift. The gate does not check this (drift is a warning for the agents, not a gate failure).
 
+**One numbering for `xnu/patches` (TP-022).** Branches diverge (GPU holds 0102-0111, everyone else stops at 0101), so a second agent writing "the next patch" would pick a number that is already taken. Before writing a patch run
+`tools/patch-numbers next --owner NAME --name SLUG`: it prints the next free number above every local and remote branch and every reservation, and records the reservation as a git ref (`refs/patch-numbers/NNNN`, shared by all worktrees).
+`tools/patch-numbers status` lists every number, who holds it and CONFLICT lines (same number, different file name on two branches); `tools/patch-numbers check` fails if THIS tree uses a number another branch has under a different name; `release NNNN`
+drops an unused reservation. The gate does not run it (another branch's state must not fail your gate): run `check` before committing a patch and before a merge.
+
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
