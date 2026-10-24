@@ -93,6 +93,7 @@ def write(owner, pid, ttl, cmd, token, pgid=0):
     tmp = INFO + ".%d" % os.getpid()
     with open(tmp, "w") as f:
         json.dump({"owner": owner, "token": token, "pid": pid, "pgid": pgid, "start": int(time.time()), "ttl": ttl, "cmd": cmd}, f)
+    os.chmod(tmp, 0o600)  # the token is the lock's identity
     os.replace(tmp, INFO)
 
 
@@ -208,9 +209,10 @@ def release(owner, token, force):
     i = read()
     if i is None:
         return result(0, owner, 0, "no lock held")
-    mine = (token and i.get("token") == token) or (not token and owner and i.get("owner") == owner)
+    # a lock with a pid (run, xrun, probe-run) is released only with its token; the owner label may release a pid-less (bare acquire) lock
+    mine = (token and i.get("token") == token) or (not token and not i.get("pid") and owner and i.get("owner") == owner)
     if not force and not mine:
-        return result(2, owner, age(i), "refused: lock is held by %s (force-release --yes to override)" % i.get("owner", "?"))
+        return result(2, owner, age(i), "refused: lock is held by %s; release needs its token (force-release --yes to override)" % i.get("owner", "?"))
     shutil.rmtree(LOCK, ignore_errors=True)
     return result(0, owner, age(i), "released lock of %s" % i.get("owner", "?"))
 
@@ -239,8 +241,14 @@ def run(a):
         for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(s, fwd)
         child = subprocess.Popen(a.cmd, start_new_session=True)  # own process group: leftovers keep the lock if `run` is SIGKILLed
-        write(a.owner, os.getpid(), a.ttl, " ".join(a.cmd), token, child.pid)
+        cur = read()
+        if cur and cur.get("token") == token:  # never overwrite a lock somebody force-released and retook
+            write(a.owner, os.getpid(), a.ttl, " ".join(a.cmd), token, child.pid)
         rc = child.wait()
+        for _ in range(60):  # children left in the group (a backgrounded fastboot) still use the phone: keep the lock up to 30 s
+            if not group_alive(child.pid):
+                break
+            time.sleep(0.5)
         rc = 128 - rc if rc < 0 else rc  # killed by signal N -> 128+N
     except OSError as e:
         print("cannot run %s: %s" % (a.cmd[0], e))
@@ -266,6 +274,7 @@ def main():
             s.add_argument("--ttl", type=int, default=1800)
         if n == "acquire":
             s.add_argument("--pid", type=int, default=0)
+            s.add_argument("--pgid", type=int, default=0, help="process group whose members keep the lock after --pid dies")
         if n in ("acquire", "release"):
             s.add_argument("--token", default=None)
         if n == "run":
@@ -276,7 +285,7 @@ def main():
     try:
         a = p.parse_args()
         if a.op == "acquire":
-            code, msg = acquire(a.owner, a.wait, a.ttl, a.pid, "acquire", a.token)
+            code, msg = acquire(a.owner, a.wait, a.ttl, a.pid, "acquire", a.token, a.pgid)
             if code == 0 and not a.pid:
                 msg = (msg + "; " if msg else "") + "warning: ttl-only lock (%ds), not checkable from other processes; prefer phone-lock run" % a.ttl
             return result(code, a.owner, 0, msg)

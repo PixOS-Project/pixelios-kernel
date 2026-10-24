@@ -1,14 +1,14 @@
 ---
 id: TP-020
 tool: "tools/phone-lock"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (driver)"
 date: 2026-10-24
 exposed_by: "user request 2026-10-24 after the GPU agent offered the phone and asked for a 35 min slot: the lock was held across builds and nothing enforced it"
 extends: "TP-016"
 related: "TP-018"
 usage: "tools/phone-lock check [--token T]; xrun/probe-run --lock-wait S; tools/phone-guard (hook)"
-refs: "-"
+refs: "kernel f1f1d04, f546f83 + review-12 fixes; reviews 11 (UNSAFE, fixed) and 12 (SAFE WITH CONDITIONS, applied); .claude/settings.json hook in the super repo"
 ---
 
 ## checked
@@ -24,4 +24,4 @@ The phone sat locked and idle for the build of every run (a shim build is ~15-70
 No device touched by the lock code. Behaviour changes for other agents: fboot/fflash/phone goto/run-probe/pstore-pull run refuse without the token (wrap manual slots in `phone-lock run`); a stuck live pid now keeps the lock until `force-release --yes` (the ttl no longer frees it). The hook blocks hand-typed mutating device commands (quoted text and heredoc bodies are ignored; an unbalanced quote is judged as far as it parses); read-only queries pass. Hooks load at session start: running sessions are not guarded until restarted.
 
 ## amendments
-- 2026-10-24 Claude Sonnet 5.5: review 11 (`docs/reviews/11-phone-lock-enforce.md`, UNSAFE on 97f666a: no-owner check passed any live lock, shared owner names, SIGKILLed `run` freed the phone, xrun released early) fixed: token identity, process-group liveness, mutex-verified stale takeover, queue deadline, xrun keeps the lock to exit, guards in run-probe.sh and pstore-pull.py, wider phone-guard. Re-review pending.
+- 2026-10-24 Claude Sonnet 5.5: review 11 (`docs/reviews/11-phone-lock-enforce.md`, UNSAFE on 97f666a: no-owner check passed any live lock, shared owner names, SIGKILLed `run` freed the phone, xrun released early) fixed: token identity, process-group liveness, mutex-verified stale takeover, queue deadline, xrun keeps the lock to exit, guards in run-probe.sh and pstore-pull.py, wider phone-guard. Re-review 12: SAFE WITH CONDITIONS, conditions applied.

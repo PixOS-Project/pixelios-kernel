@@ -257,11 +257,33 @@ class T(unittest.TestCase):
         r = self.sh("plock_take t 0; echo rc=$?; echo $PLOCK_MSG")
         self.assertIn("rc=1", r.stdout)
         self.assertIn("busy", r.stdout)
-        self.pl("release", "--owner", "other")
+        self.pl("force-release", "--yes")
         # already held by an outer run: no second lock, no release of the outer one
         r = self.pl("run", "--owner", "o", "--", "bash", "-c", '. tools/plock.sh; plock_take t 0; echo took=$PLOCK_TOOK; plock_drop; tools/phone-lock check >/dev/null && echo still-held')
         self.assertIn("took=0", r.stdout)
         self.assertIn("still-held", r.stdout)
+
+    def test_release_needs_token_for_pid_locks(self):
+        # review 12: a shell without the token must not free a live run/xrun lock by guessing the owner label
+        self.pl("acquire", "--owner", "A", "--token", "TA", "--pid", str(os.getpid()))
+        self.assertEqual(self.pl("release", "--owner", "A").returncode, 2)
+        self.assertTrue(os.path.isdir(self.lock))
+        self.assertEqual(self.pl("release", "--token", "TA").returncode, 0)
+
+    def test_acquire_pgid_keeps_lock_after_pid_dies(self):
+        # review 12: xrun/probe-run are SIGKILLed, their fastboot child survives in the group
+        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"]); dead.wait()
+        self.pl("acquire", "--owner", "x", "--pid", str(dead.pid), "--pgid", str(child.pid))
+        try:
+            self.assertEqual(self.pl("acquire", "--owner", "y").returncode, 1)
+        finally:
+            child.kill(); child.wait()
+        self.assertEqual(self.pl("acquire", "--owner", "y").returncode, 0)
+
+    def test_info_not_world_readable(self):
+        self.pl("acquire", "--owner", "x", "--pid", str(os.getpid()))
+        self.assertEqual(os.stat(os.path.join(self.lock, "info.json")).st_mode & 0o077, 0)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ plock_take() {
 	tools/phone-lock check >/dev/null 2>&1 && return 0   # PHONE_LOCK_TOKEN from an outer `phone-lock run`
 	tok=$(cat /proc/sys/kernel/random/uuid)
 	# pid-bound: the lock ends when this script dies, never by ttl; the ttl is only the figure shown to waiters
-	PLOCK_MSG=$(tools/phone-lock acquire --owner "${PHONE_OWNER:-$tool}" --wait "$wait" --ttl 7200 --pid $$ --token "$tok" 2>&1 | head -n 2 | tr '\n' ' ')
+	PLOCK_MSG=$(tools/phone-lock acquire --owner "${PHONE_OWNER:-$tool}" --wait "$wait" --ttl 7200 --pid $$ --pgid "$(ps -o pgid= -p $$ | tr -d " ")" --token "$tok" 2>&1 | head -n 2 | tr '\n' ' ')
 	tools/phone-lock check --token "$tok" >/dev/null 2>&1 || return 1
 	PLOCK_TOOK=1; PLOCK_TOKEN=$tok; export PHONE_LOCK_TOKEN=$tok
 }
