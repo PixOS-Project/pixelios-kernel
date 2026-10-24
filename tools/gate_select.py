@@ -19,7 +19,7 @@ def shim_patch_prefixes():
 
 
 SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py",
-               "tools/check-all.sh", "tools/gate_select.py") + shim_patch_prefixes()
+               "tools/check-all.sh", "tools/gate_select.py", "tools/audit_memo.py") + shim_patch_prefixes()
 UNIT_PREFIX = ("tools/", "soc/", "device/", "qrlog/", "xnu/qr/", "xnu/patches/0081", "xnu/patches/0086", "xnu/patches/0094")
 
 

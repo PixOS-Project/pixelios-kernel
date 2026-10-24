@@ -49,7 +49,11 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import audit_memo  # noqa: E402
 
 SCSI_WRITE_OPCODES = {
     0x0A: "WRITE(6)",
@@ -4471,8 +4475,7 @@ def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> Non
         raise AssertionError(f"{name}: w32 must have exactly one caller, run_row: {callers}")
 
 
-def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
-    disasm = _touch_obj_info(obj_path)[0]
+def wlanlink_object_selftest(disasm: str) -> int:
     check_wlanlink_w32_object_text(disasm, "wlanlink selftest")  # control
     wblk = re.search(r"(?ms)^[0-9a-f]+ <w32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     rblk = re.search(r"(?ms)^[0-9a-f]+ <r32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
@@ -5071,9 +5074,15 @@ def check_boot_header(path: pathlib.Path) -> tuple:
     return header_version, kernel_size, ramdisk_size, is_lz4
 
 
+def _memo(fn, arg: bytes = b"", *args):
+    """Run one of the three expensive mutation self-tests through tools/audit_memo.py (never the audit of the real objects)."""
+    return audit_memo.run(lambda: fn(*args), arg, script=__file__, name=fn.__name__)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("boot_image", type=pathlib.Path, nargs="*", help="one or more boot images: header checks per image, the tree audit once")
+    parser.add_argument("--no-memo", action="store_true", help="run the three expensive self-tests every time (also PIXELIOS_AUDIT_NO_MEMO=1); see tools/audit_memo.py")
     parser.add_argument("--wlan-link-effective", type=int, help="build.sh: the effective WLAN_LINK_N of the wlanlink.o it just built (checked against --wlan-link-explicit, then exit)")
     parser.add_argument("--wlan-link-explicit", default="", help="build.sh: the N typed as --wlan-link=N ('' = none)")
     args = parser.parse_args()
@@ -5082,6 +5091,8 @@ def main() -> None:
         print(f"PASS wlan-link N: effective N={args.wlan_link_effective} (explicit {args.wlan_link_explicit or 'none: default'})")
         return
     assert args.boot_image, "boot_image required"
+    if args.no_memo:
+        audit_memo.disable()
     headers = [check_boot_header(path) for path in args.boot_image]
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -5207,12 +5218,12 @@ def main() -> None:
     wlansmc_object_selftest(repo_root / "shim" / "out" / "wlansmc_iso.o", True)
     n_stores = check_wlansmc_object(repo_root / "shim" / "out" / "wlansmc_iso.o", True)
     print(f"PASS wlansmc_iso object audit: exactly three smc (read, rmw set, rmw clear); the RMW pair is constants only: x0 = 0x82000504, x1 = 0x17463EC4, x2 = 2, x3 = 1, x4 = 1 / 0; {n_stores} stores, all stack/argument based")
-    wlan_seq_selftest()
+    _memo(wlan_seq_selftest)
     _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
     check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
     print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S36 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 9 blocks (BAR0: 4 registers, written only by the exact S34-S36 tuples), all inside the allowlist; every write row has a restore or is a BAR0 write dropped with the module power (research 40 s.5)")
-    wlanlink_source_selftest()
+    _memo(wlanlink_source_selftest)
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())
     wlan_link_n_selftest()
     print("PASS wlan-link N audit: build.sh sets WLAN_LINK_N only from an explicit --wlan-link=N, the default is WLAN_SEQ_DEFAULT_N (19), the first LINK line prints N")
@@ -5221,7 +5232,8 @@ def main() -> None:
     touchprobe_object_selftest(repo_root / "shim" / "out" / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF, "wlanlink")
     n_stores = check_touchprobe_object(repo_root / "shim" / "out" / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF)
     print(f"PASS wlanlink object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; undef subset")
-    wlanlink_object_selftest(repo_root / "shim" / "out" / "wlanlink.o")
+    _wl_disasm = _touch_obj_info(repo_root / "shim" / "out" / "wlanlink.o")[0]  # objdump stays outside the memo: other text = other key
+    _memo(wlanlink_object_selftest, _wl_disasm.encode(), _wl_disasm)
     check_wlanlink_w32_object_text(_touch_obj_info(repo_root / "shim" / "out" / "wlanlink.o")[0], "wlanlink.o")
     print("PASS wlanlink w32 object audit: the compiled w32 keeps its window / offset compares, one try_write32, one caller (run_row)")
     wlansmc_object_selftest(repo_root / "shim" / "out" / "wlansmc_link.o", True)

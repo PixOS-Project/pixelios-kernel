@@ -21,6 +21,9 @@ class Select(unittest.TestCase):
     def test_shim_markdown_selects_no_build(self):
         self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate"])
 
+    def test_audit_memo_selects_boot_safety(self):
+        self.assertIn("boot-safety", g.select(["tools/audit_memo.py"]))
+
     def test_shim(self):
         s = g.select(["shim/ufs.c"])
         self.assertEqual(s, g.SHIM + ["public-split", "validate"])
