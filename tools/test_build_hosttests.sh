@@ -6,7 +6,8 @@
 cd "$(dirname "$0")/.." || exit 2
 T=$(mktemp -d) || exit 2; trap 'rm -rf "$T"' EXIT
 fail=0; bad() { echo "FAIL $*"; fail=1; }
-grep -nE '^[[:space:]]*(gcc|\$G[A-Z]+) .* && \$O/' shim/build.sh && bad "build.sh still has a gcc && test chain"
+# any line that builds a *host_test* output or runs a $O/ binary after && without going through chk (any compiler word, any chain form)
+grep -nE -e '-o +"?\$O"?/[A-Za-z0-9_$]*host_test' -e '(&&|;|\|\|) +"?\$O"?/' shim/build.sh | grep -v 'chk ' && bad "build.sh has a host test compile / && run that bypasses chk"
 # (2) chk() from build.sh (first definition, up to its closing brace)
 awk '/^chk\(\) \{/{f=1} f{print} f&&/exit 1; fi; \}/{exit}' shim/build.sh >"$T/chk.sh"
 [ -s "$T/chk.sh" ] || bad "chk() not found in build.sh"
@@ -30,6 +31,7 @@ g=$T/g; d=$g/shim/out/gate/build-0; mkdir -p "$d"
 for n in a_host_test b_host_test; do printf '#!/bin/sh\nexit 0\n' >"$d/$n"; chmod +x "$d/$n"; done
 step() { (cd "$g" && bash -c "$cmd" >"$T/step.out" 2>&1); }
 printf 'a_host_test\nb_host_test\n' >"$d/host-tests.list"; step || bad "complete set failed: $(cat "$T/step.out")"
+printf '#!/bin/sh\nexit 0\n' >"$d/c_host_test"; chmod +x "$d/c_host_test"; step && bad "an unlisted host test binary passed"; rm "$d/c_host_test"
 rm "$d/b_host_test"; step && bad "a missing binary was skipped"
 printf '#!/bin/sh\nexit 1\n' >"$d/b_host_test"; chmod +x "$d/b_host_test"; step && bad "a failing test passed"
 rm "$d/host-tests.list"; step && bad "a missing list passed"

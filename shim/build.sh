@@ -509,12 +509,12 @@ else
 	for v in 0 1; do chk "rails_host_test$v (compile)" gcc -O1 -Wall -Wextra -Werror -DRT_VERIFIED=$v -I. -I$O -include $O/board_config.h -o $O/rails_host_test$v rails_host_test.c; chk "rails_host_test$v" $O/rails_host_test$v; done
 	# ACPM DVFS client (docs/research/25): the fake channel-1 APM; the read-only build has no request tests (no acpm_dvfs_set there).
 	# Every check below FAILS the build (a plain `a && b && echo PASS` chain only skips the PASS line under set -e: review dvfs-1 M1).
-	gcc -O1 -Wall -Wextra -Werror -DTOUCH_DVFS_WRITE -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test dvfs_host_test.c
+	chk "dvfs_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -DTOUCH_DVFS_WRITE -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test dvfs_host_test.c
 	chk "dvfs_host_test (rw)" $O/dvfs_host_test
-	gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test_ro dvfs_host_test.c
+	chk "dvfs_host_test_ro (compile)" gcc -O1 -Wall -Wextra -Werror -I. -I$O -include $O/board_config.h -o $O/dvfs_host_test_ro dvfs_host_test.c
 	chk "dvfs_host_test (ro)" $O/dvfs_host_test_ro
 	for w in 0 1; do
-		gcc -O1 -Wall -Wextra -Werror -DDP_WRITE=$w -I. -I$O -include $O/board_config.h -o $O/dvfs_probe_host_test$w dvfs_probe_host_test.c
+		chk "dvfs_probe_host_test$w (compile)" gcc -O1 -Wall -Wextra -Werror -DDP_WRITE=$w -I. -I$O -include $O/board_config.h -o $O/dvfs_probe_host_test$w dvfs_probe_host_test.c
 		chk "dvfs_probe_host_test DP_WRITE=$w" $O/dvfs_probe_host_test$w
 	done
 	# review 2 M3: a read-only (railsr) image must not contain the UPDATE path

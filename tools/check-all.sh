@@ -102,7 +102,7 @@ laneA() {
 	par step A build-touch  bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --touch-probe=run,mux,cs,osc,loop,rst,misopu,rails --out out/gate/build-touch-0'
 	par step A build-udump  bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --udump 1 --out out/gate/build-udump-0'
 	wait
-	step A host-tests   bash -c 'cd shim && d=out/gate/build-0 && { [ -s $d/host-tests.list ] || { echo "no $d/host-tests.list (build.sh did not run the host tests)"; exit 1; }; } && while read -r n; do [ -x $d/$n ] || { echo "MISSING host test binary $n"; exit 1; }; $d/$n </dev/null || { echo "FAIL $n"; exit 1; }; done <$d/host-tests.list'
+	step A host-tests   bash -c 'cd shim && d=out/gate/build-0 && { [ -s $d/host-tests.list ] || { echo "no $d/host-tests.list (build.sh did not run the host tests)"; exit 1; }; } && while read -r n; do [ -x $d/$n ] || { echo "MISSING host test binary $n"; exit 1; }; $d/$n </dev/null || { echo "FAIL $n"; exit 1; }; done <$d/host-tests.list && for f in $d/*host_test*; do if [ -x "$f" ] && ! grep -qx "${f##*/}" $d/host-tests.list; then echo "UNLISTED host test binary ${f##*/} (compile it through chk in build.sh)"; exit 1; fi; done'
 	step A boot-safety  python3 tools/test-bluejay-boot.py --out shim/out/gate/build-0 shim/out/gate/build-0/shim-boot-avb.img
 }
 laneB() {
