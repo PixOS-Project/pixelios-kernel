@@ -48,3 +48,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-021 | tools/tools-sync | done |
 | TP-022 | tools/patch-numbers | done (amended) |
 | TP-023 | tools/runs | approved |
+| TP-024 | tools/run-preflight | approved |

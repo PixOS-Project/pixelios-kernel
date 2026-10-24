@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""run-preflight: read-only checks before a hardware run (TP-024). Host only; never touches the phone, no adb/fastboot.
+
+  tools/run-preflight [--json] [--root-sha SHA] [--margin S] -- tools/xrun|tools/probe-run ARGS...
+  tools/run-preflight --gen-bootargs [--check] [--pristine DIR]   regenerate tools/bootargs-known.txt (--check: exit 1 if stale)
+  tools/run-preflight --self-test
+
+Checks (each names the antipattern that motivates it; SKIP = not enough verified information, never a silent pass):
+  bootargs  xrun --args: every boot-arg NAME is parsed somewhere (tools/bootargs-known.txt, generated from pristine xnu-8796 +
+            xnu/patches; tools/bootargs-extra.txt = hand-added names, each with a citation). A grep is a start, not proof.
+  syntax    xrun --args: sweettouchpoke= must end with ';' (AP-10, patch 0093)
+  reach     every --expect row is < every accepted stop row (a pattern with "stopped=" and row=N|M) (AP-27)
+  timeout   probe-run --timeout >= max earlier wall of the same --label (tools/runs stats) + --margin (default 60 s, a guess) (AP-14/AP-22)
+  gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it)
+  root      newest line of flashed-userdata.txt has sha256 == --root-sha (SKIP without --root-sha)
+  lock      phone lock free or held by the caller (tools/phone-lock status/check)
+Not implemented (no verified source yet, listed as SKIP): image meta vs HEAD, --overlay after migration finished, the build's recorded root.
+Last line: RESULT: PASS | FAIL <check>: <reason>   Exit 0 pass / 1 a check failed / 2 bad arguments or internal error.
+Env (tests): PREFLIGHT_ROOT repo root, PREFLIGHT_KNOWN/PREFLIGHT_EXTRA name lists, ARTIFACTS, FLASH_STATE, RUNS_ROOT, PHONE_LOCK_DIR.
+"""
+import json, os, re, shlex, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.environ.get("PREFLIGHT_ROOT") or os.path.dirname(HERE)
+KNOWN = os.environ.get("PREFLIGHT_KNOWN") or os.path.join(HERE, "bootargs-known.txt")
+EXTRA = os.environ.get("PREFLIGHT_EXTRA") or os.path.join(HERE, "bootargs-extra.txt")
+PRISTINE = os.environ.get("XNU_PRISTINE") or os.path.expanduser("~/pixelios-artifacts/xnu-pristine")  # docs/LOCAL-BUILD.md:41
+
+
+class Bad(Exception):
+    pass
+
+
+# ---- generator: boot-arg names parsed by the kernel ------------------------------------------------------------------
+# Macro argument positions read from pristine osfmk/kern/startup.h:225-380: TUNABLE/_WRITEABLE/_DEV_WRITEABLE(type, var, boot_arg, ..),
+# TUNABLE_STR(var, count, boot_arg, ..), TUNABLE_DT/_DT_WRITEABLE(type, var, dt_base, dt_name, boot_arg, ..);
+# PE_parse_boot_argn/_arg_str/_internal take the name as 1st argument (observed: grep of the pristine tree).
+CALLS = {"PE_parse_boot_argn": 0, "PE_parse_boot_arg_str": 0, "PE_parse_boot_argn_internal": 0, "TUNABLE": 2, "TUNABLE_WRITEABLE": 2,
+         "TUNABLE_DEV_WRITEABLE": 2, "TUNABLE_STR": 2, "TUNABLE_DT": 4, "TUNABLE_DT_WRITEABLE": 4}
+CALL_RX = re.compile(r"\b(" + "|".join(sorted(CALLS, key=len, reverse=True)) + r")\s*\(")
+
+
+def split_args(text, start):
+    """text[start] is just after '(' -> list of top-level argument strings (quote and paren aware), or None if unterminated."""
+    out, depth, cur, i, q = [], 0, [], start, None
+    while i < len(text):
+        c = text[i]
+        if q:
+            cur.append(c)
+            if c == "\\" and i + 1 < len(text):
+                cur.append(text[i + 1]); i += 1
+            elif c == q:
+                q = None
+        elif c in "\"'":
+            q = c; cur.append(c)
+        elif c == "(":
+            depth += 1; cur.append(c)
+        elif c == ")":
+            if depth == 0:
+                out.append("".join(cur).strip())
+                return out
+            depth -= 1; cur.append(c)
+        elif c == "," and depth == 0:
+            out.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(c)
+        i += 1
+    return None
+
+
+def names_in(text):
+    names = set()
+    for m in CALL_RX.finditer(text):
+        a = split_args(text, m.end())
+        pos = CALLS[m.group(1)]
+        if a and len(a) > pos:
+            s = re.fullmatch(r'"([^"\\]+)"', a[pos])
+            if s:
+                names.add(s.group(1).lstrip("-"))
+    return names
+
+
+def generate(pristine):
+    found = {}
+    if not os.path.isdir(pristine):
+        raise Bad("pristine xnu tree not found: %s (set XNU_PRISTINE or --pristine)" % pristine)
+    for dp, _, fs in os.walk(pristine):
+        for f in fs:
+            if f.endswith((".c", ".h", ".cpp")):
+                try:
+                    txt = open(os.path.join(dp, f), errors="replace").read()
+                except OSError:
+                    continue
+                for n in names_in(txt):
+                    found.setdefault(n, "xnu")
+    pd = os.path.join(ROOT, "xnu", "patches")
+    for f in sorted(os.listdir(pd)) if os.path.isdir(pd) else []:
+        if f.endswith(".patch"):
+            added = "\n".join(l[1:] for l in open(os.path.join(pd, f), errors="replace").read().splitlines()
+                              if l.startswith("+") and not l.startswith("+++"))
+            for n in names_in(added):
+                found.setdefault(n, "patch:" + f.split("-")[0])
+    return "".join("%s\t%s\n" % (n, found[n]) for n in sorted(found))
+
+
+def read_names(path):
+    try:
+        return {l.split("\t")[0].split("#")[0].strip() for l in open(path) if l.strip() and not l.startswith("#")} - {""}
+    except OSError:
+        return None
+
+
+# ---- checks (each returns (status, detail), status PASS|FAIL|SKIP) ---------------------------------------------------
+def opts(argv):
+    """-> dict name -> list of values for the options this tool cares about (xrun/probe-run); unknown options are ignored."""
+    want = {"--args", "--expect", "--stop-on", "--label", "--timeout", "--hard-timeout", "--overlay", "--build-args"}
+    o, i = {}, 0
+    while i < len(argv):
+        if argv[i] in want and i + 1 < len(argv):
+            o.setdefault(argv[i], []).append(argv[i + 1]); i += 2
+        else:
+            i += 1
+    return o
+
+
+def c_bootargs(tool, o):
+    if tool != "xrun" or "--args" not in o:
+        return "SKIP", "no xrun --args"
+    known, extra = read_names(KNOWN), read_names(EXTRA) or set()
+    if known is None:
+        return "FAIL", "%s missing: run tools/run-preflight --gen-bootargs" % KNOWN
+    bad = []
+    for tok in o["--args"][-1].split():
+        n = tok.lstrip("-").split("=")[0]
+        if n and n not in known and n not in extra:
+            bad.append(n)
+    return ("FAIL", "boot-arg(s) not parsed by xnu-8796 + patches (nor in bootargs-extra.txt): " + " ".join(bad)) if bad else ("PASS", "")
+
+
+def c_syntax(tool, o):
+    if tool != "xrun" or "--args" not in o:
+        return "SKIP", "no xrun --args"
+    for tok in o["--args"][-1].split():
+        if tok.startswith("sweettouchpoke=") and not tok.endswith(";"):
+            return "FAIL", "sweettouchpoke= value must end with ';' (AP-10)"
+    return "PASS", ""
+
+
+def rows(pat):
+    """row numbers a pattern names: row=N or row=(N|M|..)"""
+    out = set()
+    for m in re.finditer(r"row=(\d+|\(\d+(?:\|\d+)*\))", pat):
+        out.update(int(x) for x in re.findall(r"\d+", m.group(1)))
+    return out
+
+
+def c_reach(tool, o):
+    pats = o.get("--expect", []) + o.get("--stop-on", [])
+    stops = [(p, rows(p)) for p in pats if "stopped=" in p and rows(p)]
+    if not stops:
+        return "SKIP", "no accepted stop row (\"stopped=\" ... row=N) in --expect/--stop-on"
+    for p in o.get("--expect", []):
+        if "stopped=" in p:
+            continue
+        for r in rows(p):
+            for sp, srows in stops:
+                late = [s for s in srows if r >= s]
+                if late:
+                    return "FAIL", "--expect row=%d is not before accepted stop row %s: the run can stop first and the expect never prints (AP-27)" % (r, ",".join(map(str, sorted(late))))
+    return "PASS", ""
+
+
+def c_timeout(tool, o, margin):
+    key = "--timeout" if tool == "probe-run" else None
+    if not key or key not in o or "--label" not in o:
+        return "SKIP", "only probe-run with --timeout and --label (xrun wall time has no verified comparison with --hard-timeout)"
+    try:
+        t = float(o[key][-1])
+    except ValueError:
+        return "FAIL", "--timeout is not a number"
+    label = re.sub(r"[^A-Za-z0-9._-]", "_", o["--label"][-1])
+    r = subprocess.run([sys.executable, os.path.join(HERE, "runs"), "stats", "--form", "^" + re.escape(label) + "_*$", "--kind", "probe", "--json"],
+                       capture_output=True, text=True, env=dict(os.environ))
+    try:
+        rows_ = json.loads(r.stdout.splitlines()[0])
+    except (IndexError, ValueError):
+        return "SKIP", "tools/runs stats gave no data"
+    mx = max([x["max"] for x in rows_ if x["max"] is not None] or [None]) if rows_ else None
+    if mx is None:
+        return "SKIP", "no earlier run of label %s" % label
+    need = mx + margin
+    if t < need:
+        return "FAIL", "--timeout %.0f < earlier max wall %.0fs + margin %.0fs (AP-14/AP-22)" % (t, mx, margin)
+    return "PASS", ""
+
+
+def head():
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def c_gate(tool, o):
+    h = head()
+    if not h:
+        return "FAIL", "not a git checkout"
+    try:
+        line = open(os.path.join(ROOT, "shim", "out", "gate.result")).readline().strip()
+    except OSError:
+        return "FAIL", "no shim/out/gate.result: run tools/check-all.sh (AP-21)"
+    m = re.match(r"GATE (PASS|FAIL) (\S+)", line)
+    if not m:
+        return "FAIL", "gate.result says %r (gate running or unreadable)" % line[:40]
+    if m.group(1) != "PASS":
+        return "FAIL", "newest gate result is FAIL " + m.group(2)
+    if m.group(2) != h:
+        return "FAIL", "newest GATE PASS is %s but HEAD is %s (stale or +dirty)" % (m.group(2), h)
+    return "PASS", ""
+
+
+def c_root(tool, o, root_sha):
+    if not root_sha:
+        return "SKIP", "no --root-sha"
+    path = os.environ.get("FLASH_STATE") or os.path.join(os.environ.get("ARTIFACTS") or os.path.expanduser("~/pixelios-artifacts"), "flashed-userdata.txt")
+    try:
+        last = [l.split() for l in open(path) if l.strip()][-1]   # format <sha256> <date> <img> (tools/fflash-userdata.sh:21)
+    except (OSError, IndexError):
+        return "FAIL", "no flashed-userdata.txt entry"
+    if not last[0].startswith(root_sha.lower()):
+        return "FAIL", "flashed root is %s, the run expects %s" % (last[0][:12], root_sha[:12])
+    return "PASS", ""
+
+
+def c_lock(tool, o):
+    pl = os.path.join(HERE, "phone-lock")
+    if subprocess.run([sys.executable, pl, "status"], capture_output=True).returncode == 0:
+        return "PASS", ""
+    if subprocess.run([sys.executable, pl, "check"], capture_output=True).returncode == 0:
+        return "PASS", ""
+    return "FAIL", "the phone lock is held by someone else (tools/phone-lock status)"
+
+
+def skip_notes(tool, o):
+    s = []
+    if "--overlay" in o:
+        s.append("overlay: migration-finished check not implemented (no verified source)")
+    if tool == "xrun":
+        s.append("image-meta: not implemented (which image xrun boots is not verified)")
+    return s
+
+
+def run_checks(tool, argv, root_sha, margin):
+    o = opts(argv)
+    res = [("bootargs",) + c_bootargs(tool, o), ("syntax",) + c_syntax(tool, o), ("reach",) + c_reach(tool, o),
+           ("timeout",) + c_timeout(tool, o, margin), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
+           ("lock",) + c_lock(tool, o)]
+    return res, skip_notes(tool, o)
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "test_run_preflight.py")], capture_output=True, text=True)
+        print("self-test %s (%s)" % ("PASS" if r.returncode == 0 else "FAIL", (r.stderr.strip().splitlines() or [""])[-1]))
+        if r.returncode:
+            print(r.stderr[-1500:])
+        print("RESULT: %s self-test" % ("PASS" if r.returncode == 0 else "FAIL"))
+        return 0 if r.returncode == 0 else 1
+    try:
+        if argv and argv[0] == "--gen-bootargs":
+            pr = PRISTINE
+            if "--pristine" in argv:
+                pr = argv[argv.index("--pristine") + 1]
+            text = generate(pr)
+            if "--check" in argv:
+                cur = open(KNOWN).read() if os.path.exists(KNOWN) else ""
+                print("RESULT: %s bootargs-known.txt %s" % (("PASS", "in sync") if cur == text else ("FAIL", "stale: rerun --gen-bootargs")))
+                return 0 if cur == text else 1
+            with open(KNOWN, "w") as f:
+                f.write(text)
+            print("wrote %s (%d names)\nRESULT: PASS" % (KNOWN, text.count("\n")))
+            return 0
+        js, root_sha, margin, i = False, None, 60.0, 0
+        while i < len(argv) and argv[i] != "--":
+            if argv[i] == "--json":
+                js = True; i += 1
+            elif argv[i] in ("--root-sha", "--margin") and i + 1 < len(argv):
+                if argv[i] == "--root-sha":
+                    root_sha = argv[i + 1]
+                else:
+                    margin = float(argv[i + 1])
+                i += 2
+            else:
+                raise Bad("unknown option %s" % argv[i])
+        rest = argv[i + 1:]
+        if i >= len(argv) or not rest or os.path.basename(rest[0]) not in ("xrun", "probe-run"):
+            raise Bad("usage: run-preflight [--json] [--root-sha SHA] [--margin S] -- tools/xrun|tools/probe-run ARGS...")
+        tool = os.path.basename(rest[0])
+        res, notes = run_checks(tool, rest[1:], root_sha, margin)
+    except (Bad, ValueError, IndexError, OSError) as e:
+        print("usage/internal error: %s\nRESULT: ERROR %s" % (e, str(e).split("\n")[0][:80]))
+        return 2
+    fails = [r for r in res if r[1] == "FAIL"]
+    if js:
+        print(json.dumps({"checks": [{"check": c, "status": s, "detail": d} for c, s, d in res], "notes": notes}))
+    else:
+        for c, s, d in res:
+            print("%-8s %-4s %s" % (c, s, d))
+        for n in notes:
+            print("note: " + n)
+    if fails:
+        print("RESULT: FAIL %s: %s" % (fails[0][0], fails[0][2]))
+        return 1
+    print("RESULT: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

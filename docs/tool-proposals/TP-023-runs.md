@@ -6,7 +6,7 @@ proposed_by: "Claude Sonnet 5.5 (implementer)"
 date: 2026-10-24
 exposed_by: "session 36: AP-14/AP-22 (a run called a hang without comparing against earlier durations of the same form); decisions-s36.md T1"
 extends: ""
-related: ""
+related: "TP-024"
 usage: "tools/runs list [--since D] [--kind xrun|probe] [--all-worktrees] | show ID | stats --form REGEX | compare A B"
 refs: "docs/research/decisions-s36.md (T1), docs/research/dev-tooling-gaps.md:52, tools/runs, tools/test_runs.py"
 ---
