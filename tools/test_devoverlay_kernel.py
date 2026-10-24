@@ -101,7 +101,7 @@ def hdr(count, ver=1):
 def corpus():
     R = random.Random(18)
     paths = ['/usr/lib/a', '/usr/lib/../x', '/usr/lib//x', '/usr/libx', '/usr/local/a/b', '/private/var/dev/h', '/etc/x',
-             '/System/Library/xpc/launchd.plist', '/System/Library/LaunchDaemons/org.pixelios.t', '/System/Library/LaunchDaemons/org.pixelios.d/x',
+             '/System/Library/xpc/launchd.plist', '/System/Library/LaunchDaemons/org.pixelios.', '/System/Library/LaunchDaemons/org.pixelios.t', '/System/Library/LaunchDaemons/org.pixelios.d/x',
              '/usr/lib/a.sweetorig', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/a\x00b', '/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/',
              '/usr/lib/', '/usr/lib/.', '/usr/lib/a/', '/usr/lib/\xe9', '/usr/lib/' + 'n' * 245, '/usr/lib/' + 'n' * 246, '/usr/lib/x/..', '/usr/lib/x/../y',
              '/System/Library/xpc/launchd.plistX', '/System/Library/xpc/launchd.plist/x', '/usr/lib/' + 'a' * 291,
@@ -176,6 +176,7 @@ MUTANTS = [
     # review 19 M1-new: mutants that survived the first version
     ('mkmin D', '*mkmin = pl - 1;', '*mkmin = 0;'),
     ('mkmin NAME', "memchr(out + pl, '/', n - pl)) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t*mkmin = ((size_t)-1);", "memchr(out + pl, '/', n - pl)) {\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\t*mkmin = 0;"),
+    ('NAME exact prefix', 'if (n == pl || memchr', 'if (memchr'),   # review 20 f3
     ('EXACT length', 'if (n != pl) {', 'if (0) {'),
     ('sd_show cap', 'e->plen < cap - 1 ? e->plen : cap - 1', 'e->plen < cap ? e->plen : cap'),
     ('C1 sizeof(tmp)', 'snprintf(tmp, tcap,', 'snprintf(tmp, sizeof(tmp),'),
@@ -195,11 +196,21 @@ class KernelTwin(unittest.TestCase):
         cls.src = kernel_source()
         cls.blobs = corpus()
 
+    @staticmethod
+    def _sizeof_hits(t):
+        src = t[t.index('+++ b/bsd/dev/sweet_devoverlay.c'):]
+        assert src.count('/* host-test end */') == 1
+        return re.search(r'sizeof\((shown|path|tmp|orig)\)', src.split('/* host-test end */')[1])
+
     def test_no_sizeof_of_pointer_buffers(self):
-        # review 19 C1: sd_one's buffers are char * into sd_w; sizeof(tmp) etc. is 8
+        # review 19 C1: sd_one's buffers are char * into sd_w; sizeof(tmp) etc. is 8. Review 20 f1: scan the region AFTER the end marker.
         t = open(PATCH).read()
-        self.assertIsNone(re.search(r'sizeof\((shown|path|tmp|orig)\)', t[t.index('+++ b/bsd/dev/sweet_devoverlay.c'):].split('host-test end')[1]))
+        self.assertIsNone(self._sizeof_hits(t))
         self.assertIn('sd_names(path, tmp, sizeof(sd_w.tmp), orig, sizeof(sd_w.orig))', t)
+        a = 'sd_show(e, shown, '
+        self.assertEqual(t.count(a), 1)
+        mut = t.replace(a, 'sd_show(e, shown, sizeof(shown)), (void)(')   # mutant: sizeof(shown) inside sd_one
+        self.assertIsNotNone(self._sizeof_hits(mut), 'sizeof(shown) mutant not caught')
 
     def test_markers_present(self):
         self.assertIn('sd_next', self.src); self.assertIn('sd_path_check', self.src)
