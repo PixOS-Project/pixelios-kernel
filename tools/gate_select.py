@@ -9,17 +9,17 @@ SHIM = ALL[:14]
 BUILD_SH = pathlib.Path(__file__).resolve().parent.parent / "shim" / "build.sh"
 
 
-def shim_patch_prefixes():
-    """build.sh extracts headers from xnu patches for its host tests (`../xnu/patches/NNNN-...`): read them from build.sh itself."""
+def shim_build_inputs():
+    """build.sh reads xnu patches (host-test headers: `../xnu/patches/NNNN-...`) and runs repo tools (`../tools/boards.py` ...): read both from build.sh itself."""
     try:
         text = BUILD_SH.read_text()
     except OSError:
         return ()
-    return tuple(sorted({"xnu/patches/" + n for n in re.findall(r"\.\./xnu/patches/(\d{4})", text)}))
+    return tuple(sorted({m for m in re.findall(r"\.\./(tools/[\w.-]+|xnu/patches/\d{4})", text)}))
 
 
 SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py",
-               "tools/check-all.sh", "tools/gate_select.py", "tools/audit_memo.py") + shim_patch_prefixes()
+               "tools/check-all.sh", "tools/gate_select.py", "tools/audit_memo.py") + shim_build_inputs()
 UNIT_PREFIX = ("tools/", "soc/", "device/", "qrlog/", "xnu/qr/", "xnu/patches/0081", "xnu/patches/0086", "xnu/patches/0094")
 
 

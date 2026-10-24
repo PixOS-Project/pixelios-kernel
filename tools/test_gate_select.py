@@ -18,6 +18,10 @@ class Select(unittest.TestCase):
         for n in ("0087-x", "0088-x", "0093-sweet-touch-poke", "0104-sweet-mali-driver-core"):
             self.assertIn("host-tests", g.select(["xnu/patches/%s.patch" % n]), n)
 
+    def test_tools_run_by_build_sh_select_the_builds(self):
+        self.assertIn("build", g.select(["tools/boards.py"]))
+        self.assertNotIn("build", g.select(["tools/qrmerge.py"]))
+
     def test_shim_markdown_selects_no_build(self):
         self.assertEqual(g.select(["shim/AGENTS.md"]), ["public-split", "validate"])
 
