@@ -23,7 +23,7 @@
 /* the new blocks: S26 ATU/CFG, S29 MEM: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
 _Static_assert(WLAN_ATU == WLAN_DBI + 0x300000u, "WLAN_ATU must be WLAN_DBI + 0x300000");
 _Static_assert(WLAN_CFG == 0x60FFE000UL, "WLAN_CFG must be the pcie_1 config window 0x60FFE000");
-_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; window 0x18000000: ChipCommon offsets 0/0xAC/0xFC/0x1E0 only; window 0x18105000 (S32): dwords below 0xE00)");
+_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; the exact offsets per BAR0 window are in mem_ok)");
 
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N
@@ -190,6 +190,24 @@ static uintptr_t pa_of(unsigned blk, uint32_t off)
 	return b + off;
 }
 
+/* The BAR0 read allowlist per window (the LIVE cfg 0x80, read by r32 first), exact: 0x18000000 ChipCommon: S30 chip id, S31 eromptr 0xFC / clk_ctl_st 0x1E0 / capabilities_ext 0xAC (research 37); 0x18105000 the EROM page: dwords below
+ * 0xE00 = ER_REMAPCONTROL (aidmp.h, review 13 M1); S33 (research 38 s.3): 0x18012000 the PMU core: pmucontrol 0x600, pmucapabilities 0x604, pmustatus 0x608, min_res_mask 0x618, max_res_mask 0x61C; 0x18120000 ARM CA7 wrapper and 0x18126000 SYS_MEM wrapper:
+ * IOCTL 0x408, RESET_CTL 0x800, RESET_ST 0x804 (never 0x400/0x404 ioctrlset/clear, 0x500, 0x808/0x80C); 0x18026000 SYS_MEM core: coreinfo 0x000. Any other window or offset refuses. noipa: the object audit evaluates the compiled function. */
+__attribute__((noipa)) static int mem_ok(uint32_t win, uint32_t off)
+{
+	if (win == 0x18105000u)
+		return off < 0xE00u;
+	if (win == 0x18000000u)
+		return off == 0u || off == 0xACu || off == 0xFCu || off == 0x1E0u;
+	if (win == 0x18012000u)
+		return off == 0x600u || off == 0x604u || off == 0x608u || off == 0x618u || off == 0x61Cu;
+	if (win == 0x18120000u || win == 0x18126000u)
+		return off == 0x408u || off == 0x800u || off == 0x804u;
+	if (win == 0x18026000u)
+		return off == 0u;
+	return 0;
+}
+
 __attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 {
 	uintptr_t pa = pa_of(blk, off);
@@ -203,7 +221,7 @@ __attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): 0x18000000 = ChipCommon (S30 chip id, research 36; S31 run A, research 37 s.9.1: eromptr 0xFC, clk_ctl_st 0x1E0, capabilities_ext 0xAC): these four offsets only; 0x18105000 = the EROM page (S32 run B, observed eromptr of run w3a-n31): the EROM dwords below 0xE00 = ER_REMAPCONTROL (aidmp.h, review 13 M1); any other window refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
 		uint32_t cr2 = 0, cmd = 0, win = 0, r1[4] = { 1, 1, 1, 1 };
 
-		if (!try_read32(WLAN_CFG + 0x80u, &win) || ((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u))) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
+		if (!try_read32(WLAN_CFG + 0x80u, &win) || !mem_ok(win, off) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
 			return 0;
 		/* review 10 L1: the window itself (RC-local reads, no TLP): type MEM, base, limit, target as programmed by S29 */
 		if (!try_read32(WLAN_ATU + 0x200u, &r1[0]) || !try_read32(WLAN_ATU + 0x208u, &r1[1]) || !try_read32(WLAN_ATU + 0x210u, &r1[2]) || !try_read32(WLAN_ATU + 0x214u, &r1[3]) ||
@@ -263,7 +281,8 @@ static int atu_ok(uint32_t off, uint32_t v, int r1ok)
 
 /* Endpoint config through the CFG window. S29 (research 36): Command 0x04 takes exactly 0 (from any state) or 0x2 = MEM only (never MASTER/IO, no status bits) and only from Command low half 0 with BAR0 low
  * at the S28 assignment; PCI_BAR0_WIN 0x80 takes exactly 0x18001000 (the restore, from any state), 0x18000000 only from 0x18001000 (S29), or in a TEARDOWN row also from 0x18105000 / 0x18000000 (the S32 restore), or 0x18105000 (S32, research 37
- * s.9.1: the EROM page observed in run w3a-n31) only from 0x18000000 in a forward row while Command reads MEM-only and BAR0 low holds the S28 assignment; nothing else (never 0x88, never 0x20-0x24).
+ * s.9.1: the EROM page observed in run w3a-n31) only from 0x18000000 in a forward row while Command reads MEM-only and BAR0 low holds the S28 assignment; S33 (research 38): the chain 0x18105000 -> 0x18012000 (PMU) -> 0x18120000 (ARM CA7 wrapper) -> 0x18126000 (SYS_MEM wrapper)
+ * -> 0x18026000 (SYS_MEM core), each only from its predecessor in a forward row (same Command / BAR0 state), and the teardown restore to 0x18000000 from any of them; nothing else (never 0x88, never 0x20-0x24).
  * S28 (research 33): the BARs 0x10/0x14/0x18/0x1C, a full-word write, and only these transitions: the observed original (low 0x4, high 0)
  * from ANY state (the restore, even if Command is not 0); otherwise Command (cmd) must have MEM/IO decode off, and all ones only from the original, the assigned address only for the low half and only from
  * the original. Linux sizes with decode off too (probe.c:188-191). */
@@ -274,8 +293,10 @@ static int cfg_ok(uint32_t off, uint32_t old, uint32_t v, const struct w32_ctx *
 	if (off == 0x04u)
 		return v == 0u || (v == 0x2u && (old & 0xFFFFu) == 0u && c->bar0 == 0x60000004u);
 	if (off == 0x80u)
-		return v == 0x18001000u || (v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u)))) ||
-		       (v == 0x18105000u && !c->tear && old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u);
+		return v == 0x18001000u || (v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u)))) ||
+		       (v == 0x18105000u && !c->tear && old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u) ||
+		       (!c->tear && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u &&
+			((v == 0x18012000u && old == 0x18105000u) || (v == 0x18120000u && old == 0x18012000u) || (v == 0x18126000u && old == 0x18120000u) || (v == 0x18026000u && old == 0x18126000u)));
 	if (!lo && !hi)
 		return 0;
 	if (v == (lo ? 0x4u : 0u))

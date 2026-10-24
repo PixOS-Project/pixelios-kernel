@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "ba4805e420429f9c68b1dca52571ec31fc9666e271b4081bf24355e40f129de1"
-_WLAN_SEQ_COUNTS = {"rows": 1318, "teardown": 47, "write_rows": 279, "distinct_targets": 193}
+_WLAN_SEQ_SHA = "8fc7cbb19c525070676df80166a89fef5e8c4c2d57c09dbf02fa720d9cc1ceaa"
+_WLAN_SEQ_COUNTS = {"rows": 1346, "teardown": 47, "write_rows": 283, "distinct_targets": 193}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2803,6 +2803,8 @@ _WLAN_ATU_OK = {(0x000, 0x4), (0x000, 0), (0x004, 0x80000000), (0x004, 0), (0x00
                 (0x204, 0x80000000), (0x204, 0), (0x208, 0x60000000), (0x208, 0), (0x210, 0x6000FFFF), (0x210, 0xFFF), (0x214, 0x60000000), (0x214, 0)}
 _WLAN_S29_WRITES = ((0x208, 0x60000000), (0x210, 0x6000FFFF), (0x214, 0x60000000), (0x204, 0x80000000))	# region 1: base, limit, target, ENABLE last (Linux's order, rc.c:1402-1414; CR1 / UPPER_* skipped: already at the written value)
 _WLAN_S32_TEAR_HEAD = (("mmio_write", "CFG", 0x80, 0x18000000, FULL_MASK, 32), ("wait_eq", "CFG", 0x80, 0x18000000, FULL_MASK, 32))	# S32: the window back to ChipCommon FIRST of all, then its one-shot read-back
+_WLAN_S33_CHAIN = (0x18012000, 0x18120000, 0x18126000, 0x18026000)	# S33: the only forward window moves after S32, each only from its predecessor (0x18105000 first)
+_WLAN_MEM_OFFS = {0x18000000: (0, 0xAC, 0xFC, 0x1E0), 0x18012000: (0x600, 0x604, 0x608, 0x618, 0x61C), 0x18120000: (0x408, 0x800, 0x804), 0x18126000: (0x408, 0x800, 0x804), 0x18026000: (0,)}	# the exact BAR0 read list per window (research 38 s.3); 0x18105000 = the EROM dwords below 0xE00
 _WLAN_S29_TEAR_HEAD = (("ATU", 0x204, 0), ("CFG", 0x04, 0), ("CFG", 0x80, 0x18001000))	# region 1 DISABLE FIRST (RC-local), Command := 0, BAR0 window := observed original
 _WLAN_S29_TEAR_ATU1 = ((0x208, 0), (0x210, 0xFFF), (0x214, 0))	# after the 4 BAR rows, before the region 0 rows
 _WLAN_S26_WRITES = ((0x008, 0x60FFE000), (0x00C, 0), (0x010, 0x60FFFFFF), (0x014, 0x01000000), (0x018, 0), (0x000, 0x4), (0x004, 0x80000000))	# the order of Linux's exynos_pcie_rc_prog_viewport_cfg0, CR2 (enable) last
@@ -2811,9 +2813,9 @@ _WLAN_S26_TEAR = ((0x004, 0), (0x000, 0), (0x008, 0), (0x00C, 0), (0x010, 0xFFF)
 _WLAN_S27_CFG = (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C) + tuple(range(0x40, 0x80, 4)) + (0x80, 0x84, 0x88, 0xAC) + tuple(range(0xB0, 0x100, 4)) + (0x100, 0x1B4, 0x240, 0x244, 0x248, 0x24C)
 _WLAN_S27_ATU = (0x200, 0x204, 0x208, 0x20C, 0x210, 0x214, 0x218)
 # S28 (research 33) + S29 (research 36): the only (offset, value) pairs a CFG window write may have (twin of wlanlink.c cfg_ok without the state): all ones (sizing), the observed originals (low 0x4, high 0; sizing restore + teardown), the assigned
-# addresses, Command 0 / 0x2 (MEM only, never MASTER), PCI_BAR0_WIN 0x18000000 / its observed original 0x18001000 / the S32 EROM page 0x18105000 (research 37 s.9.1 run B; eromptr observed in run w3a-n31): the window is only ever one of these three
+# addresses, Command 0 / 0x2 (MEM only, never MASTER), PCI_BAR0_WIN 0x18000000 / its observed original 0x18001000 / the S32 EROM page 0x18105000 (research 37 s.9.1 run B; eromptr observed in run w3a-n31): the window is only ever one of these three; S33 (research 38): the four chain pages PMU 0x18012000, ARM CA7 wrapper 0x18120000, SYS_MEM wrapper 0x18126000, SYS_MEM core 0x18026000 (EROM bases observed in run w3a-n32b)
 _WLAN_CFG_OK = {(0x10, 0xFFFFFFFF), (0x10, 0x4), (0x10, 0x60000004), (0x14, 0xFFFFFFFF), (0x14, 0), (0x18, 0xFFFFFFFF), (0x18, 0x4), (0x18, 0x60400004), (0x1C, 0xFFFFFFFF), (0x1C, 0),
-                (0x04, 0x2), (0x04, 0), (0x80, 0x18000000), (0x80, 0x18001000), (0x80, 0x18105000)}
+                (0x04, 0x2), (0x04, 0), (0x80, 0x18000000), (0x80, 0x18001000), (0x80, 0x18105000), (0x80, 0x18012000), (0x80, 0x18120000), (0x80, 0x18126000), (0x80, 0x18026000)}
 _WLAN_S28_TEAR = ((0x10, 4), (0x14, 0), (0x18, 4), (0x1C, 0))	# the BAR originals observed in run w3a-n27: FIRST in the teardown, before the ATU disable (the CFG window dies with it)
 _WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}
 _WLAN_HDR_ROW = re.compile(r"\{ (\d+)u, WLK_(\w+), WLB_(\w+), (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (\d+)u, (\d+)u \},")
@@ -2868,8 +2870,8 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
     # coverage
     steps = sorted({r["step"] for r in rows})
-    if steps != list(range(0, 33)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 32 or doc["default_last_step"] != 19:
-        raise AssertionError(f"{name}: step coverage must be S00..S32 with S22 a documented skip (unknown text kept), last 32, default 19: {steps}")
+    if steps != list(range(0, 34)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 33 or doc["default_last_step"] != 19:
+        raise AssertionError(f"{name}: step coverage must be S00..S33 with S22 a documented skip (unknown text kept), last 33, default 19: {steps}")
     # S22 (RC setup) is a DOCUMENTED SKIP (driver decision 2026-10-23): exactly one row, a 0 us delay, no write, tagged guess, saying so; its blocker text stays in `unknown`
     s22 = [r for r in rows if r["step"] == 22]
     if len(s22) != 1 or s22[0]["kind"] != "delay" or s22[0]["delay_us"] != 0 or s22[0]["tag"] != "guess" or s22[0]["blk"] is not None or "deliberately skipped" not in s22[0].get("note", "") \
@@ -2913,16 +2915,24 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s26_chk = [(r["mask"], r["value"], r["delay_us"], r["polls"]) for r in rows if r["step"] == 26 and r["kind"] == "wait_eq"]
     if s26 != s26_want or s26_chk != [(FULL_MASK, 0x80000000, 0, 1)] or any(r["kind"] == "mmio_write" and r["mask"] != FULL_MASK for r in rows if r["step"] == 26):
         raise AssertionError(f"{name}: S26 must be exactly the 7 ATU full-word writes {[(hex(o), hex(v)) for o, v in _WLAN_S26_WRITES]} each followed by its logged read-back, then ONE one-shot wait_eq ATU CR2 == 0x80000000, then the CFG probe and the CFG reads +0x0/+0x4/+0x8/+0xC, each write restored by the teardown row of its offset: {s26}")
-    # the CFG window is written ONLY by S28, S29, S32 (the window move, nothing else) and their teardown rows (the allowlist twin checks offset and value; this checks the place): S26, S27, S30 and S31 only read it, nothing else touches it
-    if any(x["blk"] == "CFG" and x["kind"] in _WLAN_WRITE_KINDS and (x.get("step", x.get("requires")) not in (28, 29, 32) or x["kind"] != "mmio_write" or (x.get("step", x.get("requires")) == 32 and (x["off"], x["value"]) not in ((0x80, 0x18105000), (0x80, 0x18000000)))) for x in rows + tear) \
-            or any(x["blk"] == "CFG" and x["kind"] in ("wait_eq", "wait_mask") and x["step"] not in (28, 29, 31, 32) for x in rows) or any(x["blk"] == "CFG" and x.get("step") not in (26, 27, 28, 29, 30, 31, 32) for x in rows) \
+    # the CFG window is written ONLY by S28, S29, S32, S33 (the window moves, nothing else) and their teardown rows (the allowlist twin checks offset and value; this checks the place): S26, S27, S30 and S31 only read it, nothing else touches it
+    if any(x["blk"] == "CFG" and x["kind"] in _WLAN_WRITE_KINDS and (x.get("step", x.get("requires")) not in (28, 29, 32, 33) or x["kind"] != "mmio_write" or (x.get("step", x.get("requires")) == 32 and (x["off"], x["value"]) not in ((0x80, 0x18105000), (0x80, 0x18000000)))
+                                                                    or (x.get("step") == 33 and (x["off"], x["value"]) not in tuple((0x80, c) for c in _WLAN_S33_CHAIN))) for x in rows + tear) \
+            or any(x["blk"] == "CFG" and x["kind"] in ("wait_eq", "wait_mask") and x["step"] not in (28, 29, 31, 32, 33) for x in rows) or any(x["blk"] == "CFG" and x.get("step") not in (26, 27, 28, 29, 30, 31, 32, 33) for x in rows) \
             or any(x["blk"] == "CFG" and not ((x["kind"] == "mmio_write" and x["requires"] in (28, 29, 32)) or (x["kind"] == "wait_eq" and x["requires"] == 32)) for x in tear):
-        raise AssertionError(f"{name}: the CFG window is read-only except S28 (BAR sizing/assignment), S29 (Command, BAR0 window), S32 (the BAR0 window move to the EROM page) and their teardown rows; only S26-S32 touch it")
+        raise AssertionError(f"{name}: the CFG window is read-only except S28 (BAR sizing/assignment), S29 (Command, BAR0 window), S32 (the BAR0 window move to the EROM page), S33 (the four chain moves) and their teardown rows; only S26-S33 touch it")
     # BAR0 (MEM, research 36 / 37): read-only, never in the teardown, no write kind anywhere; S30 reads offset 0 only, S31 (run A) reads ChipCommon 0x00 (chip id re-check), 0xAC, 0xFC, 0x1E0 only; S32 (run B) re-reads 0xFC through the ChipCommon window,
     # then (window 0x18105000) the EROM dwords 0x000..0xDFC, nothing from ER_REMAPCONTROL 0xE00 on (aidmp.h, review 13 M1)
-    mem_ok = lambda x: x["kind"] in ("read_only", "wait_eq") and (x["off"] in (0,) if x["step"] == 30 else x["off"] in (0, 0xAC, 0xFC, 0x1E0) if x["step"] == 31 else (x["off"] % 4 == 0 and 0 <= x["off"] < 0xE00) if x["step"] == 32 else False)
+    # S33 (research 38 s.3): the exact offsets of the window the table has selected so far (the last CFG 0x80 write before the row): _WLAN_MEM_OFFS
+    win_now, bad_mem = None, []
+    for x in rows:
+        if x["blk"] == "CFG" and x["off"] == 0x80 and x["kind"] == "mmio_write":
+            win_now = x["value"]
+        if x["blk"] == "MEM" and x["step"] == 33 and not (x["kind"] in ("read_only", "wait_eq") and x["off"] in _WLAN_MEM_OFFS.get(win_now, ())):
+            bad_mem.append(x["id"])
+    mem_ok = lambda x: x["kind"] in ("read_only", "wait_eq") and (x["off"] in (0,) if x["step"] == 30 else x["off"] in (0, 0xAC, 0xFC, 0x1E0) if x["step"] == 31 else (x["off"] % 4 == 0 and 0 <= x["off"] < 0xE00) if x["step"] == 32 else x["step"] == 33 and x["id"] not in bad_mem)
     if any(x["blk"] == "MEM" and not mem_ok(x) for x in rows) or any(x["blk"] == "MEM" for x in tear):
-        raise AssertionError(f"{name}: BAR0 (MEM) is read-only: S30 reads offset 0, S31 reads offsets 0/0xAC/0xFC/0x1E0 only, S32 reads dwords below 0xE00 (no write, no teardown row, no other step)")
+        raise AssertionError(f"{name}: BAR0 (MEM) is read-only: S30 reads offset 0, S31 reads offsets 0/0xAC/0xFC/0x1E0 only, S32 reads dwords below 0xE00, S33 only the exact offsets of its window (no write, no teardown row, no other step)")
     # S27: the READ-ONLY endpoint config dump (explicit --wlan-link=27 only): the pinned CFG window offsets, then ATU outbound region 1 CR1..UPPER_TARGET; every row read_only + log (a = 2, never a probe), no write, no restore, nothing else
     if any(r["step"] == 27 and r["blk"] == "CFG" and 0x8C <= r["off"] <= 0xA8 for r in rows):
         raise AssertionError(f"{name}: no S27 CFG row may lie in 0x8C..0xA8 (0xA4 PCI_BACKPLANE_DATA is a backplane access; 0xAC is allowed)")
@@ -2980,10 +2990,22 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s32_dump = [r for r in rows if r["step"] == 32 and r["blk"] == "MEM" and r["kind"] == "read_only"]
     if [r.get("eot", 0) for r in s32_dump] != [1] * (0xE00 // 4 - 1) + [2] or any("eot" in x for x in rows if x["step"] != 32 or x not in s32_dump) or any("eot" in t for t in tear):
         raise AssertionError(f"{name}: the S32 EROM dump rows must carry eot = 1 (stop after a 0xF dword) and the last one eot = 2 (refuse without an EOT); no other row has the flag")
+    # S33 (research 38, READ-ONLY chip state): the precondition (window == the S32 end state 0x18105000), then per window of the chain: the move (full word, restored by the S32 teardown row T01) with its one-shot read-back and the exact reads; the pmurev guard
+    # (0x604 & 0xFF == 0x28) AFTER the PMU logs; the RESET_CTL upper-bit guards; the SYS_MEM-up gate (IOCTL & 3 == 1, RESET_CTL & 1 == 0) BEFORE the SYS_MEM core move; the core page read (offset 0) is the last MEM row; the link / AER logs. Pinned independently of the generator.
+    tw = tear[0]["id"]
+    mv = lambda v: [("mmio_write", "CFG", 0x80, BIG, v, None, None, tw), ("wait_eq", "CFG", 0x80, BIG, v, None, None, None)]
+    lg = lambda o: ("read_only", "MEM", o, BIG, 0, None, True, None)
+    s33_want = [("wait_eq", "CFG", 0x80, BIG, 0x18105000, None, None, None)] + mv(0x18012000) + [lg(o) for o in (0x604, 0x600, 0x608, 0x618, 0x61C)] + [("wait_eq", "MEM", 0x604, 0xFF, 0x28, None, None, None)] + \
+               mv(0x18120000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [("wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, None, None, None)] + \
+               mv(0x18126000) + [lg(o) for o in (0x408, 0x800, 0x804)] + [("wait_eq", "MEM", 0x800, 0xFFFFFFFE, 0, None, None, None), ("wait_eq", "MEM", 0x408, 3, 1, None, None, None), ("wait_eq", "MEM", 0x800, 1, 0, None, None, None)] + \
+               mv(0x18026000) + [lg(0), ("read_only", "CFG", 0xBC, BIG, 0, None, True, None), ("read_only", "CFG", 0x104, BIG, 0, None, True, None)]
+    s33 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r.get("probe"), r.get("log"), r["restore"]) for r in rows if r["step"] == 33]
+    if s33 != s33_want or any((r["kind"] == "wait_eq") != (r["polls"] == 1 and r["delay_us"] == 0) or (r["kind"] != "wait_eq" and (r["polls"] or r["delay_us"])) for r in rows if r["step"] == 33) or any(t["requires"] == 33 for t in tear):
+        raise AssertionError(f"{name}: S33 must be exactly the window precondition, the four chain moves {[hex(c) for c in _WLAN_S33_CHAIN]} (each restored by teardown T01, each read back once), the exact reads per window, the pmurev and RESET_CTL guards, the SYS_MEM-up gate before the core move, and the logs; no teardown row of its own: {[x for x in s33 if x not in s33_want][:3]} / missing {[x for x in s33_want if x not in s33][:3]}")
     if any(x["blk"] == "ATU" and x["kind"] in _WLAN_WRITE_KINDS and x.get("step", x.get("requires")) not in (26, 29) for x in rows + tear):
         raise AssertionError(f"{name}: ATU writes are only for S26, S29 and their teardown")
-    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28, 29, 30, 31, 32)) for r in rows + tear) or any("log" in t for t in tear):
-        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24..S32")
+    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33)) for r in rows + tear) or any("log" in t for t in tear):
+        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24..S33")
     if [r["step"] for r in rows] != sorted(r["step"] for r in rows) or [r["id"] for r in rows] != list(range(len(rows))):
         raise AssertionError(f"{name}: rows must be in step order with sequential ids")
     # the default run (N = 19) must not release PERST nor enable the LTSSM
@@ -3113,7 +3135,7 @@ def wlan_seq_selftest() -> int:
         resha(d)
 
     def f_step_overflow(d):
-        add_row(d, step=33)
+        add_row(d, step=34)
         resha(d)
 
     def first_row(d, step, **sel):
@@ -3467,10 +3489,65 @@ def wlan_seq_selftest() -> int:
         ("the S32 window restore to the S29 original (skips the ChipCommon step)", lambda d: (d["teardown"][0].__setitem__("value", 0x18001000), resha(d)), None, "CFG window is read-only"),
         ("the S32 window restore read-back polls twice", lambda d: (d["teardown"][1].__setitem__("polls", 2), resha(d)), None, "teardown must start with exactly the S32"),
         ("the S32 window restore required only from S31 (not S32)", lambda d: (d["teardown"][0].__setitem__("requires", 31), resha(d)), None, "CFG window is read-only"),
-        ("the S32 window restore required by a step beyond the table", lambda d: (d["teardown"][0].__setitem__("requires", 33), resha(d)), None, "malformed"),
+        ("the S32 window restore required by a step beyond the table", lambda d: (d["teardown"][0].__setitem__("requires", 34), resha(d)), None, "malformed"),
         ("a teardown MEM row", tear_append(blk="MEM", off=0, kind="read_only", mask=0xFFFFFFFF, requires=32), None, "BAR0 (MEM)"),
         ("a teardown CFG window write to another value (S32)", tear_append(blk="CFG", off=0x80, kind="mmio_write", mask=0xFFFFFFFF, value=0x18105004, requires=32), None, "CFG window is read-only"),
         ("a second S32 teardown window write", tear_append(blk="CFG", off=0x80, kind="mmio_write", mask=0xFFFFFFFF, value=0x18000000, requires=32), None, "isolation clear"),
+        # S33 (research 38, W-C2), AP-16: each defect class at the table level (wrong window value, extra write, extra read offset, restore skipped, gate ignored)
+        ("S33 window move to a wrong PMU page (0x18013000)", set_row(33, "value", 0x18013000, kind="mmio_write", blk="CFG", value=0x18012000), None, "CFG window is read-only"),
+        ("S33 window move to a wrong ARM CA7 wrapper page (0x18121000)", set_row(33, "value", 0x18121000, kind="mmio_write", blk="CFG", value=0x18120000), None, "CFG window is read-only"),
+        ("S33 window move to a wrong SYS_MEM wrapper page (0x18127000)", set_row(33, "value", 0x18127000, kind="mmio_write", blk="CFG", value=0x18126000), None, "CFG window is read-only"),
+        ("S33 window move to a wrong SYS_MEM core page (0x18027000)", set_row(33, "value", 0x18027000, kind="mmio_write", blk="CFG", value=0x18026000), None, "CFG window is read-only"),
+        ("S33 window move back to ChipCommon (a forward 0x18000000 write)", set_row(33, "value", 0x18000000, kind="mmio_write", blk="CFG", value=0x18120000), None, "CFG window is read-only"),
+        ("S33 window moves in another order (ARM wrapper after the SYS_MEM wrapper)", f_swap(33, dict(kind="mmio_write", blk="CFG", value=0x18120000), dict(kind="mmio_write", blk="CFG", value=0x18126000)), None, "S33 must be exactly"),
+        ("S33 SYS_MEM core page entered before the ARM wrapper", f_swap(33, dict(kind="mmio_write", blk="CFG", value=0x18120000), dict(kind="mmio_write", blk="CFG", value=0x18026000)), None, "BAR0 (MEM)"),
+        ("an extra S33 window write (a fifth move)", lambda d: (add_row(d, step=33, blk="CFG", off=0x80, value=0x18026000, restore="T01"), resha(d)), None, "S33 must be exactly"),
+        ("an extra S33 window write to ChipCommon", lambda d: (add_row(d, step=33, blk="CFG", off=0x80, value=0x18000000, restore="T01"), resha(d)), None, "CFG window is read-only"),
+        ("an S33 Command write", lambda d: (add_row(d, step=33, blk="CFG", off=0x04, value=0x2, restore="T01"), resha(d)), None, "CFG window is read-only"),
+        ("an S33 BAR write", lambda d: (add_row(d, step=33, blk="CFG", off=0x10, value=0x60000004, restore="T01"), resha(d)), None, "CFG window is read-only"),
+        ("an S33 MEM write row (PMU pmucontrol)", lambda d: (add_row(d, step=33, kind="mmio_write", blk="MEM", off=0x600, value=0, restore="T01"), resha(d)), None, "BAR0 (MEM)"),
+        ("an S33 MEM RMW row (wrapper RESET_CTL)", lambda d: (add_row(d, step=33, kind="mmio_rmw", blk="MEM", off=0x800, mask=1, value=0, restore="T01"), resha(d)), None, "BAR0 (MEM)"),
+        ("an S33 PMA write", lambda d: (add_row(d, step=33, blk="PMA", off=0x100, value=0, restore="T01"), resha(d)), None, "S33 must be exactly"),
+        ("an S33 ATU write", lambda d: (add_row(d, step=33, blk="ATU", off=0x204, value=0, restore="T01"), resha(d)), None, "S33 must be exactly"),
+        ("an S33 GPIO write", lambda d: (add_row(d, step=33, kind="gpio_dat", blk="GPH2", off=4, mask=1, value=0, restore="T01"), resha(d)), None, "S33 must be exactly"),
+        ("an extra S33 read offset in the PMU window (0x60C)", set_row(33, "off", 0x60C, kind="read_only", blk="MEM", off=0x608), None, "BAR0 (MEM)"),
+        ("an extra S33 read offset in the PMU window (pmutimer 0x614)", set_row(33, "off", 0x614, kind="read_only", blk="MEM", off=0x618), None, "BAR0 (MEM)"),
+        ("an extra S33 read offset in the ARM wrapper (ioctrlset 0x400)", set_row(33, "off", 0x400, kind="read_only", blk="MEM", off=0x408), None, "BAR0 (MEM)"),
+        ("an extra S33 read offset in the wrapper (resetreadid 0x808)", set_row(33, "off", 0x808, kind="read_only", blk="MEM", off=0x804), None, "BAR0 (MEM)"),
+        ("an extra S33 read in the SYS_MEM core page (offset 4)", lambda d: (add_row(d, step=33, kind="read_only", blk="MEM", off=0x4, restore=None, log=True), resha(d)), None, "BAR0 (MEM)"),
+        ("an S33 core page read at another offset (0 -> 4)", set_row(33, "off", 4, kind="read_only", blk="MEM", off=0), None, "BAR0 (MEM)"),
+        ("an S33 PMU read after the window left the PMU page (0x604 in the ARM wrapper)", lambda d: (add_row(d, step=33, kind="read_only", blk="MEM", off=0x604, restore=None, log=True), resha(d)), None, "BAR0 (MEM)"),
+        ("an S33 read at ER_REMAPCONTROL-style offset 0xE00", lambda d: (add_row(d, step=33, kind="read_only", blk="MEM", off=0xE00, restore=None, log=True), resha(d)), None, "BAR0 (MEM)"),
+        ("an S33 read at an unaligned offset (0x605)", set_row(33, "off", 0x605, kind="read_only", blk="MEM", off=0x600), None, "BAR0 (MEM)"),
+        ("the S33 PMU capabilities read dropped", f_rm(33, kind="read_only", blk="MEM", off=0x604), None, "S33 must be exactly"),
+        ("the S33 window move without a restore", set_row(33, "restore", None, kind="mmio_write", blk="CFG", value=0x18012000), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM core move without a restore", set_row(33, "restore", None, kind="mmio_write", blk="CFG", value=0x18026000), None, "S33 must be exactly"),
+        ("the S33 window move restored by another teardown row", set_row(33, "restore", "T05", kind="mmio_write", blk="CFG", value=0x18120000), None, "S33 must be exactly"),
+        ("an S33 teardown row of its own (a window write)", tear_append(blk="CFG", off=0x80, kind="mmio_write", mask=0xFFFFFFFF, value=0x18000000, requires=33), None, "CFG window is read-only"),
+        ("an S33 teardown MEM row", tear_append(blk="MEM", off=0x604, kind="read_only", mask=0xFFFFFFFF, requires=33), None, "BAR0 (MEM)"),
+        ("the S33 window restore dropped from the teardown (T01/T02 removed)", f_tear_reordered(lambda t: t[2:]), None, "S"),
+        ("the S33 window precondition removed", f_rm(33, kind="wait_eq", blk="CFG", off=0x80, value=0x18105000), None, "S33 must be exactly"),
+        ("the S33 window precondition checks another value (ChipCommon)", set_row(33, "value", 0x18000000, kind="wait_eq", blk="CFG", off=0x80, value=0x18105000), None, "S33 must be exactly"),
+        ("the S33 PMU window read-back removed", f_rm(33, kind="wait_eq", blk="CFG", off=0x80, value=0x18012000), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM core window read-back removed", f_rm(33, kind="wait_eq", blk="CFG", off=0x80, value=0x18026000), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper window read-back checks another value", set_row(33, "value", 0x18012000, kind="wait_eq", blk="CFG", off=0x80, value=0x18120000), None, "S33 must be exactly"),
+        ("the S33 window read-back polls twice", set_row(33, "polls", 2, kind="wait_eq", blk="CFG", off=0x80, value=0x18126000), None, "S33 must be exactly"),
+        ("the S33 pmurev guard removed", f_rm(33, kind="wait_eq", blk="MEM", off=0x604), None, "S33 must be exactly"),
+        ("the S33 pmurev guard weakened (mask 0x0F)", set_row(33, "mask", 0x0F, kind="wait_eq", blk="MEM", off=0x604), None, "S33 must be exactly"),
+        ("the S33 pmurev guard value changed (0x27)", set_row(33, "value", 0x27, kind="wait_eq", blk="MEM", off=0x604), None, "S33 must be exactly"),
+        ("the S33 pmurev guard before the logs", f_swap(33, dict(kind="wait_eq", blk="MEM", off=0x604), dict(kind="read_only", blk="MEM", off=0x604)), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard removed", f_rm(33, kind="wait_eq", blk="MEM", off=0x800, mask=0xFFFFFFFE), None, "S33 must be exactly"),
+        ("the S33 ARM wrapper RESET_CTL guard weakened (mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x800, mask=0xFFFFFFFE), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate removed (IOCTL)", f_rm(33, kind="wait_eq", blk="MEM", off=0x408), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate removed (RESET_CTL bit 0)", f_rm(33, kind="wait_eq", blk="MEM", off=0x800, mask=1), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate weakened (IOCTL mask 0x2)", set_row(33, "mask", 0x2, kind="wait_eq", blk="MEM", off=0x408), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate weakened (IOCTL value 0)", set_row(33, "value", 0, kind="wait_eq", blk="MEM", off=0x408), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate weakened (RESET_CTL mask 0)", set_row(33, "mask", 0, kind="wait_eq", blk="MEM", off=0x800, mask=1), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM-up gate after the core page move", f_swap(33, dict(kind="wait_eq", blk="MEM", off=0x800, mask=1), dict(kind="mmio_write", blk="CFG", value=0x18026000)), None, "BAR0 (MEM)"),
+        ("the S33 SYS_MEM-up gate polls many times (a wait loop instead of a stop)", set_row(33, "polls", 20000, kind="wait_eq", blk="MEM", off=0x408), None, "S33 must be exactly"),
+        ("the S33 SYS_MEM core read made a probe", set_row(33, "probe", True, kind="read_only", blk="MEM", off=0), None, "S33 must be exactly"),
+        ("the S33 core read without the log flag", set_row(33, "log", False, kind="read_only", blk="MEM", off=0), None, "S33 must be exactly"),
+        ("the S33 AER log removed", f_rm(33, kind="read_only", blk="CFG", off=0x104), None, "S33 must be exactly"),
         ("a changed value (hash pin)", lambda d: (d["rows"][7].__setitem__("value", 2), resha(d)), _WLAN_SEQ_SHA, "audited"),
     ]
     caught = 0
@@ -3517,7 +3594,8 @@ _WLANLINK_PINS = {
                    "if(pa>=WLAN_GPH2&&pa<WLAN_GPH2+0x18u)return(mask&~gpio_field_mask((uint32_t)(pa-WLAN_GPH2),(1u<<(unsigned)WLAN_GPH2_PERST_PIN)|2u))==0u&&mask!=0u;"
                    "if(pa>=WLAN_PMA&&pa<WLAN_PMA+0x2000u)return!(pa&3u);if(pa>=WLAN_PCS&&pa<WLAN_PCS+0x1000u)return!(pa&3u);if(pa>=WLAN_IA&&pa<WLAN_IA+0x180u)return!(pa&3u);"
                    "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;if(pa>=WLAN_ATU&&pa<WLAN_ATU+0x1000u)returnmask==0xFFFFFFFFu&&atu_ok((uint32_t)(pa-WLAN_ATU),v,c->r1ok);if(pa>=WLAN_CFG&&pa<WLAN_CFG+0x1000u)returnmask==0xFFFFFFFFu&&cfg_ok((uint32_t)(pa-WLAN_CFG),old,v,c);return0;",
-    "cfg_ok": "intlo=(off==0x10u||off==0x18u),hi=(off==0x14u||off==0x1cu);if(off==0x04u)returnv==0u||(v==0x2u&&(old&0xFFFFu)==0u&&c->bar0==0x60000004u);if(off==0x80u)returnv==0x18001000u||(v==0x18000000u&&(old==0x18001000u||(c->tear&&(old==0x18105000u||old==0x18000000u))))||(v==0x18105000u&&!c->tear&&old==0x18000000u&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u);if(!lo&&!hi)return0;if(v==(lo?0x4u:0u))return1;if((c->cmd&0xFFFFu)!=0u)return0;if(v==0xFFFFFFFFu)returnold==(lo?0x4u:0u);returnlo&&old==0x4u&&v==(off==0x10u?0x60000004u:0x60400004u);",
+    "cfg_ok": "intlo=(off==0x10u||off==0x18u),hi=(off==0x14u||off==0x1cu);if(off==0x04u)returnv==0u||(v==0x2u&&(old&0xFFFFu)==0u&&c->bar0==0x60000004u);if(off==0x80u)returnv==0x18001000u||(v==0x18000000u&&(old==0x18001000u||(c->tear&&(old==0x18105000u||old==0x18000000u||old==0x18012000u||old==0x18120000u||old==0x18126000u||old==0x18026000u))))||(v==0x18105000u&&!c->tear&&old==0x18000000u&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u)||(!c->tear&&(c->cmd&0xFFFFu)==0x0002u&&c->bar0==0x60000004u&&((v==0x18012000u&&old==0x18105000u)||(v==0x18120000u&&old==0x18012000u)||(v==0x18126000u&&old==0x18120000u)||(v==0x18026000u&&old==0x18126000u)));if(!lo&&!hi)return0;if(v==(lo?0x4u:0u))return1;if((c->cmd&0xFFFFu)!=0u)return0;if(v==0xFFFFFFFFu)returnold==(lo?0x4u:0u);returnlo&&old==0x4u&&v==(off==0x10u?0x60000004u:0x60400004u);",
+    "mem_ok": "if(win==0x18105000u)returnoff<0xE00u;if(win==0x18000000u)returnoff==0u||off==0xACu||off==0xFCu||off==0x1E0u;if(win==0x18012000u)returnoff==0x600u||off==0x604u||off==0x608u||off==0x618u||off==0x61Cu;if(win==0x18120000u||win==0x18126000u)returnoff==0x408u||off==0x800u||off==0x804u;if(win==0x18026000u)returnoff==0u;return0;",
     "atu_ok": "return(off==0x000u&&(v==0x4u||v==0u))||(off==0x004u&&(v==0x80000000u||v==0u))||(off==0x008u&&(v==(uint32_t)WLAN_CFG||v==0u))||(off==0x00cu&&v==0u)||(off==0x010u&&(v==(uint32_t)WLAN_CFG+0x1fffu||v==0xfffu))||(off==0x014u&&(v==0x01000000u||v==0u))||(off==0x018u&&v==0u)||(off==0x204u&&(v==0u||(v==0x80000000u&&r1ok)))||(off==0x208u&&(v==0x60000000u||v==0u))||(off==0x210u&&(v==0x6000FFFFu||v==0xfffu))||(off==0x214u&&(v==0x60000000u||v==0u));",
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
     "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI||blk==WLB_CFG)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI||blk==WLB_ATU||blk==WLB_MEM)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
@@ -3531,7 +3609,7 @@ _WLANLINK_PINS = {
 _WLANLINK_BODY_SHA = {
     "w32": "53f7fbf08ced89a02f60ae6c6986981ff473a61557aa7e9ec230d0ed6e67444a",
     "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
-    "r32": "14e76c306ccc04f2c803003ae1e485500e7454e8c460b865644533c7aba4ec90",
+    "r32": "92a4305f153302ec38e0192d309e90064086bd8511c51dcf80656def295ca0be",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
     "base_of": "1d9d26d25b5a2af62e1b253d336f131a89e1f98cc80311a38b8477c803292cda",
     "need_probe": "44c0b22ce25cae99db97ca86bcec9e471ebb8fcbfa077005de813f1073652b02",
@@ -3546,6 +3624,8 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     check_usbgadget_source_text(src, name, **_WLANLINK_KW)
     code = _strip_c_comments(src)
     norm = re.sub(r"\s+", "", code)
+    if "__attribute__((noipa))staticintmem_ok(uint32_twin,uint32_toff)" not in norm or len(re.findall(r"\bmem_ok\s*\(", code)) != 2:
+        raise AssertionError(f"{name}: mem_ok must be noipa (the object audit evaluates the compiled function) and have exactly one caller, r32")
     if "__attribute__((noipa))staticintr32(" not in norm:
         raise AssertionError(f"{name}: r32 must be noipa (review 10 L5: the object audit checks the compiled MEM guard)")
     for bad in ("volatile", "__asm__", "asm", "goto", "smc", "hvc"):
@@ -3595,7 +3675,7 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
                  "if(r.a==1u)*probed|=need_probe(r.blk);",
                  "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}returnST_OK;",
                  "if((probed&EOT_SEEN)&&r.kind==WLK_READ_ONLY&&(r.a&4u))continue;", "#defineEOT_SEEN(1u<<31)", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
-                 "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,win=0,r1[4]={1,1,1,1};if(!try_read32(WLAN_CFG+0x80u,&win)||((win!=0x18105000u||off>=0xE00u)&&(win!=0x18000000u||(off!=0u&&off!=0xACu&&off!=0xFCu&&off!=0x1E0u)))||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
+                 "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,win=0,r1[4]={1,1,1,1};if(!try_read32(WLAN_CFG+0x80u,&win)||!mem_ok(win,off)||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
                  "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
                  "if(need_probe(r.blk)&~probed)continue;", "for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){", "if(!get_row(i,1,&r)||r.step>hi)continue;",
                  "if(!counter_freq()){", "if(stopped==ST_OK)step_line('S',s,\"ok\"", "for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){", "pstore_save();//the lastline"):
@@ -3696,7 +3776,7 @@ def wlanlink_source_selftest() -> int:
         ("allowlist: CFG Command arm from any Command", good.replace("(old & 0xFFFFu) == 0u && c->bar0", "c->bar0", 1)),
         ("allowlist: CFG Command arm without the BAR0 state", good.replace(" && c->bar0 == 0x60000004u", "", 1)),
         ("allowlist: CFG window select any value", good.replace("return v == 0x18001000u || (v == 0x18000000u && (old == 0x18001000u", "return 1 || (v == 0x18000000u && (old == 0x18001000u", 1)),
-        ("allowlist: CFG window select from any state", good.replace("(v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u))))", "(v == 0x18000000u)", 1)),
+        ("allowlist: CFG window select from any state", good.replace("(v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u))))", "(v == 0x18000000u)", 1)),
         ("allowlist: CFG window select another value", good.replace("v == 0x18000000u && (old", "v == 0x18000004u && (old", 1)),
         ("allowlist: CFG SPROM control 0x88", good.replace("if (off == 0x80u)", "if (off == 0x80u || off == 0x88u)", 1)),
         ("allowlist: ATU region 1 enable without the state", good.replace("(v == 0x80000000u && r1ok)", "(v == 0x80000000u)", 1)),
@@ -3710,13 +3790,7 @@ def wlanlink_source_selftest() -> int:
         ("MEM base swapped", good.replace("return WLAN_MEM;", "return WLAN_CFG;", 1)),
         ("MEM needs no probe", good.replace(" || blk == WLB_CFG || blk == WLB_MEM) ? 1u << blk : 0u;", " || blk == WLB_CFG) ? 1u << blk : 0u;", 1)),
         ("MEM base assert changed (BAR2)", good.replace("WLAN_MEM == 0x60000000UL", "WLAN_MEM == 0x60400000UL", 1)),
-        ("MEM base assert removed", good.replace('_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; window 0x18000000: ChipCommon offsets 0/0xAC/0xFC/0x1E0 only; window 0x18105000 (S32): dwords below 0xE00)");', "", 1)),
-        ("MEM read offset check dropped", good.replace("((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u)))", "(win != 0x18105000u && win != 0x18000000u)", 1)),
-        ("MEM read offset 0x100 allowed", good.replace("off != 0x1E0u))) ||", "off != 0x1E0u && off != 0x100u))) ||", 1)),
-        ("MEM read offset 0xFC dropped from the allowlist", good.replace(" && off != 0xFCu", "", 1)),
-        ("MEM read offset 0x1E0 widened to 0x1E4", good.replace("off != 0x1E0u)))", "off != 0x1E4u)))", 1)),
-        ("MEM read offset 0xAC widened to 0xB0", good.replace("off != 0xACu", "off != 0xB0u", 1)),
-        ("MEM read offset check turned into a range", good.replace("(off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u)", "(off > 0x1E0u)", 1)),
+        ("MEM base assert removed", good.replace('_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; the exact offsets per BAR0 window are in mem_ok)");', "", 1)),
         ("MEM read without the region 1 guard", good.replace("!try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || ", "", 1)),
         ("MEM read with the region 1 guard weakened", good.replace("cr2 != 0x80000000u", "(cr2 & 0x80000000u) == 0u", 1)),
         ("w32 without the MEM/config-space refusal", good.replace("\tif (!w32_blk_ok(r.blk, r.off))\n\t\treturn -2;\n", "", 1)),
@@ -3735,23 +3809,67 @@ def wlanlink_source_selftest() -> int:
         # S32 (research 37 s.9.1 run B): the window move, its restore, the window-dependent BAR0 reads, the teardown filter
         ("allowlist: window move from any state", good.replace("(v == 0x18105000u && !c->tear && old == 0x18000000u && ", "(v == 0x18105000u && !c->tear && ", 1)),
         ("allowlist: window move allowed in the teardown", good.replace("(v == 0x18105000u && !c->tear && ", "(v == 0x18105000u && ", 1)),
-        ("allowlist: window move without the Command check", good.replace("old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u);", "old == 0x18000000u && c->bar0 == 0x60000004u);", 1)),
-        ("allowlist: window move without the BAR0 state", good.replace("(c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u);", "(c->cmd & 0xFFFFu) == 0x0002u);", 1)),
+        ("allowlist: window move without the Command check", good.replace("old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u) ||", "old == 0x18000000u && c->bar0 == 0x60000004u) ||", 1)),
+        ("allowlist: window move without the BAR0 state", good.replace("old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u) ||", "old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u) ||", 1)),
         ("allowlist: window move to another page", good.replace("(v == 0x18105000u && !c->tear", "(v == 0x18106000u && !c->tear", 1)),
         ("allowlist: window move accepts any page", good.replace("(v == 0x18105000u && !c->tear && old == 0x18000000u", "((v & 0xFFFFF000u) == 0x18100000u && !c->tear && old == 0x18000000u", 1)),
-        ("allowlist: window restore to ChipCommon from any state in a forward row", good.replace("(c->tear && (old == 0x18105000u || old == 0x18000000u))", "(1 && (old == 0x18105000u || old == 0x18000000u))", 1)),
-        ("allowlist: window restore to ChipCommon from any old value", good.replace("(v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u))))", "(v == 0x18000000u && (old == 0x18001000u || c->tear))", 1)),
-        ("allowlist: window restore lost (teardown cannot restore the EROM page)", good.replace("(c->tear && (old == 0x18105000u || old == 0x18000000u))", "(c->tear && old == 0x18000000u)", 1)),
         ("w32 never marks a teardown row", good.replace("\tc.tear = tear;", "\tc.tear = 0;", 1)),
         ("w32 marks every row a teardown row", good.replace("\tc.tear = tear;", "\tc.tear = 1;", 1)),
-        ("r32: the window select is not read", good.replace("!try_read32(WLAN_CFG + 0x80u, &win) || ((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u))) || ", "", 1)),
-        ("r32: any window with the narrow offsets", good.replace("((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u || (off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u)))", "(off != 0u && off != 0xACu && off != 0xFCu && off != 0x1E0u && win != 0x18105000u)", 1)),
-        ("r32: the EROM page window accepts any offset in any window", good.replace("((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u ||", "(win != 0x18105000u && (win == 0u ||", 1)),
-        ("r32: the EROM page window changed", good.replace("((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u ||", "(win != 0x18106000u && (win != 0x18000000u ||", 1)),
-        ("r32: the EROM bound dropped (review 13 M1)", good.replace("((win != 0x18105000u || off >= 0xE00u) && ", "((win != 0x18105000u) && ", 1)),
-        ("r32: the EROM bound moved to 0x1000 (review 13 M1)", good.replace("off >= 0xE00u", "off >= 0x1000u", 1)),
-        ("r32: the EROM bound moved to 0xE04 (review 13 M1)", good.replace("off >= 0xE00u", "off > 0xE00u", 1)),
-        ("r32: the ChipCommon window changed", good.replace("((win != 0x18105000u || off >= 0xE00u) && (win != 0x18000000u ||", "(win != 0x18105000u && (win != 0x18001000u ||", 1)),
+        # S33 (research 38, W-C2): the window chain, the restore from every window, the per-window read list (mem_ok), r32's use of it. AP-16: each defect class (wrong window value, extra write, extra read offset, restore skipped, gate ignored) as a source mutant
+        ("allowlist: window restore to ChipCommon from any state in a forward row", good.replace("(c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u))", "(1 && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u))", 1)),
+        ("allowlist: window restore to ChipCommon from any old value", good.replace("(v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u))))", "(v == 0x18000000u && (old == 0x18001000u || c->tear))", 1)),
+        ("allowlist: window restore lost (teardown cannot restore the EROM page)", good.replace("(c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u))", "(c->tear && old == 0x18000000u)", 1)),
+        ("allowlist: window restore lost from the SYS_MEM core page (S33)", good.replace(" || old == 0x18026000u))))", "))))", 1)),
+        ("allowlist: window restore lost from the PMU page (S33)", good.replace(" || old == 0x18012000u", "", 1)),
+        ("allowlist: S33 move from any state", good.replace("((v == 0x18012000u && old == 0x18105000u) ||", "((v == 0x18012000u) ||", 1)),
+        ("allowlist: S33 move skips a link of the chain (ARM wrapper from the EROM page)", good.replace("(v == 0x18120000u && old == 0x18012000u)", "(v == 0x18120000u && old == 0x18105000u)", 1)),
+        ("allowlist: S33 SYS_MEM core page from the ARM wrapper (gate bypass at window level)", good.replace("(v == 0x18026000u && old == 0x18126000u)", "(v == 0x18026000u && old == 0x18120000u)", 1)),
+        ("allowlist: S33 move to another page (PMU 0x18013000)", good.replace("(v == 0x18012000u && old == 0x18105000u)", "(v == 0x18013000u && old == 0x18105000u)", 1)),
+        ("allowlist: S33 move to a wrong ARM wrapper page", good.replace("(v == 0x18120000u && old == 0x18012000u)", "(v == 0x18121000u && old == 0x18012000u)", 1)),
+        ("allowlist: S33 move to a wrong SYS_MEM wrapper page", good.replace("(v == 0x18126000u && old == 0x18120000u)", "(v == 0x18127000u && old == 0x18120000u)", 1)),
+        ("allowlist: S33 move to a wrong SYS_MEM core page", good.replace("(v == 0x18026000u && old == 0x18126000u)", "(v == 0x18027000u && old == 0x18126000u)", 1)),
+        ("allowlist: S33 move accepts any page of the chain region", good.replace("(v == 0x18012000u && old == 0x18105000u)", "((v & 0xFFFF0000u) == 0x18010000u && old == 0x18105000u)", 1)),
+        ("allowlist: S33 move allowed in the teardown", good.replace("(!c->tear && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u &&", "((c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u &&", 1)),
+        ("allowlist: S33 move without the Command check", good.replace("(!c->tear && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0", "(!c->tear && c->bar0", 1)),
+        ("allowlist: S33 move without the BAR0 state", good.replace("(!c->tear && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u &&", "(!c->tear && (c->cmd & 0xFFFFu) == 0x0002u &&", 1)),
+        ("allowlist: S33 one more window (page 0x18027000 after the core page)", good.replace("(v == 0x18026000u && old == 0x18126000u)))", "(v == 0x18026000u && old == 0x18126000u) || (v == 0x18027000u && old == 0x18026000u)))", 1)),
+        ("mem_ok: no check at all", good.replace("\tif (win == 0x18105000u)\n\t\treturn off < 0xE00u;", "\treturn 1;\n\tif (win == 0x18105000u)\n\t\treturn off < 0xE00u;", 1)),
+        ("mem_ok: the EROM bound dropped (review 13 M1)", good.replace("return off < 0xE00u;", "return 1;", 1)),
+        ("mem_ok: the EROM bound moved to 0x1000", good.replace("return off < 0xE00u;", "return off < 0x1000u;", 1)),
+        ("mem_ok: the EROM bound moved to 0xE00 inclusive", good.replace("return off < 0xE00u;", "return off <= 0xE00u;", 1)),
+        ("mem_ok: the EROM page window changed", good.replace("if (win == 0x18105000u)", "if (win == 0x18106000u)", 1)),
+        ("mem_ok: the ChipCommon window changed", good.replace("if (win == 0x18000000u)", "if (win == 0x18001000u)", 1)),
+        ("mem_ok: the PMU window changed", good.replace("if (win == 0x18012000u)", "if (win == 0x18013000u)", 1)),
+        ("mem_ok: the ARM CA7 wrapper window changed", good.replace("if (win == 0x18120000u || win == 0x18126000u)", "if (win == 0x18121000u || win == 0x18126000u)", 1)),
+        ("mem_ok: the SYS_MEM wrapper window changed", good.replace("win == 0x18126000u)\n\t\treturn off == 0x408u", "win == 0x18127000u)\n\t\treturn off == 0x408u", 1)),
+        ("mem_ok: the SYS_MEM core window changed", good.replace("if (win == 0x18026000u)", "if (win == 0x18027000u)", 1)),
+        ("mem_ok: the SYS_MEM core page read widened (offset 0 or 4)", good.replace("if (win == 0x18026000u)\n\t\treturn off == 0u;", "if (win == 0x18026000u)\n\t\treturn off == 0u || off == 4u;", 1)),
+        ("mem_ok: the SYS_MEM core page takes any offset", good.replace("return off == 0u;\n\treturn 0;", "return 1;\n\treturn 0;", 1)),
+        ("mem_ok: another window falls through to allowed", good.replace("\treturn 0;\n}\n\n__attribute__((noipa)) static int r32", "\treturn 1;\n}\n\n__attribute__((noipa)) static int r32", 1)),
+        ("mem_ok: PMU offset 0x60C (res_state) added", good.replace("off == 0x608u ||", "off == 0x608u || off == 0x60Cu ||", 1)),
+        ("mem_ok: PMU offset 0x614 (pmutimer, ILP sensitive) added", good.replace("off == 0x618u ||", "off == 0x618u || off == 0x614u ||", 1)),
+        ("mem_ok: PMU pmucapabilities 0x604 dropped", good.replace("off == 0x604u ||", "", 1)),
+        ("mem_ok: PMU max_res_mask widened to 0x620", good.replace("off == 0x61Cu;", "off == 0x620u;", 1)),
+        ("mem_ok: wrapper ioctrlset 0x400 added", good.replace("return off == 0x408u ||", "return off == 0x400u || off == 0x408u ||", 1)),
+        ("mem_ok: wrapper ioctrlclear 0x404 added", good.replace("off == 0x408u || off == 0x800u", "off == 0x408u || off == 0x404u || off == 0x800u", 1)),
+        ("mem_ok: wrapper resetreadid 0x808 added", good.replace("off == 0x804u;", "off == 0x804u || off == 0x808u;", 1)),
+        ("mem_ok: wrapper RESET_ST moved to 0x808", good.replace("off == 0x804u;", "off == 0x808u;", 1)),
+        ("mem_ok: wrapper iostatus 0x500 added", good.replace("off == 0x804u;", "off == 0x804u || off == 0x500u;", 1)),
+        ("mem_ok: ChipCommon offset 0x100 added", good.replace("off == 0xFCu ||", "off == 0xFCu || off == 0x100u ||", 1)),
+        ("mem_ok: ChipCommon offset 0xFC dropped", good.replace(" || off == 0xFCu", "", 1)),
+        ("mem_ok: ChipCommon offset 0x1E0 widened to 0x1E4", good.replace("off == 0x1E0u;", "off == 0x1E4u;", 1)),
+        ("mem_ok: ChipCommon offset 0xAC widened to 0xB0", good.replace("off == 0xACu", "off == 0xB0u", 1)),
+        ("mem_ok: not noipa (inlined, unaudited)", good.replace("__attribute__((noipa)) static int mem_ok", "static int mem_ok", 1)),
+        ("mem_ok: a second caller", good.replace(ins, "static int evil2(uint32_t w) { return mem_ok(w, 0x100u); }\n" + ins, 1)),
+        ("r32: the window select is not read", good.replace("!try_read32(WLAN_CFG + 0x80u, &win) || !mem_ok(win, off) || ", "", 1)),
+        ("r32: mem_ok not consulted", good.replace("!mem_ok(win, off)", "0", 1)),
+        ("r32: mem_ok result inverted", good.replace("!mem_ok(win, off)", "mem_ok(win, off)", 1)),
+        ("r32: mem_ok called with a fixed window", good.replace("!mem_ok(win, off)", "!mem_ok(0x18105000u, off)", 1)),
+        ("r32: mem_ok called with a fixed offset", good.replace("!mem_ok(win, off)", "!mem_ok(win, 0u)", 1)),
+        ("teardown skipped after a refusal (S33 gate stops)", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped != ST_REFUSED && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("teardown skipped after a fault (S33 window write fault)", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped != ST_FAULT && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("gate ignored: a one-shot wait that does not hold is not a stop", good.replace("return (st != ST_OK && r.b == 1u) ? (st == ST_TIMEOUT ? ST_REFUSED : st) : st;", "return st == ST_TIMEOUT ? ST_OK : st;", 1)),
+        ("gate ignored: the run continues after a refusal", good.replace("for (s = 0; s <= WLAN_LINK_N && stopped == ST_OK; s++) {", "for (s = 0; s <= WLAN_LINK_N && stopped != ST_FAULT; s++) {", 1)),
         ("teardown filter skips the last started step", good.replace("if (!get_row(i, 1, &r) || r.step > hi)", "if (!get_row(i, 1, &r) || r.step >= hi)", 1)),
         ("teardown only after a clean run", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && !stopped && i < WLAN_SEQ_NTEAR; i++) {", 1)),
         ("teardown row order reversed", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = WLAN_SEQ_NTEAR; started && i-- > 0;) {", 1)),
@@ -3771,7 +3889,7 @@ def wlanlink_source_selftest() -> int:
     return caught
 
 
-def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 32) -> None:
+def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 33) -> None:
     """Build-time policy: an image whose effective step bound N is >= 20 (PERST release, LTSSM enable) is accepted ONLY when the builder typed `--wlan-link=N` with exactly that N; anything without an
     explicit N is the default run (N = default_last_step = 19: no PERST, no LTSSM). `effective` is read from the preprocessed wlanlink.c by shim/build.sh."""
     if not 0 <= effective <= last:
@@ -3810,10 +3928,10 @@ def wlan_link_n_selftest() -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
     src, sh = (root / "shim" / "wlanlink.c").read_text(), (root / "shim" / "build.sh").read_text()
     check_wlan_link_n_sources(src, sh)  # control must pass
-    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24"), (25, "25"), (26, "26"), (27, "27"), (28, "28"), (29, "29"), (30, "30"), (31, "31"), (32, "32")):
+    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24"), (25, "25"), (26, "26"), (27, "27"), (28, "28"), (29, "29"), (30, "30"), (31, "31"), (32, "32"), (33, "33")):
         check_wlan_link_n(eff, exp)
     caught = 0
-    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, None), (26, None), (27, None), (28, None), (29, None), (30, None), (31, None), (32, None), (33, "33"), (32, "31"), (31, "32"), (31, "30"), (27, "26"), (30, "29"), (29, "28"), (26, "25"), (25, "24"), (24, "23"), (20, "x"), (22, "019")]
+    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, None), (26, None), (27, None), (28, None), (29, None), (30, None), (31, None), (32, None), (33, None), (34, "34"), (33, "32"), (32, "33"), (32, "31"), (31, "32"), (31, "30"), (27, "26"), (30, "29"), (29, "28"), (26, "25"), (25, "24"), (24, "23"), (20, "x"), (22, "019")]
     for eff, exp in bad_n:
         try:
             check_wlan_link_n(eff, exp)
@@ -3850,84 +3968,125 @@ _WLANLINK_W32_CONSTS = (r"#0x890\b", r"movk\s+x\d+, #0x1480, lsl #16", r"cmp\s+x
                         r"movk\s+w\d+, #0x6040, lsl #16", r"tst\s+w\d+, #0xffff\b",
                         r"cmp\s+w\d+, #0x204\b", r"cmp\s+w\d+, #0x208\b", r"cmp\s+w\d+, #0x210\b", r"cmp\s+w\d+, #0x214\b", r"mov\s+w\d+, #0x6000ffff\b", r"mov\s+w\d+, #0x60000000\b",
                         r"movk\s+w\d+, #0x1800, lsl #16", r"movk\s+w\d+, #0x6000, lsl #16",
-                        r"add\s+w\d+, w\d+, #0x105, lsl #12")	# the ATU values (S26): LOWER_TARGET, CR2 enable, LOWER_BASE (CFG window), LIMIT; the CFG BAR2 assignment 0x60400004 and the Command mask 0xffff (S28); S29: region 1 offsets 0x204/0x208/0x210/0x214 and values 0x60000000 / 0x6000ffff, the window select 0x18000000 / 0x18001000, the BAR0 state 0x60000004
+                        r"add\s+w\d+, w\d+, #0x105, lsl #12", r"mov\s+w\d+, #0x18120000\b", r"add\s+w\d+, w\d+, #0x12, lsl #12", r"add\s+w\d+, w\d+, #0x26, lsl #12")	# the ATU values (S26): LOWER_TARGET, CR2 enable, LOWER_BASE (CFG window), LIMIT; the CFG BAR2 assignment 0x60400004 and the Command mask 0xffff (S28); S29: region 1 offsets 0x204/0x208/0x210/0x214 and values 0x60000000 / 0x6000ffff, the window select 0x18000000 / 0x18001000, the BAR0 state 0x60000004
 
 
-def _wlanlink_r32_window_model(t: str, call0, name: str) -> None:
-    ins = [(int(m.group(1), 16), m.group(2), m.group(3).split("\t")[0].strip()) for m in re.finditer(r"(?m)^\s*([0-9a-f]+):\t[0-9a-f]{8} \t(\S+)\s*([^\n]*)", t)]
+def _a64_call(block: str, args: dict, name: str, fn: str, max_steps: int = 200) -> int:
+    """A tiny AArch64 evaluator for ONE pure, call-free function (objdump text of its block): runs it from the first instruction to `ret` and returns w0. Supports exactly the integer subset the compiler uses for the
+    window / offset decisions (mov movk add sub and orr eor lsr lsl cmp tst ccmp cset csel b b.cond cbz cbnz ret); anything else is an error (fail closed). args: register number -> value (x0 = window, x1 = offset). AP-16: audits
+    the BEHAVIOUR of the compiled code, not its instruction order or register choice."""
+    ins = [(int(m.group(1), 16), m.group(2), m.group(3).split("\t")[0].split("//")[0].strip()) for m in re.finditer(r"(?m)^\s*([0-9a-f]+):\t[0-9a-f]{8} \t(\S+)[ \t]*([^\n]*)", block)]
     idx = {a: i for i, (a, _, _) in enumerate(ins)}
-    after = t[call0.end():]
-    m = re.search(r"(?m)^\s*([0-9a-f]+):\t[0-9a-f]+ \tcbz\s+w0, ([0-9a-f]+) <r32\+0x[0-9a-f]+>", after)
-    guard = re.search(r"(?m)^\s*([0-9a-f]+):\t[0-9a-f]+ \tmov\s+x\d+, #0x204\b", after)
-    if not m or not guard:
-        raise AssertionError(f"{name}: r32: cannot find the refusal target (cbz after the window read) or the CR2 guard read (mov x, #0x204)")
-    refuse, gaddr = int(m.group(2), 16), int(guard.group(1), 16)
-    pc0 = idx[int(m.group(1), 16)] + 1
-    if not re.search(r"(?m)^\s*%x:\t[0-9a-f]+ \t[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tmov\s+w0, #0x0\b[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tret\b" % refuse, t):
-        raise AssertionError(f"{name}: the compiled r32 refusal target is no longer `mov w0, #0x0 ... ret`")
-    def imm(x, rg):
+    M32, M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
+    rg = [0] * 32
+    for k, v in args.items():
+        rg[k] = v & M64
+
+    def reg(x):
+        x = x.strip()
+        if x in ("wzr", "xzr"):
+            return 0
+        return rg[int(x[1:])] & (M32 if x[0] == "w" else M64)
+
+    def put(x, v):
+        x = x.strip()
+        if x in ("wzr", "xzr"):
+            return
+        rg[int(x[1:])] = v & (M32 if x[0] == "w" else M64)
+
+    def val(x, wide):
         x = x.strip()
         if x.startswith("#"):
-            return int(x[1:], 0) & 0xFFFFFFFF
-        return rg[int(x[1:])] & 0xFFFFFFFF
-    def sub_flags(a, b):
-        r = (a - b) & 0xFFFFFFFF
-        return (r >> 31, int(r == 0), int(a >= b), int(((a ^ b) & (a ^ r)) >> 31))	# N Z C V
+            return int(x[1:], 0) & (M64 if wide else M32)
+        return reg(x)
+
+    def shifted(ops):	# [Rd, Rn, #imm (, lsl #12)] -> imm value
+        v = int(ops[2].strip()[1:], 0) if ops[2].strip().startswith("#") else None
+        if v is not None and len(ops) > 3:
+            v <<= int(ops[3].split("#")[1])
+        return v
+
+    def sub_flags(a, b, wide):
+        m = M64 if wide else M32
+        sb = 63 if wide else 31
+        r = (a - b) & m
+        return ((r >> sb) & 1, int(r == 0), int(a >= b), int((((a ^ b) & (a ^ r)) >> sb) & 1))	# N Z C V
+
     def cond(c, f):
         n, z, cc, v = f
-        return {"eq": z, "ne": not z, "hi": cc and not z, "ls": (not cc) or z, "hs": cc, "cs": cc, "lo": not cc, "cc": not cc, "mi": n, "pl": not n, "vs": v, "vc": not v,
-                "ge": n == v, "lt": n != v, "gt": (not z) and n == v, "le": z or n != v}[c]
-    def run(win, off):
-        rg = [0] * 32
-        rg[19] = off
-        fl = (0, 0, 0, 0)
-        pc = pc0
-        for _ in range(60):
-            addr, mn, ops = ins[pc]
-            if addr == refuse:
-                return False
-            if addr == gaddr:
-                return True
-            o = [x.strip() for x in re.sub(r"\[[^\]]*\]", "MEM", ops).split(",")]
-            nxt = pc + 1
-            if mn == "ldr" and o[0] == "w1" and ops.endswith("[sp, #60]"):
-                rg[1] = win
-            elif mn in ("ldr", "str", "stp", "nop"):
-                pass
-            elif mn == "mov":
-                rg[int(o[0][1:])] = imm(o[1], rg)
-            elif mn == "movk":
-                sh = int(o[2].split("#")[1]) if len(o) > 2 else 0
-                d = int(o[0][1:])
-                rg[d] = (rg[d] & ~(0xFFFF << sh) & 0xFFFFFFFF) | (int(o[1][1:], 0) << sh)
-            elif mn == "sub" and len(o) == 4:
-                rg[int(o[0][1:])] = (rg[int(o[1][1:])] - (int(o[2][1:], 0) << int(o[3].split("#")[1]))) & 0xFFFFFFFF
-            elif mn == "cmp":
-                fl = sub_flags(rg[int(o[0][1:])], imm(o[1], rg))
-            elif mn == "ccmp":
-                fl = sub_flags(rg[int(o[0][1:])], imm(o[1], rg)) if cond(o[3], fl) else tuple((int(o[2][1:], 0) >> k) & 1 for k in (3, 2, 1, 0))
-            elif mn.startswith("b."):
-                tgt = int(o[0].split()[0], 16)
-                if cond(mn[2:], fl):
-                    nxt = idx[tgt]
-            elif mn == "b":
-                nxt = idx[int(o[0].split()[0], 16)]
-            else:
-                raise AssertionError(f"{name}: r32 window logic: unsupported instruction {mn} {ops} at {addr:x}")
-            pc = nxt
-        raise AssertionError(f"{name}: r32 window logic did not terminate (win {win:#x}, off {off:#x})")
-    cc_ok = {0, 0xAC, 0xFC, 0x1E0}
-    for win in (0x18105000, 0x18000000, 0x18001000, 0, 0xFFFFFFFF, 0x18106000, 0x18104000, 0x18105004, 0x38105000):
-        for off in sorted(set(range(0, 0x1010, 4)) | {1, 0xAD, 0xFFFFFFFF, 0xFFFFFFFC, 0xDFF, 0xE01}):
-            want = (win == 0x18105000 and off < 0xE00) or (win == 0x18000000 and off in cc_ok)
-            if run(win, off) != want:
-                raise AssertionError(f"{name}: the compiled r32 window decision is wrong: window {win:#x} offset {off:#x} {'refused' if want else 'accepted'} (rule: EROM page window offsets < 0xE00, ChipCommon window offsets 0/0xAC/0xFC/0x1E0)")
+        t = {"eq": z, "ne": not z, "hi": cc and not z, "ls": (not cc) or z, "hs": cc, "cs": cc, "lo": not cc, "cc": not cc, "mi": n, "pl": not n, "vs": v, "vc": not v, "ge": n == v, "lt": n != v, "gt": (not z) and n == v, "le": z or n != v}
+        return bool(t[c])
+
+    fl = (0, 0, 0, 0)
+    pc = 0
+    for _ in range(max_steps):
+        addr, mn, ops = ins[pc]
+        o = [x.strip() for x in ops.split(",")]
+        nxt = pc + 1
+        wide = bool(o) and o[0][:1] == "x"
+        if mn == "ret":
+            return rg[0] & M32
+        if mn == "mov":
+            put(o[0], val(o[1], wide))
+        elif mn == "movk":
+            sh = int(o[2].split("#")[1]) if len(o) > 2 else 0
+            put(o[0], (reg(o[0]) & ~(0xFFFF << sh)) | (int(o[1][1:], 0) << sh))
+        elif mn in ("add", "sub"):
+            b = shifted(o) if o[2].startswith("#") else reg(o[2])
+            put(o[0], reg(o[1]) + b if mn == "add" else reg(o[1]) - b)
+        elif mn in ("and", "orr", "eor"):
+            a_, b = reg(o[1]), val(o[2], wide)
+            put(o[0], a_ & b if mn == "and" else a_ | b if mn == "orr" else a_ ^ b)
+        elif mn == "lsr":
+            put(o[0], reg(o[1]) >> (val(o[2], wide) % (64 if wide else 32)))
+        elif mn == "lsl":
+            put(o[0], reg(o[1]) << (val(o[2], wide) % (64 if wide else 32)))
+        elif mn == "cmp":
+            fl = sub_flags(reg(o[0]), val(o[1], o[0][:1] == "x"), o[0][:1] == "x")
+        elif mn == "tst":
+            r_ = reg(o[0]) & val(o[1], o[0][:1] == "x")
+            fl = ((r_ >> (63 if o[0][:1] == "x" else 31)) & 1, int(r_ == 0), 0, 0)
+        elif mn == "ccmp":
+            fl = sub_flags(reg(o[0]), val(o[1], o[0][:1] == "x"), o[0][:1] == "x") if cond(o[3], fl) else tuple((int(o[2][1:], 0) >> k) & 1 for k in (3, 2, 1, 0))
+        elif mn == "cset":
+            put(o[0], 1 if cond(o[1], fl) else 0)
+        elif mn == "csel":
+            put(o[0], reg(o[1]) if cond(o[3], fl) else reg(o[2]))
+        elif mn.startswith("b.") or mn == "b" or mn in ("cbz", "cbnz"):
+            tgt = int((o[1] if mn in ("cbz", "cbnz") else o[0]).split()[0], 16)
+            if tgt not in idx:
+                raise AssertionError(f"{name}: {fn}: branch to {tgt:x} outside the function")
+            if mn == "b" or (cond(mn[2:], fl) if mn.startswith("b.") else (reg(o[0]) == 0) == (mn == "cbz")):
+                nxt = idx[tgt]
+        else:
+            raise AssertionError(f"{name}: {fn}: unsupported instruction {mn} {ops} at {addr:x} (the evaluator fails closed)")
+        pc = nxt
+    raise AssertionError(f"{name}: {fn} did not terminate in {max_steps} steps")
+
+
+def _wlanlink_mem_ok_model(blocks: list, name: str) -> None:
+    """The COMPILED mem_ok (noipa, pure): for a grid of windows x offsets it accepts exactly (research 38 s.3 + the older steps): 0x18105000 -> offset < 0xE00; 0x18000000 -> {0, 0xAC, 0xFC, 0x1E0}; 0x18012000 -> the five PMU words;
+    0x18120000 / 0x18126000 -> {0x408, 0x800, 0x804}; 0x18026000 -> {0}; every other window -> nothing."""
+    m = [b for b in blocks if re.match(r"[0-9a-f]+ <mem_ok>:", b)]
+    if len(m) != 1 or re.search(r"\b(bl|blr|br|ldr|ldrb|ldrh|str|strb|strh|stp|ldp|adrp)\b", m[0]) or "R_AARCH64" in m[0]:
+        raise AssertionError(f"{name}: expected exactly one mem_ok function, pure (no call, no load/store, no relocation)")
+    exp = {0x18000000: (0, 0xAC, 0xFC, 0x1E0), 0x18012000: (0x600, 0x604, 0x608, 0x618, 0x61C), 0x18120000: (0x408, 0x800, 0x804), 0x18126000: (0x408, 0x800, 0x804), 0x18026000: (0,)}
+    wins = list(exp) + [0x18105000, 0x18001000, 0x18011000, 0x18013000, 0x18012004, 0x18121000, 0x18127000, 0x18125000, 0x18027000, 0x18025000, 0x18100000, 0x18106000, 0x18104000, 0x18105004, 0x38105000, 0x98012000, 0, 1, 0xFFFFFFFF]
+    offs = sorted(set(range(0, 0x1010, 4)) | {1, 2, 3, 0xAD, 0x601, 0x605, 0x409, 0x801, 0xDFF, 0xE01, 0xFFFFFFFF, 0xFFFFFFFC, 0x80000600, 0x100000600, 0x100000000})
+    for win in wins:
+        for off in offs:
+            want = off < 0xE00 if win == 0x18105000 else off in exp.get(win, ())
+            got = _a64_call(m[0], {0: win, 1: off & 0xFFFFFFFF}, name, "mem_ok") & 1 if off < 0x100000000 else None
+            if got is None:
+                continue
+            if bool(got) != want:
+                raise AssertionError(f"{name}: the compiled mem_ok is wrong: window {win:#x} offset {off:#x} {'refused' if want else 'accepted'} (rule: EROM page offsets < 0xE00; ChipCommon 0/0xAC/0xFC/0x1E0; PMU 0x600/0x604/0x608/0x618/0x61C; ARM CA7 + SYS_MEM wrapper 0x408/0x800/0x804; SYS_MEM core 0; any other window nothing)")
 
 
 def check_wlanlink_r32_object_text(blocks: list, name: str) -> None:
-    """Review 10 L5 + S32: the compiled MEM read guard (r32 is noipa, so it is one function): the FIRST guard read is the BAR0 window select (cfg 0x80 = CFG+0x80); between it and the next guard read the window decides the offsets (the compiled
-    compares: window == 0x18105000 -> any offset; window == 0x18000000 (derived as 0x18105000 - 0x105000) and offset 0 / 0xAC / 0xFC / 0x1E0 -> ok; else the refusal); then region 1 CR2 == 0x80000000 at ATU+0x204, Command low half == 0x2 after a
-    try_read32, the window re-check (offsets 0x200 / 0x208 / 0x210 / 0x214 and the values 0x60000000 / 0x6000ffff): seven guard reads plus the load (tail call), never a write."""
+    """Review 10 L5 + S32 + S33: the compiled MEM read guard (r32 is noipa, so it is one function): the FIRST guard read is the BAR0 window select (cfg 0x80 = CFG+0x80); its value goes (same stack slot) into the call of mem_ok(window, offset)
+    whose zero result is the refusal (the same target as the read failure); then region 1 CR2 == 0x80000000 at ATU+0x204, Command low half == 0x2 after a try_read32, the window re-check (offsets 0x200 / 0x208 / 0x210 / 0x214 and the values
+    0x60000000 / 0x6000ffff): seven guard reads plus the load (tail call), never a write. The window / offset decision itself is audited by BEHAVIOUR in _wlanlink_mem_ok_model."""
     r = [b for b in blocks if re.match(r"[0-9a-f]+ <r32>:", b)]
     if len(r) != 1 or "try_write32" in r[0]:
         raise AssertionError(f"{name}: expected exactly one r32 function that never writes")
@@ -3938,21 +4097,25 @@ def check_wlanlink_r32_object_text(blocks: list, name: str) -> None:
     pre, seg = t[:c26[0].start()], t[c26[0].end():c26[1].start()]
     if not re.search(r"mov\s+x\d+, #0xe080\b", pre) or not re.search(r"movk\s+x\d+, #0x60ff, lsl #16", pre):
         raise AssertionError(f"{name}: the first guard read of the compiled r32 is no longer the BAR0 window select CFG+0x80 (0x60ffe080)")
-    # S32: the window constants, the S31 offset allowlist {0x0, 0xAC, 0xFC, 0x1E0} and the EROM bound (offset <= 0xDFF, i.e. < ER_REMAPCONTROL 0xE00, review 13 M1) are compiled compares after the window read (the compiler may outline the
-    # offset blocks behind the guard code, so the whole function after the first guard read is searched; 0x18000000 as 0x18105000 minus 0x105000, or as a literal)
-    rest = t[c26[0].end():]
-    for rx in (r"mov\s+w\d+, #0x5000\b", r"movk\s+w\d+, #0x1810, lsl #16", r"(?:sub\s+w\d+, w\d+, #0x105, lsl #12|movk\s+w\d+, #0x1800, lsl #16)", r"cmp\s+w\d+, #0xac\b", r"cmp\s+w\d+, #0xfc\b", r"mov\s+w\d+, #0x1e0\b", r"ccmp\s+w\d+, #0x0,", r"cmp\s+w\d+, #0xdff\b"):
-        if not re.search(rx, rest):
-            raise AssertionError(f"{name}: the compiled r32 lost the window / BAR0 offset compare /{rx}/ after its window read")
-    # review 12 L3 (extended) + review 13 M1: the BEHAVIOUR of the compiled window decision. A tiny AArch64 interpreter runs the code from the window load to either the refusal (the target of the first cbz) or the CR2 guard read
-    # (mov x, #0x204) for every (window, offset) pair and compares with the rule: accept iff (window == 0x18105000 and offset < 0xE00) or (window == 0x18000000 and offset in {0, 0xAC, 0xFC, 0x1E0}); this is layout independent
-    _wlanlink_r32_window_model(t, c26[0], name)
+    slot = re.findall(r"add\s+x1, sp, #(0x[0-9a-f]+)", pre)
+    mc = re.search(r"cbz\s+w0, ([0-9a-f]+) <r32\+0x[0-9a-f]+>", seg)
+    if not slot or not mc:
+        raise AssertionError(f"{name}: r32: cannot find the window slot (add x1, sp, #N before the first guard read) or the read-failure refusal (cbz w0)")
+    refuse = mc.group(1)
+    if not re.search(r"(?m)^\s*%s:\t[0-9a-f]+ \t[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tmov\s+w0, #0x0\b[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\tret\b" % refuse, t):
+        raise AssertionError(f"{name}: the compiled r32 refusal target is no longer `mov w0, #0x0 ... ret`")
+    sl = int(slot[-1], 16)
+    if not re.search(r"ldr\s+w0, \[sp, #%d\]\n(?:[^\n]*\n){0,3}?[^\n]*\bbl\s+[0-9a-f]+ <mem_ok>\n[^\n]*\tcbz\s+w0, %s <r32\+0x[0-9a-f]+>" % (sl, refuse), seg + "\n"):
+        raise AssertionError(f"{name}: the compiled r32 no longer calls mem_ok(window just read, offset) and refuses on a zero result (ldr w0,[sp,#{sl}] ... bl mem_ok; cbz w0 -> refusal)")
+    if len(re.findall(r"\bbl\s+[0-9a-f]+ <mem_ok>", t)) != 1 or not re.search(r"mov\s+w1, w\d+\n(?:[^\n]*\n){0,2}?[^\n]*\bbl\s+[0-9a-f]+ <mem_ok>", seg):
+        raise AssertionError(f"{name}: r32 must call mem_ok exactly once, with the offset argument (mov w1, <offset>)")
     for rx in (r"mov\s+w\d+, #0x80000000\b", r"mov\s+x\d+, #0x204\b", r"mov\s+x\d+, #0x200\b", r"mov\s+x\d+, #0x208\b", r"mov\s+x\d+, #0x210\b", r"mov\s+x\d+, #0x214\b",
                r"mov\s+w\d+, #0x60000000\b", r"mov\s+w\d+, #0x6000ffff\b"):
         if not re.search(rx, t):
             raise AssertionError(f"{name}: the compiled r32 lost the MEM guard constant /{rx}/")
     if not re.search(r"R_AARCH64_CALL26\s+try_read32(?:.*\n)*?.*\bcmp\s+w\d+, #0x2\n", t):
         raise AssertionError(f"{name}: the compiled r32 lost the Command == 0x2 compare after a guard read")
+    _wlanlink_mem_ok_model(blocks, name)
 
 
 def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> None:
@@ -3987,6 +4150,7 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
     wblk = re.search(r"(?ms)^[0-9a-f]+ <w32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     rblk = re.search(r"(?ms)^[0-9a-f]+ <r32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     cblk = re.search(r"(?ms)^[0-9a-f]+ <ctx_read>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
+    mblk = re.search(r"(?ms)^[0-9a-f]+ <mem_ok>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     def seg_mut(rb, fn):	# apply fn to the text between the first and the second try_read32 call of an r32 block
         c = list(re.finditer(r"R_AARCH64_CALL26\s+try_read32", rb))
         return rb[:c[0].end()] + fn(rb[c[0].end():c[1].start()]) + rb[c[1].start():]
@@ -4003,8 +4167,8 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("ATU region 1 LIMIT changed", disasm.replace(wblk, re.sub(r"mov\tw(\d+), #0x6000ffff", r"mov\tw\1, #0x6001ffff", wblk, count=1), 1)),
         ("ATU region 1 offset 0x204 changed", disasm.replace(wblk, re.sub(r"cmp\tw(\d+), #0x204", r"cmp\tw\1, #0x205", wblk, count=1), 1)),
         ("ATU region 1 offset 0x214 changed", disasm.replace(wblk, re.sub(r"cmp\tw(\d+), #0x214", r"cmp\tw\1, #0x218", wblk, count=1), 1)),
-        ("CFG window select changed (0x18000000 -> 0x19000000)", disasm.replace(wblk, re.sub(r"movk\tw(\d+), #0x1800, lsl #16", r"movk\tw\1, #0x1900, lsl #16", wblk, count=1), 1)),
-        ("CFG Command arm BAR0 state changed", disasm.replace(wblk, re.sub(r"movk\tw(\d+), #0x6000, lsl #16", r"movk\tw\1, #0x6100, lsl #16", wblk, count=1), 1)),
+        ("CFG window select changed (0x18000000 -> 0x19000000)", disasm.replace(wblk, re.sub(r"movk\tw(\d+), #0x1800, lsl #16", r"movk\tw\1, #0x1900, lsl #16", wblk), 1)),
+        ("CFG Command arm BAR0 state changed", disasm.replace(wblk, re.sub(r"movk\tw(\d+), #0x6000, lsl #16", r"movk\tw\1, #0x6100, lsl #16", wblk), 1)),
         ("w32 without the ctx_read call", disasm.replace(wblk, re.sub(r"bl\s+([0-9a-f]+) <ctx_read>", r"nop", wblk, count=1), 1)),
         ("a second caller of ctx_read", disasm + "0000000000fff100 <evil2>:\n fff100:\t97fffe78 \tbl\t100 <ctx_read>\n fff104:\td65f03c0 \tret\n"),
         ("ctx_read writes", disasm.replace("<ctx_read>:\n", "<ctx_read>:\n 1:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n", 1)),
@@ -4015,25 +4179,43 @@ def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
         ("r32 window limit changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x6000ffff", r"mov\tw\1, #0x6001ffff", rblk), 1)),
         ("r32 window target changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x60000000", r"mov\tw\1, #0x60400000", rblk), 1)),
         ("r32 CR1 read dropped", disasm.replace(rblk, re.sub(r"mov\tx(\d+), #0x200\b", r"mov\tx\1, #0x2f0", rblk), 1)),
-        ("r32 offset-0 check dropped", disasm.replace(rblk, re.sub(r"ccmp\tw(\d+), #0x0,", r"ccmp\tw\1, #0x1,", rblk), 1)),
-        ("r32 offset 0xAC changed", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xac\b", r"cmp\tw\1, #0xa8", rblk), 1)),
-        ("r32 offset 0xFC changed", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xfc\b", r"cmp\tw\1, #0xf8", rblk), 1)),
-        ("r32 allowlist final b.ne inverted (review 12 L3)", disasm.replace(rblk, re.sub(r"\bb\.ne(\s+[0-9a-f]+ <r32\+0x[0-9a-f]+>)", r"b.eq\1", rblk), 1)),
-        ("r32 allowlist 0xAC / 0x0 b.eq inverted (review 12 L3)", disasm.replace(rblk, re.sub(r"(ccmp\tw\d+, #0x0,[^\n]*\n[^\n]*\t)b\.(eq|ne)", lambda m: m.group(1) + ("b.ne" if m.group(2) == "eq" else "b.eq"), rblk), 1)),
-        ("r32 offset 0x1E0 changed", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x1e0\b", r"mov\tw\1, #0x1e4", rblk), 1)),
-        ("r32 EROM page window changed (mov #0x5000)", disasm.replace(rblk, re.sub(r"mov\tw(\d+), #0x5000\b", r"mov\tw\1, #0x6000", rblk), 1)),
-        ("r32 EROM page window changed (movk #0x1810)", disasm.replace(rblk, re.sub(r"movk\tw(\d+), #0x1810, lsl #16", r"movk\tw\1, #0x1811, lsl #16", rblk), 1)),
-        ("r32 ChipCommon window derivation changed (0x105000 -> 0x106000)", disasm.replace(rblk, re.sub(r"#0x105, lsl #12", r"#0x106, lsl #12", rblk), 1)),
         ("r32 window select register changed (cfg 0x80 -> 0x84)", disasm.replace(rblk, re.sub(r"mov\tx(\d+), #0xe080\b", r"mov\tx\1, #0xe084", rblk), 1)),
-        ("r32 window == EROM page branch inverted", disasm.replace(rblk, seg_mut(rblk, lambda x: re.sub(r"\bb\.eq\b", "b.ne", x, count=1)), 1)),
-        ("r32 window != ChipCommon refusal branch inverted", disasm.replace(rblk, seg_mut(rblk, lambda x: re.sub(r"(?s)(b\.eq.*?)\bb\.ne\b", r"\1b.eq", x, count=1)), 1)),
-        ("r32 window compare dropped (compares removed from the segment)", disasm.replace(rblk, seg_mut(rblk, lambda x: re.sub(r"movk\tw(\d+), #0x1810, lsl #16", "nop", x)), 1)),
         ("w32 window move page changed (0x105000 -> 0x106000)", disasm.replace(wblk, re.sub(r"#0x105, lsl #12", r"#0x106, lsl #12", wblk), 1)),
+        ("w32 S33 ARM CA7 wrapper window changed (0x18120000 -> 0x18121000, every occurrence)", disasm.replace(wblk, re.sub(r"#0x18120000\b", r"#0x18121000", wblk), 1)),
+        ("w32 S33 PMU window page changed (0x12 -> 0x13, every occurrence)", disasm.replace(wblk, re.sub(r"(add\tw\d+, w\d+, )#0x12, lsl #12", r"\1#0x13, lsl #12", wblk), 1)),
+        ("w32 S33 SYS_MEM core window page changed (0x26 -> 0x27, every occurrence)", disasm.replace(wblk, re.sub(r"(add\tw\d+, w\d+, )#0x26, lsl #12", r"\1#0x27, lsl #12", wblk), 1)),
         ("w32 window page arithmetic dropped", disasm.replace(wblk, re.sub(r"add\tw(\d+), w(\d+), #0x105, lsl #12", r"mov\tw\1, w\2", wblk), 1)),
-        ("r32 EROM bound widened (0xdff -> 0xfff, review 13 M1)", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0xfff", rblk), 1)),
-        ("r32 EROM bound narrowed (0xdff -> 0x7ff)", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x7ff", rblk), 1)),
-        ("r32 EROM bound branch inverted (b.hi -> b.ls)", disasm.replace(rblk, re.sub(r"(cmp\tw\d+, #0xdff\n[^\n]*\t)b\.hi", r"\1b.ls", rblk), 1)),
-        ("r32 EROM bound compare dropped", disasm.replace(rblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x0", rblk), 1)),
+        # S33: the compiled mem_ok is audited by behaviour; each defect class (wrong window value, extra read offset, widened range, dropped check) changes the constants of the compiled function, whatever registers the compiler picks (AP-16)
+        ("mem_ok EROM page window changed (mov #0x5000)", disasm.replace(mblk, re.sub(r"mov\tw(\d+), #0x5000\b", r"mov\tw\1, #0x6000", mblk), 1)),
+        ("mem_ok EROM page window changed (movk #0x1810)", disasm.replace(mblk, re.sub(r"movk\tw(\d+), #0x1810, lsl #16", r"movk\tw\1, #0x1811, lsl #16", mblk), 1)),
+        ("mem_ok ChipCommon window derivation changed (0x105000 -> 0x106000)", disasm.replace(mblk, re.sub(r"#0x105, lsl #12", r"#0x106, lsl #12", mblk), 1)),
+        ("mem_ok PMU window changed (0x12 -> 0x13 pages)", disasm.replace(mblk, re.sub(r"(add\tw\d+, w\d+, )#0x12, lsl #12", r"\1#0x13, lsl #12", mblk), 1)),
+        ("mem_ok SYS_MEM wrapper window changed (0x126 -> 0x127)", disasm.replace(mblk, re.sub(r"#0x126, lsl #12", r"#0x127, lsl #12", mblk), 1)),
+        ("mem_ok ARM CA7 wrapper window changed (0x18120000 -> 0x18121000)", disasm.replace(mblk, re.sub(r"#0x18120000\b", r"#0x18121000", mblk), 1)),
+        ("mem_ok SYS_MEM core window changed (0x26 -> 0x27 pages)", disasm.replace(mblk, re.sub(r"#0x26, lsl #12", r"#0x27, lsl #12", mblk), 1)),
+        ("mem_ok SYS_MEM core page: offset 4 instead of 0", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0x0\n(\s+[0-9a-f]+:\t[0-9a-f]+ \tcset)", r"cmp\tw\1, #0x4\n\2", mblk), 1)),
+        ("mem_ok offset 0xAC changed", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xac\b", r"cmp\tw\1, #0xa8", mblk), 1)),
+        ("mem_ok offset 0xFC changed", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xfc\b", r"cmp\tw\1, #0xf8", mblk), 1)),
+        ("mem_ok offset 0x1E0 changed", disasm.replace(mblk, re.sub(r"mov\tw(\d+), #0x1e0\b", r"mov\tw\1, #0x1e4", mblk), 1)),
+        ("mem_ok offset 0 dropped from ChipCommon", disasm.replace(mblk, re.sub(r"ccmp\tw(\d+), #0x0,", r"ccmp\tw\1, #0x1,", mblk), 1)),
+        ("mem_ok wrapper offset 0x408 changed to 0x400", disasm.replace(mblk, re.sub(r"mov\tw(\d+), #0x408\b", r"mov\tw\1, #0x400", mblk), 1)),
+        ("mem_ok wrapper offset mask widened (0x804 -> also 0x808)", disasm.replace(mblk, re.sub(r"and\tw(\d+), w(\d+), #0xfffffffb\b", r"and\tw\1, w\2, #0xfffffff3", mblk), 1)),
+        ("mem_ok wrapper offset 0x800 changed to 0x808", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0x800\b", r"cmp\tw\1, #0x808", mblk), 1)),
+        ("mem_ok PMU bit set changed (0x11000111 -> 0x11000113: offset 0x601)", disasm.replace(mblk, re.sub(r"mov\tx(\d+), #0x111\b", r"mov\tx\1, #0x113", mblk), 1)),
+        ("mem_ok PMU bit set changed (0x11000111 -> 0x11100111: offset 0x614)", disasm.replace(mblk, re.sub(r"movk\tx(\d+), #0x1100, lsl #16", r"movk\tx\1, #0x1110, lsl #16", mblk), 1)),
+        ("mem_ok PMU range check widened (0x1d -> 0x7f)", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0x1d\b", r"cmp\tw\1, #0x7f", mblk), 1)),
+        ("mem_ok PMU range check dropped (csel condition inverted)", disasm.replace(mblk, re.sub(r"csel\tw(\d+), w(\d+), wzr, cc", r"csel\tw\1, w\2, wzr, cs", mblk), 1)),
+        ("mem_ok EROM bound widened (0xdff -> 0xfff, review 13 M1)", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0xfff", mblk), 1)),
+        ("mem_ok EROM bound narrowed (0xdff -> 0x7ff)", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x7ff", mblk), 1)),
+        ("mem_ok EROM bound condition inverted (ls -> hi)", disasm.replace(mblk, re.sub(r"cset\tw(\d+), ls\b", r"cset\tw\1, hi", mblk), 1)),
+        ("mem_ok EROM bound compare dropped", disasm.replace(mblk, re.sub(r"cmp\tw(\d+), #0xdff\b", r"cmp\tw\1, #0x0", mblk), 1)),
+        ("mem_ok calls another function", disasm.replace(mblk, mblk.replace("ret", "bl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n  1:\td65f03c0 \tret", 1), 1)),
+        ("mem_ok became a load (reads memory)", disasm.replace(mblk, mblk.replace("cmp\tw1, #0xdff", "ldr\tw1, [x1]", 1), 1)),
+        ("r32 does not call mem_ok", disasm.replace(rblk, re.sub(r"bl\t([0-9a-f]+) <mem_ok>", r"nop", rblk), 1)),
+        ("r32 ignores the mem_ok result", disasm.replace(rblk, re.sub(r"(<mem_ok>\n\s+[0-9a-f]+:\t[0-9a-f]+ \t)cbz\tw0,", r"\1cbnz\tw1,", rblk), 1)),
+        ("r32 passes another stack slot as the window", disasm.replace(rblk, re.sub(r"ldr\tw0, \[sp, #60\]", r"ldr\tw0, [sp, #56]", rblk), 1)),
+        ("r32 passes no offset to mem_ok", disasm.replace(rblk, re.sub(r"mov\tw1, w(\d+)\n(\s+[0-9a-f]+:\t[0-9a-f]+ \tbl\t[0-9a-f]+ <mem_ok>)", r"mov\tw1, wzr\n\2", rblk), 1)),
+        ("r32 mem_ok refusal goes to a different target", disasm.replace(rblk, re.sub(r"(<mem_ok>\n\s+[0-9a-f]+:\t[0-9a-f]+ \tcbz\tw0, )[0-9a-f]+ <r32\+0x[0-9a-f]+>", r"\g<1>7fc <r32+0xb0>", rblk), 1)),
         ("r32 writes", disasm.replace("<r32>:\n", "<r32>:\n 1:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1: R_AARCH64_CALL26\ttry_write32\n", 1)),
         ("r32 guard read dropped", disasm.replace(rblk, re.sub(r"R_AARCH64_CALL26\ttry_read32", "R_AARCH64_NONE\ttry_read32", rblk, count=1), 1)),
         ("ctx_read lost the CR1 read", disasm.replace(cblk, re.sub(r"mov\tx(\d+), #0x200\b", r"mov\tx\1, #0x2f0", cblk), 1)),
@@ -4638,7 +4820,7 @@ def main() -> None:
     wlan_seq_selftest()
     _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
     check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
-    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S32 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
+    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S33 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 8 blocks, all inside the allowlist; every write row has a restore")
     wlanlink_source_selftest()
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())
