@@ -149,6 +149,11 @@ def waitusb(d):
                 return
         time.sleep(1 if expect_reset else 5)
     timed_out = bool(hard and now() >= hard)
+    if run.get("remote") and not timed_out and gone is not None and not usb_present():
+        # B1 as the default end: --duration is up, the phone still runs iOS: the caller sends the software reset (xrun EARLY branch)
+        mark(d, ["early=%f" % now(), "t_end=%f" % now(), "host_end=1"])
+        print("EARLY")
+        return
     m = re.match(r"\d+", str(run.get("restart") or ""))
     reset_due = bool(m) and now() - t0 >= float(m.group(0))
     if timed_out and gone is not None and reset_due:
@@ -355,6 +360,8 @@ def build(d, stop_on=None):
                 lines = lines[:last + 1]
             full = float(run.get("duration") or 0)
             early_txt = "stopped at %s (full run would have waited %ds)" % (at(st), full)
+    if run.get("host_end") and run.get("early"):
+        early_txt = "ended by the host at +%ds (--duration), software reset" % (float(run["early"]) - t0 if t0 else 0)
     if stop and run.get("replay_stop") and not early_txt:
         early_txt = "NOT reached: stop pattern(s) never all seen, a live run would have waited the full %ds" % float(run.get("duration") or 0)
     # EXPECT

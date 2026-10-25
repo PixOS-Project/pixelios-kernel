@@ -146,6 +146,25 @@ class Report(unittest.TestCase):
         self.assertEqual(how, "TIMEOUT")
         self.assertNotIn("late_back", rj)
 
+    def test_duration_end_by_host_when_remote_reset_is_on(self):
+        # B1 default: no stop pattern, the phone runs iOS (off the bus) when --duration is up -> EARLY + host_end, scored PASS without waiting for a timer
+        t = {"v": T0}
+        d = self.run_dir("20260101T000800Z-h", snaps=[(30, LOG1)], run={"remote": "1", "duration": "120", "t_boot": str(T0), "expect": ["SWEET CPU"]})
+        xrun_report.mark(str(d), ["usb_gone=%f" % (T0 + 2)])
+        old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+        xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = (lambda: t["v"]), (lambda x: t.__setitem__("v", t["v"] + x)), (lambda: False)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                xrun_report.waitusb(str(d))
+        finally:
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+        self.assertEqual(out.getvalue().strip(), "EARLY")
+        self.assertAlmostEqual(t["v"] - T0, 120, delta=6)
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("ended by the host", r["run"]["early"])
+
     def test_reset_text_names_what_the_phone_came_back_as(self):
         d = self.run_dir("20260101T000600Z-r", snaps=[(30, LOG1)], run={"restart": "60,bootloader", "expect": ["SWEET CPU"]})
         xrun_report.mark(str(d), ["usb_back=%f" % (T0 + 150), "usb_back_id=18d1:4ee0"])
