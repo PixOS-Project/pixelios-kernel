@@ -716,8 +716,8 @@ def self_test():
             if COV.get(r) != {"ok", "viol"}:
                 fails.append(f"coverage: rule {r} saw {sorted(COV.get(r, []))}, needs ok and viol fixtures")
         surv = []
-        for r in sorted(rules):
-            for mode in ("off", "on"):
+        for r in sorted(rules):   # the rule-toggle mutants replay every fixture 2x per rule: skip them once the verdict is already FAIL
+            for mode in ("off", "on") if not fails else ():
                 MUT = (r, mode)
                 if all(got == want for _, (got, want) in res()):
                     surv.append(f"{r}/{mode}")
