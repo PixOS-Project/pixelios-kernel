@@ -39,7 +39,7 @@ struct fake {
 	struct wrap sm, ca;
 	int has_r2, nowincheck, map_fail, ignore_writes, ones_space, ones_on, st_stuck_sm, st_stuck_ca, win_stuck;
 	unsigned nrd, nw, nmap, fail_rd_at, drop_at, fail_wr_at, corrupt_at;
-	unsigned long clock_us, bankidx_t;
+	unsigned long clock_us, bankidx_t, assert_t[2];
 	struct wrec w[512];
 	uint32_t ones_win;
 };
@@ -135,8 +135,14 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 		return 0;
 	}
 	wp = space == SWW_BAR0 ? f_wrap(f, f->win0) : 0;
-	if (wp && off == SWL_AGENT_IOCTL) wp[0] = v | f->ioctl_noise;
+	if (wp && off == SWL_AGENT_IOCTL) {
+		if ((wp[1] & 1u) && f->clock_us - f->assert_t[f->win0 == SWW_WIN_CA7WRAP] < 10)      /* aiutils.c:1263 OSL_DELAY(10) after the assert */
+			f->early++;
+		wp[0] = v | f->ioctl_noise;
+	}
 	if (wp && off == SWL_AGENT_RESET_CTL) {
+		if (v == 1)
+			f->assert_t[f->win0 == SWW_WIN_CA7WRAP] = f->clock_us;
 		wp[1] = v;
 		if (v == 1 && ((f->win0 == SWW_WIN_SMWRAP && f->st_stuck_sm) || (f->win0 == SWW_WIN_CA7WRAP && f->st_stuck_ca)))
 			wp[2] = 1;
@@ -575,6 +581,18 @@ static void gates(void)
 	CHECK(swl_wr(&x, SWW_ATU, 0, SWW_R2(4), SWW_ATU_ENABLE) == -SWW_E_ORDER && f.nw == 0 && f.a2[1] == 0);
 	obs(&f); mkx(&x, &b, 3); ready(&x, &f, F_ATU); x.done = (1u << SWT_ATU_BASE) | (1u << SWT_ATU_LIMIT) | (1u << SWT_ATU_TARGET);
 	CHECK(swl_wr(&x, SWW_ATU, 0, SWW_R2(4), SWW_ATU_ENABLE) == 0 && f.nw == 1 && f.a2[1] == SWW_ATU_ENABLE && x.armed == SWW_RG_ATU2);
+	obs(&f); mkx(&x, &b, 3); ready(&x, &f, F_ATU); f.a2[1] = 0x40000000u; x.done = (1u << SWT_ATU_BASE) | (1u << SWT_ATU_LIMIT) | (1u << SWT_ATU_TARGET);
+	CHECK(swl_wr(&x, SWW_ATU, 0, SWW_R2(4), SWW_ATU_ENABLE) == -SWW_E_OLD && f.nw == 0);
+	/* each BAR0 window select is gated by the step before it */
+	{
+		static const struct { uint32_t win, miss; } ws[3] = { { SWW_WIN_SMWRAP, SWF_W3 }, { SWW_WIN_SYSMEM, SWF_W4 }, { SWW_WIN_CA7WRAP, SWF_W5 } };
+		unsigned k;
+
+		for (k = 0; k < 3; k++) {
+			obs(&f); mkx(&x, &b, 3); ready(&x, &f, F_ALL & ~ws[k].miss);
+			CHECK(swl_wr(&x, SWW_CFG, 0, 0x80, ws[k].win) == -SWW_E_PHASE && f.nw == 0);
+		}
+	}
 	/* a window select is reusable and does not arm a restore */
 	obs(&f); mkx(&x, &b, 3); ready(&x, &f, F_ALL);
 	CHECK(swl_wr(&x, SWW_CFG, 0, 0x80, SWW_WIN_PCIE) == 0 && swl_wr(&x, SWW_CFG, 0, 0x80, SWW_WIN_PCIE) == 0 && f.nw == 2 && x.armed == 0);
@@ -604,8 +622,10 @@ static void steps(void)
 		f.a2[idx[i]] = idx[i] == 1 ? 0x80000000u : 1u;
 		CHECK(run(&f, &x, 3) < 0 && x.row == 1 && f.nw == 0 && x.stop_code == SWW_E_STATE);
 	}
-	obs(&f); f.a2[2] = 0x12345678u; f.a2[4] = 1; f.a2[5] = 2; f.a2[1] = 0x7FFFFFFFu;
+	obs(&f); f.a2[2] = 0x12345678u; f.a2[4] = 1; f.a2[5] = 2;
 	CHECK(run(&f, &x, 3) == 0);
+	obs(&f); f.a2[1] = 0x40000000u;                  /* CR2 must be exactly 0 (BAR_MODE set is not 'untouched') */
+	CHECK(run(&f, &x, 3) < 0 && x.row == 1 && f.nw == 0 && x.stop_code == SWW_E_STATE);
 	/* W2: no region 2 in silicon (reads back 0): STOP at the first store, nothing armed; mapping refused: STOP with the CR2 restore */
 	obs(&f); f.has_r2 = 0;
 	CHECK(run(&f, &x, 3) < 0 && x.row == 2 && f.nw == 1 && x.stop_code == SWW_E_READBACK && x.restore == SWW_RS_NONE);

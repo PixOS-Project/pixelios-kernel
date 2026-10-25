@@ -6,7 +6,7 @@ No image copy, no NVRAM, no ARM release: later runs are more rows in the tables.
 atu-r2-off (tools/mkadt.py, soc.json wlan.tcm/tcm_bytes/atu_r2_off). Host test: shim/wlan_wr_host_test.c, mutants: tools/test_wlan_wr_mutants.py. HW-WRITE path: NOT reviewed yet.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
-index 277e201..6a976a7 100644
+index 277e201..4934fe3 100644
 --- a/bsd/dev/sweet_wlan.c
 +++ b/bsd/dev/sweet_wlan.c
 @@ -4,17 +4,22 @@
@@ -42,7 +42,7 @@ index 277e201..6a976a7 100644
  	uint32_t win;
  	int level;
  };
-@@ -128,6 +133,110 @@ sweet_wlan_fwcheck(void)
+@@ -128,6 +133,115 @@ sweet_wlan_fwcheck(void)
  	printf("SWEET WLAN: fw container ok at %#llx, %llu bytes, %u entries\n", pa, len, n);
  }
  
@@ -107,6 +107,11 @@ index 277e201..6a976a7 100644
 +	if (space != SWW_CFG && space != SWW_ATU && space != SWW_BAR0) {
 +		return -1;
 +	}
++	/* only the offsets swl_wt[] and swl_rs[] name: cfg 0x80; ATU region 2 base, limit, target, CR2; BAR0 IOCTL, RESET_CTL, bankidx */
++	if ((space == SWW_CFG && off != SWW_CFG_WIN) || (space == SWW_ATU && (off < SWW_R2(0x04) || off > SWW_R2(0x14) || off == SWW_R2(0x0C))) ||
++	    (space == SWW_BAR0 && off != SWL_AGENT_IOCTL && off != SWL_AGENT_RESET_CTL && off != SWW_SM_BANKIDX)) {
++		return -1;
++	}
 +	p = sw3_ptr(h, space, off);
 +	if (p == NULL || (space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win)) {
 +		return -1;
@@ -153,7 +158,7 @@ index 277e201..6a976a7 100644
  void
  sweet_wlan_init(void)
  {
-@@ -149,7 +258,7 @@ sweet_wlan_init(void)
+@@ -149,7 +263,7 @@ sweet_wlan_init(void)
  	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
  		return;
  	}
@@ -162,7 +167,7 @@ index 277e201..6a976a7 100644
  	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
  	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
  		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
-@@ -160,6 +269,9 @@ sweet_wlan_init(void)
+@@ -160,6 +274,9 @@ sweet_wlan_init(void)
  	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
  		return;
  	}
@@ -172,7 +177,7 @@ index 277e201..6a976a7 100644
  	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
  	if (isop == NULL) {
  		return;
-@@ -192,7 +304,11 @@ sweet_wlan_init(void)
+@@ -192,7 +309,11 @@ sweet_wlan_init(void)
  	}
  	/* first config TLPs, only now that the link and region 0 are proven */
  	hw.win = hw.cfg[0x80 / 4];
@@ -185,7 +190,7 @@ index 277e201..6a976a7 100644
  	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
  	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
  	if (bad) {
-@@ -201,8 +317,11 @@ sweet_wlan_init(void)
+@@ -201,8 +322,11 @@ sweet_wlan_init(void)
  	}
  	bus.rd = sw_rd;
  	bus.ctx = &hw;
@@ -201,10 +206,10 @@ index 277e201..6a976a7 100644
  	}
 diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
 new file mode 100644
-index 0000000..70d8411
+index 0000000..e7cef47
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan_wr.h
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,713 @@
 +/*
 + * BCM4389 chip WRITES, stage 3 run A (docs/research/43 s.1-s.3, W-D3 step 2): the pure part of sweet_wlan.c, host-tested by
 + * shim/wlan_wr_host_test.c (which replays the values observed on the Pixel 6a and kills every guard rule with a mutant,
@@ -318,7 +323,7 @@ index 0000000..70d8411
 +	[SWT_ATU_LIMIT]  = { .row = 2, .run = 1, .space = SWW_ATU, .flags = SWT_ONCE, .pred1 = SWT_ATU_BASE + 1, .off = SWW_R2(0x10), .val = SWW_TCM_PA + (SWW_TCM_BYTES - 1u), .vmask = 0xFFFFFFFFu, .need = SWF_W0 | SWF_W1 },
 +	[SWT_ATU_TARGET] = { .row = 2, .run = 1, .space = SWW_ATU, .flags = SWT_ONCE, .pred1 = SWT_ATU_LIMIT + 1, .off = SWW_R2(0x14), .val = SWW_TCM_PA, .vmask = 0xFFFFFFFFu, .need = SWF_W0 | SWF_W1 },
 +	[SWT_ATU_CR2]    = { .row = 2, .run = 1, .space = SWW_ATU, .rgrp = SWW_RG_ATU2, .flags = SWT_ONCE, .pred1 = SWT_ATU_TARGET + 1, .off = SWW_R2(0x04), .val = SWW_ATU_ENABLE, .vmask = 0xFFFFFFFFu,
-+	                    .omask = SWW_ATU_ENABLE, .oval = 0, .need = SWF_W0 | SWF_W1 },
++	                    .omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W0 | SWF_W1 },
 +
 +	[SWT_SM_ASSERT]     = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u, .vmask = 1u, .need = SWF_W3 },
 +	[SWT_SM_IOCTL_MID]  = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .pred1 = SWT_SM_ASSERT + 1, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_IOCTL, .val = 0x3u, .vmask = SWW_IOCTL_MASK,
@@ -713,7 +718,7 @@ index 0000000..70d8411
 +	return swl_done(x, SWF_W0);
 +}
 +
-+/* W1: region 2 pre-reads, nothing written */
++/* W1: region 2 pre-reads, nothing written: CR1, CR2, UPPER_BASE and UPPER_TARGET must be 0 (region 2 unused; the CR2 tuple writes 0 -> enable only) */
 +static inline int
 +swl_w1(struct swl_wx *x)
 +{
@@ -725,7 +730,7 @@ index 0000000..70d8411
 +		SWW_RD(x, SWW_ATU, 0, SWW_R2(4u * i), r[i]);
 +	}
 +	printf("SWEET WLAN: W1 ATU r2 %#x %#x %#x %#x %#x %#x %#x\n", r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
-+	if (r[0] != 0 || r[3] != 0 || r[6] != 0 || (r[1] & SWW_ATU_ENABLE)) {
++	if (r[0] != 0 || r[3] != 0 || r[6] != 0 || r[1] != 0) {
 +		return swl_stop(x, SWW_E_STATE);
 +	}
 +	return swl_done(x, SWF_W1);
@@ -756,7 +761,7 @@ index 0000000..70d8411
 +	return swl_done(x, SWF_MAPPED);
 +}
 +
-+/* W3: SRPWR is READ-ONLY here: domain 1 (ARM/BP) must already be requested and up (the shim left it so, S34); no tuple writes it */
++/* W3: SRPWR is READ-ONLY here: domain 1 (ARM/BP) must already be requested and up (the chip's value as observed in w3a-n36, S34 skipped the request; the hold flavor does not run S34); no tuple writes it */
 +static inline int
 +swl_w3(struct swl_wx *x)
 +{
@@ -785,6 +790,7 @@ index 0000000..70d8411
 +	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
 +	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_IOCTL, mid));
 +	SWW_TRY(swl_wait(x, win, SWL_AGENT_IOCTL, SWW_IOCTL_MASK, mid, 1, 0));
++	/* two waits on purpose: DHD's SPINWAIT after the IOCTL write (aiutils.c:1279) and the first one inside the release loop (:1288); shim rows 1363/1364 */
 +	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
 +	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
 +	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 0u));

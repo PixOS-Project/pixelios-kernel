@@ -67,8 +67,12 @@ def audit_store_path(hdr, glue):
     for fn in ("swl_wr", "swl_restore"):
         if "swl_store(" not in body(hdr, fn):
             f.append("%s does not use swl_store" % fn)
-    if len(re.findall(r"\*\s*p\s*=\s*v\s*;", glue)) != 1 or not re.search(r"\*p = v;", body(glue, "sw3_wr")):
+    # statement-initial stores through a dereferenced or subscripted pointer; `*v = *p;` is sw3_rd handing the read result to its caller
+    stores = [m for m in re.findall(r"(?:^|[{;])[ \t]*((?:\*\s*\w+|\w+(?:->\w+)?\s*\[[^\]]*\])\s*=(?!=))", glue, re.M) if not re.match(r"\*\s*v\s*=", m)]
+    if len(stores) != 1 or "*p = v;" not in body(glue, "sw3_wr"):
         f.append("a store through a pointer outside sw3_wr")
+    if "off != SWW_CFG_WIN" not in body(glue, "sw3_wr") or "SWW_R2(0x14)" not in body(glue, "sw3_wr") or "SWW_SM_BANKIDX" not in body(glue, "sw3_wr"):
+        f.append("sw3_wr does not limit the offsets to the table's")
     if len(re.findall(r"\bsw3_wr\b", glue)) != 2 or "wb.wr = sw3_wr;" not in glue:
         f.append("sw3_wr used other than as the bus wr callback")
     return f
@@ -105,7 +109,8 @@ MUTANTS = [
     ("store failure ignored", [("if (swl_store(x, space, win, off, val)) {\n\t\treturn swl_stop(x, SWW_E_WR);", "swl_store(x, space, win, off, val);\n\tif (0) {\n\t\treturn swl_stop(x, SWW_E_WR);")], None),
     ("no read-back compare", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (swl_rdx(x, space, win, off, &rb)) {")], None),
     ("read-back compares all 32 bits", [("((rb ^ val) & p->vmask)", "((rb ^ val) & 0xFFFFFFFFu)")], None),
-    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {")], "a failed read leaves rb = 0, which differs from every value a tuple writes except 0 (RESET_CTL release, CR2 restore): see wlan_wr_host_test read-fail sweep"),
+    ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {")], None),
+    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (((rb ^ val) & p->vmask)) {")], None),
     ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\treturn swl_stop(x, SWW_E_RD);")], None),
     ("done bit not recorded", [("\tx->done |= 1u << t;\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
@@ -114,7 +119,7 @@ MUTANTS = [
     ("endpoint precondition dropped", [("bad = swl_pre_ep(cmd, b0, b1);", "bad = 0;")], None),
     ("region 2 not pinned once enabled", [("if (x->flags & SWF_W2) {", "if (0) {")], None),
     ("region 2 word compare dropped", [("if (r2 != w2[i]) {\n\t\t\t\treturn 7;", "if (0) {\n\t\t\t\treturn 7;")], None),
-    ("precondition read failure ignored", [("if (swl_rdx(x, SWW_ISO, 0, 0, &iso) || swl_rdx(x, SWW_ELBI, 0, 0x2C8u, &ltssm)) {\n\t\treturn 8;", "if (0) {\n\t\treturn 8;")], "a failed read leaves the register image at its previous value only inside the fake; the read-fail sweep covers the real position"),
+    ("precondition read failure ignored", [("if (swl_rdx(x, SWW_ISO, 0, 0, &iso) || swl_rdx(x, SWW_ELBI, 0, 0x2C8u, &ltssm)) {\n\t\treturn 8;", "if (0) {\n\t\treturn 8;")], None),
     # --- reads: deny by default
     ("read table: space not compared", [("if (swl_rt[i].space == space && swl_rt[i].win == win", "if (swl_rt[i].win == win")], None),
     ("read table: window not compared", [("swl_rt[i].space == space && swl_rt[i].win == win && off", "swl_rt[i].space == space && off")], None),
@@ -141,7 +146,8 @@ MUTANTS = [
     ("CA7 final IOCTL value", [(".val = 0x21u,", ".val = 0x20u,")], None),
     ("SYS_MEM middle IOCTL value", [(".val = 0x3u, .vmask = SWW_IOCTL_MASK,\n\t                       .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 1u, .need = SWF_W3 }", ".val = 0x7u, .vmask = SWW_IOCTL_MASK,\n\t                       .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 1u, .need = SWF_W3 }")], None),
     ("ATU limit one too high", [("SWW_TCM_PA + (SWW_TCM_BYTES - 1u), .vmask", "SWW_TCM_PA + SWW_TCM_BYTES, .vmask")], None),
-    ("CR2 may be written over an enabled region", [(".omask = SWW_ATU_ENABLE, .oval = 0, ", "")], None),
+    ("CR2 may be written over an enabled region", [(".omask = 0xFFFFFFFFu, .oval = 0, ", "")], None),
+    ("CR2 old value only bit 31 checked", [(".omask = 0xFFFFFFFFu, .oval = 0, ", ".omask = SWW_ATU_ENABLE, .oval = 0, ")], None),
     ("CR2 not last", [(".pred1 = SWT_ATU_TARGET + 1, .off = SWW_R2(0x04)", ".pred1 = SWT_ATU_BASE + 1, .off = SWW_R2(0x04)")], None),
     ("SYS_MEM release without the middle IOCTL", [(".coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = 0x3u, .need = SWF_W3 }", ".coff = SWL_AGENT_IOCTL, .cmask = 0, .cval = 0x3u, .need = SWF_W3 }")], None),
     ("IOCTL read-back mask 0x3FFF -> 0", [("#define SWW_IOCTL_MASK  0x3FFFu", "#define SWW_IOCTL_MASK  0x0u")], None),
@@ -156,7 +162,8 @@ MUTANTS = [
     ("W1: CR1 must be 0", [("if (r[0] != 0 || ", "if (")], None),
     ("W1: UPPER_BASE must be 0", [("r[3] != 0 || ", "")], None),
     ("W1: UPPER_TARGET must be 0", [("r[6] != 0 || ", "")], None),
-    ("W1: CR2 bit 31 must be clear", [(" || (r[1] & SWW_ATU_ENABLE)) {", ") {")], None),
+    ("W1: CR2 must be 0", [(" || r[1] != 0) {", ") {")], None),
+    ("W1: CR2 only bit 31 checked", [(" || r[1] != 0) {", " || (r[1] & SWW_ATU_ENABLE)) {")], None),
     ("W2: BAR2 map failure ignored", [("if (x->b->map2(x->b->ctx)) {", "if (0) {")], None),
     ("W2: map failure does not restore CR2", [("\t\tx->armed = SWW_RG_ATU2;\n", "")], None),
     ("W3: domain 1 request bit", [("|| !(v & SWW_SRPWR_REQ1)", "")], None),
@@ -172,6 +179,10 @@ MUTANTS = [
     ("W5: nb pin", [("|| x->nb != SWW_NB || x->nrb + x->nb > SWW_BANK_ROM", "|| x->nrb + x->nb > SWW_BANK_ROM")], None),
     ("W5: nrb+nb below the ROM bit", [("|| x->nrb + x->nb > SWW_BANK_ROM", "")], "implied by the two pins SWW_NRB + SWW_NB = 29 < 0x80; the independent guard is swl_wr_ok (val < SWW_BANK_ROM), killed above"),
     ("W5: bankinfo dead read", [("if (bi == 0xFFFFFFFFu) {", "if (0) {")], None),
+    ("reset: 10 us after the assert", [("\tSWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 1u));\n\tswl_delay(x, 10);", "\tSWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 1u));")], None),
+    ("SYS_MEM wrapper window select without SRPWR proven", [(".val = SWW_WIN_SMWRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W3", ".val = SWW_WIN_SMWRAP, .vmask = 0xFFFFFFFFu, .need = 0")], None),
+    ("SYS_MEM core window select without the reset", [(".val = SWW_WIN_SYSMEM, .vmask = 0xFFFFFFFFu, .need = SWF_W4", ".val = SWW_WIN_SYSMEM, .vmask = 0xFFFFFFFFu, .need = 0")], None),
+    ("CA7 window select without the banks", [(".val = SWW_WIN_CA7WRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W5", ".val = SWW_WIN_CA7WRAP, .vmask = 0xFFFFFFFFu, .need = 0")], None),
     ("W5: 10 us before bankinfo", [("\t\tswl_delay(x, 10);\n\t\tSWW_RD(x, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKINFO, bi);", "\t\tSWW_RD(x, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKINFO, bi);")], None),
     ("W5: bank size formula", [("SWW_BANK_SZBASE * ((bi & SWW_BANK_SZMASK) + 1u)", "SWW_BANK_SZBASE * (bi & SWW_BANK_SZMASK)")], None),
     ("W5: bank size mask", [("(bi & SWW_BANK_SZMASK)", "(bi & 0xFFu)")], None),
@@ -270,6 +281,11 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("*p = v;", "*p = v;\n\t*p = v;"), "a store through a pointer outside sw3_wr"),
             (hdr, glue + "\nstatic void sw3_z(volatile uint32_t *p, uint32_t v) { *p = v; }\n", "a store through a pointer outside sw3_wr"),
             (hdr, glue + "\nstatic void sw3_y(void) { sw3_wr(0, 0, 0, 0, 0); }\n", "sw3_wr used other than as the bus wr callback"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\th->cfg[1] = 6;"), "a store through a pointer outside sw3_wr"),
+            (hdr, glue + "\nstatic void sw3_x(struct sw_hw *h) { h->atu[0x101] = 0; }\n", "a store through a pointer outside sw3_wr"),
+            (hdr, glue + "\nstatic void sw3_q(volatile uint32_t *q) { q[0] = 1; }\n", "a store through a pointer outside sw3_wr"),
+            (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN) || ", ""), "sw3_wr does not limit the offsets to the table's"),
+            (hdr, glue.replace("SWW_R2(0x14)", "SWW_R2(0x18)"), "sw3_wr does not limit the offsets to the table's"),
             (hdr, glue.replace("wb.wr = sw3_wr;", "wb.wr = 0;"), "sw3_wr used other than as the bus wr callback"),
         ]
         for h, g, want in bad:
