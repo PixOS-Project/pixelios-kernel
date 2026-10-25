@@ -38,7 +38,7 @@
 +		return ENOENT;
 +	}
 +	target = proc_find((int)req[0]);
-+	if (target == PROC_NULL) {
++	if (target == NULL) {
 +		return ESRCH;
 +	}
 +	cred = kauth_cred_proc_ref(target);

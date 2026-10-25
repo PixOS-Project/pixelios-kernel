@@ -86,12 +86,6 @@ class T(unittest.TestCase):
         self.assertEqual(self.form("LINK summary stopped=refused at=S36 row=(1398|1405) restore=ok")[0], 0)
         self.assertEqual(self.form("LINK R36 row=1397 rd=")[0], 0)         # not a summary expect
 
-    def test_cr08_held_summary_form(self):   # review 21 F5: --wlan-hold ends in restore=held, accepted only as the S30 success
-        self.assertEqual(self.form("LINK summary reached=S30 stopped=none restore=held")[0], 0)
-        self.assertEqual(self.form("LINK summary restore=held")[0], 1)
-        self.assertEqual(self.form("LINK summary reached=S29 stopped=none restore=held")[0], 1)
-        self.assertEqual(self.form("LINK summary reached=S30 stopped=fault at=S30 row=1 restore=held")[0], 1)
-
     def test_cr08_writer_needs_changed_vs(self):
         rc, out = self.form(self.FIXED_FORM, "--writer")
         self.assertEqual(rc, 1, out)
@@ -158,10 +152,6 @@ class T(unittest.TestCase):
         rc, out = self.pf("--", "tools/probe-run", "--build-args", "--wlan-link=9")   # 600 < 560 + 60
         self.assertEqual(rc, 1, out)
         self.assertIn("RESULT: FAIL timeout:", out)
-
-    def test_timeout_default_wlan_hold_600(self):   # review 21 F5: --wlan-hold gets the --wlan-link timeout
-        self.probe_dir("20261023T065220Z-w_", 400, "--wlan-hold")
-        self.assertEqual(self.pf("--", "tools/probe-run", "--build-args", "--wlan-hold")[0], 0)
 
     def test_timeout_stats_uses_all_worktrees(self):   # review round 2 B4: history lives in other worktrees too
         ldr = importlib.machinery.SourceFileLoader("rp2", TOOL)

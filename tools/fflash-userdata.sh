@@ -19,7 +19,13 @@ unl=$(timeout 15 fastboot getvar unlocked 2>&1 | sed -n 's/^unlocked: *//p' | he
 [ "$prod" = bluejay ] && [ "$unl" = yes ] || { echo "REFUSED: product='$prod' unlocked='$unl'" >&2; exit 1; }
 # M7 (docs/PLAN-BOOT-SPEED.md): keep fastboot's own output and print what was really sent, to settle whether holes in the image are skipped
 mkdir -p logs; fl=logs/flash-$(date -u +%Y%m%dT%H%M%SZ).log; t0=$(date +%s)
-fastboot flash userdata "$img" 2>&1 | tee "$fl"
-echo "flash stats: $(grep -c "^Sending sparse" "$fl") sparse part(s) sent of $(grep -o "Sending sparse 'userdata' [0-9]*/[0-9]*" "$fl" | tail -1 | grep -o "/[0-9]*" | tr -d /) , $(( $(date +%s) - t0 )) s, image $(stat -c %s "$img") bytes apparent / $(( $(stat -c %b "$img") * 512 )) allocated (log $fl)"
+fastboot flash userdata "$img" 2>&1 | tee "$fl"; el=$(( $(date +%s) - t0 ))
+# Real payload = non-zero 4096-byte blocks (holes/zero blocks are not sent). `stat %b` is ZFS-compressed size, so it is not printed (docs/research/46).
+# Streaming scan, ~1.4 GB/s measured on a cached 3 GiB file (~8 s for 11 GiB; the sha256 above just read the image); capped at 20 s.
+s0=$(date +%s)
+if nzr=$(timeout 20 python3 -I tools/nonzero-blocks.py "$img" 2>/dev/null); then
+	nzdesc="$(awk -v n="${nzr% *}" 'BEGIN{printf "%.2f", n*4096/1073741824}') GiB non-zero data (${nzr% *} of ${nzr#* } 4 KiB blocks; scan took $(( $(date +%s) - s0 )) s)"
+else nzdesc="non-zero scan skipped (over 20 s)"; fi
+echo "flash stats: $(grep -c "^Sending sparse" "$fl") sparse part(s) sent of $(grep -o "Sending sparse 'userdata' [0-9]*/[0-9]*" "$fl" | tail -1 | grep -o "/[0-9]*" | tr -d /) , $el s, image $(stat -c %s "$img") bytes apparent, $nzdesc (log $fl)"
 echo "$got $(date -u +%FT%TZ) $img" >> "$state"
 echo "flashed; recorded in $state"

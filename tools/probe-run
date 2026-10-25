@@ -70,7 +70,7 @@ main() {
 		--dry-run) dry=1; shift ;; --from-dir) from=${2:-}; shift 2 ;; --lock-wait) lockwait=${2:-0}; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;;
 		*) usage ;; esac; done
 	# the shim sends ~12 sections spaced 3 s apart BEFORE the touch/ACPM lines (first seen at ~65 s): 60 s cut them off
-	[ -n "$timeout" ] || { [ -n "$touch" ] && timeout=240 || timeout=60; case "${args[*]}" in *--wlan-link*|*--wlan-hold*) timeout=600 ;; esac; }
+	[ -n "$timeout" ] || { [ -n "$touch" ] && timeout=240 || timeout=60; case "${args[*]}" in *--wlan-link*) timeout=600 ;; esac; }
 	[[ "$timeout" =~ ^[0-9]+$ ]] || usage
 	label=$(echo "$label" | tr -c 'A-Za-z0-9._-' _)
 	[ ${#args[@]} -gt 0 ] || [ -n "$dry" ] || usage

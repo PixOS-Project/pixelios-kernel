@@ -191,10 +191,6 @@ def c_form(tool, o, writer, changed_vs):
     for p in o.get("--expect", []):
         if "LINK summary" not in p:
             continue
-        if "restore=held" in p:		# --wlan-hold: the link is deliberately left up; only the success form is accepted (review 21 F5)
-            if "stopped=none" not in p or "reached=S30" not in p:
-                return "FAIL", "summary --expect %r: restore=held needs reached=S30 and stopped=none (CR-08)" % p
-            continue
         if "restore=ok" not in p:
             return "FAIL", "summary --expect %r lacks restore=ok: it also matches restore=FAILED (CR-08)" % p
         if not re.search(r"stopped=(none\b|\S+.*\brow=)", p):
@@ -222,9 +218,9 @@ def probe_args(argv):
 
 
 def default_timeout(args):
-    """tools/probe-run: 60, 240 with --touch-probe, 600 with --wlan-link / --wlan-hold in the build args"""
+    """tools/probe-run: 60, 240 with --touch-probe, 600 with --wlan-link in the build args"""
     t = 240 if any(a.startswith("--touch-probe") for a in args) else 60
-    return 600 if any(a.startswith(("--wlan-link", "--wlan-hold")) for a in args) else t
+    return 600 if any(a.startswith("--wlan-link") for a in args) else t
 
 
 def c_timeout(tool, o, margin, argv=()):
