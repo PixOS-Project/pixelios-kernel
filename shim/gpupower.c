@@ -386,12 +386,10 @@ int gpu_power_cycle(void)
 	dump_all("");
 #ifdef GPU_JOB
 	/* --gpu-job (docs/research/28): the one WRITE_VALUE job runs INSIDE the powered window, only if the shaders came up; the OFF sequence below follows in every case */
-	if (up[0] == 'o') {
-		uint64_t tj0 = touch_ticks();
-
+	tj = touch_ticks();
+	if (up[0] == 'o')
 		(void)gpu_job_run();
-		tj = touch_ticks() - tj0;
-	}
+	tj = touch_ticks() - tj;
 #endif
 	/* OFF, always: shaders, then the L2 (which takes the tiler with it); L2 stays on if the shaders did not go off */
 	d = power_off(G_SHADER_OFF, G_SHADER_RDY, G_SHADER_TR, GPU_SHADER_PRESENT);
