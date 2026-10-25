@@ -126,7 +126,7 @@ def uncited(path):
 # ---- checks (each returns (status, detail), status PASS|FAIL|SKIP) ---------------------------------------------------
 def opts(argv):
     """-> dict name -> list of values for the options this tool cares about (xrun/probe-run); unknown options are ignored."""
-    want = {"--args", "--expect", "--stop-on", "--label", "--timeout", "--hard-timeout", "--overlay", "--build-args"}
+    want = {"--args", "--expect", "--stop-on", "--label", "--timeout", "--hard-timeout", "--overlay", "--build-args", "--intent"}
     o, i = {}, 0
     while i < len(argv):
         if argv[i] in want and i + 1 < len(argv):
@@ -303,12 +303,42 @@ def skip_notes(tool, o):
     return s
 
 
+INTENTS = os.environ.get("PREFLIGHT_INTENTS") or os.path.join(HERE, "run-intents.json")
+
+
+def c_intent(argv, name, label=None):
+    """Per-intent flag table (tools/run-intents.json) -> (status, detail). name empty = no check; the label hint is a note, never a failure."""
+    tab = json.load(open(INTENTS))["intents"]
+    flags = {a for a in argv if a.startswith("--")}
+    toks = set(" ".join(opts(argv).get("--args", [])).split())
+    hint = ""
+    lab = label if label is not None else (opts(argv).get("--label") or [""])[-1]
+    for n, t in tab.items():
+        if lab and any(lab.lower().startswith(p) for p in t.get("label_prefix", [])) and n != name:
+            hint = "warning: label '%s' suggests --intent %s%s" % (lab, n, " (given: %s)" % name if name else " (none given)")
+            break
+    if hint and not (os.environ.get("XRUN_INTENT_OK") == "1" and name):   # a label that implies an intent needs that intent: none given (E23 bypass for scripts calling xrun), `none`, or another one all exit 2
+        return ("FAIL", hint.replace("warning: ", "") + ": pass --intent " + hint.split("--intent ")[1].split(" ")[0] + " (a run that really mixes purposes: XRUN_INTENT_OK=1 with an explicit --intent)")
+    if not name or name == "none":   # `--intent none` = explicit opt-out for an unlabelled run (tools/agent-guard E23 demands one of the two)
+        return ("PASS", "note: --intent none (opt-out)" if name else "")
+    if name not in tab:
+        return ("FAIL", "unknown --intent %s (known: %s)" % (name, " ".join(sorted(tab))))
+    t = tab[name]
+    miss = [f for f in t["require_flags"] if f not in flags] + [a for a in t["require_args"] if a not in toks]
+    bad = [f for f in t["forbid_flags"] if f in flags] + [a for a in t["forbid_args"] if a in toks]
+    if miss or bad:
+        return ("FAIL", "intent %s: " % name + ("missing %s" % " ".join(miss) if miss else "") + (" " if miss and bad else "") + ("forbidden %s" % " ".join(bad) if bad else ""))
+    return ("PASS", hint)
+
+
 def run_checks(tool, argv, root_sha, margin, writer=False, changed_vs=None):
     o = opts(argv)
     res = [("bootargs",) + c_bootargs(tool, o), ("syntax",) + c_syntax(tool, o), ("reach",) + c_reach(tool, o),
            ("form",) + c_form(tool, o, writer, changed_vs),
            ("timeout",) + c_timeout(tool, o, margin, argv), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
            ("lock",) + c_lock(tool, o)]
+    if "--intent" in o:
+        res.append(("intent",) + c_intent(argv, o["--intent"][-1]))
     return res, skip_notes(tool, o)
 
 
@@ -333,6 +363,14 @@ def main(argv):
             with open(KNOWN, "w") as f:
                 f.write(text)
             print("wrote %s (%d names)\nRESULT: PASS" % (KNOWN, text.count("\n")))
+            return 0
+        if argv[:1] == ["--intent-check"] and len(argv) > 3 and argv[2] == "--label":   # called by tools/xrun: --intent-check NAME --label L -- tools/xrun ARGS
+            st, d = c_intent(argv[argv.index("--") + 1:], argv[1], argv[3])
+            if d.startswith("warning"):
+                print("run-preflight: " + d, file=sys.stderr)
+            if st == "FAIL":
+                print("RESULT: ERROR %s (tools/run-intents.json)" % d)
+                return 2
             return 0
         js, root_sha, margin, i, writer, changed_vs = False, None, 60.0, 0, False, None
         while i < len(argv) and argv[i] != "--":

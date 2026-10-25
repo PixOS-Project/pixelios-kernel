@@ -1,0 +1,8 @@
+{
+  "_source": "gpu: docs/HANDOFF.md section 43g6 item 1 (gputest19-24 lacked --gpu-handover, build.sh:57,218-220); sweetmali=1 is NOT required (not every GPU probe loads the Mali kext); timing: patch 0115 (boot-arg sweetlogts=1, docs/AUTOMATION.md:525), patch 0047 (sweetlog=0 disables the log, default on, so sweetlog=0 is forbidden; a boot-arg sweetlogs does not exist in bootargs-known.txt); wlan: tools/build-xnu-image.sh on branch tools/wlanfw3 lines 16,40 (--wlan-hold adds sweetwlan=N, patch 0120) and NO require_flags on wlan: --wlan-hold is a shim/build.sh flag (W-D1 done, w3a-s34) that tools/xrun does not accept on this branch nor in w3a-s34 (grep tools/xrun: absent; xrun exits 2 unknown option), so requiring it makes the intent unpassable; add it here when xrun passes it through. Labels: HANDOFF uses wd2-1, wd2-1b, wd2-2, wd3-1 (prefix wd+digit so wdog/wdt do not match; prefixes are matched case-insensitively). docs/GOALS.md W-D2 / HANDOFF wd3-1 run line (--wlan-hold --wlan-level 1)",
+  "intents": {
+    "gpu":    {"label_prefix": ["gpu"], "require_flags": ["--gpu-handover"], "require_args": [], "forbid_flags": [], "forbid_args": []},
+    "timing": {"label_prefix": ["iortc", "timing"], "require_flags": [], "require_args": ["sweetlogts=1"], "forbid_flags": [], "forbid_args": ["sweetlog=0"]},
+    "wlan":   {"label_prefix": ["wlan", "wd0", "wd1", "wd2", "wd3", "wd4", "wd5", "wd6", "wd7", "wd8", "wd9"], "require_flags": [], "require_args": [], "forbid_flags": [], "forbid_args": []}
+  }
+}
