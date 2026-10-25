@@ -108,7 +108,7 @@ class G(unittest.TestCase):
     def test_installed_hook_fails_open_but_blocks_a_collision(self):
         self.pn("install-hook")
         hook = os.path.join(self.d, ".git/hooks/pre-commit")
-        text = open(hook).read().replace("~/.t3/worktrees/common-tools/kernel/tools/patch-numbers", os.path.join(self.d, "tools/patch-numbers"))
+        text = open(hook).read().replace("$HOME/.t3/worktrees/common-tools/kernel/tools/patch-numbers", os.path.join(self.d, "tools/patch-numbers"))
         open(hook, "w").write(text); os.chmod(hook, 0o755)
         self.git("checkout", "-qb", "wifi2"); self.w("xnu/patches/0102-wlan.patch", "w"); self.git("add", "-A")
         r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "x"], env=self.env, capture_output=True, text=True)
