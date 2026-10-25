@@ -5,7 +5,7 @@
 
 Checks:
   1. Patch sequence in xnu/patches/:
-     - Sequential numbering starting at 0001 with no duplicates or gaps.
+     - Sequential numbering starting at 0001 with no duplicates or gaps (a gap is allowed only where tools/patch-numbers shows the number on another branch/reservation).
      - Patch files are non-empty and have valid unified diff markers.
   2. Python script syntax:
      - All tools/*.py compile cleanly via py_compile.
@@ -21,6 +21,16 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def green(text): return f"\033[92m{text}\033[0m"
 def red(text): return f"\033[91m{text}\033[0m"
 def bold(text): return f"\033[1m{text}\033[0m"
+
+
+def numbers_held_elsewhere():
+    """Patch numbers that tools/patch-numbers lists on another branch or as a reservation (TP-022: branches number from one shared sequence, so this
+    branch may legitimately skip a number another branch holds). Fails closed: any problem running the tool = no number is excused."""
+    try:
+        out = subprocess.run([os.path.join(REPO_ROOT, 'tools/patch-numbers'), 'status'], capture_output=True, text=True, timeout=60, cwd=REPO_ROOT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {int(m.group(1)) for m in re.finditer(r'^(\d{4})  \1-\S+\.patch ', out, re.M)}
 
 
 def validate_patches(verbose=False):
@@ -59,8 +69,11 @@ def validate_patches(verbose=False):
     if seen_numbers:
         sorted_nums = sorted(seen_numbers.keys())
         expected = 1
+        elsewhere = numbers_held_elsewhere()
         for num in sorted_nums:
-            if num != expected:
+            if num != expected and all(n in elsewhere for n in range(expected, num)):
+                expected = num + 1
+            elif num != expected:
                 errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
                 expected = num + 1
             else:
