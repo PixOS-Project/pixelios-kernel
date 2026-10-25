@@ -258,19 +258,33 @@ class T(unittest.TestCase):
         self.assertIn("--kernel FILE is required", out)
 
     def test_intent_wlan_unknown_and_none(self):
-        self.assertIn("intent wlan: missing --wlan-hold", self.xr("--intent", "wlan")[1])
+        rc, out = self.xr("--intent", "wlan", "--label", "wd2-1")   # wlan row has no required flag (xrun lacks --wlan-hold): must pass the intent check
+        self.assertIn("--kernel FILE is required", out)
+        rc, out = self.xr("--label", "wdog")   # `wd` alone no longer implies wlan
+        self.assertIn("--kernel FILE is required", out)
+        rc, out = self.xr("--label", "wd2-2")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("suggests --intent wlan", out)
         self.assertIn("unknown --intent nope", self.xr("--intent", "nope")[1])
         rc, out = self.xr("--label", "gputest26")   # no --intent but the label implies one: exit 2 (closes the E23 bypass for scripts calling xrun)
         self.assertEqual(rc, 2, out)
-        self.assertIn("suggests --intent gpu (none given): add --intent gpu", out)
+        self.assertIn("suggests --intent gpu (none given): pass --intent gpu", out)
+        rc, out = self.xr("--intent", "none", "--label", "gputest26")   # opt-out on a gpu label is exit 2 too
+        self.assertEqual(rc, 2, out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1", "--label", "gputest26")   # mismatch
+        self.assertEqual(rc, 2, out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1", "--label", "GPUtest26")   # case-insensitive
+        self.assertEqual(rc, 2, out)
+        self.env["XRUN_INTENT_OK"] = "1"   # explicit escape for a run that mixes purposes
         rc, out = self.xr("--intent", "none", "--label", "gputest26")
         self.assertIn("--kernel FILE is required", out)
+        del self.env["XRUN_INTENT_OK"]
         rc, out = self.xr("--label", "zzz-unknown")   # unknown label, no --intent: unchanged
         self.assertIn("--kernel FILE is required", out)
 
     def test_intent_label_escalation_mutant(self):
         src = open(TOOL).read()
-        old = "if not name and hint:"
+        old = 'if hint and not (os.environ.get("XRUN_INTENT_OK") == "1" and name):'
         self.assertEqual(src.count(old), 1)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "rp"); open(path, "w").write(src.replace(old, "if False:"))
