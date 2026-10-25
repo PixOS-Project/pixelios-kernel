@@ -696,6 +696,7 @@ int wlan_link_run(void)
 
 int wlan_link_hold(struct wlan_hold *h)
 {
+	(void)h;
 	con_str("WLAN", "LINK hold refused: --wlan-link not built or not gs101, nothing written");
 	return 2;
 }
