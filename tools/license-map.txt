@@ -9,6 +9,8 @@ LICENSE	MIT	pixos: LICENSE:1-3 Copyright (c) 2026 PixOS-Project contributors
 xnu/patches/0120-*	APSL-2.0 AND ISC	apple-xnu + OpenBSD bwfm.c v1.118, THIRD_PARTY row 10 (Wi-Fi branch only, absent here)
 xnu/patches/0081-*	APSL-2.0 AND MIT	apple-xnu + Project Nayuki qrcodegen embedded, THIRD_PARTY row 9
 xnu/patches/0085-*	APSL-2.0	written by this project, clean-room, spec docs/cleanroom/patch-0085-spec.md, audit docs/reviews/cleanroom-0085-audit.md
+xnu/patches/0110-*	APSL-2.0	written by this project, clean-room, spec docs/cleanroom/patch-0110-spec.md (super repo), audit docs/reviews/cleanroom-0110-audit.md; accepted forced similarity overlaps (0110: pristine env-loop idiom, 8 lines)
+xnu/patches/0112-*	APSL-2.0	written by this project, clean-room, spec docs/cleanroom/patch-0112-spec.md (super repo), audit docs/reviews/cleanroom-0112-audit.md; accepted forced similarity overlaps (0112: 2 of 6 lines forced by the spec)
 xnu/patches/000[1-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5 (0058 also carries Apple IOHIDFamily headers, row 6)
 xnu/patches/00[1-4][0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5 (stagers 0019/0020/0026 .sh: ios-sweet files, row 2)
 xnu/patches/005[0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5,6 (0058: Apple IOHIDFamily headers)
