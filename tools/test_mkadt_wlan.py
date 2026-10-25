@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import unittest
 
@@ -45,12 +46,16 @@ class SweetWlanNode(unittest.TestCase):
         self.assertEqual(p["reg"], mkadt.u64(int(w["mem"], 0), 0x10000))
         self.assertEqual(p["cfg"], mkadt.u64(int(w["cfg"], 0), 0x1000))
         self.assertEqual(p["atu"], mkadt.u64(int(w["atu"], 0), 0x1000))
+        self.assertEqual(p["elbi"], mkadt.u64(int(w["elbi"], 0), 0x2000))
         self.assertEqual(p["pmu-iso"], mkadt.u64(int(w["pmu_pcie1_iso"], 0), 4))
 
     def test_pinned_values_of_the_xnu_driver(self):
-        # bsd/dev/sweet_wlan.c refuses any other value (CR-19/CR-20): the observed bluejay addresses
+        # bsd/dev/sweet_wlan.c refuses any other value (CR-19/CR-20): the observed bluejay addresses, and the SW_* pins of patch 0120 equal them
         w = boards.BOARDS["bluejay"]["wlan"]
-        self.assertEqual([int(w[k], 0) for k in ("mem", "cfg", "atu", "pmu_pcie1_iso")], [0x60000000, 0x60FFE000, 0x14B00000, 0x17463EC4])
+        self.assertEqual([int(w[k], 0) for k in ("mem", "cfg", "atu", "elbi", "pmu_pcie1_iso")], [0x60000000, 0x60FFE000, 0x14B00000, 0x14520000, 0x17463EC4])
+        patch = open(os.path.join(ROOT, "xnu", "patches", "0120-sweet-wlan-bwfm-core.patch")).read()
+        pins = {k: int(v, 16) for k, v in re.findall(r"^\+#define SW_(MEM|CFG|ATU|ELBI|ISO) +(0x[0-9A-Fa-f]+)ull", patch, re.M)}
+        self.assertEqual(pins, {"MEM": 0x60000000, "CFG": 0x60FFE000, "ATU": 0x14B00000, "ELBI": 0x14520000, "ISO": 0x17463EC4})
 
     def test_sweet_and_qemu_trees_have_no_wlan_node(self):
         self.assertIsNone(wlan_node("sweet"))

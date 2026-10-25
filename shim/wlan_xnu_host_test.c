@@ -1,9 +1,13 @@
 /* Host replay test of the stage-1 chip layer in xnu patch 0120 (sweet_wlan_chip.h, extracted from the patch by build.sh): the values observed
  * on the Pixel 6a by the shim runs w3a-n30/n31/n32b/n33 (BCM4389 rev 3, ChipCommon rev 70) are the fake chip; the guard is the one the XNU glue applies. */
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
+static unsigned fails;
+static void negative_cases(void);
+static void precheck_cases(void);
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); fails++; } } while (0)
 
 static int quiet_printf(const char *fmt, ...) { (void)fmt; return 0; }
 #define printf quiet_printf
@@ -80,7 +84,7 @@ static const struct { uint32_t a, v; } obs[] = {
 };
 #define NOBS (sizeof obs / sizeof obs[0])
 
-struct fake { unsigned nrd, nerom, refused, seen[NOBS], erom_zero, fail_at, failed; const uint32_t *alt; unsigned nalt; };
+struct fake { unsigned nrd, nerom, refused, seen[NOBS], erom_zero, fail_at, failed; const uint32_t *alt; unsigned nalt; int level; uint32_t ovr_a, ovr_v; };
 
 /* the same decision the XNU glue sw_rd() makes before it touches the BAR */
 static int fake_rd(void *ctx, uint32_t a, uint32_t *v)
@@ -89,7 +93,7 @@ static int fake_rd(void *ctx, uint32_t a, uint32_t *v)
 	uint32_t win = a & ~0xFFFu, off = a & 0xFFFu;
 	unsigned i;
 
-	if (!swl_win_ok(win) || !swl_rd_ok(win, off)) {
+	if (!swl_win_ok(win, f->level) || !swl_rd_ok(win, off, f->level)) {
 		f->refused++;
 		return -1;
 	}
@@ -109,64 +113,172 @@ static int fake_rd(void *ctx, uint32_t a, uint32_t *v)
 	for (i = 0; i < NOBS; i++)
 		if (obs[i].a == a) {
 			f->seen[i]++;
-			*v = obs[i].v;
+			*v = (f->ovr_a == a) ? f->ovr_v : obs[i].v;
 			return 0;
 		}
 	fprintf(stderr, "UNOBSERVED read %#x\n", a);
-	assert(0);
+	CHECK(0);
 	return -1;
 }
 
-static int allowed_count(void)
+static int run(struct fake *f, struct swl_chip *c, int level)
+{
+	struct swl_bus b = { fake_rd, f };
+
+	f->level = level;
+	return swl_stage1(&b, c, level);
+}
+
+static unsigned seen_in(const struct fake *f, uint32_t lo, uint32_t hi)
+{
+	unsigned i, n = 0;
+
+	for (i = 0; i < NOBS; i++)
+		if (obs[i].a >= lo && obs[i].a < hi)
+			n += f->seen[i];
+	return n;
+}
+
+static int allowed_count(int level)
 {
 	uint32_t win, off;
 	int n = 0;
 
 	for (win = 0x18000000u; win < 0x18200000u; win += 0x1000u)
 		for (off = 0; off < 0x1000u; off += 4)
-			if (swl_win_ok(win) && swl_rd_ok(win, off))
+			if (swl_win_ok(win, level) && swl_rd_ok(win, off, level))
 				n++;
 	return n;
+}
+
+static unsigned erom_idx(uint32_t w)
+{
+	unsigned i;
+
+	for (i = 0; i < sizeof erom / 4; i++)
+		if (erom[i] == w)
+			return i;
+	CHECK(0);
+	return 0;
+}
+
+/* Review 23 F2: each identity pin stops the walk before the next block is read (the rows of that block are never seen). */
+static void negative_cases(void)
+{
+	static struct swl_chip c;
+	static uint32_t alt[sizeof erom / 4];
+	struct fake f;
+	unsigned pmu = 0, wrap = 0;
+
+	memset(&f, 0, sizeof f); f.ovr_a = 0x18000000u; f.ovr_v = 0x10034388u;
+	CHECK(run(&f, &c, 2) == -1 && f.nrd == 1);
+	memset(&f, 0, sizeof f); f.ovr_a = 0x18000000u; f.ovr_v = 0x00034389u;	/* TYPE 0 = SB interconnect */
+	CHECK(run(&f, &c, 2) == -1 && f.nrd == 1);
+	memset(&f, 0, sizeof f); f.ovr_a = 0x180000FCu; f.ovr_v = 0x18106000u;
+	CHECK(run(&f, &c, 2) == -1 && f.nrd == 2 && f.nerom == 0);
+	memset(&f, 0, sizeof f); f.ovr_a = 0x18000004u; f.ovr_v = 0;	/* no PMU capability */
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x18000005u)] = 0x18001005u;	/* ChipCommon base */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x18012005u)] = 0x18013005u;	/* PMU base */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x4bf82701u)] = 0x4bf82601u;	/* PMU core part number gone */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x46084411u)] = 0x46084413u;	/* second dword of a component is not COMPONENT */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x181200c5u)] = 0x181210c5u;	/* CA7 wrapper */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1);
+	wrap = seen_in(&f, 0x18120000u, 0x18127000u);
+	pmu = seen_in(&f, 0x18012000u, 0x18013000u);
+	CHECK(wrap == 0 && pmu == 5);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x181220c5u)] = 0x181240c5u;	/* D11 #1 wrapper */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1);
+	CHECK(seen_in(&f, 0x18121000u, 0x18122000u) == 3 && seen_in(&f, 0x18122000u, 0x18124000u) == 0);
+}
+
+/* Review 23 F1: every word of the link / endpoint precheck refuses when off by one bit */
+static void precheck_cases(void)
+{
+	const uint32_t g0[7] = { 0x4u, 0x80000000u, 0x60FFE000u, 0u, 0x60FFFFFFu, 0x01000000u, 0u };
+	const uint32_t g1[7] = { 0u, 0x80000000u, 0x60000000u, 0u, 0x6000FFFFu, 0x60000000u, 0u };
+	uint32_t a0[7], a1[7];
+	unsigned i, b;
+
+	CHECK(swl_pre_link(1u, 0x11u, g0, g1) == 0 && swl_pre_link(0xFFFFFFFFu, 0xFFFFFF51u, g0, g1) == 0);
+	CHECK(swl_pre_link(0u, 0x11u, g0, g1) == 1 && swl_pre_link(0xFFFFFFFEu, 0x11u, g0, g1) == 1);
+	for (b = 0; b < 6; b++)
+		CHECK(swl_pre_link(1u, 0x11u ^ (1u << b), g0, g1) == 2);
+	CHECK(swl_pre_link(1u, 0x00u, g0, g1) == 2 && swl_pre_link(1u, 0x12u, g0, g1) == 2);
+	for (i = 0; i < 7; i++)
+		for (b = 0; b < 32; b += 31) {
+			memcpy(a0, g0, sizeof a0); memcpy(a1, g1, sizeof a1);
+			a0[i] ^= 1u << b;
+			CHECK(swl_pre_link(1u, 0x11u, a0, g1) == 3);
+			memcpy(a0, g0, sizeof a0);
+			a1[i] ^= 1u << b;
+			CHECK(swl_pre_link(1u, 0x11u, a0, a1) == 4);
+		}
+	CHECK(swl_pre_ep(0x00100002u, 0x60000004u, 0) == 0 && swl_pre_ep(0xFFFF0002u, 0x60000004u, 0) == 0);
+	CHECK(swl_pre_ep(0x00000000u, 0x60000004u, 0) == 5 && swl_pre_ep(0x00000006u, 0x60000004u, 0) == 5 && swl_pre_ep(0x00000003u, 0x60000004u, 0) == 5 &&
+	      swl_pre_ep(0x00000102u, 0x60000004u, 0) == 5);
+	CHECK(swl_pre_ep(2u, 0x60000000u, 0) == 6 && swl_pre_ep(2u, 0x60000004u, 1u) == 6 && swl_pre_ep(2u, 0x60001004u, 0) == 6 && swl_pre_ep(2u, 0u, 0) == 6);
 }
 
 int main(void)
 {
 	static struct swl_chip c;
 	struct fake f;
-	struct swl_bus b = { fake_rd, &f };
 	unsigned i, total;
 
 	/* level 2: everything runs, every read is an observed address (plus the new rows), the cores equal the shim/OpenBSD walk */
 	memset(&f, 0, sizeof f);
-	assert(swl_stage1(&b, &c, 2) == 0);
-	assert(f.refused == 0 && f.nerom >= 218);
+	CHECK(run(&f, &c, 2) == 0);
+	CHECK(f.refused == 0 && f.nerom >= 218);
 	total = f.nrd;
-	assert(SWL_CHIPID_ID(c.chipid) == 0x4389 && SWL_CHIPID_REV(c.chipid) == 3 && c.cc_caps == 0x10000000u && c.caps_ext == 0x000A044Eu);
-	assert(c.ncores == sizeof want_cores / sizeof want_cores[0]);
+	CHECK(SWL_CHIPID_ID(c.chipid) == 0x4389 && SWL_CHIPID_REV(c.chipid) == 3 && c.cc_caps == 0x10000000u && c.caps_ext == 0x000A044Eu);
+	CHECK(c.ncores == sizeof want_cores / sizeof want_cores[0]);
 	for (i = 0; i < c.ncores; i++)
-		assert(c.cores[i].id == want_cores[i].id && c.cores[i].rev == want_cores[i].rev && c.cores[i].base == want_cores[i].base && c.cores[i].wrap == want_cores[i].wrap);
+		CHECK(c.cores[i].id == want_cores[i].id && c.cores[i].rev == want_cores[i].rev && c.cores[i].base == want_cores[i].base && c.cores[i].wrap == want_cores[i].wrap);
 	for (i = 0; i < NOBS; i++)
-		assert(f.seen[i] == 1);
+		CHECK(f.seen[i] == 1);
 
 	/* level 1 never reads a D11 wrapper */
 	memset(&f, 0, sizeof f);
-	assert(swl_stage1(&b, &c, 1) == 0);
+	CHECK(run(&f, &c, 1) == 0);
 	for (i = 0; i < NOBS; i++)
-		assert(f.seen[i] == (obs[i].a >= 0x18121000u && obs[i].a < 0x18124000u ? 0u : 1u));
+		CHECK(f.seen[i] == (obs[i].a >= 0x18121000u && obs[i].a < 0x18124000u ? 0u : 1u));
 
 	/* a read that fails anywhere stops the run (every position) */
 	for (unsigned k = 1; k <= total; k++) {
 		memset(&f, 0, sizeof f);
 		f.fail_at = k;
-		assert(swl_stage1(&b, &c, 2) == -1);
-		assert(f.nrd == k - 1);
+		CHECK(run(&f, &c, 2) == -1);
+		CHECK(f.nrd == k - 1);
 	}
 
 	/* an EROM without an EOT cannot make the walk run away: the allowlist ends it inside the EROM page */
 	memset(&f, 0, sizeof f);
 	f.erom_zero = 1;
-	assert(swl_stage1(&b, &c, 2) == -1);
-	assert(f.nerom <= SWL_EROM_LIMIT / 4 && f.refused == 1);
+	CHECK(run(&f, &c, 2) == -1);
+	CHECK(f.nerom <= SWL_EROM_LIMIT / 4 && f.refused == 1);
 
 	/* more components than the core table holds: refused, not written past the table */
 	{
@@ -184,14 +296,23 @@ int main(void)
 		f.alt = big;
 		f.nalt = 4 * 40 + 1;
 		memset(&c, 0, sizeof c);
-		assert(swl_stage1(&b, &c, 2) == -1 && c.ncores == SWL_MAXCORES);
+		CHECK(run(&f, &c, 2) == -1 && c.ncores == SWL_MAXCORES);
 	}
 
 	/* the allowlist: exact count (deny by default) and the write-side offsets of the wrappers / CC never pass */
-	assert(allowed_count() == (int)(SWL_EROM_LIMIT / 4) + 5 + 5 + 5 * 3);
-	assert(!swl_rd_ok(0x18120000u, 0x400) && !swl_rd_ok(0x18120000u, 0x404) && !swl_rd_ok(0x18120000u, 0x500) && !swl_rd_ok(0x18120000u, 0x808) &&
-	       !swl_rd_ok(0x18120000u, 0x80C) && !swl_rd_ok(0x18105000u, 0xE00) && !swl_rd_ok(0x18000000u, 0x80) && !swl_rd_ok(0x18000000u, 0x1E8) &&
-	       !swl_rd_ok(0x18001000u, 0x1E8) && !swl_rd_ok(0x18124000u, 0x408) && !swl_rd_ok(0x18105000u, 0x2));
+	CHECK(allowed_count(2) == (int)(SWL_EROM_LIMIT / 4) + 5 + 5 + 5 * 3);
+	CHECK(allowed_count(1) == (int)(SWL_EROM_LIMIT / 4) + 5 + 5 + 2 * 3);
+	CHECK(!swl_rd_ok(0x18120000u, 0x400, 2) && !swl_rd_ok(0x18120000u, 0x404, 2) && !swl_rd_ok(0x18120000u, 0x500, 2) && !swl_rd_ok(0x18120000u, 0x808, 2) &&
+	       !swl_rd_ok(0x18120000u, 0x80C, 2) && !swl_rd_ok(0x18105000u, 0xE00, 2) && !swl_rd_ok(0x18000000u, 0x80, 2) && !swl_rd_ok(0x18000000u, 0x1E8, 2) &&
+	       !swl_rd_ok(0x18001000u, 0x1E8, 2) && !swl_rd_ok(0x18124000u, 0x408, 2) && !swl_rd_ok(0x18105000u, 0x2, 2));
+	CHECK(!swl_win_ok(0x18121000u, 1) && !swl_rd_ok(0x18123000u, 0x408, 1) && swl_win_ok(0x18121000u, 2) && swl_rd_ok(0x18123000u, 0x408, 2));
+
+	negative_cases();
+	precheck_cases();
+	if (fails) {
+		printf("RESULT: FAIL wlan_xnu_host_test (%u checks)\n", fails);
+		return 1;
+	}
 	printf("RESULT: PASS wlan_xnu_host_test\n");
 	return 0;
 }

@@ -325,8 +325,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
                 [(p, u32(n(b[k]))) for p, k in bits] + top)
     touch = touch_node() if 'touch_chip_id' in config and not qemu else None
 
-    # bsd/dev/sweet_wlan.c (patch 0118): the BCM4389 behind the PCIe1 link the shim left up (--wlan-hold). All addresses come from soc.json
-    # wlan (sources cited there): reg = BAR0 ATU window (mem, 64 KiB), cfg = endpoint config space, atu = DBI ATU block, pmu-iso = PHY isolation word.
+    # bsd/dev/sweet_wlan.c (patch 0120): the BCM4389 behind the PCIe1 link the shim left up (--wlan-hold). All addresses come from soc.json
+    # wlan (sources cited there): reg = BAR0 ATU window (mem, 64 KiB), cfg = endpoint config space, atu = DBI ATU block, elbi = PCIe1 ELBI (link state), pmu-iso = PHY isolation word.
     # Only boards whose soc.json has a wlan block with mem/cfg get the node; the driver additionally refuses addresses other than the pinned ones.
     w = config.get('wlan')
     wlan = node('sweet-wlan', [
@@ -335,8 +335,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         ('reg', u64(int(w['mem'], 0), 0x10000)),
         ('cfg', u64(int(w['cfg'], 0), 0x1000)),
         ('atu', u64(int(w['atu'], 0), 0x1000)),
+        ('elbi', u64(int(w['elbi'], 0), 0x2000)),
         ('pmu-iso', u64(int(w['pmu_pcie1_iso'], 0), 4)),
-    ]) if w and 'mem' in w and 'cfg' in w and not qemu else None
+    ]) if w and all(k in w for k in ('mem', 'cfg', 'atu', 'elbi', 'pmu_pcie1_iso')) and not qemu else None
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

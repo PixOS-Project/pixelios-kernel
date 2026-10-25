@@ -37,14 +37,14 @@ diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan.c
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,171 @@
 +/*
 + * BCM4389 Wi-Fi, stage 1: READ-ONLY attach from inside XNU (docs/research/42 section 6 steps 3-6, W-D2). Boot-arg sweetwlan=1 (chip, PMU
 + * and the ARM/SYS_MEM wrappers) or sweetwlan=2 (plus the three D11 wrappers); ADT node /sweet-wlan from tools/mkadt.py (bluejay only).
 + * It expects the shim flavor --wlan-hold (PCIe1 link left up, cfg 0x80 = 0x18000000, shim/wlanlink.c wlan_link_hold) and refuses
 + * otherwise, with the same preconditions as shim/wlanlink.c r32(): PHY isolation word de-isolated, EP Command MEM-only, ATU region 1
 + * (BAR0, 0x60000000..0x6000FFFF) enabled and programmed as S29 left it. The only write is the BAR0 window select (cfg 0x80) to one of the
-+ * windows swl_win_ok() names; the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written: no reset, no set_passive.
++ * windows swl_win_ok() names (cfg 0x80 is left on the last one and the held link is not torn down: a writing stage must not assume either); the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written: no reset, no set_passive.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -62,11 +62,13 @@ new file mode 100644
 +#define SW_MEM_LEN  0x10000ull
 +#define SW_CFG      0x60FFE000ull   /* soc.json wlan.cfg: ATU region 0, config space of the endpoint */
 +#define SW_ATU      0x14B00000ull   /* soc.json wlan.atu: DBI + 0x300000 */
++#define SW_ELBI     0x14520000ull   /* soc.json wlan.elbi: PCIe1 ELBI, +0x2C8 RDLH_LINKUP (rc.h:50-51), &0x3F == 0x11 is L0 */
 +#define SW_ISO      0x17463EC4ull   /* soc.json wlan.pmu_pcie1_iso: PCIe1 PHY isolation, bit 0 = de-isolated (always-on PMU block) */
 +
 +struct sw_hw {
 +	volatile uint32_t *cfg, *mem;
 +	uint32_t win;
++	int level;
 +};
 +
 +static int
@@ -75,11 +77,16 @@ new file mode 100644
 +	struct sw_hw *h = ctx;
 +	uint32_t win = a & ~0xFFFu, off = a & 0xFFFu;
 +
-+	if (!swl_win_ok(win) || !swl_rd_ok(win, off)) {
++	if (!swl_win_ok(win, h->level) || !swl_rd_ok(win, off, h->level)) {
 +		printf("SWEET WLAN: read of %#x refused\n", a);
 +		return -1;
 +	}
 +	if (win != h->win) {
++		/* shim cfg_ok(): the EP must still be MEM-only with BAR0 where ATU region 1 points before every window change */
++		if (swl_pre_ep(h->cfg[0x04 / 4], h->cfg[0x10 / 4], h->cfg[0x14 / 4]) != 0) {
++			printf("SWEET WLAN: EP Command/BAR0 changed, window %#x refused\n", win);
++			return -1;
++		}
 +		h->cfg[0x80 / 4] = win;
 +		if (h->cfg[0x80 / 4] != win) {
 +			printf("SWEET WLAN: BAR0 window did not take %#x\n", win);
@@ -130,7 +137,9 @@ new file mode 100644
 +	DTEntry node;
 +	char const *compat = NULL;
 +	unsigned int csize = 0;
-+	uint32_t level = 0, iso, cmd, cr2, r1[4];
++	uint32_t level = 0, iso, ltssm, a0[7], a1[7];
++	int bad;
++	unsigned i;
 +	struct sw_hw hw;
 +	struct swl_bus bus;
 +
@@ -143,12 +152,12 @@ new file mode 100644
 +	}
 +	if (level > 2 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
-+	    compat == NULL || csize <= sizeof(SW_COMPAT) - 1 || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT) - 1) != 0) {
++	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
 +		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
 +		return;
 +	}
 +	if (!sw_prop_is(node, "reg", SW_MEM, SW_MEM_LEN) || !sw_prop_is(node, "cfg", SW_CFG, 0x1000) ||
-+	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
++	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
 +		return;
 +	}
 +	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
@@ -162,27 +171,32 @@ new file mode 100644
 +		return;
 +	}
 +	volatile uint32_t *atu = sw_map(SW_ATU, 0x1000);
++	volatile uint32_t *elbi = sw_map(SW_ELBI, 0x2000);
 +	hw.cfg = sw_map(SW_CFG, 0x1000);
 +	hw.mem = sw_map(SW_MEM, 0x1000);
-+	if (atu == NULL || hw.cfg == NULL || hw.mem == NULL) {
++	if (atu == NULL || elbi == NULL || hw.cfg == NULL || hw.mem == NULL) {
 +		return;
 +	}
-+	/* shim r32(): ATU region 1 (RC-local reads, no TLP) before any BAR0 access */
-+	r1[0] = atu[0x200 / 4];
-+	cr2 = atu[0x204 / 4];
-+	r1[1] = atu[0x208 / 4];
-+	r1[2] = atu[0x210 / 4];
-+	r1[3] = atu[0x214 / 4];
-+	printf("SWEET WLAN: ATU r1 %#x %#x %#x %#x %#x\n", r1[0], cr2, r1[1], r1[2], r1[3]);
-+	if (r1[0] != 0 || cr2 != 0x80000000u || r1[1] != 0x60000000u || r1[2] != 0x6000FFFFu || r1[3] != 0x60000000u) {
-+		printf("SWEET WLAN: ATU region 1 is not the one the shim programmed, not touched\n");
++	/* shim r32() and the chain before S30, all RC-local (no TLP): link in L0, ATU region 0 (config) and region 1 (BAR0) as the shim left them */
++	ltssm = elbi[0x2C8 / 4];
++	for (i = 0; i < 7; i++) {
++		a0[i] = atu[i];
++		a1[i] = atu[0x200 / 4 + i];
++	}
++	printf("SWEET WLAN: ELBI 0x2C8 %#x ATU r0 %#x %#x %#x %#x %#x %#x %#x\n", ltssm, a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6]);
++	printf("SWEET WLAN: ATU r1 %#x %#x %#x %#x %#x %#x %#x\n", a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6]);
++	bad = swl_pre_link(iso, ltssm, a0, a1);
++	if (bad) {
++		printf("SWEET WLAN: link precondition %d failed (shim --wlan-hold state not there), not touched\n", bad);
 +		return;
 +	}
-+	cmd = hw.cfg[0x04 / 4];
++	/* first config TLPs, only now that the link and region 0 are proven */
 +	hw.win = hw.cfg[0x80 / 4];
-+	printf("SWEET WLAN: EP Command/Status %#x BAR0 window %#x\n", cmd, hw.win);
-+	if ((cmd & 0xFFFFu) != 0x0002u) {
-+		printf("SWEET WLAN: EP Command is not MEM-only, not touched\n");
++	hw.level = (int)level;
++	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
++	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
++	if (bad) {
++		printf("SWEET WLAN: endpoint precondition %d failed, not touched\n", bad);
 +		return;
 +	}
 +	bus.rd = sw_rd;
@@ -199,7 +213,7 @@ diff --git a/bsd/dev/sweet_wlan_chip.h b/bsd/dev/sweet_wlan_chip.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan_chip.h
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,383 @@
 +/*
 + * BCM4389 chip layer, stage 1 (read only): the EROM walk and register layout of OpenBSD sys/dev/ic/bwfm.c (v1.118,
 + * bwfm_chip_dmp_erom_scan / bwfm_chip_dmp_get_regaddr / bwfm_chip_get_pmu) and sys/dev/ic/bwfmreg.h.
@@ -306,7 +320,7 @@ new file mode 100644
 +
 +/* The BAR0 read allowlist: window (cfg 0x80 value) and the register offset in it. Deny by default (CR-25). */
 +static inline int
-+swl_rd_ok(uint32_t win, uint32_t off)
++swl_rd_ok(uint32_t win, uint32_t off, int level)
 +{
 +	if (win == SWL_EROM_PAGE) {
 +		return off < SWL_EROM_LIMIT && (off & 3u) == 0;
@@ -317,17 +331,61 @@ new file mode 100644
 +	if (win == 0x18012000u) {
 +		return off == SWL_REG_PMUCONTROL || off == SWL_REG_PMUCAPS || off == SWL_REG_PMUSTATUS || off == SWL_REG_PMU_MINRES || off == SWL_REG_PMU_MAXRES;
 +	}
-+	if (win == 0x18120000u || win == 0x18126000u || win == 0x18121000u || win == 0x18122000u || win == 0x18123000u) {
++	if (win == 0x18120000u || win == 0x18126000u || (level >= 2 && (win == 0x18121000u || win == 0x18122000u || win == 0x18123000u))) {
 +		return off == SWL_AGENT_IOCTL || off == SWL_AGENT_RESET_CTL || off == SWL_AGENT_RESET_ST;
 +	}
 +	return 0;
 +}
 +
 +static inline int
-+swl_win_ok(uint32_t win)
++swl_win_ok(uint32_t win, int level)
 +{
-+	return win == SWL_EROM_PAGE || win == 0x18000000u || win == 0x18012000u || win == 0x18120000u || win == 0x18121000u ||
-+	       win == 0x18122000u || win == 0x18123000u || win == 0x18126000u;
++	return win == SWL_EROM_PAGE || win == 0x18000000u || win == 0x18012000u || win == 0x18120000u || win == 0x18126000u ||
++	       (level >= 2 && (win == 0x18121000u || win == 0x18122000u || win == 0x18123000u));
++}
++
++/*
++ * The preconditions of shim/wlanlink.c r32()/cfg_ok() and of the chain before S30 (review 23 F1), as pure functions so the host test can
++ * kill every word (F2). swl_pre_link: PHY isolation bit 0 (de-isolated), ELBI RDLH_LINKUP 0x2C8 & 0x3F == 0x11 (L0), ATU region 0 (the
++ * config window, S26: 0x000..0x018) and region 1 (BAR0, S29: 0x200..0x218). They are RC-local DBI/ELBI reads, no TLP. swl_pre_ep:
++ * EP Command low half MEM-only, BAR0 = 0x60000004 / upper 0 (what ATU region 1 points at). 0 = ok, else the number of the failed check.
++ */
++static inline int
++swl_pre_link(uint32_t iso, uint32_t ltssm, const uint32_t a0[7], const uint32_t a1[7])
++{
++	static const uint32_t w0[7] = { 0x4u, 0x80000000u, 0x60FFE000u, 0u, 0x60FFFFFFu, 0x01000000u, 0u };
++	static const uint32_t w1[7] = { 0u, 0x80000000u, 0x60000000u, 0u, 0x6000FFFFu, 0x60000000u, 0u };
++	unsigned i;
++
++	if (!(iso & 1u)) {
++		return 1;
++	}
++	if ((ltssm & 0x3Fu) != 0x11u) {
++		return 2;
++	}
++	for (i = 0; i < 7; i++) {
++		if (a0[i] != w0[i]) {
++			return 3;
++		}
++	}
++	for (i = 0; i < 7; i++) {
++		if (a1[i] != w1[i]) {
++			return 4;
++		}
++	}
++	return 0;
++}
++
++static inline int
++swl_pre_ep(uint32_t cmd, uint32_t bar0lo, uint32_t bar0hi)
++{
++	if ((cmd & 0xFFFFu) != 0x0002u) {
++		return 5;
++	}
++	if (bar0lo != 0x60000004u || bar0hi != 0u) {
++		return 6;
++	}
++	return 0;
 +}
 +
 +/* bwfm_chip_dmp_get_regaddr(): the slave addresses of one component. 0 ok, 1 no more addresses for this component (OpenBSD: continue), -1 bus failure. */
@@ -496,6 +554,10 @@ new file mode 100644
 +		return -1;
 +	}
 +	/* bwfm_chip_get_pmu(): the AOB PMU core when ChipCommon rev >= 35 and capabilities_ext says AOB, else ChipCommon */
++	if (!(c->cc_caps & SWL_CAPS_PMU)) {
++		printf("SWEET WLAN: cc_caps %#x has no PMU, stop\n", c->cc_caps);
++		return -1;
++	}
 +	pmu = (cc->rev >= 35 && (c->caps_ext & SWL_CAPS_EXT_AOB)) ? swl_core(c, SWL_CORE_PMU, 0) : cc;
 +	if (pmu == 0 || pmu->base != 0x18012000u) {
 +		printf("SWEET WLAN: PMU core not at 0x18012000, stop\n");
