@@ -80,6 +80,9 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          # licence notices travel with the binaries (THIRD_PARTY.md rows 2,5,8,9; APSL asks for a source pointer)
+          cp -R THIRD_PARTY.md LICENSES xnu/patches/NOTICE.md out/
+          printf 'Source: %s/%s\nCommit: %s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA" > out/SOURCE.txt
 
       - uses: actions/upload-artifact@v4
         if: always()

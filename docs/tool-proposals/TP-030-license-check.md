@@ -23,7 +23,7 @@ One finding per violation, then check-rules' `RESULT: PASS|FAIL n new, m baselin
 2. an `SPDX-License-Identifier` in a file must name only ids of its map entry (so a GPL/LGPL/AGPL id always fails).
 3. a `Copyright` line naming Apple/NeXT/CMU needs APSL-2.0, Broadcom/Wildt needs ISC, Nayuki needs an origin naming nayuki, dipa-studio needs an origin naming ios-sweet, Cambus needs BSD-2-Clause in the entry.
 4. forbidden tracked names (*.img, *.bin, *.ipsw, *.dmg, *.im4p, keys, .env, ...) and the dirs ipsw/, Payload/; the allowlist is empty.
-Not built yet (open items from the plan): banned marker strings in text (EXPORT_SYMBOL, MODULE_LICENSE, "GNU General Public License", Broadcom-WL-IPTag, PolyForm) and the optional line-run similarity check against the GPL refs ($PIXELIOS_REFS, T8).
+Banned marker strings in text are built (list: `BANNED` in `tools/check_rules/r30_license.py`, standalone T5b). Not built yet (open item from the plan): the optional line-run similarity check against the GPL refs ($PIXELIOS_REFS, T8).
 Tests: tools/test_check_rules_r30.py, one planted violation per failure mode plus one mutant per content check.
 
 ## risks

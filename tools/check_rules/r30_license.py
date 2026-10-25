@@ -11,23 +11,35 @@ MAP = "tools/license-map.txt"
 ALLOWED = {"MIT", "ISC", "APSL-2.0", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0"}
 # forbidden tracked material (AGENTS.md rule 4): firmware / Apple payloads / secrets, by basename; ALLOW_TRACKED_BINARY is the exception list (empty)
 FORBIDDEN_NAMES = ["*.img", "*.bin", "*.ipsw", "*.dmg", "*.im4p", "*.im4m", "*.img4", "*.ota", "*.mbn", "*.pem", "*.key", "*.p12",
-                   "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", ".env", ".env.*"]
-FORBIDDEN_DIRS = ("ipsw/", "Payload/")
-ALLOW_TRACKED_BINARY = ()
-# content is not scanned in files that quote licences or hold the planted fixtures
-NO_SCAN = ("docs/*", "LICENSES/*", "LICENSE", "THIRD_PARTY.md", "xnu/patches/NOTICE.md", "tools/testdata/*", "tools/test_*.py",
-           "tools/license-map.txt", "tools/check_rules/r30_license.py")
-# Copyright holder (regex on the text after "Copyright") -> (id that must be in the entry's expression, substring the origin must contain)
+                   "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_ed25519*", ".env", ".env.*", "*.env", "dyld_shared_cache*", "kernelcache*"]
+FORBIDDEN_DIRS = ("ipsw", "Payload")  # a directory of this name at any depth
+ALLOW_TRACKED_BINARY = ()  # a file with a NUL byte in its first 4 KiB is a finding unless listed here
+# content is not scanned in files that quote licences/reviews or hold the planted fixtures and the check's own marker lists
+NO_SCAN = ("docs/research/*", "docs/reviews/*", "LICENSES/*", "THIRD_PARTY.md", "tools/testdata/*", "tools/test_check_rules_r30.py",
+           "tools/check_rules/r30_license.py")
+# markers that must not appear in a scanned file (plan check 2): GPL text / kernel-licence macros / non-commercial licences
+BANNED = ("GNU General Public License", "Broadcom-WL-IPTag", "MODULE_LICENSE", "EXPORT_SYMBOL", "PolyForm")
+# Copyright holder (regex on the text after "Copyright") -> (id that must be in the entry's expression, substring the origin must contain,
+# LICENSES/ file that must exist). A copyright line whose holder matches NO row is a finding (allowlist).
 HOLDERS = [
-    (r"apple|next computer|carnegie", "APSL-2.0", None),
-    (r"broadcom|wildt", "ISC", None),
-    (r"nayuki", "MIT", "nayuki"),
-    (r"dipa-studio", "MIT", "ios-sweet"),
-    (r"cambus", "BSD-2-Clause", None),
-    (r"android open source", None, "AOSP"),
+    (r"pixos-project", None, None, None),
+    (r"apple|\bnext\b|carnegie|\bcmu\b", "APSL-2.0", None, "APSL-2.0.txt"),
+    (r"broadcom|wildt", "ISC", None, "ISC-bwfm.txt"),
+    (r"nayuki", "MIT", "nayuki", "MIT-qrcodegen.txt"),
+    (r"dipa-studio", "MIT", "ios-sweet", "MIT-ios-sweet.txt"),
+    (r"cambus", "BSD-2-Clause", None, "Spleen-BSD-2-Clause.txt"),
+    (r"android open source|\baosp\b", None, "AOSP", "MIT-AOSP-avbtool.txt"),
+    (r"pornin", "MIT", None, "MIT-BearSSL.txt"),
 ]
+# device/** must not carry identifiers of the phone (AGENTS.md rule 4): serial, IMEI, a globally administered MAC
+DEVICE_LEAKS = [
+    (re.compile(r"androidboot\.serialno=(?!<|\*|x+\b|REDACTED)\S", re.I), "androidboot.serialno= with a value"),
+    (re.compile(r"\bimei\b\W{0,4}\d{8,}", re.I), "an IMEI number"),
+]
+MAC = re.compile(r"(?<![0-9A-Fa-f:-])((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})(?![0-9A-Fa-f:-])")
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^*\n]+)")
-COPY = re.compile(r"^[\s/*#;+>-]*Copyright\b(.*)", re.I)
+# "Copyright", "(c)" followed by a year (a bare "(c)" is also a list marker in comments, e.g. "(c) poll is bounded"), or the copyright sign
+COPY = re.compile(r"^[\s/*#;+>-]*(?:Copyright\b|\(c\)(?=\s*(?:19|20)\d\d)|\u00a9)(.*)", re.I)
 
 
 def ids(expr):
@@ -52,6 +64,9 @@ def read_map(root, out):
                 out.append(Finding(MAP, n, l, f"{RULE} map-id: {i} is not in the allowlist {sorted(ALLOWED)}"))
             elif not list((Path(root) / "LICENSES").glob(f"*{i}*.txt")):
                 out.append(Finding(MAP, n, l, f"{RULE} map-text: no LICENSES/*{i}*.txt for {i}"))
+        if re.fullmatch(r"\*+", c[0].strip()):
+            out.append(Finding(MAP, n, l, f"{RULE} map-catchall: a bare '*' glob would license every unmapped file"))
+            continue
         rows.append((c[0], c[1], c[2], n))
     return rows
 
@@ -69,8 +84,9 @@ def forbidden(rel):
     base = rel.rsplit("/", 1)[-1]
     if rel in ALLOW_TRACKED_BINARY:
         return None
-    if any(rel.startswith(d) for d in FORBIDDEN_DIRS):
-        return f"path under {rel.split('/')[0]}/ (Apple payload / firmware)"
+    hit = [d for d in FORBIDDEN_DIRS if d in rel.split("/")[:-1]]
+    if hit:
+        return f"path under a {hit[0]}/ directory (Apple payload / firmware)"
     for g in FORBIDDEN_NAMES:
         if fnmatch.fnmatchcase(base.lower(), g):
             return f"name matches {g} (firmware, Apple payload, key or secret)"
@@ -80,6 +96,9 @@ def forbidden(rel):
 def check(root):
     out = []
     rows = read_map(root, out)
+    for t in sorted((Path(root) / "LICENSES").glob("*.txt")):
+        if not t.read_text(errors="replace").strip():
+            out.append(Finding(f"LICENSES/{t.name}", 1, "", f"{RULE} license-empty: licence text is empty"))
     for rel in files(root):
         why = forbidden(rel)
         if why:
@@ -88,21 +107,42 @@ def check(root):
         if hit is None:
             out.append(Finding(rel, 1, rel, f"{RULE} unmapped: no line of {MAP} matches (add one with its licence and origin)"))
             continue
-        if any(fnmatch.fnmatchcase(rel, g) for g in NO_SCAN):
-            continue
         data = (Path(root) / rel).read_bytes()
         if b"\0" in data[:4096]:
+            if rel not in ALLOW_TRACKED_BINARY:
+                out.append(Finding(rel, 1, rel, f"{RULE} binary: NUL byte in the first 4 KiB (firmware / binary blob; add to ALLOW_TRACKED_BINARY only with a reason)"))
+            continue
+        if any(fnmatch.fnmatchcase(rel, g) for g in NO_SCAN):
             continue
         mapped = ids(hit[1])
         for n, l in enumerate(data.decode(errors="replace").splitlines(), 1):
+            for b in BANNED:
+                if b in l:
+                    out.append(Finding(rel, n, l, f"{RULE} banned: '{b}' (GPL / kernel-licence / non-commercial marker)"))
+            if rel.startswith("device/"):
+                for rx, what in DEVICE_LEAKS:
+                    if rx.search(l):
+                        out.append(Finding(rel, n, l, f"{RULE} device-leak: {what} (strip serials, IMEI, MACs)"))
+                for m in MAC.finditer(l):
+                    first = int(m.group(1)[:2], 16)
+                    if not first & 2 and int(m.group(1).replace(":", "").replace("-", ""), 16):
+                        out.append(Finding(rel, n, l, f"{RULE} device-leak: globally administered MAC {m.group(1)} (strip MAC addresses)"))
             for m in SPDX.finditer(l):
                 bad = ids(m.group(1)) - mapped
                 if bad:
                     out.append(Finding(rel, n, l, f"{RULE} spdx: {sorted(bad)} not in map entry '{hit[1]}' (line {hit[3]} of {MAP})"))
             m = COPY.match(l)
             if m:
-                for rx, need_id, need_origin in HOLDERS:
-                    if re.search(rx, m.group(1), re.I) and ((need_id and need_id not in mapped) or (need_origin and need_origin.lower() not in hit[2].lower())):
+                known = False
+                for rx, need_id, need_origin, notice in HOLDERS:
+                    if not re.search(rx, m.group(1), re.I):
+                        continue
+                    known = True
+                    if (need_id and need_id not in mapped) or (need_origin and need_origin.lower() not in hit[2].lower()):
                         out.append(Finding(rel, n, l, f"{RULE} holder: '{rx}' copyright needs {need_id or ''} {need_origin or ''} in map entry "
                                                       f"'{hit[1]}' / '{hit[2]}' (line {hit[3]} of {MAP})"))
+                    if notice and not (Path(root) / "LICENSES" / notice).is_file():
+                        out.append(Finding(rel, n, l, f"{RULE} notice: '{rx}' copyright needs LICENSES/{notice}"))
+                if not known:
+                    out.append(Finding(rel, n, l, f"{RULE} holder-unknown: copyright holder is not in the allowlist {[h[0] for h in HOLDERS]}"))
     return out
