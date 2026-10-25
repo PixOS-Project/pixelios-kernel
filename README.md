@@ -1,11 +1,11 @@
-# PixeliOS: kernel and shim
+# PixOS: kernel and shim
 
 **Apple's XNU kernel and iOS 16 userland on a Google Pixel 6a (Tensor G1).**
 
 [![xnu build](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml/badge.svg)](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-PixeliOS is a research port. A small bare-metal **shim** is loaded with a temporary
+PixOS is a research port. A small bare-metal **shim** is loaded with a temporary
 `fastboot boot` image, brings up what XNU needs on the Pixel's Tensor G1 (UFS storage, memory
 map, a device tree for XNU), and jumps into a patched **XNU** kernel. The iOS 16 root filesystem
 then lives in the phone's `userdata` partition. It is inspired by, and builds on,

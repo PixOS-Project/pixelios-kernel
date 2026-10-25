@@ -6,6 +6,10 @@ Read this file, then `README.md` and `docs/PLAN.md`, before touching anything.
 Scoped rules live next to the code: `shim/`, `xnu/`, `soc/`, `device/`, `docs/` each have an `AGENTS.md`.
 Review criteria are in `REVIEW.md`.
 
+## Naming
+
+The project is called **PixOS**. Use PixOS in prose. The `pixelios-*` repo, directory and remote names are legacy and stay as they are (do not rename them).
+
 ## Hard rules (a violation is a bug in the change, not a style issue)
 
 1. **Reversible only.** Never write bootloader, modem, persist, efs, vbmeta, boot*, dtbo or the GPT. Never relock a
