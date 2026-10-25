@@ -1,6 +1,6 @@
 # AI-driven development
 
-**PixeliOS is developed mostly by AI coding agents, directed by a human maintainer.** We say so
+**PixOS is developed mostly by AI coding agents, directed by a human maintainer.** We say so
 up front because it changes how you should read this repository.
 
 ## How the project is built

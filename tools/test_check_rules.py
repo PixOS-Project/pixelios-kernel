@@ -78,6 +78,10 @@ class Ratchet(unittest.TestCase):
         self.bdir.mkdir()
         self.src = self.root / "shim" / "build.sh"
         self.src.write_text("set -euo pipefail\ngcc -o $O/x x.c && $O/x\n")
+        (self.root / "tools").mkdir()      # R30 needs a licence map and the licence text for every tree it checks
+        (self.root / "tools" / "license-map.txt").write_text("shim/*\tMIT\tpixos\ntools/*\tMIT\tpixos\nLICENSES/*\tMIT\tpixos\n")
+        (self.root / "LICENSES").mkdir()
+        (self.root / "LICENSES" / "MIT.txt").write_text("MIT\n")
 
     def tearDown(self):
         self.tmp.cleanup()
