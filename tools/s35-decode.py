@@ -56,7 +56,7 @@ def powerctl_text(v):
     return f"domain id {(v >> 28) & 0xF}, ExtPwrStatus {(v >> 16) & 0xF:#x} (bit 17 {int(bool(v & 0x20000))}), PowerOnRequest {(v >> 8) & 0xF:#x} (bit 9 {int(bool(v & 0x200))})"
 
 
-def word_text(label, v, win):
+def word_text(label, v, win, bank_skipped=False):
     if label == "powerctl":
         return powerctl_text(v)
     if label == "IOCTL":
@@ -66,7 +66,7 @@ def word_text(label, v, win):
     if label == "coreinfo":
         return f"DHD(rev<12): nb {v & 0x1F} nrb {(v & 0x3E0) >> 5}; brcmfmac (0xF0): {(v & 0xF0) >> 4}"
     if label == "bankinfo":
-        return f"bank size {8192 * ((v & 0x7F) + 1)} bytes"
+        return "unselected bank (bankidx select skipped)" if bank_skipped else f"bank size {8192 * ((v & 0x7F) + 1)} bytes"
     return ""
 
 
@@ -80,7 +80,7 @@ def check(vals, rows, summary, notes, skipped=False, bank_skipped=False):
     for i, st, w, o, label, ph in rows:
         v = vals.get(i)
         pre = f"S{st} {WINDOWS[w]:<15} +{o:#05x} {label:<10} {ph:<6}"
-        lines.append(f"{pre} (no log line)" if v is None else f"{pre} {v:#010x}  {word_text(label, v, w)}".rstrip())
+        lines.append(f"{pre} (no log line)" if v is None else f"{pre} {v:#010x}  {word_text(label, v, w, bank_skipped)}".rstrip())
     g = lambda st, w, o, ph="": by.get((st, w, o, ph))
 
     def add(name, ok, text):

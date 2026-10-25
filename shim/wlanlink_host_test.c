@@ -2120,6 +2120,13 @@ int main(void)
 				EXPECT(wlan_link_run() == 0 && has("LINK S35 skip: bankidx select") && mem_wr_n == nmw - 1u && sm_bankidx == 3u && mem_illegal_w == 0u && has("stopped=none"));
 				baseline_restored();
 			}
+			for (unsigned k = 0; k < 2u; k++) {			/* review 19 finding 1: bits outside 0x3E0 (0x400, the top byte) are not ROM banks: no skip, bankidx := 0 is written */
+				static const uint32_t nw[2] = { 0x00000405u, 0x80FF0005u };
+
+				world(); sm_coreinfo = nw[k];
+				EXPECT(wlan_link_run() == 0 && !has("LINK S35 skip: bankidx select") && mem_wr_n == nmw && sm_bankidx == 0u && has("stopped=none"));
+				baseline_restored();
+			}
 			world(); sm_io = 1u; sm_rc = 0u; sm_bankidx = 0u;		/* SYS_MEM already up (not the observed state): the sequence is idempotent and the run is clean */
 			EXPECT(wlan_link_run() == 0 && has("restore=ok") && mem_wr_n == nmw && sm_io == 1u && sm_rc == 0u);
 			baseline_restored();
