@@ -2284,6 +2284,8 @@ int main(void)
 	world(); freq = 1000000;					/* a slow counter does not turn the wait into a hang: still <= 4800 polls */
 	EXPECT(wlan_link_run() == 0 || l0_polls <= 4800u);
 #endif
+	struct wlan_hold H = {0, 0, 0};
+
 	if (WLAN_LINK_N == 30)
 	/* ---- --wlan-hold (wlan_link_hold, research 42 section 7): at N = S30 the teardown is skipped on success, run on any failure ---- */
 	{
@@ -2295,67 +2297,67 @@ int main(void)
 		nref = nev;
 		memcpy(ref, ev, sizeof(ref));
 		world();
-		EXPECT(wlan_link_hold() == 0 && has("LINK S30 ok rows=5") && has("LINK summary reached=S30 stopped=none restore=held") && !has("restore=ok") && !has("restore=FAILED") && !has("!!!") && !has("LINK T"));
+		EXPECT(wlan_link_hold(&H) == 0 && has("LINK S30 ok rows=5") && has("LINK summary reached=S30 stopped=none restore=held") && !has("restore=ok") && !has("restore=FAILED") && !has("!!!") && !has("LINK T"));
 		EXPECT(nev > 0 && nev + 8u < nref && memcmp(ev, ref, nev * sizeof(ev[0])) == 0);	/* exactly the forward writes: the reference minus its teardown tail, no T row executed */
 		EXPECT(iso1 == 1 && gh2.con != 0 && (cfgspace[1] & 0xFFFFu) == 2u && cfgspace[0x80 / 4] == 0x18000000u && mem_ready());	/* PHY isolation released, PERST driven, Command MEM, window 0x18000000, BAR0 armed: all still as at S30 */
 		EXPECT(atu[0x04 / 4] != 0 && atu[0x204 / 4] != 0 && mem_reads == 3 && master_writes == 0);	/* ATU regions 0 and 1 still enabled */
 		world(); iso_clear_ret = 2;								/* nothing is restored on a held success: a failing isolation clear is never reached */
-		EXPECT(wlan_link_hold() == 0 && has("restore=held") && !has("restore=FAILED") && iso1 == 1);
+		EXPECT(wlan_link_hold(&H) == 0 && has("restore=held") && !has("restore=FAILED") && iso1 == 1);
 		world(); fault_read_pa = WLAN_DBI + 0x70;						/* S24 fault: the normal teardown, restore=ok, return 1 */
-		EXPECT(wlan_link_hold() == 1 && has("stopped=fault at=S24") && has("restore=ok") && !has("restore=held") && !has("!!!"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=fault at=S24") && has("restore=ok") && !has("restore=held") && !has("!!!"));
 		teardown_tail_is_table_order(24);
 		baseline_restored();
 		world(); fault_read_pa = WLAN_CFG + 0x104;						/* S29 fault */
-		EXPECT(wlan_link_hold() == 1 && has("stopped=fault at=S29") && has("restore=ok") && !has("restore=held") && !has("!!!"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=fault at=S29") && has("restore=ok") && !has("restore=held") && !has("!!!"));
 		teardown_tail_is_table_order(29);
 		baseline_restored();
 		world(); mem_mode = 3;									/* S30 itself refuses (another chip id): torn down */
-		EXPECT(wlan_link_hold() == 1 && has("stopped=refused at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=refused at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
 		teardown_tail_is_table_order(30);
 		baseline_restored();
 		world(); fault_read_pa = WLAN_DBI + 0x70; iso_clear_ret = 2;				/* failure + failing restore: still loud */
-		EXPECT(wlan_link_hold() == 1 && has("restore=FAILED") && has("!!! RESTORE FAILED") && !has("restore=held"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("restore=FAILED") && has("!!! RESTORE FAILED") && !has("restore=held"));
 		world(); freq = 0;									/* no timer: refused before any write, as the normal run */
-		EXPECT(wlan_link_hold() == 2 && nwrites == 0 && has("no timer") && !has("restore=held"));
+		EXPECT(wlan_link_hold(&H) == 2 && nwrites == 0 && has("no timer") && !has("restore=held"));
 		world(); iso_set_ret = 2;								/* the isolation-release SMC (S05) refuses: torn down, no hold */
-		EXPECT(wlan_link_hold() == 1 && has("at=S05") && has("restore=ok") && !has("restore=held"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("at=S05") && has("restore=ok") && !has("restore=held"));
 		baseline_restored();
 		world(); never_l0 = 1;									/* the link never comes up (S23 timeout): torn down, no hold */
-		EXPECT(wlan_link_hold() == 1 && has("stopped=timeout at=S23") && has("restore=ok") && !has("restore=held"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=timeout at=S23") && has("restore=ok") && !has("restore=held"));
 		teardown_tail_is_table_order(23);
 		baseline_restored();
 		world(); fault_read_pa = WLAN_MEM + 0x0;						/* a bus fault on the S30 BAR0 read itself: torn down, no hold */
-		EXPECT(wlan_link_hold() == 1 && has("at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
+		EXPECT(wlan_link_hold(&H) == 1 && has("at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
 		teardown_tail_is_table_order(30);
 		baseline_restored();
 		/* wlan_link_release (review 21 F1): the same T rows after a successful hold; with nothing held it writes nothing */
 		world();
-		EXPECT(wlan_link_hold() == 0 && has("restore=held"));
-		EXPECT(wlan_link_release() == 0 && has("LINK release restore=ok") && !has("restore=FAILED") && !has("!!!"));
+		EXPECT(wlan_link_hold(&H) == 0 && has("restore=held"));
+		EXPECT(wlan_link_release(&H) == 0 && has("LINK release restore=ok") && !has("restore=FAILED") && !has("!!!"));
 		teardown_tail_is_table_order(30);
 		baseline_restored();
 		{
 			unsigned nw = nwrites;
 
-			EXPECT(wlan_link_release() == 2 && nwrites == nw);				/* a second release: nothing held, nothing written */
+			EXPECT(wlan_link_release(&H) == 2 && nwrites == nw);				/* a second release: nothing held, nothing written */
 		}
 		world();
-		EXPECT(wlan_link_release() == 2 && nwrites == 0 && nev == 0);
+		EXPECT(wlan_link_release(&H) == 2 && nwrites == 0 && nev == 0);
 		world(); fault_read_pa = WLAN_DBI + 0x70;
-		EXPECT(wlan_link_hold() == 1 && has("restore=ok"));
+		EXPECT(wlan_link_hold(&H) == 1 && has("restore=ok"));
 		{
 			unsigned nw = nwrites;
 
-			EXPECT(wlan_link_release() == 2 && nwrites == nw);				/* a failed hold left nothing held */
+			EXPECT(wlan_link_release(&H) == 2 && nwrites == nw);				/* a failed hold left nothing held */
 		}
 		world();
-		EXPECT(wlan_link_hold() == 0);
+		EXPECT(wlan_link_hold(&H) == 0);
 		iso_clear_ret = 2;									/* the release reports a failing restore */
-		EXPECT(wlan_link_release() == 1 && has("LINK release restore=FAILED"));
+		EXPECT(wlan_link_release(&H) == 1 && has("LINK release restore=FAILED"));
 	}
 	else {
 	world();											/* N != S30: the hold is refused, nothing runs */
-	EXPECT(wlan_link_hold() == 2 && nwrites == 0 && nev == 0 && has("hold refused") && !has("LINK table") && !has("restore="));
+	EXPECT(wlan_link_hold(&H) == 2 && nwrites == 0 && nev == 0 && has("hold refused") && !has("LINK table") && !has("restore="));
 	}
 	puts("PASS wlanlink host test N=" WLAN_LINK_N_STR);
 	return 0;

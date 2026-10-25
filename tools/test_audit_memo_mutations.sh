@@ -48,8 +48,8 @@ mut src-dbi-offset "audited text|reviewed text|rejected|FAILED" shim/wlanlink.c 
 mut src-second-write "AssertionError" shim/wlanlink.c "static int run_row(" "static int run_row_dummy(void) { return try_write32(WLAN_PMA, 0); }
 static int run_row("
 # 4: audit mutant: the source audit accepts everything -> the warm self-test must rerun (script sha changed) and FAIL to catch
-mut audit-gutted "FAILED to catch" tools/test-bluejay-boot.py "def check_wlanlink_source_text(src: str, name: str = \"wlanlink.c\") -> None:
-" "def check_wlanlink_source_text(src: str, name: str = \"wlanlink.c\") -> None:
+mut audit-gutted "FAILED to catch" tools/test-bluejay-boot.py "def check_wlanlink_source_text(src: str, name: str = \"wlanlink.c\", pins: bool = True) -> None:
+" "def check_wlanlink_source_text(src: str, name: str = \"wlanlink.c\", pins: bool = True) -> None:
     return
 "
 # 5: data mutant: one value changed without re-hashing

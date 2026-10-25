@@ -557,10 +557,7 @@ static int link_teardown(unsigned hi, unsigned *probed, uint32_t *rd)
 	return tear_bad;
 }
 
-static int held_on;			/* set only by a hold run that completed S30 with the teardown skipped */
-static unsigned held_hi, held_probed;
-
-static int link_run(int hold)
+static int link_run(int hold, struct wlan_hold *h)
 {
 	char line[RAMLOG_LINE_MAX];
 	unsigned probed = 0, hi = 0, started = 0, bad_row = 0, fail_step = 0, nrows = 0, s, i, p;
@@ -631,10 +628,10 @@ static int link_run(int hold)
 		started = 0;		/* the ONLY way the loop below does nothing: every step 0..S30 ran ok and the caller is wlan_link_hold */
 	if (started)
 		tear_bad = link_teardown(hi, &probed, &rd);
-	held_on = held;		/* every run supersedes the previous state: only a hold run that skipped the teardown leaves something to release */
-	if (held) {
-		held_hi = hi;
-		held_probed = probed;
+	if (h) {		/* only a hold run that skipped the teardown leaves something to release; every hold run supersedes the previous state */
+		h->on = held;
+		h->hi = hi;
+		h->probed = probed;
 	}
 	p = put_txt(line, sizeof(line), 0, "LINK summary reached=S");
 	p = put_dec(line, sizeof(line), p, hi / 10u);
@@ -658,30 +655,30 @@ static int link_run(int hold)
 
 int wlan_link_run(void)
 {
-	return link_run(0);
+	return link_run(0, 0);
 }
 
-int wlan_link_hold(void)
+int wlan_link_hold(struct wlan_hold *h)
 {
 	if (WLAN_LINK_N != WLAN_HOLD_STEP) {
 		con_str("WLAN", "LINK hold refused: N is not the S30 step, nothing written");
 		return 2;
 	}
-	return link_run(1);
+	return link_run(1, h);
 }
 
 /* wlan_link_release(): the teardown of a held link (XNU is not coming). Nothing held: returns 2, writes nothing. Else the same T rows as a failed run, then `LINK release restore=ok|FAILED`; returns 0 / 1. */
-int wlan_link_release(void)
+int wlan_link_release(struct wlan_hold *h)
 {
 	char line[RAMLOG_LINE_MAX];
-	unsigned p, probed = held_probed;
+	unsigned p, probed = h->probed;
 	uint32_t rd = 0;
 	int bad;
 
-	if (!held_on)
+	if (!h->on)
 		return 2;
-	held_on = 0;
-	bad = link_teardown(held_hi, &probed, &rd);
+	h->on = 0;
+	bad = link_teardown(h->hi, &probed, &rd);
 	p = put_txt(line, sizeof(line), 0, "LINK release");
 	p = put_txt(line, sizeof(line), p, bad ? " restore=FAILED" : " restore=ok");
 	emit(line, p);
@@ -697,14 +694,15 @@ int wlan_link_run(void)
 	return 2;
 }
 
-int wlan_link_hold(void)
+int wlan_link_hold(struct wlan_hold *h)
 {
 	con_str("WLAN", "LINK hold refused: --wlan-link not built or not gs101, nothing written");
 	return 2;
 }
 
-int wlan_link_release(void)
+int wlan_link_release(struct wlan_hold *h)
 {
+	(void)h;
 	return 2;
 }
 

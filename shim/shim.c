@@ -589,6 +589,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 #endif
 #ifdef WLAN_HOLD
 	int wlan_hold_rc;
+	struct wlan_hold wlan_held = {0, 0, 0};
 #endif
 #if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)
 	/* --boot-xnu --gpu-handover: switch the shader rail BUCK2S on (audited ACPM writer, gpurailon.c: zero writes unless it reads exactly off with OUT1 in the
@@ -607,7 +608,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	/* --boot-xnu --wlan-hold (docs/research/42 section 7): power PCIe1 + the BCM4389 up to the end of S30 with the audited table interpreter and LEAVE the link up for the XNU driver.
 	 * wlan_link_hold() skips the teardown only when steps 0 to the hold step all ran ok; on any failure it tears down (restore=ok|FAILED) and XNU boots anyway. No new writer here. */
 	con_str("SECTION", "WLAN link hold");
-	wlan_hold_rc = wlan_link_hold();
+	wlan_hold_rc = wlan_link_hold(&wlan_held);
 	pstore_save();
 #endif
 	{
@@ -617,7 +618,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 #ifdef WLAN_HOLD
 		/* loader_boot returned: XNU is not coming. A held link (hold returned 0, summary restore=held) is torn down with the same audited T rows (wlan_link_release, no new writer), like the GPU rail
 		 * below. The `restore=held` / `LINK release` lines reach the screen and pstore (the USB log starts after this block). The fall-through only reads; the "WLAN link" section is compiled out of a hold image. */
-		if (wlan_hold_rc == 0 && wlan_link_release() != 0)
+		if (wlan_hold_rc == 0 && wlan_link_release(&wlan_held) != 0)
 			con_str("WLAN", "BOOT XNU failed: the held PCIe1/BCM4389 link was NOT torn down; reset the phone");
 		pstore_save();
 #endif
