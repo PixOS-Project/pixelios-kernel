@@ -284,7 +284,7 @@ def _fixtures(b):
         "cmd-exec": fx("cmdexec", "```sh\ntools/noexec.sh\n```\n", {"tools/noexec.sh": "x\n"}),
         "works": fx("works", "## What works today\n\n- The shim runs on the phone.\n"),  # K8
         "works-prose": fx("worksprose", "Everything works fine.\n"),
-        "leak": fx("leak", "see ~/x\n"),
+        "leak": fx("leak", "see /home/alice/x\n"),
         "archive": fx("archive", "<!-- readme-gate: archive -->\n[c](docs/CASE_STUDY.md)\n"),
         "known": fx("known", "[c](docs/CASE_STUDY.md)\n",
                     {"tools/check-readme.known": "README.md\tlink\tbroken relative link: docs/CASE_STUDY.md\t2026-10-24\tREADME not fixed yet\n"}),
@@ -304,7 +304,7 @@ def _fixtures(b):
         "leak-email": fx("leakemail", "mail a@b.com and c@d.org\n"),
         "leak-known": fx("leakknown", "mail a@b.com\n", kn(("README.md", "leak", "e-mail address: a@b.com", "2026-10-24", "why"))),
         "leak-fp": fx("leakfp", "see logo@2x.png, uses actions/checkout@v4.1.1 and foo@1.2.3\n"),
-        "leak-path-known": fx("leakpathknown", "see ~/x\n", kn(("README.md", "leak", "local path: ~/", "2026-10-24", "why"))),
+        "leak-path-known": fx("leakpathknown", "see /home/alice/x\n", kn(("README.md", "leak", "local path: /home/alice/", "2026-10-24", "why"))),
         "link-dotdot": fx("linkdotdot", "[x](../outside.md)\n"),
         "k2-env": fx("k2env", '```sh\nls "$HOME/pixelios"\n```\n'),
         "k2-cd": fx("k2cd", "```sh\ncd shim && ./build.sh\n```\n", {"shim/build.sh": "#!/bin/sh\n"}, execs=("tools/ok.sh", "shim/build.sh")),
