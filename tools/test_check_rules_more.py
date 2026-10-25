@@ -147,5 +147,20 @@ class Mutants(unittest.TestCase):
             self.assertEqual(run(r22, fail, dest), [])
 
 
+class TrackedOnly(unittest.TestCase):
+    """lib.tracked: in a git work tree an untracked violating file is not scanned; a non-git dir is scanned whole."""
+    BAD = "static void f(void) { int x = (1 ? 2 : 3); }\n"
+
+    def test_untracked_skipped_and_nongit_scans_all(self):
+        from check_rules import lib
+        import subprocess
+        files = {"a/tracked.c": self.BAD, "a/untracked.c": self.BAD}
+        with tmp_tree(files) as d:
+            self.assertEqual([r for r, _ in lib.tracked(d, "a/*.c")], ["a/tracked.c", "a/untracked.c"])   # non-git: everything
+            subprocess.run(["git", "-C", d, "init", "-q"], check=True)
+            subprocess.run(["git", "-C", d, "add", "a/tracked.c"], check=True)
+            self.assertEqual([r for r, _ in lib.tracked(d, "a/*.c")], ["a/tracked.c"])
+
+
 if __name__ == "__main__":
     unittest.main()
