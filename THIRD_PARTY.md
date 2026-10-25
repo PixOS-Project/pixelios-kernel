@@ -12,6 +12,8 @@ This is not legal advice. Source of the analysis: `docs/PLAN-STANDALONE.md` (row
 | 8 | Stager: BearSSL (portable AES, MD5, SHA-1, SHA-384/512 copied into `libkern/crypto/sweet_bearssl`) | https://www.bearssl.org/git/BearSSL @ `7bea48e5e850ab4cafbe68d3765cdaba13a86d6f` [src: `xnu/patches/0020*.sh:6`] | MIT, "Copyright (c) 2016 Thomas Pornin <pornin@bolet.org>"; full text below. Read from `LICENSE.txt` in a previously staged copy `~/pixelios-artifacts/bt-0082/tree/xnu/libkern/crypto/sweet_bearssl/LICENSE.txt` (copied by `0020:43`) [observed 2026-10-25]; that the staged copy is exactly the pinned commit is [guess] (the stager checks the hash, the artefact itself was not re-verified). The `src/inner.h` header repeats the same MIT text [observed] | fetched at build time; its code ends up in the kernel binary, which therefore needs this notice |
 | 9 | Project Nayuki qrcodegen: `qrlog/qrcodegen.[ch]` and the copy inside `xnu/patches/0081-sweet-qr-log.patch` | Project Nayuki | MIT: "Copyright (c) Project Nayuki. (MIT License)" with the full text in the file [observed in 0081 lines 315, 319, 1362] | tracked; 0081 is an MIT island inside the APSL directory |
 | 10 | `bsd/dev/sweet_wlan_chip.h` inside `xnu/patches/0120-sweet-wlan-bwfm-core.patch` (branch `wip/w3a-s34-skip` only) | OpenBSD `sys/dev/ic/bwfm.c` v1.118 [PLAN-STANDALONE row 10] | ISC, "Copyright (c) 2010-2016 Broadcom Corporation, Copyright (c) 2016,2017 Patrick Wildt <patrick@blueri.se>" [observed: patch lines 221-224 on that branch, 2026-10-25] | tracked on the Wi-Fi branch only, not yet public |
+| 11 | `soc/google/gs101/wlan_seq.json` + generator `tools/gen_wlan_seq.py` | values PARSED mechanically from Google Pixel kernel sources, branch `android-gs-bluejay-6.1-android16`, fetched 2026-10-23 [src: `docs/research/29-wlan-stage1-design.md:10`; exact commit not recorded: guess]; files `dwc-whi/pcie-exynos-gs101-rc-cal.c`, `dwc-whi/pcie-exynos-rc.c`, `pcie-exynos-rc.h`, `pcie-exynos-common.h`, `gs101-pcie.dtsi`, `gs101-pinctrl.dtsi`, `gs101-common-wlan.dtsi`, `linux-pinctrl-exynos-arm64.c` [src: `tools/gen_wlan_seq.py:3-9`] | **facts extracted from GPL-2.0 sources, see LAWYER note.** SPDX headers read locally: rc-cal.c, rc.c, gs101-pcie.dtsi, gs101-pinctrl.dtsi, gs101-common-wlan.dtsi = `GPL-2.0-only` (Samsung / Google copyright); `linux-pinctrl-exynos-arm64.c` = `GPL-2.0+` [observed, `~/pixelios-artifacts/refs/wlan-stage1/`, 2026-10-25] | generated, tracked |
+| 12 | `soc/google/gs101/shim/ufsphy_tables.h` + generator `tools/gen-ufsphy-tables.py` | Linux mainline `drivers/phy/samsung/phy-gs101-ufs.c` at commit `72a16bcff25e9f4a1d6d42a243301b1b76db2f32`, via Appendix A of `soc/google/gs101/docs/07-gs101-ufs-bringup.md` [src: `ufsphy_tables.h:1`, doc 07 lines 3-4] | **facts extracted from GPL-2.0 sources, see LAWYER note.** The source file is not on this machine (`/tmp/ufsspec` is gone), so its SPDX header was not read: GPL-2.0 is a [guess] (mainline drivers/phy/samsung is normally GPL-2.0-only) | generated, tracked; compiled into every shim binary |
 | 19 | AOSP `mkbootimg.py`, `avbtool.py`, `generate_gki_certificate.py` | android.googlesource.com, branch main, **not pinned** [src: `tools/fetch-android-tools.sh:7-10`] | Apache-2.0 [guess; not read] | fetched into gitignored `tools/third_party/`, not shipped |
 | 20 | CI kernel build: blacktop/darwin-xnu-build | GitHub | MIT per `docs/CREDITS.md:23` of the site repo [src, not re-checked] | fetched in CI |
 
@@ -41,3 +43,16 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 (Trailing whitespace of the original lines is dropped here.)
+
+## LAWYER note (rows 11 and 12; decision D3 = option A, user, 2026-10-25)
+
+- **Where the values come from [src].** `wlan_seq.json` holds register offsets, bit values, delays and pin settings that `tools/gen_wlan_seq.py` parses
+  out of the Google/Samsung GPL-2.0 sources listed in row 11. `ufsphy_tables.h` holds PHY register/value rows that `tools/gen-ufsphy-tables.py`
+  produces from the table in Linux `phy-gs101-ufs.c` (row 12).
+- **The extraction is mechanical [src].** The generators read the sources; the values are not typed by hand. The output contains numbers and
+  register names plus line cites, not source text or code structure [read from the generated files; not independently measured here, but
+  `docs/reviews/license-similarity.md` reports no run of more than 4 lines against any GPL tree].
+- **No claim is made either way.** This project does not claim that such facts are free of the source licence, and does not claim they are derived
+  works. The table is kept in the tree as it is (option A); the alternative (generate it at build time from fetched sources) is documented in
+  `docs/PLAN-STANDALONE.md` task T7 (B).
+- **No lawyer has reviewed this.** Everything above is a maintainer's description, not a legal opinion.
