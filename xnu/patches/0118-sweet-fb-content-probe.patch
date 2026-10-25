@@ -1,4 +1,4 @@
-SWEET FB content probe (patch 0119): every 100th presented layer, logs the nonzero count and an FNV-1a hash of a 64x64 sample grid of the copied source region
+SWEET FB content probe (patch 0118): every 100th presented layer, logs the nonzero count and an FNV-1a hash of a 64x64 sample grid of the copied source region
 (read-only, bounds already checked by the copy guard, no hardware write). Tells rendered pixels from an all-zero surface (session 42 item 2).
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
