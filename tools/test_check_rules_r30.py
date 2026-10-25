@@ -79,6 +79,10 @@ class Modes(unittest.TestCase):
         self.assertEqual(msgs(tree({"shim/a.c": "// (c) poll is bounded\n"})), [])  # list marker, not a notice
         self.assertEqual(msgs(tree({"shim/a.c": " * Copyright (c) 1988 NeXT, Inc.\n"})), ["R30 holder"])
 
+    def test_isc_boilerplate_is_not_a_holder(self):
+        self.assertEqual(msgs(tree({"shim/a.c": " * copyright notice and this permission notice appear in all copies.\n"})), [])
+        self.assertEqual(msgs(tree({"shim/a.c": " * Copyright 2020 Some Corp\n"})), ["R30 holder-unknown"])
+
     def test_notice_file_per_holder(self):
         lics = tuple(x for x in LICS if x != "MIT-ios-sweet.txt")
         self.assertEqual(msgs(tree({"shim/sweet/a.c": " * Copyright (c) 2026 dipa-studio\n"}, lics=lics)), ["R30 notice"])
