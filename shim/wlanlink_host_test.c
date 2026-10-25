@@ -168,7 +168,7 @@ static uint32_t chip_get(uint32_t win, uint32_t off)	/* the model's register val
 	if (win == 0x18126000u)
 		return off == 0x408u ? sm_io : off == 0x800u ? (s33_mode == 5 ? sm_rc | 0x100u : sm_rc) : (chip_mode == 11 ? 1u : sm_rs);
 	if (win == 0x18001000u)
-		return chip_mode == 12 ? 0xFFFFFFFFu : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
+		return chip_mode == 12 ? 0xFFFFFFFFu : chip_mode == 15 ? 0x00030300u : chip_mode == 16 ? 0x00020000u : chip_mode == 17 ? 0x00000200u : chip_mode == 18 ? 0x30030300u : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
 	return off == 0u ? sm_coreinfo : off == 0x10u ? sm_bankidx : sm_bankinfo;
 }
 
@@ -1815,12 +1815,13 @@ int main(void)
 			EXPECT(r.step <= 36u);
 			if (r.kind == WLK_MMIO_WRITE || r.kind == WLK_MMIO_RMW || r.kind == WLK_GPIO_DAT || r.kind == WLK_GPIO_CON || r.kind == WLK_SMC_ISO) {
 				EXPECT(nwr < nex && r.step == ex[nwr].step && r.blk == ex[nwr].blk && r.off == ex[nwr].off && r.kind == ex[nwr].kind && r.mask == ex[nwr].mask && r.val == ex[nwr].val);
+				EXPECT(r.a == (r.kind == WLK_MMIO_RMW ? 32u : 0u));	/* the S34 SRPWR request row carries the skip flag 32 (skipped once SRP_UP is recorded); no other write row has a flag */
 				wr_rows[nwr++] = i;
 				if (r.blk == WLB_MEM)
 					mw_rows[nmwr++] = i;
 			}
 			if (r.blk == WLB_MEM && r.kind == WLK_READ_ONLY) {
-				EXPECT(r.a == 2u);
+				EXPECT(r.a == 2u || (r.step == 34u && r.off == 0x1E8u && r.a == 18u));	/* log flag; the S34 powerctl log row also carries the SRP_UP recorder flag 16 */
 				EXPECT(nl3[r.step - 34u] < 12u);
 				lrow[r.step - 34u][nl3[r.step - 34u]++] = i;
 			}
@@ -2055,6 +2056,18 @@ int main(void)
 		world(); chip_mode = 14;					/* PowerDomain id [31:28] = 0: no SRPWR capability, the RMW is refused at row 1345 (review 16 finding 2), nothing written */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);
 		teardown_tail_is_table_order(34);
+		baseline_restored();
+		world(); chip_mode = 15;					/* S34 skip (the run w3a-n34 state 0x00030300: id 0, SRPWR domain 1 already requested and up): the request is skipped, NOT written, the read-back and the status wait pass, the run is clean */
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 18;					/* the same with PowerDomain id 3: skipped too */
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 16;					/* ExtPwrStatus bit 17 alone (PowerOnRequest bit 9 clear, id 0): no skip, the write is refused (id 0), nothing written */
+		EXPECT(wlan_link_run() == 1 && !has("skip: SRPWR request") && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 17;					/* PowerOnRequest bit 9 alone (status bit 17 clear, id 0): no skip, refused, nothing written */
+		EXPECT(wlan_link_run() == 1 && !has("skip: SRPWR request") && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && mem_illegal_w == 0u);
 		baseline_restored();
 		world(); chip_mode = 12;					/* powerctl reads all ones (dead): the RMW is refused (old != 0xFFFFFFFF), nothing written */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);

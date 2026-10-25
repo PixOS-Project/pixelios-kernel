@@ -36,6 +36,7 @@ _Static_assert(WLAN_LINK_N <= WLAN_SEQ_LAST, "--wlan-link=N: N beyond the last s
 #define ST_TIMEOUT	1
 #define ST_FAULT	2
 #define ST_REFUSED	3
+#define SRP_UP		(1u << 30)	/* kept in `probed` too: set by the S34 powerctl log row (a & 16) when ExtPwrStatus bit 17 and PowerOnRequest bit 9 are both set (observed run w3a-n34: 0x00030300); the SRPWR request row (a & 32) is then skipped, no write */
 #define EOT_SEEN	(1u << 31)	/* kept in the run's `probed` word (bits 0..7 are block probes): set when an EROM dump row read the EOT dword 0xF */
 
 __attribute__((noipa)) static unsigned put_txt(char *dst, unsigned cap, unsigned pos, const char *s)
@@ -500,6 +501,8 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 			else if (r.a & 8u)
 				return ST_REFUSED;
 		}
+		if ((r.a & 16u) && v != 0xFFFFFFFFu && (v & 0x20200u) == 0x20200u)	/* SRPWR domain 1 already requested and up: not a dead read (all ones) */
+			*probed |= SRP_UP;
 		return ST_OK;
 	}
 	if (r.kind == WLK_WAIT_EQ || r.kind == WLK_WAIT_MASK) {
@@ -569,6 +572,10 @@ int wlan_link_run(void)
 				continue;
 			if ((probed & EOT_SEEN) && r.kind == WLK_READ_ONLY && (r.a & 4u))
 				continue;		/* after the EOT no further EROM dword is read (reads past it hanging the phone is a GUESS and unlikely: run w3a-n32 was most likely the host --timeout 600 expiring, last usb line at fboot+596 s; review 14 H1) */
+			if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW && (r.a & 32u)) {
+				step_line('S', s, "skip: SRPWR request, domain 1 already up (no write)", 1, i, 1, rd, 0, 0);
+				continue;
+			}
 			st = run_row(i, 0, &probed, &rd);
 			if (st != ST_OK) {
 				stopped = st;
