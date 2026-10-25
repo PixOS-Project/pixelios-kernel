@@ -124,7 +124,7 @@ worker of docs/research/11 (old backboardd t2/t10/t14) is not present in these s
 **Single most likely next fix: get PosterBoard through its first `prewarm`.** Evidence: it is the only hard failure in the window, it sits on the code path SpringBoard
 uses for the lock-screen/home-screen wallpaper, and the assertion names its cause (a switcher configuration already in memory before the first update).
 Cheapest steps, in order:
-1. Host-only: look in the flashed root (`/tank/pixelios/ios-root.img` with the `tools/check-ios-root.py` HFS reader) for a PosterBoard data container
+1. Host-only: look in the flashed root (`<tank>/pixelios/ios-root.img` with the `tools/check-ios-root.py` HFS reader) for a PosterBoard data container
    (strings in the image: `PRBPosterExtensionDataStore`, `SwitcherConfigurationOrdering.plist`, `Extensions`, `GalleryCache`); if one exists, the pulled upstream root had it created by a real data migration. guess: the path under `/var/mobile/Library` is not verified.
 2. On the next flash, ship the root without any PosterBoard container (fresh), and capture the first PosterBoard crash with the sampler change below (the dedupe hides the second crash).
 3. If it still asserts: the cause is call order (a client request reaching the store before `prewarm`); then the fix is to delay SpringBoard's first poster request, which is a userland
