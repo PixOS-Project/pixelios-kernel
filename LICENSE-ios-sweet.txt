@@ -1,3 +1,7 @@
+Source: https://github.com/dipa-studio/ios-sweet (the text below is `LICENSE` of commit 067c9b3, blob 526359b5; observed 2026-10-25).
+Files taken: ios-sweet commit 11da58b (2026-10-19, no LICENSE at that commit); the same files are byte-identical in 067c9b3, which adds this LICENSE (except tools/mkadt.py, see THIRD_PARTY.md).
+Used for: the files listed in THIRD_PARTY.md rows 2 and 4, and xnu/patches/0001-0059 and the stagers 0019/0020/0026.
+
 MIT License
 
 Copyright (c) 2026 dipa-studio
