@@ -4,6 +4,8 @@
 #              [--reader "qr-log.py options"]   (e.g. "--workers 3 --average 3 --tiles 1"; QL2 boot-args go in --args: sweetqr_fmt=1|2 sweetqr_ver sweetqr_ecc sweetqr_tiles sweetqr_ms sweetqr_k sweetqr_red sweetqr_fec sweetqr_hold)
 #              [--expect REGEX]... [--expect-absent REGEX]... [--duration S] [--label NAME] [--no-flash-check]
 #              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]... [--overlay DIR]
+#   DEFAULT END (B1, 2026-10-25): every run ends by the host. --expect patterns imply --early (stop when all are seen; --full waits for --duration instead); a run without them ends at --duration
+#                  (default --restart, else 300 s after fastboot boot) with the software reset; the --restart timer is only the fallback (the B2 "recovery" result of run bl2-timer was a root-mount-failure reset at +207 s, not the timer).
 #   --remote-reset  adds boot-arg sweetremote=1 (xnu patch 0100): an early stop (--early / --stop-on) then resets the phone into the bootloader over the USB link (tools/phone goto fastboot sends
 #                  UDP SWEET-RESET-BL) instead of waiting for the self-reset timer. --restart N,bootloader (timer path) lands in fastboot directly, not in recovery.
 #                  --early / --stop-on turn --remote-reset ON by default (observed working 2026-10-24, run bl1-remote3: phone in fastboot ~95 s after the stop instead of waiting ~700 s); --no-remote-reset disables it.
@@ -26,24 +28,27 @@ cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
 R="python3 tools/xrun_report.py"   # not -I: PIL lives in the user site-packages
 kernel=""; adt=""; board=bluejay; cpus=1; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; handover=""; dvfs=()
-lockwait=0; remote=""; noremote=0; nocam=0; failons=(); dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""; overlay=""
+lockwait=0; remote=""; noremote=0; full=0; nocam=0; failons=(); dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""; overlay=""
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
 	--qr) qr=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) args=$2; shift 2 ;; --duration) duration=$2; shift 2 ;;
-	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --remote-reset) remote=1; shift ;; --no-remote-reset) noremote=1; shift ;; --fail-on) failons+=("$2"); shift 2 ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
+	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --full) full=1; shift ;; --remote-reset) remote=1; shift ;; --no-remote-reset) noremote=1; shift ;; --fail-on) failons+=("$2"); shift 2 ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
 	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
 	--dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;;
 	*) echo "unknown option $1 (see the header of tools/xrun)" >&2; exit 2 ;; esac; done
 if [ "$dry" = 1 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
 [ "$early" = 0 ] || [ ${#stops[@]} -gt 0 ] || stops=("${rawexp[@]}")
 [ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
-[ "$early" = 0 ] && [ ${#stops[@]} = 0 ] || { [ "$noremote" = 1 ] || remote=1; }   # an early stop needs the software reset (proven on hardware)
+[ "$full" = 1 ] || [ ${#stops[@]} -gt 0 ] || [ ${#rawexp[@]} = 0 ] || { early=1; stops=("${rawexp[@]}"); }   # B1 is the default: --expect stops the run when every pattern is seen (--full keeps the old wait)
+[ "$noremote" = 1 ] || remote=1   # the host ends every run with the software reset (proven on hardware, run bl1-remote3); the timer is only the fallback
 if { [ "$early" = 1 ] || [ ${#stops[@]} -gt 0 ]; } && [ ${#failons[@]} = 0 ]; then failons=('Kernel trap at|panic\(cpu|panic:|Assertion failed'); fi
 [ "${failons[0]:-}" != none ] || failons=()
-[ -z "$remote" ] || args="${args:+$args }sweetremote=1"
+[ -z "$remote" ] || [[ " $args " == *" sweetremote=1 "* ]] || args="${args:+$args }sweetremote=1"
 label=$(printf %s "$label" | tr -c 'A-Za-z0-9._-' _)
 D=logs/runs/$(date -u +%Y%m%dT%H%M%SZ)-$label; mkdir -p "$D/snaps" "$D/frames"; LOG=$D/xrun.log; : >"$LOG"
-secs=${restart%%,*}; [ -n "$duration" ] || duration=$(( ${secs:-60} + 300 ))
+secs=${restart%%,*}
+if [ -n "$duration" ]; then :; elif [ -n "$remote" ]; then duration=${secs:-300}   # the host resets at --duration (B1); the timer is the fallback
+else duration=$(( ${secs:-60} + 300 )); fi   # --no-remote-reset: wait for the timer
 . tools/plock.sh
 cap=""; usbpid=""
 stop_capture() { touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
@@ -57,7 +62,7 @@ stopkv=(); for x in ${stops[@]+"${stops[@]}"}; do stopkv+=("stop_on=$x"); done
 for x in ${failons[@]+"${failons[@]}"}; do stopkv+=("fail_on=$x"); done
 if head=$(git rev-parse --short HEAD 2>/dev/null); then git diff --quiet HEAD || head=$head+dirty; else head=nogit; fi
 $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$restart" duration="$duration" \
-	git_head="$head" t_start=@now ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
+	git_head="$head" t_start=@now ${remote:+remote=1} ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
 
 if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
