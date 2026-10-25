@@ -533,12 +533,15 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 	return ST_OK;
 }
 
-int wlan_link_run(void)
+/* wlan_link_hold(): the hand-over flavor (--wlan-hold). Same chain, same interpreter; ONLY when it ran every step 0..N ok AND N is the S30 step ("the first BAR0 read" in the table's steps: link up, ATU regions 0/1, BAR0/BAR2, Command MEM, cfg 0x80 = 0x18000000) the teardown is skipped and the link is left up for XNU. WLAN_HOLD_STEP is the only typed step number: wlan_seq.json has no named-step constant (checked: out/wlan_seq.h carries only SHA256/NROWS/NTEAR/LAST/DEFAULT_N); the audit pins the step text of 30. Any failure runs the normal teardown. */
+#define WLAN_HOLD_STEP	30u
+
+static int link_run(int hold)
 {
 	char line[RAMLOG_LINE_MAX];
 	unsigned probed = 0, hi = 0, started = 0, bad_row = 0, fail_step = 0, nrows = 0, s, i, p;
 	uint32_t rd = 0;
-	int stopped = ST_OK, st, tear_bad = 0;
+	int stopped = ST_OK, st, tear_bad = 0, held;
 	struct wlan_row r;
 
 	p = put_txt(line, sizeof(line), 0, "LINK table sha=");
@@ -598,7 +601,10 @@ int wlan_link_run(void)
 			step_line('S', s, st_name(stopped), 1, bad_row, 1, rd, 0, 0);
 		pstore_save();
 	}
-	/* the teardown, always, for the steps that were started; best effort, loud */
+	/* the teardown, always, for the steps that were started; best effort, loud. Only a hold run that completed S30 skips it (held). */
+	held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;
+	if (held)
+		started = 0;		/* the ONLY way the loop below does nothing: every step 0..S30 ran ok and the caller is wlan_link_hold */
 	for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {
 		if (!get_row(i, 1, &r) || r.step > hi)
 			continue;
@@ -622,7 +628,7 @@ int wlan_link_run(void)
 		p = put_txt(line, sizeof(line), p, " row=");
 		p = put_dec(line, sizeof(line), p, bad_row);
 	}
-	p = put_txt(line, sizeof(line), p, tear_bad ? " restore=FAILED" : " restore=ok");
+	p = put_txt(line, sizeof(line), p, held ? " restore=held" : tear_bad ? " restore=FAILED" : " restore=ok");
 	emit(line, p);
 	if (tear_bad)
 		con_str("WLAN", "LINK !!! RESTORE FAILED: module/PHY may be LEFT on; see the T lines, reset the phone");
@@ -630,11 +636,31 @@ int wlan_link_run(void)
 	return (stopped == ST_OK && !tear_bad) ? 0 : 1;
 }
 
+int wlan_link_run(void)
+{
+	return link_run(0);
+}
+
+int wlan_link_hold(void)
+{
+	if (WLAN_LINK_N != WLAN_HOLD_STEP) {
+		con_str("WLAN", "LINK hold refused: N is not the S30 step, nothing written");
+		return 2;
+	}
+	return link_run(1);
+}
+
 #else	/* not gs101 / --wlan-link not built: refuse, nothing written */
 
 int wlan_link_run(void)
 {
 	con_str("WLAN", "LINK refused: --wlan-link not built or not gs101, nothing written");
+	return 2;
+}
+
+int wlan_link_hold(void)
+{
+	con_str("WLAN", "LINK hold refused: --wlan-link not built or not gs101, nothing written");
 	return 2;
 }
 

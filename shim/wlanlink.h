@@ -16,3 +16,5 @@ int try_read32(uintptr_t address, uint32_t *value);
 int try_write32(uintptr_t address, uint32_t value);
 uint64_t touch_ticks(void);
 int wlan_link_run(void);
+/* --wlan-hold (needs --wlan-link=30): as wlan_link_run(), but when S00..S30 all ran ok the teardown is SKIPPED and the link is left up for XNU (summary `restore=held`, returns 0). Any failure: the normal teardown, restore=ok|FAILED, returns 1. N != 30: refused, 2, nothing written. */
+int wlan_link_hold(void);

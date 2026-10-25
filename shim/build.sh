@@ -18,6 +18,7 @@ wlan_smc_read=0
 wlan_iso=0
 wlan_link=0
 wlan_link_n=
+wlan_hold=0
 gpu_probe=0
 gpu_power=0
 gpu_stack=0
@@ -48,6 +49,7 @@ while [ "$#" -gt 0 ]; do
 		--wlan-smc-read) wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-probe; two EL3 SMC_CMD_PRIV_REG READs of PMU 0x17463EC4 / 0x17463EC0 (wlansmc.c, docs/research/29 W2a)
 		--wlan-iso) wlan_iso=1; wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-smc-read --wlan-probe; WRITER via EL3: PCIe1 PHY isolation release + restore (wlansmc.c WLAN_ISO_RUN, docs/research/29 W2c)
 		--wlan-link) wlan_link=1; wlan_probe=1; shift ;;	# implies --wlan-probe; the table-driven power-up chain S00..S19 (default: the last step BEFORE the PERST release) + teardown (wlanlink.c, docs/research/29 section 14)
+		--wlan-hold) wlan_hold=1; wlan_link=1; wlan_probe=1; shift ;;	# needs --boot-xnu, gs101; implies --wlan-link=30 (the S30 step); chain up to S30, NO teardown, link left up for XNU (wlanlink.c wlan_link_hold, docs/research/42 section 7)
 		--wlan-link=*) wlan_link=1; wlan_probe=1; wlan_link_n="${1#--wlan-link=}"; shift ;;
 		--wlan-en) wlan_en=1; wlan_probe=1; shift ;;	# implies --wlan-probe; WRITER: WLAN_EN gpp14-2 high for 200 ms and back (wlanen.c, docs/research/29 W2b)
 		--gpu-probe) gpu_probe=1; shift ;;
@@ -116,6 +118,12 @@ fi
 if [ "$wlan_smc_read" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-smc-read needs a gs101 board" >&2; exit 2; }
 	CFLAGS="$CFLAGS -DWLAN_SMC_READ"
+fi
+if [ "$wlan_hold" = 1 ]; then
+	[ "$boot_xnu" = 1 ] || { echo "--wlan-hold needs --boot-xnu (the hold exists to hand the link to XNU)" >&2; exit 2; }
+	[ -z "$wlan_link_n" ] || [ "$wlan_link_n" = 30 ] || { echo "--wlan-hold implies --wlan-link=30 (the S30 step); --wlan-link=$wlan_link_n is refused" >&2; exit 2; }
+	wlan_link_n=30
+	CFLAGS="$CFLAGS -DWLAN_HOLD"
 fi
 if [ "$wlan_link" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-link needs a gs101 board" >&2; exit 2; }
