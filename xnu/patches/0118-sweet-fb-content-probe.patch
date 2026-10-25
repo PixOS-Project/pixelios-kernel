@@ -10,12 +10,12 @@ SWEET FB content probe (patch 0118): every 100th presented layer, logs the nonze
  static uint64_t sweet_fb_swap_count;
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
-@@ -476,6 +477,25 @@
+@@ -476,6 +477,26 @@
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
 +			/*
-+			 * Diagnostic, read-only: every 100th present, sample a 64x64 grid of the
++			 * Diagnostic, read-only: every 100th layer-present, sample a 64x64 grid of the
 +			 * region just copied (bounds checked above) and log the nonzero count
 +			 * and an FNV-1a hash, to tell rendered pixels from an all-zero surface.
 +			 */
@@ -25,7 +25,8 @@ SWEET FB content probe (patch 0118): every 100th presented layer, logs the nonze
 +					const uint8_t *row = (const uint8_t *)(src + s->offset +
 +					    (uint64_t)(sy + (int32_t)((int64_t)gy * h / 64)) * s->bytesPerRow + (uint64_t)sx * 4);
 +					for (int32_t gx = 0; gx < 64; gx++) {
-+						uint32_t px = *(const uint32_t *)(row + (uint64_t)((int64_t)gx * w / 64) * 4);
++						uint32_t px;
++						memcpy(&px, row + (uint64_t)((int64_t)gx * w / 64) * 4, 4);
 +						nz += (px != 0);
 +						hash = (hash ^ px) * 16777619u;
 +					}
