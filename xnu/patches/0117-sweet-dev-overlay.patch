@@ -546,7 +546,7 @@ new file mode 100644
 +sweet_devoverlay_run(void)
 +{
 +	char arg[16] = "";
-+	if (!PE_parse_boot_argn("sweetdev", arg, sizeof(arg))) {
++	if (!PE_parse_boot_arg_str("sweetdev", arg, sizeof(arg))) {
 +		return;
 +	}
 +	bool restore = strcmp(arg, "restore") == 0;
