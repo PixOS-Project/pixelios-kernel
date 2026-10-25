@@ -1,13 +1,11 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
-
-# PixeliOS: kernel and shim
+# PixOS: kernel and shim
 
 **Apple's XNU kernel and iOS 16 userland on a Google Pixel 6a (Tensor G1).**
 
 [![xnu build](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml/badge.svg)](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-PixeliOS is a research port. A small bare-metal **shim** is loaded with a temporary
+PixOS is a research port. A small bare-metal **shim** is loaded with a temporary
 `fastboot boot` image, brings up what XNU needs on the Pixel's Tensor G1 (UFS storage, memory
 map, a device tree for XNU), and jumps into a patched **XNU** kernel. The iOS 16 root filesystem
 then lives in the phone's `userdata` partition. It is inspired by, and builds on,
@@ -55,7 +53,6 @@ then lives in the phone's `userdata` partition. It is inspired by, and builds on
 
 ```sh
 git clone https://github.com/PixOS-Project/pixelios-kernel && cd pixelios-kernel
-tools/setup-upstream.sh          # fetch ios-sweet at the pinned commit and patch it (see docs/CREDITS.md)
 tools/fetch-android-tools.sh     # mkbootimg / avbtool from AOSP
 tools/pix build bluejay --avb --qrlog
 # phone in fastboot (Power + Vol Down), unlocked; check the device first:
@@ -94,7 +91,6 @@ fastboot boot -> ABL -> shim (EL2, read-only, MMU off)
 | `shim/`, `xnu/patches/`, `qrlog/`, `tools/` | the shared platform: pre-kernel shim, XNU patch series, QR log, builders and receivers |
 | `soc/<vendor>/<soc>/` | what every phone with a chip shares: `soc.json`, SoC shim code (gs101 UFS bring-up), research |
 | `device/<vendor>/<codename>/` | one phone: `board.json` (DRAM map, framebuffer, ...), gate results, raw hardware captures |
-| `upstream-patches/` | our changes to ios-sweet files, applied by `tools/setup-upstream.sh` |
 | `docs/` | plan, safety, status, research, reviews |
 
 `tools/pix devices | check | build | new-device` is the entry point. **Another Pixel?** Start with
@@ -111,7 +107,7 @@ from other Tensor devices are especially useful.
 
 Built on the idea and groundwork of **ios-sweet** by dipa-studio. Full credits, third-party
 licenses and the legal notes are in [docs/CREDITS.md](https://github.com/PixOS-Project/pixelios-site/blob/main/docs/CREDITS.md). Not affiliated with Apple
-or Google. Our own code is [MIT](LICENSE); the XNU patches in `xnu/patches/` are modifications of Apple's source and stay under Apple's APSL 2.0 (see [xnu/patches/NOTICE.md](xnu/patches/NOTICE.md)).
+or Google. Our own code is [MIT](LICENSE); files derived from ios-sweet keep its MIT notice ([LICENSES/MIT-ios-sweet.txt](LICENSES/MIT-ios-sweet.txt)); the XNU patches in `xnu/patches/` are modifications of Apple's source and stay under Apple's APSL 2.0 (see [xnu/patches/NOTICE.md](xnu/patches/NOTICE.md)). Every third-party component and its licence is listed in [THIRD_PARTY.md](THIRD_PARTY.md); Wi-Fi specifics: [docs/WIFI-LICENSING.md](docs/WIFI-LICENSING.md).
 
 This project is AI-driven: agents write most of the code and docs, a human directs, runs the hardware
 and signs off. Code that touches hardware gets an independent (also AI) review

@@ -53,7 +53,7 @@ The main guard does not guard: any caller without PHONE_LOCK_OWNER/PHONE_OWNER p
 Not covered by the lock check [src grep of tools/]:
 - tools/run-probe.sh:20-32 (`adb reboot bootloader`, `fastboot boot`): no check at all.
 - tools/pstore-pull.py:164-177 (`run`: `fastboot boot`, `adb reboot bootloader`): no check.
-- tools/sweet-log-pull.sh, backup-partitions.sh, check-udump.sh: adb shell/su reads of the phone (non-mutating, but they run `su dd` on userdata/blocks; check-udump reads userdata) with no lock.
+- (tools/sweet-log-pull.sh, since removed), backup-partitions.sh, check-udump.sh: adb shell/su reads of the phone (non-mutating, but they run `su dd` on userdata/blocks; check-udump reads userdata) with no lock.
 - tools/hang-recover:31 calls `phone goto` (checked, but via F1 passes) and is the one tool intended for stuck phones.
 - Covered: fboot.sh (check before `fastboot getvar`, :13-14), fflash-userdata.sh (check before `getvar`, after the local sha/state tests, :16-17), phone goto (check after observe_state, which only does adb devices/getvar reads; before the first mutating step), xrun/probe-run via fboot and goto.
 - Fix: add `tools/phone-lock check --strict` (or plock_take) at the start of the mutating path in run-probe.sh and pstore-pull.py `run`; list them in TP-020 as "not guarded".
