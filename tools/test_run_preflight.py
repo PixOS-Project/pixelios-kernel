@@ -235,6 +235,40 @@ class T(unittest.TestCase):
                'TUNABLE_STR(s, 8, "str_arg", "d"); PE_parse_boot_argn(name_var, &z, 4); /* comment "x" */')
         self.assertEqual(m.names_in(src), {"a_arg", "flag", "t_arg", "dt_arg", "str_arg"})
 
+    # --intent: per-intent required/forbidden flags and boot-args (tools/run-intents.json), checked by tools/xrun before any build
+    def xr(self, *a):   # real tools/xrun, no kernel file: it reaches the "--kernel FILE is required" line only if the intent check passed
+        p = subprocess.run([os.path.join(HERE, "xrun"), "--kernel", "/nonexistent", *a], capture_output=True, text=True, env=self.env, cwd=os.path.dirname(HERE))
+        return p.returncode, p.stdout + p.stderr
+
+    def test_intent_gpu_needs_handover(self):
+        rc, out = self.xr("--intent", "gpu", "--label", "gputest26")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("intent gpu: missing --gpu-handover", out)
+        rc, out = self.xr("--intent", "gpu", "--gpu-handover", "--label", "gputest26")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--kernel FILE is required", out)   # passed the intent check, stopped later
+        self.assertNotIn("intent gpu", out)
+
+    def test_intent_timing(self):
+        rc, out = self.xr("--intent", "timing", "--args", "cpus=8")
+        self.assertEqual((rc, "intent timing: missing sweetlogts=1" in out), (2, True), out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1 sweetlog=0")
+        self.assertEqual((rc, "forbidden sweetlog=0" in out), (2, True), out)
+        rc, out = self.xr("--intent", "timing", "--args", "cpus=8 sweetlogts=1")
+        self.assertIn("--kernel FILE is required", out)
+
+    def test_intent_wlan_unknown_and_none(self):
+        self.assertIn("intent wlan: missing --wlan-hold", self.xr("--intent", "wlan")[1])
+        self.assertIn("unknown --intent nope", self.xr("--intent", "nope")[1])
+        rc, out = self.xr("--label", "gputest26")   # no --intent: unchanged behaviour (only a warning on stderr)
+        self.assertIn("--kernel FILE is required", out)
+        self.assertIn("warning: label 'gputest26' suggests --intent gpu (none given)", out)
+
+    def test_intent_in_preflight_check(self):
+        rc, out = self.pf("--", "tools/xrun", "--kernel", "K", "--args", GOOD, "--intent", "timing")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL intent:", out)
+
 
 if __name__ == "__main__":
     unittest.main()
