@@ -63,6 +63,16 @@ MUTANTS = [
     ('E13 host-test loop not found', 'if m and any("wlanlink_host_test$n" in x for x in t[i + 1:i + 4]):', 'if m and False:'),
     ('E14 no margin', 'ms < (need + 60) * 1000', 'ms < need * 1000'),
     ('E8b git -C not followed', 'if cv and "$" not in cv and "`" not in cv:', 'if False:'),
+    ('E22 shared-tool filter widened to all tools/', 'tf = [f for f in files if SHARED_TOOLS.match(f)]', 'tf = [f for f in files if f.startswith("tools/")]'),
+    ('E22 git add in another repo counted', 'if os.path.realpath(top) == os.path.realpath(root):', 'if True:'),
+    ('E22 commit PATH ignored', 'files += pathspec_files(d, named_ops(ca, COMMIT_VAL))', 'pass'),
+    ('E22 build.sh with shim code denied', ' and f != "shim/build.sh" for f in files', ' for f in files'),
+    ('E8b git rewrite in shared clone ignored', 'if gd and os.path.realpath(gd) == os.path.realpath(SHARED) and not', 'if False and not'),
+    ('E18 -I accepted as text', '"--text", "--binary-files=text", "-uuu")', '"--text", "-I", "--binary-files=text", "-uuu")'),
+    ('E14 xrun default ignored', 'n = 300         #', 'n = 0         #'),
+    ('E14 lock-wait ignored', 'need = max(need, n + (int(lw) if lw and lw.isdigit() else 0))', 'need = max(need, n)'),
+    ('prep: # inside a word is a comment', 'elif ch == "#" and wb:', 'elif ch == "#":'),
+    ('prep: backslash-newline kept', 'if cmd[i + 1] != "\\n":', 'if True:'),
     ('E10 poke inside phone-lock run not seen', 'if p == "phone-lock" or (preflight and p == "run-preflight"):', 'if preflight and p == "run-preflight":'),
 ]
 

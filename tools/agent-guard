@@ -20,15 +20,15 @@ S4b opus, S5a sleep > 30 s, S5b polling, S6a brief size, S6b "at most N lines", 
 pgrep/-s wait loop, E3a raw mutating adb/fastboot (phone-guard), E3b getvar/wait-for-device without timeout, E4 push (ask), E5
 duplicate gate, E6 brief header, E8 edit of phone tools while the lock is held, E9 git stash; post: S2; context: S1n.
 Antipattern rules (super repo docs/ANTIPATTERNS.md; per-AP table docs/ANTIPATTERN-ENFORCEMENT.md): E2c pkill/killall/kill $(pgrep)
-(AP-36/56), E8b Bash write (sed -i, cp, mv, tee, git checkout|restore, >) to a shared phone tool while the lock is held (AP-18), E10
+(AP-36/56), E8b Bash write (sed -i, cp, mv, tee, git checkout|restore, git merge|reset --hard|pull|switch|rebase|..., >) to a shared phone tool while the lock is held (AP-18), E10
 sweettouchpoke= without final ';' (AP-10), E11 row=N[..] in a run pattern (AP-42), E12 probe-run --wlan-link --timeout < 600 (AP-14),
 E13 --wlan-link=N not in the shim/build.sh host-test loop (AP-13), E14 background run without a timeout > tool limit + 60 s (AP-33),
-E15 find / (AP-24), E16 find .claude without prune (AP-35), E17 glob that expands to -names (AP-34), E18 grep without -a on Apple
+E15 find / (AP-24), E16 find .claude without prune (AP-35), E17 glob that expands to -names (AP-34), E18 grep without -a / --binary-files=text on Apple
 sources (AP-53), E19 7z e/x of an iOS root image (AP-54), E20 rea.sh in a foreground loop (AP-56), E21 ipsw disass --quiet (AP-46),
-E22 tools/** or shim/build.sh committed in the kernel repo off trunk/tools/* (AP-58; exempt: detached HEAD, merge/pick/revert in
+E22 a shared runner/gate tool (SHARED_TOOLS) or shim/build.sh alone committed in the kernel repo off trunk/tools/* (AP-58; exempt: detached HEAD, merge/pick/revert in
 progress, EMERGENCY-TOOL-FIX in the command). Known gaps (read from this code): E8b follows redirects only when the line has
 no cd, and not inside bash -c; E13/E22 skip an unknown dir; E14 margin 60 s is a guess (as run-preflight --margin); E18 only knows the
-paths sweet_hfs, xnu-pristine, localbuild/work/; E22 with -a/git add in the line also counts unstaged/untracked tool files.
+paths sweet_hfs, xnu-pristine, localbuild/work/; E22 also counts what `git add` (same repo), `commit -a` and `commit PATH` add; E22 skips bash -c, GIT_DIR=, git aliases.
 
 Deviations from the draft (each is a draft defect or an unverified contract; all [guess] unless a source is given):
  - S3b/S3c/S1 are judged on parsed command words, not regexes over the raw text (the draft denied `git commit -m "xrun fix"` over
@@ -117,10 +117,44 @@ def parse(cmd):
     return _PARSE[cmd]
 
 
+def prep(cmd):
+    """heredoc bodies cut, backslash-newline joined (bash drops it outside single quotes), real `#` comments stripped (a `#` inside a
+    word is no comment), newlines turned into ` ; `. One quote-aware scan shared by parse and redirect_targets (review r1 F4, F5)."""
+    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd)
+    out, q, i, n, wb = [], None, 0, len(cmd), True      # wb: at a word boundary (a `#` here starts a comment)
+    while i < n:
+        ch = cmd[i]
+        if q == "'":
+            out.append(ch)
+            q = None if ch == "'" else q
+        elif ch == "\\" and i + 1 < n:
+            if cmd[i + 1] != "\n":
+                out += [ch, cmd[i + 1]]
+                wb = False
+            i += 2
+            continue
+        elif q == '"':
+            out.append(ch)
+            q = None if ch == '"' else q
+        elif ch in "'\"":
+            q, wb = ch, False
+            out.append(ch)
+        elif ch == "#" and wb:
+            while i < n and cmd[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(ch)
+            wb = ch in " \t\n;&|()"
+        i += 1
+    return "".join(out).replace("\n", " ; ")
+
+
 def _parse(cmd):
-    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd).replace("\n", " ; ")
+    cmd = prep(cmd)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    lex.commenters = ""
     out, seg, skip = [], [], False
     try:
         for t in lex:
@@ -618,14 +652,16 @@ def lock_held():
     return i is not None, "held by %s pid=%s" % ((i or {}).get("owner", "?"), (i or {}).get("pid"))
 
 
+REWRITE = {"merge", "pull", "reset", "switch", "checkout", "rebase", "cherry-pick", "revert", "am", "stash"}
 REDIR_OUT = re.compile(r"&?>{1,2}[|]?")
 
 
 def redirect_targets(cmd):
     """file names after > >> &> >| in the outer command (quotes and heredoc bodies as in parse; bash -c strings are not followed)."""
-    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd).replace("\n", " ; ")
+    cmd = prep(cmd)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    lex.commenters = ""
     out, prev = [], None
     try:
         for t in lex:
@@ -670,6 +706,18 @@ def r_e8b(c):
                 gd = os.path.join(wd, os.path.expanduser(cv))
                 res = lambda x: os.path.join(gd, os.path.expanduser(x))  # noqa: E731
             cand = ops
+        if prog == "git" and git_sub(a) in REWRITE:
+            sub, cv = git_sub(a), opt_val(a, "-C") or ""
+            gd = None if "$" in cv or "`" in cv else os.path.join(wd, os.path.expanduser(cv))
+            tgt = [x for x in ops[ops.index(sub) + 1:] if not x.startswith("-")] if sub in ops else []
+            if gd and os.path.realpath(gd) == os.path.realpath(SHARED) and not (sub == "reset" and not any(x in a for x in ("--hard", "--merge", "--keep"))):
+                if sub in ("checkout", "switch") and "--" not in a and tgt and git(gd, "rev-parse", "--verify", "-q", tgt[0] + "^{commit}") is None:
+                    pass      # `git checkout PATH`: judged as a path below
+                else:
+                    paths = [f"tools/{t}" for t in sorted(PHONE_TOOLS)]
+                    dif = git(gd, "diff", "--name-only", "HEAD", tgt[0], "--", *paths) if len(tgt) == 1 and sub in ("merge", "switch", "checkout", "reset") else None
+                    if dif is None or dif:      # a changed phone tool, or a target we cannot diff (pull, rebase, cherry-pick, am, stash, ...)
+                        hits.append(f"git {sub} in the shared clone")
         hits += [x for x in cand if is_tool(res(x))]
     for t in redirect_targets(c.cmd):
         if os.path.isabs(os.path.expanduser(t)) or not moved:
@@ -777,7 +825,7 @@ def r_e13(c):
     return verdict("E13", seen, bad) if seen else None
 
 
-HEAVY = NEWWORK | {"build.sh", "rea.sh", "fflash-userdata.sh", "fboot.sh"}
+HEAVY = NEWWORK | {"build.sh", "rea.sh", "rea-xrefs.sh", "rea-fn.sh", "rea-strings.sh", "rea-phone.sh", "fflash-userdata.sh", "fboot.sh"}
 
 
 def r_e14(c):
@@ -789,11 +837,18 @@ def r_e14(c):
     except (TypeError, ValueError):
         ms = 0
     need = 0
-    for _, a in hv:
+    for p, a in hv:
+        n, given = 0, False
         for o in ("--timeout", "--hard-timeout", "--duration"):
             v = opt_val(a, o)
             if v and re.fullmatch(r"\d+", v):
-                need = max(need, int(v))
+                n, given = max(n, int(v)), True
+        if not given and p == "xrun":
+            n = 300         # xrun:50-51: --duration defaults to 300 s (remote reset) or restart + 300 s
+        elif not given and p == "probe-run":     # probe-run:73
+            n = 600 if any("--wlan-link" in x for x in a) else 240 if any(x.startswith("--touch-probe") for x in a) else 60
+        lw = opt_val(a, "--lock-wait")
+        need = max(need, n + (int(lw) if lw and lw.isdigit() else 0))
     bad = ""
     if not ms:
         bad = "background run without an explicit timeout (AP-33): the harness default kills it; set timeout > the tool's own --timeout + 60 s"
@@ -859,7 +914,7 @@ def r_e17(c):
 
 APPLE_SRC = ("sweet_hfs", "xnu-pristine", "localbuild/work/")
 GREPS = {"grep", "egrep", "fgrep", "rg", "ugrep"}
-GREP_VAL = {"-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D", "-g", "-t", "-T", "--regexp", "--file", "--glob", "--type", "--type-not",
+GREP_VAL = {"--binary-files", "-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D", "-g", "-t", "-T", "--regexp", "--file", "--glob", "--type", "--type-not",
             "--max-count", "--context", "--after-context", "--before-context"}
 
 
@@ -871,7 +926,9 @@ def r_e18(c):
             continue
         appl = True
         a, ops, pat, k = h[1], [], any(x in ("-e", "-f", "--regexp", "--file") or x.startswith(("--regexp=", "--file=")) for x in h[1]), 0
-        text = any(x in ("--text", "-I") or x.startswith("--binary-files") or re.fullmatch(r"-[A-Za-z0-9]*[aI][A-Za-z0-9]*", x) for x in a)
+        # only -a / --text / --binary-files=text read a MacRoman file; grep -I (= --binary-files=without-match) prints nothing, rg -I is --no-filename (r1 F7)
+        text = (any(x in ("--text", "--binary-files=text", "-uuu") or re.fullmatch(r"-[A-Za-z0-9]*a[A-Za-z0-9]*", x) for x in a)
+                or opt_val(a, "--binary-files") == "text")
         while k < len(a):
             x = a[k]
             if x in GREP_VAL:
@@ -912,25 +969,74 @@ def r_e21(c):
     return verdict("E21", bool(ips), "ipsw dyld disass --quiet prints no symbol names (AP-46): drop --quiet, add --cache dsc/cache/x.a2s" if bad else "")
 
 
-TOOLPATH = re.compile(r"(tools/|shim/build\.sh$)")
+SHARED_TOOLS = re.compile(r"tools/(xrun|probe-run|run-preflight|fboot\.sh|phone|phone-lock|phone-guard|agent-guard|check-all\.sh|"
+                          r"validate-repo\.py|gate_select\.py|fflash-userdata\.sh|to-fastboot\.sh|patch-numbers|check-rules\.py|check_rules/.*)$")
 SEQ_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+COMMIT_VAL = {"-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date", "--fixup", "--squash", "--cleanup", "--template",
+              "--reuse-message", "--reedit-message"}
+SRC_DIRS = ("shim/", "soc/", "device/", "xnu/")
+
+
+def git_target(a, wd):
+    """(dir, index of the subcommand) for `git [-C d] ... SUB`; dir None when unknown."""
+    i, d = 0, wd
+    while i < len(a) and a[i].startswith("-"):
+        if a[i] == "-C" and i + 1 < len(a):
+            d = None if d is None or "$" in a[i + 1] or "`" in a[i + 1] else os.path.join(d, os.path.expanduser(a[i + 1]))
+        elif a[i] in ("--git-dir", "--work-tree") or a[i].startswith(("--git-dir=", "--work-tree=")):
+            d = None
+        i += 2 if a[i] in GIT_VAL else 1
+    return d, i
+
+
+def named_ops(args, valued):
+    """non-option operands of a git subcommand, skipping option values (short clusters ending in a valued letter take one)."""
+    ops, k = [], 0
+    while k < len(args):
+        x = args[k]
+        if x == "--":
+            ops += args[k + 1:]
+            break
+        if x in valued or (re.fullmatch(r"-[A-Za-z]*[mFCct]", x) and x[-1] in "mFCct"):
+            k += 2
+            continue
+        if not x.startswith("-"):
+            ops.append(x)
+        k += 1
+    return ops
+
+
+def pathspec_files(d, ops):
+    return (git(d, "ls-files", "-m", "-o", "--exclude-standard", "--full-name", "--", *ops) or "").split() if ops else []
+
+
+def all_dirty(root):
+    return (git(root, "diff", "--name-only") or "").split() + (git(root, "ls-files", "--others", "--exclude-standard") or "").split()
 
 
 def r_e22(c):
-    """AP-58: a commit that touches tools/** or shim/build.sh in the kernel repo on a branch other than trunk or tools/*."""
+    """AP-58: a commit that touches a SHARED tool (SHARED_TOOLS) or only shim/build.sh in the kernel repo on a branch other than trunk or tools/*.
+    Staged files + what `git add` (same repo) / `commit -a` / `commit PATH` will add."""
     seen, bad = False, ""
-    adds = any(p == "git" and git_sub(a) == "add" for p, a, _, _ in c.heads)
+    adds = []      # (root, file list) of every git add in the line
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] != "git" or wd is None or git_sub(h[1]) != "add":
+            continue
+        d, i = git_target(h[1], wd)
+        top = git(d, "rev-parse", "--show-toplevel") if d else None
+        if not top:
+            continue
+        ao = h[1][i + 1:]
+        ops = [x for x in ao if not x.startswith("-")]
+        every = any(x in ("-A", "--all", "-u", "--update") or re.fullmatch(r"-[A-Za-z]*[Au][A-Za-z]*", x) for x in ao) or any(x in (".", ":/") for x in ops)
+        adds.append((top, all_dirty(top) if every else pathspec_files(d, ops)))
     for w, wd in walk(c.cmd, c.cwd):
         h = head(w)
         if not h or h[0] != "git" or git_sub(h[1]) != "commit" or wd is None:
             continue
-        a, i, d = h[1], 0, wd
-        while i < len(a) and a[i].startswith("-"):
-            if a[i] == "-C" and i + 1 < len(a):
-                d = None if d is None or "$" in a[i + 1] or "`" in a[i + 1] else os.path.join(d, os.path.expanduser(a[i + 1]))
-            elif a[i] in ("--git-dir", "--work-tree") or a[i].startswith(("--git-dir=", "--work-tree=")):
-                d = None
-            i += 2 if a[i] in GIT_VAL else 1
+        a = h[1]
+        d, i = git_target(a, wd)
         rp = (git(d, "rev-parse", "--show-toplevel", "--symbolic-full-name", "HEAD", *[y for x in SEQ_HEADS for y in ("--git-path", x)]) or "").splitlines() if d else []
         if len(rp) != 2 + len(SEQ_HEADS):
             continue      # not a repo, or an unborn HEAD
@@ -945,11 +1051,17 @@ def r_e22(c):
             continue      # concluding a merge of trunk (or a pick/revert) carries trunk's tool commits
         ca = a[i + 1:]
         files = (git(root, "diff", "--cached", "--name-only") or "").split()
-        if adds or any(x in ("-a", "--all", "--") or re.fullmatch(r"-[A-Za-z]*a[A-Za-z]*", x) for x in ca):
-            files += (git(root, "diff", "--name-only") or "").split() + (git(root, "ls-files", "--others", "--exclude-standard") or "").split()
-        tf = [f for f in files if TOOLPATH.match(f)]
+        for top, fl in adds:
+            if os.path.realpath(top) == os.path.realpath(root):
+                files += fl
+        if any(x == "--all" or re.fullmatch(r"-[A-Za-z]*a[A-Za-z]*", x) for x in ca if x != "--"):
+            files += (git(root, "diff", "--name-only") or "").split()
+        files += pathspec_files(d, named_ops(ca, COMMIT_VAL))
+        tf = [f for f in files if SHARED_TOOLS.match(f)]
+        if not tf and "shim/build.sh" in files and not any(f.startswith(SRC_DIRS) and f != "shim/build.sh" for f in files):
+            tf = ["shim/build.sh"]      # build.sh alone is a tool change; with shim/soc/device/xnu code it is feature work
         if tf and "EMERGENCY-TOOL-FIX" not in c.cmd:
-            bad = (f"tool change {tf[0]} committed on stream branch {br} (AP-58): commit it on trunk (or tools/<slug> from trunk), gate, merge down; "
+            bad = (f"shared tool change {tf[0]} committed on stream branch {br} (AP-58): commit it on trunk (or tools/<slug> from trunk), gate, merge down; "
                    "emergency: put EMERGENCY-TOOL-FIX in the message and cherry-pick -x it to trunk this session")
     return verdict("E22", seen, bad) if seen else None
 
@@ -1520,6 +1632,9 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E2c kill PID", B("kill 1234"), "allow")
     add("E2c kill $! / -- -$pgid", B('setsid sleep 1 & pid=$!; kill $pid; kill -- -"$pgid"'), "allow")
     add("E2c pgrep | head (lookup only)", B("pgrep -x foo | head -1"), "allow")
+    add("E2c # inside a word is no comment (F5)", B("echo a#b; pkill xrun"), "deny:E2c")
+    add("E2c real comment (F5)", B("echo hi # pkill xrun"), "allow")
+    add("E1 backslash continuation (F4)", B("tools/check-all.sh \\\n | tail -1 && git commit -m x"), "deny:E1")
     add("E2c quoted text", B('git commit -m "pkill x; kill $(pgrep y)"'), "allow")
     # E10 (AP-10): poke string ends with ;
     add("E10 xrun poke without ;", B("tools/xrun --label t --args 'debug=0xc sweettouchpoke=m:10c0180c=5=f'"), "deny:E10")
@@ -1546,6 +1661,11 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E14 bg phone-lock run no timeout", bg("tools/phone-lock run --owner a -- bash -c 'x'"), "deny:E14")
     add("E14 bg probe-run 600 s, timeout 600 s", bg("tools/probe-run --timeout 600 --label a", timeout=600_000), "deny:E14")
     add("E14 bg probe-run 600 s, timeout 700 s", bg("tools/probe-run --timeout 600 --label a", timeout=700_000), "allow")
+    add("E14 bg xrun default 300 s, timeout 120 s (F8)", bg("tools/xrun --label a", timeout=120_000), "deny:E14")
+    add("E14 bg probe-run wlan-link default 600 s, timeout 120 s (F8)", bg("tools/probe-run --build-args '--wlan-link=7'", timeout=120_000), "deny:E14")
+    add("E14 bg probe-run default 60 s, timeout 120 s (F8)", bg("tools/probe-run --build-args '--x'", timeout=120_000), "allow")
+    add("E14 bg --lock-wait adds to need (F8)", bg("tools/probe-run --timeout 60 --lock-wait 600 --label a", timeout=300_000), "deny:E14")
+    add("E14 bg rea-xrefs.sh no timeout (F8)", bg("tools/rea/rea-xrefs.sh abl.bin 0x1"), "deny:E14")
     add("E14 bg xrun with timeout", bg("tools/xrun --label a", timeout=1_800_000), "allow")
     add("E14 bg non-heavy job, no timeout", bg("python3 -m http.server"), "allow")
     # E15 (AP-24): find /
@@ -1574,7 +1694,11 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E18 rg xnu-pristine", B("rg BTOpenPath ~/pixelios-artifacts/xnu-pristine/bsd"), "deny:E18")
     add("E18 cd sweet_hfs && grep", B("cd bsd/sweet_hfs/core && grep -n x BTree.c"), "deny:E18")
     add("E18 grep -an", B("grep -an BTOpenPath bsd/sweet_hfs/core/BTree.c"), "allow")
-    add("E18 grep -I -rn", B("grep -I -rn x ~/pixelios-artifacts/xnu-pristine"), "allow")
+    add("E18 grep -I -rn", B("grep -I -rn x ~/pixelios-artifacts/xnu-pristine"), "deny:E18")
+    add("E18 grep --binary-files=without-match", B("grep --binary-files=without-match -rn x sweet_hfs"), "deny:E18")
+    add("E18 rg -I", B("rg -I x sweet_hfs"), "deny:E18")
+    add("E18 grep --binary-files=text", B("grep --binary-files=text -rn x sweet_hfs"), "allow")
+    add("E18 rg -uuu", B("rg -uuu x sweet_hfs"), "allow")
     add("E18 pattern names sweet_hfs", B("grep -rn sweet_hfs xnu/patches"), "allow")
     add("E18 -e sweet_hfs on our file", B("grep -n -e sweet_hfs shim/x.c"), "allow")
     # E19 (AP-54): 7z on an iOS root image
@@ -1592,16 +1716,25 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E21 ipsw dyld disass with cache", B("ipsw dyld disass --vaddr 0x1d1af5084 --cache dsc/cache/x.a2s dsc"), "allow")
     # E22 (AP-58): tool commit off trunk in the kernel repo
     add("E22 tool commit on trunk", B("git commit -m t", cwd=kst("trunk", "trunk", staged="tools/n.py")), "allow")
-    add("E22 tool commit on stream", B("git commit -m t", cwd=kst("st", "boot/s1", staged="tools/n.py")), "deny:E22")
+    add("E22 shared tool commit on stream", B("git commit -m t", cwd=kst("st", "boot/s1", staged="tools/probe-run")), "deny:E22")
+    add("E22 non-shared tools/ file on stream (F1)", B("git commit -m t", cwd=kst("nt", "boot/s1", staged="tools/n.py")), "allow")
+    add("E22 build.sh + shim code on stream (F1)", B("git commit -am t", cwd=kst("bs", "boot/s1", staged="shim/x.c", modified="shim/build.sh")), "allow")
+    add("E22 add docs only, unrelated modified tool (F2)", B("git add docs/x.md && git commit -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "allow")
+    add("E22 add -A with modified tool (F2)", B("git add -A && git commit -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 add other repo does not count (F2)", B(f"git -C {kst('chk2', 'boot/s1', modified='tools/check-all.sh')} add -A; git commit -m t", cwd=kst("clean", "boot/s1")), "allow")
+    add("E22 commit PATH names the tool (F3)", B("git commit -m t tools/check-all.sh", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 commit -o PATH names the tool (F3)", B("git commit -o tools/check-all.sh -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 commit PATH of a doc (F3)", B("git commit -m t docs/a.md", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "allow")
+    add("E22 backslash-newline -a (F4)", B("git commit -m t \\\n -a", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
     add("E22 shim/build.sh -am on stream", B("git commit -am t", cwd=kst("mod", "boot/s1", modified="shim/build.sh")), "deny:E22")
     add("E22 shim/build.sh modified, plain commit", B("git commit -m t", cwd=kst("mod", "boot/s1", modified="shim/build.sh")), "allow")
-    add("E22 add && commit on stream", B("git add tools/n.py && git commit -m t", cwd=kst("unt", "boot/s1", untracked="tools/n.py")), "deny:E22")
+    add("E22 add && commit on stream", B("git add tools/xrun && git commit -m t", cwd=kst("unt", "boot/s1", untracked="tools/xrun")), "deny:E22")
     add("E22 cd kernel && commit on stream", B(f"cd {kst('st', 'boot/s1')} && git commit -m t", cwd=tmp), "deny:E22")
     add("E22 git -C kernel commit on stream", B(f"git -C {kst('st', 'boot/s1')} commit -m t", cwd=tmp), "deny:E22")
     add("E22 doc commit on stream", B("git commit -m t", cwd=kst("doc", "boot/s1", staged="docs/n.md")), "allow")
     add("E22 emergency marker", B("git commit -m 'EMERGENCY-TOOL-FIX probe-run'", cwd=kst("st", "boot/s1")), "allow")
-    add("E22 concluding a merge of trunk", B("git commit --no-edit", cwd=kst("mrg", "boot/s1", staged="tools/n.py", merge=True)), "allow")
-    add("E22 tools/<slug> branch", B("git commit -m t", cwd=kst("slug", "tools/x", staged="tools/n.py")), "allow")
+    add("E22 concluding a merge of trunk", B("git commit --no-edit", cwd=kst("mrg", "boot/s1", staged="tools/probe-run", merge=True)), "allow")
+    add("E22 tools/<slug> branch", B("git commit -m t", cwd=kst("slug", "tools/x", staged="tools/probe-run")), "allow")
     # E8b (AP-18): Bash writes to a shared phone tool while the lock is held
     # the lock is still held by the E8 fixtures ("edit xrun, lock held"); the free case comes last
     add("E8b sed -i xrun, lock held", B(f"sed -i s/a/b/ {kt}/xrun"), "deny:E8b", check=lambda: "" if lock_held()[0] else "|lock not held")
@@ -1613,6 +1746,12 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E8b worktree copy", B(f"sed -i s/a/b/ {wt}/xrun"), "allow")
     add("E8b heredoc body", B(f"cat > /tmp/x.sh <<'EOF'\nsed -i s/a/b/ {kt}/xrun\nEOF"), "allow")
     add("E8b redirect 2>&1 / to /tmp", B(f"bash {kt}/xrun --dry-run > /tmp/o 2>&1"), "allow")
+    add("E8b git -C S merge, lock held (F6)", B(f"git -C {os.path.dirname(kt)} merge --no-ff wip/foo"), "deny:E8b")
+    add("E8b git -C S reset --hard, lock held (F6)", B(f"git -C {os.path.dirname(kt)} reset --hard"), "deny:E8b")
+    add("E8b git -C S pull, lock held (F6)", B(f"git -C {os.path.dirname(kt)} pull"), "deny:E8b")
+    add("E8b git -C S reset --soft (F6)", B(f"git -C {os.path.dirname(kt)} reset --soft HEAD~1"), "allow")
+    add("E8b git -C other merge (F6)", B(f"git -C {tmp} merge wip/foo"), "allow")
+    add("E8b git -C S merge, lock free (F6)", B(f"git -C {os.path.dirname(kt)} merge wip/foo"), "allow", setup=free)
     add("E8b sed -i xrun, lock free", B(f"sed -i s/a/b/ {kt}/xrun"), "allow", setup=free)
 
 
