@@ -1,0 +1,38 @@
+SWEET FB content probe (patch 0119): every 100th presented layer, logs the nonzero count and an FNV-1a hash of a 64x64 sample grid of the copied source region
+(read-only, bounds already checked by the copy guard, no hardware write). Tells rendered pixels from an all-zero surface (session 42 item 2).
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -367,6 +367,7 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++static uint32_t sweet_fb_present_count;
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -476,6 +477,25 @@
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			/*
++			 * Diagnostic, read-only: every 100th present, sample a 64x64 grid of the
++			 * region just copied (bounds checked above) and log the nonzero count
++			 * and an FNV-1a hash, to tell rendered pixels from an all-zero surface.
++			 */
++			if ((sweet_fb_present_count++ % 100) == 0) {
++				uint32_t nz = 0, hash = 2166136261u;
++				for (int32_t gy = 0; gy < 64; gy++) {
++					const uint8_t *row = (const uint8_t *)(src + s->offset +
++					    (uint64_t)(sy + (int32_t)((int64_t)gy * h / 64)) * s->bytesPerRow + (uint64_t)sx * 4);
++					for (int32_t gx = 0; gx < 64; gx++) {
++						uint32_t px = *(const uint32_t *)(row + (uint64_t)((int64_t)gx * w / 64) * 4);
++						nz += (px != 0);
++						hash = (hash ^ px) * 16777619u;
++					}
++				}
++				IOLog("SWEET FB: content #%u layer %u surface %u nonzero %u/4096 hash 0x%08x\n",
++				    sweet_fb_present_count - 1, layer, id, nz, hash);
++			}
+ 		}
+ 		s->release();
+ 	}
