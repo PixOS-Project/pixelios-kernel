@@ -8,50 +8,56 @@
  #include <sys/mount.h>
  #include <sys/priv.h>
  #include <sys/proc.h>
-@@ -285,8 +286,50 @@
+@@ -285,8 +286,56 @@
   */
  static uint64_t sweet_sandbox_seen;
  
 +/*
-+ * Op 4, container path of a pid: arg -> {int64 pid; 0; char *buf; u64 len; 0}.
-+ * PlugInKit's checkEnvironment aborts every app extension ("plugin has
-+ * invalid sandbox or container: error 2") without one (speech synthesizer
-+ * AUs crash-looped, boot 0109b). App extensions (executable inside a
-+ * .appex) running as mobile get the mobile home; everything else still gets
-+ * ENOENT, like an uncontainerized process on iOS.
++ * Operation 4: container path of a pid. Request block is five 64-bit words:
++ * [0] pid, [2] user destination buffer, [3] its size. Only app-extension
++ * processes (uid 501, executable path containing ".appex/") get a container
++ * (the mobile home); everything else keeps ENOENT.
 + */
-+static int
-+sweet_sandbox_container_path(user_addr_t arg)
-+{
-+	uint64_t a[5];
-+	char path[MAXPATHLEN];
-+	int len = sizeof(path), err = ENOENT;
-+	static const char home[] = "/private/var/mobile";
-+	proc_t p;
-+	kauth_cred_t cred;
-+	uid_t uid;
-+	vnode_t vp;
++#define SWEET_MOBILE_UID        501
++#define SWEET_MOBILE_HOME       "/private/var/mobile"
 +
-+	if (copyin(arg, a, sizeof(a)) != 0 || a[2] == 0 || a[3] < sizeof(home)) {
++static int
++sweet_appex_container_path(user_addr_t arg)
++{
++	uint64_t req[5];
++	char path[MAXPATHLEN];
++	int error, len;
++	proc_t target;
++	kauth_cred_t cred;
++	vnode_t vp;
++	uid_t uid;
++	bool ok;
++
++	if (copyin(arg, req, sizeof(req)) != 0 || req[2] == 0 ||
++	    req[3] < sizeof(SWEET_MOBILE_HOME)) {
 +		return ENOENT;
 +	}
-+	p = proc_find((int)a[0]);
-+	if (p == NULL) {
++	target = proc_find((int)req[0]);
++	if (target == PROC_NULL) {
 +		return ESRCH;
 +	}
-+	cred = kauth_cred_proc_ref(p);
++	cred = kauth_cred_proc_ref(target);
 +	uid = kauth_cred_getuid(cred);
 +	kauth_cred_unref(&cred);
-+	vp = proc_getexecutablevnode(p);
-+	proc_rele(p);
++	vp = proc_getexecutablevnode(target);
++	proc_rele(target);
 +	if (vp == NULLVP) {
 +		return ENOENT;
 +	}
-+	if (uid == 501 && vn_getpath(vp, path, &len) == 0 && strnstr(path, ".appex/", sizeof(path)) != NULL) {
-+		err = copyout(home, (user_addr_t)a[2], sizeof(home));
-+	}
++	len = MAXPATHLEN;
++	ok = uid == SWEET_MOBILE_UID && vn_getpath(vp, path, &len) == 0 &&
++	    strnstr(path, ".appex/", MAXPATHLEN) != NULL;
 +	vnode_put(vp);
-+	return err;
++	if (!ok) {
++		return ENOENT;
++	}
++	error = copyout(SWEET_MOBILE_HOME, (user_addr_t)req[2], sizeof(SWEET_MOBILE_HOME));
++	return error;
 +}
 +
  static int
@@ -60,13 +66,11 @@
  {
  	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
  		sweet_sandbox_seen |= 1ULL << call;
-@@ -295,7 +338,8 @@
- 		printf("SWEET Sandbox: %s op %d\n", name, call);
+@@ -296,6 +345,7 @@
  	}
  	switch (call) {
--	case 4:         /* container path (audit token / pid) */
-+	case 4:         /* container path (pid) */
-+		return sweet_sandbox_container_path(arg);
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_appex_container_path(arg);
  	case 5:         /* extension issue */
  	case 6:         /* extension consume */
  	case 0x43:      /* container expected */
