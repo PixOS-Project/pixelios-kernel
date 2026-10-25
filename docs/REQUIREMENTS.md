@@ -15,7 +15,7 @@ Two ways, same patch stack:
    Host tools: `git curl xz make clang perl python3 m4 autoconf automake gawk rsync dpkg apt-get` (flex/bison are unpacked from `.deb` files if missing, no root).
    Disk about 3.2 GB under `~/pixelios-artifacts/localbuild`; `make -j4` (capped at 4). *Observed*: cold build 71 s, one changed patch 16 s, plus a first run that downloads the SDKs and builds the helper tools.
    All download sources are pinned (git tags/commits, two tarballs checked against sha256); see the table in `docs/LOCAL-BUILD.md`.
-- 59 of the 117 patches and the three stagers (`xnu/patches/*.sh`) began as ios-sweet files (MIT, see `LICENSE-ios-sweet.txt`); the other 58 are ours. `tools/stack-apply` checks that the whole stack applies to pristine xnu-8796.
+- 59 of the 117 patches and the three stagers (`xnu/patches/*.sh`) began as ios-sweet files (MIT, see `LICENSES/MIT-ios-sweet.txt`); the other 58 are ours. `tools/stack-apply` checks that the whole stack applies to pristine xnu-8796.
 - *Observed*: a kernel built from the generated kernel tree has the same external symbols (24163), the same SWEET symbols (460) and the same strings as the one built from the private monorepo, except the build timestamp and the work-directory path length (the `__cstring` section differs by that); it is not bit-identical.
 
 ## Apple-derived input you must extract yourself

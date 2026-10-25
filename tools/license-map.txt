@@ -1,0 +1,66 @@
+# tools/license-map.txt: glob<TAB>SPDX-expression<TAB>origin. Checked by tools/check_rules/r30_license.py (R30, TP-030).
+# Glob = fnmatch on the repo-relative path ('*' also matches '/'). FIRST matching line wins. A tracked file matching no line fails R30,
+# so there is no '*' catch-all: new top-level paths need a line. Every id here needs LICENSES/*<id>*.txt. Source of every row: THIRD_PARTY.md
+# (row number in the 3rd column) and docs/PLAN-STANDALONE.md. UNRESOLVED marks a row whose licence status is not settled.
+# licence texts (quoted verbatim, not licensed themselves; MIT as the repository default)
+LICENSES/*	MIT	licence texts, THIRD_PARTY.md
+LICENSE	MIT	pixos: LICENSE:1-3 Copyright (c) 2026 PixOS-Project contributors
+# third-party material that is tracked or may appear in a tracked tree (specific lines first)
+xnu/patches/0120-*	APSL-2.0 AND ISC	apple-xnu + OpenBSD bwfm.c v1.118, THIRD_PARTY row 10 (Wi-Fi branch only, absent here)
+xnu/patches/0081-*	APSL-2.0 AND MIT	apple-xnu + Project Nayuki qrcodegen embedded, THIRD_PARTY row 9
+xnu/patches/000[1-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5 (0058 also carries Apple IOHIDFamily headers, row 6)
+xnu/patches/00[1-4][0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5 (stagers 0019/0020/0026 .sh: ios-sweet files, row 2)
+xnu/patches/005[0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3, THIRD_PARTY rows 2,5,6 (0058: Apple IOHIDFamily headers)
+xnu/patches/.keep	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+xnu/patches/NOTICE.md	MIT	pixos: notice text
+xnu/patches/*	APSL-2.0	apple-xnu modifications written by this project, xnu/patches/NOTICE.md, THIRD_PARTY row 5
+xnu/patches-archive/*.patch	APSL-2.0	apple-xnu modifications written by this project (retired), THIRD_PARTY row 5
+xnu/patches-archive/*	MIT	pixos
+qrlog/qrcodegen.*	MIT	Project Nayuki qrcodegen, THIRD_PARTY row 9 (LICENSES/MIT-qrcodegen.txt)
+shim/font.h	BSD-2-Clause	Spleen 8x16 2.2.0, Frederic Cambus, THIRD_PARTY row 16
+# ios-sweet derived files (THIRD_PARTY row 2): unmodified and modified. validate-repo.py is a clean-room rewrite and sweet-usbnet.sh was rewritten (row 2 text), so they fall under pixos.
+shim/host_test.c	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+shim/loader.h	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+shim/shim.ld	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+shim/build.sh	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/console.[ch]	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/fdt.[ch]	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/loader.c	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/mmu.[ch]	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/shim.c	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/start.S	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+shim/ufs.[ch]	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+tools/adt.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+tools/check-exports.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+tools/remotezip.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+tools/sparsediff.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+tools/xnu-cc.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
+tools/mkadt.py	MIT	ios-sweet (modified; licensed version 067c9b3 is a superset), THIRD_PARTY row 2
+tools/mkpayload.py	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+tools/sweet-crash.py	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
+# generated tables extracted from GPL-2.0 sources: UNRESOLVED (user decision D3=A keeps them; THIRD_PARTY rows 11, 12 and the LAWYER note; no lawyer review)
+soc/google/gs101/wlan_seq.json	MIT	UNRESOLVED: facts extracted from GPL-2.0 Google/Samsung sources, THIRD_PARTY row 11
+tools/gen_wlan_seq.py	MIT	UNRESOLVED: generator reading GPL-2.0 sources, THIRD_PARTY row 11
+soc/google/gs101/shim/ufsphy_tables.h	MIT	UNRESOLVED: facts extracted from Linux phy-gs101-ufs.c (GPL-2.0 guess), THIRD_PARTY row 12
+tools/gen-ufsphy-tables.py	MIT	UNRESOLVED: generator for Linux phy-gs101-ufs.c facts, THIRD_PARTY row 12
+# AOSP tools: gitignored, fetched by tools/fetch-android-tools.sh (THIRD_PARTY row 19); listed so a stray tracked copy is checked
+tools/third_party/avbtool.py	MIT	AOSP external/avb, THIRD_PARTY row 19 (LICENSES/MIT-AOSP-avbtool.txt)
+tools/third_party/*	Apache-2.0	AOSP mkbootimg + gki certificate, THIRD_PARTY row 19
+# everything else written by this project (THIRD_PARTY row 1 / PLAN-STANDALONE): explicit top-level paths, no catch-all
+shim/*	MIT	pixos
+soc/*	MIT	pixos
+device/*	MIT	pixos (device/**/hardware/*.txt: measured output of our own runs)
+qrlog/*	MIT	pixos
+tools/*	MIT	pixos (tools/testdata: fixtures taken from our own history)
+docs/*	MIT	pixos
+xnu/AGENTS.md	MIT	pixos
+xnu/qr/*	MIT	pixos
+.github/*	MIT	pixos
+.gitignore	MIT	pixos
+AGENTS.md	MIT	pixos
+CODE_OF_CONDUCT.md	MIT	pixos
+CONTRIBUTING.md	MIT	pixos
+README.md	MIT	pixos
+ROADMAP.md	MIT	pixos
+SECURITY.md	MIT	pixos
+THIRD_PARTY.md	MIT	pixos (THIRD_PARTY.md quotes third-party licence text)

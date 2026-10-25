@@ -107,7 +107,7 @@ from other Tensor devices are especially useful.
 
 Built on the idea and groundwork of **ios-sweet** by dipa-studio. Full credits, third-party
 licenses and the legal notes are in [docs/CREDITS.md](https://github.com/PixOS-Project/pixelios-site/blob/main/docs/CREDITS.md). Not affiliated with Apple
-or Google. Our own code is [MIT](LICENSE); files derived from ios-sweet keep its MIT notice ([LICENSE-ios-sweet.txt](LICENSE-ios-sweet.txt)); the XNU patches in `xnu/patches/` are modifications of Apple's source and stay under Apple's APSL 2.0 (see [xnu/patches/NOTICE.md](xnu/patches/NOTICE.md)). Every third-party component and its licence is listed in [THIRD_PARTY.md](THIRD_PARTY.md); Wi-Fi specifics: [docs/WIFI-LICENSING.md](docs/WIFI-LICENSING.md).
+or Google. Our own code is [MIT](LICENSE); files derived from ios-sweet keep its MIT notice ([LICENSES/MIT-ios-sweet.txt](LICENSES/MIT-ios-sweet.txt)); the XNU patches in `xnu/patches/` are modifications of Apple's source and stay under Apple's APSL 2.0 (see [xnu/patches/NOTICE.md](xnu/patches/NOTICE.md)). Every third-party component and its licence is listed in [THIRD_PARTY.md](THIRD_PARTY.md); Wi-Fi specifics: [docs/WIFI-LICENSING.md](docs/WIFI-LICENSING.md).
 
 This project is AI-driven: agents write most of the code and docs, a human directs, runs the hardware
 and signs off. Code that touches hardware gets an independent (also AI) review
