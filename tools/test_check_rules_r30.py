@@ -110,7 +110,7 @@ class Modes(unittest.TestCase):
         self.assertEqual(msgs(tree({"docs/x.md": "EXPORT_SYMBOL\n"}, mp=MAP + "docs/*\tMIT\tpixos\n")), ["R30 banned"])
 
     def test_device_leaks(self):
-        for body in ("[ 0.0] bootargs androidboot.serialno=ABC123XYZ foo\n", "IMEI: 356938035643809\n", "wlan0 mac 3c:28:6d:11:22:33\n"):
+        for body in ("[ 0.0] bootargs androidboot.serialno=ABC123XYZ foo\n", "IMEI: 000000000000000\n", "wlan0 mac 3c:28:6d:11:22:33\n"):
             self.assertEqual(msgs(tree({"device/google/bluejay/hardware/x.txt": body})), ["R30 device-leak"], body)
         for body in ("androidboot.serialno=<redacted>\n", "local mac 02:11:22:33:44:55, none 00:00:00:00:00:00\n", "strip the IMEI\n"):
             self.assertEqual(msgs(tree({"device/google/bluejay/hardware/x.txt": body})), [], body)
