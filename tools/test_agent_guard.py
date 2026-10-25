@@ -12,7 +12,7 @@ SRC = (HERE / "agent-guard").read_text()
 
 # (name, old text, new text): each must change the source and make --self-test FAIL
 MUTANTS = [
-    ("S1 hard cap 160k -> 100k", "SOFT, HARD = 100_000, 160_000", "SOFT, HARD = 100_000, 100_000"),
+    ("S1 hard cap 200k -> 180k", "SOFT, HARD = 180_000, 200_000", "SOFT, HARD = 180_000, 180_000"),
     ("ctx_tokens without the type=assistant filter", 'if d.get("type") != "assistant":', "if False:"),
     ("rootish: no project-dir branch", "return bool(pd and os.path.basename(a) in LOADED_DOCS and os.path.dirname(p) == os.path.realpath(pd))", "return False"),
     ("S2 keeps no tail", "so[:KEEP] + cut + so[-KEEP:]", "so[:KEEP] + cut"),

@@ -54,7 +54,7 @@ import time
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIG, OUT_CAP, KEEP = 40_000, 12_000, 4_000      # bytes for a whole-file Read; Bash stdout chars (cap, kept each end)
-SOFT, HARD = 100_000, 160_000                    # context tokens, absolute
+SOFT, HARD = 180_000, 200_000                    # context tokens, absolute
 STATE = os.environ.get("AGENT_GUARD_STATE", "/tmp/agent-guard")
 OUTDIR = os.environ.get("AGENT_GUARD_OUT", "/tmp/claude-out")
 SHARED = os.environ.get("AGENT_GUARD_SHARED") or os.path.join(
@@ -653,7 +653,7 @@ def context(h):
     if verdict("S1h", True, "x" if n > HARD else ""):
         msg = f"CONTEXT {n // 1000}k > HARD {HARD // 1000}k: finish the step, handoff, rollover NOW."
     elif verdict("S1s", True, "x" if n > SOFT else ""):
-        msg = f"context {n // 1000}k > {SOFT // 1000}k: roll over at the next safe point."
+        msg = f"context {n // 1000}k > {SOFT // 1000}k: reaching rollover (200k): tidy up now, finish or park in-flight work, write the handoff, then roll over at the next safe point."
     else:
         return None
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": msg}}
@@ -933,14 +933,14 @@ def fixtures(tmp):
         add("delegate_task good", A(good, tool="mcp__t3-code__delegate_task"), "allow")
         add("delegate_task no header", A("hi at most 3 lines", tool="mcp__t3-code__delegate_task"), "deny:E6")
         add("delegate_task unknown field", dict(tool_name="mcp__t3-code__delegate_task", tool_input={"zzz": "q"}), "allow")
-        add("ctx 170k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(170_000)), "deny:S1")
-        add("ctx 170k xrun", dict(B("tools/xrun --dry-run"), transcript_path=tr(170_000)), "deny:S1")
-        add("ctx 170k phone-lock run", dict(B("tools/phone-lock run --owner a -- true"), transcript_path=tr(170_000)), "deny:S1")
-        add("ctx 170k git commit", dict(B("git commit -m 'fix xrun'"), transcript_path=tr(170_000)), "allow")
-        add("ctx 120k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(120_000)), "allow")
-        add("ctx last usage is type=user", dict(A(good, subagent_type="implementer"), transcript_path=tr_user_last(170_000)), "allow")
-        add("ctx 170k subagent (A11)", dict(A(good, subagent_type="implementer"), transcript_path=tr(170_000), agent_id="sub1"), "allow")
-        add("ctx 90k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(90_000)), "allow")
+        add("ctx 210k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k xrun", dict(B("tools/xrun --dry-run"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k phone-lock run", dict(B("tools/phone-lock run --owner a -- true"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k git commit", dict(B("git commit -m 'fix xrun'"), transcript_path=tr(210_000)), "allow")
+        add("ctx 190k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(190_000)), "allow")
+        add("ctx last usage is type=user", dict(A(good, subagent_type="implementer"), transcript_path=tr_user_last(210_000)), "allow")
+        add("ctx 210k subagent (A11)", dict(A(good, subagent_type="implementer"), transcript_path=tr(210_000), agent_id="sub1"), "allow")
+        add("ctx 150k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(150_000)), "allow")
         add("pipe tail &&", B("tools/check-all.sh | tail -3 && git commit -m x"), "deny:E1")
         add("python validate | grep &&", B("python3 tools/validate-repo.py 2>&1 | grep FAIL && echo"), "deny:E1")
         add("pipefail first", B("set -o pipefail; tools/check-all.sh | tail -3 && git commit -m x"), "allow")
@@ -1062,8 +1062,8 @@ def fixtures(tmp):
         add("post 1k stdout", dict(tool_name="Bash", tool_use_id="t2", tool_response={"stdout": "a" * 1000}), "allow", mode="--post")
         add("session id ../x stays in STATE (A6)", dict(tool_name="mcp__t3-code__task_status", tool_input={}, session_id="../x"), "allow",
             check=lambda: "|escaped" if [n for n in os.listdir(tmp) if n.endswith(".poll")] else "")
-        add("ctx 170k nudge", dict(transcript_path=tr(170_000)), "hard", mode="--context")
-        add("ctx 120k nudge", dict(transcript_path=tr(120_000)), "soft", mode="--context")
+        add("ctx 210k nudge", dict(transcript_path=tr(210_000)), "hard", mode="--context")
+        add("ctx 190k nudge", dict(transcript_path=tr(190_000)), "soft", mode="--context")
         add("ctx 50k nudge", dict(transcript_path=tr(50_000)), "allow", mode="--context")
         return L
 
