@@ -100,6 +100,21 @@ class S35Decode(unittest.TestCase):
             self.assertEqual(rc, 1, hex(ci))
             self.assertIn(f"FAIL {nm}", out)
 
+    def test_s35_bank_skip_path(self):
+        skip = "LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write) row=1380 rd=0x00000115"
+        ov = {(35, C, 0x000, ""): 0x115, (35, C, 0x010, ""): 3}
+        rc, out, _ = run(log(36, ov) + [skip])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("UNSELECTED bank", out)
+        self.assertNotIn("uniform-bank estimate", out)
+        rc, out, _ = run(log(36, ov))				# the same words without the skip line: the write path was supposed to run, nrb != 0 fails C2 and bankidx 3 fails B1
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL C2", out)
+        self.assertIn("FAIL B1", out)
+        rc, out, _ = run(log(36) + [skip])			# a skip line but coreinfo shows no ROM bank (nrb 0): inconsistent
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL C2", out)
+
     def test_s35_bankidx_and_bankinfo(self):
         rc, out, _ = run(log(35, {(35, C, 0x010, ""): 3}))
         self.assertEqual(rc, 1)

@@ -433,7 +433,7 @@ def wlan_seq_render(doc, path="wlan_seq.json") -> str:
             raise ValueError(f"{path}: teardown row {i} is malformed")
 
     def cell(r, step):
-        a = r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0) | (16 if r.get("srp") == 1 else 0) | (32 if r.get("srp") == 2 else 0)
+        a = r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0) | (16 if r.get("srp") == 1 else 0) | (32 if r.get("srp") == 2 else 0) | (64 if r.get("srp") == 3 else 0)
         b = r["polls"]
         blk = "WLB_NONE" if r["blk"] is None else "WLB_" + r["blk"]
         return f"\t{{ {step}u, WLK_{r['kind'].upper()}, {blk}, {r['off']:#x}u, {r['mask']:#x}u, {r['value']:#x}u, {a}u, {b}u }},"

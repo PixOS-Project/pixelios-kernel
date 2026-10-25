@@ -2819,7 +2819,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "58c4ec954359868a65c9d23ab5f95553a8b585bc34f76dd3b35529b836f56be7"
+_WLAN_SEQ_SHA = "1bdc95bc71495d3a6b531e68358eee63c91e30b52c117d91147d98271361d757"
 _WLAN_SEQ_COUNTS = {"rows": 1412, "teardown": 47, "write_rows": 296, "distinct_targets": 197}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "MEM": 4, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2908,7 +2908,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # header = table (the allowlist the interpreter uses is exactly the audited table)
     hdr = _WLAN_HDR_ROW.findall(header)
     want = [(str(r["step"]), r["kind"].upper(), r["blk"] or "NONE", hex(r["off"]), hex(r["mask"]), hex(r["value"]),
-             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0) | (16 if r.get("srp") == 1 else 0) | (32 if r.get("srp") == 2 else 0)), str(r["polls"])) for r in rows]
+             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0) | (16 if r.get("srp") == 1 else 0) | (32 if r.get("srp") == 2 else 0) | (64 if r.get("srp") == 3 else 0)), str(r["polls"])) for r in rows]
     want += [(str(t["requires"]), t["kind"].upper(), t["blk"] or "NONE", hex(t["off"]), hex(t["mask"]), hex(t["value"]), str(t["delay_us"]), str(t["polls"])) for t in tear]
     if hdr != want or f'WLAN_SEQ_SHA256 "{sha}"' not in header:
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
@@ -3085,8 +3085,12 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
             raise AssertionError(f"{name}: S{stp} must be exactly the audited write sequence of research 40 s.4 (windows {[hex(c) for c in _WLAN_S34_WINDOWS[stp]]}, every write with its read-back / wait, the up gate before the core page, bankidx only 0, the ARM halt last), no teardown row of its own: {[x for x in got if x not in want_s][:3]} / missing {[x for x in want_s if x not in got][:3]}")
     # the S34 skip (srp): exactly the powerctl log row (srp = 1) and the SRPWR request row (srp = 2), both S34 BAR0+0x1E8; no other row, no teardown row, carries the flag. The skip only drops the request write; the read-back and the status wait still follow
     srp_got = [(r["step"], r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["srp"]) for r in rows if "srp" in r]
-    if srp_got != [(34, "read_only", "MEM", 0x1E8, BIGW, 0, 1), (34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, 2)] or any("srp" in t for t in tear):
-        raise AssertionError(f"{name}: the srp skip flag must sit on exactly the S34 powerctl log row (1) and the S34 SRPWR request row (2): {srp_got}")
+    if srp_got != [(34, "read_only", "MEM", 0x1E8, BIGW, 0, 1), (34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, 2), (35, "read_only", "MEM", 0x000, BIGW, 0, 3)] or any("srp" in t for t in tear):
+        raise AssertionError(f"{name}: the srp skip flag must sit on exactly the S34 powerctl log row (1), the S34 SRPWR request row (2) and the S35 coreinfo log row (3): {srp_got}")
+    # the S35 bank skip (srp = 3): the run skips every MEM write / wait_eq row at offset 0x10 once ROM banks are recorded; exactly the S35 bankidx write and its read-back wait may match, none in the teardown, so the skip can only drop those two rows
+    bank_got = [(r["step"], r["kind"], r["off"], r["value"]) for r in rows if r["blk"] == "MEM" and r["off"] == 0x10 and r["kind"] in ("mmio_write", "wait_eq")]
+    if bank_got != [(35, "mmio_write", 0x10, 0), (35, "wait_eq", 0x10, 0)] or any(t["blk"] == "MEM" and t["off"] == 0x10 for t in tear):
+        raise AssertionError(f"{name}: the bank skip (srp 3) may only drop the S35 bankidx write and its read-back wait (MEM 0x10): {bank_got}")
     if any(x["blk"] == "ATU" and x["kind"] in _WLAN_WRITE_KINDS and x.get("step", x.get("requires")) not in (26, 29) for x in rows + tear):
         raise AssertionError(f"{name}: ATU writes are only for S26, S29 and their teardown")
     if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36)) for r in rows + tear) or any("log" in t for t in tear):
@@ -3647,6 +3651,8 @@ def wlan_seq_selftest() -> int:
         ("S34 skip flag removed from the SRPWR request row", set_row(34, "srp", 0, kind="mmio_rmw", blk="MEM"), None, "srp skip flag"),
         ("S34 skip flag removed from the powerctl log row", set_row(34, "srp", 0, kind="read_only", blk="MEM", off=0x1E8), None, "srp skip flag"),
         ("S34 skip flag on another S34 log row", set_row(34, "srp", 1, kind="read_only", blk="CFG", off=0xBC), None, "srp skip flag"),
+        ("S35 bank skip flag removed from the coreinfo log row", set_row(35, "srp", 0, kind="read_only", blk="MEM", off=0x0), None, "srp skip flag"),
+        ("S35 bank skip flag on the bankinfo log row", set_row(35, "srp", 3, kind="read_only", blk="MEM", off=0x40), None, "srp skip flag"),
         ("S34 skip flag on a wait row", set_row(34, "srp", 2, kind="wait_mask", blk="MEM", off=0x1E8), None, "srp skip flag"),
         ("S34 powerctl log (before) removed", f_rm(34, kind="read_only", blk="MEM", off=0x1E8), None, "S34 must be exactly"),
         ("S34 a teardown row of its own", tear_append(blk="MEM", off=0x1E8, kind="mmio_rmw", mask=0x200, value=0, requires=34), None, "BAR0 (MEM)"),
@@ -3787,8 +3793,8 @@ _WLANLINK_BODY_SHA = {
     "need_probe": "44c0b22ce25cae99db97ca86bcec9e471ebb8fcbfa077005de813f1073652b02",
     "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
     "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
-    "run_row": "0e89ea93e009a45e62606773dab97305904cb8d39fcb58dba7bf0187563e233f",
-    "wlan_link_run": "9cdb008f392c899972acde187d62a3275994b99867c2dad315d9fe11185fe343",
+    "run_row": "9ab3df59b58faaa74975f1024df30c20ab0ec2ba6082fa3176b860c1c432a0e6",
+    "wlan_link_run": "e971bf540d6b8d8ac79a196ee602cae220f4fe0f53c7f08f172c32b004ac320b",
 }
 
 
@@ -3850,8 +3856,9 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
                  "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
                  "if(r.a==1u)*probed|=need_probe(r.blk);",
-                 "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}if((r.a&16u)&&v!=0xFFFFFFFFu&&(v&0x20200u)==0x20200u)*probed|=SRP_UP;returnST_OK;",
+                 "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}if((r.a&16u)&&v!=0xFFFFFFFFu&&(v&0x20200u)==0x20200u)*probed|=SRP_UP;if((r.a&64u)&&v!=0xFFFFFFFFu&&(v&0x3E0u)!=0u)*probed|=BANK_ROM;returnST_OK;",
                  "if((probed&SRP_UP)&&r.kind==WLK_MMIO_RMW&&(r.a&32u)){step_line('S',s,\"skip:SRPWRrequest,domain1alreadyup(nowrite)\",1,i,1,rd,0,0);continue;}", "#defineSRP_UP(1u<<30)",
+                 "if((probed&BANK_ROM)&&r.blk==WLB_MEM&&r.off==0x10u&&(r.kind==WLK_MMIO_WRITE||r.kind==WLK_WAIT_EQ)){step_line('S',s,\"skip:bankidxselect,SYS_MEMhasROMbanks(nowrite)\",1,i,1,rd,0,0);continue;}", "#defineBANK_ROM(1u<<29)",
                  "if((probed&EOT_SEEN)&&r.kind==WLK_READ_ONLY&&(r.a&4u))continue;", "#defineEOT_SEEN(1u<<31)", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
                  "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,win=0,r1[4]={1,1,1,1};if(!try_read32(WLAN_CFG+0x80u,&win)||!mem_ok(win,off)||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
                  "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
@@ -3911,6 +3918,14 @@ def wlanlink_source_selftest() -> int:
         ("S34 skip: request skipped without SRP_UP", good.replace("if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", "if (r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", 1)),
         ("S34 skip: every RMW row is skipped once SRP_UP is set", good.replace("if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", "if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW) {", 1)),
         ("S34 skip: SRP_UP set from any logged read", good.replace("if ((r.a & 16u) && v != 0xFFFFFFFFu", "if (v != 0xFFFFFFFFu", 1)),
+        ("S35 bank skip: BANK_ROM set on a dead read (all ones)", good.replace("v != 0xFFFFFFFFu && (v & 0x3E0u)", "(v & 0x3E0u)", 1)),
+        ("S35 bank skip: BANK_ROM with the brcmfmac mask (0xF0)", good.replace("(v & 0x3E0u) != 0u)\n\t\t\t*probed |= BANK_ROM", "(v & 0xF0u) != 0u)\n\t\t\t*probed |= BANK_ROM", 1)),
+        ("S35 bank skip: BANK_ROM set from any logged read", good.replace("if ((r.a & 64u) && v != 0xFFFFFFFFu", "if (v != 0xFFFFFFFFu", 1)),
+        ("S35 bank skip: bankidx skipped without BANK_ROM", good.replace("if ((probed & BANK_ROM) && r.blk == WLB_MEM", "if (r.blk == WLB_MEM", 1)),
+        ("S35 bank skip: the read-back wait is not skipped", good.replace("(r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", "r.kind == WLK_MMIO_WRITE) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", 1)),
+        ("S35 bank skip: the write is not skipped", good.replace("(r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", "r.kind == WLK_WAIT_EQ) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", 1)),
+        ("S35 bank skip: every MEM row at 0x10 is skipped", good.replace("r.blk == WLB_MEM && r.off == 0x10u && (r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)", "r.blk == WLB_MEM && r.off == 0x10u", 1)),
+        ("S35 bank skip: every MEM write is skipped once BANK_ROM is set", good.replace("r.blk == WLB_MEM && r.off == 0x10u && (r.kind == WLK_MMIO_WRITE", "r.blk == WLB_MEM && (r.kind == WLK_MMIO_WRITE", 1)),
         ("longer delay", good.replace("#define DELAY_MAX_US	250000u", "#define DELAY_MAX_US	2500000u", 1)),
         ("another default N", good.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	WLAN_SEQ_LAST", 1)),
         ("teardown never marked started", good.replace("\t\tstarted = 1;\n", "", 1)),

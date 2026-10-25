@@ -10,7 +10,7 @@ Steps present are decided by the summary (`reached=Snn`); each step has its chec
   S34  P1 powerctl before: PowerDomain id [31:28] != 0 (or, when the run logged `LINK S34 skip: SRPWR request`, bits 17 and 9 already set) and not all ones (U-N3: the PCIe core page + 0x1E8 is the SRPWR register DHD reaches via BAR0+0x2000+0x1E8); P2 powerctl after: request bit 9 (0x200) latched AND ExtPwrStatus bit 17 (0x20000) = domain 1 up; the status
        before the request is printed (U-N4, polarity, informative).
   S35  W1 SYS_MEM IOCTL after the reset sequence & 0x3FFF == 0x1 (CLK, FGC dropped); W2 RESET_CTL & 1 == 0; W3 RESET_ST == 0 (the up gate, same three tests as the table's one-shot gate rows); C1 coreinfo is not all ones; C2 nrb == 0 and nb >= 1 with the DHD rev < 12 masks
-       (nb = coreinfo & 0x1F, nrb = (coreinfo & 0x3E0) >> 5; the brcmfmac decode (coreinfo & 0xF0) >> 4 is printed for comparison, U-N2); B1 bankidx reads back 0; B2 bankinfo is not all ones, bank 0 size = 8192 * ((bankinfo & 0x7F) + 1) is printed with the uniform-bank
+       (nb = coreinfo & 0x1F, nrb = (coreinfo & 0x3E0) >> 5; the brcmfmac decode (coreinfo & 0xF0) >> 4 is printed for comparison, U-N2); B1 bankidx reads back 0 (when the run logged `LINK S35 skip: bankidx select`, C2 instead needs nrb != 0 and B1 is informative: ROM banks, no bankidx write, the bankinfo is of the unselected bank); B2 bankinfo is not all ones, bank 0 size = 8192 * ((bankinfo & 0x7F) + 1) is printed with the uniform-bank
        estimate nb * bank0 (a GUESS: bank 0 only was read).
   S36  A1 ARM CA7 IOCTL after & 0x3FFF == 0x21 (CPUHALT 0x20 | CLK 0x1; the read-back proves the bit latches, not that the CA7 halts, U-N1); A2 RESET_CTL & 1 == 0; A3 RESET_ST == 0.
   All  E1 no logged word is 0xFFFFFFFF (a dead read), except a deliberately logged one is still flagged; E2 every row of the reached steps was logged; E3 the summary says restore=ok; E4 the run completed (stopped=none) - else FAIL naming the stop row and its table note.
@@ -70,7 +70,7 @@ def word_text(label, v, win):
     return ""
 
 
-def check(vals, rows, summary, notes, skipped=False):
+def check(vals, rows, summary, notes, skipped=False, bank_skipped=False):
     """vals: row id -> word. Returns (lines, results) with results = list of (name, ok, text)."""
     by = {}
     for i, st, w, o, label, ph in rows:
@@ -103,10 +103,20 @@ def check(vals, rows, summary, notes, skipped=False):
         add("C1 coreinfo is not all ones", ci is not None and ci != ALL1, f"{ci:#010x}" if ci is not None else "no row")
         if ci is not None and ci != ALL1:
             nb, nrb = ci & 0x1F, (ci & 0x3E0) >> 5
-            add("C2 nrb == 0 and nb >= 1 (DHD rev < 12 masks; U-N2)", nrb == 0 and nb >= 1, f"coreinfo {ci:#010x}: nb {nb}, nrb {nrb}; brcmfmac decode {(ci & 0xF0) >> 4}")
-        add("B1 bankidx reads back 0", bi == 0, f"{bi:#010x}" if bi is not None else "no row")
+            if bank_skipped:
+                add("C2 (bankidx select skipped) ROM banks present: nrb != 0 (DHD rev < 12 masks; U-N2)", nrb != 0, f"coreinfo {ci:#010x}: nb {nb}, nrb {nrb}; brcmfmac decode {(ci & 0xF0) >> 4}")
+            else:
+                add("C2 nrb == 0 and nb >= 1 (DHD rev < 12 masks; U-N2)", nrb == 0 and nb >= 1, f"coreinfo {ci:#010x}: nb {nb}, nrb {nrb}; brcmfmac decode {(ci & 0xF0) >> 4}")
+        elif bank_skipped:
+            add("C2 (bankidx select skipped) coreinfo shows ROM banks", False, "coreinfo missing or all ones")
+        if bank_skipped:
+            lines.append(f"     bankidx select SKIPPED (ROM banks, no write): bankidx read {bi:#010x}" if bi is not None else "     bankidx select SKIPPED (ROM banks, no write): no bankidx row")
+        else:
+            add("B1 bankidx reads back 0", bi == 0, f"{bi:#010x}" if bi is not None else "no row")
         add("B2 bankinfo is not all ones", bk is not None and bk != ALL1, f"{bk:#010x}" if bk is not None else "no row")
-        if bk is not None and bk != ALL1:
+        if bk is not None and bk != ALL1 and bank_skipped:
+            lines.append(f"     bankinfo {bk:#010x} is the UNSELECTED bank (no bank was selected): informative, no RAM size derived")
+        elif bk is not None and bk != ALL1:
             size = 8192 * ((bk & 0x7F) + 1)
             est = f"; uniform-bank estimate {size * (ci & 0x1F) // 1024} KiB over nb {ci & 0x1F} [GUESS: bank 0 only was read]" if ci is not None and ci != ALL1 else ""
             lines.append(f"     bank 0 size {size} bytes ({size // 1024} KiB){est}")
@@ -163,7 +173,7 @@ def main(argv=None):
     sm = SUM_RE.findall(text)
     summary = sm[-1] if sm else None
     notes = {r["id"]: r.get("note", "") for r in doc["rows"]}
-    lines, res = check(vals, rows, summary, notes, "LINK S34 skip: SRPWR request" in text)
+    lines, res = check(vals, rows, summary, notes, "LINK S34 skip: SRPWR request" in text, "LINK S35 skip: bankidx select" in text)
     print("\n".join(lines))
     for nm, ok, txt in res:
         print(f"{'PASS' if ok else 'FAIL'} {nm}: {txt}")

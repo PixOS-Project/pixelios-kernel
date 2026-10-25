@@ -1823,7 +1823,7 @@ int main(void)
 					mw_rows[nmwr++] = i;
 			}
 			if (r.blk == WLB_MEM && r.kind == WLK_READ_ONLY) {
-				EXPECT(r.a == 2u || (r.step == 34u && r.off == 0x1E8u && r.a == 18u));	/* log flag; the S34 powerctl log row also carries the SRP_UP recorder flag 16 */
+				EXPECT((r.step == 35u && r.off == 0u) ? r.a == 66u : (r.a == 2u || (r.step == 34u && r.off == 0x1E8u && r.a == 18u)));	/* log flag; the S34 powerctl log row also carries the SRP_UP recorder flag 16 */
 				EXPECT(nl3[r.step - 34u] < 12u);
 				lrow[r.step - 34u][nl3[r.step - 34u]++] = i;
 			}
@@ -2100,10 +2100,24 @@ int main(void)
 			world(); chip_mode = 10;				/* the final IOCTL keeps FGC (reads 3): refused at the read-back, the up gate never passes */
 			EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S35") && mem_wr_n == 5u && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18026000u) && has("restore=ok"));
 			baseline_restored();
-			for (int m = 5; m <= 7; m++) {				/* coreinfo all ones / a ROM bank / no RAM bank: bankidx is REFUSED by the allowlist (nothing written), the run stops, restore ok */
+			for (int m = 5; m <= 7; m++) {				/* coreinfo all ones / no RAM bank: bankidx is REFUSED by the allowlist (nothing written), the run stops, restore ok; a ROM bank (6) is the observed case (run w3a-n35 0x115): the bankidx write and its read-back wait are SKIPPED, no write, and the chain goes on */
+				if (m == 6) continue;
 				world(); chip_mode = m;
 				EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S35") && has("restore=ok") && !has("!!!") && mem_wr_n == 5u && sm_bankidx == 3u && mem_illegal_w == 0u && !has("LINK S36 start"));
 				teardown_tail_is_table_order(35);
+				baseline_restored();
+			}
+			world(); chip_mode = 6;					/* coreinfo shows a ROM bank: bankidx select skipped (write and read-back wait, two skip lines), 4 S35 writes instead of 5, bankidx untouched, the run completes */
+			EXPECT(wlan_link_run() == 0 && has("LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write)") && !has("!!!") && mem_wr_n == nmw - 1u && sm_bankidx == 3u && mem_illegal_w == 0u && sm_io == 1u && sm_rc == 0u && has("restore=ok") && has("stopped=none"));
+			EXPECT(WLAN_LINK_N < 36 ? has("LINK S35 ok") && !has("LINK S36 start") : (arm_io == 0x21u && arm_rc == 0u && arm_rs == 0u && has("LINK S36 ok")));
+			snprintf(b, sizeof b, "LINK R35 row=%u rd=0x%08X", lrow[1][7], 3u); EXPECT(has(b));		/* the bankidx and bankinfo log rows still run after the skip (informative: the unselected bank) */
+			snprintf(b, sizeof b, "LINK R35 row=%u rd=0x%08X", lrow[1][8], 7u); EXPECT(has(b));
+			baseline_restored();
+			for (unsigned k = 0; k < 4u; k++) {			/* the ROM-bank test uses the DHD rev < 12 mask 0x3E0 (not brcmfmac 0xF0, not a narrower one): the observed 0x115 and words whose ROM bits are only 0x100 / only 0x200 / all */
+				static const uint32_t cw[4] = { 0x00000115u, 0x00000105u, 0x00000205u, 0x000003E5u };
+
+				world(); sm_coreinfo = cw[k];
+				EXPECT(wlan_link_run() == 0 && has("LINK S35 skip: bankidx select") && mem_wr_n == nmw - 1u && sm_bankidx == 3u && mem_illegal_w == 0u && has("stopped=none"));
 				baseline_restored();
 			}
 			world(); sm_io = 1u; sm_rc = 0u; sm_bankidx = 0u;		/* SYS_MEM already up (not the observed state): the sequence is idempotent and the run is clean */

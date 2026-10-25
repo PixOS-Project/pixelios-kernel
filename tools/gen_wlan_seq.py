@@ -311,8 +311,8 @@ def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="",
         assert kind == "read_only" and log and eot in (1, 2), "eot is for logged read_only rows: 1 = stop the dump after a 0xF dword, 2 = also refuse if the dword is not 0xF (the last row)"
         r["eot"] = eot
     if srp:
-        if not ((srp == 1 and kind == "read_only" and log) or (srp == 2 and kind == "mmio_rmw")):
-            raise ValueError("srp: 1 = logged read_only row that records `SRPWR domain 1 already up`, 2 = the mmio_rmw request row skipped when it was recorded")
+        if not ((srp == 1 and kind == "read_only" and log) or (srp == 2 and kind == "mmio_rmw") or (srp == 3 and kind == "read_only" and log)):
+            raise ValueError("srp: 1 = logged read_only row that records `SRPWR domain 1 already up`, 2 = the mmio_rmw request row skipped when it was recorded, 3 = logged read_only row (S35 coreinfo) that records `SYS_MEM has ROM banks`: the run then skips the bankidx write and its read-back wait (MEM 0x10)")
         r["srp"] = srp
     if note:
         r["note"] = note
@@ -912,7 +912,7 @@ def draft29():
     wq(35, 0x804, FULL, 0, "SYS_MEM up gate 3/3: RESET_ST == 0 (one-shot), else STOP + restore (review 15 finding 2)", tag=TAG_SRC)
     mv(35, 0x18126000, 0x18026000, "SYS_MEM core", "SYS_MEM core base 0x18026000 decoded from the EROM (observed run w3a-n33); entered only after the SYS_MEM up gate")
     ci = f"{an(G4SBSYS, r'uint32\s+coreinfo;')}; rev 9 < 12 uses the OLD masks nb = coreinfo & 0x1F ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_SRNB_MASK\s+0x1f')}), nrb = (coreinfo & 0x3E0) >> 5 ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_ROMNB_MASK\s+0x3e0')}); {an(SIU, r'if .si_corerev.sih. < 12.', 7030)}; brcmfmac decodes the same word with 0xF0 (U-N2)"
-    rl(35, 0x000, "SYS_MEM coreinfo", ci)
+    rl(35, 0x000, "SYS_MEM coreinfo", ci + "; the run records `ROM banks present` when the word is not all ones and (coreinfo & 0x3E0) != 0 (observed run w3a-n35: 0x00000115 = nrb 8, nb 21 by the DHD rev < 12 masks; a read from source, not checked against the chip) and then skips the bankidx write and its read-back wait: the bank size is informative only and S36 does not need a bank (srp)", srp=3)
     row(35, "mmio_write", "MEM", 0x10, FULL, 0, f"{r40}; bankidx := 0 for bank index i + nrb with i = 0 and nrb = 0: {an(SIU, r'W_REG.sii->osh, &regs->bankidx, bankidx.;', 6955)} ({an(G4SBSYS, r'define\s+SYSMEM_BANKIDX_REG\s+0x10')}); allowlist memw_ok: only 0, only if live coreinfo != all ones, nrb == 0 and nb >= 1", TAG_SRC, "bankidx := 0 (select RAM bank 0)")
     dly(35, 10, an(SIU, r"define SI_BANKINFO_DELAY_USEC\s+10u", 6955))
     rl(35, 0x10, "SYS_MEM bankidx", "read back, expect 0 (U-N6)")
