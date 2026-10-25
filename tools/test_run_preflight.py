@@ -235,6 +235,74 @@ class T(unittest.TestCase):
                'TUNABLE_STR(s, 8, "str_arg", "d"); PE_parse_boot_argn(name_var, &z, 4); /* comment "x" */')
         self.assertEqual(m.names_in(src), {"a_arg", "flag", "t_arg", "dt_arg", "str_arg"})
 
+    # --intent: per-intent required/forbidden flags and boot-args (tools/run-intents.json), checked by tools/xrun before any build
+    def xr(self, *a):   # real tools/xrun, no kernel file: it reaches the "--kernel FILE is required" line only if the intent check passed
+        p = subprocess.run([os.path.join(HERE, "xrun"), "--kernel", "/nonexistent", *a], capture_output=True, text=True, env=self.env, cwd=os.path.dirname(HERE))
+        return p.returncode, p.stdout + p.stderr
+
+    def test_intent_gpu_needs_handover(self):
+        rc, out = self.xr("--intent", "gpu", "--label", "gputest26")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("intent gpu: missing --gpu-handover", out)
+        rc, out = self.xr("--intent", "gpu", "--gpu-handover", "--label", "gputest26")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--kernel FILE is required", out)   # passed the intent check, stopped later
+        self.assertNotIn("intent gpu", out)
+
+    def test_intent_timing(self):
+        rc, out = self.xr("--intent", "timing", "--args", "cpus=8")
+        self.assertEqual((rc, "intent timing: missing sweetlogts=1" in out), (2, True), out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1 sweetlog=0")
+        self.assertEqual((rc, "forbidden sweetlog=0" in out), (2, True), out)
+        rc, out = self.xr("--intent", "timing", "--args", "cpus=8 sweetlogts=1")
+        self.assertIn("--kernel FILE is required", out)
+
+    def test_intent_wlan_unknown_and_none(self):
+        rc, out = self.xr("--intent", "wlan", "--label", "wd2-1")   # wlan row has no required flag (xrun lacks --wlan-hold): must pass the intent check
+        self.assertIn("--kernel FILE is required", out)
+        rc, out = self.xr("--label", "wdog")   # `wd` alone no longer implies wlan
+        self.assertIn("--kernel FILE is required", out)
+        rc, out = self.xr("--label", "wd2-2")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("suggests --intent wlan", out)
+        self.assertIn("unknown --intent nope", self.xr("--intent", "nope")[1])
+        rc, out = self.xr("--label", "gputest26")   # no --intent but the label implies one: exit 2 (closes the E23 bypass for scripts calling xrun)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("suggests --intent gpu (none given): pass --intent gpu", out)
+        rc, out = self.xr("--intent", "none", "--label", "gputest26")   # opt-out on a gpu label is exit 2 too
+        self.assertEqual(rc, 2, out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1", "--label", "gputest26")   # mismatch
+        self.assertEqual(rc, 2, out)
+        rc, out = self.xr("--intent", "timing", "--args", "sweetlogts=1", "--label", "GPUtest26")   # case-insensitive
+        self.assertEqual(rc, 2, out)
+        self.env["XRUN_INTENT_OK"] = "1"   # explicit escape for a run that mixes purposes
+        rc, out = self.xr("--intent", "none", "--label", "gputest26")
+        self.assertIn("--kernel FILE is required", out)
+        del self.env["XRUN_INTENT_OK"]
+        rc, out = self.xr("--label", "zzz-unknown")   # unknown label, no --intent: unchanged
+        self.assertIn("--kernel FILE is required", out)
+
+    def test_intent_label_escalation_mutant(self):
+        src = open(TOOL).read()
+        old = 'if hint and not (os.environ.get("XRUN_INTENT_OK") == "1" and name):'
+        self.assertEqual(src.count(old), 1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rp"); open(path, "w").write(src.replace(old, "if False:"))
+            ldr = importlib.machinery.SourceFileLoader("rpm", path)
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rpm", ldr)); ldr.exec_module(m); m.INTENTS = os.path.join(HERE, "run-intents.json")
+            self.assertEqual(m.c_intent([], "", "gputest26")[0], "PASS")   # mutant: the real tool must differ (asserted below)
+        ldr = importlib.machinery.SourceFileLoader("rpr", TOOL)
+        m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rpr", ldr)); ldr.exec_module(m)
+        self.assertEqual(m.c_intent([], "", "gputest26")[0], "FAIL")
+        self.assertEqual(m.c_intent([], "gpu", "gputest26")[0], "FAIL")   # given, but --gpu-handover missing
+        self.assertEqual(m.c_intent(["--gpu-handover"], "gpu", "gputest26")[0], "PASS")
+        self.assertEqual(m.c_intent([], "", "zzz")[0], "PASS")
+
+    def test_intent_in_preflight_check(self):
+        rc, out = self.pf("--", "tools/xrun", "--kernel", "K", "--args", GOOD, "--intent", "timing")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: FAIL intent:", out)
+
 
 if __name__ == "__main__":
     unittest.main()
