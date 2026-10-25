@@ -33,6 +33,7 @@ case "$qr" in off|0) ;; *[!0-9]*) echo "--qr needs seconds or off" >&2; exit 2 ;
 [ -n "$restart" ] && args="$args sweetrestart=$restart"
 [ "$handover" = 0 ] || args="$args sweetgpu=0x1C500000"   # patch 0102 reads the GPU; sweetgpujob=1 (patch 0103, WRITES) only via --args
 [ -n "$extra" ] && args="$args $extra"
+[ -z "$overlay" ] || case " $args " in *" ufsroot="*) echo "--overlay: ufsroot= in --args is refused (the overlay writes userdata only, AGENTS.md rule 1)" >&2; exit 2 ;; esac   # review 0117 F1
 [ -z "$overlay" ] || case " $args " in *" sweetdev="*) ;; *) args="$args sweetdev=1" ;; esac   # never doubled: an explicit sweetdev= in --args is kept
 railsarg=(); words=""; dvfsarg=(); hoarg=(); [ "$handover" = 0 ] || hoarg=(--gpu-handover)
 [ "$rails" = 0 ] || words=rails

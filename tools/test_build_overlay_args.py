@@ -40,6 +40,17 @@ class OverlayArgs(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0); self.assertIn('not allowed on the phone', r.stderr)
         self.assertNotIn('boot-args', r.stdout)
 
+    def test_overlay_refuses_ufsroot_arg(self):          # review 0117 F1
+        for a in ('ufsroot=vendor_boot', 'sweetdev=1 ufsroot=x'):
+            r = build('--overlay', overlay(), '--args', a)
+            self.assertEqual(r.returncode, 2, a); self.assertIn('ufsroot=', r.stderr); self.assertNotIn('boot-args', r.stdout)
+        self.assertEqual(build('--args', 'ufsroot=userdata').returncode, 0)   # no overlay: unchanged
+
+    def test_docs_have_failon_and_recovery(self):         # review 0117 F2-F5 (doc conditions)
+        d = open(os.path.join(HERE, '..', 'docs', 'AUTOMATION.md')).read()
+        for k in ('mounting dirty non-journaled root', 'two renames', '.sweetorig` holds the previous overlay version', 'mode or owner'):
+            self.assertIn(k, d)
+
     def test_missing_overlay_dir(self):
         self.assertNotEqual(build('--overlay', '/nonexistent-dir').returncode, 0)
 
