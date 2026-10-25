@@ -317,6 +317,8 @@ def c_intent(argv, name, label=None):
         if lab and any(lab.startswith(p) for p in t.get("label_prefix", [])) and n != name:
             hint = "warning: label '%s' suggests --intent %s%s" % (lab, n, " (given: %s)" % name if name else " (none given)")
             break
+    if not name and hint:   # E23 bypass: a script that calls xrun itself has no hook; a label that implies an intent needs --intent NAME or --intent none
+        return ("FAIL", hint.replace("warning: ", "") + ": add --intent " + hint.split("--intent ")[1].split(" ")[0] + " (or --intent none to opt out)")
     if not name or name == "none":   # `--intent none` = explicit opt-out (tools/agent-guard E23 demands one of the two)
         return ("PASS", hint or ("note: --intent none (opt-out)" if name else ""))
     if name not in tab:

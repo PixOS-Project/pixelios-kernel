@@ -260,9 +260,29 @@ class T(unittest.TestCase):
     def test_intent_wlan_unknown_and_none(self):
         self.assertIn("intent wlan: missing --wlan-hold", self.xr("--intent", "wlan")[1])
         self.assertIn("unknown --intent nope", self.xr("--intent", "nope")[1])
-        rc, out = self.xr("--label", "gputest26")   # no --intent: unchanged behaviour (only a warning on stderr)
+        rc, out = self.xr("--label", "gputest26")   # no --intent but the label implies one: exit 2 (closes the E23 bypass for scripts calling xrun)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("suggests --intent gpu (none given): add --intent gpu", out)
+        rc, out = self.xr("--intent", "none", "--label", "gputest26")
         self.assertIn("--kernel FILE is required", out)
-        self.assertIn("warning: label 'gputest26' suggests --intent gpu (none given)", out)
+        rc, out = self.xr("--label", "zzz-unknown")   # unknown label, no --intent: unchanged
+        self.assertIn("--kernel FILE is required", out)
+
+    def test_intent_label_escalation_mutant(self):
+        src = open(TOOL).read()
+        old = "if not name and hint:"
+        self.assertEqual(src.count(old), 1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rp"); open(path, "w").write(src.replace(old, "if False:"))
+            ldr = importlib.machinery.SourceFileLoader("rpm", path)
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rpm", ldr)); ldr.exec_module(m); m.INTENTS = os.path.join(HERE, "run-intents.json")
+            self.assertEqual(m.c_intent([], "", "gputest26")[0], "PASS")   # mutant: the real tool must differ (asserted below)
+        ldr = importlib.machinery.SourceFileLoader("rpr", TOOL)
+        m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rpr", ldr)); ldr.exec_module(m)
+        self.assertEqual(m.c_intent([], "", "gputest26")[0], "FAIL")
+        self.assertEqual(m.c_intent([], "gpu", "gputest26")[0], "FAIL")   # given, but --gpu-handover missing
+        self.assertEqual(m.c_intent(["--gpu-handover"], "gpu", "gputest26")[0], "PASS")
+        self.assertEqual(m.c_intent([], "", "zzz")[0], "PASS")
 
     def test_intent_in_preflight_check(self):
         rc, out = self.pf("--", "tools/xrun", "--kernel", "K", "--args", GOOD, "--intent", "timing")
