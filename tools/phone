@@ -18,7 +18,7 @@ Hardware and protocol citations:
     device/google/bluejay/docs/GATE0_RESULTS.md:25, docs/tasks/usb-stage2.md:23, tools/probe-run:74.
   - iOS XNU USB Ethernet CDC-ECM gadget VID:PID 1209:0001, host MAC 02:00:5e:77:ee:01,
     IP 192.168.7.2, UDP console log port 5140:
-    tools/xrun:61-69, tools/usbnet-log.py:3-10,36-39, tools/sweet-usbnet.sh:6,16,26,
+    tools/xrun:61-69, tools/usbnet-log.py:3-10,36-39, tools/sweet-usbnet.sh:7-8,
     docs/HANDOFF.md:496, docs/research/03-patch-inventory.md:117,
     docs/research/09-xnu-usb-gs101.md:100,183.
   - Fastboot USB IDs 18d1:d001 / 18d1:4ee0:
@@ -30,7 +30,7 @@ Hardware and protocol citations:
     tools/hang-recover:10 (90s wait bound, 300s cap), tools/probe-run:9 (30s bound),
     tools/xrun:37-39,83-88, docs/HANDOFF.md:354,368.
   - Staged USBNET command:
-    tools/sweet-usbnet.sh:16, tools/xrun:63.
+    tools/sweet-usbnet.sh:14, tools/xrun:63.
 """
 
 import argparse
@@ -47,7 +47,7 @@ BOUND_SCALE = float(os.environ.get("PHONE_BOUND_SCALE", "1"))
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Host staged USB-net command (printed for user reference, NEVER run via sudo)
-# Citation: tools/sweet-usbnet.sh:16, tools/xrun:63
+# Citation: tools/sweet-usbnet.sh:14, tools/xrun:63
 STAGED_USBNET_CMD = (
     "USBNET: sudo sh -c 'i=$(ip -o link | grep -i 02:00:5e:77:ee:01 | "
     "cut -d: -f2 | cut -d@ -f1 | xargs); ip addr replace 192.168.7.1/24 dev $i && "
@@ -486,7 +486,7 @@ def observe_state(logger=None):
     absent, fastboot, recovery, android, booting, ios, shim-probe, hung, other-device.
     Reuses tools/phone-state probe logic without duplicating probing code.
     """
-    # 1. Check for iOS (XNU): ping 192.168.7.2 with 1s timeout (tools/sweet-usbnet.sh:26, docs/HANDOFF.md:496)
+    # 1. Check for iOS (XNU): ping 192.168.7.2 with 1s timeout (docs/HANDOFF.md:496)
     rc, _, _ = run_bounded(["ping", "-c", "1", "-W", "1", "192.168.7.2"], timeout_s=2, logger=logger)
     if rc == 0:
         if logger:
@@ -499,7 +499,7 @@ def observe_state(logger=None):
     usb_has_google = (rc_usb == 0 and re.search(r"ID 18d1:", usb_out, re.IGNORECASE) is not None)
 
     # If 1209:0001 gadget is on USB, check whether it is CDC-ECM (ios) or CDC-ACM (shim-probe)
-    # MAC 02:00:5e:77:ee:01 citation: tools/sweet-usbnet.sh:16, docs/HANDOFF.md:496, docs/research/03-patch-inventory.md:117
+    # MAC 02:00:5e:77:ee:01 citation: tools/sweet-usbnet.sh:7, docs/HANDOFF.md:496, docs/research/03-patch-inventory.md:117
     if usb_has_gadget:
         _, link_out, _ = run_bounded(["ip", "-o", "link"], timeout_s=2, logger=logger)
         if "02:00:5e:77:ee:01" in link_out.lower():

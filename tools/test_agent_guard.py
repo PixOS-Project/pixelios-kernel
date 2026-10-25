@@ -12,7 +12,7 @@ SRC = (HERE / "agent-guard").read_text()
 
 # (name, old text, new text): each must change the source and make --self-test FAIL
 MUTANTS = [
-    ("S1 hard cap 160k -> 100k", "SOFT, HARD = 100_000, 160_000", "SOFT, HARD = 100_000, 100_000"),
+    ("S1 hard cap 200k -> 180k", "SOFT, HARD = 180_000, 200_000", "SOFT, HARD = 180_000, 180_000"),
     ("ctx_tokens without the type=assistant filter", 'if d.get("type") != "assistant":', "if False:"),
     ("rootish: no project-dir branch", "return bool(pd and os.path.basename(a) in LOADED_DOCS and os.path.dirname(p) == os.path.realpath(pd))", "return False"),
     ("S2 keeps no tail", "so[:KEEP] + cut + so[-KEEP:]", "so[:KEEP] + cut"),
@@ -53,6 +53,27 @@ MUTANTS = [
     ("A2c background cd kept", 'or op == "&") and cur != cwd', ') and cur != cwd'),
     ("A2d moved only first parse", "for p in ps for w, _ in p)", "for p in ps[:1] for w, _ in p)"),
     ("S6b case-sensitive", 'lines\\b", p or "", re.I)', 'lines\\b", p or "")'),
+    ('E17 -- does not end the operands', 'if x == "--" or (h[0] == "find"', 'if (h[0] == "find"'),
+    ('E15 -maxdepth ignored', '(md is None or md > 3)', 'True'),
+    ('E22 merge in progress not exempt', 'if any(os.path.exists(os.path.join(d, x)) for x in seq):', 'if False:'),
+    ('E22 tools/<slug> branch not allowed', ' or br.startswith("tools/"):', ':'),
+    ('E8b cp source counted as written', 'cand = [dst] + (ops[:-1] if prog == "mv" else [])', 'cand = ops'),
+    ('E18 pattern operand counted as a file', 'files = ops if pat else ops[1:]', 'files = ops'),
+    ('E2c split $( pgrep ) not seen', ' or (w[-1].endswith("$") and "(" in op and nxt and nxt[0] in ("pgrep", "pidof"))', ''),
+    ('E13 host-test loop not found', 'if m and any("wlanlink_host_test$n" in x for x in t[i + 1:i + 4]):', 'if m and False:'),
+    ('E14 no margin', 'ms < (need + 60) * 1000', 'ms < need * 1000'),
+    ('E8b git -C not followed', 'if cv and "$" not in cv and "`" not in cv:', 'if False:'),
+    ('E22 shared-tool filter widened to all tools/', 'tf = [f for f in files if SHARED_TOOLS.match(f)]', 'tf = [f for f in files if f.startswith("tools/")]'),
+    ('E22 git add in another repo counted', 'if os.path.realpath(top) == os.path.realpath(root):', 'if True:'),
+    ('E22 commit PATH ignored', 'files += pathspec_files(d, named_ops(ca, COMMIT_VAL))', 'pass'),
+    ('E22 build.sh with shim code denied', ' and f != "shim/build.sh" for f in files', ' for f in files'),
+    ('E8b git rewrite in shared clone ignored', 'if gd and os.path.realpath(gd) == os.path.realpath(SHARED) and not', 'if False and not'),
+    ('E18 -I accepted as text', '"--text", "--binary-files=text", "-uuu")', '"--text", "-I", "--binary-files=text", "-uuu")'),
+    ('E14 xrun default ignored', 'n = 300         #', 'n = 0         #'),
+    ('E14 lock-wait ignored', 'need = max(need, n + (int(lw) if lw and lw.isdigit() else 0))', 'need = max(need, n)'),
+    ('prep: # inside a word is a comment', 'elif ch == "#" and wb:', 'elif ch == "#":'),
+    ('prep: backslash-newline kept', 'if cmd[i + 1] != "\\n":', 'if True:'),
+    ('E10 poke inside phone-lock run not seen', 'if p == "phone-lock" or (preflight and p == "run-preflight"):', 'if preflight and p == "run-preflight":'),
 ]
 
 
