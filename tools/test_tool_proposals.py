@@ -39,6 +39,12 @@ class T(unittest.TestCase):
         return subprocess.run([sys.executable, TOOL, *a], capture_output=True, text=True,
                               env=dict(os.environ, TP_ROOT=self.root))
 
+    def test_prune_stale(self):
+        r = self.run_tool("prune", "--stale-days", "0")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("STALE TP-001", r.stdout)
+        self.assertEqual(self.run_tool("prune", "--stale-days", "99999").returncode, 0)
+
     def test_valid(self):
         r = self.run_tool("validate")
         self.assertEqual(r.returncode, 0, r.stdout)

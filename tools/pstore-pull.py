@@ -161,6 +161,11 @@ def cmd_run(args) -> int:
         print(f"error: image not found: {image}", file=sys.stderr)
         return 2
 
+    lk = subprocess.run([str(pathlib.Path(__file__).resolve().parent / "phone-lock"), "check"], capture_output=True, text=True)
+    if lk.returncode != 0:
+        print("REFUSING: the phone lock is not held by you: run under tools/phone-lock run --owner NAME -- ...", file=sys.stderr)
+        return 2
+
     r = run_cmd(["fastboot", "getvar", "product"], FASTBOOT_TIMEOUT_S, "fastboot getvar product")
     if r is None:
         return 2

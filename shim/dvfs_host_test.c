@@ -254,9 +254,11 @@ static void test_config(void)
 	assert(cfg.dvfs_ch == 1 && acpm_dvfs_ndom() == 3);
 	assert(acpm_dvfs_dom(0, &d) && d == 2 && acpm_dvfs_dom(1, &d) && d == 3 && acpm_dvfs_dom(2, &d) && d == 4 && !acpm_dvfs_dom(3, &d));
 	/* ceilings are table rows (also enforced by tools/boards.py); the very first rows are above them */
+#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* the tables exist only in images that can send a request (acpm.c); the rw run checks them */
 	assert(dvfs_ceil[0] == 1803000 && dvfs_ceil[1] == 1836000 && dvfs_ceil[2] == 1826000);
 	assert(dvfs_rate[0][0] == 2196000 && dvfs_rate[1][0] == 2466000 && dvfs_rate[2][0] == 3195000);
 	assert(dvfs_nr[0] == 15 && dvfs_nr[1] == 17 && dvfs_nr[2] == 21);
+#endif
 }
 
 static void test_get(void)

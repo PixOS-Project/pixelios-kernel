@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""patch-guard: Claude Code PreToolUse hook (TP-022). A NEW xnu/patches/NNNN-slug.patch may only be created with a number from `tools/patch-numbers next`.
+
+Denies Write/Edit/MultiEdit of a non-existing xnu/patches/NNNN-*.patch, and a Bash command that writes one (redirect, cp, mv, tee, install, git mv/checkout/restore/apply,
+format-patch), unless refs/patch-numbers/NNNN reserves that number for that slug (or the same file name is already committed on some branch). Editing an existing patch is
+always allowed. The repo that is checked is the one the PATH belongs to (the last `cd DIR` before the path in the command, else the session cwd), and a repo without
+tools/patch-numbers (a temp repo, the super repo) is not guarded. Heredoc bodies are ignored. A broken guard fails OPEN (exit 0, no decision).
+Guard rail, not a sandbox; the git pre-commit hook (`tools/patch-numbers install-hook`) catches what a script wrote without this hook seeing it.
+Stdin: the hook JSON. Stdout: a deny decision or nothing. Always exit 0. Test: tools/test_patch_guard.py.
+"""
+import importlib.machinery, importlib.util, json, os, re, subprocess, sys
+
+TOK = re.compile(r"(\S*xnu/patches/(\d{4})-([^/\s'\"]+?)\.patch)")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+WRITER = re.compile(r"^\s*(sudo\s+)?(cp|mv|tee|install|rsync|ln)\b|^\s*git\s+(mv|checkout|restore|apply)\b|format-patch|\bsed\s+[^;|&]*\bw\s")
+
+
+def repo_of(path):
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    r = subprocess.run(["git", "-C", d or ".", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def load_pn(root):
+    ldr = importlib.machinery.SourceFileLoader("pn", os.path.join(os.path.dirname(os.path.abspath(__file__)), "patch-numbers"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("pn", ldr))
+    ldr.exec_module(mod)
+    mod.ROOT = root
+    return mod
+
+
+def allowed(pn, num, slug):
+    n = int(num)
+    for k in pn.survey().get(n, {}):
+        m = pn.PAT.match(k)
+        if m and m.group(2) == slug:
+            return True  # already committed under exactly this name somewhere
+    r = pn.reservations().get(n)
+    return bool(r) and r["name"] in ("?", "", slug)
+
+
+def deny(why):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}}))
+
+
+def bash_targets(cmd, cwd):
+    """(absolute path, number, slug) of every patch path a WRITING segment of CMD names"""
+    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd)
+    out = []
+    for m in TOK.finditer(cmd):
+        seps = list(re.finditer(r"&&|\|\||;|\||\n", cmd[:m.start()]))
+        seg = cmd[seps[-1].end():m.end()] if seps else cmd[:m.end()]
+        redirect = re.search(r">>?\s*$", cmd[:m.start()])
+        if not (redirect or WRITER.search(seg)):
+            continue
+        base = cwd
+        for c in re.findall(r"(?:^|&&|;|\n)\s*cd\s+(\S+)", cmd[:m.start()]):
+            base = os.path.normpath(os.path.join(base, os.path.expanduser(c)))
+        tok = os.path.expanduser(m.group(1))
+        out.append((os.path.normpath(tok if os.path.isabs(tok) else os.path.join(base, tok)), m.group(2), m.group(3)))
+    return out
+
+
+def main():
+    try:
+        d = json.load(sys.stdin)
+        ti = d.get("tool_input") or {}
+        cwd = d.get("cwd") or os.getcwd()
+        targets = []
+        if d.get("tool_name") in ("Write", "Edit", "MultiEdit"):
+            fp = os.path.normpath(ti.get("file_path", ""))
+            m = TOK.search(fp)
+            if m:
+                targets.append((fp, m.group(2), m.group(3)))
+        elif d.get("tool_name") == "Bash":
+            targets = bash_targets(ti.get("command", ""), cwd)
+        for path, num, slug in targets:
+            if os.path.exists(path):
+                continue  # editing an existing patch
+            root = repo_of(path)
+            if not root or not os.path.isfile(os.path.join(root, "tools", "patch-numbers")):
+                continue  # not a kernel repo: not guarded
+            if not allowed(load_pn(root), num, slug):
+                deny("new xnu patch %s-%s.patch: the number is not reserved for it. Run `tools/patch-numbers next --owner NAME --name %s` and use the number it prints "
+                     "(branches diverge, so \"the next number\" collides; see docs/AUTOMATION.md 'One numbering for xnu/patches'). Already wrote it? `tools/patch-numbers claim %s --owner NAME --name %s`."
+                     % (num, slug, slug, num, slug))
+                return 0
+    except Exception:  # noqa: BLE001 - a broken guard must not block work
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

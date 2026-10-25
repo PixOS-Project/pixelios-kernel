@@ -1,0 +1,19 @@
+/* fixture source: K 4a456b8 lines 722-739 with the vacuous '|| 1' removed (the fix applied in this commit to shim/wlanlink_host_test.c:738) */
+	}
+#if WLAN_LINK_N < 20
+	EXPECT(!wrote(WLAN_GPH2 + 4, 1, 1));			/* the default run NEVER raises PERST */
+	EXPECT(!wrote(WLAN_ELBI + 0x54, 0xffffffff, 1) && !wrote(WLAN_ELBI + 0x3bc, 0xffffffff, 0x11));	/* nor enables the LTSSM / the options */
+	EXPECT(ev[nev - 1].pa == WLAN_GPH2 && ev[nev - 1].t == EV_W);
+#else
+	EXPECT(wrote(WLAN_GPH2 + 4, 1, 1));			/* S20: PERST high ... */
+	{
+		unsigned hi = 0, lo = 0;
+
+		for (unsigned i = 0; i < nev; i++)
+			if (ev[i].t == EV_W && ev[i].pa == WLAN_GPH2 + 4) {
+				if (ev[i].v & 1u && !hi) hi = i + 1;
+				if (hi && !(ev[i].v & 1u) && !lo) lo = i + 1;
+			}
+		EXPECT(hi && lo > hi);				/* ... and PERST low again, first thing of the teardown (T01) */
+		EXPECT(ev[lo].t == EV_W || ev[lo].t == EV_ISO_CLR);
+	}

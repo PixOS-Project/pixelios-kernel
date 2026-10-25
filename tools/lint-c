@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Static analysis over the shim C (TP-014): cppcheck + clang-tidy-19 with the shim/build.sh flags. Read-only, no device.
-  tools/lint-c [--files shim/a.c ...] [--strict]
+  tools/lint-c [--files shim/a.c ...] [--strict] [--out DIR]
 Default files: shim/*.c except *_host_test.c (host builds, hosted libc). Logs: shim/out/lint-c/.
+--out DIR (relative to the repo root, default shim/out): where board_config.h / wlan_seq.h come from. The gate no longer refreshes shim/out, so after a gate
+run use --out shim/out/gate/build-0 (a header from an old build is silently stale otherwise).
 RESULT: PASS|FAIL|ERROR files=N findings=N   exit 0 clean / 1 findings / 2 tool or shim/out/board_config.h missing.
 Findings = cppcheck error|warning|portability + every clang-tidy diagnostic (--strict adds cppcheck style).
 Env (tests): LINT_ROOT, LINT_CPPCHECK, LINT_TIDY, LINT_TIMEOUT (s per tool per file).
@@ -32,13 +34,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--files", nargs="+")
     ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--out", default="shim/out")
     a = ap.parse_args()
     cpp = os.environ.get("LINT_CPPCHECK") or shutil.which("cppcheck")
     tidy = os.environ.get("LINT_TIDY") or shutil.which("clang-tidy-19") or shutil.which("clang-tidy")
-    bc = os.path.join(ROOT, "shim/out/board_config.h")
+    bc = os.path.join(ROOT, a.out, "board_config.h")
     miss = [n for n, v in (("cppcheck", cpp), ("clang-tidy", tidy)) if not v]
     if not os.path.exists(bc):
-        miss.append("shim/out/board_config.h (python3 tools/boards.py bluejay shim/out/board_config.h)")
+        miss.append("%s/board_config.h (python3 tools/boards.py bluejay %s/board_config.h, or --out shim/out/gate/build-0 after a gate run)" % (a.out, a.out))
     if miss:
         print("RESULT: ERROR missing: %s files=0 findings=0" % ", ".join(miss))
         return 2
@@ -47,7 +50,7 @@ def main():
     ld = os.path.join(ROOT, "shim/out/lint-c")
     os.makedirs(ld, exist_ok=True)
     to = int(os.environ.get("LINT_TIMEOUT", "180"))
-    common = ["-DSOC_GS101=1", "-Ishim", "-Ishim/out"]
+    common = ["-DSOC_GS101=1", "-Ishim", "-I" + a.out]
     findings, style, lines = 0, 0, []
     for f in files:
         d = EXTRA.get(os.path.basename(f), [])
@@ -55,7 +58,7 @@ def main():
         log = os.path.join(ld, os.path.basename(f) + ".log")
         open(log, "w").close()
         out, rc = run([cpp, "--enable=warning,portability,style", "--quiet", "--template={file}:{line}: {severity}: {id}: {message}",
-                       "--include=shim/out/board_config.h"] + common + d + inc + [f], log, to)
+                       "--include=" + a.out + "/board_config.h"] + common + d + inc + [f], log, to)
         for l in out.splitlines():
             m = CPP.match(l)
             if not m:
@@ -69,7 +72,7 @@ def main():
             findings += 1
             lines.append("%s: cppcheck timeout" % f)
         out, rc = run([tidy, "--checks=" + TIDY_CHECKS, "--quiet", f, "--", "--target=aarch64-none-elf", "-ffreestanding", "-nostdlib",
-                       "-include", "shim/out/board_config.h"] + common + d + inc, log, to)
+                       "-include", a.out + "/board_config.h"] + common + d + inc, log, to)
         for l in out.splitlines():
             if DIAG.match(l) and "noipa" not in l:  # noipa: GCC-only attribute, clang warns
                 findings += 1

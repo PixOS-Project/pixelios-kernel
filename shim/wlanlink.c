@@ -15,14 +15,15 @@
 #include "wlansmc.h"
 #include "wlanlink.h"
 
-#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && defined(WLAN_CFG) && \
+#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && defined(WLAN_CFG) && defined(WLAN_MEM) && \
 	defined(WLAN_PMU_ALIVE) && defined(WLAN_GPP14_EN_PIN) && defined(WLAN_GPH2_PERST_PIN)
 
 #include "wlan_seq.h"
 
-/* the two new S26 blocks: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
+/* the new blocks: S26 ATU/CFG, S29 MEM: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
 _Static_assert(WLAN_ATU == WLAN_DBI + 0x300000u, "WLAN_ATU must be WLAN_DBI + 0x300000");
 _Static_assert(WLAN_CFG == 0x60FFE000UL, "WLAN_CFG must be the pcie_1 config window 0x60FFE000");
+_Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range start 0x60000000 (BAR0, read-only; the exact offsets per BAR0 window are in mem_ok)");
 
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N
@@ -35,6 +36,7 @@ _Static_assert(WLAN_LINK_N <= WLAN_SEQ_LAST, "--wlan-link=N: N beyond the last s
 #define ST_TIMEOUT	1
 #define ST_FAULT	2
 #define ST_REFUSED	3
+#define EOT_SEEN	(1u << 31)	/* kept in the run's `probed` word (bits 0..7 are block probes): set when an EROM dump row read the EOT dword 0xF */
 
 __attribute__((noipa)) static unsigned put_txt(char *dst, unsigned cap, unsigned pos, const char *s)
 {
@@ -155,6 +157,8 @@ static uintptr_t base_of(unsigned blk)
 		return WLAN_ATU;
 	if (blk == WLB_CFG)
 		return WLAN_CFG;
+	if (blk == WLB_MEM)
+		return WLAN_MEM;
 	return 0;
 }
 
@@ -164,7 +168,7 @@ static uint32_t size_of(unsigned blk)
 		return 0x18u;
 	if (blk == WLB_PMA || blk == WLB_ELBI || blk == WLB_CFG)
 		return 0x2000u;
-	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU)
+	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_MEM)
 		return 0x1000u;
 	if (blk == WLB_PMU)
 		return 0x4000u;
@@ -174,7 +178,7 @@ static uint32_t size_of(unsigned blk)
 /* the blocks that may only be touched after their probe read worked */
 static unsigned need_probe(unsigned blk)
 {
-	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_CFG) ? 1u << blk : 0u;
+	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_CFG || blk == WLB_MEM) ? 1u << blk : 0u;
 }
 
 static uintptr_t pa_of(unsigned blk, uint32_t off)
@@ -186,7 +190,62 @@ static uintptr_t pa_of(unsigned blk, uint32_t off)
 	return b + off;
 }
 
-static int r32(unsigned blk, uint32_t off, uint32_t *v)
+/* The BAR0 read allowlist per window (the LIVE cfg 0x80, read by r32 first), exact: 0x18000000 ChipCommon: S30 chip id, S31 eromptr 0xFC / clk_ctl_st 0x1E0 / capabilities_ext 0xAC (research 37); 0x18105000 the EROM page: dwords below
+ * 0xE00 = ER_REMAPCONTROL (aidmp.h, review 13 M1); S33 (research 38 s.3): 0x18012000 the PMU core: pmucontrol 0x600, pmucapabilities 0x604, pmustatus 0x608, min_res_mask 0x618, max_res_mask 0x61C; 0x18120000 ARM CA7 wrapper and 0x18126000 SYS_MEM wrapper:
+ * IOCTL 0x408, RESET_CTL 0x800, RESET_ST 0x804 (never 0x400/0x404 ioctrlset/clear, 0x500, 0x808/0x80C); S34-S36 (research 40 s.5): 0x18001000 the PCIe core page: powerctl 0x1E8; 0x18026000 SYS_MEM core: coreinfo 0x000, bankidx 0x010, bankinfo 0x040.
+ * Any other window or offset refuses. noipa: the object audit evaluates the compiled function. */
+__attribute__((noipa)) static int mem_ok(uint32_t win, uint32_t off)
+{
+	if (win == 0x18105000u)
+		return off < 0xE00u;
+	if (win == 0x18000000u)
+		return off == 0u || off == 0xACu || off == 0xFCu || off == 0x1E0u;
+	if (win == 0x18012000u)
+		return off == 0x600u || off == 0x604u || off == 0x608u || off == 0x618u || off == 0x61Cu;
+	if (win == 0x18120000u || win == 0x18126000u)
+		return off == 0x408u || off == 0x800u || off == 0x804u;
+	if (win == 0x18001000u)
+		return off == 0x1E8u;
+	if (win == 0x18026000u)
+		return off == 0u || off == 0x10u || off == 0x40u;
+	return 0;
+}
+
+/* The BAR0 WRITE allowlist (research 40 s.5): exact (window, offset, old -> new, predecessor) tuples, nothing else is writable behind BAR0. win = the live cfg 0x80, old = the live register, pred = the live companion register
+ * memw_pred() names (IOCTL for RESET_CTL, RESET_CTL for IOCTL, coreinfo for bankidx). The reset sequence of Broadcom _ai_core_reset(bits, resetbits) (aiutils.c:1242-1325): RESET_CTL := 1, IOCTL := bits | resetbits | FGC 0x2 | CLK 0x1, RESET_CTL := 0,
+ * IOCTL := bits | CLK; `want` is the IOCTL value of the middle step: SYS_MEM wrapper 0x3 (bits = resetbits = 0), ARM CA7 wrapper 0x23 (CPUHALT 0x20 twice, SICF_CPUHALT dhd_pcie.c:10125). noipa: the object audit evaluates the compiled function. */
+__attribute__((noipa)) static int memw_ok(uint32_t win, uint32_t off, uint32_t old, uint32_t v, uint32_t pred)
+{
+	uint32_t want;
+
+	if (win == 0x18001000u)		/* SRPWR domain 1 request: only bit 0x200 of powerctl (no-op if already set), nothing else, not on a dead read, only when PowerDomain id [31:28] != 0 (si_srpwr_cap; review 16 finding 2) */
+		return off == 0x1E8u && old != 0xFFFFFFFFu && (old & 0xF0000000u) != 0u && v == (old | 0x200u);
+	if (win == 0x18126000u || win == 0x18120000u) {
+		want = win == 0x18126000u ? 0x3u : 0x23u;
+		if (off == 0x800u)	/* pred = IOCTL: the assert is always fine, the release only after the IOCTL write of the sequence */
+			return v == 1u || (v == 0u && (pred & 0x3FFFu) == want);
+		if (off == 0x408u)	/* pred = RESET_CTL, old = IOCTL: FGC|CLK only while in reset, the final value only after the release */
+			return (v == want && (pred & 1u) == 1u) || (v == (want & ~0x2u) && (pred & 1u) == 0u && (old & 0x3FFFu) == want);
+		return 0;
+	}
+	if (win == 0x18026000u)		/* bankidx := 0 only with a live coreinfo that is not a dead read, has no ROM bank (nrb = 0) and at least one RAM bank */
+		return off == 0x10u && v == 0u && pred != 0xFFFFFFFFu && (pred & 0x3E0u) == 0u && (pred & 0x1Fu) != 0u;
+	return 0;
+}
+
+/* the companion register memw_ok needs for a BAR0 write at off (0xFFFFFFFF: none) */
+__attribute__((noipa)) static uint32_t memw_pred(uint32_t off)
+{
+	if (off == 0x800u)
+		return 0x408u;
+	if (off == 0x408u)
+		return 0x800u;
+	if (off == 0x10u)
+		return 0u;
+	return 0xFFFFFFFFu;
+}
+
+__attribute__((noipa)) static int r32(unsigned blk, uint32_t off, uint32_t *v)
 {
 	uintptr_t pa = pa_of(blk, off);
 
@@ -196,7 +255,23 @@ static int r32(unsigned blk, uint32_t off, uint32_t *v)
 		return 0;
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
+	if (blk == WLB_MEM) {		/* BAR0 reads, decided by the LIVE BAR0 window (cfg 0x80, read first): the exact offsets per window are in mem_ok (S30-S36); any other window or offset refuses. Only while region 1 reads enabled and the EP Command reads MEM-only (an unmapped window could stall the bus) */
+		uint32_t cr2 = 0, cmd = 0, win = 0, r1[4] = { 1, 1, 1, 1 };
+
+		if (!try_read32(WLAN_CFG + 0x80u, &win) || !mem_ok(win, off) || !try_read32(WLAN_ATU + 0x204u, &cr2) || cr2 != 0x80000000u || !try_read32(WLAN_CFG + 4u, &cmd) || (cmd & 0xFFFFu) != 0x0002u)
+			return 0;
+		/* review 10 L1: the window itself (RC-local reads, no TLP): type MEM, base, limit, target as programmed by S29 */
+		if (!try_read32(WLAN_ATU + 0x200u, &r1[0]) || !try_read32(WLAN_ATU + 0x208u, &r1[1]) || !try_read32(WLAN_ATU + 0x210u, &r1[2]) || !try_read32(WLAN_ATU + 0x214u, &r1[3]) ||
+		    r1[0] != 0u || r1[1] != 0x60000000u || r1[2] != 0x6000FFFFu || r1[3] != 0x60000000u)
+			return 0;
+	}
 	return try_read32(pa, v);
+}
+
+/* review 10 M1: config space is 4 KiB; w32 refuses an offset above it BEFORE its old-value read. BAR0 (MEM) is written only from S34 (research 40) and only through memw_ok: w32 never reads a MEM old value with try_read32 (r32 guards it) */
+static int w32_blk_ok(unsigned blk, uint32_t off)
+{
+	return !(blk == WLB_CFG && off >= 0x1000u);
 }
 
 /* ---- the independent write allowlist ---- */
@@ -224,15 +299,58 @@ static int elbi_ok(uint32_t off)
 	       off == 0x1400u || off == 0x1404u || off == 0x1408u;
 }
 
-/* ATU outbound region 0 (rc.h:286-292): only the seven registers of S26 and only the values of S26 or its teardown (research 31 s.2.2; reset values observed in run w3a-n25); a full-word write only */
-static int atu_ok(uint32_t off, uint32_t v)
+/* The live register state the stateful allowlist rules need (read by ctx_read, guarded; an unreadable word reads as "not ready" so only the restores pass): cmd = EP Command dword (CFG rows),
+ * bar0 = EP BAR0 low dword (CFG rows), r1ok = ATU region 1 LOWER_BASE / LIMIT / LOWER_TARGET hold the S29 values (ATU rows). */
+struct w32_ctx {
+	uint32_t cmd, bar0;
+	int r1ok;
+	int tear;	/* the row is a teardown row (set by w32; forward rows keep the strict S29 / S32 rules) */
+	uint32_t win, pred;	/* BAR0 (MEM) rows: the live window select cfg 0x80 and the live companion register (memw_pred), 0 otherwise (set by w32) */
+};
+
+/* ATU outbound regions (rc.h:286-300): region 0 = the seven registers of S26 (research 31 s.2.2; reset values observed in run w3a-n25), region 1 (S29, research 36 s.2) = exactly 0x204/0x208/0x210/0x214
+ * with the S29 values or the reset values; the region 1 ENABLE only once base, limit and target hold the S29 values; never 0x200/0x20C/0x218, never above 0x218; a full-word write only */
+static int atu_ok(uint32_t off, uint32_t v, int r1ok)
 {
 	return (off == 0x000u && (v == 0x4u || v == 0u)) || (off == 0x004u && (v == 0x80000000u || v == 0u)) || (off == 0x008u && (v == (uint32_t)WLAN_CFG || v == 0u)) ||
-	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u);
+	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u) ||
+	       (off == 0x204u && (v == 0u || (v == 0x80000000u && r1ok))) || (off == 0x208u && (v == 0x60000000u || v == 0u)) || (off == 0x210u && (v == 0x6000FFFFu || v == 0xfffu)) || (off == 0x214u && (v == 0x60000000u || v == 0u));
 }
 
-/* v may differ from old only inside mask; pa must be inside one of the seven writable windows, with the per-block rules. */
-static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
+/* Endpoint config through the CFG window. S29 (research 36): Command 0x04 takes exactly 0 (from any state) or 0x2 = MEM only (never MASTER/IO, no status bits) and only from Command low half 0 with BAR0 low
+ * at the S28 assignment; PCI_BAR0_WIN 0x80 takes 0x18001000 in a TEARDOWN row from any state (the restore of the observed original) and in a forward row only from 0x18126000 (S34, see below), 0x18000000 only from 0x18001000 (S29), or in a TEARDOWN row also from 0x18105000 / 0x18000000 (the S32 restore), or 0x18105000 (S32, research 37
+ * s.9.1: the EROM page observed in run w3a-n31) only from 0x18000000 in a forward row while Command reads MEM-only and BAR0 low holds the S28 assignment; S33 (research 38): the chain 0x18105000 -> 0x18012000 (PMU) -> 0x18120000 (ARM CA7 wrapper) -> 0x18126000 (SYS_MEM wrapper)
+ * -> 0x18026000 (SYS_MEM core), each only from its predecessor in a forward row (same Command / BAR0 state), and the teardown restore to 0x18000000 from any of them; S34-S36 (research 40 s.5): the chain after the S33 trim 0x18126000 -> 0x18001000 (PCIe core page, powerctl)
+ * -> 0x18126000 -> 0x18026000 -> 0x18120000 (ARM CA7 wrapper), each only from its predecessor, in a forward row (0x18001000 is also the teardown's observed original, from any state); nothing else (never 0x88, never 0x20-0x24).
+ * S28 (research 33): the BARs 0x10/0x14/0x18/0x1C, a full-word write, and only these transitions: the observed original (low 0x4, high 0)
+ * from ANY state (the restore, even if Command is not 0); otherwise Command (cmd) must have MEM/IO decode off, and all ones only from the original, the assigned address only for the low half and only from
+ * the original. Linux sizes with decode off too (probe.c:188-191). */
+static int cfg_ok(uint32_t off, uint32_t old, uint32_t v, const struct w32_ctx *c)
+{
+	int lo = (off == 0x10u || off == 0x18u), hi = (off == 0x14u || off == 0x1cu);
+
+	if (off == 0x04u)
+		return v == 0u || (v == 0x2u && (old & 0xFFFFu) == 0u && c->bar0 == 0x60000004u);
+	if (off == 0x80u)
+		return (v == 0x18001000u && (c->tear || (old == 0x18126000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u))) ||
+		       (v == 0x18000000u && (old == 0x18001000u || (c->tear && (old == 0x18105000u || old == 0x18000000u || old == 0x18012000u || old == 0x18120000u || old == 0x18126000u || old == 0x18026000u)))) ||
+		       (v == 0x18105000u && !c->tear && old == 0x18000000u && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u) ||
+		       (!c->tear && (c->cmd & 0xFFFFu) == 0x0002u && c->bar0 == 0x60000004u &&
+			((v == 0x18012000u && old == 0x18105000u) || (v == 0x18120000u && old == 0x18012000u) || (v == 0x18126000u && old == 0x18120000u) || (v == 0x18126000u && old == 0x18001000u) ||
+			 (v == 0x18026000u && old == 0x18126000u) || (v == 0x18120000u && old == 0x18026000u)));
+	if (!lo && !hi)
+		return 0;
+	if (v == (lo ? 0x4u : 0u))
+		return 1;
+	if ((c->cmd & 0xFFFFu) != 0u)
+		return 0;
+	if (v == 0xFFFFFFFFu)
+		return old == (lo ? 0x4u : 0u);
+	return lo && old == 0x4u && v == (off == 0x10u ? 0x60000004u : 0x60400004u);
+}
+
+/* v may differ from old only inside mask; pa must be inside one of the writable windows, with the per-block rules. c = the live state (ctx_read). */
+static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v, const struct w32_ctx *c)
 {
 	if (((old ^ v) & ~mask) != 0u)
 		return 0;
@@ -251,8 +369,32 @@ static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
 	if (pa == WLAN_DBI + 0x890u)
 		return 1;
 	if (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000u)
-		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v);
+		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v, c->r1ok);
+	if (pa >= WLAN_CFG && pa < WLAN_CFG + 0x1000u)
+		return mask == 0xFFFFFFFFu && cfg_ok((uint32_t)(pa - WLAN_CFG), old, v, c);
+	if (pa >= WLAN_MEM && pa < WLAN_MEM + 0x1000u)
+		return !c->tear && memw_ok(c->win, (uint32_t)(pa - WLAN_MEM), old, v, c->pred);
 	return 0;
+}
+
+/* The guarded reads behind the stateful rules. CFG rows: Command (0xFFFF = unreadable: only the restores pass) and BAR0 low (0xFFFFFFFF = unreadable); ATU rows: region 1 base / limit / target. Other blocks read nothing. */
+__attribute__((noipa)) static void ctx_read(unsigned blk, struct w32_ctx *c)
+{
+	uint32_t lb = 0, lim = 0, lt = 0, cr1 = 1, ub = 1, ut = 1;
+
+	c->cmd = 0xFFFFu;
+	c->bar0 = 0xFFFFFFFFu;
+	c->r1ok = 0;
+	if (blk == WLB_CFG) {
+		if (!try_read32(WLAN_CFG + 4u, &c->cmd))
+			c->cmd = 0xFFFFu;
+		if (!try_read32(WLAN_CFG + 0x10u, &c->bar0))
+			c->bar0 = 0xFFFFFFFFu;
+	}
+	if (blk == WLB_ATU)
+		c->r1ok = try_read32(WLAN_ATU + 0x208u, &lb) && try_read32(WLAN_ATU + 0x210u, &lim) && try_read32(WLAN_ATU + 0x214u, &lt) && lb == 0x60000000u && lim == 0x6000FFFFu && lt == 0x60000000u &&
+			  /* review 10 L2: CR1 (TYPE = MEM), UPPER_BASE and UPPER_TARGET must be 0 too (observed 0 at reset, n28c R27 rows 343/346/349) */
+			  try_read32(WLAN_ATU + 0x200u, &cr1) && try_read32(WLAN_ATU + 0x20Cu, &ub) && try_read32(WLAN_ATU + 0x218u, &ut) && cr1 == 0u && ub == 0u && ut == 0u;
 }
 
 /* The ONLY writer: the row (kind, block, offset, mask, value) comes from the const table by index; GPIO / RMW rows read-modify-write the masked bits, full writes just write. noipa +
@@ -262,6 +404,7 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 	struct wlan_row r;
 	uintptr_t pa;
 	uint32_t old = 0, v;
+	struct w32_ctx c;
 
 	if (!get_row(idx, tear, &r))
 		return -2;
@@ -271,16 +414,27 @@ __attribute__((noipa)) static int w32(unsigned idx, int tear)
 		return -2;
 	if (r.kind == WLK_MMIO_WRITE && r.mask != 0xFFFFFFFFu)	/* a full write has no old value to check the mask rule against: only whole-word rows */
 		return -2;
+	if (!w32_blk_ok(r.blk, r.off))
+		return -2;
 	pa = pa_of(r.blk, r.off);
 	if (!pa)
 		return -2;
-	if (r.kind == WLK_MMIO_WRITE) {
+	if (r.blk == WLB_MEM || (r.kind == WLK_MMIO_WRITE && r.blk != WLB_CFG)) {	/* BAR0: the old value comes below, through r32 (guarded), never from a raw read */
 		old = r.val;
-	} else if (!try_read32(pa, &old)) {
+	} else if (!try_read32(pa, &old)) {		/* CFG writes check the real old value (BAR transitions) */
 		return -1;
 	}
+	ctx_read(r.blk, &c);
+	c.tear = tear;				/* Command / BAR0 (CFG rows) or region 1 (ATU rows); unreadable = not ready, only the restores pass */
+	c.win = c.pred = 0u;
+	if (r.blk == WLB_MEM) {			/* research 40 s.5: the live window select, the live old value and the live companion register, all by r32 (region 1, Command and mem_ok guards); an unreadable or off-list word refuses, nothing written */
+		uint32_t pr = memw_pred(r.off);
+
+		if (tear || !try_read32(WLAN_CFG + 0x80u, &c.win) || !r32(WLB_MEM, r.off, &old) || (pr != 0xFFFFFFFFu && !r32(WLB_MEM, pr, &c.pred)))
+			return -2;
+	}
 	v = (old & ~r.mask) | (r.val & r.mask);
-	if (!w32_allowed(pa, r.mask, old, v))
+	if (!w32_allowed(pa, r.mask, old, v, &c))
 		return -2;
 	return try_write32(pa, v) ? 0 : -1;
 }
@@ -338,8 +492,14 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 		*rd = v;
 		if (r.a == 1u)
 			*probed |= need_probe(r.blk);
-		if (r.a == 2u)		/* log flag (a = 2: a non-probe row whose value is printed) */
+		if (r.a & 2u)		/* log flag (a & 2: a non-probe row whose value is printed) */
 			step_line('R', r.step, "", 1, idx, 1, v, 0, 0);
+		if (r.a & 4u) {		/* EROM dump row (a & 4): the EOT dword 0xF (observed run w3a-n32: 0-based dword 217, offset 0x364, row 637) ends the dump, wlan_link_run skips the later dump rows; the last row (a & 8) must have seen it, else refused */
+			if (v == 0xFu)
+				*probed |= EOT_SEEN;
+			else if (r.a & 8u)
+				return ST_REFUSED;
+		}
 		return ST_OK;
 	}
 	if (r.kind == WLK_WAIT_EQ || r.kind == WLK_WAIT_MASK) {
@@ -407,6 +567,8 @@ int wlan_link_run(void)
 		for (i = 0; i < WLAN_SEQ_NROWS; i++) {
 			if (!get_row(i, 0, &r) || r.step != s)
 				continue;
+			if ((probed & EOT_SEEN) && r.kind == WLK_READ_ONLY && (r.a & 4u))
+				continue;		/* after the EOT no further EROM dword is read (reads past it hanging the phone is a GUESS and unlikely: run w3a-n32 was most likely the host --timeout 600 expiring, last usb line at fboot+596 s; review 14 H1) */
 			st = run_row(i, 0, &probed, &rd);
 			if (st != ST_OK) {
 				stopped = st;
