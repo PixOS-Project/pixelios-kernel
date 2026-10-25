@@ -1,10 +1,10 @@
-/* Render the console layout on the host: ./out/host_test && view out/host.ppm */
+/* Render the console layout on the host: ./out/host_test out/host.ppm && view out/host.ppm (no argument: render, write nothing) */
 #include <stdio.h>
 #include "console.h"
 
 static uint32_t host_fb[FB_H * FB_STRIDE / 4];
 
-int main(void)
+int main(int argc, char **argv)
 {
 	con_fb = host_fb;
 	con_clear(RED);
@@ -15,7 +15,8 @@ int main(void)
 	con_clear(BLUE);
 	con_str("PANIC", "sync exception");
 	con_hex("ESR", 0x96000010);
-	FILE *f = fopen("out/host.ppm", "wb");
+	FILE *f = argc > 1 ? fopen(argv[1], "wb") : NULL;
+	if (!f) return 0;	/* no path given (the gate reruns it): nothing shared is written */
 	fprintf(f, "P6 %d %d 255\n", FB_W, FB_H);
 	for (int i = 0; i < FB_W * FB_H; i++) {
 		unsigned char px[3] = { host_fb[i] >> 16, host_fb[i] >> 8, host_fb[i] };

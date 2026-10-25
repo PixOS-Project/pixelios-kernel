@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index d437d4d..45bcccf 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -28,6 +28,13 @@
+ extern "C" void proc_selfname(char *buf, int size);
+ #include "SweetSurface.h"
+ #include "../../../bsd/dev/sweet_mali.h"
++#include <libkern/OSAtomic.h>
++/* gputest15: CoreAnimation makes ~100 000 GPU calls per run, one console line each (printf also goes to the screen and the USB log) slowed the phone and hid the GUI:
++ * the first 64 lines of the run are kept, later lines only when a call fails. */
++static volatile SInt32 sm_uc_log_n;
++#define SM_UC_LOG(...) do { if (OSIncrementAtomic(&sm_uc_log_n) < 64) { printf(__VA_ARGS__); } } while (0)
++#define SM_UC_ERR(...) printf(__VA_ARGS__)
++
+ 
+ extern "C" void flush_dcache64(addr64_t, unsigned, int);
+ extern "C" uint64_t gPhysBase;               /* gputest3: panic phystokv_range in IOConnectMapMemory64 -> print the bounds phystokv uses */
+@@ -251,9 +258,9 @@ SweetMaliUserClient::mapMemory(IOMemoryDescriptor *md, uint64_t len, uint32_t fl
+ 	}
+ 	uint64_t gva = 0;
+ 	if (ret == kIOReturnSuccess) {
+-		printf("SWEET MALI: uc map n=%u pa0=%#llx gPhysBase=%#llx real_phys_size=%#lx\n", n, pa[0], gPhysBase, real_phys_size);       /* gputest2 hung after the query: log each step */
++		SM_UC_LOG("SWEET MALI: uc map n=%u pa0=%#llx gPhysBase=%#llx real_phys_size=%#lx\n", n, pa[0], gPhysBase, real_phys_size);       /* gputest2 hung after the query: log each step */
+ 		ret = errno_to_ioreturn(sweet_mali_map(pa, n, flags, &gva));
+-		printf("SWEET MALI: uc map -> %#x va=%#llx\n", ret, gva);
++		SM_UC_LOG("SWEET MALI: uc map -> %#x va=%#llx\n", ret, gva);
+ 	}
+ 	IOFreeData(pa, n * sizeof(uint64_t));
+ 	if (ret != kIOReturnSuccess) {
+@@ -394,7 +401,7 @@ SweetMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOM
+ 	IOReturn ret = kIOReturnNotFound;
+ 
+ 	IOLockLock(fLock);
+-	printf("SWEET MALI: uc clientMemoryForType %u\n", (unsigned)type);
++	SM_UC_LOG("SWEET MALI: uc clientMemoryForType %u\n", (unsigned)type);
+ 	if (type >= 1 && type <= SWEET_MALI_MAX_BOS && fBo[type - 1].md != NULL) {
+ 		fBo[type - 1].md->retain();
+ 		*memory = fBo[type - 1].md;
+@@ -450,9 +457,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			if (!owns(args->scalarInput[0])) {
+ 				ret = kIOReturnNotPermitted;
+ 			} else {
+-				printf("SWEET MALI: uc submit va=%#llx\n", args->scalarInput[0]);
++				SM_UC_LOG("SWEET MALI: uc submit va=%#llx\n", args->scalarInput[0]);
+ 				ret = errno_to_ioreturn(sweet_mali_submit(args->scalarInput[0], (uint32_t)args->scalarInput[1] & SWEET_MALI_REQ_FS, &seq));
+-				printf("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq);
++				if (ret != 0) { SM_UC_ERR("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); } else { SM_UC_LOG("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); }
+ 				if (ret == kIOReturnSuccess) {
+ 					fLastSeq = seq;
+ 					args->scalarOutput[0] = seq;
+@@ -465,9 +472,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	case 4:                         /* wait (no client lock held: other threads may keep working) */
+ 		if (args->scalarInputCount == 2) {
+ 			uint64_t to = args->scalarInput[1] > 60000000ull ? 60000000ull : args->scalarInput[1];
+-			printf("SWEET MALI: uc wait seq=%llu to=%llu us\n", args->scalarInput[0], to);
++			SM_UC_LOG("SWEET MALI: uc wait seq=%llu to=%llu us\n", args->scalarInput[0], to);
+ 			ret = errno_to_ioreturn(sweet_mali_wait(args->scalarInput[0], to));
+-			printf("SWEET MALI: uc wait -> %#x\n", ret);
++			if (ret != 0) { SM_UC_ERR("SWEET MALI: uc wait -> %#x\n", ret); } else { SM_UC_LOG("SWEET MALI: uc wait -> %#x\n", ret); }
+ 		}
+ 		break;
+ 	case 5:                         /* importSurface */

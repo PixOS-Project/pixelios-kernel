@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include "out/sweet_keys_gs101_debounce.h"
+#include "sweet_keys_gs101_debounce.h"
 
 static int feed(struct keys_deb *d, const char *s, unsigned need, int *events)
 {

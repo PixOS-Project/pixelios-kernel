@@ -24,8 +24,8 @@ firmware into prompts or commits. See [docs/AI_DEVELOPMENT.md](docs/AI_DEVELOPME
 ## Getting started
 
 1. Read [README.md](README.md), [docs/STATUS.md](https://github.com/PixOS-Project/pixelios-site/blob/main/docs/STATUS.md) and [ROADMAP.md](ROADMAP.md) to see what exists and what is wanted.
-2. Set up: `tools/setup-upstream.sh`, then the build steps in [docs/BUILD.md](docs/BUILD.md). Run `tools/check-all.sh` before you push; it must print `GATE PASS`.
-3. Kernel changes are numbered patches in `xnu/patches/` (contiguous, applied in order on xnu-8796). Never edit the fetched upstream tree; add or regenerate a patch.
+2. Set up: the build steps in [docs/BUILD.md](docs/BUILD.md). Run `tools/check-all.sh` before you push; it must print `GATE PASS`.
+3. Kernel changes are numbered patches in `xnu/patches/` (contiguous, applied in order on xnu-8796). Never edit the xnu tree; add or regenerate a patch.
    `tools/stack-apply` checks that the stack applies on pristine xnu-8796.
 4. Prefer changing a table (`soc/*/soc.json`, `device/*/*/board.json`) over copying constants into code, and cite the source of every hardware constant
    (Linux driver at a commit, bootloader decompile, or a measured register dump). Do not invent values.

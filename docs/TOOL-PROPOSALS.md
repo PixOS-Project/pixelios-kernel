@@ -13,6 +13,11 @@ Rules:
    to its index line. If that proposal is `done`, the new idea is a new file with `extends: TP-NNN`.
 3. Next id = highest existing + 1. File name = `TP-NNN-<slug>.md`.
 4. Never rewrite someone else's proposal except `status`/`refs` (driver) and `amendments` (anyone).
+5. Anti-spam: a new file needs the same manual step done 2+ times with a measured cost (first occurrence = a line in the super repo `docs/ANTIPATTERNS.md`).
+   At most 3 open (`proposed`) proposals; a 4th must supersede or replace one.
+6. Expiry: a `proposed` entry with no decision after 14 days becomes `rejected (stale)` at housekeeping; revive it only with a new reason.
+7. Housekeeping (driver, at each handoff): `tools/tool-proposals prune` (TP-017) lists stale proposals and `done` tools unused for 30 days;
+   deletions need the user's approval.
 
 Status values: proposed, approved, building, done, rejected, superseded.
 
@@ -34,5 +39,19 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-012 | tools/xrun --burst-on REGEX | rejected (amended) |
 | TP-013 | tools/mg-key NAME... [--dsc CACHE] | done (amended) |
 | TP-014 | tools/lint-c | done (amended) |
-| TP-015 | tools/probe-run-timeout | proposed (amended) |
+| TP-015 | tools/probe-run-timeout | done (amended) |
 | TP-016 | tools/phone-lock | done |
+| TP-017 | tools/tool-proposals prune | done |
+| TP-018 | tools/phone | proposed |
+| TP-019 | tools/check-site | done |
+| TP-020 | tools/phone-lock | done (amended) |
+| TP-021 | tools/tools-sync | done |
+| TP-022 | tools/patch-numbers | done (amended) |
+| TP-023 | tools/runs | done |
+| TP-024 | tools/run-preflight | done |
+| TP-025 | tools/fflash-userdata.sh --sparse | approved (amended) |
+| TP-026 | QEMU runner --smoke (runner removed in standalone T2) | rejected (amended) |
+| TP-027 | tools/devsh + org.pixelios.devd | approved (amended) |
+| TP-028 | tools/check-all.sh (gate speed + reliability) | approved (amended) |
+| TP-029 | tools/physmem-dev (range-guarded phys-mem device + client over TP-027 devsh) | proposed (amended) |
+| TP-030 | tools/check_rules/r30_license.py (rule R30 of tools/check-rules.py) | building |

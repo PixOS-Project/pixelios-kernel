@@ -10,12 +10,13 @@
 # USB_WINDOW=90 (see shim/build.sh).
 set -u
 board=${BOARD:-bluejay}	# device codename the safety checks expect (tools/pix devices)
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 img=${1:?usage: tools/run-probe.sh IMAGE [CAPTURE_SECONDS]}
 secs=${2:-300}
 mkdir -p logs
 die() { echo "run-probe: $*" >&2; exit 1; }
 [ -f "$img" ] || die "no such image: $img"
+"$(dirname "$0")/phone-lock" check >&2 || die "the phone lock is not held by you: run this under tools/phone-lock run --owner NAME -- tools/run-probe.sh ..."
 
 if [ "$(adb get-state 2>/dev/null)" = device ]; then
 	[ "$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = "$board" ] || die "adb device is not $board"

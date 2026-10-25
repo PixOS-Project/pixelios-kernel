@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 14a51de..cb59e33 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -25,6 +25,8 @@
+ 
+ extern void flush_dcache64(addr64_t, unsigned, int);
+ extern vm_offset_t kvtophys(vm_offset_t);
++extern unsigned long gPhysBase;
++extern boolean_t pmap_valid_page(ppnum_t);
+ extern int sweet_gpu_precheck(volatile uint32_t *g, int s2mpu_open, const char **why);   /* bsd/dev/sweet_gpu_job.c */
+ extern int sweet_gpu_power_on(volatile uint32_t *g);
+ 
+@@ -348,6 +350,11 @@ sweet_mali_map(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_o
+ 		if ((pa16k[i] & (PAGE_SIZE - 1)) || pa16k[i] >= (1ull << 40)) {
+ 			return EINVAL;
+ 		}
++		/* gputest2: flush_dcache64 on a PA outside the kernel's managed RAM panicked (phystokv_range: illegal PA 0x573d...), so every PA is checked before any flush or page table write */
++		if (!pmap_valid_page((ppnum_t)(pa16k[i] >> PAGE_SHIFT))) {
++			printf("SWEET MALI: map refused, PA %#llx (page %u of %u) is not managed RAM (gPhysBase=%#lx)\n", (unsigned long long)pa16k[i], i, n, gPhysBase);
++			return EFAULT;
++		}
+ 	}
+ 	lck_mtx_lock(&sm_lock);
+ 	va = mali_va_alloc(&sm.va, n * 4u, 4u);

@@ -1,8 +1,8 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -139,6 +139,47 @@
+@@ -134,6 +134,47 @@
  
- OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
 +/*
 + * configd's InterfaceNamer (the "network stack" part of SCNetworkInterfaceCopyAll, which Settings -> About calls on the main
@@ -48,10 +48,10 @@
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
  
-@@ -221,6 +262,12 @@
- 		es->registerService();
+@@ -223,6 +264,12 @@
+ 		}
  	}
- 	OSSafeReleaseNULL(es);
+ 
 +	IONetworkStack *ns = OSTypeAlloc(IONetworkStack);
 +	if (ns != NULL && ns->init() && ns->attach(IOService::getServiceRoot())) {
 +		ns->setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");

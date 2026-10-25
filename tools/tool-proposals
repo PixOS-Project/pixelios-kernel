@@ -5,6 +5,8 @@
   tools/tool-proposals check NAME_OR_KEYWORD exists in tools/, tools/pix, docs/AUTOMATION.md, or already proposed?
   tools/tool-proposals new NAME [--extends X] [--related TP-NNN] [--force]
                                              write the next free TP-NNN-slug.md (does not edit the index)
+  tools/tool-proposals prune [--stale-days 14] [--unused-days 30]
+                                             read-only: stale `proposed` entries, unused `done` tools (TP-017)
   tools/tool-proposals validate              front matter, sections, ids, references, README index in sync
 
 check: last line `RESULT: EXISTS|ALREADY-PROPOSED|NONE ...`, exit 0 NONE / 1 hit / 2 error.
@@ -280,8 +282,56 @@ def cmd_validate(a):
     return 1 if bad else 0
 
 
+def _last_use(rel):
+    """Newest of: last commit touching the tool file, mtime of any file under logs/ that mentions its name (epoch, 0 = never)."""
+    import subprocess
+    t = 0
+    r = subprocess.run(["git", "-C", ROOT, "log", "-1", "--format=%ct", "--", rel], capture_output=True, text=True)
+    if r.stdout.strip():
+        t = int(r.stdout)
+    logs = os.path.join(ROOT, "logs")
+    if os.path.isdir(logs):
+        r = subprocess.run(["grep", "-rlF", "--", os.path.basename(rel), logs], capture_output=True, text=True)
+        for f in r.stdout.split("\n"):
+            if f:
+                t = max(t, int(os.path.getmtime(f)))
+    return t
+
+
+def cmd_prune(args):
+    import time
+    stale, unused = 14, 30
+    while args:
+        k = args.pop(0)
+        if k == "--stale-days" and args:
+            stale = int(args.pop(0))
+        elif k == "--unused-days" and args:
+            unused = int(args.pop(0))
+        else:
+            raise Err("unknown arg " + k)
+    now, hits = time.time(), 0
+    for f, fm, body, err in load():
+        if err:
+            continue
+        if fm.get("status") == "proposed":
+            age = (now - datetime.datetime.strptime(fm["date"], "%Y-%m-%d").timestamp()) / 86400
+            if age > stale:
+                print("STALE %s %s proposed %d days ago -> rejected (stale)?" % (fm["id"], fm["tool"], age))
+                hits += 1
+        elif fm.get("status") == "done":
+            m = re.match(r"tools/[\w./-]+", fm["tool"])
+            if m and os.path.exists(os.path.join(ROOT, m.group(0))):
+                t = _last_use(m.group(0))
+                if (now - t) / 86400 > unused:
+                    print("UNUSED %s %s last use %s -> delete?" % (fm["id"], m.group(0),
+                          time.strftime("%Y-%m-%d", time.localtime(t)) if t else "never"))
+                    hits += 1
+    print("RESULT: %s %d candidates (user approves any deletion)" % ("PARTIAL" if hits else "PASS", hits))
+    return 1 if hits else 0
+
+
 def main(argv):
-    cmds = {"list": cmd_list, "check": cmd_check, "new": cmd_new, "validate": cmd_validate}
+    cmds = {"list": cmd_list, "check": cmd_check, "new": cmd_new, "validate": cmd_validate, "prune": cmd_prune}
     if not argv or argv[0] not in cmds:
         sys.stderr.write(__doc__)
         return 2

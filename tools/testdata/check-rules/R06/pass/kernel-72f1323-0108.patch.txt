@@ -1,0 +1,14 @@
+# fixture source: K 72f1323 xnu/patches/0108-pmap-sync-page-attributes-64bit-pa.patch
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..27709c8 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,7 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);   /* pp is a 32-bit ppnum_t: pp << PAGE_SHIFT wrapped for PA >= 4 GB (phystokv_range panic, gputest2/3) */
+ }
+ 
+ #if CONFIG_COREDUMP

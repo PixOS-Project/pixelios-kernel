@@ -587,10 +587,27 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 		pstore_save();
 	}
 #endif
+#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)
+	/* --boot-xnu --gpu-handover: switch the shader rail BUCK2S on (audited ACPM writer, gpurailon.c: zero writes unless it reads exactly off with OUT1 in the
+	 * window) and LEAVE it on for XNU, which has no ACPM client (docs/research/30; patch 0103 powers the cores through the GPU registers, 0102 only reads).
+	 * A refusal is logged and XNU boots anyway; an UNVERIFIED or MISMATCH result is put back (gpurailon.h, review M1); a verified rail stays on. */
+	int gpu_ho;
+
+	con_str("SECTION", "GPU handover (rail on, left on)");
+	gpu_ho = gpu_rail_enable();
+	con_hex("GPU handover rail (0=on)", (uint32_t)gpu_ho);
+	if (gpu_ho == RAIL_UNVERIFIED || gpu_ho == RAIL_MISMATCH)
+		gpu_rail_restore(gpu_ho, RAIL_POWER_NONE);
+	pstore_save();
+#endif
 	{
 		const char *why = loader_boot(dtb);
 		con_str("BOOT XNU failed", why ? why : "?");
 		pstore_save();
+#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)
+		if (gpu_ho == RAIL_ON_OK)	/* loader_boot returned, XNU is not coming: do not leave the rail on (review L2) */
+			gpu_rail_restore(gpu_ho, RAIL_POWER_NONE);
+#endif
 		delay_ms(3000);
 	}
 #endif
@@ -928,6 +945,7 @@ uint64_t touch_ticks(void)	/* touchprobe.c / gpupower.c: bounded waits (CNTPCT) 
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
+	(void)after_s;	/* unused under --pstore-fast */
 #if SOC_GS101
 #ifdef PSTORE_FAST
 	con_str("RESET", "fast: system reset in ~5s");

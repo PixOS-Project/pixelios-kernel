@@ -1,0 +1,158 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 88a8bfb..da478bd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_keys_gs101.c		standard
+ bsd/dev/sweet_touch_gs101.c		standard
++bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu_gs101.c b/bsd/dev/sweet_gpu_gs101.c
+new file mode 100644
+index 0000000..1735213
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_gs101.c
+@@ -0,0 +1,120 @@
++/*
++ * Read-only Mali-G78 (gs101) probe from inside XNU, boot-arg sweetgpu=<physical base of the GPU block> (0x1C500000 on the Pixel 6a).
++ * Answers docs/research/30 Q1/Q2: does the GPU that ABL powered survive the jump to XNU, and is the G3D S2MPU still open?
++ * Reads only. Gate, as the shim's gpu_gate() (shim/gpuprobe.h): both PMU status words bit0 on, then (CMU_G3D is inside the top domain, so only now)
++ * the three CMU_G3D user muxes at +0x600/+0x610/+0x620 must all have bit 4 set; only then the GPU block is touched. A read of a powered-off or
++ * unclocked block can hang the bus and cannot be caught from here. The base must be exactly 0x1C500000 (the only Mali block, soc.json gpu.mali).
++ * Register offsets: kbase mali_kbase_regmap_jm_enums.h (GPU_CONTROL / JOB_CONTROL / MMU_CONTROL), same set as shim/gpuprobe.c
++ * [read from source, observed readable from EL1 in docs/research/27]. PMU words: soc.json gpu.pmu_g3d_stat / pmu_emb_stat
++ * (0x17461E04 / 0x17462004, flexpmu_cal_local_gs101.h), S2MPU: soc.json gpu.s2mpu_g3d0..3 and docs/research/28 section 6.
++ * Nothing is written.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++
++#define SG_PMU_G3D_STAT   0x17461E04ull
++#define SG_PMU_EMB_STAT   0x17462004ull
++#define SG_MALI_BASE      0x1C500000ull
++#define SG_CMU_G3D        0x1C400000ull
++#define SG_MUX_SELECT     (1u << 4)
++#define SG_S2MPU_N        4u
++static const uint64_t sg_s2mpu[SG_S2MPU_N] = {0x20080000ull, 0x20090000ull, 0x200A0000ull, 0x200B0000ull};
++
++static volatile uint32_t *
++sg_map(uint64_t pa, uint64_t len)
++{
++	const uint64_t page = 0x4000;
++	uint64_t base = pa & ~(page - 1), end = (pa + len + page - 1) & ~(page - 1);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++
++	if (va == 0) {
++		printf("SWEET GPU: ml_io_map(%#llx) failed\n", pa);
++		return NULL;
++	}
++	return (volatile uint32_t *)(va + (vm_offset_t)(pa - base));
++}
++
++static void
++sg_rd(const char *name, volatile uint32_t *base, uint32_t off)
++{
++	printf("SWEET GPU: %s +%#x = %#x\n", name, off, base[off / 4]);
++}
++
++void
++sweet_gpu_gs101_init(void)
++{
++	static int started;
++	uint64_t mali = 0;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (!PE_parse_boot_argn("sweetgpu", &mali, sizeof(mali)) || mali == 0) {
++		return;
++	}
++	volatile uint32_t *pmu_g = sg_map(SG_PMU_G3D_STAT & ~0xFFFull, 0x1000);
++	volatile uint32_t *pmu_e = sg_map(SG_PMU_EMB_STAT & ~0xFFFull, 0x1000);
++	if (pmu_g == NULL || pmu_e == NULL) {
++		return;
++	}
++	uint32_t top = pmu_g[(SG_PMU_G3D_STAT & 0xFFFull) / 4], emb = pmu_e[(SG_PMU_EMB_STAT & 0xFFFull) / 4];
++	printf("SWEET GPU: PMU_G3D_STAT=%#x PMU_EMB_STAT=%#x (mali base %#llx)\n", top, emb, mali);
++	if (!(top & 1u) || !(emb & 1u)) {
++		printf("SWEET GPU: a power domain is off, GPU block not touched\n");
++		return;
++	}
++	if (mali != SG_MALI_BASE) {
++		printf("SWEET GPU: sweetgpu=%#llx refused, the only Mali block is %#llx\n", mali, SG_MALI_BASE);
++		return;
++	}
++	volatile uint32_t *cmu = sg_map(SG_CMU_G3D, 0x1000);
++	if (cmu == NULL) {
++		return;
++	}
++	uint32_t mt = cmu[0x620 / 4], mc = cmu[0x600 / 4], ms = cmu[0x610 / 4];
++	printf("SWEET GPU: CMU_MUX_TOP=%#x CORE=%#x STACK=%#x\n", mt, mc, ms);
++	if (!(mt & mc & ms & SG_MUX_SELECT)) {
++		printf("SWEET GPU: CMU_G3D mux not selected, GPU block not touched\n");
++		return;
++	}
++	volatile uint32_t *g = sg_map(mali, 0x5000);
++	if (g == NULL) {
++		return;
++	}
++	sg_rd("GPU_ID", g, 0x000);
++	sg_rd("L2_FEATURES", g, 0x004);
++	sg_rd("MEM_FEATURES", g, 0x010);
++	sg_rd("MMU_FEATURES", g, 0x014);
++	sg_rd("AS_PRESENT", g, 0x018);
++	sg_rd("JS_PRESENT", g, 0x01c);
++	sg_rd("GPU_IRQ_RAWSTAT", g, 0x020);
++	sg_rd("GPU_STATUS", g, 0x034);
++	sg_rd("GPU_FAULTSTATUS", g, 0x03c);
++	sg_rd("SHADER_PRESENT", g, 0x100);
++	sg_rd("TILER_PRESENT", g, 0x110);
++	sg_rd("L2_PRESENT", g, 0x120);
++	sg_rd("SHADER_READY", g, 0x140);
++	sg_rd("TILER_READY", g, 0x150);
++	sg_rd("L2_READY", g, 0x160);
++	sg_rd("SHADER_PWRTRANS", g, 0x200);
++	sg_rd("TILER_PWRTRANS", g, 0x210);
++	sg_rd("L2_PWRTRANS", g, 0x220);
++	sg_rd("COHERENCY_ENABLE", g, 0x304);
++	sg_rd("JOB_IRQ_RAWSTAT", g, 0x1000);
++	sg_rd("MMU_IRQ_RAWSTAT", g, 0x2000);
++	for (unsigned i = 0; i < SG_S2MPU_N; i++) {
++		volatile uint32_t *s = sg_map(sg_s2mpu[i], 0x4000);
++		if (s != NULL) {
++			printf("SWEET GPU: S2MPU%u CTRL0=%#x FAULT_STATUS=%#x\n", i, s[0], s[0x2000 / 4]);
++		}
++	}
++	printf("SWEET GPU: probe done (read-only)\n");
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 8516f23..af4f163 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
+ extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
+ extern void sweet_touch_gs101_init(void);
++extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -701,6 +702,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	sweet_keys_gs101_start();
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
++	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
+ 	return 0;
+ }
+ 

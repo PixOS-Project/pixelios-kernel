@@ -573,8 +573,8 @@ export MACHINE_CONFIG=SWEET XLB_XNU=$X
 MK=(make SDKROOT=macosx XCRUN="$HB/xcrun" HOST_SDKROOT_RESOLVED=/ HOST_CC="$HB/host-cc" HOST_FLEX="$(command -v flex)" HOST_BISON="$(command -v bison)" HOST_GM4="$(command -v m4)"
 	PLUTIL="$HB/plutil" HOST_CODESIGN="$HB/true-tool" HOST_CODESIGN_ALLOCATE="$HB/true-tool" CC="$HB/xnu-clang" CXX="$HB/xnu-clang++" LOGCOLORS=n
 	BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 SRCROOT="$X" OBJROOT="$OBJ" SYMROOT="$SYM" DSTROOT="$FR" FAKEROOT_DIR="$FR" KDKROOT="$KDKROOT"
-	TIGHTBEAMC=tightbeamc-not-supported RC_DARWIN_KERNEL_VERSION=$RCDK MEMORY_SIZE=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)
-	SYSCTL_HW_PHYSICALCPU=$(nproc) SYSCTL_HW_LOGICALCPU=$(nproc) KERNEL_BUILDS_IN_PARALLEL=1)
+	TIGHTBEAMC=tightbeamc-not-supported RC_DARWIN_KERNEL_VERSION="$RCDK" MEMORY_SIZE="$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)"
+	SYSCTL_HW_PHYSICALCPU="$(nproc)" SYSCTL_HW_LOGICALCPU="$(nproc)" KERNEL_BUILDS_IN_PARALLEL=1)
 
 # ---------------------------------------------------------------- 5. headers, libfirehose_kernel, kernel
 if [ ! -f "$FR/.xnu_headers_installed" ]; then

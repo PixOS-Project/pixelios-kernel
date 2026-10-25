@@ -15,7 +15,17 @@ import calendar, glob, json, os, pathlib, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qrmerge  # noqa: E402
 
-LISTKEYS = ("expect", "expect_absent", "stop_on")
+# kernel patch 0115 (boot-arg sweetlogts=1) prefixes every console line with "[SSSSS.mmm] " (raw timer seconds, i.e. including ABL + shim time): match on the text without it,
+# keep the stamp for the report (merged.log stays raw)
+KTS = re.compile(r"^\[([ 0-9]{4}[0-9])\.([0-9]{3})\] ")
+
+
+def kstamp(line):
+    m = KTS.match(line)
+    return int(m.group(1)) + int(m.group(2)) / 1000.0 if m else None
+
+
+LISTKEYS = ("expect", "expect_absent", "stop_on", "fail_on")
 BLACK = 25          # mean luma (0-255) under which a camera frame counts as a black screen
 EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 1, "ERROR": 2}
 # label -> regex. Counted over the merged log; the first matching line is shown. (touch/keys/cpu lines are listed separately.)
@@ -86,6 +96,17 @@ def usb_present(vid="18d1"):
     return False
 
 
+def usb_ids(vid="18d1"):
+    """vid:pid of the first Google USB device on the bus (18d1:4ee0 = fastboot, 18d1:d001 = recovery), or ''"""
+    for p in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            if pathlib.Path(p).read_text().strip() == vid:
+                return "%s:%s" % (vid, pathlib.Path(p).with_name("idProduct").read_text().strip())
+        except OSError:
+            pass
+    return ""
+
+
 def stop_seen(d, pats):
     """True when every regex in pats occurs in the merged QR snapshots + usbnet log of run dir d (live early-stop check)."""
     snaps = sorted(glob.glob(os.path.join(d, "snaps", "qr-*.txt")))
@@ -102,27 +123,54 @@ def waitusb(d):
     end = t0 + float(run.get("duration", 180))
     hard = float(run["t_start"]) + float(run["hard_timeout"]) if run.get("hard_timeout") and run.get("t_start") else None
     stop = run.get("stop_on", [])
+    fails = run.get("fail_on", [])   # any one of these ends the run at once (a failing run must not wait out the restart window)
     expect_reset = bool(run.get("restart"))
     gone = None
     nxt = 0
     while now() < min(end, hard or end):
         if usb_present():
             if gone is not None:
-                mark(d, ["usb_back=%f" % now()])
+                mark(d, ["usb_back=%f" % now(), "usb_back_id=%s" % usb_ids()])
                 print("DONE")
                 return
         elif gone is None:
             gone = now()
             mark(d, ["usb_gone=%f" % gone])
-        if stop and now() >= nxt:
+        if (stop or fails) and now() >= nxt:
             nxt = now() + 10
-            if stop_seen(d, stop):
+            hit = next((p for p in fails if stop_seen(d, [p])), None)
+            if hit:
+                mark(d, ["early=%f" % now(), "t_end=%f" % now(), "early_fail=%s" % hit])
+                print("EARLY")
+                return
+            if stop and stop_seen(d, stop):
                 mark(d, ["early=%f" % now(), "t_end=%f" % now()])
                 print("EARLY")
                 return
         time.sleep(1 if expect_reset else 5)
-    mark(d, ["t_end=%f" % now()] + (["timeout=1"] if hard and now() >= hard else []))
-    print("TIMEOUT" if hard and now() >= hard else "DONE")
+    timed_out = bool(hard and now() >= hard)
+    if run.get("remote") and not timed_out and gone is not None and not usb_present():
+        # B1 as the default end: --duration is up, the phone still runs iOS: the caller sends the software reset (xrun EARLY branch)
+        mark(d, ["early=%f" % now(), "t_end=%f" % now(), "host_end=1"])
+        print("EARLY")
+        return
+    m = re.match(r"\d+", str(run.get("restart") or ""))
+    reset_due = bool(m) and now() - t0 >= float(m.group(0))
+    if timed_out and gone is not None and reset_due:
+        # the reset was due but the phone is not back yet when the hard timeout cuts the wait (it returns in recovery after ~30 s or more): short grace window.
+        # usb_gone is when the phone left fastboot for XNU (+2 s), not proof that the reset fired.
+        try:
+            grace = float(os.environ.get("XRUN_GRACE") or 90)
+        except ValueError:
+            grace = 90.0
+        grace_end = now() + grace
+        while now() < grace_end:
+            if usb_present():
+                mark(d, ["usb_back=%f" % now(), "late_back=1", "usb_back_id=%s" % usb_ids()])
+                break
+            time.sleep(1)
+    mark(d, ["t_end=%f" % now()] + (["timeout=1"] if timed_out else []))
+    print("TIMEOUT" if timed_out else "DONE")
 
 
 def prune(d):
@@ -291,6 +339,8 @@ def build(d, stop_on=None):
         from_boot = True        # guess: the live stream replays the last 64 KiB at link-up and then every line; UDP may drop datagrams
     else:
         ltime = [times[x] if x is not None and times else None for x in sidx]
+    rawlines = lines
+    lines = [KTS.sub("", x, count=1) for x in lines]
     tl = lambda i: ltime[i] - t0 if ltime[i] is not None and t0 else None     # seconds after the boot command
 
     def find(rx):
@@ -310,6 +360,8 @@ def build(d, stop_on=None):
                 lines = lines[:last + 1]
             full = float(run.get("duration") or 0)
             early_txt = "stopped at %s (full run would have waited %ds)" % (at(st), full)
+    if run.get("host_end") and run.get("early"):
+        early_txt = "ended by the host at +%ds (--duration), software reset" % (float(run["early"]) - t0 if t0 else 0)
     if stop and run.get("replay_stop") and not early_txt:
         early_txt = "NOT reached: stop pattern(s) never all seen, a live run would have waited the full %ds" % float(run.get("duration") or 0)
     # EXPECT
@@ -325,7 +377,7 @@ def build(d, stop_on=None):
     markers = {}
     for lab, rx in MARKERS:
         h = find(rx)
-        markers[lab] = {"count": len(h), "first": cut(lines[h[0]]) if h else None, "t": tl(h[0]) if h else None}
+        markers[lab] = {"count": len(h), "first": cut(lines[h[0]]) if h else None, "t": tl(h[0]) if h else None, "k": kstamp(rawlines[h[0]]) if h else None}
     swaps = [int(m.group(1)) for ln in lines for m in [re.match(r"SWEET FB: swap (\d+)", ln)] if m]
     markers["FB swaps (max n)"] = {"count": max(swaps) if swaps else 0, "first": None, "t": None}
     listed = {lab: [cut(lines[i]) for i in find(rx)[:cap]] for lab, rx, cap in LISTED}
@@ -340,7 +392,15 @@ def build(d, stop_on=None):
     back = f("usb_back")
     reset_at = back - t0 if back and t0 else None
     restart = run.get("restart") or ""
-    reset_txt = ("reset observed at +%ds" % reset_at if reset_at is not None else
+    gone = f("usb_gone")
+    restart_s = float(re.match(r"\d+", restart).group(0)) if re.match(r"\d+", restart) else 0.0
+    # inferred, not observed: the hard timeout ended the wait after the reset was due and the bluejay itself (adb recovery / fastboot product bluejay) is on the bus
+    phone = str(run.get("phone", ""))
+    if (restart and reset_at is None and run.get("timeout") and gone and t0 and (f("t_end") or 0) - t0 >= restart_s
+            and ("adb [recovery]" in phone or "fastboot product [bluejay]" in phone)):
+        reset_at = (f("t_end") or now()) - t0
+        run["late_back"] = "1"
+    reset_txt = (("reset inferred at ~+%ds (the phone is in recovery/fastboot; its re-enumeration was not seen)" % reset_at if run.get("late_back") else "reset observed at +%ds%s" % (reset_at, " (back as %s)" % {"18d1:4ee0": "fastboot"}.get(run.get("usb_back_id"), run.get("usb_back_id")) if run.get("usb_back_id") else "")) if reset_at is not None else
                  ("reset NOT observed (waited %ds; the sweetrestart did not fire or the phone hung)" % (waited or 0)) if restart
                  else "no --restart (no reset expected)")
     qr_t = first_snap_t - t0 if first_snap_t and t0 else None
@@ -359,8 +419,13 @@ def build(d, stop_on=None):
         result, reason = "ERROR", run["error"]
     elif markers["panic/hang/watchdog"]["count"]:
         result, reason = "FAIL", "panic/hang/watchdog line in the log: %s" % cut(markers["panic/hang/watchdog"]["first"], 80)
+    elif run.get("early_fail"):
+        result, reason = "FAIL", "stopped early on a failure pattern (%s) at +%ds; the full run would have waited %ss" % (cut(str(run["early_fail"]), 60), waited or 0, run.get("duration"))
+    elif restart and reset_at is None and run.get("timeout") and waited is not None and waited < restart_s and not (early_txt and not early_txt.startswith("NOT")):
+        result, reason = "PARTIAL", "hard timeout after %ds, before the reset was due (restart %ds): the reset was not awaited%s" % (waited, restart_s, "; %d expectation(s) missing" % len(bad) if bad else "")
     elif restart and reset_at is None and not (early_txt and not early_txt.startswith("NOT")):
-        result, reason = "FAIL", "%ssweetrestart did not fire: phone never re-appeared on USB within %ds" % ("HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
+        result, reason = "FAIL", "%ssweetrestart did not fire or the phone hung: it never re-appeared on USB within %ds (check tools/phone-state before asking for a button hold)" % (
+            "HARD TIMEOUT: " if run.get("timeout") else "", waited or 0)
     elif bad:
         what = "%d of %d expectations failed (first: %s%s)" % (len(bad), len(exp), "absent-violated " if bad[0]["absent"] else "missing ", cut(bad[0]["regex"], 50))
         if incomplete and not all(b["absent"] for b in bad):
@@ -420,7 +485,7 @@ def render(r):
     out.append("MARKERS:")
     seen = [(k, v) for k, v in r["markers"].items() if v["count"]]
     for k, v in seen:
-        out.append("  %s: %d%s%s" % (k, v["count"], (" first " + at(v["t"]) if v["t"] is not None else ""), (": " + v["first"]) if v["first"] and k not in ("SpringBoard lines", "backboardd lines") else ""))
+        out.append("  %s: %d%s%s" % (k, v["count"], (" first " + at(v["t"]) if v["t"] is not None else "") + (" [kernel stamp %.3f]" % v["k"] if v.get("k") is not None else ""), (": " + v["first"]) if v["first"] and k not in ("SpringBoard lines", "backboardd lines") else ""))
     out.append("  not seen: " + (", ".join(k for k, v in r["markers"].items() if not v["count"]) or "-"))
     for lab, ls in r["listed"].items():
         if ls:

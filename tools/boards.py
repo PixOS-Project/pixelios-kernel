@@ -402,7 +402,7 @@ def c_header(board: str) -> str:
 
 
 _WLAN_SEQ_KINDS = ("delay", "read_only", "wait_eq", "wait_mask", "gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso")	# enum WLK_* order of the generated header
-_WLAN_SEQ_BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")						# enum WLB_* order
+_WLAN_SEQ_BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG", "MEM")					# enum WLB_* order
 
 
 def wlan_seq_header(board: str) -> str:
@@ -433,7 +433,7 @@ def wlan_seq_render(doc, path="wlan_seq.json") -> str:
             raise ValueError(f"{path}: teardown row {i} is malformed")
 
     def cell(r, step):
-        a = r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0)
+        a = r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0)
         b = r["polls"]
         blk = "WLB_NONE" if r["blk"] is None else "WLB_" + r["blk"]
         return f"\t{{ {step}u, WLK_{r['kind'].upper()}, {blk}, {r['off']:#x}u, {r['mask']:#x}u, {r['value']:#x}u, {a}u, {b}u }},"
@@ -443,7 +443,7 @@ def wlan_seq_render(doc, path="wlan_seq.json") -> str:
            f"#define WLAN_SEQ_DEFAULT_N {int(doc['default_last_step'])}u", "",
            "enum { " + ", ".join(f"WLK_{k.upper()}" for k in _WLAN_SEQ_KINDS) + " };",
            "enum { " + ", ".join(f"WLB_{b}" for b in _WLAN_SEQ_BLOCKS) + ", WLB_NONE };", "",
-           "/* kind WLK_*, blk WLB_*; a = delay_us (delay) / poll interval us (wait_*) / read_only: 1 = block probe, 2 = log the value (LINK R line); b = polls. In wlan_tear, step = the step that must have STARTED for the action to run. */",
+           "/* kind WLK_*, blk WLB_*; a = delay_us (delay) / poll interval us (wait_*) / read_only: 1 = block probe, 2 = log the value (LINK R line), 4 = EROM dump row (stop after a 0xF dword), 8 = last dump row (refuse without an EOT); b = polls. In wlan_tear, step = the step that must have STARTED for the action to run. */",
            "struct wlan_row { uint16_t step; uint8_t kind, blk; uint32_t off, mask, val, a, b; };", "",
            "static const struct wlan_row wlan_rows[WLAN_SEQ_NROWS] = {"]
     out += [cell(r, r["step"]) for r in rows]

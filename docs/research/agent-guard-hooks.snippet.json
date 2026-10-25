@@ -1,0 +1,55 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "sh -c 'P=\"$CLAUDE_PROJECT_DIR\"/pixos-project/pixelios-kernel/tools/agent-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\" --statusline; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Bash|Write|Edit|MultiEdit|Agent|Task|mcp__t3-code__delegate_task|mcp__t3-code__task_status|mcp__t3-code__t3_thread_list|mcp__t3-code__t3_thread_read",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh -c 'P=\"$CLAUDE_PROJECT_DIR\"/pixos-project/pixelios-kernel/tools/agent-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\" --pre; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh -c 'P=\"$CLAUDE_PROJECT_DIR\"/pixos-project/pixelios-kernel/tools/agent-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\" --post; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh -c 'P=\"$CLAUDE_PROJECT_DIR\"/pixos-project/pixelios-kernel/tools/agent-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\" --context; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh -c 'P=\"$CLAUDE_PROJECT_DIR\"/pixos-project/pixelios-kernel/tools/agent-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\" --session; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      }
+    ]
+  }
+}

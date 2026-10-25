@@ -1,0 +1,44 @@
+sweet-console-mute-early (boot-speed A2, docs/PLAN-BOOT-SPEED.md s2): boot-arg sweetfb_noconsole=2 mutes the framebuffer
+text console from the first console output that can read boot-args, instead of from the first swap (value 1, patch 0065,
+iokit/Kernel/arm/SweetFramebuffer.cpp:400-403, is unchanged). INERT without the boot-arg (value 2).
+Facts, read from source: _cnputs calls sweet_log_append BEFORE the mute test (osfmk/console/serial_console.c:285-289), so the
+persistent log and the USB replay still get all text; the test is `sweet_console_muted && !panic_active()`, so a panic still draws.
+PE_boot_args() dereferences PE_state.bootArgs (pexpert/arm/pe_bootargs.c:10), NULL until PE_init_platform
+(pexpert/arm/pe_init.c:403): output before that cannot be muted and is drawn; the check repeats on each call until bootArgs is set.
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -274,6 +274,26 @@
+  * the GUI. A panic draws again.
+  */
+ int sweet_console_muted;
++
++/*
++ * Boot-arg sweetfb_noconsole=2 (patch 0116): mute the framebuffer text from the
++ * first console output instead of the first swap. 0 = boot-args not readable yet
++ * (PE_state.bootArgs is NULL until PE_init_platform; text before that is drawn),
++ * 1 = checked. Value 1 is unchanged (set by AppleCLCD at the first swap).
++ */
++static int sweet_mute_early_checked;
++
++static inline void
++sweet_mute_early_check(void)
++{
++	if (sweet_mute_early_checked == 0 && PE_state.bootArgs != NULL) {
++		int v = 0;
++		sweet_mute_early_checked = 1;
++		if (PE_parse_boot_argn("sweetfb_noconsole", &v, sizeof(v)) && v == 2) {
++			sweet_console_muted = 1;
++		}
++	}
++}
+ #endif
+ 
+ static inline void
+@@ -283,6 +303,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	sweet_mute_early_check();
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}

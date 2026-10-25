@@ -1,0 +1,4 @@
+// fixture source: synthetic: the allowed form from the guide (CR-14 good)
+#if WLAN_LINK_N >= 30
+static int step30(void) { return 0; }
+#endif

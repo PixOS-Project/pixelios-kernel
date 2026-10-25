@@ -1,67 +1,101 @@
 #!/bin/bash
 # One hardware test cycle -> ONE short report (docs/AUTOMATION.md). Progress goes to <run dir>/xrun.log, stdout is the report.
-#   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
+#   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--gpu-handover] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
 #              [--reader "qr-log.py options"]   (e.g. "--workers 3 --average 3 --tiles 1"; QL2 boot-args go in --args: sweetqr_fmt=1|2 sweetqr_ver sweetqr_ecc sweetqr_tiles sweetqr_ms sweetqr_k sweetqr_red sweetqr_fec sweetqr_hold)
 #              [--expect REGEX]... [--expect-absent REGEX]... [--duration S] [--label NAME] [--no-flash-check]
-#              [--early] [--stop-on REGEX]... [--hard-timeout S]
+#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]... [--overlay DIR]
+#   DEFAULT END (B1, 2026-10-25): every run ends by the host. --expect patterns imply --early (stop when all are seen; --full waits for --duration instead); a run without them ends at --duration
+#                  (default --restart, else 300 s after fastboot boot) with the software reset; the --restart timer is only the fallback (the B2 "recovery" result of run bl2-timer was a root-mount-failure reset at +207 s, not the timer).
+#   --remote-reset  adds boot-arg sweetremote=1 (xnu patch 0100): an early stop (--early / --stop-on) then resets the phone into the bootloader over the USB link (tools/phone goto fastboot sends
+#                  UDP SWEET-RESET-BL) instead of waiting for the self-reset timer. --restart N,bootloader (timer path) lands in fastboot directly, not in recovery.
+#                  --early / --stop-on turn --remote-reset ON by default (observed working 2026-10-24, run bl1-remote3: phone in fastboot ~95 s after the stop instead of waiting ~700 s); --no-remote-reset disables it.
+#   --fail-on RX   (repeatable) end the run as soon as RX appears in the log and score it FAIL: a failing run no longer waits out --restart. With --early/--stop-on these default to
+#                  `Kernel trap at|panic\(cpu|panic:|Assertion failed`; --fail-on none disables the defaults.
+#   --no-camera    do not start the ESP camera capture (saves ~5 s, and works without the camera; the report then has no SCREEN line)
+#   --lock-wait S  the phone lock (tools/phone-lock, TP-020) is taken only AFTER the image is built, right before the phone is touched; wait up to S s
+#                  (queued, in arrival order) for another owner to finish, default 0 = fail at once with who holds it. Under `phone-lock run` it is already held.
 #   --stop-on RX   (repeatable; --early = all --expect patterns) end the capture as soon as every pattern is in the merged log, instead of
 #                  waiting for the self-reset (restart+300 s). Then the phone is put back in fastboot (to-fastboot.sh) if it has reset or is
 #                  reachable; else ONE report line "PHONE: still running; self-reset due in ~Ns / Power+VolDown hold". RESULT PASS + "EARLY: stopped at +Ns (full run would have waited Ms)".
-#   --hard-timeout S  absolute cap (from xrun start) on the whole run; default none (--duration still applies). A FAIL on timeout carries
+#   --hard-timeout S  cap (from xrun start) on the wait for the run, plus up to XRUN_GRACE s (default 90) when the reset was due but the phone is not back yet; default none (--duration still applies). A FAIL on timeout carries
 #                  "PHONE:" from a bounded probe (lsusb, adb get-state, fastboot product; each under its own 5-8 s timeout).
 #   tools/xrun --dry-run --from-dir DIR [--stop-on RX]...   rebuild the report of an existing run dir (no phone); with --stop-on, replay an early stop
 #                                            (rewrites report.txt/merged.log in DIR: copy it first if it must stay untouched)
-# Cycle: to-fastboot -> mkadt -> build-xnu-image -> camera/QR capture -> fboot -> wait for the self-reset -> report.
+# Cycle: mkadt -> build-xnu-image -> [take the phone lock] -> to-fastboot -> camera/QR capture -> fboot -> wait for the self-reset -> report.
 # Exit: 0 PASS, 1 FAIL/PARTIAL, 2 ERROR.  --no-flash-check: skip the to-fastboot step (the phone is already in fastboot).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
 R="python3 tools/xrun_report.py"   # not -I: PIL lives in the user site-packages
-kernel=""; adt=""; board=bluejay; cpus=1; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; dvfs=()
-dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""
+kernel=""; adt=""; board=bluejay; cpus=1; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; handover=""; dvfs=()
+lockwait=0; remote=""; noremote=0; full=0; nocam=0; failons=(); dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""; overlay=""
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
 	--qr) qr=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) args=$2; shift 2 ;; --duration) duration=$2; shift 2 ;;
-	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
-	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
-	--dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;;
+	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --full) full=1; shift ;; --remote-reset) remote=1; shift ;; --no-remote-reset) noremote=1; shift ;; --fail-on) failons+=("$2"); shift 2 ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
+	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
+	--dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;;
 	*) echo "unknown option $1 (see the header of tools/xrun)" >&2; exit 2 ;; esac; done
 if [ "$dry" = 1 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
 [ "$early" = 0 ] || [ ${#stops[@]} -gt 0 ] || stops=("${rawexp[@]}")
 [ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
+[ "$full" = 1 ] || [ ${#stops[@]} -gt 0 ] || [ ${#rawexp[@]} = 0 ] || { early=1; stops=("${rawexp[@]}"); }   # B1 is the default: --expect stops the run when every pattern is seen (--full keeps the old wait)
+[ "$noremote" = 1 ] || remote=1   # the host ends every run with the software reset (proven on hardware, run bl1-remote3); the timer is only the fallback
+if { [ "$early" = 1 ] || [ ${#stops[@]} -gt 0 ]; } && [ ${#failons[@]} = 0 ]; then failons=('Kernel trap at|panic\(cpu|panic:|Assertion failed'); fi
+[ "${failons[0]:-}" != none ] || failons=()
+[ -z "$remote" ] || [[ " $args " == *" sweetremote=1 "* ]] || args="${args:+$args }sweetremote=1"
 label=$(printf %s "$label" | tr -c 'A-Za-z0-9._-' _)
 D=logs/runs/$(date -u +%Y%m%dT%H%M%SZ)-$label; mkdir -p "$D/snaps" "$D/frames"; LOG=$D/xrun.log; : >"$LOG"
-secs=${restart%%,*}; [ -n "$duration" ] || duration=$(( ${secs:-60} + 300 ))
+secs=${restart%%,*}
+if [ -n "$duration" ]; then :; elif [ -n "$remote" ]; then duration=${secs:-300}   # the host resets at --duration (B1); the timer is the fallback
+else duration=$(( ${secs:-60} + 300 )); fi   # --no-remote-reset: wait for the timer
+. tools/plock.sh
 cap=""; usbpid=""
-cleanup() { touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
+stop_capture() { touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
 	[ -z "$cap" ] || { sleep 1; kill "$cap" 2>/dev/null || true; wait "$cap" 2>/dev/null || true; }; }
+cleanup() { stop_capture; plock_drop; }
 trap cleanup EXIT
 die() { $R error "$D" "$*" || exit $?; exit 2; }
 tailog() { tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-200; }
 
 stopkv=(); for x in ${stops[@]+"${stops[@]}"}; do stopkv+=("stop_on=$x"); done
+for x in ${failons[@]+"${failons[@]}"}; do stopkv+=("fail_on=$x"); done
 if head=$(git rev-parse --short HEAD 2>/dev/null); then git diff --quiet HEAD || head=$head+dirty; else head=nogit; fi
 $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$restart" duration="$duration" \
-	git_head="$head" t_start=@now ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
+	git_head="$head" t_start=@now ${remote:+remote=1} ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
 
+if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
+# shim/out is shared with gates and other builds of this worktree: build under its lock and boot a PRIVATE copy of the image (a gate rebuilding shim/out between build and boot made fboot refuse, 2026-10-24)
+mkdir -p shim/out
+fw=3600; tools/phone-lock check >/dev/null 2>&1 && fw=60   # under `phone-lock run` the phone is already ours: do not hold it for an hour behind a gate
+( flock -x -w $fw 9 || { echo "shim/out busy: a gate or build in this worktree holds shim/out/.build.lock" >&2; exit 98; }
+  tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} ${overlay:+--overlay "$overlay"} $rw $rails $handover "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" 9>&- &&
+  cp shim/out/shim-boot-avb.img "$D/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img.meta.json" ) 9>shim/out/.build.lock \
+	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
+[ -z "$usbnet" ] || $R mark "$D" usbnet=1
+$R mark "$D" boot_args="$(sed -n 's/^boot-args: //p' "$D/build.out")"
+cp "$D/shim-boot-avb.img.meta.json" "$D/image.meta.json" 2>/dev/null || true
+
+# the image is ready: only now take the phone (builds and gates never hold the lock)
+plock_take xrun "$lockwait" || die "phone lock busy: $PLOCK_MSG"
+$R mark "$D" t_start=@now   # --hard-timeout counts from here, not from the start of a (possibly long) wait for the phone lock
 if [ "$check" = 1 ]; then
-	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "needs Power+VolDown hold (no Google USB device 18d1 visible)"
+	# we own the phone now: after a previous run it is off the bus for a while while it reboots; wait (bounded) before asking for a button hold
+	uw=${XRUN_USB_WAIT:-120}; [[ $uw =~ ^[0-9]+$ ]] || uw=120
+	for _ in $(seq 1 "$uw"); do grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && break; sleep 1; done
+	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "no Google USB device (18d1) appeared within ${uw} s: needs Power+VolDown hold"
 	tools/to-fastboot.sh 120 >>"$LOG" 2>&1 || {
 		if grep -q REFUSED "$LOG"; then die "device is not bluejay (to-fastboot refused): $(tailog)"; fi
 		die "needs Power+VolDown hold (phone not reachable by fastboot/adb)"; }
 fi
-if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
-tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} $rw $rails "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" \
-	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
-[ -z "$usbnet" ] || $R mark "$D" usbnet=1
-$R mark "$D" boot_args="$(sed -n 's/^boot-args: //p' "$D/build.out")"
-cp shim/out/shim-boot-avb.img.meta.json "$D/image.meta.json" 2>/dev/null || true
 
+if [ "$nocam" = 0 ]; then
 PYTHONPATH="$A/pylib" python3 tools/qr-log.py --esp --keep-going --follow --out "$D/snaps" --save-dir "$D/frames" --save-every 4 --until-file "$D/stop" $reader >"$D/capture.log" 2>&1 &
 cap=$!
 sleep 4
 kill -0 "$cap" 2>/dev/null || { cap=""; die "camera capture died at start: $(tail -n 2 "$D/capture.log" | tr '\n' ' ' | cut -c1-200)"; }
+fi
 
 if [ -n "$usbnet" ]; then
 	# root-free UDP listener (stops on $D/stop); the interface address needs the user's one sudo line
@@ -71,13 +105,14 @@ if [ -n "$usbnet" ]; then
 	echo "USBNET: run once the phone enumerates (needs root): $(tools/sweet-usbnet.sh --stage)" | tee -a "$LOG" >&2
 fi
 $R mark "$D" t_boot=@now
-tools/fboot.sh --expect xnu shim/out/shim-boot-avb.img >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
+tools/fboot.sh --expect xnu --max-age-min $(( lockwait / 60 + 30 )) "$D/shim-boot-avb.img" >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
+rm -f "$D/shim-boot-avb.img"   # 64 MiB per run; the meta stays
 tb=$(date +%s)
 echo "booted; waiting up to ${duration}s" >>"$LOG"
 how=$($R waitusb "$D" || true)
 sleep 3
 $R mark "$D" t_end=@now
-cleanup; cap=""
+stop_capture; cap=""   # the phone lock stays held until exit: the EARLY/TIMEOUT recovery below still talks to the phone
 # bounded probe: every call has its own timeout (never a bare fastboot call)
 probe() { local u a f
 	u=$(timeout 5 lsusb 2>/dev/null | awk '{print $6}' | grep -E '^(18d1|05ac)' | tr '\n' ' ')
@@ -87,9 +122,9 @@ probe() { local u a f
 case "$how" in
 EARLY) # every stop pattern seen: recover the phone if it can be reached, else say so in one line
 	el=$(( $(date +%s) - tb )); left=$(( ${secs:-0} - el ))
-	if grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && timeout 90 tools/to-fastboot.sh 60 >>"$LOG" 2>&1; then
-		$R mark "$D" phone="back in fastboot (stopped early)"
-	elif grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="reachable but to-fastboot failed (see xrun.log); Power+VolDown hold"
+	if { [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; } && timeout 120 tools/to-fastboot.sh 90 >>"$LOG" 2>&1; then
+		$R mark "$D" phone="back in fastboot (stopped early${remote:+, software reset over the USB link})"
+	elif [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="to-fastboot failed${remote:+ after the software reset request} (see xrun.log); check tools/phone-state before a Power+VolDown hold"
 	else $R mark "$D" phone="still running; self-reset due in ~$(( left > 0 ? left : 0 ))s / Power+VolDown hold"; fi ;;
 TIMEOUT) $R mark "$D" phone="$(probe)" ;;
 esac
