@@ -502,7 +502,7 @@ did not get the lock from `run`/`xrun`/`probe-run` cannot flash or boot: wrap ma
 when that pid is dead and its process group (`run` starts CMD in its own group) is empty, never by ttl; a bare `acquire` without `--pid` is ttl-only and warns. Waiters (`--wait`) are served in
 arrival order (`$PHONE_LOCK_DIR.queue`, shown by `status`). `tools/phone-guard` is a Claude Code PreToolUse hook (wired in the super repo `.claude/settings.json`) that denies hand-typed
 mutating `fastboot`/`adb` (also inside `bash -c`/`eval`); read-only queries and `adb shell getprop` pass; it is a guard rail against accidents, not a sandbox; sessions pick it up at start. Gates and builds never take the lock.
-Not guarded: `sweet-log-pull.sh`, `backup-partitions.sh`, `check-udump.sh` (adb reads, run by the user with root). Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
+Not guarded: `backup-partitions.sh`, `check-udump.sh` (adb reads, run by the user with root). Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
 
 **Fewer false alarms, no cut tails (TP-020 follow-up, 2026-10-24).** `probe-run` waits up to 120 s (`PR_BACK`) for the phone after a shim run (it leaves USB for about 30 s and returns in recovery: observed by the Wi-Fi agent, HANDOFF session 28, not re-measured) with the
 capture still running; a slow return is a PASS note, a run that hit `--timeout` while the shim was still logging (log younger than 15 s) is a FAIL "raise --timeout", and HANG / "hold Power+VolDown" needs the

@@ -78,7 +78,7 @@ def fake_mac(kind):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wlan_node=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (the QEMU virt smoke runs were retired, T2)."""
     config = BOARDS[board]
     if board == 'sweet':
         phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
