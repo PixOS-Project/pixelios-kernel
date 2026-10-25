@@ -53,6 +53,17 @@ MUTANTS = [
     ("A2c background cd kept", 'or op == "&") and cur != cwd', ') and cur != cwd'),
     ("A2d moved only first parse", "for p in ps for w, _ in p)", "for p in ps[:1] for w, _ in p)"),
     ("S6b case-sensitive", 'lines\\b", p or "", re.I)', 'lines\\b", p or "")'),
+    ('E17 -- does not end the operands', 'if x == "--" or (h[0] == "find"', 'if (h[0] == "find"'),
+    ('E15 -maxdepth ignored', '(md is None or md > 3)', 'True'),
+    ('E22 merge in progress not exempt', 'if any(os.path.exists(os.path.join(d, x)) for x in seq):', 'if False:'),
+    ('E22 tools/<slug> branch not allowed', ' or br.startswith("tools/"):', ':'),
+    ('E8b cp source counted as written', 'cand = [dst] + (ops[:-1] if prog == "mv" else [])', 'cand = ops'),
+    ('E18 pattern operand counted as a file', 'files = ops if pat else ops[1:]', 'files = ops'),
+    ('E2c split $( pgrep ) not seen', ' or (w[-1].endswith("$") and "(" in op and nxt and nxt[0] in ("pgrep", "pidof"))', ''),
+    ('E13 host-test loop not found', 'if m and any("wlanlink_host_test$n" in x for x in t[i + 1:i + 4]):', 'if m and False:'),
+    ('E14 no margin', 'ms < (need + 60) * 1000', 'ms < need * 1000'),
+    ('E8b git -C not followed', 'if cv and "$" not in cv and "`" not in cv:', 'if False:'),
+    ('E10 poke inside phone-lock run not seen', 'if p == "phone-lock" or (preflight and p == "run-preflight"):', 'if preflight and p == "run-preflight":'),
 ]
 
 
