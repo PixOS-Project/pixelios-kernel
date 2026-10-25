@@ -155,7 +155,7 @@ patch header.
 ## Requirement 4: ADT
 
 mkadt node (tools/mkadt.py:328-339) emits compatible, reg (0x60000000, 0x10000), cfg (0x60FFE000, 0x1000), atu (0x14B00000, 0x1000),
-pmu-iso (0x17463EC4, 4) from soc.json (soc/google/gs101/soc.json:21, 48-50) as `<2Q` (mkadt.py:62); these equal the glue pins P:61-65 and the
+pmu-iso (0x17463EC4, 4) from soc.json (soc/google/gs101/soc.json wlan keys pmu_pcie1_iso, atu, cfg, mem) as `<2Q` (mkadt.py:62); these equal the glue pins P:61-65 and the
 lengths P:150-151 (read from source). A wrong value is refused before any mapping (P:150-152, `sw_prop_is` P:118). CR-20 satisfied; CR-25
 satisfied for the allowlist (deny by default, `return 0` chip.h:121). Gaps: F6, F8.
 
