@@ -74,7 +74,7 @@ The table adds read-backs after every write: 1359, 1362, 1367, 1369, 1384, 1395,
 ## Teardown, allowlist, caps (requirement 3), read from source at 4a456b8
 
 **Teardown rows** [src]:
-- T01 is at `soc/google/gs101/wlan_seq.json:1426` (cfg 0x80 := 0x18000000, requires 32) and T02 at `:1427`.
+- T01 is in the `soc/google/gs101/wlan_seq.json` teardown (CFG off 0x80) (cfg 0x80 := 0x18000000, requires 32) and T02 is the CFG 0x80 read-back right after it.
 - **T20 PERST low is at `:1445` (requires 20). T22 WLAN_EN low is at `:1447` (requires 3).** The `~:1351/:1353` in the brief and GOALS is stale (finding 4).
 
 **Every stop reaches them** [src]: `shim/wlanlink.c:556-597`.
@@ -126,7 +126,7 @@ In the host test, the tuple `memw_ok(0x18001000,0x1E8,0,0x200,0)` flipped from e
 ### 4. LOW (doc): stale teardown line cites
 - Tag: observed.
 - Where: super `docs/GOALS.md:28` cites T20 `:1351` and T22 `:1353`; `docs/research/40...md:99` cites `:1380/:1382` and T05 `:1365`.
-- At 4a456b8: T20 `wlan_seq.json:1445`, T22 `:1447`, T05 `:1430`, T01 `:1426`.
+- At 4a456b8: T20 (GPH2 off 4), T22 (GPP14 off 4), T05 (CFG off 0x80), T01 (CFG off 0x80), as rows of `wlan_seq.json` teardown.
 - **Fix:** cite by row id (`T20`, `T22`, `T05`), not by JSON line, in both docs. The line numbers move with every table change.
 
 ### 5. LOW (doc): the GOALS W-C3 criterion is out of date
