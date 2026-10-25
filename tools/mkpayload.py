@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--wlanfw CONTAINER]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -24,12 +24,15 @@ Payload layout (little endian, all offsets from payload start):
 kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
-turn into md0 (boot with rd=md0).
+turn into md0 (boot with rd=md0). --wlanfw does the same for the BCM4389 container but names the
+property WLANFW (page-rounded placement, <phys, exact size>), which nothing turns into a disk; the container is
+validated (magic, CRCs) before it is packed.
 """
 import argparse, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import adt, boards  # noqa: E402
+from tools.pack_wlanfw import parse as wlanfw_parse  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
@@ -122,13 +125,13 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
-    """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
+def add_ramdisk_to_adt(adt_blob, phys, size, name='RAMDisk'):
+    """Return the ADT with /chosen/memory-map NAME = <phys, size> (two uintptr_t)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next(c for c in chosen.children if c.name == 'memory-map')
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(name) is None, f'ADT already has a {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
 
 
@@ -148,7 +151,7 @@ def check_cmdline(cmdline):
     return cl
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet'):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet', wlanfw_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -178,6 +181,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet'):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    wlanfw = None
+    if wlanfw_path:
+        # BCM4389 firmware container (tools/pack_wlanfw.py): same placement as the RAM disk, own property so IOFindBSDRoot ignores it
+        image = open(wlanfw_path, 'rb').read()
+        wlanfw_parse(image)
+        fw_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        fw_va = kernel_end
+        kernel_end = fw_va + fw_size
+        fw_pa = fw_va - virt_base + PHYS_BASE
+        pieces.append((fw_va, fw_size, image))
+        adt_blob = add_ramdisk_to_adt(adt_blob, fw_pa, len(image), 'WLANFW')
+        wlanfw = (hex(fw_pa), hex(len(image)))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -199,7 +214,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board='sweet'):
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, wlanfw=wlanfw, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -209,9 +224,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--wlanfw', help='BCM4389 firmware container (tools/pack_wlanfw.py) -> /chosen/memory-map WLANFW')
     ap.add_argument('--board', choices=('sweet', 'bluejay'), default='sweet')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.board, a.wlanfw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
