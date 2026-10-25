@@ -90,8 +90,11 @@ CC=${CROSS_CC:-${prefix}gcc}
 OBJCOPY=${CROSS_OBJCOPY:-${prefix}objcopy}
 READELF=${CROSS_READELF:-${prefix}readelf}
 NM=${CROSS_NM:-${prefix}nm}
-MKBOOTIMG=${MKBOOTIMG:-../tools/third_party/mkbootimg.py}
-AVBTOOL=${AVBTOOL:-../tools/third_party/avbtool.py}
+# tools/third_party is untracked (tools/fetch-android-tools.sh); linked worktrees use the main clone's copy.
+tp=../tools/third_party
+[ -e "$tp/mkbootimg.py" ] || tp=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/tools/third_party
+MKBOOTIMG=${MKBOOTIMG:-$tp/mkbootimg.py}
+AVBTOOL=${AVBTOOL:-$tp/avbtool.py}
 # Marker line identity: git short hash of this worktree (date fallback
 # when detached from git), so the pulled pstore log names its build.
 build_id=$(git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d)

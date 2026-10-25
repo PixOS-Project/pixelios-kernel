@@ -2,7 +2,7 @@
 shim/out/
 logs/
 .env
-tools/third_party/
+tools/third_party
 __pycache__/
 *.pyc
 # fetched by tools/setup-upstream.sh (not ours, not redistributed)
