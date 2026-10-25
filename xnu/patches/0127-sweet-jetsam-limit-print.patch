@@ -1,0 +1,26 @@
+sweet-jetsam-limit-print (audit 1 item 7, docs/research/50-audit1-items-5-7-8.md): READ-ONLY diagnostic. Prints the per-process
+footprint limit and the current phys footprint (MB) of the process the ledger callback is about to kill with
+JETSAM_REASON_MEMORY_PERPROCESSLIMIT (reason ns 1 code 0x7, e.g. driverkitd), so "reason ns 1 code 0x7: (none)" gains numbers.
+Changes no limit and no kill decision; only a printf in the fatal branch of memorystatus_on_ledger_footprint_exceeded, current_proc()
+being the offender. Facts, read from source: the function is the only creator of that reason (bsd/kern/kern_memorystatus.c:4252
+pristine), it is not under CONFIG_JETSAM (it is compiled on this config, line 4225); get_task_phys_footprint_limit() is bytes
+(bsd/kern/kern_exit.c:452 shifts it >> 20 for the MB field of EXC_RESOURCE). Not run on hardware.
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -4249,6 +4249,16 @@
+ 		 * If this process has no high watermark or has a fatal task limit, then we have been invoked because the task
+ 		 * has violated either the system-wide per-task memory limit OR its own task limit.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			extern uint64_t get_task_phys_footprint(task_t);
++			extern uint64_t get_task_phys_footprint_limit(task_t);
++			printf("SWEET JETSAM: %s[%d] per-process limit exceeded: limit %llu MB footprint %llu MB\n",
++			    p->p_name, proc_getpid(p),
++			    get_task_phys_footprint_limit(proc_task(p)) >> 20,
++			    get_task_phys_footprint(proc_task(p)) >> 20);
++		}
++#endif
+ 		jetsam_reason = os_reason_create(OS_REASON_JETSAM, JETSAM_REASON_MEMORY_PERPROCESSLIMIT);
+ 		if (jetsam_reason == NULL) {
+ 			memorystatus_log_error("task_exceeded footprint: failed to allocate jetsam reason\n");
