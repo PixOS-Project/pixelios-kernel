@@ -536,6 +536,30 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 /* wlan_link_hold(): the hand-over flavor (--wlan-hold). Same chain, same interpreter; ONLY when it ran every step 0..N ok AND N is the S30 step ("the first BAR0 read" in the table's steps: link up, ATU regions 0/1, BAR0/BAR2, Command MEM, cfg 0x80 = 0x18000000) the teardown is skipped and the link is left up for XNU. WLAN_HOLD_STEP is the only typed step number: wlan_seq.json has no named-step constant (checked: out/wlan_seq.h carries only SHA256/NROWS/NTEAR/LAST/DEFAULT_N); the audit pins the step text of 30. Any failure runs the normal teardown. */
 #define WLAN_HOLD_STEP	30u
 
+/* the teardown rows of the steps 0..hi, in the table order; returns the number of failed rows. Shared by link_run and wlan_link_release: no row is written that the table does not carry. */
+static int link_teardown(unsigned hi, unsigned *probed, uint32_t *rd)
+{
+	struct wlan_row r;
+	unsigned i;
+	int st, tear_bad = 0;
+
+	for (i = 0; i < WLAN_SEQ_NTEAR; i++) {
+		if (!get_row(i, 1, &r) || r.step > hi)
+			continue;
+		if (need_probe(r.blk) & ~*probed)
+			continue;		/* a block that was never probed was never written (writes need the probe): nothing to undo there */
+		st = run_row(i, 1, probed, rd);
+		if (st != ST_OK) {
+			tear_bad++;
+			step_line('T', i + 1u, st_name(st), 0, 0, 1, *rd, 0, 0);
+		}
+	}
+	return tear_bad;
+}
+
+static int held_on;			/* set only by a hold run that completed S30 with the teardown skipped */
+static unsigned held_hi, held_probed;
+
 static int link_run(int hold)
 {
 	char line[RAMLOG_LINE_MAX];
@@ -605,16 +629,12 @@ static int link_run(int hold)
 	held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;
 	if (held)
 		started = 0;		/* the ONLY way the loop below does nothing: every step 0..S30 ran ok and the caller is wlan_link_hold */
-	for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {
-		if (!get_row(i, 1, &r) || r.step > hi)
-			continue;
-		if (need_probe(r.blk) & ~probed)
-			continue;		/* a block that was never probed was never written (writes need the probe): nothing to undo there */
-		st = run_row(i, 1, &probed, &rd);
-		if (st != ST_OK) {
-			tear_bad++;
-			step_line('T', i + 1u, st_name(st), 0, 0, 1, rd, 0, 0);
-		}
+	if (started)
+		tear_bad = link_teardown(hi, &probed, &rd);
+	held_on = held;		/* every run supersedes the previous state: only a hold run that skipped the teardown leaves something to release */
+	if (held) {
+		held_hi = hi;
+		held_probed = probed;
 	}
 	p = put_txt(line, sizeof(line), 0, "LINK summary reached=S");
 	p = put_dec(line, sizeof(line), p, hi / 10u);
@@ -650,6 +670,25 @@ int wlan_link_hold(void)
 	return link_run(1);
 }
 
+/* wlan_link_release(): the teardown of a held link (XNU is not coming). Nothing held: returns 2, writes nothing. Else the same T rows as a failed run, then `LINK release restore=ok|FAILED`; returns 0 / 1. */
+int wlan_link_release(void)
+{
+	char line[RAMLOG_LINE_MAX];
+	unsigned p, probed = held_probed;
+	uint32_t rd = 0;
+	int bad;
+
+	if (!held_on)
+		return 2;
+	held_on = 0;
+	bad = link_teardown(held_hi, &probed, &rd);
+	p = put_txt(line, sizeof(line), 0, "LINK release");
+	p = put_txt(line, sizeof(line), p, bad ? " restore=FAILED" : " restore=ok");
+	emit(line, p);
+	pstore_save();
+	return bad ? 1 : 0;
+}
+
 #else	/* not gs101 / --wlan-link not built: refuse, nothing written */
 
 int wlan_link_run(void)
@@ -661,6 +700,11 @@ int wlan_link_run(void)
 int wlan_link_hold(void)
 {
 	con_str("WLAN", "LINK hold refused: --wlan-link not built or not gs101, nothing written");
+	return 2;
+}
+
+int wlan_link_release(void)
+{
 	return 2;
 }
 
