@@ -38,8 +38,8 @@ DEVICE_LEAKS = [
 ]
 MAC = re.compile(r"(?<![0-9A-Fa-f:-])((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})(?![0-9A-Fa-f:-])")
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^*\n]+)")
-# "Copyright", "(c)" followed by a year (a bare "(c)" is also a list marker in comments, e.g. "(c) poll is bounded"), or the copyright sign
-COPY = re.compile(r"^[\s/*#;+>-]*(?:Copyright\b|\(c\)(?=\s*(?:19|20)\d\d)|\u00a9)(.*)", re.I)
+# "Copyright" (not the ISC boilerplate "copyright notice and this permission notice"), "(c)" followed by a year (a bare "(c)" is also a list marker in comments, e.g. "(c) poll is bounded"), or the copyright sign
+COPY = re.compile(r"^[\s/*#;+>-]*(?:Copyright\b(?!\s+notice)|\(c\)(?=\s*(?:19|20)\d\d)|\u00a9)(.*)", re.I)
 
 
 def ids(expr):
