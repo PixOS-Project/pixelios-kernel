@@ -1,6 +1,6 @@
---- a/bsd/kern/sweet_amfi.c
-+++ b/bsd/kern/sweet_amfi.c
-@@ -373,6 +373,26 @@
+--- a/bsd/kern/sweet_amfi.c	2026-10-25 22:47:49.328805205 +0100
++++ b/bsd/kern/sweet_amfi.c	2026-10-25 22:49:58.195943085 +0100
+@@ -373,14 +373,40 @@
  } sweet_priv_logged[SWEET_PRIV_LOG_MAX];
  static int sweet_priv_logged_count;
  
@@ -8,8 +8,8 @@
 + * Network privileges the real Sandbox/AMFI grant by entitlement; the closed
 + * entitlement-to-privilege map is not in the xnu source, so this stand-in
 + * grants exactly these two privileges to the daemons that were denied them
-+ * (HANDOFF 2026-10 (b): socket delegate 10001, network statistics 10003),
-+ * keyed on the process name. Anything else stays denied and logged.
++ * (socket delegate 10001, network statistics 10003 seen denied in boot logs),
++ * keyed on the process name (p_name, set from the executable: spoofable). Anything else stays denied and logged.
 + */
 +static const struct {
 +	int         priv;
@@ -25,11 +25,14 @@
 +};
 +
  static int
- sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+-sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
  {
-@@ -381,6 +401,12 @@
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
  	}
- 	char name[20];
+-	char name[20];
++	char name[20] = "";
  	proc_selfname(name, sizeof(name));
 +	for (size_t g = 0; g < sizeof(sweet_priv_net_grants) / sizeof(sweet_priv_net_grants[0]); g++) {
 +		if (sweet_priv_net_grants[g].priv == priv &&
@@ -40,3 +43,12 @@
  	for (int i = 0; i < sweet_priv_logged_count; i++) {
  		if (sweet_priv_logged[i].priv == priv &&
  		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
+@@ -391,7 +417,7 @@
+ 		sweet_priv_logged[sweet_priv_logged_count].priv = priv;
+ 		strlcpy(sweet_priv_logged[sweet_priv_logged_count].name, name, sizeof(name));
+ 		sweet_priv_logged_count++;
+-		printf("SWEET Sandbox: %s privilege %d denied\n", name, priv);
++		printf("SWEET Sandbox: %s privilege %d denied (uid %u)\n", name, priv, kauth_cred_getuid(cred));
+ 	}
+ 	return EPERM;
+ }
