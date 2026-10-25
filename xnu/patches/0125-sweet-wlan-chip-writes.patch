@@ -1,0 +1,919 @@
+SWEET WLAN stage 3 run A (patch 0125, W-D3 step 2, docs/research/43 rows W0..W7): the first chip WRITES from inside XNU, behind boot-arg sweetwlan=3 (stage 1 runs at level 2 first;
+levels 1-2 are byte-identical to 0120/0124). Pure header bsd/dev/sweet_wlan_wr.h: deny-by-default tuple table swl_wt[] (+ read table swl_rt[], restore table swl_rs[]), the one writer swl_wr()
+(level/predecessor/phase gate, the 0120 preconditions re-read, live window, old and companion value, store, read-back under the tuple's mask, STOP latch + restore of the armed group),
+the run-A steps: entry state, outbound iATU region 2 over BAR2 (4 MiB) + its ml_io_map, SRPWR READ-ONLY check, SYS_MEM wrapper reset, 21 bank reads for the RAM size, CA7 halt, two BAR2 reads.
+No image copy, no NVRAM, no ARM release: later runs are more rows in the tables. sweet_wlan.c glue: sw3_rd/sw3_wr (the one store, called only through swl_store()), needs ADT /sweet-wlan tcm and
+atu-r2-off (tools/mkadt.py, soc.json wlan.tcm/tcm_bytes/atu_r2_off). Host test: shim/wlan_wr_host_test.c, mutants: tools/test_wlan_wr_mutants.py. HW-WRITE path: NOT reviewed yet.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index 277e201..6a976a7 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -4,17 +4,22 @@
+  * It expects the shim flavor --wlan-hold (PCIe1 link left up, cfg 0x80 = 0x18000000, shim/wlanlink.c wlan_link_hold) and refuses
+  * otherwise, with the same preconditions as shim/wlanlink.c r32(): PHY isolation word de-isolated, EP Command MEM-only, ATU region 1
+  * (BAR0, 0x60000000..0x6000FFFF) enabled and programmed as S29 left it. The only write is the BAR0 window select (cfg 0x80) to one of the
+- * windows swl_win_ok() names (cfg 0x80 is left on the last one and the held link is not torn down: a writing stage must not assume either); the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written: no reset, no set_passive.
++ * windows swl_win_ok() names (cfg 0x80 is left on the last one and the held link is not torn down: a writing stage must not assume either); the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written at levels 1-2: no reset, no set_passive.
++ *
++ * Patch 0125 (W-D3 step 2, docs/research/43): sweetwlan=3 runs stage 1 at level 2 and then run A of stage 3, the first chip WRITES (sweet_wlan_wr.h: ATU region 2 over BAR2,
++ * SYS_MEM reset, bank reads, CA7 halt, two BAR2 reads). Every store of stage 3 is sw3_wr(), called only through swl_wr()/swl_restore() of that header; levels 1-2 are unchanged.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <stdint.h>
+ #include "sweet_wlan_chip.h"
+ #include "sweet_wlan_fw.h"
++#include "sweet_wlan_wr.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ 
+@@ -27,7 +32,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_rou
+ #define SW_ISO      0x17463EC4ull   /* soc.json wlan.pmu_pcie1_iso: PCIe1 PHY isolation, bit 0 = de-isolated (always-on PMU block) */
+ 
+ struct sw_hw {
+-	volatile uint32_t *cfg, *mem;
++	volatile uint32_t *cfg, *mem, *atu, *elbi, *iso, *tcm;
+ 	uint32_t win;
+ 	int level;
+ };
+@@ -128,6 +133,110 @@ sweet_wlan_fwcheck(void)
+ 	printf("SWEET WLAN: fw container ok at %#llx, %llu bytes, %u entries\n", pa, len, n);
+ }
+ 
++/* one u32 property must equal the pinned value */
++static int
++sw_prop_u32_is(DTEntry node, const char *name, uint32_t v)
++{
++	uint32_t const *p = NULL;
++	unsigned int sz = 0;
++
++	if (SecureDTGetProperty(node, name, (void const **)&p, &sz) != kSuccess || sz != sizeof(uint32_t) || *p != v) {
++		printf("SWEET WLAN: /sweet-wlan %s is not %#x, refused\n", name, v);
++		return 0;
++	}
++	return 1;
++}
++
++/* Stage 3 (patch 0125) bus: the mapped pages of stage 1 plus BAR2 once swl_w2() asks for it. Reads and stores are refused outside the pages and the spaces swl_wt[]/swl_rt[] name. */
++static volatile uint32_t *
++sw3_ptr(struct sw_hw *h, int space, uint32_t off)
++{
++	if ((off & 3u) != 0) {
++		return NULL;
++	}
++	switch (space) {
++	case SWW_CFG:
++		return off < 0x1000 ? &h->cfg[off / 4] : NULL;
++	case SWW_ATU:
++		return off < 0x1000 ? &h->atu[off / 4] : NULL;
++	case SWW_ELBI:
++		return off < 0x2000 ? &h->elbi[off / 4] : NULL;
++	case SWW_ISO:
++		return off == 0 ? h->iso : NULL;
++	case SWW_BAR0:
++		return off < 0x1000 ? &h->mem[off / 4] : NULL;
++	case SWW_BAR2:
++		return h->tcm != NULL && off < SWW_TCM_BYTES ? &h->tcm[off / 4] : NULL;
++	}
++	return NULL;
++}
++
++static int
++sw3_rd(void *ctx, int space, uint32_t win, uint32_t off, uint32_t *v)
++{
++	struct sw_hw *h = ctx;
++	volatile uint32_t *p = sw3_ptr(h, space, off);
++
++	if (p == NULL || (space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win) || (space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)) {
++		return -1;
++	}
++	*v = *p;
++	return 0;
++}
++
++/* THE store of stage 3 (called only by swl_store()): config space, ATU and BAR0 only, BAR0 only on the live window the tuple named; ref: aiutils.c W_REG + R_REG, dsb sy before the read-back (osfmk/arm/atomic.h DSB_SY 0xf) */
++static int
++sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
++{
++	struct sw_hw *h = ctx;
++	volatile uint32_t *p;
++
++	if (space != SWW_CFG && space != SWW_ATU && space != SWW_BAR0) {
++		return -1;
++	}
++	p = sw3_ptr(h, space, off);
++	if (p == NULL || (space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win)) {
++		return -1;
++	}
++	*p = v;
++	__builtin_arm_dsb(0xf);
++	return 0;
++}
++
++static int
++sw3_map2(void *ctx)
++{
++	struct sw_hw *h = ctx;
++
++	h->tcm = sw_map(SWW_TCM_PA, SWW_TCM_BYTES);
++	return h->tcm == NULL;
++}
++
++static void
++sw3_delay(void *ctx, unsigned us)
++{
++	(void)ctx;
++	delay((int)us);
++}
++
++static void
++sweet_wlan_stage3(struct sw_hw *hw, int level)
++{
++	struct swl_wbus wb;
++	struct swl_wx x;
++
++	wb.rd = sw3_rd;
++	wb.wr = sw3_wr;
++	wb.map2 = sw3_map2;
++	wb.delay_us = sw3_delay;
++	wb.ctx = hw;
++	memset(&x, 0, sizeof x);
++	x.b = &wb;
++	x.level = level;
++	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run A, docs/research/43)\n", level);
++	(void)swl_stage3(&x);
++}
++
+ void
+ sweet_wlan_init(void)
+ {
+@@ -149,7 +258,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 2 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 3 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+@@ -160,6 +269,9 @@ sweet_wlan_init(void)
+ 	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
+ 		return;
+ 	}
++	if (level >= 3 && (!sw_prop_is(node, "tcm", SWW_TCM_PA, SWW_TCM_BYTES) || !sw_prop_u32_is(node, "atu-r2-off", SWW_ATU_R2))) {
++		return;
++	}
+ 	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
+ 	if (isop == NULL) {
+ 		return;
+@@ -192,7 +304,11 @@ sweet_wlan_init(void)
+ 	}
+ 	/* first config TLPs, only now that the link and region 0 are proven */
+ 	hw.win = hw.cfg[0x80 / 4];
+-	hw.level = (int)level;
++	hw.level = level > 2 ? 2 : (int)level;
++	hw.atu = atu;
++	hw.elbi = elbi;
++	hw.iso = &isop[(SW_ISO & 0xFFFull) / 4];
++	hw.tcm = NULL;
+ 	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
+ 	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
+ 	if (bad) {
+@@ -201,8 +317,11 @@ sweet_wlan_init(void)
+ 	}
+ 	bus.rd = sw_rd;
+ 	bus.ctx = &hw;
+-	if (swl_stage1(&bus, &chip, (int)level) == 0) {
+-		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", level);
++	if (swl_stage1(&bus, &chip, hw.level) == 0) {
++		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", (unsigned)hw.level);
++		if (level >= 3) {
++			sweet_wlan_stage3(&hw, (int)level);
++		}
+ 	} else {
+ 		printf("SWEET WLAN: stage 1 stopped\n");
+ 	}
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+new file mode 100644
+index 0000000..70d8411
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -0,0 +1,712 @@
++/*
++ * BCM4389 chip WRITES, stage 3 run A (docs/research/43 s.1-s.3, W-D3 step 2): the pure part of sweet_wlan.c, host-tested by
++ * shim/wlan_wr_host_test.c (which replays the values observed on the Pixel 6a and kills every guard rule with a mutant,
++ * tools/test_wlan_wr_mutants.py). No libc, no asm, no pointer from an integer literal, no device access of its own: every
++ * access goes through struct swl_wbus, whose one store callback is called ONLY by swl_store(), which only swl_wr() (the
++ * deny-by-default tuple table swl_wt[]) and swl_restore() (its own tiny table swl_rs[]) call.
++ *
++ * Run A (boot-arg sweetwlan=3) = rows W0..W7 of the note: entry state, outbound iATU region 2 over BAR2, SRPWR read-only check,
++ * SYS_MEM reset, the 21 bank reads that give the RAM size, CA7 halt, the first two BAR2 reads. Nothing is copied to the chip.
++ * Later runs (image copy, NVRAM, vector, release) are NOT here: they are more rows in swl_wt[] / swl_rt[] / swl_rs[] with a higher
++ * .run and a step function, the checks in swl_wr() do not change.
++ *
++ * swl_wr() checks, in this order: not stopped, tuple exists (space, window, offset, value), run <= level - 2, tuple not consumed,
++ * predecessor done, phase flags set, bank rule state, the 0120 preconditions re-read (link L0, ATU r0/r1/r2, EP Command, BAR0),
++ * the live BAR0 window equals the tuple's, old value read and not all-ones, old/companion conditions; then it writes and reads back
++ * under the tuple's mask. Any failure latches STOPPED, runs the restore of the armed groups and returns a negative code.
++ */
++#ifndef SWEET_WLAN_WR_H
++#define SWEET_WLAN_WR_H
++
++#include <stdint.h>
++#include "sweet_wlan_chip.h"
++
++/* Pinned values (CR-04): tcm and atu_r2_off equal soc.json wlan (tools/test_mkadt_wlan.py compares them); the rest is cited at the use. */
++#define SWW_TCM_PA      0x60400000u     /* BAR2 CPU range = soc.json wlan.tcm: assigned by S28 (cfg 0x18 := 0x60400004), PCI address == CPU address */
++#define SWW_TCM_BYTES   0x400000u       /* soc.json wlan.tcm_bytes: 4 MiB, S28 sizing readback 0xFFC00000 */
++#define SWW_ATU_R2      0x400u          /* soc.json wlan.atu_r2_off: outbound iATU region 2 inside the atu block (pcie-exynos-rc.h:302-308) */
++#define SWW_ATU_ENABLE  0x80000000u     /* CR2 bit 31 (pcie-exynos-rc.h EXYNOS_PCIE_ATU_ENABLE) */
++#define SWW_BAR2_CFG    (SWW_TCM_PA | 0x4u)     /* cfg 0x18 as S28 left it: 64-bit memory BAR (observed run w3a-n33) */
++#define SWW_CFG88       0x00080080u     /* PCI_SPROM_CONTROL as observed (runs w3a-n33, w3a-n28c); DHD dhd_pcie.c:2165 aborts on all-ones */
++#define SWW_RAM_BASE    0x200000u       /* CA7_4389_RAM_BASE, include_sbchipc.h:4169, dhd_pcie.c:2348-2351 */
++#define SWW_RAM_MAX     0x400000u       /* DONGLE_TCM_MAP_SIZE, dhd_pcie.h:42; dhd_pcie.c:2453 fails attach above it */
++#define SWW_RAM_MIN     1791226u        /* 1764018 B image + 27208 B vars/token/rTLV bound (docs/research/43 s.2 fit arithmetic) */
++#define SWW_NRB         8u              /* SYS_MEM rev 9 coreinfo 0x115: (coreinfo & 0x3E0) >> 5 (siutils.c:7036-7041; observed run w3a-n36 row 1379) */
++#define SWW_NB          21u             /* coreinfo & 0x1F */
++#define SWW_BANK_ROM    0x80u           /* SYSMEM_BANKIDX_ROM_MASK (g4389-include_sbsysmem.h:164): a RAM bank index stays below it */
++#define SWW_BANK_SZBASE 8192u           /* SYSMEM_BANKINFO_SZBASE */
++#define SWW_BANK_SZMASK 0x7Fu           /* SYSMEM_BANKINFO_SZMASK */
++#define SWW_SRPWR       0x1E8u          /* PCIe core powerctl (shim S34, include_pcie_core.h:296) */
++#define SWW_SRPWR_REQ1  0x200u          /* PowerOnRequest[11:8] domain 1 (SRPWR_REQON_SHIFT 8, include_sbchipc.h:5199) */
++#define SWW_SRPWR_ST1   0x20000u        /* ExtPwrStatus[19:16] domain 1 (SRPWR_STATUS_SHIFT 16, include_sbchipc.h:5202) */
++#define SWW_SM_COREINFO 0x00u           /* sysmemregs (g4389-include_sbsysmem.h:37-56) */
++#define SWW_SM_BANKIDX  0x10u
++#define SWW_SM_BANKINFO 0x40u
++#define SWW_CFG_WIN     0x80u           /* BAR0 window (include_pcicfg.h:488) */
++#define SWW_CFG_WIN2    0x84u           /* BAR2 window (include_pcicfg.h:489) */
++#define SWW_IOCTL_MASK  0x3FFFu
++#define SWW_WIN_PCIE    0x18001000u     /* EROM-decoded core pages, observed run w3a-n33 */
++#define SWW_WIN_SYSMEM  0x18026000u
++#define SWW_WIN_SMWRAP  0x18126000u
++#define SWW_WIN_CA7WRAP 0x18120000u
++#define SWW_R2(n)       (SWW_ATU_R2 + (n))      /* CR1 +0, CR2 +4, LOWER_BASE +8, UPPER_BASE +0xC, LIMIT +0x10, LOWER_TARGET +0x14, UPPER_TARGET +0x18 */
++#define SWW_LEVEL0      2               /* sweetwlan level N runs the runs up to N - SWW_LEVEL0 (level 3 = run A) */
++
++enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
++
++/* phase flags (what the steps proved), required by swl_wt[].need */
++#define SWF_W0      0x001u
++#define SWF_W1      0x002u
++#define SWF_W2      0x004u      /* ATU region 2 enabled and read back: from here the preconditions also pin it */
++#define SWF_MAPPED  0x008u
++#define SWF_W3      0x010u
++#define SWF_W4      0x020u
++#define SWF_W5      0x040u
++#define SWF_W6      0x080u
++#define SWF_W7      0x100u
++
++#define SWW_RG_ATU2 1u          /* restore groups, armed by the first store of a tuple that names one */
++#define SWW_RG_SM   2u
++#define SWW_RG_CA   4u
++
++#define SWT_ONCE    1u          /* consumed on success */
++#define SWT_BANK    2u          /* the value is nrb + k, k ascending, one write per k, k < nb */
++#define SWT_WIN     4u          /* cfg window select: the old window must be a known one */
++
++enum {
++	SWW_E_STOPPED = 1, SWW_E_DENIED, SWW_E_LEVEL, SWW_E_REPEAT, SWW_E_ORDER, SWW_E_PHASE, SWW_E_BANK, SWW_E_PRE, SWW_E_WIN, SWW_E_RD,
++	SWW_E_DEAD, SWW_E_OLD, SWW_E_COMP, SWW_E_WR, SWW_E_READBACK, SWW_E_STATE, SWW_E_WAIT, SWW_E_SRPWR, SWW_E_RAM, SWW_E_MAP, SWW_E_LAST
++};
++
++enum { SWW_RS_NONE, SWW_RS_OK, SWW_RS_FAILED, SWW_RS_SKIPPED };
++
++struct swl_wt {                 /* one allowed write */
++	uint8_t row, run, space, rgrp, flags, pred1;    /* pred1 = predecessor tuple index + 1 (0 none) */
++	uint32_t win, off, val, vmask;                  /* BAR0/BAR2 window (0 otherwise), offset, value, read-back mask */
++	uint32_t omask, oval;                           /* (old & omask) == oval, omask 0 = no condition */
++	uint32_t coff, cmask, cval;                     /* (companion register at coff & cmask) == cval, cmask 0 = none */
++	uint32_t need;                                  /* phase flags required */
++};
++
++struct swl_rt { uint8_t run, space; uint32_t win, lo, hi; };    /* one allowed read range (4-aligned offsets lo..hi) */
++struct swl_rs { uint8_t grp, space; uint32_t win, off, val, vmask; };   /* one restore write */
++
++enum {
++	SWT_ATU_BASE, SWT_ATU_LIMIT, SWT_ATU_TARGET, SWT_ATU_CR2,
++	SWT_SM_ASSERT, SWT_SM_IOCTL_MID, SWT_SM_RELEASE, SWT_SM_IOCTL_END,
++	SWT_BANK_IDX,
++	SWT_CA_ASSERT, SWT_CA_IOCTL_MID, SWT_CA_RELEASE, SWT_CA_IOCTL_END,
++	SWT_WIN_PCIE, SWT_WIN_SMWRAP, SWT_WIN_SYSMEM, SWT_WIN_CA7,
++	SWT_N
++};
++
++/*
++ * The write allowlist. Deny by default (CR-25): a store that matches no row does not happen. Values: ATU region 2 in the order of
++ * pcie-exynos-rc.c:1474-1483 (CR1/UPPER_* stay 0; base, limit, target, CR2 last); the reset sequences of Broadcom _ai_core_reset
++ * (aiutils.c:1242-1325) with the IOCTL value of the middle step 0x3 (SYS_MEM, bits = resetbits = 0) / 0x23 (CA7, SICF_CPUHALT 0x20 twice,
++ * dhd_pcie.c:10123-10125) as proven by shim runs w3a-n35/n36 (memw_ok, shim/wlanlink.c); bankidx per siutils.c:6971.
++ */
++static const struct swl_wt swl_wt[SWT_N] = {
++	[SWT_ATU_BASE]   = { .row = 2, .run = 1, .space = SWW_ATU, .flags = SWT_ONCE, .off = SWW_R2(0x08), .val = SWW_TCM_PA, .vmask = 0xFFFFFFFFu, .need = SWF_W0 | SWF_W1 },
++	[SWT_ATU_LIMIT]  = { .row = 2, .run = 1, .space = SWW_ATU, .flags = SWT_ONCE, .pred1 = SWT_ATU_BASE + 1, .off = SWW_R2(0x10), .val = SWW_TCM_PA + (SWW_TCM_BYTES - 1u), .vmask = 0xFFFFFFFFu, .need = SWF_W0 | SWF_W1 },
++	[SWT_ATU_TARGET] = { .row = 2, .run = 1, .space = SWW_ATU, .flags = SWT_ONCE, .pred1 = SWT_ATU_LIMIT + 1, .off = SWW_R2(0x14), .val = SWW_TCM_PA, .vmask = 0xFFFFFFFFu, .need = SWF_W0 | SWF_W1 },
++	[SWT_ATU_CR2]    = { .row = 2, .run = 1, .space = SWW_ATU, .rgrp = SWW_RG_ATU2, .flags = SWT_ONCE, .pred1 = SWT_ATU_TARGET + 1, .off = SWW_R2(0x04), .val = SWW_ATU_ENABLE, .vmask = 0xFFFFFFFFu,
++	                    .omask = SWW_ATU_ENABLE, .oval = 0, .need = SWF_W0 | SWF_W1 },
++
++	[SWT_SM_ASSERT]     = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u, .vmask = 1u, .need = SWF_W3 },
++	[SWT_SM_IOCTL_MID]  = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .pred1 = SWT_SM_ASSERT + 1, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_IOCTL, .val = 0x3u, .vmask = SWW_IOCTL_MASK,
++	                       .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 1u, .need = SWF_W3 },
++	[SWT_SM_RELEASE]    = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .pred1 = SWT_SM_IOCTL_MID + 1, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_RESET_CTL, .val = 0u, .vmask = 1u,
++	                       .coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = 0x3u, .need = SWF_W3 },
++	[SWT_SM_IOCTL_END]  = { .row = 4, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_SM, .flags = SWT_ONCE, .pred1 = SWT_SM_RELEASE + 1, .win = SWW_WIN_SMWRAP, .off = SWL_AGENT_IOCTL, .val = 0x1u, .vmask = SWW_IOCTL_MASK,
++	                       .omask = SWW_IOCTL_MASK, .oval = 0x3u, .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 0u, .need = SWF_W3 },
++
++	[SWT_BANK_IDX]      = { .row = 5, .run = 1, .space = SWW_BAR0, .flags = SWT_BANK, .win = SWW_WIN_SYSMEM, .off = SWW_SM_BANKIDX, .vmask = 0xFFFFFFFFu,
++	                       .coff = SWW_SM_COREINFO, .cmask = 0x3FFu, .cval = (SWW_NRB << 5) | SWW_NB, .need = SWF_W4 },
++
++	[SWT_CA_ASSERT]     = { .row = 6, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u, .vmask = 1u, .need = SWF_W5 },
++	[SWT_CA_IOCTL_MID]  = { .row = 6, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_CA_ASSERT + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_IOCTL, .val = 0x23u, .vmask = SWW_IOCTL_MASK,
++	                       .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 1u, .need = SWF_W5 },
++	[SWT_CA_RELEASE]    = { .row = 6, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_CA_IOCTL_MID + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 0u, .vmask = 1u,
++	                       .coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = 0x23u, .need = SWF_W5 },
++	[SWT_CA_IOCTL_END]  = { .row = 6, .run = 1, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_CA_RELEASE + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_IOCTL, .val = 0x21u, .vmask = SWW_IOCTL_MASK,
++	                       .omask = SWW_IOCTL_MASK, .oval = 0x23u, .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 0u, .need = SWF_W5 },
++
++	/* BAR0 window selects (cfg 0x80): one row per window run A visits, reusable (no SWT_ONCE) */
++	[SWT_WIN_PCIE]   = { .row = 3, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_PCIE, .vmask = 0xFFFFFFFFu, .need = SWF_W2 | SWF_MAPPED },
++	[SWT_WIN_SMWRAP] = { .row = 4, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_SMWRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W3 },
++	[SWT_WIN_SYSMEM] = { .row = 5, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_SYSMEM, .vmask = 0xFFFFFFFFu, .need = SWF_W4 },
++	[SWT_WIN_CA7]    = { .row = 6, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_CA7WRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W5 },
++};
++
++/* The read allowlist (every read of run A, including the ones of the preconditions). */
++static const struct swl_rt swl_rt[] = {
++	{ 1, SWW_ISO, 0, 0, 0 },
++	{ 1, SWW_ELBI, 0, 0x2C8u, 0x2C8u },
++	{ 1, SWW_ATU, 0, 0x000u, 0x018u },
++	{ 1, SWW_ATU, 0, 0x200u, 0x218u },
++	{ 1, SWW_ATU, 0, SWW_R2(0), SWW_R2(0x18) },
++	{ 1, SWW_CFG, 0, 0x04u, 0x04u },
++	{ 1, SWW_CFG, 0, 0x10u, 0x1Cu },
++	{ 1, SWW_CFG, 0, SWW_CFG_WIN, SWW_CFG_WIN2 },
++	{ 1, SWW_CFG, 0, 0x88u, 0x88u },
++	{ 1, SWW_BAR0, SWW_WIN_PCIE, SWW_SRPWR, SWW_SRPWR },
++	{ 1, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_COREINFO, SWW_SM_COREINFO },
++	{ 1, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKIDX, SWW_SM_BANKIDX },
++	{ 1, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKINFO, SWW_SM_BANKINFO },
++	{ 1, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_IOCTL, SWL_AGENT_IOCTL },
++	{ 1, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_CTL, SWL_AGENT_RESET_ST },
++	{ 1, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_IOCTL, SWL_AGENT_IOCTL },
++	{ 1, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, SWL_AGENT_RESET_ST },
++	{ 1, SWW_BAR2, 0, SWW_RAM_BASE, SWW_RAM_BASE },
++	{ 1, SWW_BAR2, 0, 0, 0 },
++};
++
++/* Restore: what XNU itself writes at a STOP (docs/research/43 s.2 "Restore at STOP"), only for the groups armed by the failing step. */
++static const struct swl_rs swl_rs[] = {
++	{ SWW_RG_ATU2, SWW_ATU, 0, SWW_R2(0x04), 0u, SWW_ATU_ENABLE },
++	{ SWW_RG_SM, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
++	{ SWW_RG_CA, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
++};
++
++struct swl_wbus {
++	int (*rd)(void *ctx, int space, uint32_t win, uint32_t off, uint32_t *v);       /* nonzero: refused or failed; BAR0/BAR2 compare the live window with win */
++	int (*wr)(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v);        /* THE store; nonzero: refused; called only by swl_store() */
++	int (*map2)(void *ctx);                                                         /* ml_io_map of BAR2, after region 2 is enabled */
++	void (*delay_us)(void *ctx, unsigned us);
++	void *ctx;
++};
++
++struct swl_wx {
++	const struct swl_wbus *b;
++	int level, stopped, stop_code, restore;
++	unsigned row, nbank, nrb, nb, nstore;
++	uint32_t done, flags, armed, ram_bytes;
++};
++
++static inline const char *
++swl_ename(int c)
++{
++	static const char *const n[SWW_E_LAST] = { "none", "stopped", "no tuple", "level", "repeat", "order", "phase", "bank rule", "precondition", "window", "read",
++	                                           "dead read", "old value", "companion", "store", "read-back", "state", "wait", "srpwr", "ram size", "map" };
++	return c > 0 && c < SWW_E_LAST ? n[c] : "?";
++}
++
++static inline const char *
++swl_rsname(int r)
++{
++	return r == SWW_RS_OK ? "ok" : r == SWW_RS_FAILED ? "failed" : r == SWW_RS_SKIPPED ? "skipped" : "none";
++}
++
++/* ---- reads ---- */
++
++static inline int
++swl_rd_find(int space, uint32_t win, uint32_t off)
++{
++	unsigned i;
++
++	for (i = 0; i < sizeof swl_rt / sizeof swl_rt[0]; i++) {
++		if (swl_rt[i].space == space && swl_rt[i].win == win && off >= swl_rt[i].lo && off <= swl_rt[i].hi && (off & 3u) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* a table read, not gated by the stopped latch (preconditions and restore use it) */
++static inline int
++swl_rdx(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t *v)
++{
++	int i = swl_rd_find(space, win, off);
++
++	if (i < 0 || (int)swl_rt[i].run > x->level - SWW_LEVEL0) {
++		printf("SWEET WLAN: read space %d win %#x off %#x refused\n", space, win, off);
++		return -1;
++	}
++	return x->b->rd(x->b->ctx, space, win, off, v);
++}
++
++/* ---- the guard ---- */
++
++/* tuple index of (space, window, offset, value) or -1: the whole allowlist decision that needs no state */
++static inline int
++swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
++{
++	unsigned i;
++
++	for (i = 0; i < SWT_N; i++) {
++		const struct swl_wt *p = &swl_wt[i];
++
++		if (p->space != space || p->win != win || p->off != off) {
++			continue;
++		}
++		if (p->flags & SWT_BANK) {
++			if (val < SWW_BANK_ROM) {
++				return (int)i;
++			}
++		} else if (p->val == val) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static inline int
++swl_win_known(uint32_t w)
++{
++	unsigned i;
++
++	if (swl_win_ok(w, 2)) {
++		return 1;
++	}
++	for (i = 0; i < SWT_N; i++) {
++		if (swl_wt[i].space == SWW_CFG && swl_wt[i].off == SWW_CFG_WIN && swl_wt[i].val == w) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* The 0120 preconditions, re-read: PHY isolation, link L0, ATU r0/r1 (and r2 once enabled), EP Command MEM-only, BAR0. 0 = ok. */
++static inline int
++swl_wpre(struct swl_wx *x)
++{
++	static const uint32_t w2[7] = { 0u, SWW_ATU_ENABLE, SWW_TCM_PA, 0u, SWW_TCM_PA + (SWW_TCM_BYTES - 1u), SWW_TCM_PA, 0u };
++	uint32_t iso, ltssm, cmd, b0, b1, a0[7], a1[7], r2;
++	unsigned i;
++	int bad;
++
++	if (swl_rdx(x, SWW_ISO, 0, 0, &iso) || swl_rdx(x, SWW_ELBI, 0, 0x2C8u, &ltssm)) {
++		return 8;
++	}
++	for (i = 0; i < 7; i++) {
++		if (swl_rdx(x, SWW_ATU, 0, 4u * i, &a0[i]) || swl_rdx(x, SWW_ATU, 0, 0x200u + 4u * i, &a1[i])) {
++			return 8;
++		}
++	}
++	bad = swl_pre_link(iso, ltssm, a0, a1);
++	if (bad) {
++		return bad;
++	}
++	if (swl_rdx(x, SWW_CFG, 0, 0x04u, &cmd) || swl_rdx(x, SWW_CFG, 0, 0x10u, &b0) || swl_rdx(x, SWW_CFG, 0, 0x14u, &b1)) {
++		return 8;
++	}
++	bad = swl_pre_ep(cmd, b0, b1);
++	if (bad) {
++		return bad;
++	}
++	if (x->flags & SWF_W2) {
++		for (i = 0; i < 7; i++) {
++			if (swl_rdx(x, SWW_ATU, 0, SWW_R2(4u * i), &r2)) {
++				return 8;
++			}
++			if (r2 != w2[i]) {
++				return 7;
++			}
++		}
++	}
++	return 0;
++}
++
++static inline int
++swl_store(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t v)
++{
++	x->nstore++;
++	return x->b->wr(x->b->ctx, space, win, off, v);
++}
++
++/* restore of the groups the failing step armed; each write from swl_rs[], read back, BAR0 ones only while the preconditions still hold */
++static inline void
++swl_restore(struct swl_wx *x)
++{
++	unsigned i;
++	uint32_t live, rb;
++	int bad = 0, did = 0, skipped = 0, pre = -1, ok;
++
++	for (i = 0; i < sizeof swl_rs / sizeof swl_rs[0]; i++) {
++		const struct swl_rs *r = &swl_rs[i];
++
++		if (!(x->armed & r->grp)) {
++			continue;
++		}
++		x->armed &= ~r->grp;
++		if (r->space == SWW_BAR0) {
++			if (pre < 0) {
++				pre = swl_wpre(x);
++			}
++			if (pre) {
++				printf("SWEET WLAN: restore of group %u skipped, precondition %d\n", r->grp, pre);
++				skipped = 1;
++				continue;
++			}
++			if (swl_rdx(x, SWW_CFG, 0, SWW_CFG_WIN, &live)) {
++				bad = 1;
++				continue;
++			}
++			if (live != r->win && (swl_store(x, SWW_CFG, 0, SWW_CFG_WIN, r->win) || swl_rdx(x, SWW_CFG, 0, SWW_CFG_WIN, &live) || live != r->win)) {
++				bad = 1;
++				continue;
++			}
++		}
++		did = 1;
++		ok = !swl_store(x, r->space, r->win, r->off, r->val) && !swl_rdx(x, r->space, r->win, r->off, &rb) && !((rb ^ r->val) & r->vmask);
++		printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", r->space, r->win, r->off, r->val, ok ? "ok" : "FAILED");
++		bad |= !ok;
++	}
++	x->restore = bad ? SWW_RS_FAILED : skipped ? SWW_RS_SKIPPED : did ? SWW_RS_OK : SWW_RS_NONE;
++}
++
++/* the first failure latches STOPPED, records the row and runs the restore; returns the negative code */
++static inline int
++swl_stop(struct swl_wx *x, int code)
++{
++	if (!x->stopped) {
++		x->stopped = 1;
++		x->stop_code = code;
++		printf("SWEET WLAN: W%u STOP: %s (code %d)\n", x->row, swl_ename(code), code);
++		swl_restore(x);
++	}
++	return -code;
++}
++
++/* THE writer of stage 3 (docs/research/43 s.3): 0 = written and read back equal, else negative and STOPPED */
++static inline int
++swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
++{
++	const struct swl_wt *p;
++	uint32_t old = 0, comp = 0, live = 0, rb = 0;
++	int t;
++
++	if (x->stopped) {
++		return -SWW_E_STOPPED;
++	}
++	t = swl_wr_ok(space, win, off, val);
++	if (t < 0) {
++		return swl_stop(x, SWW_E_DENIED);
++	}
++	p = &swl_wt[t];
++	if ((int)p->run > x->level - SWW_LEVEL0) {
++		return swl_stop(x, SWW_E_LEVEL);
++	}
++	if ((p->flags & SWT_ONCE) && (x->done & (1u << t))) {
++		return swl_stop(x, SWW_E_REPEAT);
++	}
++	if (p->pred1 && !(x->done & (1u << (p->pred1 - 1u)))) {
++		return swl_stop(x, SWW_E_ORDER);
++	}
++	if ((x->flags & p->need) != p->need) {
++		return swl_stop(x, SWW_E_PHASE);
++	}
++	if ((p->flags & SWT_BANK) && (x->nrb != SWW_NRB || x->nb != SWW_NB || x->nbank >= x->nb || val != x->nrb + x->nbank)) {
++		return swl_stop(x, SWW_E_BANK);
++	}
++	if (swl_wpre(x)) {
++		return swl_stop(x, SWW_E_PRE);
++	}
++	if (p->space == SWW_BAR0 && (swl_rdx(x, SWW_CFG, 0, SWW_CFG_WIN, &live) || live != p->win)) {
++		return swl_stop(x, SWW_E_WIN);
++	}
++	if (swl_rdx(x, space, win, off, &old)) {
++		return swl_stop(x, SWW_E_RD);
++	}
++	if (old == 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	if ((p->omask && (old & p->omask) != p->oval) || ((p->flags & SWT_WIN) && !swl_win_known(old))) {
++		return swl_stop(x, SWW_E_OLD);
++	}
++	if (p->cmask && (swl_rdx(x, space, win, p->coff, &comp) || (comp & p->cmask) != p->cval)) {
++		return swl_stop(x, SWW_E_COMP);
++	}
++	x->armed |= p->rgrp;
++	if (swl_store(x, space, win, off, val)) {
++		return swl_stop(x, SWW_E_WR);
++	}
++	if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {
++		return swl_stop(x, SWW_E_READBACK);
++	}
++	x->done |= 1u << t;
++	if (p->flags & SWT_BANK) {
++		x->nbank++;
++	}
++	return 0;
++}
++
++/* ---- the steps of run A (rows W0..W7 of docs/research/43 s.2) ---- */
++
++#define SWW_TRY(e) do { int rc_ = (e); if (rc_) { return rc_; } } while (0)
++#define SWW_RD(x, sp, w, o, v) do { if (swl_rd((x), (sp), (w), (o), &(v))) { return swl_stop((x), SWW_E_RD); } } while (0)
++
++static inline int
++swl_rd(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t *v)
++{
++	return x->stopped ? -1 : swl_rdx(x, space, win, off, v);
++}
++
++static inline void
++swl_delay(struct swl_wx *x, unsigned us)
++{
++	x->b->delay_us(x->b->ctx, us);
++}
++
++/* a step that finished: its restore groups are no longer armed (the note's "Restore at STOP" is per row) */
++static inline int
++swl_done(struct swl_wx *x, uint32_t flag)
++{
++	x->armed = 0;
++	x->flags |= flag;
++	return 0;
++}
++
++static inline int
++swl_win(struct swl_wx *x, uint32_t win)
++{
++	return swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN, win);
++}
++
++/* poll (space BAR0, win, off) & mask == want, polls reads, us apart (the shim wait_eq rows) */
++static inline int
++swl_wait(struct swl_wx *x, uint32_t win, uint32_t off, uint32_t mask, uint32_t want, unsigned polls, unsigned us)
++{
++	uint32_t v = 0;
++	unsigned i;
++
++	for (i = 0; i < polls; i++) {
++		SWW_RD(x, SWW_BAR0, win, off, v);
++		if ((v & mask) == want) {
++			return 0;
++		}
++		if (i + 1 < polls) {
++			swl_delay(x, us);
++		}
++	}
++	printf("SWEET WLAN: W%u wait win %#x off %#x & %#x == %#x failed (last %#x)\n", x->row, win, off, mask, want, v);
++	return swl_stop(x, SWW_E_WAIT);
++}
++
++/* W0: entry state, nothing written */
++static inline int
++swl_w0(struct swl_wx *x)
++{
++	uint32_t cmd, lo, hi, w84, s88;
++
++	x->row = 0;
++	if (swl_wpre(x)) {
++		return swl_stop(x, SWW_E_PRE);
++	}
++	SWW_RD(x, SWW_CFG, 0, 0x04u, cmd);
++	SWW_RD(x, SWW_CFG, 0, 0x18u, lo);
++	SWW_RD(x, SWW_CFG, 0, 0x1Cu, hi);
++	SWW_RD(x, SWW_CFG, 0, SWW_CFG_WIN2, w84);
++	SWW_RD(x, SWW_CFG, 0, 0x88u, s88);
++	printf("SWEET WLAN: W0 EP command %#x BAR2 %#x %#x cfg84 %#x cfg88 %#x\n", cmd, lo, hi, w84, s88);
++	if (lo != SWW_BAR2_CFG || hi != 0 || w84 != 0 || s88 != SWW_CFG88) {
++		return swl_stop(x, SWW_E_STATE);
++	}
++	return swl_done(x, SWF_W0);
++}
++
++/* W1: region 2 pre-reads, nothing written */
++static inline int
++swl_w1(struct swl_wx *x)
++{
++	uint32_t r[7];
++	unsigned i;
++
++	x->row = 1;
++	for (i = 0; i < 7; i++) {
++		SWW_RD(x, SWW_ATU, 0, SWW_R2(4u * i), r[i]);
++	}
++	printf("SWEET WLAN: W1 ATU r2 %#x %#x %#x %#x %#x %#x %#x\n", r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
++	if (r[0] != 0 || r[3] != 0 || r[6] != 0 || (r[1] & SWW_ATU_ENABLE)) {
++		return swl_stop(x, SWW_E_STATE);
++	}
++	return swl_done(x, SWF_W1);
++}
++
++/* W2: region 2 over BAR2 (base, limit, target, CR2 last), every word read back by swl_wr; then the BAR2 mapping */
++static inline int
++swl_w2(struct swl_wx *x)
++{
++	uint32_t r[7];
++	unsigned i;
++
++	x->row = 2;
++	SWW_TRY(swl_wr(x, SWW_ATU, 0, SWW_R2(0x08), SWW_TCM_PA));
++	SWW_TRY(swl_wr(x, SWW_ATU, 0, SWW_R2(0x10), SWW_TCM_PA + (SWW_TCM_BYTES - 1u)));
++	SWW_TRY(swl_wr(x, SWW_ATU, 0, SWW_R2(0x14), SWW_TCM_PA));
++	SWW_TRY(swl_wr(x, SWW_ATU, 0, SWW_R2(0x04), SWW_ATU_ENABLE));
++	for (i = 0; i < 7; i++) {
++		SWW_RD(x, SWW_ATU, 0, SWW_R2(4u * i), r[i]);
++	}
++	printf("SWEET WLAN: W2 ATU r2 %#x %#x %#x %#x %#x %#x %#x\n", r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
++	swl_done(x, SWF_W2);
++	if (x->b->map2(x->b->ctx)) {
++		x->armed = SWW_RG_ATU2;
++		return swl_stop(x, SWW_E_MAP);
++	}
++	printf("SWEET WLAN: W2 BAR2 mapped %#x + %#x\n", SWW_TCM_PA, SWW_TCM_BYTES);
++	return swl_done(x, SWF_MAPPED);
++}
++
++/* W3: SRPWR is READ-ONLY here: domain 1 (ARM/BP) must already be requested and up (the shim left it so, S34); no tuple writes it */
++static inline int
++swl_w3(struct swl_wx *x)
++{
++	uint32_t v;
++
++	x->row = 3;
++	SWW_TRY(swl_win(x, SWW_WIN_PCIE));
++	SWW_RD(x, SWW_BAR0, SWW_WIN_PCIE, SWW_SRPWR, v);
++	printf("SWEET WLAN: W3 SRPWR powerctl %#x\n", v);
++	if (v == 0xFFFFFFFFu || !(v & SWW_SRPWR_REQ1) || !(v & SWW_SRPWR_ST1)) {
++		return swl_stop(x, SWW_E_SRPWR);
++	}
++	return swl_done(x, SWF_W3);
++}
++
++/* Broadcom _ai_core_reset(0, 0 or CPUHALT) of the wrapper at win, with the waits of shim steps S35/S36 (30 x 10 us on RESET_ST) */
++static inline int
++swl_core_reset(struct swl_wx *x, uint32_t win, uint32_t mid, uint32_t end)
++{
++	uint32_t io, ctl, st;
++
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 1u));
++	swl_delay(x, 10);
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_CTL, 1u, 1u, 1, 0));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_IOCTL, mid));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_IOCTL, SWW_IOCTL_MASK, mid, 1, 0));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 0u));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_CTL, 1u, 0u, 10, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_IOCTL, end));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_IOCTL, SWW_IOCTL_MASK, end, 1, 0));
++	swl_delay(x, 1);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_IOCTL, io);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, ctl);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_RESET_ST, st);
++	printf("SWEET WLAN: W%u wrapper %#x after reset: ioctl %#x reset_ctl %#x reset_st %#x\n", x->row, win, io, ctl, st);
++	if ((io & SWW_IOCTL_MASK) != end || (ctl & 1u) != 0 || st != 0) {
++		return swl_stop(x, SWW_E_STATE);
++	}
++	return 0;
++}
++
++/* W4: SYS_MEM wrapper reset (the core must be up before its banks are read) */
++static inline int
++swl_w4(struct swl_wx *x)
++{
++	uint32_t io, ctl, st;
++
++	x->row = 4;
++	SWW_TRY(swl_win(x, SWW_WIN_SMWRAP));
++	SWW_RD(x, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_IOCTL, io);
++	SWW_RD(x, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_CTL, ctl);
++	SWW_RD(x, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_ST, st);
++	printf("SWEET WLAN: W4 SYS_MEM wrapper before: ioctl %#x reset_ctl %#x reset_st %#x\n", io, ctl, st);
++	SWW_TRY(swl_core_reset(x, SWW_WIN_SMWRAP, 0x3u, 0x1u));
++	return swl_done(x, SWF_W4);
++}
++
++/* W5: the RAM size = sum over the RAM banks (siutils.c:6966-6976, 7049-7050): bankidx := nrb + k, 10 us, bankinfo */
++static inline int
++swl_w5(struct swl_wx *x)
++{
++	uint32_t ci, bi, sz, sum = 0;
++	unsigned k;
++
++	x->row = 5;
++	SWW_TRY(swl_win(x, SWW_WIN_SYSMEM));
++	SWW_RD(x, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_COREINFO, ci);
++	printf("SWEET WLAN: W5 SYS_MEM coreinfo %#x nrb %u nb %u\n", ci, (ci & 0x3E0u) >> 5, ci & 0x1Fu);
++	if (ci == 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	x->nrb = (ci & 0x3E0u) >> 5;
++	x->nb = ci & 0x1Fu;
++	if (x->nrb != SWW_NRB || x->nb != SWW_NB || x->nrb + x->nb > SWW_BANK_ROM) {
++		x->nrb = x->nb = 0;
++		return swl_stop(x, SWW_E_BANK);
++	}
++	for (k = 0; k < x->nb; k++) {
++		SWW_TRY(swl_wr(x, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKIDX, x->nrb + k));
++		swl_delay(x, 10);
++		SWW_RD(x, SWW_BAR0, SWW_WIN_SYSMEM, SWW_SM_BANKINFO, bi);
++		if (bi == 0xFFFFFFFFu) {
++			return swl_stop(x, SWW_E_DEAD);
++		}
++		sz = SWW_BANK_SZBASE * ((bi & SWW_BANK_SZMASK) + 1u);
++		sum += sz;
++		printf("SWEET WLAN: W5 bank %u bankinfo %#x size %#x\n", x->nrb + k, bi, sz);
++	}
++	x->ram_bytes = sum;
++	printf("SWEET WLAN: W5 RAM %#x bytes, ram_end %#x\n", sum, SWW_RAM_BASE + sum);
++	if (sum > SWW_RAM_MAX || sum < SWW_RAM_MIN) {
++		return swl_stop(x, SWW_E_RAM);
++	}
++	return swl_done(x, SWF_W5);
++}
++
++/* W6: CA7 halt (CPUHALT stays set; the core is NOT released) */
++static inline int
++swl_w6(struct swl_wx *x)
++{
++	x->row = 6;
++	SWW_TRY(swl_win(x, SWW_WIN_CA7WRAP));
++	SWW_TRY(swl_core_reset(x, SWW_WIN_CA7WRAP, 0x23u, 0x21u));
++	return swl_done(x, SWF_W6);
++}
++
++/* W7: the first two BAR2 reads, backplane 0x200000 (RAM base) and 0; cfg 0x84 must still be 0 so BAR2 offset == backplane address */
++static inline int
++swl_w7(struct swl_wx *x)
++{
++	uint32_t w84, a, b;
++
++	x->row = 7;
++	if (swl_wpre(x)) {
++		return swl_stop(x, SWW_E_PRE);
++	}
++	SWW_RD(x, SWW_CFG, 0, SWW_CFG_WIN2, w84);
++	if (w84 != 0) {
++		return swl_stop(x, SWW_E_STATE);
++	}
++	SWW_RD(x, SWW_BAR2, 0, SWW_RAM_BASE, a);
++	SWW_RD(x, SWW_BAR2, 0, 0, b);
++	printf("SWEET WLAN: W7 BAR2 [%#x] %#x [0] %#x\n", SWW_RAM_BASE, a, b);
++	if (a == 0xFFFFFFFFu || b == 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	return swl_done(x, SWF_W7);
++}
++
++/* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
++static inline int
++swl_stage3(struct swl_wx *x)
++{
++	int rc;
++
++	if (x->level < SWW_LEVEL0 + 1) {
++		return -SWW_E_LEVEL;
++	}
++	rc = swl_w0(x);
++	rc = rc ? rc : swl_w1(x);
++	rc = rc ? rc : swl_w2(x);
++	rc = rc ? rc : swl_w3(x);
++	rc = rc ? rc : swl_w4(x);
++	rc = rc ? rc : swl_w5(x);
++	rc = rc ? rc : swl_w6(x);
++	rc = rc ? rc : swl_w7(x);
++	if (rc) {
++		printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
++		return rc;
++	}
++	printf("SWEET WLAN: stage 3 level %d done ram_end=%#x banks=%u\n", x->level, SWW_RAM_BASE + x->ram_bytes, x->nbank);
++	return 0;
++}
++
++#endif /* SWEET_WLAN_WR_H */
