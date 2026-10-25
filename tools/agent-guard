@@ -26,7 +26,7 @@ E13 --wlan-link=N not in the shim/build.sh host-test loop (AP-13), E14 backgroun
 E15 find / (AP-24), E16 find .claude without prune (AP-35), E17 glob that expands to -names (AP-34), E18 grep without -a / --binary-files=text on Apple
 sources (AP-53), E19 7z e/x of an iOS root image (AP-54), E20 rea.sh in a foreground loop (AP-56), E21 ipsw disass --quiet (AP-46),
 E22 a shared runner/gate tool (SHARED_TOOLS) or shim/build.sh alone committed in the kernel repo off trunk/tools/* (AP-58; exempt: detached HEAD, merge/pick/revert in
-progress, EMERGENCY-TOOL-FIX in the command). Known gaps (read from this code): E8b follows redirects only when the line has
+progress, EMERGENCY-TOOL-FIX in the command), E23 a phone run (tools/xrun, or phone-lock run -- xrun) without --intent NAME (a key of tools/run-intents.json) or --intent none (AP-69; --dry-run/--help exempt; a script that calls xrun is not seen). Known gaps (read from this code): E8b follows redirects only when the line has
 no cd, and not inside bash -c; E13/E22 skip an unknown dir; E14 margin 60 s is a guess (as run-preflight --margin); E18 only knows the
 paths sweet_hfs, xnu-pristine, localbuild/work/; E22 also counts what `git add` (same repo), `commit -a` and `commit PATH` add; E22 skips bash -c, GIT_DIR=, git aliases.
 
@@ -1066,6 +1066,35 @@ def r_e22(c):
     return verdict("E22", seen, bad) if seen else None
 
 
+def intent_names():
+    """known intents of tools/run-intents.json (the table tools/xrun checks); [] if unreadable (the rule then only accepts `none`)."""
+    try:
+        return sorted(json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "run-intents.json")))["intents"])
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def r_e23(c):
+    runs = []
+    for p, a, _, _ in c.heads:
+        if p == "xrun":
+            runs.append(a)
+        elif p == "phone-lock" and "run" in a:
+            k = [i for i, x in enumerate(a) if os.path.basename(x) == "xrun"]
+            if k:
+                runs.append(a[k[0] + 1:])
+    runs = [a for a in runs if not ({"--dry-run", "--help", "-h"} & set(a))]
+    bad = ""
+    for a in runs:
+        v = opt_val(a, "--intent")
+        if v is None or (v != "none" and v not in intent_names()):
+            bad = (("--intent %s is not a known intent" % v) if v is not None else "no --intent") + (
+                " on a phone run (AP-69): pass --intent %s, or --intent none to opt out; table: tools/run-intents.json "
+                "(gputest19-24 ran without --gpu-handover, an IORTC run without sweetlogts=1)" % "|".join(intent_names() or ["NAME"]))
+            break
+    return verdict("E23", bool(runs), bad)
+
+
 def r_e2c(c):
     ks, bad = False, ""
     for p in parses(c.cmd) if c.cmd else []:
@@ -1128,7 +1157,7 @@ RULES = [("S1", "deny", r_s1), ("S3a", "deny", r_s3a), ("S3b", "deny", r_s3b), (
          ("E3b", "deny", r_e3b), ("E9", "deny", r_e9), ("E2c", "deny", r_e2c), ("E10", "deny", r_e10), ("E11", "deny", r_e11),
          ("E12", "deny", r_e12), ("E14", "deny", r_e14), ("E15", "deny", r_e15), ("E16", "deny", r_e16), ("E17", "deny", r_e17),
          ("E18", "deny", r_e18), ("E19", "deny", r_e19), ("E20", "deny", r_e20), ("E21", "deny", r_e21), ("E13", "deny", r_e13),
-         ("E22", "deny", r_e22), ("E8", "deny", r_e8), ("E8b", "deny", r_e8b), ("E5", "deny", r_e5), ("E4", "ask", r_e4),
+         ("E22", "deny", r_e22), ("E23", "deny", r_e23), ("E8", "deny", r_e8), ("E8b", "deny", r_e8b), ("E5", "deny", r_e5), ("E4", "ask", r_e4),
          ("S5b", "deny", r_s5b)]   # S5b last: it records the poll time, so only a call no other rule denied counts
 BRIEF = {"S4a", "S4b", "S6a", "S6b", "E6"}
 
@@ -1459,7 +1488,7 @@ def fixtures(tmp):
         add("python validate | grep &&", B("python3 tools/validate-repo.py 2>&1 | grep FAIL && echo"), "deny:E1")
         add("pipefail first", B("set -o pipefail; tools/check-all.sh | tail -3 && git commit -m x"), "allow")
         add("check to file", B("tools/check-all.sh > /tmp/o 2>&1; echo $?"), "allow")
-        add("check | tail alone", B("tools/xrun x | tail -3"), "allow")
+        add("check | tail alone", B("tools/xrun --intent none x | tail -3"), "allow")
         add("pkill -f", B("pkill -f xrun"), "deny:E2a")
         add("bash -c pkill -9f", B("bash -c 'pkill -9f xrun'"), "deny:E2a")
         add("pkill by pid-less name (E2a passes, E2c: AP-56)", B("pkill xrun"), "deny:E2c")
@@ -1639,7 +1668,7 @@ def ap_fixtures(add, B, tmp, kt, free):
     # E10 (AP-10): poke string ends with ;
     add("E10 xrun poke without ;", B("tools/xrun --label t --args 'debug=0xc sweettouchpoke=m:10c0180c=5=f'"), "deny:E10")
     add("E10 phone-lock run xrun poke without ;", B("tools/phone-lock run --owner a -- tools/xrun --args 'sweettouchpoke=m:1=2=3 cpus=8'"), "deny:E10")
-    add("E10 xrun poke with ;", B("tools/xrun --label t --args 'debug=0xc sweettouchpoke=m:10c00640=0=10;d:100;m:10c0180c=5=f;'"), "allow")
+    add("E10 xrun poke with ;", B("tools/xrun --intent none --label t --args 'debug=0xc sweettouchpoke=m:10c00640=0=10;d:100;m:10c0180c=5=f;'"), "allow")
     add("E10 poke in a commit message", B("git commit -m 'sweettouchpoke=m:1=2=3'"), "allow")
     # E11 (AP-42): row character class
     add("E11 probe-run row=134[56]", B("tools/probe-run --expect 'stopped=refused at=S34 row=134[56]'"), "deny:E11")
@@ -1666,7 +1695,7 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E14 bg probe-run default 60 s, timeout 120 s (F8)", bg("tools/probe-run --build-args '--x'", timeout=120_000), "allow")
     add("E14 bg --lock-wait adds to need (F8)", bg("tools/probe-run --timeout 60 --lock-wait 600 --label a", timeout=300_000), "deny:E14")
     add("E14 bg rea-xrefs.sh no timeout (F8)", bg("tools/rea/rea-xrefs.sh abl.bin 0x1"), "deny:E14")
-    add("E14 bg xrun with timeout", bg("tools/xrun --label a", timeout=1_800_000), "allow")
+    add("E14 bg xrun with timeout", bg("tools/xrun --intent none --label a", timeout=1_800_000), "allow")
     add("E14 bg non-heavy job, no timeout", bg("python3 -m http.server"), "allow")
     # E15 (AP-24): find /
     add("E15 find /", B("find / -name '*objdump*' -path '*aarch64*'"), "deny:E15")
@@ -1714,6 +1743,17 @@ def ap_fixtures(add, B, tmp, kt, free):
     # E21 (AP-46): ipsw disass --quiet
     add("E21 ipsw dyld disass --quiet", B("ipsw dyld disass --quiet --vaddr 0x1d1af5084 dsc"), "deny:E21")
     add("E21 ipsw dyld disass with cache", B("ipsw dyld disass --vaddr 0x1d1af5084 --cache dsc/cache/x.a2s dsc"), "allow")
+    # E23 (AP-69): phone run needs --intent
+    add("E23 xrun without intent", B("tools/xrun --kernel k --label gputest26 --gpu-handover"), "deny:E23")
+    add("E23 xrun with intent", B("tools/xrun --kernel k --intent gpu --gpu-handover"), "allow")
+    add("E23 xrun intent none", B("tools/xrun --kernel k --intent none"), "allow")
+    add("E23 xrun unknown intent", B("tools/xrun --kernel k --intent nope"), "deny:E23")
+    add("E23 phone-lock run xrun without intent", B("tools/phone-lock run --owner gpu -- tools/xrun --kernel k"), "deny:E23")
+    add("E23 phone-lock run xrun with intent", B("tools/phone-lock run --owner gpu -- tools/xrun --kernel k --intent timing"), "allow")
+    add("E23 xrun --dry-run", B("tools/xrun --dry-run --from-dir d"), "allow")
+    add("E23 grep xrun", B("grep -n xrun docs/WORKFLOW.md"), "allow")
+    add("E23 echo xrun", B("echo tools/xrun --kernel k"), "allow")
+    add("E23 bash -c xrun without intent", B("bash -c 'tools/xrun --kernel k'"), "deny:E23")
     # E22 (AP-58): tool commit off trunk in the kernel repo
     add("E22 tool commit on trunk", B("git commit -m t", cwd=kst("trunk", "trunk", staged="tools/n.py")), "allow")
     add("E22 shared tool commit on stream", B("git commit -m t", cwd=kst("st", "boot/s1", staged="tools/probe-run")), "deny:E22")
