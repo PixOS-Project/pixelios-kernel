@@ -30,6 +30,7 @@ _spec.loader.exec_module(ed)
 
 R_RE = re.compile(r"LINK R(3[4-6]) row=(\d+) rd=0x([0-9A-Fa-f]{8})")
 SUM_RE = re.compile(r"LINK summary reached=S(\d+) stopped=(\w+)(?: at=S(\d+) row=(\d+))? restore=(\w+)")
+BANK_SKIP_RE = re.compile(r"LINK S35 skip: bankidx select[^\n]* row=(\d+)")
 WRAP = {0x408: "IOCTL", 0x800: "RESET_CTL", 0x804: "RESET_ST"}
 CORE = {0x000: "coreinfo", 0x010: "bankidx", 0x040: "bankinfo"}
 WINDOWS = {0x18001000: "PCIe core", 0x18126000: "SYS_MEM wrapper", 0x18026000: "SYS_MEM core", 0x18120000: "ARM_CA7 wrapper"}
@@ -173,7 +174,11 @@ def main(argv=None):
     sm = SUM_RE.findall(text)
     summary = sm[-1] if sm else None
     notes = {r["id"]: r.get("note", "") for r in doc["rows"]}
-    lines, res = check(vals, rows, summary, notes, "LINK S34 skip: SRPWR request" in text, "LINK S35 skip: bankidx select" in text)
+    bank_rows = [int(x) for x in BANK_SKIP_RE.findall(text)]
+    bank_ids = {r["id"] for r in doc["rows"] if r.get("step") == 35 and r.get("blk") == "MEM" and r.get("off") == 0x10 and r.get("kind") in ("mmio_write", "wait_eq")}
+    lines, res = check(vals, rows, summary, notes, "LINK S34 skip: SRPWR request" in text, bool(bank_rows))
+    if bank_rows:
+        res.append(("S1 bank skip rows", bool(bank_ids) and set(bank_rows) <= bank_ids, f"skip line rows {sorted(set(bank_rows))} must be S35 MEM 0x10 bankidx rows {sorted(bank_ids)}"))
     print("\n".join(lines))
     for nm, ok, txt in res:
         print(f"{'PASS' if ok else 'FAIL'} {nm}: {txt}")

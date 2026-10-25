@@ -3087,6 +3087,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     srp_got = [(r["step"], r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["srp"]) for r in rows if "srp" in r]
     if srp_got != [(34, "read_only", "MEM", 0x1E8, BIGW, 0, 1), (34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, 2), (35, "read_only", "MEM", 0x000, BIGW, 0, 3)] or any("srp" in t for t in tear):
         raise AssertionError(f"{name}: the srp skip flag must sit on exactly the S34 powerctl log row (1), the S34 SRPWR request row (2) and the S35 coreinfo log row (3): {srp_got}")
+    # (review 19 finding 2: this clause is shadowed by the exact S34-S36 sequence clause and the BAR0 read-only clause above, so no table mutant reaches it; kept as defence in depth)
     # the S35 bank skip (srp = 3): the run skips every MEM write / wait_eq row at offset 0x10 once ROM banks are recorded; exactly the S35 bankidx write and its read-back wait may match, none in the teardown, so the skip can only drop those two rows
     bank_got = [(r["step"], r["kind"], r["off"], r["value"]) for r in rows if r["blk"] == "MEM" and r["off"] == 0x10 and r["kind"] in ("mmio_write", "wait_eq")]
     if bank_got != [(35, "mmio_write", 0x10, 0), (35, "wait_eq", 0x10, 0)] or any(t["blk"] == "MEM" and t["off"] == 0x10 for t in tear):

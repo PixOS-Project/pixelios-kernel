@@ -115,6 +115,12 @@ class S35Decode(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL C2", out)
 
+    def test_s35_bank_skip_wrong_row_fails(self):
+        ov = {(35, C, 0x000, ""): 0x115, (35, C, 0x010, ""): 3}
+        rc, out, _ = run(log(36, ov) + ["LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write) row=1345 rd=0x00000115"])	# review 19 finding 4: a skip line for another row
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL S1 bank skip rows", out)
+
     def test_s35_bankidx_and_bankinfo(self):
         rc, out, _ = run(log(35, {(35, C, 0x010, ""): 3}))
         self.assertEqual(rc, 1)
