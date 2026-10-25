@@ -8,7 +8,7 @@ SWEET Sandbox extension ops (patch 0119): op 5 writes a constant token, op 6 a n
  
 +/*
 + * Op 5 (extension issue) and op 6 (extension consume). Argument layouts read from libsystem_sandbox (iOS 16.7.16 DSC):
-+ * __sandbox_extension_issue @0x1d1af4f98 passes 7 x u64 {class, type, path, flags, out buffer (0x800 B), out size, w5};
++ * __sandbox_extension_issue @0x1d1af4f98 passes 7 x u64 {class, type, path, flags, out buffer (always malloc(0x800) @0x1d1af4fcc), caller x4 (0 from issue_file/generic; not a size), w5};
 + * _sandbox_extension_consume @0x1d1af4ecc passes 3 x u64 {token, strlen+1, &handle}. The policy is permissive, so the token is a
 + * constant string (anything but "invalid") and the handle any non-zero value. tccd answers a granted request only if the issue
 + * succeeds ("Failed to issue Sandbox Extension for kTCCServicePhotos", gputest20; docs/research/44-tccd-photos-grant.md).
@@ -24,7 +24,7 @@ SWEET Sandbox extension ops (patch 0119): op 5 writes a constant token, op 6 a n
 +	if (error) {
 +		return error;
 +	}
-+	if (a[4] == 0 || a[5] < sizeof(SWEET_SBX_TOKEN) || a[5] > 0x800) {
++	if (a[4] == 0) {
 +		return EINVAL;
 +	}
 +	return copyout(SWEET_SBX_TOKEN, (user_addr_t)a[4], sizeof(SWEET_SBX_TOKEN));
