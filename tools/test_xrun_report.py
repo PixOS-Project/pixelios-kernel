@@ -202,6 +202,33 @@ class Report(unittest.TestCase):
         self.assertEqual(xrun_report.kstamp("[   12.345] SWEET CPU: x"), 12.345)
         self.assertIsNone(xrun_report.kstamp("SWEET CPU: x"))
 
+    def test_dead_root_is_a_fail(self):
+        bad = LOG1 + "hfs_mountroot failed: 5\ncannot mount root, errno = 19\n"
+        d = self.run_dir("20260101T000900Z-r", snaps=[(30, bad)], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertIn("root mount failed (2 line(s))", r["reason"])
+        d = self.run_dir("20260101T001000Z-r", snaps=[(30, bad)], run={"expect": ["SWEET CPU: cpu=0"], "no_root_ok": True})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertEqual(r["markers"]["root mount failed"]["count"], 2)
+        d = self.run_dir("20260101T001100Z-r", snaps=[(30, LOG1 + "hfs: Initializing the journal\n")], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["markers"]["root mount failed"]["count"], 0)
+        self.assertEqual(r["result"], "PASS")
+
+    def test_dead_root_mutant_is_caught(self):
+        # mutant: the new elif never fires -> the dead-root run is reported PASS, so test_dead_root_is_a_fail would fail
+        src = (HERE / "xrun_report.py").read_text()
+        branch = 'elif markers["root mount failed"]["count"] and not run.get("no_root_ok"):'
+        self.assertIn(branch, src)
+        mod = type(sys)("xrun_report_mutant")
+        mod.__file__ = str(HERE / "xrun_report.py")
+        exec(compile(src.replace(branch, "elif False:"), mod.__file__, "exec"), mod.__dict__)
+        d = self.run_dir("20260101T001200Z-m", snaps=[(30, LOG1 + "hfs_mountroot failed: 5\n")], run={"expect": ["SWEET CPU: cpu=0"]})
+        self.assertEqual(mod.build(str(d))["result"], "PASS")
+        self.assertEqual(xrun_report.build(str(d))["result"], "FAIL")
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")

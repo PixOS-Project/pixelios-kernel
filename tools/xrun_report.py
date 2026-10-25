@@ -9,6 +9,8 @@
 
 Run dir layout: run.json, snaps/qr-<UTC>[-sid].txt (tools/qr-log.py --keep-going), frames/*.jpg (mtime = capture time),
 merged.log, luma.json (frame brightness cache), report.json, report.txt.
+A log with "hfs_mountroot failed" / "cannot mount root" is a FAIL (dead iOS root); a truthy run.json key no_root_ok
+(set by hand or by a future flag) lets a rootless hold-flavor run opt out.
 """
 import calendar, glob, json, os, pathlib, re, sys, time
 
@@ -44,6 +46,7 @@ MARKERS = [
     ("SpringBoard lines", r"^\|SpringBoard\||^IOK SpringBoard:"),
     ("backboardd lines", r"^\|backboardd\||^IOK backboardd:"),
     ("extension check-in timeout", r"extension check-in timeout"),
+    ("root mount failed", r"hfs_mountroot failed|cannot mount root"),
 ]
 LISTED = [("TOUCH/KEYS", r"^SWEET (TOUCH|KEYS):", 12), ("CPU", r"^SWEET CPU:", 4)]
 
@@ -419,6 +422,8 @@ def build(d, stop_on=None):
         result, reason = "ERROR", run["error"]
     elif markers["panic/hang/watchdog"]["count"]:
         result, reason = "FAIL", "panic/hang/watchdog line in the log: %s" % cut(markers["panic/hang/watchdog"]["first"], 80)
+    elif markers["root mount failed"]["count"] and not run.get("no_root_ok"):
+        result, reason = "FAIL", "root mount failed (%d line(s)); the run never reached launchd: %s" % (markers["root mount failed"]["count"], cut(markers["root mount failed"]["first"], 80))
     elif run.get("early_fail"):
         result, reason = "FAIL", "stopped early on a failure pattern (%s) at +%ds; the full run would have waited %ss" % (cut(str(run["early_fail"]), 60), waited or 0, run.get("duration"))
     elif restart and reset_at is None and run.get("timeout") and waited is not None and waited < restart_s and not (early_txt and not early_txt.startswith("NOT")):
