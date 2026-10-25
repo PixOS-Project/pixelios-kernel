@@ -42,7 +42,7 @@ index 277e201..4934fe3 100644
  	uint32_t win;
  	int level;
  };
-@@ -128,6 +133,115 @@ sweet_wlan_fwcheck(void)
+@@ -128,6 +133,119 @@ sweet_wlan_fwcheck(void)
  	printf("SWEET WLAN: fw container ok at %#llx, %llu bytes, %u entries\n", pa, len, n);
  }
  
@@ -112,6 +112,10 @@ index 277e201..4934fe3 100644
 +	    (space == SWW_BAR0 && off != SWL_AGENT_IOCTL && off != SWL_AGENT_RESET_CTL && off != SWW_SM_BANKIDX)) {
 +		return -1;
 +	}
++	/* bind the BAR0 offset to its window: bankidx only on SYS_MEM, IOCTL/RESET_CTL only on the SYS_MEM wrapper or the CA7 wrapper (review 0125 R2-3) */
++	if (space == SWW_BAR0 && !(off == SWW_SM_BANKIDX ? win == SWW_WIN_SYSMEM : (win == SWW_WIN_SMWRAP || win == SWW_WIN_CA7WRAP))) {
++		return -1;
++	}
 +	p = sw3_ptr(h, space, off);
 +	if (p == NULL || (space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win)) {
 +		return -1;
@@ -158,7 +162,7 @@ index 277e201..4934fe3 100644
  void
  sweet_wlan_init(void)
  {
-@@ -149,7 +263,7 @@ sweet_wlan_init(void)
+@@ -149,7 +267,7 @@ sweet_wlan_init(void)
  	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
  		return;
  	}
@@ -167,7 +171,7 @@ index 277e201..4934fe3 100644
  	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
  	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
  		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
-@@ -160,6 +274,9 @@ sweet_wlan_init(void)
+@@ -160,6 +278,9 @@ sweet_wlan_init(void)
  	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
  		return;
  	}
@@ -177,7 +181,7 @@ index 277e201..4934fe3 100644
  	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
  	if (isop == NULL) {
  		return;
-@@ -192,7 +309,11 @@ sweet_wlan_init(void)
+@@ -192,7 +313,11 @@ sweet_wlan_init(void)
  	}
  	/* first config TLPs, only now that the link and region 0 are proven */
  	hw.win = hw.cfg[0x80 / 4];
@@ -190,7 +194,7 @@ index 277e201..4934fe3 100644
  	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
  	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
  	if (bad) {
-@@ -201,8 +322,11 @@ sweet_wlan_init(void)
+@@ -201,8 +326,11 @@ sweet_wlan_init(void)
  	}
  	bus.rd = sw_rd;
  	bus.ctx = &hw;

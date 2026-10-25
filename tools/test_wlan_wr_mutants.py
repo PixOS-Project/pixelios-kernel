@@ -48,6 +48,59 @@ def strip_comments(text):
     return re.sub(r"^ \*.*$", " ", re.sub(r"/\*.*?\*/", " ", text, flags=re.S), flags=re.M)
 
 
+# Every assignment of the added glue, as (function, statement), pinned (review 0125 R2-1). Anything else, any duplicate and any missing one fails.
+GLUE_ASSIGNS = sorted([
+    ("sw_prop_u32_is", "uint32_t const *p = NULL;"),
+    ("sw_prop_u32_is", "unsigned int sz = 0;"),
+    ("sw3_rd", "struct sw_hw *h = ctx;"),
+    ("sw3_rd", "volatile uint32_t *p = sw3_ptr(h, space, off);"),
+    ("sw3_rd", "*v = *p;"),  # hands the read result to the caller
+    ("sw3_wr", "struct sw_hw *h = ctx;"),
+    ("sw3_wr", "p = sw3_ptr(h, space, off);"),
+    ("sw3_wr", "*p = v;"),  # THE store
+    ("sw3_map2", "struct sw_hw *h = ctx;"),
+    ("sw3_map2", "h->tcm = sw_map(SWW_TCM_PA, SWW_TCM_BYTES);"),
+    ("sweet_wlan_stage3", "wb.rd = sw3_rd;"),
+    ("sweet_wlan_stage3", "wb.wr = sw3_wr;"),
+    ("sweet_wlan_stage3", "wb.map2 = sw3_map2;"),
+    ("sweet_wlan_stage3", "wb.delay_us = sw3_delay;"),
+    ("sweet_wlan_stage3", "wb.ctx = hw;"),
+    ("sweet_wlan_stage3", "x.b = &wb;"),
+    ("sweet_wlan_stage3", "x.level = level;"),
+    ("sweet_wlan_init", "hw.level = level > 2 ? 2 : (int)level;"),  # fragments of the function: its header is a context line of the patch
+    ("sweet_wlan_init", "hw.atu = atu;"),
+    ("sweet_wlan_init", "hw.elbi = elbi;"),
+    ("sweet_wlan_init", "hw.iso = &isop[(SW_ISO & 0xFFFull) / 4];"),
+    ("sweet_wlan_init", "hw.tcm = NULL;"),
+])
+ASSIGN_OP = re.compile(r"(?<![=!<>])(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--")
+
+
+def audit_assignments(glue):
+    """Operator scan of the comment- and string-stripped glue: every `=`, compound assignment, `++`, `--` must be one of GLUE_ASSIGNS in its function;
+    no mem*/atomic call, no use of the wr callback but `wb.wr = sw3_wr;`, no call of the 0124 window reader sw_rd()."""
+    f = []
+    g = re.sub(r"'(?:\\.|[^'\\])'", "0", re.sub(r'"(?:\\.|[^"\\])*"', '""', strip_comments(glue)))
+    rng = [(m.group(1), m.start(), m.end()) for m in re.finditer(r"^(\w+)\(.*?^}$", g, re.S | re.M)]
+    seen, got = set(), []
+    for m in ASSIGN_OP.finditer(g):
+        a = max(g.rfind(c, 0, m.start()) for c in ";{}") + 1
+        if a in seen:
+            continue
+        seen.add(a)
+        fn = next((n for n, s, e in rng if s <= m.start() < e), "sweet_wlan_init")
+        got.append((fn, " ".join(g[a:g.find(";", m.end()) + 1].split())))
+    if sorted(got) != GLUE_ASSIGNS:
+        f.append("assignment outside the allowlist: " + "; ".join("%s: %s" % x for x in sorted(set(got) ^ set(GLUE_ASSIGNS)) or [("duplicate", "count")]))
+    if re.search(r"\b(?:memcpy|memmove|bcopy|__builtin_mem\w*|os_atomic\w*|atomic_store\w*)\b", g):
+        f.append("memory-copy or atomic store call")
+    if len(re.findall(r"(?:\.|->)\s*wr\b", g)) != 1 or "wb.wr = sw3_wr;" not in g:
+        f.append("wr callback used other than by wb.wr = sw3_wr;")
+    if re.search(r"\bsw_rd\s*\(", g):
+        f.append("call of sw_rd in the added glue")
+    return f
+
+
 def audit_store_path(hdr, glue):
     """Source audit of the store path (docs/research/43 s.5 step 5): the header has no asm and no pointer made from an integer literal, its one bus store
     callback is called only in swl_store(), swl_store() only from swl_wr() and swl_restore(); the glue has exactly one store through a pointer (sw3_wr) and
@@ -67,10 +120,7 @@ def audit_store_path(hdr, glue):
     for fn in ("swl_wr", "swl_restore"):
         if "swl_store(" not in body(hdr, fn):
             f.append("%s does not use swl_store" % fn)
-    # statement-initial stores through a dereferenced or subscripted pointer; `*v = *p;` is sw3_rd handing the read result to its caller
-    stores = [m for m in re.findall(r"(?:^|[{;])[ \t]*((?:\*\s*\w+|\w+(?:->\w+)?\s*\[[^\]]*\])\s*=(?!=))", glue, re.M) if not re.match(r"\*\s*v\s*=", m)]
-    if len(stores) != 1 or "*p = v;" not in body(glue, "sw3_wr"):
-        f.append("a store through a pointer outside sw3_wr")
+    f.extend(audit_assignments(glue))
     if "off != SWW_CFG_WIN" not in body(glue, "sw3_wr") or "SWW_R2(0x14)" not in body(glue, "sw3_wr") or "SWW_SM_BANKIDX" not in body(glue, "sw3_wr"):
         f.append("sw3_wr does not limit the offsets to the table's")
     if len(re.findall(r"\bsw3_wr\b", glue)) != 2 or "wb.wr = sw3_wr;" not in glue:
@@ -251,6 +301,117 @@ def glue_added_lines():
         raise ValueError("patch 0129 adds nothing to bsd/dev/sweet_wlan.c")
     return "\n".join(out) + "\n"
 
+# ---- the glue limit sw3_ptr..sw3_wr, compiled and swept (review 0125 R2-2/R2-3) ----
+GLUE_HARNESS = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include "sweet_wlan_wr.h"
+#define __builtin_arm_dsb(x) ((void)0)
+struct sw_hw {
+	volatile uint32_t *cfg, *atu, *elbi, *iso, *mem, *tcm;
+	uint32_t win;
+	int level;
+};
+@GLUE@
+static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[8];
+static uint32_t *const arr[] = { cfg, atu, elbi, iso, mem, tcm };
+static const size_t len[] = { 0x1000 / 4, 0x1000 / 4, 0x2000 / 4, 1, 0x1000 / 4, 8 };
+static uint32_t snap[6][0x2000 / 4];
+
+/* the table's offsets, restated: cfg 0x80; ATU region 2 CR2/LOWER_BASE/LIMIT/LOWER_TARGET; BAR0 bankidx on SYS_MEM, IOCTL + RESET_CTL on the two wrappers */
+static int expect(int space, uint32_t off, uint32_t win, int eq)
+{
+	if (space == SWW_CFG) return off == 0x80;
+	if (space == SWW_ATU) return off == 0x404 || off == 0x408 || off == 0x410 || off == 0x414;
+	if (space == SWW_BAR0 && eq) {
+		if (win == SWW_WIN_SYSMEM) return off == 0x10;
+		if (win == SWW_WIN_SMWRAP || win == SWW_WIN_CA7WRAP) return off == 0x408 || off == 0x800;
+	}
+	return 0;
+}
+
+int main(void)
+{
+	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 3 };
+	int bad = 0, acc = 0;
+
+	(void)sw3_rd;
+	for (unsigned wi = 0; wi < 5; wi++) {
+		for (int eq = 0; eq < 2; eq++) {
+			for (int space = 0; space < 8; space++) {
+				for (uint32_t off = 0; off < 0x2004; off++) {
+					for (int a = 0; a < 6; a++) {
+						for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+						memcpy(snap[a], arr[a], len[a] * 4);
+					}
+					cfg[0x80 / 4] = eq ? wins[wi] : wins[wi] ^ 0x1000u;
+					memcpy(snap[0] + 0x80 / 4, &cfg[0x80 / 4], 4);
+					int r = sw3_wr(&hw, space, wins[wi], off, 0xDEADBEEFu);
+					int ch = 0;
+					for (int a = 0; a < 6; a++)
+						for (size_t i = 0; i < len[a]; i++) ch += arr[a][i] != snap[a][i];
+					int want = expect(space, off, wins[wi], eq);
+					if ((r == 0) != want || ch != (r == 0 ? 1 : 0)) {
+						if (bad++ < 20) printf("BAD space %d off %#x win %#x live-equal %d: ret %d changed %d, want accept %d\n", space, off, wins[wi], eq, r, ch, want);
+					}
+					acc += r == 0;
+				}
+			}
+		}
+	}
+	printf("%s accepted %d bad %d\n", bad ? "FAIL" : "PASS", acc, bad);
+	return bad != 0;
+}
+"""
+
+
+def glue_function_text():
+    """sw3_ptr .. the closing brace of sw3_wr from the glue hunk of patch 0129, with the return type of sw3_ptr put back."""
+    g = glue_added_lines()
+    a = re.search(r"^sw3_ptr\(", g, re.M)
+    e = re.search(r"^sw3_wr\(.*?^}$", g, re.S | re.M)
+    if not a or not e:
+        raise ValueError("sw3_ptr..sw3_wr not found in the glue hunk")
+    return "static volatile uint32_t *\n" + g[a.start():e.end()] + "\n"
+
+
+def run_glue(glue_text, work, extra=()):
+    """Compile the glue functions with gcc -Werror against the real header, sweep them. Returns ('pass'|'fail'|'compile', output)."""
+    d = tempfile.mkdtemp(dir=work)
+    for patch, path, name in ((PATCH0120, "bsd/dev/sweet_wlan_chip.h", "sweet_wlan_chip.h"), (PATCH0125, "bsd/dev/sweet_wlan_wr.h", "sweet_wlan_wr.h")):
+        with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+            fh.write(new_file(patch, path))
+    with open(os.path.join(d, "g.c"), "w", encoding="utf-8") as fh:
+        fh.write(GLUE_HARNESS.replace("@GLUE@", glue_text))
+    c = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-Werror", "-I" + d] + list(extra) + ["-o", os.path.join(d, "g"), os.path.join(d, "g.c")], capture_output=True, text=True)
+    if c.returncode != 0:
+        return "compile", c.stderr[-600:]
+    r = subprocess.run([os.path.join(d, "g")], capture_output=True, text=True, timeout=300)
+    return ("pass" if r.returncode == 0 else "fail"), r.stdout[-600:]
+
+
+_LIM = "\tif ((space == SWW_CFG && off != SWW_CFG_WIN) ||"
+_MOVE = "@move"  # special: the offset check block is moved behind the store (see test_glue_mutants_are_killed)
+_LIMEND = "off != SWW_SM_BANKIDX)) {\n\t\treturn -1;\n\t}\n"
+# (name, [(old, new)]) applied to the glue text; each must change it and the sweep must FAIL (a compile error is a broken mutant, not a kill)
+GLUE_MUTANTS = [
+    ("UPPER_BASE writable", [(" || off == SWW_R2(0x0C)", "")]),
+    ("CR1 writable", [("off < SWW_R2(0x04)", "off < SWW_R2(0x00)")]),
+    ("any BAR0 offset", [("(space == SWW_BAR0 && off != SWL_AGENT_IOCTL", "(space == SWW_BAR0 || off != SWL_AGENT_IOCTL")]),
+    ("silent no-op success", [("off != SWW_SM_BANKIDX)) {\n\t\treturn -1;", "off != SWW_SM_BANKIDX)) {\n\t\treturn 0;")]),
+    ("limit disabled", [(_LIM, "\tif (0 && ((space == SWW_CFG && off != SWW_CFG_WIN) ||"), ("off != SWW_SM_BANKIDX)) {", "off != SWW_SM_BANKIDX))) {")]),
+    ("limit evaluated after the store", [(_MOVE, "")]),
+    ("CFG clause kept as a string needle", [("(space == SWW_CFG && off != SWW_CFG_WIN)", "(space == SWW_CFG && off > 0x1000 && *\"off != SWW_CFG_WIN\")")]),
+    # R2-3 and the live-window compare
+    ("window binding removed", [("\tif (space == SWW_BAR0 && !(off == SWW_SM_BANKIDX ?", "\tif (0 && !(off == SWW_SM_BANKIDX ?")]),
+    ("bankidx bound to the wrapper window", [("off == SWW_SM_BANKIDX ? win == SWW_WIN_SYSMEM :", "off == SWW_SM_BANKIDX ? win == SWW_WIN_SMWRAP :")]),
+    ("CA7 window refused", [("win == SWW_WIN_SMWRAP || win == SWW_WIN_CA7WRAP", "win == SWW_WIN_SMWRAP")]),
+    ("live BAR0 window not compared", [("(space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win)) {\n\t\treturn -1;\n\t}\n\t*p = v;", "0) {\n\t\treturn -1;\n\t}\n\t*p = v;")]),
+]
+
 
 class WlanWrMutants(unittest.TestCase):
     def test_every_guard_rule_is_killed(self):
@@ -278,18 +439,56 @@ class WlanWrMutants(unittest.TestCase):
             (hdr + "\nstatic inline void x(void) { volatile uint32_t *p = (volatile uint32_t *)0x14B00404; (void)p; }\n", glue, "pointer from an integer literal"),
             (hdr.replace("return x->b->wr(x->b->ctx, space, win, off, v);", "return 0;") + "\nstatic inline int\nswl_z(struct swl_wx *x)\n{\n\treturn x->b->wr(x->b->ctx, 1, 0, 0, 0);\n}\n", glue, "bus store callback called outside swl_store"),
             (hdr + "\nstatic inline int\nswl_z(struct swl_wx *x)\n{\n\treturn swl_store(x, 1, 0, 0, 0);\n}\n", glue, "swl_store called from swl_z"),
-            (hdr, glue.replace("*p = v;", "*p = v;\n\t*p = v;"), "a store through a pointer outside sw3_wr"),
-            (hdr, glue + "\nstatic void sw3_z(volatile uint32_t *p, uint32_t v) { *p = v; }\n", "a store through a pointer outside sw3_wr"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\t*p = v;"), "assignment outside the allowlist"),
+            (hdr, glue + "\nstatic void sw3_z(volatile uint32_t *p, uint32_t v) { *p = v; }\n", "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_y(void) { sw3_wr(0, 0, 0, 0, 0); }\n", "sw3_wr used other than as the bus wr callback"),
-            (hdr, glue.replace("*p = v;", "*p = v;\n\th->cfg[1] = 6;"), "a store through a pointer outside sw3_wr"),
-            (hdr, glue + "\nstatic void sw3_x(struct sw_hw *h) { h->atu[0x101] = 0; }\n", "a store through a pointer outside sw3_wr"),
-            (hdr, glue + "\nstatic void sw3_q(volatile uint32_t *q) { q[0] = 1; }\n", "a store through a pointer outside sw3_wr"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\th->cfg[1] = 6;"), "assignment outside the allowlist"),
+            (hdr, glue + "\nstatic void sw3_x(struct sw_hw *h) { h->atu[0x101] = 0; }\n", "assignment outside the allowlist"),
+            (hdr, glue + "\nstatic void sw3_q(volatile uint32_t *q) { q[0] = 1; }\n", "assignment outside the allowlist"),
             (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN) || ", ""), "sw3_wr does not limit the offsets to the table's"),
             (hdr, glue.replace("SWW_R2(0x14)", "SWW_R2(0x18)"), "sw3_wr does not limit the offsets to the table's"),
             (hdr, glue.replace("wb.wr = sw3_wr;", "wb.wr = 0;"), "sw3_wr used other than as the bus wr callback"),
+            # review 0125 R2-1: the 12 spellings the old regex missed
+            (hdr, glue + "\nstatic void sw3_c(struct sw_hw *h) { h->cfg[1] |= 6; }\n", "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\th->atu[0x101] += 0;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\t*(h->cfg + 1) = 6;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\thw3.cfg[1] = 6;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\tif (h != NULL)\n\t\th->cfg[1] = 6;"), "assignment outside the allowlist"),
+            (hdr, glue + "\nstatic void sw3_v(struct sw_hw *h) { volatile uint32_t *v = &h->cfg[1]; *v = 6; }\n", "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\t__builtin_memcpy((void *)&h->cfg[1], &s, 4);"), "memory-copy or atomic store call"),
+            (hdr, glue.replace("*p = v;", "*p++ = v;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\t(void)0, h->cfg[1] = 6;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("*p = v;", "*p = v;\n\tuint32_t a = h->cfg[1] = 6;"), "assignment outside the allowlist"),
+            (hdr, glue + "\nstatic void sw3_w(struct sw_hw *hw, struct swl_wbus wb) { void *w_ = wb.wr; w_(hw, SWW_CFG, 0, 4, 6); }\n", "wr callback used other than by wb.wr = sw3_wr;"),
+            (hdr, glue + "\nstatic void sw3_r(struct sw_hw *h) { uint32_t t_; sw_rd(h, 0x18000000u + 0x804u, &t_); }\n", "call of sw_rd in the added glue"),
         ]
         for h, g, want in bad:
-            self.assertIn(want, audit_store_path(h, g), want)
+            self.assertTrue(any(x.startswith(want) for x in audit_store_path(h, g)), want)
+
+    def test_glue_sweep_accepts_exactly_the_table(self):
+        with tempfile.TemporaryDirectory() as work:
+            st, out = run_glue(glue_function_text(), work)
+        self.assertEqual(st, "pass", out)
+
+    def test_glue_mutants_are_killed(self):
+        base = glue_function_text()
+        bad = []
+        with tempfile.TemporaryDirectory() as work:
+            for name, subs in GLUE_MUTANTS:
+                t = base
+                for old, new in subs:
+                    if old == _MOVE:
+                        m = re.search(r"\tif \(\(space == SWW_CFG && off != SWW_CFG_WIN\).*?\n\t}\n", t, re.S)
+                        self.assertTrue(m, name)
+                        t = t.replace(m.group(0), "").replace("\t*p = v;\n", "\t*p = v;\n" + m.group(0))
+                        continue
+                    self.assertIn(old, t, name + ": pattern not found (glue changed under the mutant)")
+                    t = t.replace(old, new)
+                self.assertNotEqual(t, base, name)
+                st, out = run_glue(t, work, ["-Wno-parentheses"])
+                if st != "fail":
+                    bad.append("%s: %s %s" % (name, "SURVIVED" if st == "pass" else "does not compile", out))
+        self.assertEqual(bad, [], "\n".join(bad))
 
     def test_extraction_rejects_a_missing_hunk(self):
         with self.assertRaises(ValueError):
