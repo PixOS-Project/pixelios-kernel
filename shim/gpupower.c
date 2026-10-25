@@ -346,7 +346,7 @@ int gpu_power_cycle(void)
 {
 	const char *up = "ok", *down, *why = precheck();
 	char line[RAMLOG_LINE_MAX];
-	uint64_t t0, t1, t2;
+	uint64_t t0, t1, t2, tj = 0;
 	unsigned p, blk = 0;
 	int e, d;
 
@@ -386,8 +386,12 @@ int gpu_power_cycle(void)
 	dump_all("");
 #ifdef GPU_JOB
 	/* --gpu-job (docs/research/28): the one WRITE_VALUE job runs INSIDE the powered window, only if the shaders came up; the OFF sequence below follows in every case */
-	if (up[0] == 'o')
+	if (up[0] == 'o') {
+		uint64_t tj0 = touch_ticks();
+
 		(void)gpu_job_run();
+		tj = touch_ticks() - tj0;
+	}
 #endif
 	/* OFF, always: shaders, then the L2 (which takes the tiler with it); L2 stays on if the shaders did not go off */
 	d = power_off(G_SHADER_OFF, G_SHADER_RDY, G_SHADER_TR, GPU_SHADER_PRESENT);
@@ -421,6 +425,8 @@ int gpu_power_cycle(void)
 	p = put_hex(line, sizeof(line), p, t1 - t0, 8);
 	p = put_txt(line, sizeof(line), p, "/");
 	p = put_hex(line, sizeof(line), p, t2 - t1, 8);
+	p = put_txt(line, sizeof(line), p, " job=");	/* ticks inside gpu_job_run: the OFF ticks above include it plus dump_all (G-4 item b) */
+	p = put_hex(line, sizeof(line), p, tj, 8);
 	p = put_txt(line, sizeof(line), p, " freq=");
 	p = put_hex(line, sizeof(line), p, counter_freq(), 8);
 	emit(line, p);
