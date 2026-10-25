@@ -2,8 +2,8 @@ SWEET Sandbox extension ops (patch 0119): op 5 writes a constant token, op 6 a n
 
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -328,6 +328,46 @@
- 	return err;
+@@ -334,6 +334,46 @@
+ 	return error;
  }
  
 +/*
@@ -49,9 +49,9 @@ SWEET Sandbox extension ops (patch 0119): op 5 writes a constant token, op 6 a n
  static int
  sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  {
-@@ -341,7 +381,9 @@
- 	case 4:         /* container path (pid) */
- 		return sweet_sandbox_container_path(arg);
+@@ -347,7 +387,9 @@
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_appex_container_path(arg);
  	case 5:         /* extension issue */
 +		return sweet_sandbox_ext_issue(arg);
  	case 6:         /* extension consume */
