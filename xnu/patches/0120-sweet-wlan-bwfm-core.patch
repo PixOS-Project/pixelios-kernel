@@ -1,0 +1,537 @@
+SWEET WLAN stage 1 (patch 0120): READ-ONLY attach of the BCM4389 from inside XNU (docs/research/42, W-D2). Inert unless boot-arg sweetwlan=1|2 AND ADT /sweet-wlan
+(tools/mkadt.py, bluejay only) AND the PCIe1 link left up by the shim flavor --wlan-hold. bsd/dev/sweet_wlan_chip.h = OpenBSD bwfm.c EROM walk (ISC) + the
+BAR0 read allowlist of shim/wlanlink.c mem_ok(); bsd/dev/sweet_wlan.c = ADT/precheck/mapping glue. The only write is the BAR0 window select (cfg 0x80).
+Host test: shim/wlan_xnu_host_test.c. Hardware-reading path: reviewed in docs/reviews (see the commit).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_keys_gs101.c		standard
+ bsd/dev/sweet_touch_gs101.c		standard
+ bsd/dev/sweet_gpu_gs101.c		standard
++bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void sweet_usb_probe(void);
+ extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
+ extern void sweet_touch_gs101_init(void);
+ extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
++extern void sweet_wlan_init(void);          /* bsd/dev/sweet_wlan.c, read-only stage 1, needs boot-arg sweetwlan= and ADT /sweet-wlan */
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -703,6 +704,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_gs101_start();
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
++	sweet_wlan_init();            /* no-op without boot-arg sweetwlan= */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan.c
+@@ -0,0 +1,157 @@
++/*
++ * BCM4389 Wi-Fi, stage 1: READ-ONLY attach from inside XNU (docs/research/42 section 6 steps 3-6, W-D2). Boot-arg sweetwlan=1 (chip, PMU
++ * and the ARM/SYS_MEM wrappers) or sweetwlan=2 (plus the three D11 wrappers); ADT node /sweet-wlan from tools/mkadt.py (bluejay only).
++ * It expects the shim flavor --wlan-hold (PCIe1 link left up, cfg 0x80 = 0x18000000, shim/wlanlink.c wlan_link_hold) and refuses
++ * otherwise, with the same preconditions as shim/wlanlink.c r32(): PHY isolation word de-isolated, EP Command MEM-only, ATU region 1
++ * (BAR0, 0x60000000..0x6000FFFF) enabled and programmed as S29 left it. The only write is the BAR0 window select (cfg 0x80) to one of the
++ * windows swl_win_ok() names; the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written: no reset, no set_passive.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <stdint.h>
++#include "sweet_wlan_chip.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++
++#define SW_COMPAT   "google,gs101-bcm4389-pcie"
++#define SW_MEM      0x60000000ull   /* soc.json wlan.mem: ATU region 1 outbound, BAR0 */
++#define SW_MEM_LEN  0x10000ull
++#define SW_CFG      0x60FFE000ull   /* soc.json wlan.cfg: ATU region 0, config space of the endpoint */
++#define SW_ATU      0x14B00000ull   /* soc.json wlan.atu: DBI + 0x300000 */
++#define SW_ISO      0x17463EC4ull   /* soc.json wlan.pmu_pcie1_iso: PCIe1 PHY isolation, bit 0 = de-isolated (always-on PMU block) */
++
++struct sw_hw {
++	volatile uint32_t *cfg, *mem;
++	uint32_t win;
++};
++
++static int
++sw_rd(void *ctx, uint32_t a, uint32_t *v)
++{
++	struct sw_hw *h = ctx;
++	uint32_t win = a & ~0xFFFu, off = a & 0xFFFu;
++
++	if (!swl_win_ok(win) || !swl_rd_ok(win, off)) {
++		printf("SWEET WLAN: read of %#x refused\n", a);
++		return -1;
++	}
++	if (win != h->win) {
++		h->cfg[0x80 / 4] = win;
++		if (h->cfg[0x80 / 4] != win) {
++			printf("SWEET WLAN: BAR0 window did not take %#x\n", win);
++			return -1;
++		}
++		h->win = win;
++	}
++	*v = h->mem[off / 4];
++	if (win != SWL_EROM_PAGE) {
++		printf("SWEET WLAN: rd %#010x = %#010x\n", a, *v);
++	}
++	return 0;
++}
++
++static volatile uint32_t *
++sw_map(uint64_t pa, uint64_t len)
++{
++	const uint64_t page = 0x4000;
++	uint64_t base = pa & ~(page - 1), end = (pa + len + page - 1) & ~(page - 1);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++
++	if (va == 0) {
++		printf("SWEET WLAN: ml_io_map(%#llx) failed\n", pa);
++		return NULL;
++	}
++	return (volatile uint32_t *)(va + (vm_offset_t)(pa - base));
++}
++
++/* one u64 pair property must equal the pinned (pa, len) */
++static int
++sw_prop_is(DTEntry node, const char *name, uint64_t pa, uint64_t len)
++{
++	uintptr_t const *p = NULL;
++	unsigned int sz = 0;
++
++	if (SecureDTGetProperty(node, name, (void const **)&p, &sz) != kSuccess || sz < 2 * sizeof(uintptr_t) || p[0] != pa || p[1] != len) {
++		printf("SWEET WLAN: /sweet-wlan %s is not %#llx+%#llx, refused\n", name, pa, len);
++		return 0;
++	}
++	return 1;
++}
++
++void
++sweet_wlan_init(void)
++{
++	static int started;
++	static struct swl_chip chip;
++	DTEntry node;
++	char const *compat = NULL;
++	unsigned int csize = 0;
++	uint32_t level = 0, iso, cmd, cr2, r1[4];
++	struct sw_hw hw;
++	struct swl_bus bus;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	if (level > 2 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
++	    compat == NULL || csize <= sizeof(SW_COMPAT) - 1 || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT) - 1) != 0) {
++		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
++		return;
++	}
++	if (!sw_prop_is(node, "reg", SW_MEM, SW_MEM_LEN) || !sw_prop_is(node, "cfg", SW_CFG, 0x1000) ||
++	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
++		return;
++	}
++	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
++	if (isop == NULL) {
++		return;
++	}
++	iso = isop[(SW_ISO & 0xFFFull) / 4];
++	printf("SWEET WLAN: PCIe1 PHY isolation word %#x\n", iso);
++	if (!(iso & 1u)) {
++		printf("SWEET WLAN: PHY still isolated (no --wlan-hold link), not touched\n");
++		return;
++	}
++	volatile uint32_t *atu = sw_map(SW_ATU, 0x1000);
++	hw.cfg = sw_map(SW_CFG, 0x1000);
++	hw.mem = sw_map(SW_MEM, 0x1000);
++	if (atu == NULL || hw.cfg == NULL || hw.mem == NULL) {
++		return;
++	}
++	/* shim r32(): ATU region 1 (RC-local reads, no TLP) before any BAR0 access */
++	r1[0] = atu[0x200 / 4];
++	cr2 = atu[0x204 / 4];
++	r1[1] = atu[0x208 / 4];
++	r1[2] = atu[0x210 / 4];
++	r1[3] = atu[0x214 / 4];
++	printf("SWEET WLAN: ATU r1 %#x %#x %#x %#x %#x\n", r1[0], cr2, r1[1], r1[2], r1[3]);
++	if (r1[0] != 0 || cr2 != 0x80000000u || r1[1] != 0x60000000u || r1[2] != 0x6000FFFFu || r1[3] != 0x60000000u) {
++		printf("SWEET WLAN: ATU region 1 is not the one the shim programmed, not touched\n");
++		return;
++	}
++	cmd = hw.cfg[0x04 / 4];
++	hw.win = hw.cfg[0x80 / 4];
++	printf("SWEET WLAN: EP Command/Status %#x BAR0 window %#x\n", cmd, hw.win);
++	if ((cmd & 0xFFFFu) != 0x0002u) {
++		printf("SWEET WLAN: EP Command is not MEM-only, not touched\n");
++		return;
++	}
++	bus.rd = sw_rd;
++	bus.ctx = &hw;
++	if (swl_stage1(&bus, &chip, (int)level) == 0) {
++		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", level);
++	} else {
++		printf("SWEET WLAN: stage 1 stopped\n");
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_wlan_chip.h b/bsd/dev/sweet_wlan_chip.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_chip.h
+@@ -0,0 +1,335 @@
++/*
++ * BCM4389 chip layer, stage 1 (read only): the EROM walk and register layout of OpenBSD sys/dev/ic/bwfm.c (v1.118,
++ * bwfm_chip_dmp_erom_scan / bwfm_chip_dmp_get_regaddr / bwfm_chip_get_pmu) and sys/dev/ic/bwfmreg.h.
++ *
++ * Copyright (c) 2010-2016 Broadcom Corporation
++ * Copyright (c) 2016,2017 Patrick Wildt <patrick@blueri.se>
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ * Deviations from OpenBSD, each on purpose: no malloc (fixed core table); the walk is bounded (OpenBSD loops until it meets an
++ * EOT descriptor, here every EROM read goes through the allowlist swl_rd_ok(), which refuses past the EROM page limit, and a
++ * refused read ends the walk); a bus read can fail; no write of any kind (set_passive, reset, ramsize bank select are not ported).
++ * The read allowlist is the one of shim/wlanlink.c mem_ok() (S30..S33, reviews 13, 16) plus ChipCommon capabilities (0x04) and the three
++ * D11 wrappers (research 42 section 7, drafted read_only rows). The firmware-boot stages add their own entries with their own review.
++ * Everything here is host-tested (shim/wlan_xnu_host_test.c includes this file as extracted from patch 0120 by shim/build.sh).
++ */
++#ifndef SWEET_WLAN_CHIP_H
++#define SWEET_WLAN_CHIP_H
++
++#include <stdint.h>
++
++#define SWL_CHIP_BASE       0x18000000u
++#define SWL_REG_CHIPID      0x000u
++#define SWL_REG_CAPS        0x004u
++#define SWL_REG_CAPS_EXT    0x0ACu
++#define SWL_CAPS_PMU        0x10000000u
++#define SWL_CAPS_EXT_AOB    0x00000040u
++#define SWL_REG_EROMPTR     0x0FCu
++#define SWL_REG_CLK_CTL_ST  0x1E0u
++#define SWL_REG_PMUCONTROL  0x600u
++#define SWL_REG_PMUCAPS     0x604u
++#define SWL_REG_PMUSTATUS   0x608u
++#define SWL_REG_PMU_MINRES  0x618u
++#define SWL_REG_PMU_MAXRES  0x61Cu
++#define SWL_AGENT_IOCTL     0x408u
++#define SWL_AGENT_RESET_CTL 0x800u
++#define SWL_AGENT_RESET_ST  0x804u
++
++#define SWL_CORE_CC     0x800
++#define SWL_CORE_D11    0x812
++#define SWL_CORE_PMU    0x827
++#define SWL_CORE_GCI    0x840
++#define SWL_CORE_CA7    0x847
++#define SWL_CORE_SYSMEM 0x849
++
++#define SWL_CHIPID_ID(x)    (((x) >> 0) & 0xffffu)
++#define SWL_CHIPID_REV(x)   (((x) >> 16) & 0xfu)
++#define SWL_CHIPID_TYPE(x)  (((x) >> 28) & 0xfu)
++#define SWL_CHIPID_TYPE_AI  1u
++#define SWL_CHIP_4389       0x4389u
++
++#define SWL_EROM_PAGE       0x18105000u
++#define SWL_EROM_LIMIT      0xE00u      /* shim mem_ok(): below ER_REMAPCONTROL (review 13 M1) */
++#define SWL_DESC_MASK       0x0000000Fu
++#define SWL_DESC_COMPONENT  0x00000001u
++#define SWL_DESC_MASTER     0x00000003u
++#define SWL_DESC_ADDRESS    0x00000005u
++#define SWL_DESC_GT32       0x00000008u
++#define SWL_DESC_EOT        0x0000000Fu
++#define SWL_COMP_PARTNUM    0x000FFF00u
++#define SWL_COMP_PARTNUM_S  8
++#define SWL_COMP_REV        0xFF000000u
++#define SWL_COMP_REV_S      24
++#define SWL_COMP_NSWRAP     0x00F80000u
++#define SWL_COMP_NSWRAP_S   19
++#define SWL_COMP_NMWRAP     0x0007C000u
++#define SWL_COMP_NMWRAP_S   14
++#define SWL_SL_ADDR         0xFFFFF000u
++#define SWL_SL_TYPE         0x000000C0u
++#define SWL_SL_TYPE_S       6
++#define SWL_SL_TYPE_SLAVE   0u
++#define SWL_SL_TYPE_SWRAP   2u
++#define SWL_SL_TYPE_MWRAP   3u
++#define SWL_SL_SIZE         0x00000030u
++#define SWL_SL_SIZE_S       4
++#define SWL_SL_SIZE_4K      0u
++#define SWL_SL_SIZE_8K      1u
++#define SWL_SL_SIZE_DESC    3u
++
++#define SWL_MAXCORES 32
++
++struct swl_core { uint16_t id; uint8_t rev; uint32_t base, wrap; };
++
++struct swl_bus {
++	int (*rd)(void *ctx, uint32_t addr, uint32_t *v);   /* nonzero: refused or failed, *v untouched */
++	void *ctx;
++};
++
++struct swl_chip {
++	uint32_t chipid, eromptr, cc_caps, caps_ext;
++	unsigned ncores;
++	struct swl_core cores[SWL_MAXCORES];
++};
++
++/* The BAR0 read allowlist: window (cfg 0x80 value) and the register offset in it. Deny by default (CR-25). */
++static inline int
++swl_rd_ok(uint32_t win, uint32_t off)
++{
++	if (win == SWL_EROM_PAGE) {
++		return off < SWL_EROM_LIMIT && (off & 3u) == 0;
++	}
++	if (win == 0x18000000u) {
++		return off == SWL_REG_CHIPID || off == SWL_REG_CAPS || off == SWL_REG_CAPS_EXT || off == SWL_REG_EROMPTR || off == SWL_REG_CLK_CTL_ST;
++	}
++	if (win == 0x18012000u) {
++		return off == SWL_REG_PMUCONTROL || off == SWL_REG_PMUCAPS || off == SWL_REG_PMUSTATUS || off == SWL_REG_PMU_MINRES || off == SWL_REG_PMU_MAXRES;
++	}
++	if (win == 0x18120000u || win == 0x18126000u || win == 0x18121000u || win == 0x18122000u || win == 0x18123000u) {
++		return off == SWL_AGENT_IOCTL || off == SWL_AGENT_RESET_CTL || off == SWL_AGENT_RESET_ST;
++	}
++	return 0;
++}
++
++static inline int
++swl_win_ok(uint32_t win)
++{
++	return win == SWL_EROM_PAGE || win == 0x18000000u || win == 0x18012000u || win == 0x18120000u || win == 0x18121000u ||
++	       win == 0x18122000u || win == 0x18123000u || win == 0x18126000u;
++}
++
++/* bwfm_chip_dmp_get_regaddr(): the slave addresses of one component. 0 ok, 1 no more addresses for this component (OpenBSD: continue), -1 bus failure. */
++static inline int
++swl_dmp_regaddr(struct swl_bus *b, uint32_t *erom, uint32_t *base, uint32_t *wrap)
++{
++	uint32_t type = 0, val, sztype, stype, wraptype;
++
++	*base = 0;
++	*wrap = 0;
++	if (b->rd(b->ctx, *erom, &val)) {
++		return -1;
++	}
++	type = val & SWL_DESC_MASK;
++	if (type == SWL_DESC_MASTER) {
++		wraptype = SWL_SL_TYPE_MWRAP;
++		*erom += 4;
++	} else if ((type & ~SWL_DESC_GT32) == SWL_DESC_ADDRESS) {
++		wraptype = SWL_SL_TYPE_SWRAP;
++	} else {
++		return 1;
++	}
++	do {
++		do {
++			if (b->rd(b->ctx, *erom, &val)) {
++				return -1;
++			}
++			type = val & SWL_DESC_MASK;
++			if (type == SWL_DESC_COMPONENT) {
++				return 0;
++			}
++			if (type == SWL_DESC_EOT) {
++				return 1;
++			}
++			*erom += 4;
++		} while ((type & ~SWL_DESC_GT32) != SWL_DESC_ADDRESS);
++		if (type & SWL_DESC_GT32) {
++			*erom += 4;
++		}
++		sztype = (val & SWL_SL_SIZE) >> SWL_SL_SIZE_S;
++		if (sztype == SWL_SL_SIZE_DESC) {
++			if (b->rd(b->ctx, *erom, &val)) {
++				return -1;
++			}
++			type = val & SWL_DESC_MASK;
++			*erom += (type & SWL_DESC_GT32) ? 8 : 4;
++		}
++		if (sztype != SWL_SL_SIZE_4K && sztype != SWL_SL_SIZE_8K) {
++			continue;
++		}
++		stype = (val & SWL_SL_TYPE) >> SWL_SL_TYPE_S;
++		if (*base == 0 && stype == SWL_SL_TYPE_SLAVE) {
++			*base = val & SWL_SL_ADDR;
++		}
++		if (*wrap == 0 && stype == wraptype) {
++			*wrap = val & SWL_SL_ADDR;
++		}
++	} while (*base == 0 || *wrap == 0);
++	return 0;
++}
++
++/* bwfm_chip_dmp_erom_scan(): 0 ok (cores in the walk order, OpenBSD lists them reversed), -1 bus failure or table full. */
++static inline int
++swl_erom_scan(struct swl_bus *b, struct swl_chip *c)
++{
++	uint32_t erom = c->eromptr, val, base, wrap, type = 0, nmw, nsw;
++	uint16_t id;
++	uint8_t rev;
++	int rc;
++
++	c->ncores = 0;
++	while (type != SWL_DESC_EOT) {
++		if (b->rd(b->ctx, erom, &val)) {
++			return -1;
++		}
++		type = val & SWL_DESC_MASK;
++		erom += 4;
++		if (type != SWL_DESC_COMPONENT) {
++			continue;
++		}
++		id = (val & SWL_COMP_PARTNUM) >> SWL_COMP_PARTNUM_S;
++		if (b->rd(b->ctx, erom, &val)) {
++			return -1;
++		}
++		type = val & SWL_DESC_MASK;
++		erom += 4;
++		if (type != SWL_DESC_COMPONENT) {
++			return -1;
++		}
++		nmw = (val & SWL_COMP_NMWRAP) >> SWL_COMP_NMWRAP_S;
++		nsw = (val & SWL_COMP_NSWRAP) >> SWL_COMP_NSWRAP_S;
++		rev = (val & SWL_COMP_REV) >> SWL_COMP_REV_S;
++		if (nmw + nsw == 0 && id != SWL_CORE_PMU && id != SWL_CORE_GCI) {
++			continue;
++		}
++		rc = swl_dmp_regaddr(b, &erom, &base, &wrap);
++		if (rc < 0) {
++			return -1;
++		}
++		if (rc > 0) {
++			continue;
++		}
++		if (c->ncores == SWL_MAXCORES) {
++			return -1;
++		}
++		c->cores[c->ncores].id = id;
++		c->cores[c->ncores].rev = rev;
++		c->cores[c->ncores].base = base;
++		c->cores[c->ncores].wrap = wrap;
++		c->ncores++;
++	}
++	return 0;
++}
++
++static inline const struct swl_core *
++swl_core(const struct swl_chip *c, unsigned id, unsigned idx)
++{
++	unsigned i;
++
++	for (i = 0; i < c->ncores; i++) {
++		if (c->cores[i].id == id && idx-- == 0) {
++			return &c->cores[i];
++		}
++	}
++	return 0;
++}
++
++/* One read, logged unless it is an EROM dword; -1 on refusal (the caller stops, nothing else was done). */
++#define SWL_RD(b, a, out) do { if ((b)->rd((b)->ctx, (a), &(out))) { printf("SWEET WLAN: stage 1 stops at read %#x\n", (unsigned)(a)); return -1; } } while (0)
++
++/*
++ * Stage 1: the reads of shim steps S30..S33 (LINK R30..R33) in the same order, plus ChipCommon capabilities and, at level 2, the three D11
++ * wrappers. Nothing is written except the BAR0 window select inside b->rd. Every identity is pinned to the observed value (runs w3a-n30..n33)
++ * before the next block is touched: chip id 0x4389 type AI, eromptr 0x18105000, ChipCommon 0x18000000, PMU 0x18012000, CA7 wrapper
++ * 0x18120000, SYS_MEM wrapper 0x18126000, D11 wrappers 0x18121000/0x18122000/0x18123000. 0 ok, -1 stopped.
++ */
++static inline int
++swl_stage1(struct swl_bus *b, struct swl_chip *c, int level)
++{
++	const struct swl_core *cc, *pmu, *ca7, *sm, *d;
++	uint32_t v, i;
++
++	SWL_RD(b, SWL_CHIP_BASE + SWL_REG_CHIPID, c->chipid);
++	if (SWL_CHIPID_ID(c->chipid) != SWL_CHIP_4389 || SWL_CHIPID_TYPE(c->chipid) != SWL_CHIPID_TYPE_AI) {
++		printf("SWEET WLAN: chip id %#x is not a BCM4389 on the AI interconnect, stop\n", c->chipid);
++		return -1;
++	}
++	SWL_RD(b, SWL_CHIP_BASE + SWL_REG_EROMPTR, c->eromptr);
++	if (c->eromptr != SWL_EROM_PAGE) {
++		printf("SWEET WLAN: eromptr %#x is not %#x, stop\n", c->eromptr, SWL_EROM_PAGE);
++		return -1;
++	}
++	SWL_RD(b, SWL_CHIP_BASE + SWL_REG_CAPS, c->cc_caps);
++	SWL_RD(b, SWL_CHIP_BASE + SWL_REG_CAPS_EXT, c->caps_ext);
++	SWL_RD(b, SWL_CHIP_BASE + SWL_REG_CLK_CTL_ST, v);
++	if (swl_erom_scan(b, c)) {
++		printf("SWEET WLAN: EROM walk failed after %u cores, stop\n", c->ncores);
++		return -1;
++	}
++	for (i = 0; i < c->ncores; i++) {
++		printf("SWEET WLAN: core %#x rev %u base %#x wrap %#x\n", c->cores[i].id, c->cores[i].rev, c->cores[i].base, c->cores[i].wrap);
++	}
++	cc = swl_core(c, SWL_CORE_CC, 0);
++	if (cc == 0 || cc->base != SWL_CHIP_BASE) {
++		printf("SWEET WLAN: ChipCommon not at %#x, stop\n", SWL_CHIP_BASE);
++		return -1;
++	}
++	/* bwfm_chip_get_pmu(): the AOB PMU core when ChipCommon rev >= 35 and capabilities_ext says AOB, else ChipCommon */
++	pmu = (cc->rev >= 35 && (c->caps_ext & SWL_CAPS_EXT_AOB)) ? swl_core(c, SWL_CORE_PMU, 0) : cc;
++	if (pmu == 0 || pmu->base != 0x18012000u) {
++		printf("SWEET WLAN: PMU core not at 0x18012000, stop\n");
++		return -1;
++	}
++	SWL_RD(b, pmu->base + SWL_REG_PMUCONTROL, v);
++	SWL_RD(b, pmu->base + SWL_REG_PMUCAPS, v);
++	SWL_RD(b, pmu->base + SWL_REG_PMUSTATUS, v);
++	SWL_RD(b, pmu->base + SWL_REG_PMU_MINRES, v);
++	SWL_RD(b, pmu->base + SWL_REG_PMU_MAXRES, v);
++	ca7 = swl_core(c, SWL_CORE_CA7, 0);
++	sm = swl_core(c, SWL_CORE_SYSMEM, 0);
++	if (ca7 == 0 || ca7->wrap != 0x18120000u || sm == 0 || sm->wrap != 0x18126000u) {
++		printf("SWEET WLAN: CA7/SYS_MEM wrappers not at 0x18120000/0x18126000, stop\n");
++		return -1;
++	}
++	SWL_RD(b, ca7->wrap + SWL_AGENT_IOCTL, v);
++	SWL_RD(b, ca7->wrap + SWL_AGENT_RESET_CTL, v);
++	SWL_RD(b, ca7->wrap + SWL_AGENT_RESET_ST, v);
++	SWL_RD(b, sm->wrap + SWL_AGENT_IOCTL, v);
++	SWL_RD(b, sm->wrap + SWL_AGENT_RESET_CTL, v);
++	SWL_RD(b, sm->wrap + SWL_AGENT_RESET_ST, v);
++	if (level < 2) {
++		return 0;
++	}
++	for (i = 0; i < 3; i++) {
++		d = swl_core(c, SWL_CORE_D11, i);
++		if (d == 0 || d->wrap != 0x18121000u + 0x1000u * i) {
++			printf("SWEET WLAN: D11 core %u wrapper not at %#x, stop\n", i, 0x18121000u + 0x1000u * i);
++			return -1;
++		}
++		SWL_RD(b, d->wrap + SWL_AGENT_IOCTL, v);
++		SWL_RD(b, d->wrap + SWL_AGENT_RESET_CTL, v);
++		SWL_RD(b, d->wrap + SWL_AGENT_RESET_ST, v);
++	}
++	return 0;
++}
++
++#endif /* SWEET_WLAN_CHIP_H */

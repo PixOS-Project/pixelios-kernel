@@ -13,16 +13,17 @@
 #   --dvfs K0,K1,K2  shim asks the ACPM firmware for these CPU cluster rates (kHz; table rows below the ceilings, 0 = leave; docs/research/25) before XNU starts; --dvfs read = read the rates only (dvfsr)
 #   --rails      shim switches the touch rails on via ACPM before XNU starts (observed needed for the FTM5, docs/HANDOFF.md session 12)
 #   --gpu-handover  shim switches the GPU shader rail on (ACPM) before XNU starts and leaves it on; boot-arg sweetgpu=0x1C500000 makes patch 0102 read the GPU (docs/research/30)
+#   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, docs/research/42 s.7) and boot-arg sweetwlan=1 (xnu patch 0120: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
 #   --rw         ufsrw=1 rootrw=1 (UFS writes inside userdata, needed to initialise the HFS journal)
 # Never use --pstore-fast here: this bootloader silently rejects the lz4 image (docs/HANDOFF.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
-kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""
+kernel=$A/xnu-0085/kernel.development.sweet; adt=$A/xnu-0085-root/A.adt; qr=off; rw=0; gui=0; usbnet=0; usbdma=0; rails=0; handover=0; dvfs=""; restart=""; cpus=1; extra=""; out=""; overlay=""; wlan=0; wlanlvl=1
 while [ $# -gt 0 ]; do case "$1" in
 	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --qr) qr=$2; shift 2 ;;
-	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;;
+	--rw) rw=1; shift ;; --rails) rails=1; shift ;; --wlan-hold) wlan=1; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --gpu-handover) handover=1; shift ;; --dvfs) dvfs=$2; shift 2 ;; --gui) gui=1; shift ;; --usbnet) usbnet=1; shift ;; --usbdma) usbnet=1; usbdma=1; shift ;; --cpus) cpus=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) extra=$2; shift 2 ;; --out) out=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;;
 	*) echo "unknown option $1" >&2; exit 2 ;; esac; done
 args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweetusb=0 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1"
 [ "$usbnet" = 1 ] && args=${args/sweetusb=0/sweetusb=2}   # replace, never add: a duplicate key is ambiguous (review 17 L5: for key=value the LAST one wins in PE_parse_boot_argn, so `--gui --args sweetfb_noconsole=2` gives 2)
@@ -32,9 +33,10 @@ args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress 
 case "$qr" in off|0) ;; *[!0-9]*) echo "--qr needs seconds or off" >&2; exit 2 ;; *) args="$args sweetqr=$qr" ;; esac
 [ -n "$restart" ] && args="$args sweetrestart=$restart"
 [ "$handover" = 0 ] || args="$args sweetgpu=0x1C500000"   # patch 0102 reads the GPU; sweetgpujob=1 (patch 0103, WRITES) only via --args
+[ "$wlan" = 0 ] || args="$args sweetwlan=$wlanlvl"   # patch 0120: read-only attach, needs the --wlan-hold shim flavor (link left up)
 [ -n "$extra" ] && args="$args $extra"
 [ -z "$overlay" ] || case " $args " in *" sweetdev="*) ;; *) args="$args sweetdev=1" ;; esac   # never doubled: an explicit sweetdev= in --args is kept
-railsarg=(); words=""; dvfsarg=(); hoarg=(); [ "$handover" = 0 ] || hoarg=(--gpu-handover)
+railsarg=(); words=""; dvfsarg=(); hoarg=(); [ "$handover" = 0 ] || hoarg=(--gpu-handover); [ "$wlan" = 0 ] || hoarg+=(--wlan-hold)
 [ "$rails" = 0 ] || words=rails
 if [ "$dvfs" = read ]; then words="${words:+$words,}dvfsr"
 elif [ -n "$dvfs" ]; then words="${words:+$words,}dvfs"; dvfsarg=(--dvfs "$dvfs"); fi

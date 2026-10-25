@@ -551,6 +551,10 @@ else
 	awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > $O/sweet_ftm5.h
 	chk "ftm5_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/ftm5_host_test ftm5_host_test.c
 	chk "ftm5_host_test" $O/ftm5_host_test
+	# stage-1 BCM4389 chip layer of xnu patch 0120 (new-file hunk of bsd/dev/sweet_wlan_chip.h): replayed against the values observed on hardware
+	awk '$0=="+++ b/bsd/dev/sweet_wlan_chip.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0120-sweet-wlan-bwfm-core.patch > $O/sweet_wlan_chip.h
+	chk "wlan_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_xnu_host_test wlan_xnu_host_test.c
+	chk "wlan_xnu_host_test" $O/wlan_xnu_host_test
 	awk '$0=="+++ b/bsd/dev/sweet_mali_pt.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0104-sweet-mali-driver-core.patch > $O/sweet_mali_pt.h
 	chk "mali_pt_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/mali_pt_host_test mali_pt_host_test.c
 	chk "mali_pt_host_test" $O/mali_pt_host_test
