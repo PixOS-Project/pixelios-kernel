@@ -187,7 +187,7 @@ static void negative_cases(void)
 	memcpy(alt, erom, sizeof erom);
 	alt[erom_idx(0x18012005u)] = 0x18013005u;	/* PMU base */
 	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
-	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0);
+	CHECK(run(&f, &c, 2) == -1 && seen_in(&f, 0x18012000u, 0x18013000u) == 0 && f.refused == 0);
 
 	memcpy(alt, erom, sizeof erom);
 	alt[erom_idx(0x4bf82701u)] = 0x4bf82601u;	/* PMU core part number gone */
@@ -212,6 +212,17 @@ static void negative_cases(void)
 	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
 	CHECK(run(&f, &c, 2) == -1);
 	CHECK(seen_in(&f, 0x18121000u, 0x18122000u) == 3 && seen_in(&f, 0x18122000u, 0x18124000u) == 0);
+
+	/* review 23b F-A: the pin itself refuses (the allowlist never sees the bad address) */
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x18126185u)] = 0x18127185u;	/* SYS_MEM wrapper */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && f.refused == 0);
+
+	memcpy(alt, erom, sizeof erom);
+	alt[erom_idx(0x181230c5u)] = 0x181250c5u;	/* D11 #2 wrapper */
+	memset(&f, 0, sizeof f); f.alt = alt; f.nalt = sizeof erom / 4;
+	CHECK(run(&f, &c, 2) == -1 && f.refused == 0);
 }
 
 /* Review 23 F1: every word of the link / endpoint precheck refuses when off by one bit */
