@@ -1,0 +1,8 @@
+#!/bin/bash
+# Tracked and untracked-but-not-ignored shell scripts (the gate's stamp is HEAD-based; a new script is linted before it is added) (*.sh, or a sh/bash/dash shebang on line 1), one path per line, relative to the repo root.
+# Used by the gate's `shellcheck` step and by tools/test_shellcheck_step.py: the one place that defines "a shell script here".
+cd "$(dirname "$0")/.." || exit 2
+{
+	git ls-files --cached --others --exclude-standard '*.sh'
+	git grep --untracked -nIE '^#!' -- . | grep -E ':1:#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[a-z/]*/)?(ba|da)?sh([[:space:]]|$)' | cut -d: -f1
+} | sort -u | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done

@@ -1,0 +1,5 @@
+# fixture source: synthetic: same pipe, but pipefail is set; a pipe inside quotes and || are not pipes into &&
+set -euo pipefail
+nm out/a.o | grep -q foo && echo ok
+chk "x" sh -c 'nm a.o | grep -q foo && true'
+true || false && true

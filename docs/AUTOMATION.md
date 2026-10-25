@@ -79,6 +79,40 @@ Applies the three stagers and every `xnu/patches/*.patch` in order on a pristine
 stager downloads. FAIL names the first failing patch and prints 10 lines of the `git apply` error. `--only-new 0088`
 still applies everything but states the verdict for that patch. It does not build; CI does.
 
+## Dev overlay: change files in the flashed root without re-flashing (xnu patch 0117, UNREVIEWED, never run on hardware)
+
+```
+tools/xrun --kernel K --overlay DIR [--args "..."] ...          # or: tools/build-xnu-image.sh --overlay DIR
+tools/mkdevoverlay.py DIR OUT.bin [--owner UID:GID]               # the packer alone (default owner 0:0)
+```
+`DIR/usr/lib/libsweetgl.dylib` becomes `/usr/lib/libsweetgl.dylib` on the phone. The image gets the archive as the payload
+RAM disk (`mkpayload.py --ramdisk`) and ` sweetdev=1` in the boot-args (607-byte budget still enforced by mkpayload). Before launchd starts,
+`sweet_devoverlay_run()` (called in `bsd_init` after `vfs_mountroot`) copies the files into the mounted root (`rootrw=1`, i.e. inside `userdata`
+only). Without `sweetdev=` it returns before printing anything; the payload of a normal `xrun` has no RAM disk.
+
+* **Archive** (little-endian, documented in the header of the patch's `bsd/dev/sweet_devoverlay.c`, validated by the kernel and by `mkdevoverlay.parse`):
+  `"SWEETDEV" | u32 version=1 | u32 count` then per entry (16-byte aligned) `u16 pathlen | u16 mode | u32 uid | u32 gid | u32 crc32 | u64 size | path | pad | data | pad`.
+  Every length is checked against the remaining bytes before use; a structural error means nothing is written; a bad crc skips that file.
+* **Allowlist** (anything else: packer error; kernel `SWEET DEV: refused PATH (reason)`): `/usr/lib/`, `/usr/local/`, `/private/var/dev/`,
+  exactly `/System/Library/xpc/launchd.plist`, `/System/Library/LaunchDaemons/org.pixelios.*` (one file name). Also refused: relative paths,
+  `..`, `.`, empty components, components over 245 bytes, control bytes, mode above 0777 (no setuid), names ending `.sweettmp`/`.sweetorig` (any case), symlinks and non-regular files in DIR, more than 40 MiB in total (the 64 MiB boot image holds ~16 MiB already).
+* **Safety model:** every existing parent component is looked up without following symlinks and must be a directory; directories are created
+  only at or below an allowlisted directory prefix; the target must be absent or a regular file. Per file: identical (size + bytes) -> `skipped`;
+  else write `PATH.sweettmp`, set mode/uid/gid, fsync, rename over the target; the first replaced original is kept as `PATH.sweetorig`.
+  Errors are logged and the loop goes on; no panics, all loops bounded (count <= 4096).
+* **`sweetdev=restore`:** `--overlay DIR --args "sweetdev=restore"` (the overlay still names the paths) renames `PATH.sweetorig` back over `PATH` for every archive entry.
+* **Log lines** (UDP log): `SWEET DEV: wrote|skipped|refused|failed|restored PATH ... N ms` per file, then `SWEET DEV: sync error N` (only on a VFS_SYNC failure), then `SWEET DEV: done: W written, S skipped, R refused/failed, T ms`.
+* **First-run checklist** (review 18, `docs/reviews/18-dev-overlay-0117.md`). Preconditions: host tests below pass; the flashed root has finished its first (DataMigration) boot;
+  the phone lock is held by you and the agent that owns the installed root has been told it gets ONE new file. **Never replace an existing file on the first runs.**
+  1. `DIR/private/var/dev/hello` = `hello\n` (6 bytes), nothing else. `tools/xrun --kernel K --overlay DIR --label dev1 --restart 600 --expect "SWEET DEV: wrote /private/var/dev/hello 6 bytes" --expect "SWEET DEV: done: 1 written, 0 skipped, 0 refused/failed" --fail-on "SWEET DEV: (refused|failed|sync error|bad archive|sweetdev=.* but no SWEETDEV|root is not mounted|out of memory)"`; add `--gui` plus the owning agent's GUI `--expect` so the GUI-marker PASS rule below is encoded in the command, not only read by hand.
+     PASS = both expects, no fail-on, and the run still reaches the usual GUI marker of that agent's runs; the shim/loader lines must not say `ramdisk overlaps kernel memory`.
+  2. Same image again: expect `SWEET DEV: skipped /private/var/dev/hello 6 bytes (identical)` and `done: 0 written, 1 skipped` (proves the read-back path and that run 1 reached the disk).
+  3. Only after 1 and 2: a replacement under `/usr/local/` (not `/usr/lib/`), then a `--args "sweetdev=restore"` run for it. Size ramp for the RAM disk (research 41 U1) before anything over ~20 MiB.
+  * **Recovery:** on any `panic`/`Kernel trap` in 1 or 2, boot the previous image WITHOUT `--overlay` (the hook is inert; HFS replays its journal). If that boot does not reach the GUI the root is damaged: stop,
+    tell the agent that owns the image, and re-flash it with `tools/fflash-userdata.sh IMG --yes-erase-userdata` after it confirms which image. A bad `launchd.plist`: `--overlay DIR --args "sweetdev=restore"`
+    (restores `.sweetorig`), else re-flash. Files the overlay CREATED (and created directories) are not removed by `restore`. Never run fsck or write to the root from the host.
+* **Tests:** `python3 tools/test_mkdevoverlay.py`, `python3 tools/test_build_overlay_args.py`, `python3 tools/test_devoverlay_kernel.py` (compiles the kernel's parsing/path functions on the host with ASan/UBSan, differential vs the packer's reader, plus mutants; skipped without gcc). Design and unknowns: kernel `docs/research/41-dev-overlay-without-reflash.md`.
+
 ## tools/phone-state: what state is the Pixel in?
 
 ```
@@ -125,23 +159,66 @@ reset half of TP-006 is not built (open for the user's decision). Verified with 
 ## tools/check-all.sh: the quality gate
 
 `tools/check-all.sh` (full) is what must print `GATE PASS <hash>` before a push. Output is one line; `shim/out/gate.log` has the
-full log plus a per-step timing table. Two lanes run in parallel (cap of 2 jobs): lane A = the seven bluejay shim builds (they share
-`shim/out`, so they stay serial) + host-tests + boot-safety, lane B = unit, rootless, validate. The log is merged A then B, so it is
-deterministic. Measured on the dev machine (*observed*, 2026-10-22, 01a978f): 50 s serial -> 37 s with lanes; the builds
-(6 x ~6 s) dominate.
+full log (steps in a fixed order) plus a per-step timing table. *Read from source* (`tools/check-all.sh`, this branch; not yet measured on a full gate):
+
+- **Lanes.** Two lanes run in parallel: lane A = shim builds + host-tests + boot-safety, lane B = validate, public-split, unit, phone-state,
+  hang-recover, probe-run, rootless. Lane A runs `build` first and serially (it creates `shim/out/bluejay-testkey.pem`, warms the audit
+  memo and the host-test stamp, and forces the host tests: `PIXELIOS_HOST_TESTS=always`), then the other 11 build steps in parallel,
+  at most `GATE_JOBS` (default 8; `-j N` works too) at a time, then host-tests (the binaries of `build`) and boot-safety (`--out shim/out/gate/build-0`).
+- **No shim/out writes, no `.build.lock`.** Every `build.sh` call gets its own dir `shim/out/gate/<step>-<i>/` (`--out`, below); the gate
+  never overwrites `shim/out/*.img` and does not wait for xrun/probe-run. It takes `shim/out/.gate.lock` instead (one gate per worktree;
+  `tools-sync pull` refuses while it is held). Per-step logs: `shim/out/gate/<step>.log` (live); `gate.log` is rebuilt from them at the end.
+- **Live state.** `shim/out/gate.progress` (`START <step> <epoch>` / `END <step> PASS|FAIL [(timeout)] <s>` lines), `shim/out/gate.result`
+  (atomic: `WAITING <pid> <epoch>` while the gate waits for `.gate.lock` (it replaces the old result; a lock timeout writes `GATE FAIL lock-timeout`),
+  `RUNNING <pid> <epoch>`, then the final `GATE ...` line + epoch). The waiter names the holder from `shim/out/.gate.owner` (removed when a gate ends; `unknown` if empty).
+  A hash with `+dirty` means `git status --porcelain` was not empty at the start, or HEAD moved / the tree changed during the run (read from source: tools/check-all.sh, tools/test_check_all_stub.sh).
+  The stamp is `HEAD` taken at the start, written only by a full (or quick-turned-full) PASS whose HEAD and tree did not change; never after a quick run or any failure.
+- **Interrupt (Ctrl-C, kill).** INT/TERM/HUP kills every step's process group (`timeout` puts each step in its own group, pids in a temp dir), the lane jobs,
+  releases the lock, and writes `GATE FAIL <hash> interrupted <epoch>` to `gate.result` (also printed). A lane never starts a step once the gate is gone or interrupted.
+  Tested with stubs: `bash tools/test_check_all_stub.sh` (~15 s, also run by the `unit` step through `tools/test_check_all_stub.py`).
+- **Timeouts and failure.** Each step runs under `timeout -k 10`: 1500 s for `build-wlan`, 900 s other `build*`, 300 s others; `GATE_STEP_TIMEOUT=SECONDS` (positive integer; `0`, empty-digits or non-numeric values exit 2, since `timeout 0` means no limit) overrides all;
+  a timeout is a step FAIL `(timeout)`. A failing step stops every other step at its next step boundary (running parallel builds finish);
+  `--keep-going` stops only the failing lane. The reported failure is the first failed step in the fixed step order.
+- **shellcheck step (lane B).** `shellcheck -S warning $(tools/shell-files)`, zero tolerance, over every tracked `*.sh` or sh/bash/dash-shebang script
+  (`tools/shell-files` is the single listing; it also lists untracked-but-not-ignored scripts, so a new script is linted before `git add`). `--quick` selects it for any changed shell file (`gate_select.is_shell`). Fix findings; `# shellcheck disable=SCxxxx` needs a reason on the same line.
+  `shim/build.sh` carries two such directives (CFLAGS word splitting, host-test hash file lists). Needs `shellcheck` installed (apt).
+- **Flags and env.** `--quick`, `--keep-going`, `--no-memo` (= `PIXELIOS_AUDIT_NO_MEMO=1`; `1`, `true`, `yes` in any case turn the memo off; `0`, `false`, `no`, `off` or empty keep it on; any other spelling prints a warning on stderr and also turns it off, fail safe), `-j N` (= `GATE_JOBS=N`), `GATE_STEP_TIMEOUT`.
+
+**Audit memo (`tools/audit_memo.py`, R2).** The three expensive mutation self-tests of `tools/test-bluejay-boot.py` (`wlan_seq_selftest`,
+`wlanlink_source_selftest`, `wlanlink_object_selftest`) are cached by content. Key = sha256 of the audit script bytes, `tools/audit_memo.py` itself, the function name,
+the argument bytes (the objdump text for the object self-test; objdump itself stays outside), `sys.version` + implementation; the entry also
+records every file the function opened (`sys.addaudithook`, event `open`) with its sha256 taken at open time and re-hashes them on lookup. Only a PASS is stored, and only if every recorded file still has its open-time hash after the run (an edit during the run stores nothing);
+a run that started a process or wrote a file is never stored; a corrupt entry is a miss. A hit prints the captured lines with
+`(memo <key16>)` appended. The audit of the real objects/sources (`check_*` on `shim/out/*.o`, `shim/*.c`) is never memoized.
+Cache dir: `$PIXELIOS_AUDIT_MEMO_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/pixelios/audit/` (shared by worktrees; entries store repo paths relative
+to the repo root). Off: `tools/test-bluejay-boot.py --no-memo`, `PIXELIOS_AUDIT_NO_MEMO=1`, `check-all.sh --no-memo`.
+Tests: `tools/test_audit_memo.py` (key parts, dep tracking, FAIL / subprocess / write not stored, corrupt entry, replay) and
+(path normalisation across worktrees, mid-run edit) and `tools/test_audit_memo_mutations.sh` (also run by the `unit` step through `tools/test_audit_memo_mutations.py`, ~30 s; ends `RESULT: PASS mutants=N caught=N`; runs from a temp copy with a warm memo and requires each
+mutant of the wlanlink source, the audit script, `wlan_seq.json` and `boards.py` to still FAIL; the object self-test needs an aarch64
+objdump and a built `wlanlink.o` and is not covered by it; logs in `logs/audit-memo-mut/<UTC>/`).
+
+**`shim/build.sh` additions.** `--out DIR` (default `out`; relative to `shim/`; `[A-Za-z0-9._/-]` only) replaces every `out/` path; the AVB test key
+stays `out/bluejay-testkey.pem`. `tools/test-bluejay-boot.py --out DIR` audits that dir (default `shim/out`) and takes one or more boot
+images (header checks per image, the tree audit once). The variant-independent host tests (and the extracted xnu-patch headers) run once per input digest:
+sha256 of `shim/*.c *.h`, `out/board_config.h`, `out/wlan_seq.h`, the `../xnu/patches/NNNN` files `build.sh` references, `gcc -v` and `build.sh`;
+the stamp `${XDG_CACHE_HOME:-~/.cache}/pixelios/host-tests/<digest>.ok` is written only after all of them passed
+(`host tests: cached <digest>` otherwise; `PIXELIOS_HOST_TESTS=always` runs them anyway); the digest is recomputed after the tests and no stamp is written if an input changed meanwhile.
+Every host-test compile and run goes through `chk` (a failure stops the build; no stamp), and `chk` lists each compiled `*host_test*` output in `$O/host-tests.list`.
+The gate's `host-tests` step runs exactly that list from `out/gate/build-0` and FAILS on a missing list or binary (no silent skip); `host_test` writes its `.ppm` only to a path given as argv[1].
+`tools/test_build_hosttests.sh` (via `test_build_hosttests.py`) tests this plumbing without a build, and that the `--wlan-iso --wlan-en` build is refused with the intended message. The variant `nm` checks always run.
 
 `tools/check-all.sh --quick` is for iterating: it diffs the tree against the commit in `shim/out/gate.stamp` (written only by a
 full PASS on a clean tree) and runs only the needed steps, selected by `tools/gate_select.py` (tested by `tools/test_gate_select.py`):
 
 | Changed paths | Steps |
 |---|---|
-| `shim/`, `soc/`, `device/`, `tools/imgmeta*`, `tools/mk*`, `tools/test-bluejay-boot.py`, `tools/check-all.sh`, xnu patches 0087/0088 (the host tests extract headers from them) | 6 builds, host-tests, boot-safety |
+| `shim/`, `soc/`, `device/`, `tools/imgmeta*`, `tools/mk*`, `tools/test-bluejay-boot.py`, `tools/check-all.sh`, the xnu patches `shim/build.sh` references as `../xnu/patches/NNNN` (0087, 0088, 0093, 0104 today; the host tests extract headers from them; read from build.sh, not listed in code); `shim/*.md` selects no build | 6 builds, host-tests, boot-safety |
 | `tools/`, `soc/`, `device/` | unit, phone-state, hang-recover, rootless |
 | `tools/`, `soc/`, `device/` | unit, phone-state, probe-run, rootless |
 | anything (docs, other `xnu/` patches) | validate (patch numbering/header format, script syntax), always |
 
 No stamp, or a stamp that is not an ancestor of HEAD: the full gate runs. A quick PASS line says `quick: ran N of 17 steps`;
-it is not a substitute for the full gate before a push.
+it is not a substitute for the full gate before a push. `tools/audit_memo.py` selects the build steps like `tools/test-bluejay-boot.py`.
 
 ## shim --gpu-power: Mali-G78 power on/off cycle (G2 stage 1, opt-in)
 
@@ -417,8 +494,55 @@ tools/phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N] | release -
 tools/phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...     # acquire, run CMD, release in a finally (also SIGTERM/INT/HUP)
 tools/test_phone_lock.py                                              # host test, run by check-all.sh (unittest discover)
 ```
+**Enforcement and queue (TP-020, 2026-10-24; review 11 fixes).** Take the phone only when you are ready to use it: `xrun` and `probe-run` build the image first and take the lock
+afterwards (`--lock-wait S` waits in line; default fails at once with who holds it) and keep it until they exit. Identity is a **token**, not the owner name (the name is only a label):
+`phone-lock run` and the self-locking tools create a token and export `PHONE_LOCK_TOKEN` to everything they start. `phone-lock check [--token T]` exits 0 only if that token is
+the live lock's; `fboot.sh`, `fflash-userdata.sh`, `run-probe.sh`, `pstore-pull.py run` and `phone goto` (not `--dry-run`, not `state`) call it and refuse without it. So a shell that
+did not get the lock from `run`/`xrun`/`probe-run` cannot flash or boot: wrap manual slots as `tools/phone-lock run --owner NAME --wait S -- bash -c '...'`. A lock with a pid ends only
+when that pid is dead and its process group (`run` starts CMD in its own group) is empty, never by ttl; a bare `acquire` without `--pid` is ttl-only and warns. Waiters (`--wait`) are served in
+arrival order (`$PHONE_LOCK_DIR.queue`, shown by `status`). `tools/phone-guard` is a Claude Code PreToolUse hook (wired in the super repo `.claude/settings.json`) that denies hand-typed
+mutating `fastboot`/`adb` (also inside `bash -c`/`eval`); read-only queries and `adb shell getprop` pass; it is a guard rail against accidents, not a sandbox; sessions pick it up at start. Gates and builds never take the lock.
+Not guarded: `backup-partitions.sh`, `check-udump.sh` (adb reads, run by the user with root). Tests: `tools/test_phone_lock.py`, `tools/test_phone_guard.py`, `tools/test_phone_sm.py`, `tools/probe-run --self-test`.
+
+**Fewer false alarms, no cut tails (TP-020 follow-up, 2026-10-24).** `probe-run` waits up to 120 s (`PR_BACK`) for the phone after a shim run (it leaves USB for about 30 s and returns in recovery: observed by the Wi-Fi agent, HANDOFF session 28, not re-measured) with the
+capture still running; a slow return is a PASS note, a run that hit `--timeout` while the shim was still logging (log younger than 15 s) is a FAIL "raise --timeout", and HANG / "hold Power+VolDown" needs the
+expected lines missing AND no Google USB device on the bus after the window (on the bus but not fastboot/recovery: FAIL pointing at `phone-state`). `xrun` waits up to 120 s (`XRUN_USB_WAIT`) for the phone to
+appear, after it holds the phone lock, before asking for a button hold; a hard timeout shorter than `--restart` is PARTIAL (reset not awaited); when the reset was due but the phone is not back at the hard
+timeout there is a 90 s grace window (`XRUN_GRACE`, so the cap is `--hard-timeout` + 90 s), and if the bluejay itself is then in recovery/fastboot the run is scored PASS as "reset inferred" (not observed).
+`usb_gone` in run.json is when the phone left fastboot for XNU (+2 s), not proof that the reset fired. Log tails (unit-tested on a pty / loopback socket, not yet seen on hardware): `usb-log.py capture` drains the
+tty (bounded to 2 s) after the device node vanishes and keeps a last partial line on SIGTERM; `usbnet-log.py` drains queued datagrams (bounded to 2 s) after the stop file appears. Two 2026-10-22 runs (`dvfs4-all`, `busy2`) were scored FAIL although the reset fired: `report.revised.txt` next to their `report.txt` (wording: reset inferred, not observed).
+
+**One set of phone-path tools for every agent (TP-021).** The agent-independent tools listed in `tools/common-files.txt` (lock, phone, fboot, fflash, xrun, probe-run, log capture, guard hook and their tests) have one
+source of truth: the branch `common-tools` (own worktree `~/.t3/worktrees/common-tools/kernel`; change them there). In any other worktree, at a task boundary and with the phone lock free:
+`tools/tools-sync status` (per file same/differs/missing) and `tools/tools-sync pull` (copies differing files from the ref, skips files with uncommitted changes, refuses while the lock is held; you review and commit). An agent-specific flag in a common file
+must be upstreamed to `common-tools`, or it shows as drift. The gate does not check this (drift is a warning for the agents, not a gate failure).
+
+**Runs that end when the answer is in (boot-speed B1/B2, 2026-10-24).** *Observed on hardware* (run `bl1-remote3`, kernel with patch 0100): `xrun --early --stop-on RX` stops at the pattern and `phone goto fastboot` resets the phone over the USB link (UDP `SWEET-RESET-BL`, boot-arg `sweetremote=1`);
+the phone was in fastboot 95 s later instead of the ~700 s a `--restart 400` run waits. So `--early`/`--stop-on` now switch `--remote-reset` on by default (`--no-remote-reset` to disable), `phone goto` waits 150 s (was 90) before it asks for a button hold,
+and `--fail-on RX` (default with an early stop: `Kernel trap at|panic\(cpu|panic:|Assertion failed`, `--fail-on none` to disable) ends a failing run at once and scores it FAIL, so a failing run no longer waits out the restart window. Observed NOT working (run `bl2-timer`, 2026-10-24): `--restart N,bootloader` alone (timer path) came back at restart+152 s as 18d1:d001, the same as a plain timer reset, not as fastboot (18d1:4ee0); use the remote reset.
+
+**Kernel log timestamps (boot-speed M1, patch 0115 on branch boot-speed-patches; review 17).** With boot-arg `sweetlogts=1` every console line in the persistent/USB log starts with `[SSSSS.mmm] ` (raw timer seconds: includes ABL and shim time, subtract the first stamp for time since kernel entry). The stamp is when the line's first byte reaches the console drain, not the printf time (output printed with preemption disabled is drained later): read a gap as "between drains" and confirm it with a second marker. `tools/xrun_report.py` strips the prefix before matching (merged.log stays raw) and prints `[kernel stamp N.NNN]` on the marker lines. With `sweetfb_noconsole=2` (patch 0116) keep one run without it: a hang that is not a panic shows nothing on screen while the console is muted.
+
+**shim/out and `tools-sync` safety (review 16).** `xrun` and `probe-run` take `shim/out/.build.lock` around anything that writes `shim/out` (the gate no longer does: it builds into `shim/out/gate/` and holds `shim/out/.gate.lock`); `xrun`/`probe-run` boot a private copy of the image from the run directory and delete it after fboot. Under `phone-lock run` they wait only 60 s for a gate (the phone is held), otherwise up to an hour. `tools/tools-sync pull` refuses while the phone lock is held or unreadable, while that build lock or the gate lock is held, and for a file this branch changed in its own commits (shown with the log; `--force` overrides); it checks out all files in one command. Never edit `tools/xrun`, `probe-run` or `check-all.sh` in a worktree that has a run waiting or running from it (bash reads a script while it runs, AP-18): run hardware from a worktree you do not edit.
+
+**One numbering for `xnu/patches` (TP-022).** Patches stay per branch (a kernel build contains only the patches of the branch that builds it; sharing one stack was tried and rejected by the user on 2026-10-24: every agent's
+experimental patch would enter everyone's kernel and make failures harder to attribute). Branches diverge (GPU holds 0102-0111, everyone else stops at 0101), so a second agent writing "the next patch" would pick a number that is already taken.
+Before writing a patch run `tools/patch-numbers next --owner NAME --name SLUG`: it prints the next free number above every local and remote branch and every reservation, and records the reservation as a git ref
+(`refs/patch-numbers/NNNN`, shared by all worktrees). `tools/patch-numbers status` lists every number, who holds it and CONFLICT lines (same number, different file name on two branches); `tools/patch-numbers check` fails if THIS
+tree uses a number another branch has under a different name; `release NNNN` drops an unused reservation. When the branches are merged, the numbers are already in order. The gate does not run it (another branch's state must not fail
+your gate): run `check` before committing a patch and before a merge. Enforcement (two hooks): `tools/patch-guard` is a Claude Code PreToolUse hook (super repo `.claude/settings.json`) that denies creating a NEW `xnu/patches/NNNN-slug.patch` (Write/Edit tool, or a Bash redirect/cp/mv/tee/git mv) unless `refs/patch-numbers/NNNN` reserves that number for that slug
+(`tools/patch-numbers next ...`; a patch you already wrote: `tools/patch-numbers claim NNNN --owner NAME --name SLUG`); editing an existing patch is always allowed. `.git/hooks/pre-commit` (installed with `tools/patch-numbers install-hook`, shared by every worktree,
+runs the script from the common-tools worktree) refuses a staged NEW patch whose number another branch or reservation holds under a different name, and reserves the number of a clean one so nobody else picks it. Guard rails, not sandboxes, and both fail OPEN: the settings.json commands are wrapped so a missing or broken script exits 1 (non-blocking) and never 2 (which blocks every tool call), the git hook only blocks on a real overlap (exit 3 of `precommit`) and lets the commit through, with a message, on any internal error. The guard looks at the repo the PATH belongs to (last `cd` in the command), not at the session's cwd. `tools/tools-sync` can also sync a directory (manifest line ending in "/"), but no patch directory is in the manifest.
+
 Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
 (owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
 `release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
 unless `--pid N`. Owner default: `$PHONE_OWNER`, else `agent-<pid>`. Last line `RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns`; exit 0 ok, 1 busy after `--wait`
 (max 3600; holder and age printed) or, for `run`, CMD's own exit code, 2 error; `status` exits 0 free / 1 held. Touches no device. Tested on the host only.
+
+- **`tools/lint-c` and the gate's build dirs (round 3 F6).** The gate builds into `shim/out/gate/build-*` and no longer refreshes `shim/out/board_config.h`;
+  `tools/lint-c` reads `shim/out` by default (RESULT: ERROR if the header is missing, but an old one is accepted), so after a gate run use
+  `tools/lint-c --out shim/out/gate/build-0`.
+- **Memo limits (round 3 F4/F5).** The memo compares a dependency's hash on every open (an edit + revert during a run stores nothing), records
+  `os.listdir`/`os.scandir`/`glob.glob` results as inputs (hash of the sorted names, re-listed on a hit; by fd or with `root_dir` = not stored),
+  and does NOT track failed opens of missing files or `os.stat`/`Path.exists` checks (a memoized function must not branch on those).

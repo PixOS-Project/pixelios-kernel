@@ -1,0 +1,295 @@
+# fixture source: super repo commit da03e99^ (9410da5) shim/build.sh, git show once
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+board=sweet
+payload=
+avb=0
+pstore_fast=0
+usb_gadget=0
+boot_xnu=0
+udump_mib=0
+qrlog=0
+wlan_probe=0
+gpu_probe=0
+touch_probe=0
+touch_opts=
+touch_rails=0
+touch_dvfs=0
+dvfs_khz=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--board) board="$2"; shift 2 ;;
+		--avb) avb=1; shift ;;
+		--pstore-fast) pstore_fast=1; shift ;;
+		--usb-gadget) usb_gadget=1; shift ;;
+		--boot-xnu) boot_xnu=1; shift ;;
+		--udump) udump_mib="$2"; shift 2 ;;
+		--qrlog) qrlog=1; shift ;;
+		--wlan-probe) wlan_probe=1; shift ;;
+		--gpu-probe) gpu_probe=1; shift ;;
+		--dvfs) dvfs_khz="$2"; shift 2 ;;
+		--touch-probe) touch_probe=1; shift ;;
+		--touch-probe=*) touch_probe=1; touch_opts="${1#--touch-probe=}"; shift ;;
+		*)
+			[ -z "$payload" ] || { echo "unexpected argument: $1" >&2; exit 2; }
+			payload="$1"; shift ;;
+	esac
+done
+PYTHON=${PYTHON:-python3}
+soc=$("$PYTHON" ../tools/boards.py "$board" --get soc 2>/dev/null) || { echo "unknown board: $board (tools/pix devices)" >&2; exit 2; }
+gs101=0; [ "$soc" = google/gs101 ] && gs101=1
+if [ "$udump_mib" != 0 ]; then
+	# Framed read-only userdata dump over the USB gadget
+	# (default OFF). UDUMP_MAX_BLOCKS = 16384 blocks = 64 MiB.
+	case "$udump_mib" in ''|*[!0-9]*) echo "--udump needs an integer MiB count" >&2; exit 2 ;; esac
+	[ "$udump_mib" -ge 1 ] && [ "$udump_mib" -le 64 ] || { echo "--udump N_MIB must be 1..64" >&2; exit 2; }
+	[ "$gs101" = 1 ] || { echo "--udump needs a gs101 board (streams over the gadget)" >&2; exit 2; }
+	usb_gadget=1	# the dump needs the CDC-ACM gadget; --usb-gadget is implied
+fi
+
+prefix=${CROSS_PREFIX:-aarch64-linux-gnu-}
+if ! command -v "${prefix}gcc" >/dev/null 2>&1 && [ -x "$HOME/.local/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-gcc" ]; then
+	prefix="$HOME/.local/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+fi
+CC=${CROSS_CC:-${prefix}gcc}
+OBJCOPY=${CROSS_OBJCOPY:-${prefix}objcopy}
+READELF=${CROSS_READELF:-${prefix}readelf}
+NM=${CROSS_NM:-${prefix}nm}
+MKBOOTIMG=${MKBOOTIMG:-../tools/third_party/mkbootimg.py}
+AVBTOOL=${AVBTOOL:-../tools/third_party/avbtool.py}
+# Marker line identity: git short hash of this worktree (date fallback
+# when detached from git), so the pulled pstore log names its build.
+build_id=$(git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d)
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -march=armv8-a+crc -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -Iout -include out/board_config.h -DPSTORE_BUILD_ID=\"$build_id\""
+if [ "$usb_gadget" = 1 ]; then
+	# Stage-2 CDC-ACM log gadget (default OFF): bluejay only (needs try_write32).
+	[ "$gs101" = 1 ] || { echo "--usb-gadget needs a gs101 board" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DUSB_GADGET"
+fi
+if [ "$wlan_probe" = 1 ]; then
+	# Read-only BCM4389 Wi-Fi path probe (default OFF); bluejay only.
+	[ "$gs101" = 1 ] || { echo "--wlan-probe needs a gs101 board" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DWLAN_PROBE"
+fi
+if [ "$gpu_probe" = 1 ]; then
+	# Read-only Mali-G78 probe (default OFF); bluejay only.
+	[ "$gs101" = 1 ] || { echo "--gpu-probe needs a gs101 board" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DGPU_PROBE"
+fi
+if [ "$touch_probe" != 0 ]; then
+	# Touchscreen SPI11/USI11 probe (default OFF); bluejay only. =run adds the XNU driver's writes (allowlisted).
+	[ "$gs101" = 1 ] || { echo "--touch-probe needs a gs101 board" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DTOUCH_PROBE"
+	# --touch-probe=[run][,mux,cs,osc|top,loop,rst,misopu][,railsr|rails] (docs/research/21 section 3, docs/research/23); unknown words are an error.
+	# railsr = ACPM read of the two touch rails (acpm.c), rails = railsr + set their enable bit 7; both work without run.
+	touch_bits=0; touch_run=0; touch_spi=0; touch_need_run=0
+	if [ -n "$touch_opts" ]; then
+		IFS=, read -ra touch_words <<< "$touch_opts"
+		for w in "${touch_words[@]}"; do
+			touch_spi=1
+			case "$w" in
+				run) touch_run=1; b=0 ;;
+				mux) b=1 ;; cs) b=2 ;; osc) b=4 ;; top) b=8 ;; loop) b=16 ;; rst) b=32 ;; misopu) b=64 ;;
+				railsr) b=128; touch_spi=0 ;; rails) b=384; touch_spi=0 ;;
+				dvfsr) b=512; touch_spi=0 ;; dvfs) b=1536; touch_spi=0 ;;
+				*) echo "unknown --touch-probe option '$w' (run,mux,cs,osc,top,loop,rst,misopu,railsr,rails,dvfsr,dvfs)" >&2; exit 2 ;;
+			esac
+			touch_bits=$((touch_bits | b))
+			[ "$touch_spi" = 0 ] || touch_need_run=1
+		done
+		[ "$touch_need_run" = 0 ] || [ "$touch_run" = 1 ] || { echo "--touch-probe=$touch_opts: 'run' is required for the SPI options (writes are opt-in)" >&2; exit 2; }
+		[ $((touch_bits & 12)) != 12 ] || { echo "--touch-probe: osc and top are exclusive" >&2; exit 2; }
+		CFLAGS="$CFLAGS -DTOUCH_OPTS=$touch_bits"
+		[ "$touch_run" = 0 ] || CFLAGS="$CFLAGS -DTOUCH_PROBE_RUN"
+		[ $((touch_bits & 128)) = 0 ] || { CFLAGS="$CFLAGS -DTOUCH_RAILS"; touch_rails=1; }
+		[ $((touch_bits & 256)) = 0 ] || CFLAGS="$CFLAGS -DTOUCH_RAILS_WRITE"
+		# dvfsr = ACPM FREQ_GET of the CPU clusters (docs/research/25); dvfs = dvfsr + FREQ_REQ of the --dvfs K0,K1,K2 kHz (table rows at or below the ceilings)
+		[ $((touch_bits & 512)) = 0 ] || { CFLAGS="$CFLAGS -DTOUCH_DVFS"; touch_dvfs=1; }
+		if [ $((touch_bits & 1024)) != 0 ]; then
+			[ -n "$dvfs_khz" ] || { echo "--touch-probe=dvfs needs --dvfs CL0_KHZ,CL1_KHZ,CL2_KHZ (0 = leave that cluster)" >&2; exit 2; }
+			dv=$("$PYTHON" ../tools/boards.py "$board" --dvfs-check "$dvfs_khz") || exit 2
+			set -- $dv
+			CFLAGS="$CFLAGS -DTOUCH_DVFS_WRITE -DDVFS_KHZ0=$1 -DDVFS_KHZ1=$2 -DDVFS_KHZ2=$3"
+		fi
+	fi
+fi
+if [ "$boot_xnu" = 1 ]; then
+	# Jump into the SWEETXNU payload (ramdisk) right after display setup; bluejay only.
+	[ "$gs101" = 1 ] || { echo "--boot-xnu needs a gs101 board" >&2; exit 2; }
+	CFLAGS="$CFLAGS -DBOOT_XNU"
+fi
+if [ -n "${USB_WINDOW:-}" ]; then
+	CFLAGS="$CFLAGS -DUSB_GADGET_SECONDS=$USB_WINDOW"	# dev: shorter gadget window
+fi
+if [ -n "${REBOOT_BL:-}" ]; then
+	CFLAGS="$CFLAGS -DREBOOT_BL"	# end-of-run reset goes to the bootloader (docs/research/10), no button press
+fi
+if [ -n "${XNU_UFS:-}" ]; then
+	CFLAGS="$CFLAGS -DXNU_UFS"	# --boot-xnu: cold-init UFS before handing over (needs an ADT with /sweet-ufs)
+fi
+if [ -n "${UFS_DMA_HI_BASE:-}" ]; then
+	CFLAGS="$CFLAGS -DUFS_DMA_HI_BASE=$UFS_DMA_HI_BASE"	# dev: UFS buffers at this PA (e.g. 0x880100000ULL)
+fi
+if [ -n "${USB_DMA_HI_BASE:-}" ]; then
+	CFLAGS="$CFLAGS -DUSB_DMA_HI_BASE=$USB_DMA_HI_BASE"	# dev: gadget DMA pool at this PA (e.g. 0x880200000ULL)
+fi
+if [ -n "${UFS_ATTEMPTS:-}" ]; then
+	CFLAGS="$CFLAGS -DUFS_ATTEMPTS=$UFS_ATTEMPTS"	# dev: 0 = survey only
+fi
+if [ "$pstore_fast" = 1 ]; then
+	# Skip the ~10-minute photo pager: final pstore save, then PSCI reset
+	# ~5 s later so Android comes up and the log can be pulled.
+	CFLAGS="$CFLAGS -DPSTORE_FAST"
+fi
+if [ "$udump_mib" != 0 ]; then
+	CFLAGS="$CFLAGS -DUDUMP -DUDUMP_MIB=$udump_mib"
+fi
+if [ "$qrlog" = 1 ]; then
+	# Log as looping QR codes on the final screens (tools/qr-log.py reads them). Not with --pstore-fast (no pager).
+	CFLAGS="$CFLAGS -DQRLOG -I../qrlog -I../qrlog/stubs"
+fi
+mkdir -p out
+"$PYTHON" ../tools/boards.py "$board" out/board_config.h
+for f in start.S shim.c console.c ramlog.c mmu.c fdt.c pstore.c loader.c payload.c ufs.c usbprobe.c; do
+	"$CC" $CFLAGS -c "$f" -o "out/${f%.*}.o"
+done
+# SoC-specific UFS code lives with the SoC (soc/<vendor>/<soc>/shim); same object names as before.
+socshim=../$("$PYTHON" ../tools/boards.py "$board" --get soc_dir)/shim
+for f in ufsdiag ufsinit; do
+	"$CC" $CFLAGS -I"$socshim" -I. -c "$socshim/$f.c" -o "out/$f.o"
+done
+# Gate honesty: usbproto.c and usbgadget.c are
+# cross-compiled with the shim CFLAGS on EVERY build so the object
+# audits in tools/test-bluejay-boot.py always see them; they are only
+# LINKED with --usb-gadget, so the default images stay unchanged.
+# usbgadget.o calls try_write32, which shim.c defines under
+# SOC_GS101, so --usb-gadget is only meaningful with a gs101 board.
+"$CC" $CFLAGS -c usbproto.c -o out/usbproto.o
+"$CC" $CFLAGS -c usbgadget.c -o out/usbgadget.o
+"$CC" $CFLAGS -c usbpool.c -o out/usbpool.o
+# Gate honesty: udump.c is cross-compiled with
+# the shim CFLAGS on EVERY build so the object audit in
+# tools/test-bluejay-boot.py always sees it; it is only LINKED with
+# --udump (which also forces --usb-gadget), so default images stay
+# byte-identical.
+"$CC" $CFLAGS -c udump.c -o out/udump.o
+# Same for wlanprobe.c (read-only audit sees it every build); only LINKED with --wlan-probe.
+"$CC" $CFLAGS -c wlanprobe.c -o out/wlanprobe.o
+# Same for gpuprobe.c; only LINKED with --gpu-probe. Its name switches must not become
+# .rodata pointer tables (ABS64 relocations, rejected below).
+"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpuprobe.c -o out/gpuprobe.o
+# Same for touchprobe.c; only LINKED with --touch-probe. Its writes go through one allowlisted helper (audited).
+"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c touchprobe.c -o out/touchprobe.o
+# Same for acpm.c (ACPM client for the touch rails); only LINKED with --touch-probe=railsr|rails. Its writes go through one allowlisted helper (audited).
+"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c acpm.c -o out/acpm.o
+qr_objs=
+if [ "$qrlog" = 1 ]; then
+	for f in qrlog qrcodegen qrlog_libc; do
+		"$CC" $CFLAGS -Wno-unused-parameter -Wno-sign-compare -c "../qrlog/$f.c" -o "out/$f.o"
+	done
+	qr_objs="out/qrlog.o out/qrcodegen.o out/qrlog_libc.o"
+fi
+usb_objs=
+if [ "$usb_gadget" = 1 ]; then
+	usb_objs="out/usbproto.o out/usbgadget.o"
+fi
+if [ "$udump_mib" != 0 ]; then
+	usb_objs="$usb_objs out/udump.o"
+fi
+if [ "$wlan_probe" = 1 ]; then
+	usb_objs="$usb_objs out/wlanprobe.o"
+fi
+if [ "$gpu_probe" = 1 ]; then
+	usb_objs="$usb_objs out/gpuprobe.o"
+fi
+if [ "$touch_probe" != 0 ]; then
+	usb_objs="$usb_objs out/touchprobe.o"
+fi
+if [ "$touch_rails" = 1 ] || [ "$touch_dvfs" = 1 ]; then
+	usb_objs="$usb_objs out/acpm.o"
+fi
+abs=$("$READELF" -r out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbproto.o out/usbgadget.o out/usbpool.o out/udump.o out/wlanprobe.o out/gpuprobe.o out/touchprobe.o out/acpm.o $qr_objs | grep -c ABS64 || true)
+[ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
+"$CC" $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
+	out/start.o out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbpool.o $usb_objs $qr_objs -o out/shim.elf
+"$OBJCOPY" -O binary out/shim.elf out/Image
+size_hex=$("$NM" out/shim.elf | awk '$3=="_end"{print $1}')
+size=$((16#$size_hex))
+truncate -s "$size" out/Image
+if [ -n "$payload" ]; then
+	cp "$payload" out/ramdisk.bin
+else
+	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+fi
+
+if [ "$board" = sweet ]; then
+	dtb=${SWEET_DTB:-../dtb/boot_unpacked/dtb}
+	"$PYTHON" "$MKBOOTIMG" --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
+		--dtb "$dtb" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
+		--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
+		--os_version 17.0.0 --os_patch_level 2035-06 --cmdline "console=null" -o out/shim-boot.img
+else
+	"$PYTHON" "$MKBOOTIMG" --header_version 4 --kernel out/Image --ramdisk out/ramdisk.bin \
+		--pagesize 4096 --os_version 12.0.0 --os_patch_level 2022-07 \
+		--cmdline "console=null" -o out/shim-boot.img
+	"$PYTHON" -c 'import lz4.frame, pathlib; d = pathlib.Path("out/Image").read_bytes(); pathlib.Path("out/Image.lz4").write_bytes(lz4.frame.compress(d))'
+	"$PYTHON" "$MKBOOTIMG" --header_version 4 --kernel out/Image.lz4 --ramdisk out/ramdisk.bin \
+		--pagesize 4096 --os_version 12.0.0 --os_patch_level 2022-07 \
+		--cmdline "console=null" -o out/shim-boot-lz4.img
+	if [ "$avb" = 1 ]; then
+		key=out/bluejay-testkey.pem
+		[ -f "$key" ] || openssl genrsa -out "$key" 2048
+		cp out/shim-boot.img out/shim-boot-avb.img
+		"$PYTHON" "$AVBTOOL" add_hash_footer --image out/shim-boot-avb.img \
+			--partition_name boot --partition_size "${AVB_PARTITION_SIZE:-67108864}" \
+			--key "$key" --algorithm SHA256_RSA2048
+		cp out/shim-boot-lz4.img out/shim-boot-lz4-avb.img
+		"$PYTHON" "$AVBTOOL" add_hash_footer --image out/shim-boot-lz4-avb.img \
+			--partition_name boot --partition_size "${AVB_PARTITION_SIZE:-67108864}" \
+			--key "$key" --algorithm SHA256_RSA2048
+	fi
+fi
+gcc -O1 -Wall -o out/host_test console.c ramlog.c host_test.c && ./out/host_test
+gcc -O1 -Wall -Wextra -o out/ramlog_host_test ramlog.c ramlog_host_test.c && ./out/ramlog_host_test
+gcc -O1 -Wall -Wextra -I. -o out/fdt_host_test fdt.c fdt_host_test.c && ./out/fdt_host_test
+gcc -O1 -Wall -Wextra -I. -o out/pstore_host_test fdt.c pstore.c pstore_host_test.c && ./out/pstore_host_test
+gcc -O1 -Wall -Wextra -I. -o out/usbprobe_host_test fdt.c usbprobe.c usbprobe_host_test.c && ./out/usbprobe_host_test
+gcc -O1 -Wall -Wextra -I. -o out/usbproto_host_test usbproto.c usbproto_host_test.c && ./out/usbproto_host_test
+gcc -O1 -Wall -Wextra -I. -o out/usbgadget_host_test usbproto.c usbgadget.c usbgadget_host_test.c && ./out/usbgadget_host_test
+gcc -O1 -Wall -Wextra -I. -DUSB_DMA_HI_BASE=1 -o out/usbpool_host_test usbpool.c usbpool_host_test.c && ./out/usbpool_host_test
+gcc -O1 -Wall -Wextra -Werror -I. -o out/wlanprobe_host_test wlanprobe_host_test.c && ./out/wlanprobe_host_test
+gcc -O1 -Wall -Wextra -Werror -I. -o out/gpuprobe_host_test gpuprobe_host_test.c && ./out/gpuprobe_host_test
+gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/touch_host_test touch_host_test.c && ./out/touch_host_test
+gcc -O1 -Wall -Wextra -Werror -DTOUCH_RAILS_WRITE -I. -Iout -include out/board_config.h -o out/acpm_host_test acpm_host_test.c && ./out/acpm_host_test
+for v in 0 1; do gcc -O1 -Wall -Wextra -Werror -DRT_VERIFIED=$v -I. -Iout -include out/board_config.h -o out/rails_host_test$v rails_host_test.c && ./out/rails_host_test$v; done
+# ACPM DVFS client (docs/research/25): the fake channel-1 APM; the read-only build has no request tests (no acpm_dvfs_set there)
+gcc -O1 -Wall -Wextra -Werror -DTOUCH_DVFS_WRITE -I. -Iout -include out/board_config.h -o out/dvfs_host_test dvfs_host_test.c && ./out/dvfs_host_test
+gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/dvfs_host_test_ro dvfs_host_test.c && ./out/dvfs_host_test_ro
+for w in 0 1; do gcc -O1 -Wall -Wextra -Werror -DDP_WRITE=$w -I. -Iout -include out/board_config.h -o out/dvfs_probe_host_test$w dvfs_probe_host_test.c && ./out/dvfs_probe_host_test$w; done
+# review 2 M3: a read-only (railsr) image must not contain the UPDATE path
+gcc -O1 -w -DTOUCH_PROBE -DTOUCH_RAILS -I. -Iout -include out/board_config.h -c -o out/acpm_ro.o acpm.c && ! nm out/acpm_ro.o | grep -q acpm_pmic_update && echo "PASS railsr object has no acpm_pmic_update"
+# the same for DVFS: a read-only (dvfsr) image must not contain the FREQ_REQ path (acpm_dvfs_set, dvfs_rate_ok, the XM_DREQ wait)
+gcc -O1 -w -DTOUCH_PROBE -DTOUCH_DVFS -I. -Iout -include out/board_config.h -c -o out/acpm_dvfs_ro.o acpm.c && nm out/acpm_dvfs_ro.o | grep -q acpm_dvfs_get && ! nm out/acpm_dvfs_ro.o | grep -q "acpm_dvfs_set\|dvfs_rate_ok" && echo "PASS dvfsr object has acpm_dvfs_get and no acpm_dvfs_set"
+gcc -O1 -w -DTOUCH_PROBE -DTOUCH_DVFS -DTOUCH_DVFS_WRITE -I. -Iout -include out/board_config.h -c -o out/acpm_dvfs_rw.o acpm.c && nm out/acpm_dvfs_rw.o | grep -q acpm_dvfs_set && echo "PASS dvfs object has acpm_dvfs_set"
+gcc -O1 -Wall -Wextra -Werror -I. -o out/udump_host_test udump.c udump_host_test.c && ./out/udump_host_test
+# the debounce under test is the header shipped in xnu patch 0087 (new-file hunk: drop the leading "+")
+awk '/^\+\+\+ b\/bsd\/dev\/sweet_keys_gs101_debounce.h$/{f=1;next} f&&/^diff --git/{exit} f&&/^@@/{next} f{print substr($0,2)}' ../xnu/patches/0087-sweet-gs101-keys.patch > out/sweet_keys_gs101_debounce.h
+gcc -O1 -Wall -Wextra -Werror -I. -o out/keys_gs101_host_test keys_gs101_host_test.c && ./out/keys_gs101_host_test
+# pure FTM5 protocol header of the Pixel 6a touch driver: extracted from xnu patch 0088 so the test sees the kernel's bytes
+awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > out/sweet_ftm5.h
+gcc -O1 -Wall -Wextra -Werror -Iout -o out/ftm5_host_test ftm5_host_test.c && ./out/ftm5_host_test
+# runtime MMIO poke parser of the same driver (xnu patch 0093, new-file hunk)
+awk '$0=="+++ b/bsd/dev/sweet_touch_poke.h"{on=1;next} on&&/^diff --git/{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0093-sweet-touch-poke.patch > out/sweet_touch_poke.h
+gcc -O1 -Wall -Wextra -Werror -Iout -o out/touchpoke_host_test touchpoke_host_test.c && ./out/touchpoke_host_test
+if [ "$gs101" = 1 ]; then
+	"$PYTHON" ../tools/test-bluejay-boot.py out/shim-boot.img
+	"$PYTHON" ../tools/test-bluejay-boot.py out/shim-boot-lz4.img
+fi
+# provenance sidecar for the image fastboot will boot (tools/fboot.sh refuses images without a matching one)
+if [ -f out/shim-boot-avb.img ]; then
+	if [ "$boot_xnu" = 1 ]; then kind=xnu; elif [ "$udump_mib" != 0 ]; then kind=udump; else kind=probe; fi
+	"$PYTHON" ../tools/imgmeta.py write out/shim-boot-avb.img --kind "$kind" --args "${META_ARGS:-}"
+fi
+ls -l out/Image out/shim-boot*.img

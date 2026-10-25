@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""tools-sync: keep the phone-path tools identical in every agent worktree (TP-021). Python 3 stdlib only, no prompts.
+
+  tools/tools-sync status [--ref common-tools]           per file: same | differs | missing | not-in-ref
+  tools/tools-sync pull   [--ref common-tools] [--force] [--prune]  copy the differing files from the ref (git checkout REF -- FILE); you commit them
+
+A manifest line ending in "/" is a whole directory (today xnu/patches/): every file of it at the ref, plus files that exist only here (state only-here: upstream them to the ref
+first; `pull --prune` deletes them, never together with uncommitted work unless --force). One shared patch directory means one numbering and one stack for every agent.
+
+The file list is tools/common-files.txt AS OF THE REF. The source of truth is the branch `common-tools`: change a common file there (its own worktree),
+then every other worktree runs `tools/tools-sync pull` at a task boundary. `pull` skips a file with uncommitted local changes and refuses while the
+phone lock is held by anyone (changing tools under a live run is AP-18); --force overrides both.
+Last line: RESULT: PASS|FAIL|ERROR ...   Exit 0 in sync / pulled, 1 drift (status) or blocked (pull), 2 error.
+"""
+import argparse, os, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git(*a, text=True):
+    return subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=text)
+
+
+def manifest(ref):
+    r = git("show", "%s:tools/common-files.txt" % ref)
+    if r.returncode:
+        raise SystemExit("ERROR: no tools/common-files.txt on %s (does the branch exist? git branch --list %s)" % (ref, ref))
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+def expand(ref, entries):
+    out = []
+    for e in entries:
+        if not e.endswith("/"):
+            out.append(e)
+            continue
+        names = set(git("ls-tree", "-r", "--name-only", ref, "--", e).stdout.split())
+        here = os.path.join(ROOT, e)
+        if os.path.isdir(here):
+            names |= {os.path.join(e, f) for f in os.listdir(here) if os.path.isfile(os.path.join(here, f))}
+        out += sorted(names)
+    return out
+
+
+def state(ref, path):
+    r = git("show", "%s:%s" % (ref, path), text=False)
+    if r.returncode:
+        return "only-here" if os.path.exists(os.path.join(ROOT, path)) else "not-in-ref"
+    try:
+        with open(os.path.join(ROOT, path), "rb") as f:
+            return "same" if f.read() == r.stdout else "differs"
+    except OSError:
+        return "missing"
+
+
+def lock_held():
+    lock = os.path.join(ROOT, "tools", "phone-lock")
+    if not os.path.exists(lock):
+        return False
+    return subprocess.run([sys.executable, lock, "status"], capture_output=True).returncode != 0  # held (1) or unreadable (2): do not touch the tools
+
+
+def build_busy():
+    """a gate (shim/out/.gate.lock), xrun or probe-run build (shim/out/.build.lock) of THIS worktree is running (a pull would give that run mixed tool versions)"""
+    for name in (".build.lock", ".gate.lock"):
+        lk = os.path.join(ROOT, "shim", "out", name)
+        if os.path.exists(lk) and subprocess.run(["flock", "-n", lk, "true"], capture_output=True).returncode != 0:
+            return True
+    return False
+
+
+def local_commits(ref, f):
+    """True if THIS branch changed f since it forked from REF (a pull would silently drop that work)"""
+    base = git("merge-base", "HEAD", ref).stdout.strip()
+    if not base:
+        return False
+    here, there = git("rev-parse", "HEAD:" + f).stdout.strip(), git("rev-parse", "%s:%s" % (base, f)).stdout.strip()
+    return bool(here) and here != there
+
+
+def dirty(path):
+    return bool(git("status", "--porcelain", "--", path).stdout.strip())
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tools-sync")
+    p.add_argument("op", choices=("status", "pull"))
+    p.add_argument("--ref", default="common-tools")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--prune", action="store_true", help="delete files that exist only here (directory entries)")
+    a = p.parse_args()
+    try:
+        files = manifest(a.ref)
+    except SystemExit as e:
+        print("RESULT: %s" % e.code)
+        return 2
+    files = expand(a.ref, files)
+    st = {f: state(a.ref, f) for f in files}
+    drift = [f for f, s in st.items() if s != "same"]
+    if a.op == "status":
+        for f in files:
+            print("%-10s %s" % (st[f], f))
+        if drift and lock_held():
+            print("note: the phone lock is held; do not pull until that run ends")
+        print("RESULT: %s" % ("PASS all %d common files match %s" % (len(files), a.ref) if not drift else
+                              "FAIL %d of %d differ from %s (tools/tools-sync pull)" % (len(drift), len(files), a.ref)))
+        return 1 if drift else 0
+    if not drift:
+        print("RESULT: PASS nothing to pull, all %d files match %s" % (len(files), a.ref))
+        return 0
+    if lock_held() and not a.force:
+        print("RESULT: FAIL the phone lock is held (a run may be using these tools); wait, or --force")
+        return 1
+    if build_busy() and not a.force:
+        print("RESULT: FAIL a gate (shim/out/.gate.lock) or build (shim/out/.build.lock) is running in this worktree (it would see mixed tool versions); wait, or --force")
+        return 1
+    blocked, pull = [], []
+    for f in drift:
+        if st[f] == "only-here":
+            if a.prune and (a.force or not dirty(f)):
+                os.remove(os.path.join(ROOT, f))
+                print("pruned     %s" % f)
+            else:
+                print("blocked    %s (only here: upstream it to %s first%s)" % (f, a.ref, "" if a.prune else ", or --prune"))
+                blocked.append(f)
+        elif st[f] == "not-in-ref":
+            print("skip       %s (listed but not in %s)" % (f, a.ref))
+            blocked.append(f)
+        elif st[f] == "differs" and dirty(f) and not a.force:
+            print("blocked    %s (uncommitted local changes; commit or --force)" % f)
+            blocked.append(f)
+        elif st[f] == "differs" and local_commits(a.ref, f) and not a.force:
+            print("blocked    %s (this branch committed changes to it since the fork; upstream them to %s first, or --force):" % (f, a.ref))
+            print("           " + git("log", "--oneline", "-3", "%s..HEAD" % git("merge-base", "HEAD", a.ref).stdout.strip(), "--", f).stdout.strip().replace("\n", "\n           "))
+            blocked.append(f)
+        else:
+            pull.append(f)
+    if pull:  # one checkout for all, so an error cannot leave a half-updated set
+        r = git("checkout", a.ref, "--", *pull)
+        if r.returncode:
+            print("ERROR      nothing pulled: %s" % r.stderr.strip())
+            blocked += pull
+        else:
+            for f in pull:
+                print("pulled     %s" % f)
+    print("RESULT: %s" % ("PASS pulled %d file(s) from %s; review and commit them" % (len(drift), a.ref) if not blocked else
+                          "FAIL %d of %d pulled, %d blocked" % (len(drift) - len(blocked), len(drift), len(blocked))))
+    return 1 if blocked else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

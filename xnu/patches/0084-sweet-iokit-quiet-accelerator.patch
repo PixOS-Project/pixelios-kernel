@@ -1,67 +1,75 @@
---- a/iokit/Kernel/IOStartIOKit.cpp
-+++ b/iokit/Kernel/IOStartIOKit.cpp
-@@ -188,7 +188,17 @@
- 	}
- 
- #if !NO_KEXTD
-+	/*
-+	 * SWEET: iOS has no IOKit daemon (kernelmanagerd) to report its launch, so
-+	 * this hold kept the registry root busy for good: IOKit never quiesced
-+	 * (IOKitWaitQuiet callers, configd's InterfaceNamer). Idea from the
-+	 * ios-topaz fork (0128).
-+	 */
-+#if !defined(ARM64_BOARD_CONFIG_SWEET)
- 	if (OSKext::iokitDaemonAvailable()) {
-+#else
-+	if (false) {
-+#endif
- 		/* Add a busy count to keep the registry busy until the IOKit daemon has
- 		 * completely finished launching. This is decremented when the IOKit daemon
- 		 * messages the kernel after the in-kernel linker has been
---- a/iokit/Kernel/IOService.cpp
-+++ b/iokit/Kernel/IOService.cpp
-@@ -1200,7 +1200,9 @@
- 	}
- 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
- 	startDeferredMatches();
-+#if !defined(ARM64_BOARD_CONFIG_SWEET)                  /* no hold taken (IOStartIOKit.cpp) */
- 	getServiceRoot()->adjustBusy(-1);
-+#endif
- 	IOService::publishUserResource(gIOResourceIOKitKey);
- #endif /* !NO_KEXTD */
- }
+# 0084: on the sweet board, let IOKit go quiet without a kext daemon (skip the
+# startup busy count and its matching release) and publish an empty
+# IOAcceleratorES service under AppleCLCD (boot-arg sweetaccel=0 disables).
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -126,6 +126,18 @@
+@@ -90,6 +90,13 @@
  
- OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ class IOMobileFramebufferUserClient;
  
-+/*
-+ * The GPU's service class as QuartzCore looks for it: CAMetalContextCreate polls IOServiceMatching("IOAcceleratorES")
-+ * 300 times, 100 ms apart, in every process that sets up CA rendering (30 s per backboardd start). One without
-+ * MetalPluginName is found and then passed over by Metal, so the renderers stay as they were. Boot-arg sweetaccel=0
-+ * leaves it out. Idea from the ios-topaz / ios-sailfish forks (topaz 0138, sailfish 0166).
-+ */
++/* Empty service so QuartzCore's class-name lookup succeeds immediately. */
 +class IOAcceleratorES : public IOService {
 +	OSDeclareDefaultStructors(IOAcceleratorES);
 +};
 +
 +OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
 +
- class IOMobileFramebufferUserClient : public IOUserClient {
- 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
  
-@@ -201,6 +213,13 @@
+@@ -201,6 +208,20 @@
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
-+	int accel = 1;
-+	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
-+	IOAcceleratorES *es = accel ? OSTypeAlloc(IOAcceleratorES) : NULL;
-+	if (es != NULL && es->init() && es->attach(this)) {
-+		es->registerService();
++
++	/* Publish the empty accelerator node unless sweetaccel=0 was given. */
++	int wantEmptyAccel = 1;
++	PE_parse_boot_argn("sweetaccel", &wantEmptyAccel, sizeof(wantEmptyAccel));
++	if (wantEmptyAccel != 0) {
++		IOService *emptyAccel = new IOAcceleratorES;
++		if (emptyAccel != NULL) {
++			if (emptyAccel->init() && emptyAccel->attach(this)) {
++				emptyAccel->registerService();
++			}
++			emptyAccel->release();
++		}
 +	}
-+	OSSafeReleaseNULL(es);
++
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  	return true;
+diff -ru a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff -ru a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,6 +188,9 @@
+ 	}
+ 
+ #if !NO_KEXTD
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Sweet has no IOKit daemon to release this count, so it is not taken
++	 * (paired with IOService::iokitDaemonLaunched). */
+ 	if (OSKext::iokitDaemonAvailable()) {
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+@@ -196,6 +199,7 @@
+ 		 */
+ 		IOService::getServiceRoot()->adjustBusy(1);
+ 	}
++#endif /* !ARM64_BOARD_CONFIG_SWEET */
+ #endif
+ }
+ 

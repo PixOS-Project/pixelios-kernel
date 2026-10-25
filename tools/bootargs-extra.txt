@@ -1,0 +1,4 @@
+# Boot-arg names parsed OUTSIDE xnu (e.g. by launchd) that tools/run-preflight must accept. One per line: NAME  # citation (rule 7: no citation, no entry).
+wdt_test  # UPSTREAM_README.md:105,116 (upstream cmdline, "no hardware watchdog"); in every booting run's boot_args (observed, logs/runs/*demo2/run.json); parser not located in xnu-8796, guess: userland/firmware reads it
+ignition_level  # UPSTREAM_README.md:105 (upstream cmdline); in every booting run's boot_args (observed, logs/runs/*demo2/run.json); meaning not reversed (guess)
+launchd_unsecure_cache  # UPSTREAM_README.md:105,115 ("launchd accepts its job cache without AMFI"); in every booting run's boot_args (observed); dev-tooling-gaps.md:65 lists its semantics as unreversed

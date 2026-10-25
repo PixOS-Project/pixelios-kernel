@@ -1,0 +1,3 @@
+# fixture source: synthetic (no historic commit): a pipe into && in a script without pipefail
+set -eu
+nm out/a.o | grep -q foo && echo ok

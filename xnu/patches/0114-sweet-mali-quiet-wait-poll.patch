@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index 45bcccf..62e5260 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -474,7 +474,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			uint64_t to = args->scalarInput[1] > 60000000ull ? 60000000ull : args->scalarInput[1];
+ 			SM_UC_LOG("SWEET MALI: uc wait seq=%llu to=%llu us\n", args->scalarInput[0], to);
+ 			ret = errno_to_ioreturn(sweet_mali_wait(args->scalarInput[0], to));
+-			if (ret != 0) { SM_UC_ERR("SWEET MALI: uc wait -> %#x\n", ret); } else { SM_UC_LOG("SWEET MALI: uc wait -> %#x\n", ret); }
++			if (ret != 0 && !(ret == kIOReturnTimeout && to == 0)) { SM_UC_ERR("SWEET MALI: uc wait -> %#x\n", ret); } else { SM_UC_LOG("SWEET MALI: uc wait -> %#x\n", ret); }   /* a timeout of a to=0 poll is "not done yet", not an error */
+ 		}
+ 		break;
+ 	case 5:                         /* importSurface */

@@ -46,6 +46,16 @@ class T(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("RESULT: ERROR", r.stdout)
 
+    def test_out_dir_selects_the_header(self):
+        os.makedirs(self.r + "/shim/out/gate/b0")
+        open(self.r + "/shim/out/gate/b0/board_config.h", "w").close()     # only here, not in shim/out
+        env = dict(os.environ, LINT_ROOT=self.r, LINT_CPPCHECK=self.fake("cpp", ""), LINT_TIDY=self.fake("tidy", ""))
+        r = subprocess.run([sys.executable, TOOL, "--out", "shim/out/gate/b0"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = subprocess.run([sys.executable, TOOL, "--out", "shim/out/gate/nope"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("shim/out/gate/nope/board_config.h", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

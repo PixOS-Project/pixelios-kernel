@@ -1,0 +1,1778 @@
+#!/usr/bin/env python3
+"""agent-guard: Claude Code hooks for token discipline and procedure rules (extends tools/phone-guard; python3 stdlib only).
+
+  agent-guard --pre          PreToolUse (Bash, Read, Write|Edit|MultiEdit, Agent|Task|delegate_task, task_status|t3_thread_*)
+  agent-guard --post         PostToolUse Bash: cap huge stdout (S2)
+  agent-guard --context      UserPromptSubmit: roll-over nudge (S1, E-7; alias --context-nudge)
+  agent-guard --session      SessionStart: inject docs/state.md (S8)
+  agent-guard --statusline   status line meter
+  agent-guard --brief        only the delegate-brief rules (S4/S6/E-6) of --pre
+  agent-guard --self-test    fixtures for every rule + a mutant check; last line RESULT: PASS|FAIL, exit 0/1/2
+
+Hook modes read the hook JSON on stdin and ALWAYS exit 0; any exception prints nothing (fail open). The deny/ask decision is
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"|"ask","permissionDecisionReason":...}}.
+Specs: docs/research/token-efficiency.md 3a-3d (S1-S8), docs/research/procedure-standard.md E-1..E-9. NOT wired anywhere: the snippet
+is docs/research/agent-guard-hooks.snippet.json, the driver reviews and enables it (AP-19: tested before wired).
+Quoted text and heredoc bodies are never judged (phone-guard parser); the guard is a rail against accidents, not a sandbox.
+
+Rules (name: what). S1 hard context cap, S3a big Read, S3b AGENTS/CLAUDE.md, S3c hot doc dump, S3d range > 300 lines, S4a role,
+S4b opus, S5a sleep > 30 s, S5b polling, S6a brief size, S6b "at most N lines", E1 `check | tail && next`, E2a `pkill -f`, E2b
+pgrep/-s wait loop, E3a raw mutating adb/fastboot (phone-guard), E3b getvar/wait-for-device without timeout, E4 push (ask), E5
+duplicate gate, E6 brief header, E8 edit of phone tools while the lock is held, E9 git stash; post: S2; context: S1n.
+Antipattern rules (super repo docs/ANTIPATTERNS.md; per-AP table docs/ANTIPATTERN-ENFORCEMENT.md): E2c pkill/killall/kill $(pgrep)
+(AP-36/56), E8b Bash write (sed -i, cp, mv, tee, git checkout|restore, git merge|reset --hard|pull|switch|rebase|..., >) to a shared phone tool while the lock is held (AP-18), E10
+sweettouchpoke= without final ';' (AP-10), E11 row=N[..] in a run pattern (AP-42), E12 probe-run --wlan-link --timeout < 600 (AP-14),
+E13 --wlan-link=N not in the shim/build.sh host-test loop (AP-13), E14 background run without a timeout > tool limit + 60 s (AP-33),
+E15 find / (AP-24), E16 find .claude without prune (AP-35), E17 glob that expands to -names (AP-34), E18 grep without -a / --binary-files=text on Apple
+sources (AP-53), E19 7z e/x of an iOS root image (AP-54), E20 rea.sh in a foreground loop (AP-56), E21 ipsw disass --quiet (AP-46),
+E22 a shared runner/gate tool (SHARED_TOOLS) or shim/build.sh alone committed in the kernel repo off trunk/tools/* (AP-58; exempt: detached HEAD, merge/pick/revert in
+progress, EMERGENCY-TOOL-FIX in the command). Known gaps (read from this code): E8b follows redirects only when the line has
+no cd, and not inside bash -c; E13/E22 skip an unknown dir; E14 margin 60 s is a guess (as run-preflight --margin); E18 only knows the
+paths sweet_hfs, xnu-pristine, localbuild/work/; E22 also counts what `git add` (same repo), `commit -a` and `commit PATH` add; E22 skips bash -c, GIT_DIR=, git aliases.
+
+Deviations from the draft (each is a draft defect or an unverified contract; all [guess] unless a source is given):
+ - S3b/S3c/S1 are judged on parsed command words, not regexes over the raw text (the draft denied `git commit -m "xrun fix"` over
+   160k and `sed -i ... AGENTS.md`); S3b applies to the root AGENTS.md/CLAUDE.md only (scoped shim/AGENTS.md etc. are not preloaded).
+ - S3d: `tail -n +N` is a start line, not a count (draft treated it as a span); sed ranges accept quoted words; sleep accepts s/m/h/d.
+ - Poll state/session ids are sanitised before use as file names. A transcript line must be type=assistant with usage > 0.
+ - Brief rules need the prompt field: if no `prompt`/`task` string is present the brief rules do not apply (field names of
+   delegate_task are unverified; failing closed would deny every delegate). `subagent_type`/`model` names of the Agent tool input
+   are also unverified (U2 in token-efficiency.md): if they are named otherwise S4a denies every Agent call; check before wiring.
+ - `updatedToolOutput` (S2) comes from the hooks doc as cited in token-efficiency.md; not verified here. If the harness ignores it
+   the output is simply not cut.
+ - E5: RUNNING counts only while its pid is alive (a killed gate leaves RUNNING behind). E8: "another owner" = the lock is held
+   (`phone-lock status` exit 1); the hook cannot know the agent's own owner name.
+ - Known gaps (review new-tools-review-1 Batch A): E4/E5 track `cd`/`pushd` only along one command line (a `cd` inside `bash -c`
+   or a function is not followed, and a `cd` inside `( ... )`, `$( ... )` or before `popd` is forgotten at its end, which makes the
+   dir unknown; an unknown dir, -C/--git-dir/remote with `$` makes E4 ask and E5/S3b skip); S5b keys status polls by their input;
+   A11 (agent_id => S1 off) is a guess
+   about which transcript a subagent hook sees. `tools/test_agent_guard.py` (run by the gate's unittest step) runs --self-test and
+   kills real code mutants (thresholds, parsing, sanitising) on a copy.
+ - Settings: python on a missing script exits 2 (= blocking); the snippet therefore wraps the call in sh with exit 1 (non-blocking).
+"""
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+BIG, OUT_CAP, KEEP = 40_000, 12_000, 4_000      # bytes for a whole-file Read; Bash stdout chars (cap, kept each end)
+SOFT, HARD = 180_000, 200_000                    # context tokens, absolute
+STATE = os.environ.get("AGENT_GUARD_STATE", "/tmp/agent-guard")
+OUTDIR = os.environ.get("AGENT_GUARD_OUT", "/tmp/claude-out")
+SHARED = os.environ.get("AGENT_GUARD_SHARED") or os.path.join(
+    os.environ.get("CLAUDE_PROJECT_DIR") or os.path.expanduser("~/.t3/projects/pixelios"), "pixos-project/pixelios-kernel")
+
+HOT = re.compile(r"(NOTES\.md|HANDOFF\.md|ANTIPATTERNS\.md|test-bluejay-boot\.py|\.jsonl|usbnet\.log|usb\.txt|gate\.log)$")
+NOLIMIT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".ipynb"}
+HOT_DOCS = {"NOTES.md", "HANDOFF.md", "ANTIPATTERNS.md"}
+LOADED_DOCS = {"AGENTS.md", "CLAUDE.md"}
+NEWWORK = {"xrun", "probe-run", "check-all.sh", "xnu-local-build", "ci-kernel"}
+CHECKS = {"check-all.sh", "validate-repo.py", "probe-run", "xrun"}
+PIPE_FILTERS = {"tail", "head", "grep", "egrep", "fgrep"}
+DELEGATE = ("Agent", "Task")
+PHONE_TOOLS = {"probe-run", "xrun", "fboot.sh", "plock.sh", "phone-lock", "phone", "fflash-userdata.sh"}
+WRAP = {"sudo", "env", "exec", "nohup", "time", "timeout", "nice", "stdbuf", "setsid", "xargs", "watch", "command", "builtin"}
+KEYWORDS = {"then", "do", "else", "elif", "while", "until", "if", "!", "{", "}"}
+ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+REDIR = {"<", ">", ">>", "<<", "&>", ">&", "<<<"}
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+SHELLS = {"bash", "sh", "zsh", "dash"}
+INTERP = SHELLS | {"python3", "python"}
+
+MUT = None   # (rule, 'off'|'on') during --self-test
+COV = {}     # rule -> {'ok','viol'} seen
+
+
+def verdict(name, applies, bad):
+    """None if the rule does not apply or passes, else the reason. Self-test mutants: 'off' never fires, 'on' always fires."""
+    if not applies:
+        return None
+    viol = bool(bad)
+    COV.setdefault(name, set()).add("viol" if viol else "ok")
+    mode = MUT[1] if MUT and MUT[0] == name else None
+    if mode == "off":
+        viol = False
+    elif mode == "on":
+        viol, bad = True, bad or "mutant"
+    return bad if viol else None
+
+
+# ---- command parsing (phone-guard's rules: quotes and heredoc bodies are not commands) ----
+_PARSE = {}
+
+
+def parse(cmd):
+    """[(words, op_after)] split at ; && || | & ( ) and newlines (memoised per command text: the rules only read the result)."""
+    if cmd not in _PARSE:
+        _PARSE[cmd] = _parse(cmd)
+    return _PARSE[cmd]
+
+
+def prep(cmd):
+    """heredoc bodies cut, backslash-newline joined (bash drops it outside single quotes), real `#` comments stripped (a `#` inside a
+    word is no comment), newlines turned into ` ; `. One quote-aware scan shared by parse and redirect_targets (review r1 F4, F5)."""
+    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd)
+    out, q, i, n, wb = [], None, 0, len(cmd), True      # wb: at a word boundary (a `#` here starts a comment)
+    while i < n:
+        ch = cmd[i]
+        if q == "'":
+            out.append(ch)
+            q = None if ch == "'" else q
+        elif ch == "\\" and i + 1 < n:
+            if cmd[i + 1] != "\n":
+                out += [ch, cmd[i + 1]]
+                wb = False
+            i += 2
+            continue
+        elif q == '"':
+            out.append(ch)
+            q = None if ch == '"' else q
+        elif ch in "'\"":
+            q, wb = ch, False
+            out.append(ch)
+        elif ch == "#" and wb:
+            while i < n and cmd[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(ch)
+            wb = ch in " \t\n;&|()"
+        i += 1
+    return "".join(out).replace("\n", " ; ")
+
+
+def _parse(cmd):
+    cmd = prep(cmd)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    out, seg, skip = [], [], False
+    try:
+        for t in lex:
+            if re.fullmatch(r"[;&|()<>]+", t):
+                if t in REDIR:
+                    skip = True        # the word after a redirection is a file name
+                    continue
+                if seg:
+                    out.append((seg, t))
+                elif out and ")" in t:      # `(cd x;)`: the close follows an empty segment; keep it visible on the last real one
+                    out[-1] = (out[-1][0], out[-1][1] + t)
+                seg = []
+            elif skip:
+                skip = False
+            else:
+                seg.append(t)
+    except ValueError:
+        pass
+    if seg:
+        out.append((seg, ""))
+    return out
+
+
+def head(words):
+    """(program basename, args, wrappers seen) after env assignments, keywords and wrappers; `python3 x.py` -> x.py."""
+    i, wr = 0, set()
+    while i < len(words):
+        t = words[i]
+        b = os.path.basename(t)
+        if b in KEYWORDS or ASSIGN.match(t):
+            i += 1
+        elif b in WRAP:
+            wr.add(b)
+            i += 1
+            if b in ("sudo", "env") and words[i:i + 1] and words[i] in ("-u", "-g", "-C", "-h", "-p", "-U"):
+                i += 2
+            while i < len(words) and (words[i].startswith("-") or ASSIGN.match(words[i]) or re.fullmatch(r"\d+(\.\d+)?[smhd]?", words[i])):
+                i += 1
+        else:
+            break
+    if i >= len(words):
+        return None
+    prog, args = os.path.basename(words[i]), words[i + 1:]
+    if prog in INTERP and args and not args[0].startswith("-"):
+        prog, args = os.path.basename(args[0]), args[1:]
+    return prog, args, wr
+
+
+def parses(cmd, depth=0):
+    """the outer parse plus the parses of bash -c / eval strings."""
+    p = parse(cmd)
+    out = [p]
+    if depth < 3:
+        for words, _ in p:
+            i = 0
+            while i < len(words) and (ASSIGN.match(words[i]) or os.path.basename(words[i]) in WRAP | KEYWORDS):
+                i += 1
+            if i >= len(words):
+                continue
+            b = os.path.basename(words[i])
+            rest = words[i + 1:]
+            if b == "eval" and rest:
+                out += parses(" ".join(rest), depth + 1)
+            elif b in SHELLS:
+                for k, x in enumerate(rest):
+                    if re.fullmatch(r"-[a-z]*c[a-z]*", x) and k + 1 < len(rest):
+                        out += parses(rest[k + 1], depth + 1)
+                        break
+    return out
+
+
+def heads(cmd):
+    """every (prog, args, wrappers, words) of a Bash command, including bash -c strings."""
+    for p in parses(cmd):
+        for words, _ in p:
+            h = head(words)
+            if h:
+                yield h + (words,)
+
+
+# ---- context size ----
+def ctx_tokens(tp):
+    """tokens of the last assistant usage in the transcript tail (hooks may see the file one turn late)."""
+    try:
+        with open(tp, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 400_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, TypeError):
+        return 0
+    for line in reversed(lines):
+        if '"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+            if d.get("type") != "assistant":
+                continue
+            u = d["message"]["usage"]
+            n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if n:
+            return n
+    return 0
+
+
+class Ctx:
+    def __init__(self, h):
+        self.h, self.t, self.i = h, h.get("tool_name", ""), h.get("tool_input") or {}
+        self.cmd = self.i.get("command", "") if self.t == "Bash" and isinstance(self.i.get("command"), str) else ""
+        self._n = None
+        self._heads = None
+
+    @property
+    def n(self):
+        if self._n is None:
+            self._n = ctx_tokens(self.h.get("transcript_path"))
+        return self._n
+
+    @property
+    def heads(self):
+        if self._heads is None:
+            self._heads = list(heads(self.cmd)) if self.cmd else []
+        return self._heads
+
+    @property
+    def is_delegate(self):
+        return self.t in DELEGATE or self.t.endswith("delegate_task")
+
+    @property
+    def prompt(self):
+        p = self.i.get("prompt") or self.i.get("task")
+        return p if isinstance(p, str) else None
+
+    @property
+    def cwd(self):
+        return self.h.get("cwd") or os.getcwd()
+
+
+def git(cwd, *a):
+    try:
+        r = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def rootish(a, cwd):
+    """the AGENTS.md/CLAUDE.md the session already loaded: the file directly under the project dir (bare names resolve against cwd)."""
+    pd = os.environ.get("CLAUDE_PROJECT_DIR")
+    p = os.path.realpath(os.path.join(cwd, os.path.expanduser(a)))
+    return bool(pd and os.path.basename(a) in LOADED_DOCS and os.path.dirname(p) == os.path.realpath(pd))
+
+
+# ---- rules: fn(ctx) -> None | reason (through verdict) ----
+def r_s1(c):
+    if c.h.get("agent_id"):     # a subagent has its own window (A11, guess: the transcript_path may be the parent's)
+        return None
+    new = c.is_delegate or any(p in NEWWORK or (p == "phone-lock" and "run" in a) for p, a, _, _ in c.heads)
+    if not new:
+        return None
+    return verdict("S1", True, f"context {c.n // 1000}k > {HARD // 1000}k: no new work; commit, write the handoff, run the rollover skill"
+                   if c.n > HARD else "")
+
+
+def r_s3a(c):
+    if c.t != "Read":
+        return None
+    p = c.i.get("file_path") or ""
+    size = os.path.getsize(p) if os.path.isfile(p) else 0
+    if os.path.splitext(p)[1].lower() in NOLIMIT:     # images/PDFs/notebooks: `limit` does not apply (a PDF is bounded by `pages`)
+        return None
+    try:
+        lim = int(c.i.get("limit") or 0)
+    except (TypeError, ValueError):
+        lim = 0
+    bad = (HOT.search(p) or size > BIG) and (not lim or lim > 300)
+    return verdict("S3a", True, f"{os.path.basename(p)} is {size // 1000} KB, limit {lim or 'none'}: grep -n KEY first, then Read with offset/limit (<= 300 lines)" if bad else "")
+
+
+def r_s3b(c):
+    hit = []
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if h and wd is not None and h[0] in ("cat", "less", "more", "head", "tail", "sed", "bat") \
+                and not (h[0] == "sed" and any(x.startswith("-i") or x == "--in-place" for x in h[1])) and any(rootish(x, wd) for x in h[1]):
+            hit.append(1)
+    return verdict("S3b", bool(c.heads) and any(p in ("cat", "less", "more", "head", "tail", "sed", "bat") for p, *_ in c.heads),
+                   "AGENTS.md/CLAUDE.md are already in context; do not re-read them" if hit else "")
+
+
+def r_s3c(c):
+    dump = [1 for p, a, _, _ in c.heads if p in ("cat", "less", "more") and any(os.path.basename(x) in HOT_DOCS for x in a)]
+    return verdict("S3c", any(p in ("cat", "less", "more") for p, *_ in c.heads),
+                   "whole-file read of a hot doc: grep -n KEY, then sed -n A,Bp (<= 300 lines)" if dump else "")
+
+
+def spans(prog, a):
+    """line counts requested by sed -n A,Bp / head -n N / head -N / tail -n N (tail -n +N is a start line: skipped)."""
+    out = []
+    if prog == "sed" and "-n" in a:
+        for x in a:
+            m = re.fullmatch(r"(\d+),(\d+)p", x)
+            if m:
+                out.append(int(m.group(2)) - int(m.group(1)) + 1)
+    elif prog in ("head", "tail"):
+        for k, x in enumerate(a):
+            m = re.fullmatch(r"-n?(\d+)", x) or (re.fullmatch(r"-n", x) and k + 1 < len(a) and re.fullmatch(r"\d+", a[k + 1]) and re.match(r"(\d+)", a[k + 1]))
+            if m:
+                out.append(int(m.group(1)))
+    return out
+
+
+def r_s3d(c):
+    ap = [(p, a) for p, a, _, _ in c.heads if p in ("sed", "head", "tail")]
+    bad = any(s > 300 for p, a in ap for s in spans(p, a))
+    return verdict("S3d", bool(ap), "range > 300 lines: narrow it with grep -n first" if bad else "")
+
+
+def secs(x):
+    if x in ("infinity", "inf"):
+        return float("inf")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", x)
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)] if m else 0
+
+
+def r_s5a(c):
+    sl = [a for p, a, _, _ in c.heads if p == "sleep"]
+    bad = any(sum(secs(x) for x in a) > 30 for a in sl)
+    return verdict("S5a", bool(sl) and c.i.get("run_in_background") is not True,
+                   "sleep > 30 s: no timed polling; run the work in the background and wait for the completion notification" if bad else "")
+
+
+def r_s5b(c):
+    if not re.search(r"(task_status|t3_thread_list|t3_thread_read)$", c.t):
+        return None
+    key = hashlib.sha1(json.dumps(c.i, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    f = os.path.join(STATE, re.sub(r"\W", "_", c.h.get("session_id") or "x") + "." + re.sub(r"\W", "_", c.t) + "." + key + ".poll")
+    recent = os.path.exists(f) and time.time() - os.path.getmtime(f) < 600
+    r = verdict("S5b", True, "status polled < 10 min ago: wait for the completion notification" if recent else "")
+    if not recent:
+        os.makedirs(STATE, exist_ok=True)
+        open(f, "w").close()
+    return r
+
+
+def r_s6a(c):
+    p = c.prompt
+    return verdict("S6a", c.is_delegate and p is not None, f"brief {len(p or '')} chars > 6000: cite file:line ranges instead of pasting" if len(p or "") > 6000 else "")
+
+
+def r_s6b(c):
+    p = c.prompt
+    return verdict("S6b", c.is_delegate and p is not None, "" if re.search(r"\bat most \d+ lines\b", p or "", re.I) else 'brief must say "Return a summary of at most N lines"')
+
+
+def r_s4a(c):
+    if c.t not in DELEGATE:
+        return None
+    bad = c.i.get("subagent_type") in (None, "", "general-purpose") and "ROLE-EXEMPT:" not in (c.prompt or "")
+    return verdict("S4a", True, "use subagent_type researcher/implementer/reviewer/reverser (or ROLE-EXEMPT: <why>)" if bad else "")
+
+
+def r_s4b(c):
+    tg = c.i.get("target")
+    m = c.i.get("model") or (tg.get("model") if isinstance(tg, dict) else None)     # delegate_task: tool_input.target.model
+    opus = "opus" in str(m or "").lower()
+    return verdict("S4b", c.is_delegate and opus, "" if "HW-WRITE" in (c.prompt or "") else "Opus only for hardware-writing/safety work: add HW-WRITE to the brief or drop model")
+
+
+def r_e6(c):
+    p = c.prompt
+    miss = [k for k, rx in (("Work alone", r"work alone"), ("ANTIPATTERNS", r"antipatterns"), ("Verif", r"\bverif")) if not re.search(rx, p or "", re.I)]
+    return verdict("E6", c.is_delegate and p is not None, f"brief lacks: {', '.join(miss)} (AGENTS.md rule 6)" if miss else "")
+
+
+def r_e1(c):
+    bad = ""
+    for p in parses(c.cmd) if c.cmd else []:
+        pf = False
+        for k, (w, op) in enumerate(p):
+            h = head(w)
+            if h and h[0] == "set" and any("pipefail" in x for x in h[1]):
+                pf = True
+            if not h or op != "|" or pf or not (h[0] in CHECKS or (h[0] == "tool-proposals" and "validate" in h[1])):
+                continue
+            nxt = head(p[k + 1][0]) if k + 1 < len(p) else None
+            m = k + 1
+            while m < len(p) and p[m][1] == "|":
+                m += 1
+            if nxt and nxt[0] in PIPE_FILTERS and m < len(p) and p[m][1] == "&&":
+                bad = f"`{h[0]} | {nxt[0]} && ...` hides the check's exit code (AP-09/AP-21): use `set -o pipefail` or redirect to a file and test $?"
+    appl = any(h[0] in CHECKS or h[0] == "tool-proposals" for h in (head(w) for p in (parses(c.cmd) if c.cmd else []) for w, _ in p) if h)
+    return verdict("E1", appl, bad)
+
+
+def r_e2a(c):
+    pk = [a for p, a, _, _ in c.heads if p == "pkill"]
+    bad = any(re.fullmatch(r"-[A-Za-z0-9]*f[A-Za-z0-9]*|--full", x) for a in pk for x in a)
+    return verdict("E2a", bool(pk), "pkill -f matches other agents' processes (AP-20, AP-36): kill by PID" if bad else "")
+
+
+def r_e2b(c):
+    bad, loops = "", 0
+    for p in parses(c.cmd) if c.cmd else []:
+        for k, (w, _) in enumerate(p):
+            if not ({"while", "until"} & set(w[:2])):
+                continue
+            loops += 1
+            for w2, _ in p[k:]:
+                if w2[0] == "do":
+                    break
+                h = head(w2)
+                if any(os.path.basename(x) == "pgrep" for x in w2) or (h and h[0] in ("[", "[[", "test") and "-s" in h[1]):
+                    bad = "wait loop on pgrep / file size (AP-01, AP-02): use run_in_background and the completion notification"
+    return verdict("E2b", bool(loops), bad)
+
+
+def r_e3a(c):
+    if not re.search(r"\b(adb|fastboot)\b", c.cmd):
+        return None
+    pg = _phone_guard()
+    bad = pg.offending(c.cmd) if pg else None
+    return verdict("E3a", True, ("hand-typed `%s`: use the built tools (xrun, probe-run, fboot.sh, fflash-userdata.sh, phone); they hold the phone lock "
+                                 "and verify bluejay. Read-only fastboot devices|getvar, adb devices|get-state pass." % bad) if bad else "")
+
+
+def r_e3b(c):
+    blocking = []
+    for p, a, wr, _ in c.heads:
+        if p in ("adb", "fastboot"):
+            sub, j = None, 0
+            while j < len(a):
+                if a[j] in ("-s", "-t", "-H", "-P", "-p"):
+                    j += 2
+                elif a[j].startswith("-"):
+                    j += 1
+                else:
+                    sub = a[j]
+                    break
+            if (p, sub) in (("fastboot", "getvar"), ("adb", "wait-for-device")):
+                blocking.append("timeout" in wr)
+    return verdict("E3b", bool(blocking), "fastboot getvar / adb wait-for-device block (120 s / forever): run under `timeout N`" if not all(blocking) else "")
+
+
+def walk(cmd, cwd):
+    """(words, dir) for every segment, in order; `cd X` / `pushd X` update dir; dir is None once a target is unknown ($, backtick, `-`,
+    after `popd`, or after a `( ... )` / `$( ... )` that changed it) and in every bash -c / eval string when the outer line moves at all."""
+    ps = parses(cmd) if cmd else []
+    moved = any((h := head(w)) and h[0] in ("cd", "pushd", "popd") for p in ps for w, _ in p)
+    for n, p in enumerate(ps):
+        cur = None if n and moved else cwd
+        for w, op in p:
+            h = head(w)
+            if h and h[0] in ("cd", "pushd"):
+                t = [x for x in h[1] if not x.startswith("-") or x == "-"]
+                t = t[0] if t else "~"
+                cur = None if cur is None or "$" in t or "`" in t or t == "-" else os.path.normpath(os.path.join(cur, os.path.expanduser(t)))
+            elif h and h[0] == "popd":
+                cur = None
+            yield w, cur
+            if ("(" in op or ")" in op or op == "&") and cur != cwd:   # `a & b`: a runs in a background subshell
+                cur = None
+
+
+GIT_VAL = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path")
+PUSH_VAL = ("-o", "--push-option", "--receive-pack", "--exec", "--repo")   # git push -h: these take a value (observed, review 3 A2)
+GITENV = re.compile(r"^(GIT_DIR|GIT_WORK_TREE|GIT_CONFIG_PARAMETERS)=")
+
+
+def r_e4(c):
+    pushes = []
+    # GIT_DIR= & co. in an export / bare-assignment segment redirect every later git: direction unknown
+    envset = any(GITENV.match(x) for p in (parses(c.cmd) if c.cmd else []) for w, _ in p if (head(w) is None or head(w)[0] in ("export", "declare", "typeset")) for x in w)
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] != "git":
+            continue
+        a, i, d, gd, unk = h[1], 0, None, None, envset
+        gi = next((k for k, x in enumerate(w) if os.path.basename(x) == "git"), len(w))
+        unk |= any(GITENV.match(x) for x in w[:gi])
+        while i < len(a) and a[i].startswith("-"):
+            val = a[i + 1] if i + 1 < len(a) else ""
+            if a[i] == "-C":
+                unk |= "$" in val or "`" in val
+                d = os.path.join(d, os.path.expanduser(val)) if d else os.path.expanduser(val)
+            elif a[i] == "--git-dir":
+                unk |= "$" in val or "`" in val
+                gd = val
+            elif a[i].startswith("--git-dir="):
+                unk |= "$" in a[i] or "`" in a[i]
+                gd = a[i][10:]
+            i += 2 if a[i] in GIT_VAL else 1
+        if i < len(a) and a[i] == "push":
+            pushes.append((a[i + 1:], d, gd, unk, wd))
+    why = ""
+    for a, d, gd, unk, wd in pushes:
+        pos, flags, repo, k = [], [], None, 0
+        while k < len(a):
+            x = a[k]
+            if x in PUSH_VAL:
+                if x == "--repo" and k + 1 < len(a):
+                    repo = a[k + 1]
+                k += 2
+                continue
+            if x.startswith("--repo="):
+                repo = x[7:]
+            elif x.startswith("-"):
+                flags.append(x)
+            else:
+                pos.append(x)
+            k += 1
+        risky = [x for x in flags if x.startswith("--force") or x in ("--delete", "--mirror", "--prune") or re.fullmatch(r"-[A-Za-z]*[fd][A-Za-z]*", x)]
+        risky += [x for x in (pos if repo is not None else pos[1:]) if x[:1] in (":", "+")]
+        remote = repo if repo is not None else pos[0] if pos else "origin"
+        unk |= "$" in remote or "`" in remote
+        cwd = None if wd is None else os.path.join(wd, d) if d else wd
+        if gd is not None and cwd is not None:
+            gd_args = ("--git-dir", os.path.join(cwd, os.path.expanduser(gd)))
+        else:
+            gd_args = ()
+        if cwd is None or unk or (gd is not None and not gd_args):
+            url, cwd = "", None
+        else:
+            url = remote if "://" in remote or ":" in remote else (git(cwd, *gd_args, "remote", "get-url", "--push", remote) or "")
+        if cwd is None and not risky:
+            why = "cannot resolve the push target (unknown directory, -C/--git-dir or remote): the user decides"
+        elif risky:
+            why = f"git push with {risky[0]} (force/delete): the user decides"
+        elif "pixos-project/" in url.lower():
+            why = f"git push to the public repo {url} (AGENTS.md: publish only when the user says so)"
+    return verdict("E4", bool(pushes), why)
+
+
+def r_e5(c):
+    bad, seen = "", False
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] != "check-all.sh" or wd is None:
+            continue
+        path = os.path.expanduser(next(x for x in w if os.path.basename(x) == "check-all.sh"))
+        if "$" in path or "`" in path:
+            continue   # unknown dir, as for wd None (a literal `$K` would join to a non-repo)
+        seen = True
+        base = os.path.normpath(os.path.join(wd, os.path.dirname(os.path.dirname(path)))) if "/" in path else wd
+        root = git(base, "rev-parse", "--show-toplevel")
+        if not root:
+            continue
+        try:
+            line = open(os.path.join(root or "", "shim/out/gate.result")).read().split()
+        except OSError:
+            line = []
+        if line[:1] == ["RUNNING"] and len(line) > 1 and line[1].isdigit():
+            try:
+                os.kill(int(line[1]), 0)
+                bad = f"a gate is RUNNING (pid {line[1]}): wait for shim/out/gate.result"
+            except OSError:
+                pass
+        elif line[:2] == ["GATE", "PASS"] and len(line) > 2 and "+" not in line[2]:
+            # a quick PASS (`quick:` in the line) does not cover the full gate that must pass before a push
+            quick_line, want_quick = "quick:" in line and "ran full" not in " ".join(line), "--quick" in h[1]
+            if line[2] == git(root, "rev-parse", "--short", "HEAD") and git(root, "status", "--porcelain") == "" and (want_quick or not quick_line):
+                bad = f"already PASS {line[2]}: read shim/out/gate.result"
+    return verdict("E5", seen, bad) if seen else None
+
+
+def r_e8(c):
+    if c.t not in ("Write", "Edit", "MultiEdit"):
+        return None
+    p = os.path.realpath(c.i.get("file_path") or "")
+    if not (os.path.basename(p) in PHONE_TOOLS and os.path.dirname(p) == os.path.realpath(os.path.join(SHARED, "tools"))):
+        return None
+    held, why = lock_held()
+    return verdict("E8", True, f"phone tool edited in the shared clone while the lock is held ({why}); edit in your worktree (AP-18)" if held else "")
+
+
+_PL = []
+
+
+def lock_held():
+    """(held, why): tools/phone-lock `status` says held iff read() finds the lock (phone-lock:296-300); loaded in-process like phone-guard.
+    A broken load counts as free (fail open)."""
+    if not _PL:
+        try:
+            ld = importlib.machinery.SourceFileLoader("phone_lock", os.path.join(HERE, "phone-lock"))
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader("phone_lock", ld))
+            ld.exec_module(m)
+            _PL.append(m)
+        except Exception:  # noqa: BLE001 - fail open
+            _PL.append(None)
+    try:
+        i = _PL[0].read() if _PL[0] else None
+    except Exception:  # noqa: BLE001
+        i = None
+    return i is not None, "held by %s pid=%s" % ((i or {}).get("owner", "?"), (i or {}).get("pid"))
+
+
+REWRITE = {"merge", "pull", "reset", "switch", "checkout", "rebase", "cherry-pick", "revert", "am", "stash"}
+REDIR_OUT = re.compile(r"&?>{1,2}[|]?")
+
+
+def redirect_targets(cmd):
+    """file names after > >> &> >| in the outer command (quotes and heredoc bodies as in parse; bash -c strings are not followed)."""
+    cmd = prep(cmd)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    out, prev = [], None
+    try:
+        for t in lex:
+            if prev is not None and REDIR_OUT.fullmatch(prev) and not re.fullmatch(r"[;&|()<>]+", t):
+                out.append(t)
+            prev = t
+    except ValueError:
+        pass
+    return out
+
+
+def r_e8b(c):
+    """AP-18 for Bash: sed -i / cp / mv / install / tee / git checkout|restore / > onto a phone tool of the shared clone while the lock is held."""
+    if not c.cmd:
+        return None
+    tdir = os.path.realpath(os.path.join(SHARED, "tools"))
+    is_tool = lambda x: os.path.basename(os.path.realpath(x)) in PHONE_TOOLS and os.path.dirname(os.path.realpath(x)) == tdir  # noqa: E731
+    hits, moved = [], False
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h:
+            continue
+        moved |= h[0] in ("cd", "pushd", "popd")
+        if wd is None:
+            continue
+        prog, a = h[0], h[1]
+        ops = [x for x in a if not x.startswith("-")]
+        res = lambda x: os.path.join(wd, os.path.expanduser(x))  # noqa: E731
+        cand = []
+        if prog in ("sed", "perl") and any(x.startswith("-i") or x == "--in-place" for x in a):
+            cand = ops
+        elif prog in ("tee", "truncate"):
+            cand = ops
+        elif prog in ("cp", "mv", "install", "rsync", "ln") and ops:
+            dst = ops[-1]
+            cand = [dst] + (ops[:-1] if prog == "mv" else [])     # a source is only harmed by mv
+            if os.path.isdir(res(dst)):
+                cand += [os.path.join(dst, os.path.basename(s)) for s in ops[:-1]]
+        elif prog == "git" and git_sub(a) in ("checkout", "restore"):
+            cv = opt_val(a, "-C")
+            if cv and "$" not in cv and "`" not in cv:
+                gd = os.path.join(wd, os.path.expanduser(cv))
+                res = lambda x: os.path.join(gd, os.path.expanduser(x))  # noqa: E731
+            cand = ops
+        if prog == "git" and git_sub(a) in REWRITE:
+            sub, cv = git_sub(a), opt_val(a, "-C") or ""
+            gd = None if "$" in cv or "`" in cv else os.path.join(wd, os.path.expanduser(cv))
+            tgt = [x for x in ops[ops.index(sub) + 1:] if not x.startswith("-")] if sub in ops else []
+            if gd and os.path.realpath(gd) == os.path.realpath(SHARED) and not (sub == "reset" and not any(x in a for x in ("--hard", "--merge", "--keep"))):
+                if sub in ("checkout", "switch") and "--" not in a and tgt and git(gd, "rev-parse", "--verify", "-q", tgt[0] + "^{commit}") is None:
+                    pass      # `git checkout PATH`: judged as a path below
+                else:
+                    paths = [f"tools/{t}" for t in sorted(PHONE_TOOLS)]
+                    dif = git(gd, "diff", "--name-only", "HEAD", tgt[0], "--", *paths) if len(tgt) == 1 and sub in ("merge", "switch", "checkout", "reset") else None
+                    if dif is None or dif:      # a changed phone tool, or a target we cannot diff (pull, rebase, cherry-pick, am, stash, ...)
+                        hits.append(f"git {sub} in the shared clone")
+        hits += [x for x in cand if is_tool(res(x))]
+    for t in redirect_targets(c.cmd):
+        if os.path.isabs(os.path.expanduser(t)) or not moved:
+            if is_tool(os.path.join(c.cwd, os.path.expanduser(t))):
+                hits.append(t)
+    if not hits:
+        return None
+    held, why = lock_held()
+    return verdict("E8b", True, f"Bash write to the shared phone tool {hits[0]} while the lock is held ({why}): edit in your worktree or wait for "
+                   "`tools/phone-lock status` to say free (AP-18)" if held else "")
+
+
+# ---- antipattern rules (super repo docs/ANTIPATTERNS.md; table docs/ANTIPATTERN-ENFORCEMENT.md) ----
+RUNNERS = {"xrun", "probe-run"}
+
+
+def run_of(h, preflight=False):
+    """(runner, args, runner word) of a head tuple: tools/xrun|probe-run, also behind `phone-lock run --` (and run-preflight --)."""
+    p, a = h[0], h[1]
+    if p in RUNNERS:
+        w = next((x for x in h[3] if os.path.basename(x) == p), p) if len(h) > 3 else p
+        return p, a, w
+    if p == "phone-lock" or (preflight and p == "run-preflight"):
+        k = next((i for i, x in enumerate(a) if os.path.basename(x) in RUNNERS), None)
+        if k is not None:
+            return os.path.basename(a[k]), a[k + 1:], a[k]
+    return None
+
+
+def runs(c, preflight=False):
+    return [r for r in (run_of(h, preflight) for h in c.heads) if r]
+
+
+POKE = re.compile(r"(?:^|\s)(?:--[\w-]+=)?sweettouchpoke=(\S*)")
+
+
+def r_e10(c):
+    rs = runs(c)
+    bad = any(not m.group(1).endswith(";") for _, a, _ in rs for x in a for m in POKE.finditer(x))
+    return verdict("E10", bool(rs), "sweettouchpoke= must end with ';' (AP-10, patch 0093, tools/run-preflight syntax): the shim rejects the "
+                   "poke and touch stays off" if bad else "")
+
+
+def r_e11(c):
+    rs = runs(c, preflight=True)
+    bad = any(re.search(r"row=\(?[\d|]*\[", x) for _, a, _ in rs for x in a)
+    return verdict("E11", bool(rs), "row=N[..] character class in a run pattern (AP-42): run-preflight reach reads it as one row; spell the rows "
+                   "out (row=(1345|1346) or row=1345|row=1346)" if bad else "")
+
+
+def opt_val(a, name):
+    """the value after the last `name VALUE` in args (None if absent)."""
+    v = None
+    for k, x in enumerate(a[:-1]):
+        if x == name:
+            v = a[k + 1]
+    return v
+
+
+def r_e12(c):
+    pr = [a for p, a, _ in runs(c) if p == "probe-run"]
+    bad = ""
+    for a in pr:
+        v = opt_val(a, "--timeout")
+        if any("--wlan-link" in x for x in a) and v and v.isdigit() and int(v) < 600:
+            bad = (f"probe-run --wlan-link with --timeout {v} < 600 (AP-14): the shim needs ~170-190 s to the LINK steps, a short capture "
+                   "reads as HANG; drop --timeout (probe-run defaults to 600 for --wlan-link) or use >= 600")
+    return verdict("E12", bool(pr), bad)
+
+
+def wlan_bounds(root):
+    """the N of the wlanlink host-test loop in ROOT/shim/build.sh (`for n in ...; do` followed by wlanlink_host_test$n), None if not found."""
+    try:
+        t = open(os.path.join(root, "shim/build.sh")).read().splitlines()
+    except OSError:
+        return None
+    for i, line in enumerate(t):
+        m = re.match(r"\s*for n in ([\d ]+); do\s*$", line)
+        if m and any("wlanlink_host_test$n" in x for x in t[i + 1:i + 4]):
+            return {int(x) for x in m.group(1).split()}
+    return None
+
+
+def r_e13(c):
+    seen, bad = False, ""
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        r = run_of(h + (w,)) if h else None
+        if not r or wd is None:
+            continue
+        ns = {int(m.group(1)) for x in r[1] for m in re.finditer(r"--wlan-link=(\d+)", x)}
+        path = os.path.expanduser(r[2])
+        if not ns or "$" in path or "`" in path:
+            continue
+        base = wd if "/" not in path else os.path.normpath(os.path.join(wd, os.path.dirname(os.path.dirname(path))))
+        root = git(base, "rev-parse", "--show-toplevel")
+        b = wlan_bounds(root) if root else None
+        if b is None:
+            continue
+        seen = True
+        miss = sorted(ns - b)
+        if miss:
+            bad = (f"--wlan-link={miss[0]} is not in the wlanlink host-test loop of shim/build.sh (AP-13): add {miss[0]} to the `for n in` "
+                   "list and gate before the hardware run")
+    return verdict("E13", seen, bad) if seen else None
+
+
+HEAVY = NEWWORK | {"build.sh", "rea.sh", "rea-xrefs.sh", "rea-fn.sh", "rea-strings.sh", "rea-phone.sh", "fflash-userdata.sh", "fboot.sh"}
+
+
+def r_e14(c):
+    if c.t != "Bash" or c.i.get("run_in_background") is not True:
+        return None
+    hv = [(p, a) for p, a, _, _ in c.heads if p in HEAVY or (p == "phone-lock" and "run" in a)]
+    try:
+        ms = int(c.i.get("timeout") or 0)
+    except (TypeError, ValueError):
+        ms = 0
+    need = 0
+    for p, a in hv:
+        n, given = 0, False
+        for o in ("--timeout", "--hard-timeout", "--duration"):
+            v = opt_val(a, o)
+            if v and re.fullmatch(r"\d+", v):
+                n, given = max(n, int(v)), True
+        if not given and p == "xrun":
+            n = 300         # xrun:50-51: --duration defaults to 300 s (remote reset) or restart + 300 s
+        elif not given and p == "probe-run":     # probe-run:73
+            n = 600 if any("--wlan-link" in x for x in a) else 240 if any(x.startswith("--touch-probe") for x in a) else 60
+        lw = opt_val(a, "--lock-wait")
+        need = max(need, n + (int(lw) if lw and lw.isdigit() else 0))
+    bad = ""
+    if not ms:
+        bad = "background run without an explicit timeout (AP-33): the harness default kills it; set timeout > the tool's own --timeout + 60 s"
+    elif need and ms < (need + 60) * 1000:
+        bad = f"background timeout {ms // 1000} s < the tool's own limit {need} s + 60 s margin (AP-33): raise the Bash timeout"
+    return verdict("E14", bool(hv), bad)
+
+
+def find_ops(a):
+    """(path operands, -maxdepth) of a find/bfs arg list (leading -H/-L/-P/-O<n>/-D x are options, the expression starts at - ( !)."""
+    i = 0
+    while i < len(a) and (a[i] in ("-H", "-L", "-P") or re.fullmatch(r"-O\d", a[i]) or a[i] == "-D"):
+        i += 2 if a[i] == "-D" else 1
+    ops = []
+    while i < len(a) and not (a[i].startswith("-") or a[i] in ("(", "!", ")")):
+        ops.append(a[i])
+        i += 1
+    md = opt_val(a, "-maxdepth")
+    return ops, (int(md) if md and md.isdigit() else None)
+
+
+def r_e15(c):
+    fs = [a for p, a, _, _ in c.heads if p in ("find", "bfs")]
+    bad = ""
+    for a in fs:
+        ops, md = find_ops(a)
+        if any(x.startswith("/") and x.strip("/") == "" for x in ops) and (md is None or md > 3):
+            bad = ("find / runs past the 120 s tool limit (AP-24): objdump via tools/test-bluejay-boot.py _cross_tool(), XNU trees: "
+                   "ls ~/pixelios-artifacts, audit memos: $PIXELIOS_AUDIT_MEMO_DIR or ~/.cache/pixelios/audit; or add -maxdepth <= 3")
+    return verdict("E15", bool(fs), bad)
+
+
+def r_e16(c):
+    fs = [a for p, a, _, _ in c.heads if p in ("find", "bfs")]
+    bad = ""
+    for a in fs:
+        ops, md = find_ops(a)
+        if any(os.path.basename(os.path.normpath(x)) == ".claude" for x in ops) and "-prune" not in a and (md is None or md > 2):
+            bad = ("find .claude walks .claude/worktrees/agent-* (full checkouts) (AP-35): ls .claude/skills .claude/agents, or "
+                   "find .claude -path .claude/worktrees -prune -o ...")
+    return verdict("E16", bool(fs), bad)
+
+
+GLOBBERS = {"ls", "du", "find", "wc", "stat", "rm", "file"}
+
+
+def r_e17(c):
+    appl, bad = False, ""
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] not in GLOBBERS:
+            continue
+        appl = True
+        if wd is None:
+            continue
+        for x in h[1]:
+            if x == "--" or (h[0] == "find" and (x.startswith("-") or x in ("(", "!"))):
+                break
+            if x[:1] in ("*", "?", "[") and any(os.path.basename(m).startswith("-") for m in glob.glob(os.path.join(wd, x))):
+                bad = f"`{h[0]} {x}` expands to names starting with '-' here, read as options (AP-34): use ./{x} or put -- before the operands"
+    return verdict("E17", appl, bad)
+
+
+APPLE_SRC = ("sweet_hfs", "xnu-pristine", "localbuild/work/")
+GREPS = {"grep", "egrep", "fgrep", "rg", "ugrep"}
+GREP_VAL = {"--binary-files", "-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D", "-g", "-t", "-T", "--regexp", "--file", "--glob", "--type", "--type-not",
+            "--max-count", "--context", "--after-context", "--before-context"}
+
+
+def r_e18(c):
+    appl, bad = False, ""
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] not in GREPS:
+            continue
+        appl = True
+        a, ops, pat, k = h[1], [], any(x in ("-e", "-f", "--regexp", "--file") or x.startswith(("--regexp=", "--file=")) for x in h[1]), 0
+        # only -a / --text / --binary-files=text read a MacRoman file; grep -I (= --binary-files=without-match) prints nothing, rg -I is --no-filename (r1 F7)
+        text = (any(x in ("--text", "--binary-files=text", "-uuu") or re.fullmatch(r"-[A-Za-z0-9]*a[A-Za-z0-9]*", x) for x in a)
+                or opt_val(a, "--binary-files") == "text")
+        while k < len(a):
+            x = a[k]
+            if x in GREP_VAL:
+                k += 2
+                continue
+            if not x.startswith("-"):
+                ops.append(x)
+            k += 1
+        files = ops if pat else ops[1:]      # without -e/-f the first operand is the pattern
+        if not text and any(s in os.path.join(wd or "", os.path.expanduser(x)) for x in files for s in APPLE_SRC):
+            bad = "grep without -a on Apple sources (AP-53): MacRoman bytes make grep call the file binary and print no match lines; add -a"
+    return verdict("E18", appl, bad)
+
+
+def r_e19(c):
+    zs = [a for p, a, _, _ in c.heads if p in ("7z", "7za", "7zz", "7zr")]
+    bad = any(a and a[0] in ("e", "x") and any(re.fullmatch(r"[^/]*root[^/]*\.img", os.path.basename(x)) for x in a[1:]) for a in zs)
+    return verdict("E19", bool(zs), "7z e/x from an iOS root image writes 0-byte files (AP-54): use pixelios-userland tools/check-ios-root.py "
+                   "Volume.index()/read_file() or tools/rootless/vm.sh run get, and compare the size with the catalog" if bad else "")
+
+
+REA = {"rea.sh", "rea-xrefs.sh", "rea-fn.sh", "rea-strings.sh", "rea-phone.sh"}
+
+
+def r_e20(c):
+    rea = [wr for p, a, wr, _ in c.heads if p in REA]
+    if not rea:
+        return None
+    loop = any("xargs" in wr for wr in rea) or any({"for", "while", "until"} & set(w[:2]) for p in parses(c.cmd) for w, _ in p)
+    return verdict("E20", True, "rea.sh in a foreground loop (AP-56): each call re-analyses the binary (~35-40 s) and the loop hits the tool "
+                   "limit; pick the 6-8 addresses that matter and run the loop with run_in_background and a timeout"
+                   if loop and c.i.get("run_in_background") is not True else "")
+
+
+def r_e21(c):
+    ips = [a for p, a, _, _ in c.heads if p == "ipsw"]
+    bad = any("dyld" in a and any(x.startswith("disass") for x in a) and "--quiet" in a for a in ips)
+    return verdict("E21", bool(ips), "ipsw dyld disass --quiet prints no symbol names (AP-46): drop --quiet, add --cache dsc/cache/x.a2s" if bad else "")
+
+
+SHARED_TOOLS = re.compile(r"tools/(xrun|probe-run|run-preflight|fboot\.sh|phone|phone-lock|phone-guard|agent-guard|check-all\.sh|"
+                          r"validate-repo\.py|gate_select\.py|fflash-userdata\.sh|to-fastboot\.sh|patch-numbers|check-rules\.py|check_rules/.*)$")
+SEQ_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+COMMIT_VAL = {"-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date", "--fixup", "--squash", "--cleanup", "--template",
+              "--reuse-message", "--reedit-message"}
+SRC_DIRS = ("shim/", "soc/", "device/", "xnu/")
+
+
+def git_target(a, wd):
+    """(dir, index of the subcommand) for `git [-C d] ... SUB`; dir None when unknown."""
+    i, d = 0, wd
+    while i < len(a) and a[i].startswith("-"):
+        if a[i] == "-C" and i + 1 < len(a):
+            d = None if d is None or "$" in a[i + 1] or "`" in a[i + 1] else os.path.join(d, os.path.expanduser(a[i + 1]))
+        elif a[i] in ("--git-dir", "--work-tree") or a[i].startswith(("--git-dir=", "--work-tree=")):
+            d = None
+        i += 2 if a[i] in GIT_VAL else 1
+    return d, i
+
+
+def named_ops(args, valued):
+    """non-option operands of a git subcommand, skipping option values (short clusters ending in a valued letter take one)."""
+    ops, k = [], 0
+    while k < len(args):
+        x = args[k]
+        if x == "--":
+            ops += args[k + 1:]
+            break
+        if x in valued or (re.fullmatch(r"-[A-Za-z]*[mFCct]", x) and x[-1] in "mFCct"):
+            k += 2
+            continue
+        if not x.startswith("-"):
+            ops.append(x)
+        k += 1
+    return ops
+
+
+def pathspec_files(d, ops):
+    return (git(d, "ls-files", "-m", "-o", "--exclude-standard", "--full-name", "--", *ops) or "").split() if ops else []
+
+
+def all_dirty(root):
+    return (git(root, "diff", "--name-only") or "").split() + (git(root, "ls-files", "--others", "--exclude-standard") or "").split()
+
+
+def r_e22(c):
+    """AP-58: a commit that touches a SHARED tool (SHARED_TOOLS) or only shim/build.sh in the kernel repo on a branch other than trunk or tools/*.
+    Staged files + what `git add` (same repo) / `commit -a` / `commit PATH` will add."""
+    seen, bad = False, ""
+    adds = []      # (root, file list) of every git add in the line
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] != "git" or wd is None or git_sub(h[1]) != "add":
+            continue
+        d, i = git_target(h[1], wd)
+        top = git(d, "rev-parse", "--show-toplevel") if d else None
+        if not top:
+            continue
+        ao = h[1][i + 1:]
+        ops = [x for x in ao if not x.startswith("-")]
+        every = any(x in ("-A", "--all", "-u", "--update") or re.fullmatch(r"-[A-Za-z]*[Au][A-Za-z]*", x) for x in ao) or any(x in (".", ":/") for x in ops)
+        adds.append((top, all_dirty(top) if every else pathspec_files(d, ops)))
+    for w, wd in walk(c.cmd, c.cwd):
+        h = head(w)
+        if not h or h[0] != "git" or git_sub(h[1]) != "commit" or wd is None:
+            continue
+        a = h[1]
+        d, i = git_target(a, wd)
+        rp = (git(d, "rev-parse", "--show-toplevel", "--symbolic-full-name", "HEAD", *[y for x in SEQ_HEADS for y in ("--git-path", x)]) or "").splitlines() if d else []
+        if len(rp) != 2 + len(SEQ_HEADS):
+            continue      # not a repo, or an unborn HEAD
+        root, ref, seq = rp[0], rp[1], rp[2:]
+        if not (os.path.isfile(os.path.join(root, "tools/check-all.sh")) and os.path.isfile(os.path.join(root, "shim/build.sh"))):
+            continue
+        seen = True
+        br = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None
+        if not br or br == "trunk" or br.startswith("tools/"):
+            continue      # detached HEAD (rebase, cherry-pick) or an allowed branch
+        if any(os.path.exists(os.path.join(d, x)) for x in seq):
+            continue      # concluding a merge of trunk (or a pick/revert) carries trunk's tool commits
+        ca = a[i + 1:]
+        files = (git(root, "diff", "--cached", "--name-only") or "").split()
+        for top, fl in adds:
+            if os.path.realpath(top) == os.path.realpath(root):
+                files += fl
+        if any(x == "--all" or re.fullmatch(r"-[A-Za-z]*a[A-Za-z]*", x) for x in ca if x != "--"):
+            files += (git(root, "diff", "--name-only") or "").split()
+        files += pathspec_files(d, named_ops(ca, COMMIT_VAL))
+        tf = [f for f in files if SHARED_TOOLS.match(f)]
+        if not tf and "shim/build.sh" in files and not any(f.startswith(SRC_DIRS) and f != "shim/build.sh" for f in files):
+            tf = ["shim/build.sh"]      # build.sh alone is a tool change; with shim/soc/device/xnu code it is feature work
+        if tf and "EMERGENCY-TOOL-FIX" not in c.cmd:
+            bad = (f"shared tool change {tf[0]} committed on stream branch {br} (AP-58): commit it on trunk (or tools/<slug> from trunk), gate, merge down; "
+                   "emergency: put EMERGENCY-TOOL-FIX in the message and cherry-pick -x it to trunk this session")
+    return verdict("E22", seen, bad) if seen else None
+
+
+def r_e2c(c):
+    ks, bad = False, ""
+    for p in parses(c.cmd) if c.cmd else []:
+        for k, (w, op) in enumerate(p):
+            h = head(w)
+            if not h:
+                continue
+            if h[0] in ("pkill", "killall"):
+                ks = True
+                bad = f"{h[0]} picks processes by name and hits other owners' (AP-36, AP-56): kill only a PID you started ($!) or looked up and read"
+            elif h[0] == "kill":
+                ks = True
+                nxt = head(p[k + 1][0]) if k + 1 < len(p) else None
+                if any(re.search(r"(\$\(|`)\s*(pgrep|pidof)\b", x) for x in h[1]) or (w[-1].endswith("$") and "(" in op and nxt and nxt[0] in ("pgrep", "pidof")):
+                    bad = "kill $(pgrep ...) picks a process by name (AP-36): look the PID up, read it, then kill that PID (or use $! of your own job)"
+            elif h[0] in ("pgrep", "pidof") and op == "|":
+                m = k + 1
+                while m < len(p):
+                    hh = head(p[m][0])
+                    if hh and hh[0] == "kill" and "xargs" in hh[2]:
+                        ks = True
+                        bad = "pgrep | xargs kill picks a process by name (AP-36): look the PID up, read it, then kill that PID"
+                    if p[m][1] != "|":
+                        break
+                    m += 1
+    return verdict("E2c", ks, bad)
+
+
+def git_sub(a):
+    """the git subcommand: first word after the leading options."""
+    i = 0
+    while i < len(a) and a[i].startswith("-"):
+        i += 2 if a[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path") else 1
+    return a[i] if i < len(a) else None
+
+
+def r_e9(c):
+    st = [1 for p, a, _, w in c.heads if p == "git" and git_sub(a) == "stash"]
+    return verdict("E9", any(p == "git" for p, *_ in c.heads), "git stash is banned (AP-28): commit a wip commit instead" if st else "")
+
+
+_PG = []
+
+
+def _phone_guard():
+    if not _PG:
+        try:
+            ld = importlib.machinery.SourceFileLoader("phone_guard", os.path.join(HERE, "phone-guard"))
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader("phone_guard", ld))
+            ld.exec_module(m)
+            _PG.append(m)
+        except Exception:  # noqa: BLE001 - fail open
+            _PG.append(None)
+    return _PG[0]
+
+
+RULES = [("S1", "deny", r_s1), ("S3a", "deny", r_s3a), ("S3b", "deny", r_s3b), ("S3c", "deny", r_s3c), ("S3d", "deny", r_s3d),
+         ("S5a", "deny", r_s5a), ("S4a", "deny", r_s4a), ("S4b", "deny", r_s4b), ("S6a", "deny", r_s6a), ("S6b", "deny", r_s6b),
+         ("E6", "deny", r_e6), ("E1", "deny", r_e1), ("E2a", "deny", r_e2a), ("E2b", "deny", r_e2b), ("E3a", "deny", r_e3a),
+         ("E3b", "deny", r_e3b), ("E9", "deny", r_e9), ("E2c", "deny", r_e2c), ("E10", "deny", r_e10), ("E11", "deny", r_e11),
+         ("E12", "deny", r_e12), ("E14", "deny", r_e14), ("E15", "deny", r_e15), ("E16", "deny", r_e16), ("E17", "deny", r_e17),
+         ("E18", "deny", r_e18), ("E19", "deny", r_e19), ("E20", "deny", r_e20), ("E21", "deny", r_e21), ("E13", "deny", r_e13),
+         ("E22", "deny", r_e22), ("E8", "deny", r_e8), ("E8b", "deny", r_e8b), ("E5", "deny", r_e5), ("E4", "ask", r_e4),
+         ("S5b", "deny", r_s5b)]   # S5b last: it records the poll time, so only a call no other rule denied counts
+BRIEF = {"S4a", "S4b", "S6a", "S6b", "E6"}
+
+
+def pre(h, only=None):
+    """-> (kind, rule, reason) or None."""
+    c = Ctx(h)
+    for name, kind, fn in RULES:
+        if only and name not in only:
+            continue
+        try:
+            r = fn(c)
+        except Exception:  # noqa: BLE001 - one crashing rule must not disable the others (review 3 A1)
+            continue
+        if r:
+            return kind, name, r
+    return None
+
+
+def post(h):
+    r = h.get("tool_response")
+    ok = h.get("tool_name") == "Bash" and isinstance(r, dict) and isinstance(r.get("stdout"), str)
+    so = r["stdout"] if ok else ""
+    if not verdict("S2", ok, "cut" if len(so) > OUT_CAP else ""):
+        return None
+    os.makedirs(OUTDIR, exist_ok=True)
+    p = os.path.join(OUTDIR, re.sub(r"\W", "_", str(h.get("tool_use_id") or "x")) + ".txt")
+    with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(so)
+    cut = f"\n[agent-guard: {len(so)} chars cut; full output in {p}; grep it, do not cat it]\n"
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {**r, "stdout": so[:KEEP] + cut + so[-KEEP:]}}}
+
+
+def context(h):
+    n = ctx_tokens(h.get("transcript_path"))
+    if verdict("S1h", True, "x" if n > HARD else ""):
+        msg = f"CONTEXT {n // 1000}k > HARD {HARD // 1000}k: finish the step, handoff, rollover NOW."
+    elif verdict("S1s", True, "x" if n > SOFT else ""):
+        msg = f"context {n // 1000}k > {SOFT // 1000}k: reaching rollover (200k): tidy up now, finish or park in-flight work, write the handoff, then roll over at the next safe point."
+    else:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": msg}}
+
+
+def session(h):
+    p = os.path.join(os.environ.get("CLAUDE_PROJECT_DIR", "."), "docs/state.md")
+    if os.path.isfile(p):
+        return {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                       "additionalContext": open(p).read()[:7000] + "\nRead this, not HANDOFF.md/NOTES.md in full."}}
+    return None
+
+
+def statusline(h):
+    u = (h.get("context_window") or {}).get("current_usage") or {}
+    n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    tag = "ROLL OVER NOW" if n > HARD else "roll over soon" if n > SOFT else "ok"
+    return f"{(h.get('model') or {}).get('display_name', '?')} ctx {n // 1000}k/{HARD // 1000}k {tag}"
+
+
+def decide(mode, h):
+    """stdout text for MODE (None = print nothing)."""
+    if mode in ("--pre", "--brief"):
+        r = pre(h, BRIEF if mode == "--brief" else None)
+        if r:
+            return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": r[0],
+                                                      "permissionDecisionReason": "agent-guard %s: %s" % (r[1], r[2])}})
+        return None
+    if mode == "--statusline":
+        return statusline(h)
+    o = {"--post": post, "--context": context, "--context-nudge": context, "--session": session}[mode](h)
+    return json.dumps(o) if o else None
+
+
+# ---- self-test ----
+def self_test():
+    import shutil
+    import tempfile
+    global STATE, OUTDIR, SHARED, MUT
+    tmp = tempfile.mkdtemp(prefix="agent-guard-test-")
+    saved = (STATE, OUTDIR, SHARED, dict(os.environ))
+    me, cwd0 = os.path.abspath(__file__), os.getcwd()
+    os.chdir(tmp)   # fixtures must not read the caller's cwd (AP-39); the hook cwd is each fixture's own `cwd`
+    try:
+        STATE, OUTDIR = os.path.join(tmp, "state"), os.path.join(tmp, "out")
+        SHARED = os.path.join(tmp, "kernel")
+        os.environ.update(PHONE_LOCK_DIR=os.path.join(tmp, "phone.lock"), CLAUDE_PROJECT_DIR=os.path.join(tmp, "proj"))
+        os.environ.pop("PHONE_LOCK_TOKEN", None)
+        os.makedirs(os.path.join(SHARED, "tools"))
+        os.makedirs(os.path.join(tmp, "proj"))
+        fx = fixtures(tmp)
+        res = lambda: [(lbl, run_fx(f)) for lbl, f in fx()]  # noqa: E731 - fixtures rebuilt per pass (they hold state)
+        fails, n = [], 0
+        for lbl, (got, want) in res():
+            n += 1
+            if got != want:
+                fails.append(f"{lbl}: got {got} want {want}")
+        rules = {x[0] for x in RULES} | {"S2", "S1h", "S1s"}
+        for r in sorted(rules):
+            if COV.get(r) != {"ok", "viol"}:
+                fails.append(f"coverage: rule {r} saw {sorted(COV.get(r, []))}, needs ok and viol fixtures")
+        surv = []
+        for r in sorted(rules):   # the rule-toggle mutants replay every fixture 2x per rule: skip them once the verdict is already FAIL
+            for mode in ("off", "on") if not fails else ():
+                MUT = (r, mode)
+                if all(got == want for _, (got, want) in res()):
+                    surv.append(f"{r}/{mode}")
+        MUT = None
+        fails += [f"mutant survived: {s}" for s in surv]
+        # CLI contract: fail open, exit 0, JSON shape
+        for inp, mode in (("{broken", "--pre"), ("", "--post"), ("[]", "--context")):
+            p = subprocess.run([sys.executable, "-B", me, mode], input=inp, capture_output=True, text=True, timeout=20)
+            if p.returncode != 0 or p.stdout:
+                fails.append(f"fail-open {mode} {inp!r}: rc={p.returncode} out={p.stdout!r}")
+        p = subprocess.run([sys.executable, "-B", me, "--pre"], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git stash"}}),
+                           capture_output=True, text=True, timeout=20)
+        try:
+            o = json.loads(p.stdout)["hookSpecificOutput"]
+            assert p.returncode == 0 and o["hookEventName"] == "PreToolUse" and o["permissionDecision"] == "deny" and o["permissionDecisionReason"]
+        except (ValueError, KeyError, AssertionError):
+            fails.append(f"CLI deny shape: rc={p.returncode} out={p.stdout!r}")
+        for f in fails:
+            print("FAIL", f)
+        print("RESULT: %s fixtures=%d rules=%d mutants=%d survived=%d failures=%d" % (
+            "FAIL" if fails else "PASS", n, len(rules), 2 * len(rules), len(surv), len(fails)))
+        return 1 if fails else 0
+    finally:
+        os.chdir(cwd0)
+        STATE, OUTDIR, SHARED = saved[:3]
+        os.environ.clear()
+        os.environ.update(saved[3])
+        subprocess.run([sys.executable, "-B", os.path.join(HERE, "phone-lock"), "release", "--owner", "agent-guard-test"],
+                       capture_output=True, env={**saved[3], "PHONE_LOCK_DIR": os.path.join(tmp, "phone.lock")})
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_fx(f):
+    """fixture -> (got, want); got/want are 'allow' or 'kind:rule' (or 'out:...' for the non-PreToolUse modes)."""
+    mode, h, want, pre_hook = f["mode"], f["h"], f["want"], f.get("setup")
+    if pre_hook:
+        pre_hook()
+    if mode == "--pre":
+        try:
+            r = pre(h)
+        except Exception as e:  # noqa: BLE001 - a crash is a failed fixture, not a harness error
+            return f"crash:{type(e).__name__}", want
+        return (f"{r[0]}:{r[1]}" if r else "allow") + (f["check"]() if f.get("check") else ""), want
+    if mode == "--post":
+        r = post(h)
+        so = r["hookSpecificOutput"]["updatedToolOutput"]["stdout"] if r else ""
+        if not r:
+            return "allow", want
+        full = open(re.search(r"full output in (\S+);", so).group(1)).read()
+        orig = h["tool_response"]["stdout"]
+        return ("cut" if len(so) <= 9000 and len(full) == len(orig) and so.endswith(orig[-KEEP:]) and so.startswith(orig[:KEEP]) else "badcut"), want
+    if mode == "--context":
+        r = context(h)
+        return ("allow" if not r else ("hard" if "CONTEXT" in r["hookSpecificOutput"]["additionalContext"] else "soft")), want
+    return None, want
+
+
+def fixtures(tmp):
+    def tr(n):
+        p = os.path.join(tmp, f"tr{n}.jsonl")
+        with open(p, "w") as f:
+            f.write('{"type":"user","message":{"content":"x"}}\n')
+            f.write(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": n, "cache_creation_input_tokens": 0}}}) + "\n")
+        return p
+
+    def tr_user_last(n):
+        """assistant 50k, then a type=user line carrying a 170k usage: the guard must ignore the user line."""
+        p = os.path.join(tmp, f"trul{n}.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": 50_000}}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": n}}}) + "\n")
+        return p
+
+    proj = os.path.join(tmp, "proj")
+    repo = os.path.join(tmp, "repo")
+    big = os.path.join(tmp, "big.c")
+    small = os.path.join(tmp, "small.c")
+    open(big, "w").write("x" * 50_000)
+    open(small, "w").write("x\n")
+    png = os.path.join(tmp, "shot.png")
+    open(png, "w").write("x" * 60_000)
+    notes = os.path.join(tmp, "NOTES.md")
+    open(notes, "w").write("n\n")
+    kt = os.path.join(SHARED, "tools")
+    lockdir = os.environ["PHONE_LOCK_DIR"]
+
+    def mkrepo():
+        if os.path.isdir(os.path.join(repo, ".git")):
+            return
+        os.makedirs(repo, exist_ok=True)
+        for a in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"],
+                  ["remote", "add", "pub", "https://github.com/PixOS-Project/x.git"], ["remote", "add", "priv", "git@example.com:me/priv.git"]):
+            subprocess.run(["git", "-C", repo, *a], capture_output=True, check=True)
+        os.makedirs(os.path.join(repo, "shim/out"), exist_ok=True)
+
+    pubr, privr = os.path.join(tmp, "pubr"), os.path.join(tmp, "privr")
+
+    def mkpair():
+        """two clones whose `origin` is the public / a private remote; privr carries a clean-tree PASS gate result."""
+        if os.path.isdir(os.path.join(privr, ".git")):
+            return
+        for d, url in ((pubr, "https://github.com/PixOS-Project/x.git"), (privr, "git@example.com:me/priv.git")):
+            os.makedirs(d)
+            for a in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"], ["remote", "add", "origin", url]):
+                subprocess.run(["git", "-C", d, *a], capture_output=True, check=True)
+        os.makedirs(os.path.join(privr, "shim/out"))
+        open(os.path.join(privr, ".git/info/exclude"), "w").write("shim/\n")
+        open(os.path.join(privr, "shim/out/gate.result"), "w").write("GATE PASS %s 1\n" % git(privr, "rev-parse", "--short", "HEAD"))
+
+    def gate(text):
+        def f():
+            git(repo, "status")
+            open(os.path.join(repo, "shim/out/gate.result"), "w").write(text.replace("@H", git(repo, "rev-parse", "--short", "HEAD") or "") + "\n")
+            # shim/out is untracked output: keep the tree clean for the clean-tree fixtures
+            open(os.path.join(repo, ".git/info/exclude"), "w").write("shim/\nuntracked*\n")
+            u = os.path.join(repo, "untracked.txt")
+            if os.path.exists(u):
+                os.remove(u)
+        return f
+
+    def dirty():
+        gate("GATE PASS @H 1")()
+        open(os.path.join(repo, "untracked.txt"), "w").write("x")
+        subprocess.run(["git", "-C", repo, "add", "-f", "untracked.txt"], capture_output=True)
+
+    def dead_pid():
+        p = subprocess.Popen(["true"])
+        p.wait()
+        return p.pid
+
+    def hold():
+        subprocess.run([sys.executable, "-B", os.path.join(HERE, "phone-lock"), "acquire", "--owner", "agent-guard-test", "--pid", str(os.getpid()),
+                        "--ttl", "60"], capture_output=True, check=True)
+
+    def free():
+        shutil.rmtree(lockdir, ignore_errors=True)
+
+    import shutil
+    sid = [0]
+
+    def B(cmd, **kw):
+        return dict(tool_name="Bash", tool_input={"command": cmd}, cwd=kw.pop("cwd", tmp), **kw)
+
+    def A(prompt, tool="Agent", **inp):
+        sid[0] += 1
+        return dict(tool_name=tool, tool_input={"prompt": prompt, **inp}, session_id=f"a{sid[0]}")
+
+    good = "Work alone. Read docs/ANTIPATTERNS.md first. Verification: x. Return a summary of at most 10 lines."
+
+    def build():
+        mkrepo()
+        mkpair()
+        gp = lambda: gate("RUNNING %d 1" % os.getpid())()  # noqa: E731
+        gd = lambda: gate("RUNNING %d 1" % dead_pid())()  # noqa: E731
+        sess = lambda n: dict(tool_name="mcp__t3-code__task_status", tool_input={}, session_id=f"s{n}-{time.time()}")  # noqa: E731
+        s1 = sess(1)
+        L = []
+
+        def add(label, h, want, mode="--pre", setup=None, check=None):
+            L.append((label, dict(mode=mode, h=h, want=want, setup=setup, check=check)))
+
+        add("Read NOTES.md no limit", dict(tool_name="Read", tool_input={"file_path": notes}), "deny:S3a")
+        add("Read NOTES.md limit 80", dict(tool_name="Read", tool_input={"file_path": notes, "limit": 80}), "allow")
+        add("Read 50KB .c no limit", dict(tool_name="Read", tool_input={"file_path": big}), "deny:S3a")
+        add("Read 60KB png no limit (A5)", dict(tool_name="Read", tool_input={"file_path": png}), "allow")
+        add("Read NOTES.md limit 5000 (A5)", dict(tool_name="Read", tool_input={"file_path": notes, "limit": 5000}), "deny:S3a")
+        add("Read small .c limit 400 (A8)", dict(tool_name="Read", tool_input={"file_path": small, "limit": 400}), "allow")
+        add("Read small .c", dict(tool_name="Read", tool_input={"file_path": small}), "allow")
+        add("cat AGENTS.md", B("cat AGENTS.md", cwd=proj), "deny:S3b")
+        add("true && head ./CLAUDE.md", B("true && head -n 5 ./CLAUDE.md", cwd=proj), "deny:S3b")
+        add("cat absolute $CLAUDE_PROJECT_DIR/AGENTS.md", B("cat " + os.path.join(proj, "AGENTS.md")), "deny:S3b")
+        add("cat AGENTS.md of another cwd (A9)", B("cat AGENTS.md", cwd=tmp), "allow")
+        add("grep AGENTS.md", B("grep -n x AGENTS.md"), "allow")
+        add("cat scoped shim/AGENTS.md", B("cat shim/AGENTS.md"), "allow")
+        add("sed -i AGENTS.md", B("sed -i s/a/b/ AGENTS.md", cwd=proj), "allow")
+        add("quoted text only", B('git commit -m "cat AGENTS.md; pkill -f x; git stash"'), "allow")
+        add("cat HANDOFF.md", B("cat docs/HANDOFF.md"), "deny:S3c")
+        add("cat small file", B("cat docs/x.md"), "allow")
+        add("sed -n 1,900p", B("sed -n 1,900p x.c"), "deny:S3d")
+        add("sed -n quoted 1,900p", B("sed -n '1,900p' x.c"), "deny:S3d")
+        add("sed -n 10,60p", B("sed -n 10,60p x.c"), "allow")
+        add("head -n 1000", B("ls | head -n 1000"), "deny:S3d")
+        add("head -20", B("ls | head -20"), "allow")
+        add("tail -n +900", B("tail -n +900 x"), "allow")
+        add("tail -n 500", B("tail -n 500 x"), "deny:S3d")
+        add("sleep 120", B("sleep 120"), "deny:S5a")
+        add("sleep 2m", B("sleep 2m"), "deny:S5a")
+        add("sleep 5", B("sleep 5"), "allow")
+        add("sleep infinity (A10)", B("sleep infinity"), "deny:S5a")
+        add("sleep 600 background (A10)", dict(B("sleep 600; tools/phone-state"), tool_input={"command": "sleep 600", "run_in_background": True}), "allow")
+        add("poll 1st", s1, "allow")
+        add("poll 2nd", s1, "deny:S5b")
+        add("poll other session", sess(2), "allow")
+        ts = lambda i: dict(tool_name="mcp__t3-code__task_status", tool_input={"taskId": i}, session_id="stask")  # noqa: E731
+        add("task_status A (A5)", ts("A"), "allow")
+        add("task_status B (A5)", ts("B"), "allow")
+        add("task_status A again (A5)", ts("A"), "deny:S5b")
+        th = lambda i: dict(tool_name="mcp__t3-code__t3_thread_read", tool_input={"threadId": i}, session_id="sthr")  # noqa: E731
+        add("thread_read A (A4)", th("A"), "allow")
+        add("thread_read B (A4)", th("B"), "allow")
+        add("thread_read A again (A4)", th("A"), "deny:S5b")
+        add("brief 7000", A(good + "x" * 7000, subagent_type="implementer"), "deny:S6a")
+        add("brief no 'at most'", A("Work alone. ANTIPATTERNS. Verification.", subagent_type="implementer"), "deny:S6b")
+        add("brief lower-case keywords (A3)", A("work alone. read docs/antipatterns.md. verification: x. Return a summary of At Most 10 lines.", subagent_type="implementer"), "allow")
+        add("brief no header", A("do it. Return a summary of at most 5 lines.", subagent_type="implementer"), "deny:E6")
+        add("general-purpose", A(good, subagent_type="general-purpose"), "deny:S4a")
+        add("missing type", A(good), "deny:S4a")
+        add("ROLE-EXEMPT", A(good + " ROLE-EXEMPT: odd job"), "allow")
+        add("typed implementer", A(good, subagent_type="implementer"), "allow")
+        add("opus no HW-WRITE", A(good, subagent_type="reviewer", model="opus"), "deny:S4b")
+        add("opus HW-WRITE", A(good + " HW-WRITE", subagent_type="reviewer", model="opus"), "allow")
+        add("delegate_task target.model opus (A7)", A(good, tool="mcp__t3-code__delegate_task", target={"model": "claude-opus-5-5"}), "deny:S4b")
+        add("delegate_task good", A(good, tool="mcp__t3-code__delegate_task"), "allow")
+        add("delegate_task no header", A("hi at most 3 lines", tool="mcp__t3-code__delegate_task"), "deny:E6")
+        add("delegate_task unknown field", dict(tool_name="mcp__t3-code__delegate_task", tool_input={"zzz": "q"}), "allow")
+        add("ctx 210k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k xrun", dict(B("tools/xrun --dry-run"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k phone-lock run", dict(B("tools/phone-lock run --owner a -- true"), transcript_path=tr(210_000)), "deny:S1")
+        add("ctx 210k git commit", dict(B("git commit -m 'fix xrun'"), transcript_path=tr(210_000)), "allow")
+        add("ctx 190k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(190_000)), "allow")
+        add("ctx last usage is type=user", dict(A(good, subagent_type="implementer"), transcript_path=tr_user_last(210_000)), "allow")
+        add("ctx 210k subagent (A11)", dict(A(good, subagent_type="implementer"), transcript_path=tr(210_000), agent_id="sub1"), "allow")
+        add("ctx 150k Agent", dict(A(good, subagent_type="implementer"), transcript_path=tr(150_000)), "allow")
+        add("pipe tail &&", B("tools/check-all.sh | tail -3 && git commit -m x"), "deny:E1")
+        add("python validate | grep &&", B("python3 tools/validate-repo.py 2>&1 | grep FAIL && echo"), "deny:E1")
+        add("pipefail first", B("set -o pipefail; tools/check-all.sh | tail -3 && git commit -m x"), "allow")
+        add("check to file", B("tools/check-all.sh > /tmp/o 2>&1; echo $?"), "allow")
+        add("check | tail alone", B("tools/xrun x | tail -3"), "allow")
+        add("pkill -f", B("pkill -f xrun"), "deny:E2a")
+        add("bash -c pkill -9f", B("bash -c 'pkill -9f xrun'"), "deny:E2a")
+        add("pkill by pid-less name (E2a passes, E2c: AP-56)", B("pkill xrun"), "deny:E2c")
+        add("until pgrep", B("until ! pgrep xrun; do sleep 1; done"), "deny:E2b")
+        add("while pgrep", B("while pgrep -f x >/dev/null; do sleep 1; done"), "deny:E2b")
+        add("until -s", B("until [ -s out.txt ]; do sleep 1; done"), "deny:E2b")
+        add("for loop", B("for i in 1 2 3; do echo $i; done"), "allow")
+        add("pgrep in body only", B("while true; do pgrep x; break; done"), "allow")
+        add("fastboot flash", B("fastboot flash boot x.img"), "deny:E3a")
+        add("adb reboot", B("adb reboot"), "deny:E3a")
+        add("fastboot getvar timeout", B("timeout 20 fastboot getvar product"), "allow")
+        add("fastboot getvar bare", B("fastboot getvar product"), "deny:E3b")
+        add("adb wait-for-device bare", B("adb -s abc wait-for-device"), "deny:E3b")
+        add("adb wait timeout", B("timeout 30 adb wait-for-device"), "allow")
+        add("adb devices", B("adb devices"), "allow")
+        add("git stash", B("git stash"), "deny:E9")
+        add("git -C x stash pop", B("git -C x stash pop"), "deny:E9")
+        add("git status", B("git status"), "allow")
+        add("git commit -m stash (A8)", B("git commit -m stash"), "allow")
+        add("git log --grep stash (A8)", B("git log --grep stash"), "allow")
+        add("push force", B("git push --force origin main", cwd=repo), "ask:E4")
+        add("push -f", B("git push -f priv main", cwd=repo), "ask:E4")
+        add("push delete", B("git push priv --delete wip/x", cwd=repo), "ask:E4")
+        add("push :ref", B("git push priv :wip/x", cwd=repo), "ask:E4")
+        add("push public", B("git push pub main", cwd=repo), "ask:E4")
+        add("push public via -C", B(f"git -C {repo} push pub main", cwd=tmp), "ask:E4")
+        add("cd public && push, private cwd (A2)", B(f"cd {repo} && git push pub main", cwd=tmp), "ask:E4")
+        add("cd private && push (A2)", B(f"cd {repo} && git push priv main", cwd=tmp), "allow")
+        add("cd $X && push (A2)", B('cd "$X" && git push priv main', cwd=repo), "ask:E4")
+        add("push private", B("git push priv main", cwd=repo), "allow")
+        for lbl, cmd in (("cd in (...) ends (A1)", "(cd ../privr && git status); git push origin main"),
+                         ("pushd..popd (A1)", "pushd ../privr >/dev/null && git status && popd && git push origin main"),
+                         ("cd in $(...) ends (A1)", "x=$(cd ../privr && pwd); git push origin main"),
+                         ("VAR=1 prefix (A2)", "GIT_TRACE=1 git push origin main"), ("env prefix (A2)", "env GIT_TRACE=1 git push origin main"),
+                         ("sudo (A2)", "sudo git push origin main"), ("timeout (A2)", "timeout 60 git push origin main"),
+                         ("command (A2)", "command git push origin main"), ("if..then (A2)", "if true; then git push origin main; fi"),
+                         ("-C $P (A2)", 'git -C "$P" push origin main'), ("remote $URL (A2)", 'git push "$URL" main')):
+            add("push public from pubr: " + lbl, B(cmd, cwd=pubr), "ask:E4")
+        add("cd in (cd x; ) ends (A1)", B("(cd ../privr; ); git push origin main", cwd=pubr), "ask:E4")
+        add("cd private then push, from pubr", B("cd ../privr && git push origin main", cwd=pubr), "allow")
+        add("push GIT_TRACE=1 private (A2)", B("GIT_TRACE=1 git push origin main", cwd=privr), "allow")
+        add("nested bash -c after cd (A1)", B("cd ../pubr && bash -c 'git push origin main'", cwd=privr), "ask:E4")
+        add("cd sub in (...) then push (A1)", B("(cd sub && make); git push origin main", cwd=privr), "ask:E4")
+        add("--git-dir public from privr (A2)", B("git --git-dir ../pubr/.git push origin main", cwd=privr), "ask:E4")
+        add("--git-dir=public from privr (A2)", B("git --git-dir=../pubr/.git push origin main", cwd=privr), "ask:E4")
+        add("push -o value is not the remote (A2a)", B("git push -o ci.skip origin main", cwd=pubr), "ask:E4")
+        add("push --push-option value (A2a)", B("git push --push-option ci.skip origin main", cwd=pubr), "ask:E4")
+        add("push --repo public (A2a)", B("git push --repo origin main", cwd=pubr), "ask:E4")
+        add("push --repo=public (A2a)", B("git push --repo=origin main", cwd=pubr), "ask:E4")
+        add("push -o value private (A2a)", B("git push -o ci.skip priv main", cwd=repo), "allow")
+        add("GIT_DIR= prefix public (A2b)", B("GIT_DIR=../pubr/.git git push origin main", cwd=privr), "ask:E4")
+        add("export GIT_DIR public (A2b)", B("export GIT_DIR=../pubr/.git; git push origin main", cwd=privr), "ask:E4")
+        add("cd priv in background, push (A2c)", B("cd ../privr && make -s >/dev/null 2>&1 & git push origin main", cwd=pubr), "ask:E4")
+        add("bash -c cd; eval push (A2d)", B("bash -c 'cd ../pubr; eval git push origin main'", cwd=privr), "ask:E4")
+        add("bash -c cd && bash -c push (A2d)", B("bash -c \"cd ../pubr && bash -c 'git push origin main'\"", cwd=privr), "ask:E4")
+        add("cd - then push (A7)", B("cd - && git push priv main", cwd=repo), "ask:E4")
+        add("(cd ..) then check-all keeps priv result out (A3)", B("(cd ../privr && git log -1); tools/check-all.sh", cwd=pubr), "allow")
+        add("pushd..popd then check-all (A3)", B("pushd ../privr >/dev/null && popd && tools/check-all.sh", cwd=pubr), "allow")
+        add("cd public repo/AGENTS.md of subdir (A4)", B("cd kern && cat AGENTS.md", cwd=proj), "allow")
+        add("cd . && cat AGENTS.md (A4)", B("cd . && cat AGENTS.md", cwd=proj), "deny:S3b")
+        add("push -u private", B("git push -u priv main", cwd=repo), "allow")
+        os.makedirs(os.path.join(tmp, "ngit"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "shim/out"), exist_ok=True)
+        open(os.path.join(tmp, "shim/out/gate.result"), "w").write("GATE PASS 1234567 1\n")   # the process cwd (self_test chdirs to tmp) has a PASS result
+
+        def e5_ok(cmd, cwd):
+            def f():
+                try:
+                    r_e5(Ctx(B(cmd, cwd=cwd)))
+                    return ""
+                except Exception:  # noqa: BLE001
+                    return "|e5 crashed"
+            return f
+        k1 = '"$K"/tools/check-all.sh; git push origin main'
+        add("E5 $K path, cwd gate.result, public push (A1)", B(k1, cwd=pubr), "ask:E4", check=e5_ok(k1, pubr))
+        k2 = os.path.join(tmp, "ngit/tools/check-all.sh")
+        add("E5 non-git dir, cwd gate.result (A1)", B(k2, cwd=tmp), "allow", check=e5_ok(k2, tmp))
+        add("E5 ~ path expanded, PASS at HEAD (A1)", B("~/privr/tools/check-all.sh", cwd=pubr), "deny:E5", setup=lambda: os.environ.update(HOME=tmp))
+        def iso():
+            RULES.insert(0, ("XBOOM", "deny", lambda c: 1 // 0))
+            try:
+                r = pre(B("git stash", cwd=repo))
+                return "" if r and r[1] == "E9" else "|crashing rule hid E9"
+            except Exception:  # noqa: BLE001
+                return "|crash escaped pre"
+            finally:
+                RULES.pop(0)
+        add("a crashing rule skips only itself (A1)", B("git stash", cwd=repo), "deny:E9", check=iso)
+        k3 = 'cd "$X" && tools/check-all.sh'
+        add("E5 unknown dir (cd $X) does not crash (A7)", B(k3, cwd=repo), "allow", check=e5_ok(k3, repo))
+        add("gate: no result", B("tools/check-all.sh", cwd=repo), "allow", setup=lambda: os.path.exists(os.path.join(repo, "shim/out/gate.result")) and os.remove(os.path.join(repo, "shim/out/gate.result")))
+        add("gate RUNNING live", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gp)
+        add("gate RUNNING dead pid", B("tools/check-all.sh", cwd=repo), "allow", setup=gd)
+        add("gate PASS HEAD clean", B("tools/check-all.sh --quick", cwd=repo), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("gate full PASS then full", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("gate quick PASS then full (A1)", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS @H quick: ran 3 of 9 steps 1"))
+        add("gate quick PASS then --quick (A1)", B("tools/check-all.sh --quick", cwd=repo), "deny:E5", setup=gate("GATE PASS @H quick: ran 3 of 9 steps 1"))
+        add("cd repo && check-all, PASS at HEAD (A2)", B(f"cd {repo} && tools/check-all.sh", cwd=tmp), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("gate quick fell back to full (A6)", B("tools/check-all.sh", cwd=repo), "deny:E5", setup=gate("GATE PASS @H quick: no usable stamp, ran full 1"))
+        add("abs path check-all from other cwd (A7)", B(os.path.join(repo, "tools/check-all.sh"), cwd=tmp), "deny:E5", setup=gate("GATE PASS @H 1"))
+        add("cd $X then check-all (A7)", B('cd "$X" && tools/check-all.sh', cwd=repo), "allow")
+        add("gate PASS HEAD dirty", B("tools/check-all.sh", cwd=repo), "allow", setup=dirty)
+        add("gate PASS +dirty token", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS @H+dirty 1"))
+        add("gate PASS other hash", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE PASS deadbee 1"))
+        add("gate FAIL HEAD", B("tools/check-all.sh", cwd=repo), "allow", setup=gate("GATE FAIL @H 1"))
+        ed = lambda name, d=kt: dict(tool_name="Edit", tool_input={"file_path": os.path.join(d, name)})  # noqa: E731
+        add("edit xrun, lock free", ed("xrun"), "allow", setup=free)
+        add("edit xrun, lock held", ed("xrun"), "deny:E8", setup=hold)
+        add("edit probe-run (Write), held", dict(tool_name="Write", tool_input={"file_path": os.path.join(kt, "probe-run")}), "deny:E8")
+        add("edit other tool, held", ed("agent-guard"), "allow")
+        add("edit xrun in worktree, held", ed("xrun", os.path.join(tmp, "wt/tools")), "allow")
+        add("post 50k stdout", dict(tool_name="Bash", tool_use_id="t1", tool_response={"stdout": "a" * 50_000, "stderr": "", "interrupted": False, "isImage": False}), "cut", mode="--post")
+        add("post 50k stdout, tail kept", dict(tool_name="Bash", tool_use_id="t3", tool_response={"stdout": "a" * 30_000 + "THE-END-MARK"}), "cut", mode="--post")
+        add("post 1k stdout", dict(tool_name="Bash", tool_use_id="t2", tool_response={"stdout": "a" * 1000}), "allow", mode="--post")
+        add("session id ../x stays in STATE (A6)", dict(tool_name="mcp__t3-code__task_status", tool_input={}, session_id="../x"), "allow",
+            check=lambda: "|escaped" if [n for n in os.listdir(tmp) if n.endswith(".poll")] else "")
+        add("ctx 210k nudge", dict(transcript_path=tr(210_000)), "hard", mode="--context")
+        add("ctx 190k nudge", dict(transcript_path=tr(190_000)), "soft", mode="--context")
+        add("ctx 50k nudge", dict(transcript_path=tr(50_000)), "allow", mode="--context")
+        ap_fixtures(add, B, tmp, kt, free)
+        return L
+
+    return build
+
+
+def ap_fixtures(add, B, tmp, kt, free):
+    """deny and allow fixtures of the antipattern rules E2c, E8b, E10-E22 (each AP of docs/ANTIPATTERNS.md that a hook can see)."""
+    import shutil
+    krepo = os.path.join(tmp, "krepo")
+    G = lambda d, *a: subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a], capture_output=True)  # noqa: E731
+
+    def kst(name, branch, staged=None, merge=False, untracked=None, modified=None):
+        """a copy of krepo on BRANCH in state NAME, built once (fixtures are rebuilt per self-test pass; no per-pass git setup)."""
+        d = os.path.join(tmp, "k-" + name)
+        if os.path.isdir(d):
+            return d
+        shutil.copytree(krepo, d, symlinks=True)
+        G(d, "checkout", "-q", "-B", branch)
+        for p, add_it in ((staged, True), (untracked, False)):
+            if p:
+                os.makedirs(os.path.dirname(os.path.join(d, p)), exist_ok=True)
+                open(os.path.join(d, p), "w").write("x\n")
+                if add_it:
+                    G(d, "add", p)
+        if modified:
+            open(os.path.join(d, modified), "a").write("# m\n")
+        if merge:
+            open(os.path.join(d, ".git/MERGE_HEAD"), "w").write(G(d, "rev-parse", "HEAD").stdout.decode())
+        return d
+
+    if not os.path.isdir(os.path.join(krepo, ".git")):
+        os.makedirs(os.path.join(krepo, "tools"))
+        os.makedirs(os.path.join(krepo, "shim"))
+        open(os.path.join(krepo, "tools/check-all.sh"), "w").write("#!/bin/sh\n")
+        open(os.path.join(krepo, "shim/build.sh"), "w").write('# --wlan-link host tests\nfor n in 7 8 10; do\n\tchk "wlanlink_host_test$n" x\ndone\n')
+        for a in (["init", "-q"], ["symbolic-ref", "HEAD", "refs/heads/trunk"], ["add", "-A"], ["commit", "-q", "-m", "i"], ["branch", "boot/s1"]):
+            G(krepo, *a)
+
+    projs = os.path.join(tmp, "projs")
+    for d in ("-home-a-pixelios", "-home-b-pixelios"):
+        os.makedirs(os.path.join(projs, d), exist_ok=True)
+    wt = os.path.join(tmp, "wt/tools")
+    bg = lambda cmd, **kw: dict(tool_name="Bash", tool_input={"command": cmd, "run_in_background": True, **kw}, cwd=tmp)  # noqa: E731
+    # E2c (AP-36, AP-56): kill by name
+    add("E2c killall", B("killall python3"), "deny:E2c")
+    add("E2c kill $(pgrep -x)", B("kill $(pgrep -x foo)"), "deny:E2c")
+    add("E2c kill \"$(pgrep)\"", B('kill "$(pgrep foo)"'), "deny:E2c")
+    add("E2c kill `pgrep`", B("kill `pgrep foo`"), "deny:E2c")
+    add("E2c pgrep | xargs kill", B("pgrep -x foo | xargs kill"), "deny:E2c")
+    add("E2c kill PID", B("kill 1234"), "allow")
+    add("E2c kill $! / -- -$pgid", B('setsid sleep 1 & pid=$!; kill $pid; kill -- -"$pgid"'), "allow")
+    add("E2c pgrep | head (lookup only)", B("pgrep -x foo | head -1"), "allow")
+    add("E2c # inside a word is no comment (F5)", B("echo a#b; pkill xrun"), "deny:E2c")
+    add("E2c real comment (F5)", B("echo hi # pkill xrun"), "allow")
+    add("E1 backslash continuation (F4)", B("tools/check-all.sh \\\n | tail -1 && git commit -m x"), "deny:E1")
+    add("E2c quoted text", B('git commit -m "pkill x; kill $(pgrep y)"'), "allow")
+    # E10 (AP-10): poke string ends with ;
+    add("E10 xrun poke without ;", B("tools/xrun --label t --args 'debug=0xc sweettouchpoke=m:10c0180c=5=f'"), "deny:E10")
+    add("E10 phone-lock run xrun poke without ;", B("tools/phone-lock run --owner a -- tools/xrun --args 'sweettouchpoke=m:1=2=3 cpus=8'"), "deny:E10")
+    add("E10 xrun poke with ;", B("tools/xrun --label t --args 'debug=0xc sweettouchpoke=m:10c00640=0=10;d:100;m:10c0180c=5=f;'"), "allow")
+    add("E10 poke in a commit message", B("git commit -m 'sweettouchpoke=m:1=2=3'"), "allow")
+    # E11 (AP-42): row character class
+    add("E11 probe-run row=134[56]", B("tools/probe-run --expect 'stopped=refused at=S34 row=134[56]'"), "deny:E11")
+    add("E11 run-preflight row=(1345|134[67])", B("tools/run-preflight -- tools/probe-run --expect 'row=(1345|134[67])'"), "deny:E11")
+    add("E11 row alternatives", B("tools/probe-run --expect 'stopped=refused at=S34 row=(1345|1346)' --expect 'LINK R34 row=1340'"), "allow")
+    # E12 (AP-14): --wlan-link capture >= 600 s
+    add("E12 wlan-link --timeout 180", B("tools/probe-run --build-args '--board bluejay --wlan-link=9' --timeout 180"), "deny:E12")
+    add("E12 wlan-link --timeout 600", B("tools/probe-run --build-args '--board bluejay --wlan-link=9' --timeout 600"), "allow")
+    add("E12 wlan-link default timeout", B("tools/probe-run --build-args '--wlan-link=9'"), "allow")
+    add("E12 touch --timeout 180", B("tools/probe-run --touch-probe --timeout 180"), "allow")
+    # E13 (AP-13): bound in the host-test loop (krepo build.sh: 7 8 10)
+    add("E13 --wlan-link=9 not host-tested", B("tools/probe-run --build-args '--wlan-link=9' --expect x", cwd=krepo), "deny:E13")
+    add("E13 phone-lock run probe-run =9", B("tools/phone-lock run --owner a -- tools/probe-run --build-args \"--wlan-link=9\"", cwd=krepo), "deny:E13")
+    add("E13 abs path from other cwd =9", B(f"{krepo}/tools/probe-run --build-args --wlan-link=9", cwd=tmp), "deny:E13")
+    add("E13 --wlan-link=8 host-tested", B("tools/probe-run --build-args '--wlan-link=8' --expect x", cwd=krepo), "allow")
+    add("E13 --wlan-link=10 in bash -c", B("bash -c 'tools/probe-run --build-args --wlan-link=10'", cwd=krepo), "allow")
+    # E14 (AP-33): background run with an explicit, large enough timeout
+    add("E14 bg xrun no timeout", bg("tools/xrun --label a"), "deny:E14")
+    add("E14 bg phone-lock run no timeout", bg("tools/phone-lock run --owner a -- bash -c 'x'"), "deny:E14")
+    add("E14 bg probe-run 600 s, timeout 600 s", bg("tools/probe-run --timeout 600 --label a", timeout=600_000), "deny:E14")
+    add("E14 bg probe-run 600 s, timeout 700 s", bg("tools/probe-run --timeout 600 --label a", timeout=700_000), "allow")
+    add("E14 bg xrun default 300 s, timeout 120 s (F8)", bg("tools/xrun --label a", timeout=120_000), "deny:E14")
+    add("E14 bg probe-run wlan-link default 600 s, timeout 120 s (F8)", bg("tools/probe-run --build-args '--wlan-link=7'", timeout=120_000), "deny:E14")
+    add("E14 bg probe-run default 60 s, timeout 120 s (F8)", bg("tools/probe-run --build-args '--x'", timeout=120_000), "allow")
+    add("E14 bg --lock-wait adds to need (F8)", bg("tools/probe-run --timeout 60 --lock-wait 600 --label a", timeout=300_000), "deny:E14")
+    add("E14 bg rea-xrefs.sh no timeout (F8)", bg("tools/rea/rea-xrefs.sh abl.bin 0x1"), "deny:E14")
+    add("E14 bg xrun with timeout", bg("tools/xrun --label a", timeout=1_800_000), "allow")
+    add("E14 bg non-heavy job, no timeout", bg("python3 -m http.server"), "allow")
+    # E15 (AP-24): find /
+    add("E15 find /", B("find / -name '*objdump*' -path '*aarch64*'"), "deny:E15")
+    add("E15 find -L / in bash -c", B("bash -c 'find -L / -name x'"), "deny:E15")
+    add("E15 cd && bfs /", B("cd /tmp && bfs / -name x"), "deny:E15")
+    add("E15 find / -maxdepth 2", B("find / -maxdepth 2 -name x"), "allow")
+    add("E15 find /tmp", B("find /tmp -name x"), "allow")
+    add("E15 find / quoted", B('echo "find / -name x"'), "allow")
+    # E16 (AP-35): find .claude without prune
+    add("E16 find .claude", B("find .claude -type f | xargs wc -c"), "deny:E16")
+    add("E16 find ./.claude/", B("find ./.claude/ -name '*.md'"), "deny:E16")
+    add("E16 find .claude with prune", B("find .claude -path .claude/worktrees -prune -o -type f -print"), "allow")
+    add("E16 find .claude/skills", B("find .claude/skills -type f"), "allow")
+    add("E16 find .claude -maxdepth 2", B("find .claude -maxdepth 2 -type d"), "allow")
+    # E17 (AP-34): glob that expands to -names
+    add("E17 ls -d *pixelios*", B("ls -d *pixelios*", cwd=projs), "deny:E17")
+    add("E17 cd && du -sh *", B(f"cd {projs} && du -sh *", cwd=tmp), "deny:E17")
+    add("E17 find *pixelios* -name", B("find *pixelios* -name x", cwd=projs), "deny:E17")
+    add("E17 ls -d ./*pixelios*", B("ls -d ./*pixelios*", cwd=projs), "allow")
+    add("E17 ls -d -- *pixelios*", B("ls -d -- *pixelios*", cwd=projs), "allow")
+    add("E17 ls *.c (no - names)", B("ls *.c", cwd=tmp), "allow")
+    add("E17 find . -name '*pix*'", B("find . -name '*pix*'", cwd=projs), "allow")
+    # E18 (AP-53): grep -a on Apple sources
+    add("E18 grep Apple source", B("grep -n BTOpenPath bsd/sweet_hfs/core/BTree.c"), "deny:E18")
+    add("E18 rg xnu-pristine", B("rg BTOpenPath ~/pixelios-artifacts/xnu-pristine/bsd"), "deny:E18")
+    add("E18 cd sweet_hfs && grep", B("cd bsd/sweet_hfs/core && grep -n x BTree.c"), "deny:E18")
+    add("E18 grep -an", B("grep -an BTOpenPath bsd/sweet_hfs/core/BTree.c"), "allow")
+    add("E18 grep -I -rn", B("grep -I -rn x ~/pixelios-artifacts/xnu-pristine"), "deny:E18")
+    add("E18 grep --binary-files=without-match", B("grep --binary-files=without-match -rn x sweet_hfs"), "deny:E18")
+    add("E18 rg -I", B("rg -I x sweet_hfs"), "deny:E18")
+    add("E18 grep --binary-files=text", B("grep --binary-files=text -rn x sweet_hfs"), "allow")
+    add("E18 rg -uuu", B("rg -uuu x sweet_hfs"), "allow")
+    add("E18 pattern names sweet_hfs", B("grep -rn sweet_hfs xnu/patches"), "allow")
+    add("E18 -e sweet_hfs on our file", B("grep -n -e sweet_hfs shim/x.c"), "allow")
+    # E19 (AP-54): 7z on an iOS root image
+    add("E19 7z e root image", B("7z e -y /srv/pixelios/ios-root3-inj3.img 'iOSRoot/System/Library/xpc/launchd.plist'"), "deny:E19")
+    add("E19 7z x root image", B("7z x -o/tmp/r ios-root4.img"), "deny:E19")
+    add("E19 7z l root image", B("7z l /srv/pixelios/ios-root3-inj3.img"), "allow")
+    add("E19 7z x zip", B("7z x factory.zip"), "allow")
+    # E20 (AP-56): rea.sh loop in the foreground
+    add("E20 for loop rea.sh", B("for a in 0x1 0x2; do tools/rea/rea.sh xrefs abl.bin $a; done"), "deny:E20")
+    add("E20 xargs rea.sh", B("printf '%s\\n' 0x1 0x2 | xargs -n1 tools/rea/rea.sh xrefs abl.bin"), "deny:E20")
+    add("E20 for loop rea.sh in background", bg("for a in 0x1 0x2; do tools/rea/rea.sh xrefs abl.bin $a; done", timeout=3_600_000), "allow")
+    add("E20 one rea.sh call", B("tools/rea/rea.sh xrefs abl.bin 0x1"), "allow")
+    # E21 (AP-46): ipsw disass --quiet
+    add("E21 ipsw dyld disass --quiet", B("ipsw dyld disass --quiet --vaddr 0x1d1af5084 dsc"), "deny:E21")
+    add("E21 ipsw dyld disass with cache", B("ipsw dyld disass --vaddr 0x1d1af5084 --cache dsc/cache/x.a2s dsc"), "allow")
+    # E22 (AP-58): tool commit off trunk in the kernel repo
+    add("E22 tool commit on trunk", B("git commit -m t", cwd=kst("trunk", "trunk", staged="tools/n.py")), "allow")
+    add("E22 shared tool commit on stream", B("git commit -m t", cwd=kst("st", "boot/s1", staged="tools/probe-run")), "deny:E22")
+    add("E22 non-shared tools/ file on stream (F1)", B("git commit -m t", cwd=kst("nt", "boot/s1", staged="tools/n.py")), "allow")
+    add("E22 build.sh + shim code on stream (F1)", B("git commit -am t", cwd=kst("bs", "boot/s1", staged="shim/x.c", modified="shim/build.sh")), "allow")
+    add("E22 add docs only, unrelated modified tool (F2)", B("git add docs/x.md && git commit -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "allow")
+    add("E22 add -A with modified tool (F2)", B("git add -A && git commit -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 add other repo does not count (F2)", B(f"git -C {kst('chk2', 'boot/s1', modified='tools/check-all.sh')} add -A; git commit -m t", cwd=kst("clean", "boot/s1")), "allow")
+    add("E22 commit PATH names the tool (F3)", B("git commit -m t tools/check-all.sh", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 commit -o PATH names the tool (F3)", B("git commit -o tools/check-all.sh -m t", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 commit PATH of a doc (F3)", B("git commit -m t docs/a.md", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "allow")
+    add("E22 backslash-newline -a (F4)", B("git commit -m t \\\n -a", cwd=kst("chk", "boot/s1", modified="tools/check-all.sh")), "deny:E22")
+    add("E22 shim/build.sh -am on stream", B("git commit -am t", cwd=kst("mod", "boot/s1", modified="shim/build.sh")), "deny:E22")
+    add("E22 shim/build.sh modified, plain commit", B("git commit -m t", cwd=kst("mod", "boot/s1", modified="shim/build.sh")), "allow")
+    add("E22 add && commit on stream", B("git add tools/xrun && git commit -m t", cwd=kst("unt", "boot/s1", untracked="tools/xrun")), "deny:E22")
+    add("E22 cd kernel && commit on stream", B(f"cd {kst('st', 'boot/s1')} && git commit -m t", cwd=tmp), "deny:E22")
+    add("E22 git -C kernel commit on stream", B(f"git -C {kst('st', 'boot/s1')} commit -m t", cwd=tmp), "deny:E22")
+    add("E22 doc commit on stream", B("git commit -m t", cwd=kst("doc", "boot/s1", staged="docs/n.md")), "allow")
+    add("E22 emergency marker", B("git commit -m 'EMERGENCY-TOOL-FIX probe-run'", cwd=kst("st", "boot/s1")), "allow")
+    add("E22 concluding a merge of trunk", B("git commit --no-edit", cwd=kst("mrg", "boot/s1", staged="tools/probe-run", merge=True)), "allow")
+    add("E22 tools/<slug> branch", B("git commit -m t", cwd=kst("slug", "tools/x", staged="tools/probe-run")), "allow")
+    # E8b (AP-18): Bash writes to a shared phone tool while the lock is held
+    # the lock is still held by the E8 fixtures ("edit xrun, lock held"); the free case comes last
+    add("E8b sed -i xrun, lock held", B(f"sed -i s/a/b/ {kt}/xrun"), "deny:E8b", check=lambda: "" if lock_held()[0] else "|lock not held")
+    add("E8b cp onto probe-run", B(f"cp /tmp/x {kt}/probe-run"), "deny:E8b")
+    add("E8b cp into tools/ dir", B(f"cp /tmp/xrun {kt}"), "deny:E8b")
+    add("E8b redirect > tools/xrun", B("echo x > tools/xrun", cwd=os.path.dirname(kt)), "deny:E8b")
+    add("E8b git -C restore", B(f"git -C {os.path.dirname(kt)} restore tools/fboot.sh"), "deny:E8b")
+    add("E8b cp from xrun (source)", B(f"cp {kt}/xrun /tmp/x"), "allow")
+    add("E8b worktree copy", B(f"sed -i s/a/b/ {wt}/xrun"), "allow")
+    add("E8b heredoc body", B(f"cat > /tmp/x.sh <<'EOF'\nsed -i s/a/b/ {kt}/xrun\nEOF"), "allow")
+    add("E8b redirect 2>&1 / to /tmp", B(f"bash {kt}/xrun --dry-run > /tmp/o 2>&1"), "allow")
+    add("E8b git -C S merge, lock held (F6)", B(f"git -C {os.path.dirname(kt)} merge --no-ff wip/foo"), "deny:E8b")
+    add("E8b git -C S reset --hard, lock held (F6)", B(f"git -C {os.path.dirname(kt)} reset --hard"), "deny:E8b")
+    add("E8b git -C S pull, lock held (F6)", B(f"git -C {os.path.dirname(kt)} pull"), "deny:E8b")
+    add("E8b git -C S reset --soft (F6)", B(f"git -C {os.path.dirname(kt)} reset --soft HEAD~1"), "allow")
+    add("E8b git -C other merge (F6)", B(f"git -C {tmp} merge wip/foo"), "allow")
+    add("E8b git -C S merge, lock free (F6)", B(f"git -C {os.path.dirname(kt)} merge wip/foo"), "allow", setup=free)
+    add("E8b sed -i xrun, lock free", B(f"sed -i s/a/b/ {kt}/xrun"), "allow", setup=free)
+
+
+def main():
+    a = sys.argv[1] if len(sys.argv) > 1 else "--pre"
+    if a == "--self-test":
+        try:
+            return self_test()
+        except Exception as e:  # noqa: BLE001 - harness fault, not a rule failure
+            print("RESULT: ERROR self-test crashed: %r" % e)
+            return 2
+    try:
+        if a not in ("--pre", "--brief", "--post", "--context", "--context-nudge", "--session", "--statusline"):
+            return 0
+        out = decide(a, json.load(sys.stdin))
+        if out:
+            print(out)
+    except Exception:  # noqa: BLE001 - fail open
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

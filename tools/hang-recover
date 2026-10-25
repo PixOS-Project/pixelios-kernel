@@ -72,13 +72,18 @@ S
 exit 1
 S
 	chmod +x "$d"/lsusb "$d"/adb "$d"/fastboot "$d"/ping
+	# TP-020: `phone goto` needs the phone lock; the test holds its own in a temp dir (never the real lock)
+	PHONE_LOCK_DIR="$d/lock" "$(dirname "$self")/phone-lock" acquire --owner hr-test --token hr-token --pid $$ >/dev/null || return 1
 	chk() { # name rc grep-pattern seq args...
 		local n=$1 erc=$2 pat=$3 seq=$4 out rc; shift 4; rm -f "$d/n" "$d/cur" "$d/fb"
-		out=$(env PATH="$d:$PATH" HS_DIR="$d" HS_SEQ="$seq" HR_POLL=0.2 PS_TMO=2 "$self" "$@" 2>&1); rc=$?
+		out=$(env PHONE_LOCK_DIR="$d/lock" PHONE_LOCK_TOKEN=hr-token PATH="$d:$PATH" HS_DIR="$d" HS_SEQ="$seq" HR_POLL=0.2 PS_TMO=2 "$self" "$@" 2>&1); rc=$?
 		if [ $rc = "$erc" ] && echo "$out" | grep -q -- "$pat" && ! echo "$out" | grep -q SECRET; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
 	}
-	chk already-fastboot 0 'RESULT: PASS state=fastboot after [01]s' "fastboot" --wait 5
+	# count lsusb polls (stub counter $d/n), not wall-clock seconds: whole-second $SECONDS flaked under load (AP-21)
+	chk already-fastboot 0 'RESULT: PASS state=fastboot after' "fastboot" --wait 5
+	polls=$(cat "$d/n" 2>/dev/null || echo 0)
+	[ "$polls" -ge 1 ] && [ "$polls" -le 3 ] && echo "ok   already-fastboot polls=$polls" || { echo "FAIL already-fastboot polled lsusb $polls times (want 1..3)"; fail=1; }
 	chk recovery-then-fb 0 'RESULT: PASS state=fastboot' "recovery" --wait 30
 	chk absent-then-back 0 'RESULT: PASS state=fastboot after' "absent absent absent absent absent fastboot" --wait 30
 	chk expect-recovery  0 'RESULT: PASS state=recovery' "absent recovery" --wait 30 --expect recovery
