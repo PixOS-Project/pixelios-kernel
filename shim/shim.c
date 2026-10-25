@@ -605,7 +605,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 #endif
 #ifdef WLAN_HOLD
 	/* --boot-xnu --wlan-hold (docs/research/42 section 7): power PCIe1 + the BCM4389 up to the end of S30 with the audited table interpreter and LEAVE the link up for the XNU driver.
-	 * wlan_link_hold() skips the teardown only when S00..S30 all ran ok; on any failure it tears down (restore=ok|FAILED) and XNU boots anyway. No new writer here. */
+	 * wlan_link_hold() skips the teardown only when steps 0 to the hold step all ran ok; on any failure it tears down (restore=ok|FAILED) and XNU boots anyway. No new writer here. */
 	con_str("SECTION", "WLAN link hold");
 	(void)wlan_link_hold();
 	pstore_save();

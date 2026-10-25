@@ -2284,7 +2284,7 @@ int main(void)
 	world(); freq = 1000000;					/* a slow counter does not turn the wait into a hang: still <= 4800 polls */
 	EXPECT(wlan_link_run() == 0 || l0_polls <= 4800u);
 #endif
-#if WLAN_LINK_N == 30
+	if (WLAN_LINK_N == 30)
 	/* ---- --wlan-hold (wlan_link_hold, research 42 section 7): at N = S30 the teardown is skipped on success, run on any failure ---- */
 	{
 		static struct { int t; uintptr_t pa; uint32_t v; } ref[800];
@@ -2318,10 +2318,10 @@ int main(void)
 		world(); freq = 0;									/* no timer: refused before any write, as the normal run */
 		EXPECT(wlan_link_hold() == 2 && nwrites == 0 && has("no timer") && !has("restore=held"));
 	}
-#else
+	else {
 	world();											/* N != S30: the hold is refused, nothing runs */
 	EXPECT(wlan_link_hold() == 2 && nwrites == 0 && nev == 0 && has("hold refused") && !has("LINK table") && !has("restore="));
-#endif
+	}
 	puts("PASS wlanlink host test N=" WLAN_LINK_N_STR);
 	return 0;
 }
