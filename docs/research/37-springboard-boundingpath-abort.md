@@ -61,7 +61,7 @@ All [obs-RE] from UIKitCore (`ipsw dyld disass CACHE --image UIKitCore`), symbol
 * `KEYFORMAT` = tokens 12 (scale), 15 (idiom), 17 (identifier), 1 (element), 2 (part): every rendition is idiom 1 (phone) except one `-A` iPad entry
   with idiom 0. So a lookup that carries a wrong/empty idiom or subtype cannot match. [obs-RE; mapping of token numbers to names is from my memory of
   CoreUI's `kCRThemeXxxName` enum: **guess**]
-* In OUR images: `docs`-recorded listing `/tank/pixelios/cmp2/LISTING.0` (image `ios-root-rootless2.img`, same tools/plan as ios-root3) lists
+* In OUR images: `docs`-recorded listing `<tank>/pixelios/cmp2/LISTING.0` (image `ios-root-rootless2.img`, same tools/plan as ios-root3) lists
   `./System/Library/PrivateFrameworks/UIKitCore.framework/BoundingPathData.bundle/{Assets.car,BoundingPathData,Info.plist,_CodeSignature/...}`
   (mode 644 root). [obs] The root plan does not prune anything: `pixelios-userland/tools/ios-root-plan.py` only adds cryptex links, the dyld cache link and the
   sweet tweaks (header docstring lines 1-20); grep for `UIKitCore|PrivateFrameworks|exclude|prune` finds no filter. [src]

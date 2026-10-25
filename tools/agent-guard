@@ -1702,9 +1702,9 @@ def ap_fixtures(add, B, tmp, kt, free):
     add("E18 pattern names sweet_hfs", B("grep -rn sweet_hfs xnu/patches"), "allow")
     add("E18 -e sweet_hfs on our file", B("grep -n -e sweet_hfs shim/x.c"), "allow")
     # E19 (AP-54): 7z on an iOS root image
-    add("E19 7z e root image", B("7z e -y /tank/pixelios/ios-root3-inj3.img 'iOSRoot/System/Library/xpc/launchd.plist'"), "deny:E19")
+    add("E19 7z e root image", B("7z e -y /srv/pixelios/ios-root3-inj3.img 'iOSRoot/System/Library/xpc/launchd.plist'"), "deny:E19")
     add("E19 7z x root image", B("7z x -o/tmp/r ios-root4.img"), "deny:E19")
-    add("E19 7z l root image", B("7z l /tank/pixelios/ios-root3-inj3.img"), "allow")
+    add("E19 7z l root image", B("7z l /srv/pixelios/ios-root3-inj3.img"), "allow")
     add("E19 7z x zip", B("7z x factory.zip"), "allow")
     # E20 (AP-56): rea.sh loop in the foreground
     add("E20 for loop rea.sh", B("for a in 0x1 0x2; do tools/rea/rea.sh xrefs abl.bin $a; done"), "deny:E20")
