@@ -54,3 +54,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-027 | tools/devsh + org.pixelios.devd | approved (amended) |
 | TP-028 | tools/check-all.sh (gate speed + reliability) | approved (amended) |
 | TP-029 | tools/physmem-dev (range-guarded phys-mem device + client over TP-027 devsh) | proposed (amended) |
+| TP-030 | tools/check_rules/r30_license.py (rule R30 of tools/check-rules.py) | building |
