@@ -18,12 +18,12 @@ Scope: every Wi-Fi component in this tree, its origin and licence, and what is n
 ## Rules (plan section 3)
 
 1. Port boundary: only OpenBSD bwfm files (`bwfm.c`, `bwfmreg.h`, `bwfmvar.h`, `if_bwfm_pci.c`, `if_bwfm_pci.h`) and, if needed, OpenBSD net80211 / `sys/dev/pci` helpers may be translated, each checked for ISC or BSD in its own header first. Pin the OpenBSD revision (`v1.118` style) in the header. Files with translated code carry the full ISC block plus "Modifications (c) 2026 PixOS-Project contributors, ISC".
-2. Never copy text, comments or function structure from DHD/bcmdhd (`Broadcom-WL-IPTag` files, GPL-2.0 in the copy we read), Linux `bcma`/`bcma_regs.h` (GPL-2.0), `pci_regs.h`, `pcie-exynos*`, `dwc-whi`, `cal.c`, HackiOS (APSL / PolyForm-NC for parts), ios-topaz / ios-sailfish (no licence). Linux brcmfmac core files are ISC (SPDX) but bwfm is the single template so each file has one provenance.
+2. Never copy text, comments or function structure from DHD/bcmdhd (the files with a Broadcom WL IP tag, GPL-2.0 in the copy we read), Linux `bcma`/`bcma_regs.h` (GPL-2.0), `pci_regs.h`, `pcie-exynos*`, `dwc-whi`, `cal.c`, HackiOS (APSL / a non-commercial licence for parts), ios-topaz / ios-sailfish (no licence). Linux brcmfmac core files are ISC (SPDX) but bwfm is the single template so each file has one provenance.
 3. A register offset or bit value cited from a GPL file is a fact: write it as our own `#define` with a cite, never a copied block. Prefer the bwfm / brcmfmac (ISC) cite when the same constant is there.
 4. Firmware (`fw_bcmdhd.bin`), NVRAM and CLM come from the user's own phone at install time. Never in git, never in CI artifacts (hard rule 4). linux-firmware's Broadcom licence allows redistribution [guess]; we still do not ship it. No Apple binaries or IPSW contents either.
 5. The copyright lines "Broadcom Corporation" and "Patrick Wildt" are allowed only in files tagged ISC in the licence map.
 
-Source licences as read in the research copies (plan section 3, [obs] there, not re-read for this doc): OpenBSD bwfm ISC; Linux brcmfmac `SPDX-License-Identifier: ISC` (`refs/wlan-stage3/brcmfmac-chip.h:1`); `bcma_regs.h` GPL-2.0 (`:1`); DHD `aiutils.c` GPL-2.0 / Broadcom dual (`refs/wlan-stage2/aiutils.c:5-10`).
+Source licences as read in the research copies (plan section 3, [obs] there, not re-read for this doc): OpenBSD bwfm ISC; Linux brcmfmac an SPDX ISC tag (`refs/wlan-stage3/brcmfmac-chip.h:1`); `bcma_regs.h` GPL-2.0 (`:1`); DHD `aiutils.c` GPL-2.0 / Broadcom dual (`refs/wlan-stage2/aiutils.c:5-10`).
 
 ## Pending swaps (Wi-Fi stream; this doc does not touch the code)
 
