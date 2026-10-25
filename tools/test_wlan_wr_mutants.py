@@ -1,4 +1,4 @@
-"""Mutation test of the stage-3 chip writer in xnu patch 0125 (bsd/dev/sweet_wlan_wr.h, W-D3 step 2, docs/research/43 s.3).
+"""Mutation test of the stage-3 chip writer in xnu patch 0130 (bsd/dev/sweet_wlan_wr.h, W-D3 step 2, docs/research/43 s.3).
 
 Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in a copy of the header (every occurrence of the pattern), the host test
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
@@ -13,8 +13,8 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATCH0120 = os.path.join(ROOT, "xnu", "patches", "0120-sweet-wlan-bwfm-core.patch")
-PATCH0125 = os.path.join(ROOT, "xnu", "patches", "0125-sweet-wlan-chip-writes.patch")
+PATCH0120 = os.path.join(ROOT, "xnu", "patches", "0128-sweet-wlan-bwfm-core.patch")
+PATCH0125 = os.path.join(ROOT, "xnu", "patches", "0130-sweet-wlan-chip-writes.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
 
 
@@ -114,7 +114,7 @@ MUTANTS = [
     ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\treturn swl_stop(x, SWW_E_RD);")], None),
     ("done bit not recorded", [("\tx->done |= 1u << t;\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
-    # --- the 0120 preconditions inside swl_wpre
+    # --- the 0128 preconditions inside swl_wpre
     ("link precondition dropped", [("bad = swl_pre_link(iso, ltssm, a0, a1);", "bad = 0;")], None),
     ("endpoint precondition dropped", [("bad = swl_pre_ep(cmd, b0, b1);", "bad = 0;")], None),
     ("region 2 not pinned once enabled", [("if (x->flags & SWF_W2) {", "if (0) {")], None),
@@ -237,7 +237,7 @@ def run_all():
 
 
 def glue_added_lines():
-    """The lines patch 0125 adds to bsd/dev/sweet_wlan.c."""
+    """The lines patch 0130 adds to bsd/dev/sweet_wlan.c."""
     out, on = [], False
     with open(PATCH0125, encoding="utf-8") as fh:
         for line in fh.read().split("\n"):
@@ -248,7 +248,7 @@ def glue_added_lines():
             elif on and line.startswith("+") and not line.startswith("+++"):
                 out.append(line[1:])
     if not out:
-        raise ValueError("patch 0125 adds nothing to bsd/dev/sweet_wlan.c")
+        raise ValueError("patch 0130 adds nothing to bsd/dev/sweet_wlan.c")
     return "\n".join(out) + "\n"
 
 

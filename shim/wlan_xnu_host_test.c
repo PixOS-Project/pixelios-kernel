@@ -1,4 +1,4 @@
-/* Host replay test of the stage-1 chip layer in xnu patch 0120 (sweet_wlan_chip.h, extracted from the patch by build.sh): the values observed
+/* Host replay test of the stage-1 chip layer in xnu patch 0128 (sweet_wlan_chip.h, extracted from the patch by build.sh): the values observed
  * on the Pixel 6a by the shim runs w3a-n30/n31/n32b/n33 (BCM4389 rev 3, ChipCommon rev 70) are the fake chip; the guard is the one the XNU glue applies. */
 #include <stdio.h>
 #include <string.h>

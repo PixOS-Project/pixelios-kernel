@@ -1,4 +1,4 @@
-SWEET WLAN firmware container check (patch 0124, W-D3 step 1): no hardware access. When boot-arg sweetwlan= and the ADT /sweet-wlan node are present,
+SWEET WLAN firmware container check (patch 0129, W-D3 step 1): no hardware access. When boot-arg sweetwlan= and the ADT /sweet-wlan node are present,
 sweet_wlan_init() looks for /chosen/memory-map WLANFW <pa, size> (tools/mkpayload.py --wlanfw, container from tools/pack_wlanfw.py), reads it through
 ml_static_ptovirt, verifies magic/version/offsets/CRC32 of every entry with the pure header bsd/dev/sweet_wlan_fw.h (host test shim/wlan_fw_host_test.c)
 and prints one line per entry plus a summary. Nothing is written or copied; the chip is not touched.
