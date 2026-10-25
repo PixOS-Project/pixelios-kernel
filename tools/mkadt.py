@@ -325,7 +325,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
                 [(p, u32(n(b[k]))) for p, k in bits] + top)
     touch = touch_node() if 'touch_chip_id' in config and not qemu else None
 
-    # bsd/dev/sweet_wlan.c (patches 0128, 0130): the BCM4389 behind the PCIe1 link the shim left up (--wlan-hold). All addresses come from soc.json
+    # bsd/dev/sweet_wlan.c (patches 0124, 0129): the BCM4389 behind the PCIe1 link the shim left up (--wlan-hold). All addresses come from soc.json
     # wlan (sources cited there): reg = BAR0 ATU window (mem, 64 KiB), cfg = endpoint config space, atu = DBI ATU block, elbi = PCIe1 ELBI (link state), pmu-iso = PHY isolation word.
     # Only boards whose soc.json has a wlan block with mem/cfg get the node; the driver additionally refuses addresses other than the pinned ones.
     w = config.get('wlan')
@@ -338,7 +338,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         ('elbi', u64(int(w['elbi'], 0), 0x2000)),
         ('pmu-iso', u64(int(w['pmu_pcie1_iso'], 0), 4)),
     ] + (
-        # xnu patch 0130 (W-D3 step 2, docs/research/43): tcm = BAR2 (the chip's 4 MiB backplane window, CPU range), atu-r2-off = outbound iATU region 2
+        # xnu patch 0129 (W-D3 step 2, docs/research/43): tcm = BAR2 (the chip's 4 MiB backplane window, CPU range), atu-r2-off = outbound iATU region 2
         # inside the atu block. The driver pins both, like the five above, and refuses any other value.
         [('tcm', u64(int(w['tcm'], 0), int(w['tcm_bytes'], 0))), ('atu-r2-off', u32(int(w['atu_r2_off'], 0)))]
         if all(k in w for k in ('tcm', 'tcm_bytes', 'atu_r2_off')) else [])

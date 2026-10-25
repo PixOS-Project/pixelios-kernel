@@ -1,4 +1,4 @@
-SWEET WLAN stage 1 (patch 0128): READ-ONLY attach of the BCM4389 from inside XNU (docs/research/42, W-D2). Inert unless boot-arg sweetwlan=1|2 AND ADT /sweet-wlan
+SWEET WLAN stage 1 (patch 0124): READ-ONLY attach of the BCM4389 from inside XNU (docs/research/42, W-D2). Inert unless boot-arg sweetwlan=1|2 AND ADT /sweet-wlan
 (tools/mkadt.py, bluejay only) AND the PCIe1 link left up by the shim flavor --wlan-hold. bsd/dev/sweet_wlan_chip.h = OpenBSD bwfm.c EROM walk (ISC) + the
 BAR0 read allowlist of shim/wlanlink.c mem_ok(); bsd/dev/sweet_wlan.c = ADT/precheck/mapping glue. The only write is the BAR0 window select (cfg 0x80).
 Host test: shim/wlan_xnu_host_test.c. Hardware-reading path: reviewed in docs/reviews (see the commit).
@@ -238,7 +238,7 @@ new file mode 100644
 + * refused read ends the walk); a bus read can fail; no write of any kind (set_passive, reset, ramsize bank select are not ported).
 + * The read allowlist is the one of shim/wlanlink.c mem_ok() (S30..S33, reviews 13, 16) plus ChipCommon capabilities (0x04) and the three
 + * D11 wrappers (research 42 section 7, drafted read_only rows). The firmware-boot stages add their own entries with their own review.
-+ * Everything here is host-tested (shim/wlan_xnu_host_test.c includes this file as extracted from patch 0128 by shim/build.sh).
++ * Everything here is host-tested (shim/wlan_xnu_host_test.c includes this file as extracted from patch 0124 by shim/build.sh).
 + */
 +#ifndef SWEET_WLAN_CHIP_H
 +#define SWEET_WLAN_CHIP_H

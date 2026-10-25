@@ -1,6 +1,6 @@
-SWEET WLAN stage 3 run A (patch 0130, W-D3 step 2, docs/research/43 rows W0..W7): the first chip WRITES from inside XNU, behind boot-arg sweetwlan=3 (stage 1 runs at level 2 first;
-levels 1-2 are byte-identical to 0128/0129). Pure header bsd/dev/sweet_wlan_wr.h: deny-by-default tuple table swl_wt[] (+ read table swl_rt[], restore table swl_rs[]), the one writer swl_wr()
-(level/predecessor/phase gate, the 0128 preconditions re-read, live window, old and companion value, store, read-back under the tuple's mask, STOP latch + restore of the armed group),
+SWEET WLAN stage 3 run A (patch 0129, W-D3 step 2, docs/research/43 rows W0..W7): the first chip WRITES from inside XNU, behind boot-arg sweetwlan=3 (stage 1 runs at level 2 first;
+levels 1-2 are byte-identical to 0124/0128). Pure header bsd/dev/sweet_wlan_wr.h: deny-by-default tuple table swl_wt[] (+ read table swl_rt[], restore table swl_rs[]), the one writer swl_wr()
+(level/predecessor/phase gate, the 0124 preconditions re-read, live window, old and companion value, store, read-back under the tuple's mask, STOP latch + restore of the armed group),
 the run-A steps: entry state, outbound iATU region 2 over BAR2 (4 MiB) + its ml_io_map, SRPWR READ-ONLY check, SYS_MEM wrapper reset, 21 bank reads for the RAM size, CA7 halt, two BAR2 reads.
 No image copy, no NVRAM, no ARM release: later runs are more rows in the tables. sweet_wlan.c glue: sw3_rd/sw3_wr (the one store, called only through swl_store()), needs ADT /sweet-wlan tcm and
 atu-r2-off (tools/mkadt.py, soc.json wlan.tcm/tcm_bytes/atu_r2_off). Host test: shim/wlan_wr_host_test.c, mutants: tools/test_wlan_wr_mutants.py. HW-WRITE path: NOT reviewed yet.
@@ -16,7 +16,7 @@ index 277e201..4934fe3 100644
 - * windows swl_win_ok() names (cfg 0x80 is left on the last one and the held link is not torn down: a writing stage must not assume either); the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written: no reset, no set_passive.
 + * windows swl_win_ok() names (cfg 0x80 is left on the last one and the held link is not torn down: a writing stage must not assume either); the chip logic is sweet_wlan_chip.h (OpenBSD bwfm.c, ISC). Nothing else is written at levels 1-2: no reset, no set_passive.
 + *
-+ * Patch 0130 (W-D3 step 2, docs/research/43): sweetwlan=3 runs stage 1 at level 2 and then run A of stage 3, the first chip WRITES (sweet_wlan_wr.h: ATU region 2 over BAR2,
++ * Patch 0129 (W-D3 step 2, docs/research/43): sweetwlan=3 runs stage 1 at level 2 and then run A of stage 3, the first chip WRITES (sweet_wlan_wr.h: ATU region 2 over BAR2,
 + * SYS_MEM reset, bank reads, CA7 halt, two BAR2 reads). Every store of stage 3 is sw3_wr(), called only through swl_wr()/swl_restore() of that header; levels 1-2 are unchanged.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -60,7 +60,7 @@ index 277e201..4934fe3 100644
 +	return 1;
 +}
 +
-+/* Stage 3 (patch 0130) bus: the mapped pages of stage 1 plus BAR2 once swl_w2() asks for it. Reads and stores are refused outside the pages and the spaces swl_wt[]/swl_rt[] name. */
++/* Stage 3 (patch 0129) bus: the mapped pages of stage 1 plus BAR2 once swl_w2() asks for it. Reads and stores are refused outside the pages and the spaces swl_wt[]/swl_rt[] name. */
 +static volatile uint32_t *
 +sw3_ptr(struct sw_hw *h, int space, uint32_t off)
 +{
@@ -223,7 +223,7 @@ index 0000000..e7cef47
 + * .run and a step function, the checks in swl_wr() do not change.
 + *
 + * swl_wr() checks, in this order: not stopped, tuple exists (space, window, offset, value), run <= level - 2, tuple not consumed,
-+ * predecessor done, phase flags set, bank rule state, the 0128 preconditions re-read (link L0, ATU r0/r1/r2, EP Command, BAR0),
++ * predecessor done, phase flags set, bank rule state, the 0124 preconditions re-read (link L0, ATU r0/r1/r2, EP Command, BAR0),
 + * the live BAR0 window equals the tuple's, old value read and not all-ones, old/companion conditions; then it writes and reads back
 + * under the tuple's mask. Any failure latches STOPPED, runs the restore of the armed groups and returns a negative code.
 + */
@@ -479,7 +479,7 @@ index 0000000..e7cef47
 +	return 0;
 +}
 +
-+/* The 0128 preconditions, re-read: PHY isolation, link L0, ATU r0/r1 (and r2 once enabled), EP Command MEM-only, BAR0. 0 = ok. */
++/* The 0124 preconditions, re-read: PHY isolation, link L0, ATU r0/r1 (and r2 once enabled), EP Command MEM-only, BAR0. 0 = ok. */
 +static inline int
 +swl_wpre(struct swl_wx *x)
 +{

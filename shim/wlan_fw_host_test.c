@@ -1,4 +1,4 @@
-/* Host test of the firmware container parser (xnu patch 0129, bsd/dev/sweet_wlan_fw.h): synthetic blobs only, never the real firmware. */
+/* Host test of the firmware container parser (xnu patch 0128, bsd/dev/sweet_wlan_fw.h): synthetic blobs only, never the real firmware. */
 #include <stdio.h>
 #include <string.h>
 #include "sweet_wlan_fw.h"

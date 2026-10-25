@@ -1,4 +1,4 @@
-/* Host replay + fault-injection test of the stage-3 chip WRITER in xnu patch 0130 (sweet_wlan_wr.h, extracted from the patch by build.sh), docs/research/43.
+/* Host replay + fault-injection test of the stage-3 chip WRITER in xnu patch 0129 (sweet_wlan_wr.h, extracted from the patch by build.sh), docs/research/43.
  * The fake bus holds the values observed on the Pixel 6a (EP Command 0x00100002, BAR2 0x60400004, cfg 0x88 0x00080080, ELBI 0x0300a911, ATU r0/r1 of
  * run wd2-2, SRPWR 0x00030300, SYS_MEM coreinfo 0x115, wrapper IOCTL 0 / RESET_CTL 1 / RESET_ST 0); bank sizes and the two BAR2 words are chosen by the test.
  * Every guard rule of swl_wr() has a case that fails when the rule is removed: tools/test_wlan_wr_mutants.py removes each one from the header and requires this
@@ -723,7 +723,7 @@ static void steps(void)
 		x.stopped = 0;
 		CHECK(swl_w7(&x) < 0 && x.stop_code == SWW_E_STATE);
 	}
-	/* link not in L0 / region 1 changed after the run began: the next store refuses (the 0128 preconditions are live, not cached) */
+	/* link not in L0 / region 1 changed after the run began: the next store refuses (the 0124 preconditions are live, not cached) */
 	{
 		struct swl_wbus b;
 
