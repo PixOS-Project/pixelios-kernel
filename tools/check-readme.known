@@ -1,6 +1,5 @@
 # Findings on the current READMEs that are known and not fixed yet (dated allowlist, tools/check-readme.py).
 # Columns (TAB): file, rule, message, date, reason. An entry that no longer matches a finding fails the gate: delete it when the README is fixed.
-README.md	link	broken relative link: assets/icon.svg	2026-10-24	README not fixed yet
 README.md	works	claim without date or "observed": The shim runs on an unlocked Pixel 6a and logs to 	2026-10-24	README not fixed yet
 README.md	works	claim without date or "observed": UFS cold re-init after the bootloader shuts the co	2026-10-24	README not fixed yet
 README.md	works	claim without date or "observed": **USB network log** from the running iOS: the phon	2026-10-24	README not fixed yet
@@ -11,4 +10,3 @@ README.md	path	backticked path does not exist: tools/build-ios-root.sh	2026-10-2
 xnu/patches-archive/README.md	path	backticked path does not exist: bsd/dev/sweet_keys.c	2026-10-24	README not fixed yet
 xnu/patches-archive/README.md	path	backticked path does not exist: bsd/dev/sweet_touch.c	2026-10-24	README not fixed yet
 xnu/patches-archive/README.md	path	backticked path does not exist: docs/HANDOFF.md	2026-10-24	README not fixed yet
-README.md	path	fenced path does not exist: docs/CREDITS.md	2026-10-25	README not fixed yet (K2)

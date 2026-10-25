@@ -5,8 +5,6 @@ logs/
 tools/third_party/
 __pycache__/
 *.pyc
-# fetched by tools/setup-upstream.sh (not ours, not redistributed)
-/.upstream/
 # device dumps: persist/modemst/fsg hold IMEI + calibration; the live device tree holds the serial
 backup/
 dtb/
