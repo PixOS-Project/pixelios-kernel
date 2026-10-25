@@ -7,7 +7,7 @@ Input: the `LINK R3x row=<id> rd=0x<8 hex>` lines of the run (a file, or a direc
 through the table (logged MEM rows of steps 34..36; the window is the last cfg 0x80 write before the row). Register layout: PCIe core powerctl at +0x1E8 (include_pcie_core.h:296; PowerOnRequest [11:8], ExtPwrStatus [19:16], PowerDomain id [31:28],
 include_sbchipc.h:5199-5209), AI wrapper IOCTL 0x408 / RESET_CTL 0x800 / RESET_ST 0x804 (aidmp.h:168,175,176), SYS_MEM coreinfo +0, bankidx +0x10, bankinfo +0x40 (g4389 include_sbsysmem.h:166-167).
 Steps present are decided by the summary (`reached=Snn`); each step has its checks (PASS/FAIL, research 40 s.3/s.4):
-  S34  P1 powerctl before: PowerDomain id [31:28] != 0 and not all ones (U-N3: the PCIe core page + 0x1E8 is the SRPWR register DHD reaches via BAR0+0x2000+0x1E8); P2 powerctl after: request bit 9 (0x200) latched AND ExtPwrStatus bit 17 (0x20000) = domain 1 up; the status
+  S34  P1 powerctl before: PowerDomain id [31:28] != 0 (or, when the run logged `LINK S34 skip: SRPWR request`, bits 17 and 9 already set) and not all ones (U-N3: the PCIe core page + 0x1E8 is the SRPWR register DHD reaches via BAR0+0x2000+0x1E8); P2 powerctl after: request bit 9 (0x200) latched AND ExtPwrStatus bit 17 (0x20000) = domain 1 up; the status
        before the request is printed (U-N4, polarity, informative).
   S35  W1 SYS_MEM IOCTL after the reset sequence & 0x3FFF == 0x1 (CLK, FGC dropped); W2 RESET_CTL & 1 == 0; W3 RESET_ST == 0 (the up gate, same three tests as the table's one-shot gate rows); C1 coreinfo is not all ones; C2 nrb == 0 and nb >= 1 with the DHD rev < 12 masks
        (nb = coreinfo & 0x1F, nrb = (coreinfo & 0x3E0) >> 5; the brcmfmac decode (coreinfo & 0xF0) >> 4 is printed for comparison, U-N2); B1 bankidx reads back 0; B2 bankinfo is not all ones, bank 0 size = 8192 * ((bankinfo & 0x7F) + 1) is printed with the uniform-bank
@@ -70,7 +70,7 @@ def word_text(label, v, win):
     return ""
 
 
-def check(vals, rows, summary, notes):
+def check(vals, rows, summary, notes, skipped=False):
     """vals: row id -> word. Returns (lines, results) with results = list of (name, ok, text)."""
     by = {}
     for i, st, w, o, label, ph in rows:
@@ -88,7 +88,8 @@ def check(vals, rows, summary, notes):
 
     if reached >= 34:
         b, a = g(34, 0x18001000, 0x1E8, "before"), g(34, 0x18001000, 0x1E8, "after")
-        add("P1 powerctl before: domain id != 0, not all ones (U-N3)", b is not None and b != ALL1 and (b >> 28) & 0xF != 0, f"{b:#010x}: {powerctl_text(b)}" if b is not None else "no row")
+        up = b is not None and b & 0x20200 == 0x20200
+        add("P1 powerctl before: domain id != 0, or (skip line logged) bits 17 and 9 already up, not all ones (U-N3, review 18)", b is not None and b != ALL1 and ((b >> 28) & 0xF != 0 or (skipped and up)) and (up or not skipped), f"{b:#010x}: {powerctl_text(b)}" if b is not None else "no row")
         if b is not None:
             lines.append(f"     U-N4: ExtPwrStatus bit 17 BEFORE the request = {int(bool(b & 0x20000))} (informative)")
         add("P2 powerctl after: request bit 9 latched and status bit 17 up", a is not None and a != ALL1 and bool(a & 0x200) and bool(a & 0x20000), f"{a:#010x}: {powerctl_text(a)}" if a is not None else "no row")
@@ -162,7 +163,7 @@ def main(argv=None):
     sm = SUM_RE.findall(text)
     summary = sm[-1] if sm else None
     notes = {r["id"]: r.get("note", "") for r in doc["rows"]}
-    lines, res = check(vals, rows, summary, notes)
+    lines, res = check(vals, rows, summary, notes, "LINK S34 skip: SRPWR request" in text)
     print("\n".join(lines))
     for nm, ok, txt in res:
         print(f"{'PASS' if ok else 'FAIL'} {nm}: {txt}")

@@ -77,7 +77,7 @@ static int s33_mode, win_fault_v, win_ign_v, win_lat_v, clobber33, fault33;	/* S
 static unsigned mem_illegal, s33_reads, core_reads;	/* BAR0 reads that the test's own (independent) allowlist does not know / reads in the S33 windows / reads of the SYS_MEM core page */
 /* S34..S36 (research 40): the register model of the three cores behind BAR0. Writes are checked by the TEST'S OWN spec (spec_memw, a data table, independent of memw_ok); mem_illegal_w counts writes it rejects (must stay 0) */
 static uint32_t cp_powerctl, sm_io, sm_rc, sm_rs, arm_io, arm_rc, arm_rs, sm_coreinfo, sm_bankidx, sm_bankinfo;
-static unsigned srpwr_cnt, srpwr_after, mem_wr_n, mw_n, mem_illegal_w, mem_wr_unready, mw_log[16];
+static unsigned pc_reads, srpwr_cnt, srpwr_after, mem_wr_n, mw_n, mem_illegal_w, mem_wr_unready, mw_log[16];
 static int chip_mode, mw_kind;	/* chip_mode (N >= 34): 1 SRPWR status never set, 2 SYS_MEM RESET_CTL release does not take, 3 SYS_MEM IOCTL write does not take, 4 RESET_ST stuck 1 after the assert, 5 coreinfo all ones, 6 coreinfo nrb = 1, 7 coreinfo nb = 0, 8 ARM RESET_CTL release does not take, 9 ARM IOCTL write does not take, 10 SYS_MEM IOCTL keeps FGC on the final write, 11 SYS_MEM RESET_ST stuck 1 from the start, 12 powerctl dead (all ones), 13 SRPWR already on, 14 powerctl PowerDomain id [31:28] = 0 (no SRPWR capability); mw_kind: 1 = the mw_n-th BAR0 write is swallowed, 2 = it stores a wrong value */
 static unsigned link_dead_after;	/* review 13 L3: after this many EROM reads every config read answers all ones (link down mid-dump); 0 = off */
 static uint64_t freq, tick, waited_us;
@@ -153,7 +153,7 @@ static void chip_reset(void)
 {
 	cp_powerctl = 0; sm_io = arm_io = 0; sm_rc = arm_rc = 1; sm_rs = arm_rs = 0;	/* observed run w3a-n33: IOCTL 0, RESET_CTL 1, RESET_ST 0 */
 	sm_coreinfo = 0x00000005u; sm_bankidx = 0x3u; sm_bankinfo = 0x00000007u;	/* FAKE: nb = 5, nrb = 0, bankidx not 0 at start, bank size (7 + 1) * 8 KiB */
-	srpwr_cnt = 0; srpwr_after = 3; mem_wr_n = 0; mw_n = 0; mw_kind = 0; mem_illegal_w = mem_wr_unready = 0; chip_mode = 0;
+	pc_reads = 0; srpwr_cnt = 0; srpwr_after = 3; mem_wr_n = 0; mw_n = 0; mw_kind = 0; mem_illegal_w = mem_wr_unready = 0; chip_mode = 0;
 	memset(mw_log, 0, sizeof mw_log);
 }
 
@@ -168,7 +168,7 @@ static uint32_t chip_get(uint32_t win, uint32_t off)	/* the model's register val
 	if (win == 0x18126000u)
 		return off == 0x408u ? sm_io : off == 0x800u ? (s33_mode == 5 ? sm_rc | 0x100u : sm_rc) : (chip_mode == 11 ? 1u : sm_rs);
 	if (win == 0x18001000u)
-		return chip_mode == 12 ? 0xFFFFFFFFu : chip_mode == 15 ? 0x00030300u : chip_mode == 16 ? 0x00020000u : chip_mode == 17 ? 0x00000200u : chip_mode == 18 ? 0x30030300u : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
+		return chip_mode == 12 ? 0xFFFFFFFFu : chip_mode == 15 ? 0x00030300u : chip_mode == 16 ? 0x00020000u : chip_mode == 17 ? 0x00000200u : chip_mode == 18 ? 0x30030300u : chip_mode == 19 ? (pc_reads <= 1u ? 0x00030300u : 0x00010300u) : chip_mode == 20 ? (pc_reads <= 1u ? 0x00030300u : 0x00020100u) : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
 	return off == 0u ? sm_coreinfo : off == 0x10u ? sm_bankidx : sm_bankinfo;
 }
 
@@ -191,6 +191,8 @@ static int spec_memw(uint32_t win, uint32_t off, uint32_t old, uint32_t v, uint3
 
 static uint32_t s33_val(uint32_t win, uint32_t off)	/* a BAR0 read: side effects (the SRPWR status follows the reads of powerctl) and the S35 coreinfo knobs */
 {
+	if (win == 0x18001000u)
+		pc_reads++;
 	if (win == 0x18001000u && (cp_powerctl & 0x200u))
 		srpwr_cnt++;
 	if (win == 0x18026000u && off == 0u)
@@ -2058,10 +2060,16 @@ int main(void)
 		teardown_tail_is_table_order(34);
 		baseline_restored();
 		world(); chip_mode = 15;					/* S34 skip (the run w3a-n34 state 0x00030300: id 0, SRPWR domain 1 already requested and up): the request is skipped, NOT written, the read-back and the status wait pass, the run is clean */
-		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("LINK R34 row=1348 rd=") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
 		baseline_restored();
 		world(); chip_mode = 18;					/* the same with PowerDomain id 3: skipped too */
-		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("LINK R34 row=1348 rd=") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 19;					/* review 18 finding 1: after the skip the status wait still runs against the live register: bit 17 drops after the log row -> timeout at row 1347, nothing written */
+		EXPECT(wlan_link_run() == 1 && has("skip: SRPWR request") && has("stopped=timeout at=S34 row=1347") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start"));
+		baseline_restored();
+		world(); chip_mode = 20;					/* the read-back (bit 9) still runs: bit 9 drops after the log row -> refused at row 1346 */
+		EXPECT(wlan_link_run() == 1 && has("skip: SRPWR request") && has("stopped=refused at=S34 row=1346") && has("restore=ok") && mem_wr_n == 0u);
 		baseline_restored();
 		world(); chip_mode = 16;					/* ExtPwrStatus bit 17 alone (PowerOnRequest bit 9 clear, id 0): no skip, the write is refused (id 0), nothing written */
 		EXPECT(wlan_link_run() == 1 && !has("skip: SRPWR request") && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && mem_illegal_w == 0u);
