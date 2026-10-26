@@ -49,6 +49,10 @@ struct fake {
 	unsigned win2_stuck;                            /* run B: from this store number on, writes to cfg 0x84 are ignored (0 = never) */
 	unsigned src_flip_at;                           /* run B: after this store number one byte of the source image two words ahead flips (the source changes during the copy; 0 = never) */
 	uint32_t *ram;                                  /* run B: backplane 0..0x5FFFFC as words (BAR2 offset + window = backplane address); NULL = the two words of run A */
+	struct wrec lastw;                              /* run D: the last store that reached the bus (w[] keeps only the first 512) */
+	unsigned rom0;                                  /* run D: a store to backplane address 0 is accepted and ignored (a ROM bank aliased at 0, unknown X4) */
+	unsigned clob_at;                               /* run C: after this store number the RAM word at backplane address clob_bp flips a bit (a later store clobbering an earlier one; 0 = never) */
+	uint32_t clob_bp;
 };
 
 static uint32_t *f_wrap(struct fake *f, uint32_t win)
@@ -128,6 +132,7 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	if (f->nw < sizeof f->w / sizeof f->w[0]) {
 		f->w[f->nw].space = space; f->w[f->nw].win = win; f->w[f->nw].off = off; f->w[f->nw].val = v;
 	}
+	f->lastw.space = space; f->lastw.win = win; f->lastw.off = off; f->lastw.val = v;
 	f->nw++;
 	if (f->src_flip_at == f->nw && space == SWW_BAR2 && win == 0 && off >= SWW_RAM_BASE)
 		imgbuf[off - SWW_RAM_BASE + 8] ^= 0x40;
@@ -140,9 +145,17 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	if (space == SWW_CFG && off == SWW_CFG_WIN) { if (!f->win_stuck) f->win0 = v; return 0; }
 	if (space == SWW_CFG && off == SWW_CFG_WIN2) { if (!f->win2_stuck || f->nw < f->win2_stuck) f->win2 = v; return 0; }
 	if (space == SWW_BAR2 && f->ram) {
+		if (f->rom0 == 2 && win + off == 0 && f->win2 == win) {
+			f->ram[0] = (f->ram[0] & 0xFFFF0000u) | (v & 0xFFFFu);   /* a partial stick: only the low 16 bits (review 0132 F3) */
+			return 0;
+		}
+		if (f->rom0 && win + off == 0 && f->win2 == win)
+			return 0;
 		if (f->win2 != win || (win + off) / 4 >= RAM_WORDS)
 			return -1;
 		f->ram[(win + off) / 4] = v;
+		if (f->clob_at == f->nw)
+			f->ram[f->clob_bp / 4] ^= 1u;
 		return 0;
 	}
 	if (space == SWW_ATU && off >= SWW_R2(0) && off < SWW_R2(0x20)) {
@@ -437,7 +450,7 @@ static void deny_sweep(void)
 	CHECK(swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x200) < 0 && swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x00030300) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x400, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18126000, 0x404, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x808, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18120000, 0x80C, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18120000, 0x408, 0x03) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x408, 0x23) < 0 && swl_wr_ok(SWW_BAR0, 0x18121000, 0x800, 1) < 0 &&
-	      swl_wr_ok(SWW_BAR0, 0x18000000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18012000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0x1FFFFC, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 0) < 0 &&
+	      swl_wr_ok(SWW_BAR0, 0x18000000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18012000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0x1FFFFC, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 4, 0) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18026000, 0x40, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18026000, 0, 0) < 0);
 	/* a store that matches no row never reaches the bus and latches STOPPED */
 	obs(&f);
@@ -1133,7 +1146,7 @@ static void runb_gates(void)
 	GB(224, RB | SWF_W8); f.win2 = 0x400000u; x.done = 1u << SWT_WIN2_TAIL;
 	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, 0x1FFFCu, 0) == -SWW_E_TAIL && f.nw == 0);
 	GB(336, RB | SWF_W8); f.win2 = 0x400000u; x.done = 1u << SWT_WIN2_TAIL;
-	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, 0x9FFFCu, 1) == -SWW_E_DENIED && swl_wr(&x, SWW_BAR2, 0x400000, 0x200000u, 0) == -SWW_E_STOPPED && f.nw == 0);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, 0x9FFFCu, 1) == -SWW_E_LEVEL && swl_wr(&x, SWW_BAR2, 0x400000, 0x200000u, 0) == -SWW_E_STOPPED && f.nw == 0);       /* value 1: a run C tail tuple matches, level 4 refuses it */
 	/* W10: ascending, the image word, inside the image, per-chunk checks only at a chunk start */
 	GB(336, RB | SWF_W9);
 	CHECK(swl_wr(&x, SWW_BAR2, 0, SWW_RAM_BASE, iw(0)) == 0 && x.img_next == 1 && f.nw == 1 && f.nrd > 0 && x.done == 0);
@@ -1187,9 +1200,9 @@ static void runb_deny_sweep(void)
 
 				w = wins[wi];
 				if (w == 0)
-					want = off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAB4u || v == 0);
+					want = off == 0 || (off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAB4u || v == 0));      /* offset 0: the run D reset vector, any value (swl_wr decides the value) */
 				else if (w == 0x400000u)
-					want = off <= 0x1FFFFCu && v == 0;
+					want = off <= 0x1FFFFCu;        /* v == 0: the last word of run B; any v: the run C tail tuples (their address and word are decided at run time) */
 				else
 					want = 0;
 				CHECK((swl_wr_ok(SWW_BAR2, w, off, v) >= 0) == want);
@@ -1201,9 +1214,15 @@ static void runb_deny_sweep(void)
 		CHECK((swl_wr_ok(SWW_CFG, 0, 0x84, v << 20) >= 0) == (v == 0 || v == 4));
 	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0x400004) < 0 && swl_wr_ok(SWW_CFG, 0, 0x84, 0x80000000u) < 0 && swl_wr_ok(SWW_CFG, 0, 0x88, 0) < 0 && swl_wr_ok(SWW_CFG, 0, 0x8C, 0) < 0 && swl_wr_ok(SWW_CFG, 0x400000, 0x84, 0) < 0);
 	CHECK(swl_wr_ok(SWW_ATU, 0, 0x84, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x84, 0) < 0 && swl_wr_ok(SWW_ELBI, 0, 0x84, 0) < 0 && swl_wr_ok(SWW_ISO, 0, 0x84, 0) < 0);
-	/* every run B tuple: run 2, a row of W8..W10 */
-	for (v = SWT_N_A; v < SWT_N; v++)
+	/* every run B tuple: run 2, a row of W8..W10; every run C tuple: run 3, a row of W11..W13, and only in the window 0x400000 or on cfg 0x84 */
+	for (v = SWT_N_A; v < SWT_N_B; v++)
 		CHECK(swl_wt[v].run == 2 && swl_wt[v].row >= 8 && swl_wt[v].row <= 10 && (swl_wt[v].space == SWW_BAR2 || swl_wt[v].space == SWW_CFG));
+	for (v = SWT_N_B; v < SWT_N_C; v++)
+		CHECK(swl_wt[v].run == 3 && swl_wt[v].row >= 11 && swl_wt[v].row <= 13 && ((swl_wt[v].space == SWW_BAR2 && swl_wt[v].win == 0x400000u) || (swl_wt[v].space == SWW_CFG && swl_wt[v].off == 0x84)));
+	/* the run D tuple: run 4, row 14, once, a reset-vector value decided at run time, BAR2 window 0 offset 0 exactly, after W13 */
+	CHECK(SWT_N == SWT_N_C + 1 && SWT_RESET0 == SWT_N_C && swl_wt[SWT_RESET0].run == 4 && swl_wt[SWT_RESET0].row == 14 && swl_wt[SWT_RESET0].space == SWW_BAR2 && swl_wt[SWT_RESET0].win == 0 && swl_wt[SWT_RESET0].off == 0 &&
+	      swl_wt[SWT_RESET0].hi == 0 && swl_wt[SWT_RESET0].flags == (SWT_ONCE | SWT_RV) && swl_wt[SWT_RESET0].need == SWF_W13 && swl_wt[SWT_RESET0].pred1 == 0 && swl_wt[SWT_RESET0].rgrp == 0 &&
+	      swl_wt[SWT_RESET0].vmask == 0xFFFFFFFFu && swl_wt[SWT_RESET0].omask == 0x2u && swl_wt[SWT_RESET0].oval == 0);   /* review 0132 F1 (secured bit) and F3 (whole word) */
 	/* reads: the BAR2 words of run B only at level 4, windows 0 and 0x400000, inside the table's ranges */
 	{
 		static struct fake f;
@@ -1222,8 +1241,928 @@ static void runb_deny_sweep(void)
 	}
 }
 
+/* ---- run C (patch 0131, docs/research/43 rows W11..W13): NVRAM text, length token, rTLV ---- */
+
+#define NVMAXB (SWW_NV_VARS_MAX + 16u)
+static uint8_t nvtext[NVMAXB];                  /* the container's NVRM entry: a synthetic text, never a real calibration file */
+static uint32_t nvlen, nvcrc;
+static uint8_t nvscr[SWW_NV_BUF];
+static uint8_t nvbig[SWW_NV_BUF + 64];
+static uint8_t rngb[SWW_RTLV_RNG];              /* what the injected generator returns */
+static int rng_fail, rng_calls, rng_zero;
+
+static int t_rng(void *c, uint8_t *buf, uint32_t n)
+{
+	uint32_t i;
+
+	(void)c;
+	rng_calls++;
+	if (rng_fail)
+		return -1;
+	for (i = 0; i < n; i++)
+		buf[i] = rng_zero ? 0 : rngb[i];
+	return 0;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* the oracle: what must end up in RAM, written from the DHD layout and not from the header (docs/research/43 s.2, note 43b): the text zero padded to varsize at ram_end - 4 - varsize, the token
+ * (~w << 16 | w, w = varsize / 4) at ram_end - 4, the rTLV (128 random bytes, 0x80, 0xFEEDC0DE) 136 bytes below the text. Literals are used in the cases below. */
+static struct {
+	uint32_t units, end, varsize, rt, vars, tok, vw, token, crc;
+	uint8_t txt[NVMAXB];
+} cx;
+
+static void cx_geo(uint32_t units)
+{
+	cx.units = units;
+	cx.end = SWW_RAM_BASE + units * 8192u;
+	cx.tok = cx.end - 4u;
+	cx.vars = cx.tok - cx.varsize;
+	cx.rt = cx.vars - 136u;
+	cx.vw = cx.varsize / 4u;
+	cx.token = ((~cx.vw) << 16) | (cx.vw & 0xFFFFu);
+}
+
+static void cx_init_rng(void)
+{
+	uint32_t i;
+
+	for (i = 0; i < SWW_RTLV_RNG; i++)
+		rngb[i] = (uint8_t)(i * 37u + 11u);
+	for (i = 0; i < SWW_RTLV_RNG / 4; i++)
+		CHECK(le32(rngb + 4 * i) != PAT && le32(rngb + 4 * i) != PATX && le32(rngb + 4 * i) != 0 && le32(rngb + 4 * i) != 0xFFFFFFFFu);
+	rng_fail = rng_zero = 0;
+}
+
+/* a text of exactly n bytes of lines "kN=V" (no CR, comment or blank line): every byte is kept, each LF (and the forced last NUL) becomes a NUL, so varsize = roundup4(n) + 4 */
+static void cx_plain(uint32_t n, uint32_t units)
+{
+	uint32_t o = 0, i, line = 0;
+
+	memset(nvtext, 0, sizeof nvtext);
+	while (o < n) {
+		char t[48];
+		int m = snprintf(t, sizeof t, "k%u=%u\n", line, line * 7919u % 1000u + 1000u);
+
+		line++;
+		for (i = 0; i < (uint32_t)m && o < n; i++)
+			nvtext[o++] = (uint8_t)t[i];
+	}
+	nvtext[n - 1u] = '\n';
+	if (n > 1 && nvtext[n - 2u] == '\n')
+		nvtext[n - 2u] = 'x';
+	nvlen = n;
+	nvcrc = tcrc(nvtext, n);
+	memset(cx.txt, 0, sizeof cx.txt);
+	for (i = 0; i < n; i++)
+		cx.txt[i] = nvtext[i] == '\n' ? 0 : nvtext[i];
+	cx.varsize = ((n + 3u) & ~3u) + 4u;
+	cx_geo(units);
+	cx.crc = tcrc(cx.txt, cx.varsize);
+}
+
+/* a text with CR, a comment and a blank line; by hand from bcmutils.c:5101-5146 it becomes "k=v\0z=1\0" (the final LF is the forced NUL, kept) = 8 bytes, +1 NUL = varsz 9, varsize 12 */
+static void cx_hand(uint32_t units)
+{
+	static const char t[] = "k=v\r\n# c\r\n\r\nz=1\r\n";
+
+	memset(nvtext, 0, sizeof nvtext);
+	memcpy(nvtext, t, sizeof t - 1u);
+	nvlen = (uint32_t)sizeof t - 1u;
+	CHECK(nvlen == 17);
+	nvcrc = tcrc(nvtext, nvlen);
+	memset(cx.txt, 0, sizeof cx.txt);
+	memcpy(cx.txt, "k=v\0z=1\0", 8);
+	cx.varsize = 12;
+	cx_geo(units);
+	cx.crc = tcrc(cx.txt, cx.varsize);
+}
+
+static int cx_tail(uint32_t bp, uint32_t *v)
+{
+	uint32_t i;
+
+	if (bp == cx.tok) {
+		*v = cx.token;
+		return 1;
+	}
+	if (bp >= cx.vars && bp < cx.tok) {
+		*v = le32(cx.txt + (bp - cx.vars));
+		return 1;
+	}
+	if (bp >= cx.rt && bp < cx.vars) {
+		i = (bp - cx.rt) / 4u;
+		*v = i < 32 ? le32(rngb + 4u * i) : i == 32 ? 0x80u : 0xFEEDC0DEu;
+		return 1;
+	}
+	return 0;
+}
+
+/* the whole RAM: the image words, the tail words (mode 0: all as expected; mode 1 after a fault: each untouched, expected, or expected with bit 0 flipped), everything else untouched */
+static int ramc_ok(uint32_t words, int mode)
+{
+	uint32_t a, e;
+
+	for (a = 0; a < RAM_WORDS; a++) {
+		uint32_t i = a - SWW_RAM_BASE / 4u, v = ramarr[a];
+
+		if (a >= SWW_RAM_BASE / 4u && i < words) {
+			if (v != iw(i))
+				return 0;
+		} else if (cx_tail(4u * a, &e)) {
+			uint32_t pre = 4u * a == cx.tok ? 0u : PAT;
+
+			if (mode == 0 ? v != e : (v != e && v != pre && v != (e ^ 1u)))
+				return 0;
+		} else if (v != PAT) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static struct swl_wbus cbus;
+
+static void mkc(struct swl_wx *x, struct fake *f, int level, uint32_t len, uint32_t crc)
+{
+	bus(&cbus, f);
+	cbus.rng = t_rng;
+	mkx(x, &cbus, level);
+	x->img = len ? imgbuf : 0;
+	x->img_len = len;
+	x->img_crc = crc;
+	x->nv_src = nvlen ? nvtext : 0;
+	x->nv_src_len = nvlen;
+	x->nv_src_crc = nvcrc;
+	x->nv = nvscr;
+	x->nv_cap = sizeof nvscr;
+	loglen = 0; logbuf[0] = 0; rng_calls = 0;
+}
+
+static int runc(struct fake *f, struct swl_wx *x, int level, uint32_t len, uint32_t crc)
+{
+	mkc(x, f, level, len, crc);
+	return swl_stage3(x);
+}
+
+#define CLEVEL5 (0x1FFu | SWF_W8 | SWF_W9 | SWF_W10 | SWF_W11 | SWF_W12 | SWF_RTLV | SWF_W13)
+
+static void runc_happy(void)
+{
+	static struct fake f, g;
+	struct swl_wx x;
+	uint32_t len = 66, words = (len + 3) / 4, crc, nw4, i, k, e;
+	char t[128];
+
+	cx_init_rng();
+	mkimg(len);
+	crc = tcrc(imgbuf, len);
+	CHECK(words == 17);
+	/* the hand-processed text, ram_end 0x4a0000 (the observed size); the literals are the layout worked out by hand */
+	cx_hand(336);
+	CHECK(cx.varsize == 12 && cx.tok == 0x49FFFCu && cx.vars == 0x49FFF0u && cx.rt == 0x49FF68u && cx.token == 0xFFFC0003u);
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 4, len, crc) == 0 && rng_calls == 0 && x.nv_varsize == 0 && x.tok == 0 && x.flags == (0x1FFu | SWF_W8 | SWF_W9 | SWF_W10));      /* level 4: nothing of run C */
+	nw4 = g.nw;
+	CHECK(nw4 == NWANT + NB_TAIL + words);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 5, len, crc) == 0);
+	CHECK(x.stopped == 0 && x.restore == SWW_RS_NONE && rng_calls == 1 && x.flags == CLEVEL5 && x.armed == 0);
+	CHECK(x.nv_varsize == 12 && x.tok == 0xFFFC0003u && x.nv_crc == cx.crc && x.nv_crc_rb == cx.crc && memcmp(x.rtlv, rngb, sizeof rngb) == 0 && memcmp(x.nv, cx.txt, 12) == 0);
+	CHECK(f.nw == nw4 + 3 + 37 && x.nstore == f.nw && f.win2 == 0 && all_allowed(&f));
+	/* the stores of run C, one by one: window, 3 text words, token, 34 rTLV words, window back */
+	CHECK(f.w[nw4].space == SWW_CFG && f.w[nw4].off == 0x84 && f.w[nw4].val == 0x400000u);
+	for (i = 0; i < 3; i++)
+		CHECK(f.w[nw4 + 1 + i].space == SWW_BAR2 && f.w[nw4 + 1 + i].win == 0x400000u && f.w[nw4 + 1 + i].off == 0x9FFF0u + 4 * i && f.w[nw4 + 1 + i].val == le32(cx.txt + 4 * i));
+	CHECK(f.w[nw4 + 4].space == SWW_BAR2 && f.w[nw4 + 4].win == 0x400000u && f.w[nw4 + 4].off == 0x9FFFCu && f.w[nw4 + 4].val == 0xFFFC0003u);
+	for (i = 0; i < 34; i++) {
+		k = nw4 + 5 + i;
+		e = i < 32 ? le32(rngb + 4 * i) : i == 32 ? 0x80u : 0xFEEDC0DEu;
+		CHECK(f.w[k].space == SWW_BAR2 && f.w[k].win == 0x400000u && f.w[k].off == 0x9FF68u + 4 * i && f.w[k].val == e);
+	}
+	CHECK(f.w[nw4 + 39].space == SWW_CFG && f.w[nw4 + 39].off == 0x84 && f.w[nw4 + 39].val == 0);
+	CHECK(ramc_ok(words, 0) && ramarr[0x49FFFCu / 4] == 0xFFFC0003u && ramarr[0x49FF68u / 4 + 32] == 0x80u && ramarr[0x49FF68u / 4 + 33] == 0xFEEDC0DEu);
+	CHECK(ramarr[0x49FFF0u / 4] == 0x00763D6Bu && ramarr[0x49FFF4u / 4] == 0x00313D7Au && ramarr[0x49FFF8u / 4] == 0);       /* "k=v\0", "z=1\0" and the zero pad */
+	snprintf(t, sizeof t, "SWEET WLAN: stage 3 level 5 done vars=12 token=0xfffc0003 crc=%#010x\n", cx.crc);
+	CHECK(strstr(logbuf, t) != 0 && strstr(logbuf, "level 4 done") == 0 && strstr(logbuf, "W11 NVRAM text bp 0x49fff0..0x49fff8 varsize 12 ") != 0 && strstr(logbuf, "W12 token 0xfffc0003 at bp 0x49fffc read back") != 0);
+	CHECK(strstr(logbuf, "W13 rTLV bp 0x49ff68..0x49ffec (value 128 B, length word 0x80, type 0xfeedc0de) read back") != 0 && strstr(logbuf, "W13 cfg 0x84 := 0 (window restored)") != 0);
+	CHECK(strstr(logbuf, "W11 NVRAM 17 bytes -> varsz 9 varsize 12 token 0xfffc0003") != 0);
+	/* levels 3 and 4 with the NVRAM fields handed over: no entropy drawn, no store beyond their own, nothing prepared */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 3, len, crc) == 0 && f.nw == NWANT && rng_calls == 0 && x.nv_varsize == 0 && ram_ok(0, 0));
+	/* a plain text of several lengths (the pad variants), the tail at the top of a 6 MiB RAM, the real calibration file's size, the largest text */
+	{
+		static const uint32_t n[] = { 1, 2, 3, 4, 5, 150, 151, 152, 153, 4096, 8048, 23533, 27064 };
+		static const uint32_t u[] = { 336, 336, 336, 336, 336, 336, 512, 336, 336, 400, 257, 336, 336 };
+		unsigned j;
+
+		for (j = 0; j < sizeof n / sizeof n[0]; j++) {
+			cx_plain(n[j], u[j]);
+			obsb(&f, u[j]);
+			CHECK(runc(&f, &x, 5, len, crc) == 0 && f.nw == nw4 + cx.vw + 37 && x.nv_varsize == cx.varsize && x.nv_crc_rb == cx.crc && ramc_ok(words, 0) && f.win2 == 0);
+			CHECK(x.tok == cx.token && ramarr[cx.tok / 4] == cx.token && x.tn[SWK_VARS] == cx.vw && x.tn[SWK_TOKEN] == 1 && x.tn[SWK_RTLV] == 34);
+		}
+	}
+	/* the window boundary: the tail starts exactly at 0x400000 (text of 8048 bytes, ram_end 0x402000), one word lower is refused after W7 and before the first image word */
+	cx_plain(8048, 257);
+	CHECK(cx.rt == 0x400000u);
+	obsb(&f, 257);
+	CHECK(runc(&f, &x, 5, len, crc) == 0 && ramc_ok(words, 0));
+	cx_plain(8052, 257);
+	CHECK(cx.rt == 0x3FFFFCu);
+	obsb(&f, 257);
+	CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_GEO && f.nw == NWANT && x.row == 11 && strstr(logbuf, "W11 tail geometry refused: ram_end 0x402000 varsize 8056") != 0 && strstr(logbuf, "stopped at W11 restore=none") != 0);
+	CHECK(f.win2 == 0 && ram_ok(0, 0) && x.img_next == 0);
+	cx_plain(300, 256);                                     /* ram_end 0x400000 and below: the tail is not in the window */
+	obsb(&f, 256);
+	CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_GEO && f.nw == NWANT && ram_ok(0, 0));
+	cx_plain(300, 224);
+	obsb(&f, 224);
+	CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_GEO && f.nw == NWANT && ram_ok(0, 0));
+}
+
+/* the entry checks, all before W0: nothing is stored or read when one fails, and the prepared state stays empty */
+static void runc_prep(void)
+{
+	static struct fake f;
+	struct swl_wx x;
+	uint32_t len = 66, crc;
+	unsigned step;
+	/* step 0 is the good one; each other step breaks one thing: the text size, the code and a text of the log */
+	static const struct { uint32_t n; int code; const char *text; } want[] = {
+		{ 300, 0, "" },
+		{ 300, SWW_E_NV, "no usable NVRAM entry" },                     /* 1: no entry */
+		{ 300, SWW_E_NV, "no usable NVRAM entry" },                     /* 2: empty entry */
+		{ 27069, SWW_E_NV, "no usable NVRAM entry" },                   /* 3: one byte above the input bound, right CRC: only the size refuses it */
+		{ 300, SWW_E_NV, "no usable NVRAM entry" },                     /* 4: no scratch */
+		{ 300, SWW_E_NV, "no usable NVRAM entry" },                     /* 5: scratch one byte short of len + 8 */
+		{ 300, SWW_E_NV, "NVRAM CRC " },                                /* 6: wrong container CRC */
+		{ 300, SWW_E_NV, "NVRAM CRC " },                                /* 7: a changed byte under the old CRC */
+		{ 300, SWW_E_NV, "gives varsz 0" },                             /* 8: nothing left after processing */
+		{ 27065, SWW_E_NV, "varsize 27072" },                           /* 9: processed 27065 -> varsz 27069 -> varsize 27072 > 27068 */
+		{ 300, SWW_E_RNG, "no random bytes" },                          /* 10: no generator */
+		{ 300, SWW_E_RNG, "no random bytes" },                          /* 11: the generator fails */
+		{ 300, SWW_E_RNG, "all zero" },                                 /* 12: the generator returns zeros */
+		{ 300, 0, "" },                                                 /* 13: scratch of exactly len + 8 */
+		{ 27068, SWW_E_NV, "varsize 27072" },                           /* 14: exactly the input bound: passes the size check, refused by the varsize bound */
+		{ 27064, 0, "" },                                               /* 15: the largest text that fits: varsize 27068 */
+	};
+
+	cx_init_rng();
+	mkimg(len);
+	crc = tcrc(imgbuf, len);
+	for (step = 0; step < sizeof want / sizeof want[0]; step++) {
+		int rc;
+
+		cx_plain(want[step].n, 336);
+		obsb(&f, 336);
+		mkc(&x, &f, 5, len, crc);
+		x.nv_varsize = 99;
+		rng_fail = rng_zero = 0;
+		switch (step) {
+		case 1: x.nv_src = 0; break;
+		case 2: x.nv_src_len = 0; break;
+		case 3: x.nv = nvbig; x.nv_cap = sizeof nvbig; break;           /* a scratch that would hold it: only the input bound refuses */
+		case 4: x.nv = 0; break;
+		case 5: x.nv_cap = nvlen + 7; break;
+		case 6: x.nv_src_crc ^= 1u; break;
+		case 7: nvtext[5] ^= 0x20; break;
+		case 8: memset(nvtext, 'x', nvlen); nvtext[0] = '#'; nvtext[nvlen - 1u] = '\n'; x.nv_src_crc = tcrc(nvtext, nvlen); break;       /* one comment line: its LF is the forced NUL, the comment never ends */
+		case 10: cbus.rng = 0; break;
+		case 11: rng_fail = 1; break;
+		case 12: rng_zero = 1; break;
+		case 13: x.nv_cap = nvlen + 8; break;
+		default: break;
+		}
+		memset(nvscr, 0xEE, sizeof nvscr);
+		rc = swl_stage3(&x);
+		if (want[step].code == 0) {
+			CHECK(rc == 0 && x.nv_varsize == cx.varsize && x.nv_crc == cx.crc && x.tok == cx.token && memcmp(x.nv, cx.txt, cx.varsize) == 0 && memcmp(x.rtlv, rngb, sizeof rngb) == 0 && rng_calls == 1);
+			CHECK(ramc_ok(17, 0));                                  /* and the whole of run C was done on the fake */
+		} else {
+			CHECK(rc < 0 && x.stop_code == want[step].code && f.nw == 0 && f.nrd == 0 && x.row == 11 && x.nv_varsize == 0 && x.restore == SWW_RS_NONE && ram_ok(0, 0));
+			CHECK(strstr(logbuf, want[step].text) != 0 && strstr(logbuf, "stopped at W11 restore=none") != 0);
+			CHECK(rng_calls == (step == 11 || step == 12 ? 1 : 0));
+			if (step == 14)
+				CHECK(strstr(logbuf, "no usable NVRAM entry") == 0);
+		}
+	}
+	/* the processed text of the hand case is what the scratch holds, byte for byte: zero padded up to varsize, untouched after len + 8 */
+	cx_hand(336);
+	obsb(&f, 336);
+	mkc(&x, &f, 5, len, crc);
+	memset(nvscr, 0xEE, sizeof nvscr);
+	x.row = 11;
+	CHECK(swl_nv_prep(&x) == 0 && x.nv_varsize == 12 && memcmp(nvscr, "k=v\0z=1\0\0\0\0\0", 12) == 0 && nvscr[16] == 0 && nvscr[24] == 0 && nvscr[25] == 0xEE);
+	CHECK(x.nv_crc == tcrc(cx.txt, 12));
+}
+
+/* a dropped, corrupted or refused store at every position of run C, a failing read at every position, a window that does not go back, a later store that damages an earlier word */
+static void runc_faults(void)
+{
+	static struct fake f, g;
+	struct swl_wx x;
+	uint32_t len = 66, words = 17, crc, nw4, nrd4, nrd5, p, k, vw, nst;
+	const uint32_t B = 0x1FFu | SWF_W8 | SWF_W9 | SWF_W10;     /* run B done */
+	unsigned mode, c;
+
+	cx_init_rng();
+	mkimg(len);
+	crc = tcrc(imgbuf, len);
+	cx_plain(150, 336);
+	vw = cx.vw;
+	CHECK(vw == 39 && cx.varsize == 156);
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 4, len, crc) == 0);
+	nw4 = g.nw;
+	nrd4 = g.nrd;
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 5, len, crc) == 0);
+	nrd5 = g.nrd;
+	nst = vw + 37;
+	CHECK(g.nw == nw4 + nst && nrd5 > nrd4 + 3 * vw);
+	for (p = 1; p <= nst; p++) {
+		/* store p of run C: 1 window, 2..1+vw text, 2+vw token, 3+vw..36+vw rTLV, 37+vw window back */
+		uint32_t j = nw4 + p, stored = p < 2 ? 0 : p - 2 > vw + 35 ? vw + 35 : p - 2;
+		unsigned row = p <= 1 + vw ? 11 : p == 2 + vw ? 12 : 13;
+		uint32_t fl = p <= 1 + vw ? B : p == 2 + vw ? B | SWF_W11 : p < nst ? B | SWF_W11 | SWF_W12 : B | SWF_W11 | SWF_W12 | SWF_RTLV;
+
+		for (mode = 0; mode < 3; mode++) {
+			obsb(&f, 336);
+			if (mode == 0) f.drop_at = j; else if (mode == 1) f.corrupt_at = j; else f.fail_wr_at = j;
+			CHECK(runc(&f, &x, 5, len, crc) < 0);
+			CHECK(x.stopped == 1 && x.row == row && x.stop_code == (mode == 2 ? SWW_E_WR : SWW_E_READBACK) && x.restore == SWW_RS_OK && f.win2 == 0 && x.flags == fl);
+			CHECK(f.nw == j + 1 && only_restore_after(&f, j) && all_allowed(&f) && x.tn[SWK_VARS] + x.tn[SWK_TOKEN] + x.tn[SWK_RTLV] == stored && ramc_ok(words, 1));
+		}
+	}
+	/* a failing read at every position after run B */
+	for (k = nrd4 + 1; k <= nrd5; k++) {
+		obsb(&f, 336);
+		f.fail_rd_at = k;
+		CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stopped == 1 && x.stop_code != 0 && x.row >= 11 && f.win2 == 0 && all_allowed(&f) && ramc_ok(words, 1));
+	}
+	/* the window does not go back: the store of 0 and the restore both have no effect on the chip: reported, not hidden */
+	obsb(&f, 336);
+	f.win2_stuck = nw4 + nst;
+	CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_READBACK && x.row == 13 && f.win2 == 0x400000u && x.restore == SWW_RS_FAILED && f.nw == nw4 + nst + 1 && ramc_ok(words, 0));
+	CHECK(strstr(logbuf, "stopped at W13 restore=failed") != 0);
+	/* the window does not move at all */
+	obsb(&f, 336);
+	f.win2_stuck = nw4 + 1;
+	CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_READBACK && x.row == 11 && f.win2 == 0 && f.nw == nw4 + 2 && x.tn[SWK_VARS] == 0);
+	/* a later store damages an earlier word (bit 0 flips after store number nw4 + after): found by the verify that comes next */
+	{
+		const struct { uint32_t after, bp; unsigned row; uint32_t fl; } cl[] = {
+			{ 1 + vw, cx.vars, 11, B },                                     /* after the last text word: the text's own verify in W11 (W13 would be row 13) */
+			{ 2 + vw, cx.tok, 12, B | SWF_W11 },                            /* after the token: the verify of W12 */
+			{ 3 + vw, cx.tok, 13, B | SWF_W11 | SWF_W12 },                  /* after the first rTLV word: the token verify of W13 */
+			{ 36 + vw, cx.vars, 13, B | SWF_W11 | SWF_W12 },                /* after the last rTLV word: the text, in W13 */
+			{ 36 + vw, cx.rt + 40, 13, B | SWF_W11 | SWF_W12 },             /* ... an rTLV word */
+			{ 36 + vw, cx.tok, 13, B | SWF_W11 | SWF_W12 },                 /* ... the token */
+			{ 36 + vw, cx.vars + 4 * (vw - 1), 13, B | SWF_W11 | SWF_W12 }, /* ... the last text word (the CRC covers all of it) */
+			{ 36 + vw, cx.rt, 13, B | SWF_W11 | SWF_W12 },                  /* ... the first rTLV word */
+			{ 36 + vw, cx.rt + 128, 13, B | SWF_W11 | SWF_W12 },            /* ... the rTLV length word */
+			{ 36 + vw, cx.rt + 132, 13, B | SWF_W11 | SWF_W12 },            /* ... the rTLV type word (the last one) */
+		};
+
+		for (c = 0; c < sizeof cl / sizeof cl[0]; c++) {
+			obsb(&f, 336);
+			f.clob_at = nw4 + cl[c].after;
+			f.clob_bp = cl[c].bp;
+			CHECK(runc(&f, &x, 5, len, crc) < 0 && x.stop_code == SWW_E_READBACK && x.row == cl[c].row && f.win2 == 0 && x.restore == SWW_RS_OK && x.flags == cl[c].fl && ramc_ok(words, 1));
+		}
+	}
+}
+
+/* the allowlist decision for the run C tuples: which tuple a (space, window, offset, value) belongs to, restated with literals (windows 0x400000 up to offset 0x1FFFFC, cfg 0x84) */
+static void runc_deny_sweep(void)
+{
+	CHECK(swl_wr_ok(SWW_BAR2, 0x400000, 0, 5) == SWT_NV_VARS && swl_wr_ok(SWW_BAR2, 0x400000, 4, 5) == SWT_NV_VARS && swl_wr_ok(SWW_BAR2, 0x400000, 0x9FFF0u, 5) == SWT_NV_VARS);
+	CHECK(swl_wr_ok(SWW_BAR2, 0x400000, 0x1FFFF8u, 5) == SWT_NV_VARS && swl_wr_ok(SWW_BAR2, 0x400000, 0x1FFFFCu, 5) == SWT_NV_TOKEN && swl_wr_ok(SWW_BAR2, 0x400000, 0x200000u, 5) < 0);
+	CHECK(swl_wr_ok(SWW_BAR2, 0x400000, 0, 0) == SWT_LAST_HI && swl_wr_ok(SWW_BAR2, 0x400000, 0x1FFFFCu, 0) == SWT_LAST_HI);       /* a zero is the last word of run B first */
+	CHECK(swl_wr_ok_from(SWT_LAST_HI + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_VARS && swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_RTLV);
+	CHECK(swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) < 0);
+	CHECK(swl_wr_ok(SWW_BAR2, 0, 0x3B0000u, 5) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 5) == SWT_RESET0 && swl_wr_ok(SWW_BAR2, 0, 4, 5) < 0 && swl_wr_ok(SWW_BAR2, 0x200000u, 0, 5) < 0 && swl_wr_ok(SWW_BAR0, 0x400000, 0, 5) < 0 && swl_wr_ok(SWW_ATU, 0x400000, 0, 5) < 0);
+	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL && swl_wr_ok_from(SWT_WIN2_TAIL + 1, SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL_C && swl_wr_ok_from(SWT_WIN2_TAIL_C + 1, SWW_CFG, 0, 0x84, 0x400000) < 0);
+	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO && swl_wr_ok_from(SWT_WIN2_ZERO + 1, SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO_C && swl_wr_ok_from(SWT_WIN2_ZERO_C + 1, SWW_CFG, 0, 0x84, 0) < 0);
+	{
+		unsigned v;
+
+		for (v = 0; v < SWT_N; v++)             /* a tail tuple names one of the three kinds (x->tn has a slot for each), no other tuple names one */
+			CHECK(((swl_wt[v].flags & SWT_TW) != 0) == (v >= SWT_NV_VARS && v <= SWT_NV_RTLV) && (!(swl_wt[v].flags & SWT_TW) || (swl_wt[v].kind >= SWK_VARS && swl_wt[v].kind <= SWK_RTLV)) &&
+			      (!!(swl_wt[v].flags & SWT_TW) || swl_wt[v].kind == 0));
+	}
+	CHECK(SWT_N == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
+}
+
+/* the stores that reached the bus other than the restore of cfg 0x84 (a refused store with the window moved runs that restore) */
+static unsigned nonrestore(const struct fake *f)
+{
+	unsigned i, n = 0;
+
+	for (i = 0; i < f->nw && i < sizeof f->w / sizeof f->w[0]; i++)
+		n += !is_restore(&f->w[i]);
+	return n;
+}
+
+/* the guard rules of swl_wr() for the run C tuples and the helpers they use, each in isolation. Geometry of the hand text at ram_end 0x4a0000: rTLV 0x49ff68..0x49ffef, text 0x49fff0..0x49fffb, token 0x49fffc */
+static void runc_gates(void)
+{
+	static struct fake f;
+	struct swl_wx x;
+	uint32_t len = 66, crc, n, w0, w1, i;
+	const uint32_t RB = 0x1FFu | SWF_W8 | SWF_W9 | SWF_W10;      /* run A and B done */
+	const uint32_t OFV = 0x9FFF0u, OFT = 0x9FFFCu, OFR = 0x9FF68u;      /* BAR2 offsets in window 0x400000: text, token, rTLV */
+	const uint32_t WU = 1u << SWT_WIN2_TAIL_C, B_ = (1u << SWT_WIN2_TAIL) | (1u << SWT_WIN2_ZERO);
+
+	cx_init_rng();
+	mkimg(len);
+	crc = tcrc(imgbuf, len);
+#define GCN(units, fl) do { obsb(&f, (units)); mkc(&x, &f, 5, len, crc); ready(&x, &f, (fl)); x.ram_bytes = (units) * 8192u; x.row = 11; CHECK(swl_nv_prep(&x) == 0); loglen = 0; logbuf[0] = 0; } while (0)
+#define GC(units, fl) do { cx_hand(units); GCN(units, fl); } while (0)
+#define GV(fl) do { GC(336, (fl)); f.win2 = 0x400000u; x.done = WU; x.armed = SWW_RG_W84; } while (0)       /* as the store of cfg 0x84 := 0x400000 leaves it */
+	w0 = le32((const uint8_t *)"k=v\0");
+	w1 = le32((const uint8_t *)"z=1\0");
+	/* the geometry helper alone */
+	GC(336, RB);
+	{
+		struct swl_geo g;
+
+		CHECK(swl_geo_get(&x, &g) == 0 && g.tok == 0x49FFFCu && g.vars == 0x49FFF0u && g.rt == 0x49FF68u && g.vwords == 3);
+		x.nv_varsize = 0;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_NV);
+		x.nv_varsize = 27068u;
+		CHECK(swl_geo_get(&x, &g) == 0 && g.vars == 0x49FFFCu - 27068u);
+		x.nv_varsize = 27072u;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_NV);
+		x.nv_varsize = 13u;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_NV);
+		x.nv_varsize = 14u;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_NV);
+		x.nv_varsize = 16u;
+		CHECK(swl_geo_get(&x, &g) == 0 && g.vwords == 4 && g.vars == 0x49FFECu && g.rt == 0x49FFECu - 136u);
+		x.nv_varsize = 12u;
+		x.ram_bytes = 0x400000u;
+		CHECK(swl_geo_get(&x, &g) == 0 && g.tok == 0x5FFFFCu);
+		x.ram_bytes = 0x400001u;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_RAM);
+		x.ram_bytes = 0x2000u;                                           /* ram_end 0x202000: far below the window */
+		CHECK(swl_geo_get(&x, &g) == SWW_E_GEO);
+		x.ram_bytes = 0x200000u + 12u + 140u;                            /* ram_end 0x400098: rt = 0x400098 - 4 - 12 - 136 = 0x400000, the lowest the tail may start */
+		CHECK(swl_geo_get(&x, &g) == 0 && g.rt == 0x400000u);
+		x.ram_bytes -= 4;
+		CHECK(swl_geo_get(&x, &g) == SWW_E_GEO);
+		/* the kind of every address around the regions */
+		x.ram_bytes = 0x2A0000u;
+		CHECK(swl_tw_kind(&x, 0x49FF64u) == 0 && swl_tw_kind(&x, 0x49FF68u) == SWK_RTLV && swl_tw_kind(&x, 0x49FFECu) == SWK_RTLV && swl_tw_kind(&x, 0x49FFF0u) == SWK_VARS);
+		CHECK(swl_tw_kind(&x, 0x49FFF8u) == SWK_VARS && swl_tw_kind(&x, 0x49FFFCu) == SWK_TOKEN && swl_tw_kind(&x, 0x4A0000u) == 0 && swl_tw_kind(&x, 0) == 0);
+		x.nv_varsize = 0;
+		CHECK(swl_tw_kind(&x, 0x49FFFCu) == 0);
+	}
+	/* W11, cfg 0x84 := 0x400000 (the second time cfg 0x84 is written this way: the run B tuple is consumed and the run C tuple takes over) */
+	GC(336, RB); x.done = 1u << SWT_WIN2_TAIL;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == 0 && f.win2 == 0x400000u && f.nw == 1 && (x.armed & SWW_RG_W84) && (x.done & WU));
+	GC(336, RB); x.done = (1u << SWT_WIN2_TAIL) | WU;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_REPEAT && f.nw == 0);
+	GC(336, RB); x.done = 1u << SWT_WIN2_TAIL; x.level = 4;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_REPEAT && f.nw == 0);               /* level 4 reports the repeat, it does not reach for the run C tuple */
+	GC(336, RB & ~SWF_W10); x.done = 1u << SWT_WIN2_TAIL;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_PHASE && f.nw == 0);
+	GC(224, RB); x.done = 1u << SWT_WIN2_TAIL;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_TAIL && f.nw == 0);
+	GC(336, RB); x.done = 1u << SWT_WIN2_TAIL; f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_OLD && f.nw == 0);
+	GC(336, RB); x.done = 1u << SWT_WIN2_TAIL; f.cmd = 6;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0x400000) == -SWW_E_PRE && f.nw == 0);
+	/* W11 text words */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == 0 && x.tn[SWK_VARS] == 1 && f.nw == 1 && f.nrd > 0 && ramarr[0x49FFF0u / 4] == w0 && (x.armed & SWW_RG_W84));
+	n = f.nrd;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 4, w1) == 0 && x.tn[SWK_VARS] == 2 && f.nrd == n + 1 && ramarr[0x49FFF4u / 4] == w1);     /* a later word: only its read-back */
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 4, w1) == -SWW_E_NV && x.stopped && f.nw == 3 && f.win2 == 0 && x.restore == SWW_RS_OK);   /* the same word again: STOP, the window restore is the third store */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 4, w1) == -SWW_E_NV && nonrestore(&f) == 0);                                                 /* must start at the first word */
+	GV(RB); x.done |= 1u << SWT_LAST_HI;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 8, 0) == -SWW_E_NV && nonrestore(&f) == 0);                                                 /* ... also with a zero word, once the last word of run B is consumed */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0 ^ 1u) == -SWW_E_NV && nonrestore(&f) == 0);                                                /* not the text word */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w1) == -SWW_E_NV && nonrestore(&f) == 0);                                                    /* a text word at the wrong place */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV - 4, w0) == -SWW_E_PHASE && nonrestore(&f) == 0 && ramarr[0x49FFECu / 4] == PAT);             /* one word below the text is the rTLV: the rTLV tuple (not yet allowed) judges it */
+	GV(RB | SWF_W11 | SWF_W12);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV - 4, w0) == -SWW_E_NV && nonrestore(&f) == 0 && ramarr[0x49FFECu / 4] == PAT);                /* ... and refuses a text word there */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 1, w0) == -SWW_E_DENIED && nonrestore(&f) == 0);
+	GV(RB & ~SWF_W10);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_PHASE && nonrestore(&f) == 0);
+	GV(RB); x.done = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_ORDER && nonrestore(&f) == 0);
+	GV(RB); x.level = 4;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_LEVEL && nonrestore(&f) == 0);
+	GV(RB); f.win2 = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_WIN && nonrestore(&f) == 0);
+	GV(RB); f.cmd = 6;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_PRE && nonrestore(&f) == 0);
+	GV(RB); ramarr[0x49FFF0u / 4] = 0xFFFFFFFFu;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_DEAD && nonrestore(&f) == 0);
+	GV(RB); x.tn[SWK_VARS] = 1; f.cmd = 6; ramarr[0x49FFF4u / 4] = 0xFFFFFFFFu;                                                    /* a later word: no precondition, no old-value read */
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 4, w1) == 0 && f.nrd == 1 && f.nw == 1);
+	GV(RB); f.fail_rd_at = 1;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) < 0 && nonrestore(&f) == 0);
+	/* a zero word of the text: the last word of run B (value 0, ONCE, after the run B window store) is the first match until it is consumed */
+	GV(RB); x.tn[SWK_VARS] = 2;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 8, 0) == -SWW_E_ORDER && nonrestore(&f) == 0);
+	GV(RB); x.tn[SWK_VARS] = 2; x.done |= 1u << SWT_WIN2_TAIL;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 8, 0) == -SWW_E_RAM && nonrestore(&f) == 0);
+	GV(RB); x.tn[SWK_VARS] = 2; x.done |= 1u << SWT_LAST_HI;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV + 8, 0) == 0 && x.tn[SWK_VARS] == 3 && f.nw == 1);
+	/* the step refuses a bad geometry before it moves the window */
+	GC(336, RB); x.nv_varsize = 0;
+	CHECK(swl_w11(&x) == -SWW_E_NV && f.nw == 0 && f.win2 == 0);
+	GC(336, RB); x.ram_bytes = 0x2000u;
+	CHECK(swl_w11(&x) == -SWW_E_GEO && f.nw == 0 && f.win2 == 0);
+	/* the geometry and the prepared state are checked by the writer itself */
+	GV(RB); x.nv_varsize = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB); x.nv_varsize = 27072;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB); x.nv_varsize = 14;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB); x.ram_bytes = 0x400000u + 8192u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFV, w0) == -SWW_E_RAM && nonrestore(&f) == 0);
+	cx_plain(20000, 257);                                                                                                       /* a text that does not fit above 0x400000 at ram_end 0x402000 */
+	GCN(257, RB); f.win2 = 0x400000u; x.done = WU;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, 0x1000u, 5) == -SWW_E_GEO && nonrestore(&f) == 0);
+	/* one word past the end of RAM, whatever the kind counters say */
+	{
+		static const uint32_t val[] = { 0, 0xFFFC0003u, 0xFEEDC0DEu, 0x80u };
+		unsigned v;
+
+		for (v = 0; v < sizeof val / sizeof val[0]; v++) {
+			GV(RB | SWF_W11 | SWF_W12); x.done |= 1u << SWT_LAST_HI; x.tn[SWK_VARS] = 4; x.tn[SWK_TOKEN] = 1; x.tn[SWK_RTLV] = 38;
+			CHECK(swl_wr(&x, SWW_BAR2, 0x400000, 0xA0000u, val[v]) < 0 && nonrestore(&f) == 0 && ramarr[0x4A0000u / 4] == PAT);
+		}
+	}
+	/* the index of a kind is bounded by its word count: a RAM that ends at 0x5fe000 and a repeated token counter aimed at the top table offset 0x5ffffc (first match there: the token tuple) */
+	cx_hand(511); GCN(511, RB | SWF_W11); f.win2 = 0x400000u; x.done = WU; x.tn[SWK_TOKEN] = 2048;
+	CHECK(cx.tok == 0x5FDFFCu && swl_wr(&x, SWW_BAR2, 0x400000, 0x1FFFFCu, x.tok) == -SWW_E_NV && nonrestore(&f) == 0 && ramarr[0x5FFFFCu / 4] == PAT);
+	/* W12 the token at the last RAM word (its old value 0 from W9) */
+	GV(RB | SWF_W11);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == 0 && x.tn[SWK_TOKEN] == 1 && f.nw == 1 && f.nrd > 0 && ramarr[0x49FFFCu / 4] == 0xFFFC0003u);
+	GV(RB | SWF_W11);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok ^ 1u) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB | SWF_W11);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, (~2u << 16) | 2u) == -SWW_E_NV && nonrestore(&f) == 0);                                    /* the token of another size */
+	GV(RB);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_PHASE && nonrestore(&f) == 0);
+	GV(RB | SWF_W11); f.cmd = 6;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_PRE && nonrestore(&f) == 0);
+	GV(RB | SWF_W11); ramarr[0x49FFFCu / 4] = 0xFFFFFFFFu;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_DEAD && nonrestore(&f) == 0);
+	GV(RB | SWF_W11); f.win2 = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_WIN && nonrestore(&f) == 0);
+	GV(RB | SWF_W11); x.done = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_ORDER && nonrestore(&f) == 0);
+	GV(RB | SWF_W11); x.level = 4;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT, x.tok) == -SWW_E_LEVEL && nonrestore(&f) == 0);
+	GV(RB | SWF_W11);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFT - 4, x.tok) == -SWW_E_NV && nonrestore(&f) == 0);                                            /* the token's value at the last text word's place */
+	/* W13 the rTLV: value words, the length word, the type word */
+	GV(RB | SWF_W11 | SWF_W12);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == 0 && x.tn[SWK_RTLV] == 1 && f.nrd > 0 && f.nw == 1);
+	n = f.nrd;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 4, le32(rngb + 4)) == 0 && f.nrd == n + 1);
+	GV(RB | SWF_W11 | SWF_W12);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb) ^ 1u) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 4, le32(rngb + 4)) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB | SWF_W11);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == -SWW_E_PHASE && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); x.tn[SWK_RTLV] = 32;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 128, 0x80u) == 0 && x.tn[SWK_RTLV] == 33 && f.nrd == 1);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 132, 0xFEEDC0DEu) == 0 && x.tn[SWK_RTLV] == 34 && ramarr[0x49FFECu / 4] == 0xFEEDC0DEu);
+	GV(RB | SWF_W11 | SWF_W12); x.tn[SWK_RTLV] = 32;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 128, 0x81u) == -SWW_E_NV && nonrestore(&f) == 0);                                          /* the length word has no checksum: exactly 0x80 */
+	GV(RB | SWF_W11 | SWF_W12); x.tn[SWK_RTLV] = 33;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 132, 0xFEEDC0DFu) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); x.tn[SWK_RTLV] = 33;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR + 128, 0xFEEDC0DEu) == -SWW_E_NV && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); f.cmd = 6;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == -SWW_E_PRE && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); x.done = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == -SWW_E_ORDER && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); x.level = 4;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == -SWW_E_LEVEL && nonrestore(&f) == 0);
+	GV(RB | SWF_W11 | SWF_W12); ramarr[0x49FF68u / 4] = 0xFFFFFFFFu;
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000, OFR, le32(rngb)) == -SWW_E_DEAD && nonrestore(&f) == 0);
+	/* W13 the window back to 0: after the rTLV only, from 0x400000 only */
+	GC(336, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = B_ | WU; f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == 0 && f.win2 == 0 && f.nw == 1);
+	GC(336, RB | SWF_W11 | SWF_W12); x.done = B_ | WU; f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_PHASE && f.nw == 0);
+	GC(336, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = (1u << SWT_WIN2_TAIL) | (1u << SWT_WIN2_ZERO); f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_ORDER && f.nw == 0);
+	GC(336, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = B_ | WU;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_OLD && f.nw == 0);
+	GC(224, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = B_ | WU; f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_TAIL && f.nw == 0);
+	GC(336, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = B_ | WU | (1u << SWT_WIN2_ZERO_C); f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_REPEAT && f.nw == 0);
+	GC(336, RB | SWF_W11 | SWF_W12 | SWF_RTLV); x.done = B_ | WU; f.win2 = 0x400000u; x.level = 4;
+	CHECK(swl_wr(&x, SWW_CFG, 0, 0x84, 0) == -SWW_E_REPEAT && f.nw == 0);
+	/* an address that is no tail address, and values for the tail window other than the tail: nothing is stored */
+	GV(RB | SWF_W11 | SWF_W12);
+	for (i = 0; i < 40; i++) {
+		static const uint32_t off[] = { 0, 4, 0x1000, 0x9FF60, 0x9FF64, 0xA0000, 0xA0004, 0x1FFFFC, 0x200000 };
+		unsigned o;
+
+		for (o = 0; o < sizeof off / sizeof off[0]; o++) {
+			x.stopped = 0; x.stop_code = 0; f.nw = 0; x.nstore = 0; x.armed = 0;
+			CHECK(swl_wr(&x, SWW_BAR2, 0x400000, off[o], i * 0x01010101u) < 0 && f.nw == 0);
+		}
+	}
+#undef GV
+#undef GC
+#undef GCN
+}
+
+
+/* ---------------------------------------------------------------- run D (patch 0132): W14, the reset vector at backplane address 0 ---------------------------------------------------------------- */
+
+static uint32_t cstep(uint32_t c, const uint8_t *p, unsigned n)         /* the CRC32 register after n more bytes (no final xor) */
+{
+	unsigned k;
+
+	while (n--) {
+		c ^= *p++;
+		for (k = 0; k < 8; k++)
+			c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
+	}
+	return c;
+}
+
+/* make the CRC32 of buf[0..len) equal target by choosing its last four bytes (the CRC is affine over GF(2): solve the 32 columns): a synthetic blob with the CRC of the real firmware, no firmware byte */
+static void forge(uint8_t *buf, uint32_t len, uint32_t target)
+{
+	uint32_t s = cstep(0xFFFFFFFFu, buf, len - 4u), f0, basis[32], bm[32], v, m, want, b = 0;
+	uint8_t t[4];
+	unsigned j;
+	int bit;
+
+	memset(basis, 0, sizeof basis);
+	memset(t, 0, 4);
+	f0 = cstep(s, t, 4);
+	for (j = 0; j < 32; j++) {
+		memset(t, 0, 4);
+		t[j / 8] = (uint8_t)(1u << (j % 8));
+		v = cstep(s, t, 4) ^ f0;
+		m = 1u << j;
+		for (bit = 31; bit >= 0 && v; bit--) {
+			if (!((v >> bit) & 1u))
+				continue;
+			if (!basis[bit]) {
+				basis[bit] = v; bm[bit] = m;
+				break;
+			}
+			v ^= basis[bit]; m ^= bm[bit];
+		}
+	}
+	want = ~target ^ f0;
+	for (bit = 31; bit >= 0; bit--) {
+		if (((want >> bit) & 1u) && basis[bit]) {
+			want ^= basis[bit]; b ^= bm[bit];
+		}
+	}
+	CHECK(want == 0);
+	for (j = 0; j < 4; j++)
+		buf[len - 4u + j] = (uint8_t)(b >> (8 * j));
+}
+
+static struct fake sf;                                  /* the state after run C on the pinned image: every W14 case starts from it */
+static struct swl_wx sx;
+static uint32_t sram[RAM_WORDS];
+
+static void rd_put(struct fake *f, struct swl_wx *x)
+{
+	*f = sf;
+	*x = sx;
+	memcpy(ramarr, sram, sizeof ramarr);
+	f->ram = ramarr;
+	bus(&cbus, f);
+	cbus.rng = t_rng;
+	x->b = &cbus;
+	x->level = 6;
+	loglen = 0; logbuf[0] = 0;
+}
+
+static void rund(void)
+{
+	static struct fake f, g;
+	struct swl_wx x;
+	const uint32_t len = 1764018u, words = 441005u, pin = 0x1153ccffu;
+	uint32_t w0, n5, k, nrd, keep;
+	char t[256];
+
+	cx_init_rng();
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	CHECK(tcrc(imgbuf, len) == pin && SWW_FW_LEN == 1764018u && SWW_FW_CRC == 0x1153ccffu && SWW_FW_LEN == SWW_IMG_MAX);
+	w0 = iw(0);
+	CHECK(w0 == 0xEA000010u && w0 != PAT);
+	cx_hand(336);
+	/* run C on the pinned image (level 5): the reference; address 0 is untouched and nothing says w14 */
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 5, len, pin) == 0 && x.flags == CLEVEL5 && ramarr[0] == PAT && x.w14_old == 0 && strstr(logbuf, "w14") == 0 && strstr(logbuf, "W14") == 0 && strstr(logbuf, "level 5 done vars=12") != 0);
+	n5 = g.nw;
+	sf = g; sx = x; memcpy(sram, ramarr, sizeof ramarr);
+	/* level 6, the whole run: one more store than level 5, the first dword of the image at address 0 */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	CHECK(x.stopped == 0 && x.restore == SWW_RS_NONE && x.flags == (CLEVEL5 | SWF_W14) && x.armed == 0 && f.nw == n5 + 1 && x.nstore == f.nw && f.win2 == 0 && all_allowed(&f));
+	CHECK(f.lastw.space == SWW_BAR2 && f.lastw.win == 0 && f.lastw.off == 0 && f.lastw.val == w0 && x.w14_old == PAT && x.rb == w0 && ramarr[0] == w0);
+	snprintf(t, sizeof t, "SWEET WLAN: stage 3 level 6 done w14 old=0xa5a5a5a5 new=0xea000010 vars=12 token=0xfffc0003 crc=%#010x\n", cx.crc);
+	CHECK(strstr(logbuf, t) != 0 && strstr(logbuf, "level 5 done") == 0 && strstr(logbuf, "W14 backplane 0 reads 0xa5a5a5a5 before the store") != 0);
+	CHECK(strstr(logbuf, "W14 reset vector bp 0 old 0xa5a5a5a5 := 0xea000010 read back 0xea000010") != 0);
+	ramarr[0] = PAT;
+	CHECK(ramc_ok(words, 0));                                       /* everything else is as at level 5 */
+	/* W14 alone from the level-5 state, and its read count */
+	rd_put(&f, &x);
+	nrd = f.nrd;
+	CHECK(swl_w14(&x) == 0 && f.nw == n5 + 1 && ramarr[0] == w0 && x.flags == (CLEVEL5 | SWF_W14));
+	nrd = f.nrd - nrd;
+	CHECK(nrd > 10 && nrd < 60);
+	/* the word read at 0 is all ones: a stop, the value is logged, nothing is stored (DHD dhd_pcie.c:10218) */
+	rd_put(&f, &x);
+	ramarr[0] = 0xFFFFFFFFu;
+	CHECK(swl_w14(&x) == -SWW_E_DEAD && x.stop_code == SWW_E_DEAD && f.nw == n5 && x.restore == SWW_RS_NONE && f.win2 == 0 && ramarr[0] == 0xFFFFFFFFu && !(x.flags & SWF_W14));
+	CHECK(strstr(logbuf, "W14 backplane 0 reads 0xffffffff before the store") != 0 && strstr(logbuf, "W14 STOP: dead read") != 0 && strstr(logbuf, "done") == 0);
+	/* a failing read at every position of W14: never a success, at most the one store, and then the read-back is what stops it */
+	for (k = 1; k <= nrd; k++) {
+		rd_put(&f, &x);
+		f.fail_rd_at = f.nrd + k;
+		CHECK(swl_w14(&x) < 0 && x.stopped && f.nw <= n5 + 1 && (f.nw == n5 || x.stop_code == SWW_E_READBACK || x.stop_code == SWW_E_RD) && !(x.flags & SWF_W14) && x.restore == SWW_RS_NONE && f.win2 == 0 && all_allowed(&f));
+		/* review 0132 F4: a read-back read that fails is the stop "read" and prints no chip value */
+		CHECK(!(f.nw == n5 + 1 && x.stop_code == SWW_E_RD) || strstr(logbuf, "read back 0x") == 0);
+	}
+	/* a store the bus refuses */
+	rd_put(&f, &x);
+	f.fail_wr_at = f.nw + 1;
+	CHECK(swl_w14(&x) == -SWW_E_WR && f.nw == n5 + 1 && ramarr[0] == PAT && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14));
+	/* X4: address 0 aliases a ROM bank: the store is accepted and ignored. A clean stop with the read-back printed, one store, nothing else, window 0 */
+	rd_put(&f, &x);
+	f.rom0 = 1;
+	ramarr[0] = 0x12345678u;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && x.stop_code == SWW_E_READBACK && f.nw == n5 + 1 && x.restore == SWW_RS_NONE && f.win2 == 0 && ramarr[0] == 0x12345678u && !(x.flags & SWF_W14) && x.armed == 0);
+	CHECK(strstr(logbuf, "W14 backplane 0 wrote 0xea000010, old 0x12345678, read back 0x12345678") != 0 && strstr(logbuf, "W14 STOP: read-back") != 0 && strstr(logbuf, "done") == 0);
+	/* review 0132 F3: a partial stick (only the low 16 bits of the word take) is a read-back stop that prints what was read */
+	rd_put(&f, &x);
+	f.rom0 = 2;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && f.nw == n5 + 1 && ramarr[0] == 0xa5a50010u && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14) && strstr(logbuf, "read back 0xa5a50010") != 0);
+	/* review 0132 F4: the last read of W14 is the read-back; when it fails the stop is "read" (stop_code RD) and no read back value is printed */
+	rd_put(&f, &x);
+	f.fail_rd_at = f.nrd + nrd;
+	CHECK(swl_w14(&x) == -SWW_E_RD && x.stop_code == SWW_E_RD && f.nw == n5 + 1 && x.rb == 0 && strstr(logbuf, "read back 0x") == 0 && strstr(logbuf, "W14 STOP: read (code") != 0);
+	/* review 0132 F1: a vector word with the secured bit (DAR_SEC_SBOOT_MASK, bit 1) set is refused as DHD refuses it, before any store, at the old-value test */
+	rd_put(&f, &x);
+	ramarr[0] = 0xba3ef002u;
+	CHECK(swl_w14(&x) == -SWW_E_OLD && x.stop_code == SWW_E_OLD && f.nw == n5 && ramarr[0] == 0xba3ef002u && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14) && strstr(logbuf, "W14 STOP: old value") != 0);
+	rd_put(&f, &x);
+	ramarr[0] = 0xba3ef000u;
+	CHECK(swl_w14(&x) == 0 && f.nw == n5 + 1 && ramarr[0] == w0);                          /* the observed word (bit 1 clear) still goes */
+	/* a word that reads back with a bit flipped */
+	rd_put(&f, &x);
+	f.corrupt_at = f.nw + 1;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && f.nw == n5 + 1 && ramarr[0] == (w0 ^ 1u) && strstr(logbuf, "read back 0xea000011") != 0);
+	/* the whole stage on a ROM-like bank: stops at W14 with restore none, exactly one store more than level 5 */
+	obsb(&f, 336);
+	f.rom0 = 1;
+	CHECK(runc(&f, &x, 6, len, pin) == -SWW_E_READBACK && x.stop_code == SWW_E_READBACK && f.nw == n5 + 1 && x.restore == SWW_RS_NONE && f.win2 == 0 && x.flags == CLEVEL5 && x.row == 14);
+	CHECK(strstr(logbuf, "stage 3 level 6 stopped at W14 restore=none") != 0 && strstr(logbuf, "level 6 done") == 0 && strstr(logbuf, "read back 0xa5a5a5a5") != 0);
+	/* the gates of swl_wr() for the run D tuple, each alone */
+	rd_put(&f, &x);
+	x.flags &= ~SWF_W13;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_PHASE && f.nw == n5);                    /* needs W13 */
+	rd_put(&f, &x);
+	x.level = 5;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_LEVEL && f.nw == n5);                    /* run 4 */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == 0 && f.nw == n5 + 1 && swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_REPEAT && f.nw == n5 + 1);        /* once */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0 ^ 1u) == -SWW_E_IMG && f.nw == n5);                 /* only image word 0 */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, 0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	x.img_crc ^= 1u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);                      /* the pinned CRC */
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);                      /* the pinned length */
+	rd_put(&f, &x);
+	x.img_len = len + 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	x.img = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_WIN && f.nw == n5);                      /* the live BAR2 window is 0 */
+	rd_put(&f, &x);
+	f.win2 = 0x400000u;
+	CHECK(swl_w14(&x) == -SWW_E_RD && f.nw == n5);
+	rd_put(&f, &x);
+	f.cmd ^= 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_PRE && f.nw == n5);                      /* the preconditions are read again */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 4, w0) == -SWW_E_DENIED && f.nw == n5);                  /* no other word of window 0 below the RAM */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0x1FFFFCu, w0) == -SWW_E_DENIED && f.nw == n5);
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000u, 0, w0) < 0 && f.nw == n5);                       /* offset 0 of the tail window is not the reset vector */
+	/* the image and its identity are checked again at W14 (AP-74): a byte of the source changed after W10, with the pinned CRC no longer true */
+	rd_put(&f, &x);
+	imgbuf[len / 2] ^= 1;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "image CRC") != 0);
+	imgbuf[len / 2] ^= 1;
+	rd_put(&f, &x);
+	imgbuf[0] ^= 1;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && ramarr[0] == PAT);                     /* the vector itself */
+	imgbuf[0] ^= 1;
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	x.img_crc = tcrc(imgbuf, len - 4u);                                                     /* a consistent but different image */
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc") != 0);
+	rd_put(&f, &x);
+	imgbuf[100] ^= 1;
+	x.img_crc = tcrc(imgbuf, len);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not the pinned 1764018 bytes crc 0x1153ccff") != 0);
+	/* the pin before the first store of the run: a consistent image of another length or content stops at the early check, no read, no store, nothing armed (review 0130 finding 8) */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, tcrc(imgbuf, len)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && x.row == 14 && x.restore == SWW_RS_NONE && x.armed == 0 && x.rb == 0);
+	CHECK(strstr(logbuf, "firmware identity") != 0 && strstr(logbuf, "stage 3 level 6 stopped at W14 restore=none") != 0 && ramarr[0] == PAT);
+	/* ... which level 5 does not do: the same bytes copy (the run is run C) */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 5, len, tcrc(imgbuf, len)) == 0 && f.nw == n5 && strstr(logbuf, "firmware identity") == 0);
+	imgbuf[100] ^= 1;
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len - 4u, tcrc(imgbuf, len - 4u)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc") != 0);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin ^ 1u) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "image CRC") != 0);     /* a CRC that is not the bytes' CRC stops at the image check */
+	/* a shorter image whose CRC is the pinned one: only the length tells it from the firmware */
+	forge(imgbuf, len - 4u, pin);
+	CHECK(tcrc(imgbuf, len - 4u) == pin);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	x.img_crc = pin;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	keep = imglen;
+	mkimg(66);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, 66, tcrc(imgbuf, 66)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 66 bytes crc") != 0);
+	CHECK(keep == len);
+	/* the NVRAM entry is not pinned: the 17 byte hand text above and the 27062 byte size of the real calibration file both run to the end (the NVRAM is only checked against its container record) */
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	cx_plain(27062, 336);
+	CHECK(nvlen == 27062);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && x.nv_src_len == 27062 && x.flags == (CLEVEL5 | SWF_W14) && ramarr[0] == w0 && x.nv_crc_rb == cx.crc);
+	cx_plain(3, 336);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && ramarr[0] == w0);
+}
+
+/* review 0132 F2: W14 runs only when stage 1 listed PCIe core 0x83c with rev < 74 or == 128 (DHD does not read the DAR security register there, dhd_pcie.c:11735-11745) */
+static void rev_gate(void)
+{
+	static struct swl_chip c;
+	static const unsigned revs[] = { 0, 72, 73, 74, 75, 127, 128, 129, 255 };
+	static const int want[] = { 1, 1, 1, 0, 0, 0, 1, 0, 0 };
+	unsigned i;
+
+	CHECK(swl_w14_rev_ok(&c) == 0);                                 /* no cores listed */
+	c.ncores = 2;
+	c.cores[0].id = SWL_CORE_CC; c.cores[0].rev = 72;
+	c.cores[1].id = 0x83d; c.cores[1].rev = 72;                     /* another core with a good rev does not count */
+	CHECK(swl_w14_rev_ok(&c) == 0);
+	c.cores[1].id = SWW_CORE_PCIE2;
+	for (i = 0; i < sizeof revs / sizeof revs[0]; i++) {
+		c.cores[1].rev = (uint8_t)revs[i];
+		CHECK(swl_w14_rev_ok(&c) == want[i]);
+	}
+}
+
 int main(void)
 {
+	rev_gate();
 	happy();
 	fault_sweeps();
 	deny_sweep();
@@ -1234,6 +2173,12 @@ int main(void)
 	runb_faults();
 	runb_gates();
 	runb_deny_sweep();
+	runc_happy();
+	runc_prep();
+	runc_faults();
+	runc_gates();
+	runc_deny_sweep();
+	rund();
 	if (fails) {
 		fprintf(stderr, "RESULT: FAIL wlan_wr_host_test (%u checks)\n", fails);
 		return 1;

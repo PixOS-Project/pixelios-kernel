@@ -1,0 +1,287 @@
+SWEET WLAN stage 3 run D (patch 0132, docs/research/43a-xnu-stage3-chip-writes.md row W14 and unknown X4), boot-arg sweetwlan=6 (= run C of 0131, then W14; levels 1-5 behave as in 0131).
+W14: read backplane address 0 (BAR2 window 0, offset 0; all-ones or a failed read is a stop, the value is logged), store the first dword of the image (DHD resetinstr: dhd_pcie.c:3934-3936, 10198-10227), read it back; a word that does not hold it (X4: ROM bank alias) is a stop that stores nothing else (restore: none).
+Pure part (bsd/dev/sweet_wlan_wr.h): new deny-by-default tuple SWT_RESET0 (run 4, once, needs W13, value = image word 0 of the pinned firmware, decided in the one swl_wr()). Before any store at level 6 the firmware identity is pinned: container FW entry length 1764018 and CRC32 0x1153ccff (review 0130 finding 8). The NVRAM entry is not pinned (CRC against its container record only). W14 re-checks the image and the pin (AP-74).
+W14 stops (old value) on a vector word with bit 1 set (DHD parity, PCIe core rev < 74); a read-back read failure stops as "read".
+Glue (bsd/dev/sweet_wlan.c): sw3_wr() allows BAR2 window 0 offset 0 only once, at level 6, with the pinned container's first dword (sw_hw.l3/rv/rv_ok/rv_done); level 6 runs as 5 unless PCIe core 0x83c rev < 74 or == 128.
+Final line: "SWEET WLAN: stage 3 level 6 done w14 old=<hex> new=<hex> vars=<n> token=<hex> crc=<hex>".
+Tests: shim/wlan_wr_host_test.c, tools/test_wlan_wr_mutants.py. HW-WRITE path: not yet reviewed.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index a914c1c..a775678 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -10,6 +10,8 @@
+  * SYS_MEM reset, bank reads, CA7 halt, two BAR2 reads). Every store of stage 3 is sw3_wr(), called only through swl_wr()/swl_restore() of that header; levels 1-2 are unchanged.
+  * Patch 0131 (run C, sweetwlan=5 = run B + rows W11..W13): the NVRAM text (the "NVRM" entry of the container, processed as DHD does), the length token and a 128 byte rTLV at ram_end,
+  * all through the same swl_wr(); the glue adds only the NVRM entry, a scratch buffer and sw3_rng() (read_random()).
++ * Patch 0132 (run D, sweetwlan=6 = run C + row W14): the image's first dword at backplane address 0 (BAR2 window 0, offset 0). The glue only allows that one word, at level 6, with the value the container
++ * entry holds (sw3_wr, independent of the header's tuple).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -38,6 +40,10 @@ struct sw_hw {
+ 	volatile uint32_t *cfg, *mem, *atu, *elbi, *iso, *tcm;
+ 	uint32_t win;
+ 	int level;
++	int l3;         /* patch 0132: the stage 3 level (sweetwlan), 0 until sweet_wlan_stage3() */
++	uint32_t rv;    /* patch 0132: the first dword of the FW container entry (the reset vector), little endian */
++	int rv_ok;      /* patch 0132 (review 0132 F5): level 6 and the container's FW entry is the pinned length and CRC */
++	int rv_done;    /* the one store of rv at backplane address 0 has been made */
+ };
+ 
+ static int
+@@ -230,10 +236,10 @@ sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
+ 	if (space != SWW_CFG && space != SWW_ATU && space != SWW_BAR0 && space != SWW_BAR2) {
+ 		return -1;
+ 	}
+-	/* only the offsets swl_wt[] and swl_rs[] name: cfg 0x80, cfg 0x84 only as 0 or SWW_WIN_TAIL; ATU region 2 base, limit, target, CR2; BAR0 IOCTL, RESET_CTL, bankidx; BAR2 (patch 0130): window 0 from the RAM base up (sw3_ptr stops at 4 MiB), window SWW_WIN_TAIL up to the last word of a 6 MiB RAM */
++	/* only the offsets swl_wt[] and swl_rs[] name: cfg 0x80, cfg 0x84 only as 0 or SWW_WIN_TAIL; ATU region 2 base, limit, target, CR2; BAR0 IOCTL, RESET_CTL, bankidx; BAR2 (patch 0130): window 0 from the RAM base up (sw3_ptr stops at 4 MiB), window SWW_WIN_TAIL up to the last word of a 6 MiB RAM; patch 0132: window 0 offset 0 once (rv_done) at level 6 and only the pinned container's first dword (rv_ok, review 0132 F5) */
+ 	if ((space == SWW_CFG && off != SWW_CFG_WIN && !(off == SWW_CFG_WIN2 && (v == 0 || v == SWW_WIN_TAIL))) || (space == SWW_ATU && (off < SWW_R2(0x04) || off > SWW_R2(0x14) || off == SWW_R2(0x0C))) ||
+ 	    (space == SWW_BAR0 && off != SWL_AGENT_IOCTL && off != SWL_AGENT_RESET_CTL && off != SWW_SM_BANKIDX) ||
+-	    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))) {
++	    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && h->rv_ok && !h->rv_done && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))) {
+ 		return -1;
+ 	}
+ 	/* bind the BAR0 offset to its window: bankidx only on SYS_MEM, IOCTL/RESET_CTL only on the SYS_MEM wrapper or the CA7 wrapper (review 0125 R2-3) */
+@@ -246,6 +252,9 @@ sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
+ 	}
+ 	*p = v;
+ 	__builtin_arm_dsb(0xf);
++	if (space == SWW_BAR2 && win == 0 && off == 0) {
++		h->rv_done = 1;
++	}
+ 	return 0;
+ }
+ 
+@@ -289,6 +298,10 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	memset(&x, 0, sizeof x);
+ 	x.b = &wb;
+ 	x.level = level;
++	hw->l3 = level;
++	hw->rv_ok = level >= 6 && sw_fw.p != NULL && sw_fw.len == SWW_FW_LEN && sw_fw.crc == SWW_FW_CRC;
++	hw->rv_done = 0;
++	hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;
+ 	x.img = sw_fw.p;
+ 	x.img_len = sw_fw.len;
+ 	x.img_crc = sw_fw.crc;
+@@ -297,7 +310,7 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	x.nv_src_crc = sw_nv.crc;
+ 	x.nv = sw_nvbuf;
+ 	x.nv_cap = sizeof sw_nvbuf;
+-	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 4 ? "C" : level > 3 ? "B" : "A");
++	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
+ 	(void)swl_stage3(&x);
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+@@ -313,7 +326,7 @@ sweet_wlan_init(void)
+ 	uint32_t level = 0, iso, ltssm, a0[7], a1[7];
+ 	int bad;
+ 	unsigned i;
+-	struct sw_hw hw;
++	struct sw_hw hw = { 0 };
+ 	struct swl_bus bus;
+ 
+ 	if (started) {
+@@ -323,7 +336,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 5 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 6 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+@@ -384,6 +397,10 @@ sweet_wlan_init(void)
+ 	bus.ctx = &hw;
+ 	if (swl_stage1(&bus, &chip, hw.level) == 0) {
+ 		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", (unsigned)hw.level);
++		if (level >= 6 && !swl_w14_rev_ok(&chip)) {
++			printf("SWEET WLAN: W14 needs the DAR security register (PCIe core 0x83c missing or rev not < 74 or 128), not implemented, running level 5\n");
++			level = 5;
++		}
+ 		if (level >= 3) {
+ 			sweet_wlan_stage3(&hw, (int)level);
+ 		}
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+index a9d19ac..ff842b9 100644
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -77,6 +77,15 @@ _Static_assert(SWW_IMG_MAX + SWW_RAM_VARS == SWW_RAM_MIN && SWW_IMG_MAX == 17640
+ _Static_assert(SWW_NV_VARS_MAX + 4u + SWW_RTLV_BYTES == SWW_RAM_VARS && SWW_NV_VARS_MAX % 4u == 0, "tail bound");
+ _Static_assert(SWW_WIN_TAIL >= SWW_IMG_END, "the tail window starts above the image");
+ 
++/* Run D (patch 0132, docs/research/43a rows W14, X4; boot-arg sweetwlan=6): the reset vector. DHD stores the first dword of the firmware file as bus->resetinstr (dhd_pcie.c:3934-3936) and, for a CA7,
++ * writes it at address 0 after the image, the vars and the rTLV (dhd_pcie.c:10198-10227); the image itself also goes to SWW_RAM_BASE. Firmware IDENTITY pinned for level 6 (not firmware bytes): the
++ * container entry's length and CRC32 (observed run wd3, review 0130 finding 8). The NVRAM entry is NOT pinned: it is only CRC-checked against its container record (swl_nv_prep). */
++#define SWW_FW_LEN      1764018u
++#define SWW_FW_CRC      0x1153ccffu
++#define SWW_SEC_SBOOT   0x2u            /* DAR_SEC_SBOOT_MASK, include_pcie_core.h:1161; tested on the word at bp 0 because PCIe core 0x83c rev 72 < 74 (dhd_pcie.c:11741, 10208-10222) */
++#define SWW_CORE_PCIE2  0x83c           /* PCIE2_CORE_ID, include_hndsoc.h:200; the core whose rev is DHD's buscorerev */
++_Static_assert(SWW_FW_LEN == SWW_IMG_MAX, "the pinned firmware is the largest accepted image");
++
+ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+ /* phase flags (what the steps proved), required by swl_wt[].need */
+@@ -96,6 +105,7 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ #define SWF_W12     0x2000u     /* the length token is stored and read back */
+ #define SWF_RTLV    0x4000u     /* the rTLV is stored and read back (cfg 0x84 not yet back at 0) */
+ #define SWF_W13     0x8000u     /* cfg 0x84 is back at 0 */
++#define SWF_W14     0x10000u    /* run D: the reset vector is stored at backplane address 0 and read back */
+ 
+ #define SWW_RG_ATU2 1u          /* restore groups, armed by the first store of a tuple that names one */
+ #define SWW_RG_SM   2u
+@@ -108,6 +118,7 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ #define SWT_BULK    8u          /* image words: val is the image word, off ascending inside the image; preconditions, live window and the old-value read only on the first word of a 64 KiB chunk, no per-word read-back (the chunk CRC is the read-back) */
+ #define SWT_TAIL    16u         /* only when ram_end > SWW_TCM_BYTES (the last RAM word is beyond the BAR2 window 0) */
+ #define SWT_LAST    32u         /* the last RAM word: off == ram_end - 4 - win */
++#define SWT_RV      128u        /* run D reset vector: val is image word 0 of the pinned firmware (decided in swl_wr), only at BAR2 window 0 offset 0 */
+ #define SWT_TW      64u         /* run C tail word: val is the next word of the tail kind that the address names (swl_tw_kind), off ascending from that kind's base */
+ 
+ #define SWK_VARS    1               /* tail kinds: the NVRAM text (varsize bytes), the length token (the last RAM word), the rTLV (value, length word, type word) */
+@@ -145,6 +156,8 @@ enum {
+ 	SWT_IMG,                                                        /* W10 */
+ 	SWT_N_B,                                                        /* the run B tuples end here (run C follows) */
+ 	SWT_WIN2_TAIL_C = SWT_N_B, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C, /* W11 window, W11 vars, W12, W13, W13 window restore */
++	SWT_N_C,                                                        /* the run C tuples end here (run D follows) */
++	SWT_RESET0 = SWT_N_C,                                           /* W14 */
+ 	SWT_N
+ };
+ _Static_assert(SWT_N <= 32, "x->done is a 32-bit tuple mask");
+@@ -212,6 +225,9 @@ static const struct swl_wt swl_wt[SWT_N] = {
+ 	                     .hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W12 },
+ 	[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL, .pred1 = SWT_WIN2_TAIL_C + 1, .off = SWW_CFG_WIN2, .val = 0, .vmask = 0xFFFFFFFFu,
+ 	                     .omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_RTLV },
++
++	/* Run D (row W14, once): the image's first dword at backplane address 0 (BAR2 window 0, offset 0), only after W13 (cfg 0x84 is back at 0). The value is not in the table: swl_wr() takes it from the pinned image. */
++	[SWT_RESET0]     = { .row = 14, .run = 4, .space = SWW_BAR2, .flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 },
+ };
+ 
+ /* The read allowlist (every read of run A, including the ones of the preconditions). */
+@@ -269,6 +285,7 @@ struct swl_wx {
+ 	uint32_t nv_cap, nv_varsize, nv_crc, nv_crc_rb, tok;    /* its size, ROUNDUP(varsz, 4) (0 = not prepared), CRC32 of the varsize bytes (source / read back), the length token */
+ 	uint32_t tn[4];                                 /* run C: index of the next word swl_wr() accepts per tail kind SWK_* */
+ 	uint8_t rtlv[SWW_RTLV_RNG];                     /* run C: the random bytes of the rTLV */
++	uint32_t w14_old, rb;                           /* run D: the word read at address 0 before the store; the word swl_wr() last read back */
+ };
+ 
+ static inline const char *
+@@ -514,7 +531,7 @@ swl_wr_ok_from(unsigned i0, int space, uint32_t win, uint32_t off, uint32_t val)
+ 			if (val < SWW_BANK_ROM) {
+ 				return (int)i;
+ 			}
+-		} else if (p->flags & (SWT_BULK | SWT_TW)) {
++		} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV)) {
+ 			return (int)i;
+ 		} else if (p->val == val) {
+ 			return (int)i;
+@@ -706,6 +723,9 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 	    x->img_next >= (x->img_len + 3u) / 4u || val != swl_img_word(x, x->img_next))) {
+ 		return swl_stop(x, SWW_E_IMG);
+ 	}
++	if ((p->flags & SWT_RV) && (x->img == NULL || x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0))) {
++		return swl_stop(x, SWW_E_IMG);  /* run D: only image word 0 of the pinned firmware */
++	}
+ 	if (p->flags & SWT_TW) {        /* run C: the geometry, the kind's next address and its word are computed here from the state, not taken from the caller */
+ 		ti = x->tn[p->kind];
+ 		gr = swl_geo_get(x, &g);
+@@ -745,9 +765,15 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 		x->img_next++;
+ 		return 0;
+ 	}
+-	if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {
++	if (swl_rdx(x, space, win, off, &rb)) {
++		x->rb = 0;      /* review 0132 F4: a failed read is not a chip value; the stop name says so */
++		return swl_stop(x, SWW_E_RD);
++	}
++	if ((rb ^ val) & p->vmask) {
++		x->rb = rb;     /* run D logs the word that did not stick */
+ 		return swl_stop(x, SWW_E_READBACK);
+ 	}
++	x->rb = rb;
+ 	if (p->flags & SWT_TW) {
+ 		x->tn[p->kind]++;
+ 		return 0;
+@@ -1286,6 +1312,50 @@ swl_w13(struct swl_wx *x)
+ 	return swl_done(x, SWF_W13);
+ }
+ 
++/* run D: the firmware is the one this run was reviewed for: container entry length and CRC32 (swl_img_check has proven that the CRC is the CRC of the bytes); no store here */
++static inline int
++swl_fw_pin(struct swl_wx *x)
++{
++	if (x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC) {
++		printf("SWEET WLAN: W%u firmware identity %u bytes crc %#010x is not the pinned %u bytes crc %#010x\n", x->row, x->img_len, x->img_crc, SWW_FW_LEN, SWW_FW_CRC);
++		return swl_stop(x, SWW_E_IMG);
++	}
++	return 0;
++}
++
++/* review 0132 F2: W14 tests bit 1 of the vector word (SWW_SEC_SBOOT) as DHD does where it does NOT read the DAR security register, i.e. PCIe core rev < 74 or == 128 (dhd_pcie.c:11735-11745);
++ * 1 when stage 1 listed the core and its rev is such a one, 0 otherwise (the caller then does not run W14) */
++static inline int
++swl_w14_rev_ok(const struct swl_chip *c)
++{
++	const struct swl_core *p = swl_core(c, SWW_CORE_PCIE2, 0);
++
++	return p != 0 && (p->rev < 74 || p->rev == 128);
++}
++
++/* W14: backplane address 0 (BAR2 window 0, offset 0, cfg 0x84 is 0 after W13): read it (all-ones is a stop, X4: the value is logged first), then store the first dword of the image (DHD's resetinstr,
++ * dhd_pcie.c:10198-10227) and read it back; a word that does not hold the value (address 0 may alias a ROM bank) is a stop that stores nothing else. The image and its identity are checked again first (AP-74). */
++static inline int
++swl_w14(struct swl_wx *x)
++{
++	int rc;
++
++	x->row = 14;
++	SWW_TRY(swl_img_check(x));
++	SWW_TRY(swl_fw_pin(x));
++	SWW_RD(x, SWW_BAR2, 0, 0, x->w14_old);
++	printf("SWEET WLAN: W14 backplane 0 reads %#010x before the store\n", x->w14_old);
++	rc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 0));
++	if (rc) {
++		if (rc == -SWW_E_READBACK) {
++			printf("SWEET WLAN: W14 backplane 0 wrote %#010x, old %#010x, read back %#010x\n", swl_img_word(x, 0), x->w14_old, x->rb);
++		}
++		return rc;
++	}
++	printf("SWEET WLAN: W14 reset vector bp 0 old %#010x := %#010x read back %#010x\n", x->w14_old, swl_img_word(x, 0), x->rb);
++	return swl_done(x, SWF_W14);
++}
++
+ /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
+ static inline int
+ swl_stage3(struct swl_wx *x)
+@@ -1303,6 +1373,14 @@ swl_stage3(struct swl_wx *x)
+ 			return rc;
+ 		}
+ 	}
++	if (x->level >= SWW_LEVEL0 + 4) {      /* run D: the firmware identity, before any store */
++		x->row = 14;
++		rc = swl_fw_pin(x);
++		if (rc) {
++			printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
++			return rc;
++		}
++	}
+ 	if (x->level >= SWW_LEVEL0 + 3) {      /* run C: the NVRAM entry is checked and processed and the entropy drawn before any store, like the image */
+ 		x->row = 11;
+ 		rc = swl_nv_prep(x);
+@@ -1332,10 +1410,17 @@ swl_stage3(struct swl_wx *x)
+ 		rc = rc ? rc : swl_w12(x);
+ 		rc = rc ? rc : swl_w13(x);
+ 	}
++	if (x->level >= SWW_LEVEL0 + 4) {
++		rc = rc ? rc : swl_w14(x);
++	}
+ 	if (rc) {
+ 		printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
+ 		return rc;
+ 	}
++	if (x->level >= SWW_LEVEL0 + 4) {
++		printf("SWEET WLAN: stage 3 level %d done w14 old=%#010x new=%#010x vars=%u token=%#010x crc=%#010x\n", x->level, x->w14_old, x->rb, x->nv_varsize, x->tok, x->nv_crc_rb);
++		return 0;
++	}
+ 	if (x->level >= SWW_LEVEL0 + 3) {
+ 		printf("SWEET WLAN: stage 3 level %d done vars=%u token=%#010x crc=%#010x\n", x->level, x->nv_varsize, x->tok, x->nv_crc_rb);
+ 		return 0;
