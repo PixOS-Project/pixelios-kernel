@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the BCM4389 firmware, NVRAM and CLM blob into one container for xnu (docs/research/39 s.3, 42 s.7 U10).
+"""Pack the BCM4389 firmware, NVRAM and CLM blob into one container for xnu (docs/research/39 s.3; unit U10 in private notes).
 
   pack_wlanfw.py OUT --fw FILE --nvram FILE --clm FILE
 
