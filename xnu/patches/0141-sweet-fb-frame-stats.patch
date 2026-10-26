@@ -1,4 +1,4 @@
-SWEET frame statistics (patch 0131, boot-arg sweetfps=1, default off): at every IOMFB swap samples a 32x32 grid of layer 0 and logs once per second `SWEET FPS: swaps N distinct M max_gap_ms G` (distinct = swaps whose content differs from the previous one, max_gap = longest gap between distinct frames): a render-rate/jank measure that is not capped by the 60/s swap pacing (G-10). Read-only.
+SWEET frame statistics (patch 0141, boot-arg sweetfps=1, default off): at every IOMFB swap samples a 32x32 grid of layer 0 and logs once per second `SWEET FPS: swaps N distinct M max_gap_ms G` (distinct = swaps whose content differs from the previous one, max_gap = longest gap between distinct frames): a render-rate/jank measure that is not capped by the 60/s swap pacing (G-10). Read-only.
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -390,6 +390,61 @@
@@ -6,7 +6,7 @@ SWEET frame statistics (patch 0131, boot-arg sweetfps=1, default off): at every 
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
 +	/*
-+	 * Frame statistics (patch 0131, boot-arg sweetfps=1, default off; G-10): CoreAnimation swaps every vsync even when nothing
++	 * Frame statistics (patch 0141, boot-arg sweetfps=1, default off; G-10): CoreAnimation swaps every vsync even when nothing
 +	 * changes, so the swap rate is not a render rate. Sample a 32x32 grid of layer 0's surface at every swap, count the swaps whose
 +	 * content differs from the previous one ("distinct") and the longest gap between distinct frames in the second ("jank"). One
 +	 * line per second that had a distinct frame (an idle second prints every 10th). Read-only.
