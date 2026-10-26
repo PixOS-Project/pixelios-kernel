@@ -6,6 +6,7 @@ binaries in a temporary directory prepended to PATH.
 """
 
 from importlib.machinery import SourceFileLoader
+import importlib.util
 import json
 import os
 import shutil
@@ -20,7 +21,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHONE_TOOL = os.path.join(REPO_ROOT, "tools", "phone")
 
 # Import tools/phone as a module
-phone = SourceFileLoader("phone", PHONE_TOOL).load_module()
+_spec = importlib.util.spec_from_loader("phone", SourceFileLoader("phone", PHONE_TOOL))
+phone = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(phone)
 
 
 class PhoneStateMachineTest(unittest.TestCase):
@@ -42,6 +45,7 @@ class PhoneStateMachineTest(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["PATH"] = f"{self.bin_dir}:{self.orig_path}"
         self.env["PHONE_STATE_TEST_DIR"] = self.test_dir
+        self.env["PHONE_RESET_BL_BIN"] = os.path.join(self.bin_dir, "fake-sweet-reset-bl")	# AP-55: never the real UDP sender
         # TP-020: goto needs the phone lock; the tests hold their own, in a temp dir
         self.env["PHONE_LOCK_DIR"] = os.path.join(self.test_dir, "phone.lock")
         self.env["PHONE_LOCK_TOKEN"] = "sm-test-token"
@@ -182,12 +186,17 @@ esac
 """
         self._write_executable("fastboot", fastboot_src)
 
+        # fake sweet-reset-bl (AP-55): the real one sends UDP SWEET-RESET-BL to 192.168.7.2:5141 and resets a live phone run
+        self.reset_log = os.path.join(self.test_dir, "reset-bl.log")
+        self._write_executable("fake-sweet-reset-bl", f"#!/bin/bash\necho called >> \"{self.reset_log}\"\nexit 0\n")
+
     def _write_executable(self, name, content):
         path = os.path.join(self.bin_dir, name)
         with open(path, "w") as f:
             f.write(content)
         st = os.stat(path)
         os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return path
 
     def run_phone(self, *args, timeout=30):
         cmd = [PHONE_TOOL] + list(args)
@@ -245,6 +254,15 @@ esac
         self.assertIn("RESULT: PASS state=fastboot target=fastboot", res.stdout)
         self.assertIn("USBNET: sudo sh -c", res.stdout)
         self.assertNotIn("NEED USER", res.stdout)	# the phone reset by itself inside the bound: the user is never asked
+        with open(self.reset_log) as f:	# AP-55: the fake ran; the real script cannot have (PATH-less absolute call would send UDP)
+            self.assertIn("called", f.read())
+
+    def test_04b_real_reset_bl_refuses_without_lock(self):
+        # AP-55 backstop: the real script exits 2 before sending when the caller holds no phone lock (empty lock dir, no token)
+        env = dict(self.env, PHONE_LOCK_DIR=os.path.join(self.test_dir, "nolock"), PHONE_LOCK_TOKEN="")
+        res = subprocess.run([os.path.join(REPO_ROOT, "tools", "sweet-reset-bl")], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("RESULT: ERROR", res.stdout)
 
     # 5. hung -> NEED USER line then success after fake state changes
     def test_05_hung_need_user_and_recover(self):
