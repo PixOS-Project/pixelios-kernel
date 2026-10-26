@@ -794,7 +794,7 @@ static void steps(void)
 #define PAT 0xA5A5A5A5u
 #define PATX 0x5A5A5A5Au            /* the RAM word under the image before the copy = image word ^ PATX: never equal, so a dropped store is always visible */
 static uint32_t ramarr[RAM_WORDS];
-static uint8_t imgbuf[SWW_IMG_MAX];
+static uint8_t imgbuf[SWW_IMG_MAX + 1];
 static uint32_t imglen;
 
 static uint32_t tcrc(const uint8_t *p, uint32_t n)         /* zlib CRC32, written independently of the header (known answer below) */
@@ -954,7 +954,9 @@ static void runb_full(void)
 	CHECK(f.w[NWANT + 3].off == SWW_RAM_BASE && ramarr[0x3AEAB0u / 4] == iw(441004u) && (ramarr[0x3AEAB0u / 4] >> 16) == 0 && ramarr[0x3AEAB4u / 4] == PAT && ram_ok(441005u, 0x49FFFCu));
 	/* one byte more than the bound, an empty image, a wrong container CRC, no image: refused at W8, before the first run B store */
 	obsb(&f, 336);
-	CHECK(runb(&f, &x, 4, SWW_IMG_MAX + 1, crc) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT && f.win2 == 0 && x.row == 8 && ram_ok(0, 0));
+	mkimg(SWW_IMG_MAX + 1);
+	obsb(&f, 336);
+	CHECK(runb(&f, &x, 4, SWW_IMG_MAX + 1, tcrc(imgbuf, SWW_IMG_MAX + 1)) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT && f.win2 == 0 && x.row == 8 && ram_ok(0, 0));       /* the CRC is right: only the size bound refuses it */
 	CHECK(strstr(logbuf, "stopped at W8 restore=none") != 0);
 	obsb(&f, 336);
 	CHECK(runb(&f, &x, 4, 0, 0) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT);
@@ -1125,6 +1127,8 @@ static void runb_gates(void)
 	CHECK(swl_wr(&x, SWW_BAR2, 0, SWW_RAM_BASE, iw(0) ^ 1u) == -SWW_E_IMG && f.nw == 0);                                              /* not the image word */
 	GB(336, RB | SWF_W9);
 	CHECK(swl_wr(&x, SWW_BAR2, 0, SWW_RAM_BASE + 4, iw(1)) == -SWW_E_IMG && f.nw == 0);                                                /* must start at word 0 */
+	GB(336, RB | SWF_W9);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, SWW_RAM_BASE + 4, iw(0)) == -SWW_E_IMG && f.nw == 0 && ramarr[SWW_RAM_BASE / 4 + 1] == (iw(1) ^ PATX));  /* the right word at the wrong address */
 	GB(336, RB | SWF_W9); x.img = 0;
 	CHECK(swl_wr(&x, SWW_BAR2, 0, SWW_RAM_BASE, 0) == -SWW_E_IMG && f.nw == 0);
 	GB(336, RB | SWF_W9); x.img_len = SWW_IMG_MAX + 1;
