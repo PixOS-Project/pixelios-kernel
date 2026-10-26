@@ -1,0 +1,720 @@
+SWEET WLAN stage 3 run C (patch 0131, W-D3 step 2, docs/research/43 rows W11..W13), behind boot-arg sweetwlan=5 (level 5 = run B of 0130, then W11-W13; levels 1-4 are byte-identical in behaviour to 0130).
+W11 the NVRAM text: the "NVRM" entry of the 0128 container, CRC-checked before W0 (like the image), run through a pure C port of Broadcom's process_nvram_vars() (bcmutils.c:5101-5146) and of what its caller does (dhd_pcie.c:4208-4253: last
+input byte forced to NUL, length rounded up to 4, one more NUL), stored at ram_end - 4 - varsize (varsize = ROUNDUP(len + 1, 4), dhd_pcie.c:10887-10891), zero padded, every word read back, then the whole text read back and its CRC32 compared.
+W12 the length token (~w << 16) | (w & 0xFFFF), w = varsize / 4, at the last RAM word ram_end - 4 (dhd_pcie.c:10962-10970). W13 the rTLV 136 bytes below the text: 128 random bytes, the length word 0x80 (no checksum for the RNG type), the type word
+0xFEEDC0DE (dhd_pcie.c:10480-10520, 17224-17236), read back; then the text and the token are read back once more and cfg 0x84 goes back to 0. The CA7 stays halted; nothing is released.
+Pure part (bsd/dev/sweet_wlan_wr.h): tuples SWT_WIN2_TAIL_C, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C (run 3, flag SWT_TW for the three tail kinds), still the one swl_wr(): a tail tuple carries no value and no address, swl_wr() computes the next
+word of the kind the address lies in (swl_tw_kind, swl_tw_word) and its address from ram_end and varsize (swl_geo_get) for every store; the table only bounds them at compile time. The whole tail must lie in the window 0x400000 (offset = backplane - 0x400000):
+a RAM end that puts any of it lower is refused after W7, before the first image word (the geometry was not observed; deny by default). A consumed ONCE tuple or a tail tuple of another kind hands the store to the next matching tuple of an allowed
+run (swl_wr_pick), so the second cfg 0x84 write and a zero text word at the last-word address need no second table of values. Entropy: swl_wbus.rng, injectable; the glue passes read_random() (bsd/sys/random.h, registered by patch 0014 at
+STARTUP_RANK_FIRST of EARLY_BOOT); a failing or all-zero draw stops before W0.
+Glue (bsd/dev/sweet_wlan.c): sw_fw_note() keeps the NVRM entry too, a 27 KB scratch buffer, sw3_rng(), level 5 accepted. sw3_wr() is unchanged (BAR2 window 0x400000 and cfg 0x84 as 0 / 0x400000 were already allowed by 0130).
+The final line of level 5: "SWEET WLAN: stage 3 level 5 done vars=<varsize> token=<hex> crc=<hex>", crc = CRC32 of the NVRAM region as read back.
+Host tests shim/wlan_wr_host_test.c and shim/wlan_nv_host_test.c (the process_nvram_vars port: hand-derived known answers and a differently structured reference), mutants tools/test_wlan_wr_mutants.py. HW-WRITE path: not yet reviewed.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index 686f404..734668a 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -8,6 +8,8 @@
+  *
+  * Patch 0129 (W-D3 step 2, docs/research/43): sweetwlan=3 runs stage 1 at level 2 and then run A of stage 3, the first chip WRITES (sweet_wlan_wr.h: ATU region 2 over BAR2,
+  * SYS_MEM reset, bank reads, CA7 halt, two BAR2 reads). Every store of stage 3 is sw3_wr(), called only through swl_wr()/swl_restore() of that header; levels 1-2 are unchanged.
++ * Patch 0131 (run C, sweetwlan=5 = run B + rows W11..W13): the NVRAM text (the "NVRM" entry of the container, processed as DHD does), the length token and a 128 byte rTLV at ram_end,
++ * all through the same swl_wr(); the glue adds only the NVRM entry, a scratch buffer and sw3_rng() (read_random()).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -17,6 +19,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <stdint.h>
++#include <sys/random.h>
+ #include "sweet_wlan_chip.h"
+ #include "sweet_wlan_fw.h"
+ #include "sweet_wlan_wr.h"
+@@ -101,6 +104,13 @@ static struct {
+ 	uint32_t len, crc;
+ } sw_fw;
+ 
++/* patch 0131 (run C): the "NVRM" entry the same way, and the scratch swl_nv_prep() processes it in (SWW_NV_BUF bytes: the largest accepted input + 8) */
++static struct {
++	uint8_t const *p;
++	uint32_t len, crc;
++} sw_nv;
++static uint8_t sw_nvbuf[SWW_NV_BUF];
++
+ static void
+ sw_fw_note(uint8_t const *base, struct swf_entry const *e, unsigned n)
+ {
+@@ -112,6 +122,11 @@ sw_fw_note(uint8_t const *base, struct swf_entry const *e, unsigned n)
+ 			sw_fw.len = e[i].length;
+ 			sw_fw.crc = e[i].crc;
+ 		}
++		if (memcmp(e[i].tag, "NVRM", 4) == 0) {
++			sw_nv.p = base + e[i].offset;
++			sw_nv.len = e[i].length;
++			sw_nv.crc = e[i].crc;
++		}
+ 	}
+ }
+ 
+@@ -243,6 +258,15 @@ sw3_map2(void *ctx)
+ 	return h->tcm == NULL;
+ }
+ 
++/* run C entropy for the rTLV: the kernel PRNG that patch 0014 registers at STARTUP_RANK_FIRST of EARLY_BOOT (osfmk/prng/prng_random.c), long before sweet_ufs_init() calls this; read_random() is declared in bsd/sys/random.h */
++static int
++sw3_rng(void *ctx, uint8_t *buf, uint32_t n)
++{
++	(void)ctx;
++	read_random(buf, n);
++	return 0;
++}
++
+ static void
+ sw3_delay(void *ctx, unsigned us)
+ {
+@@ -259,6 +283,7 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	wb.rd = sw3_rd;
+ 	wb.wr = sw3_wr;
+ 	wb.map2 = sw3_map2;
++	wb.rng = sw3_rng;
+ 	wb.delay_us = sw3_delay;
+ 	wb.ctx = hw;
+ 	memset(&x, 0, sizeof x);
+@@ -267,7 +292,12 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	x.img = sw_fw.p;
+ 	x.img_len = sw_fw.len;
+ 	x.img_crc = sw_fw.crc;
+-	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 3 ? "B" : "A");
++	x.nv_src = sw_nv.p;
++	x.nv_src_len = sw_nv.len;
++	x.nv_src_crc = sw_nv.crc;
++	x.nv = sw_nvbuf;
++	x.nv_cap = sizeof sw_nvbuf;
++	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 4 ? "C" : level > 3 ? "B" : "A");
+ 	(void)swl_stage3(&x);
+ }
+ 
+@@ -292,7 +322,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 4 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 5 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+index db50868..0d209c7 100644
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -9,6 +9,8 @@
+  * SYS_MEM reset, the 21 bank reads that give the RAM size, CA7 halt, the first two BAR2 reads. Nothing is copied to the chip.
+  * Later runs (image copy, NVRAM, vector, release) are NOT here: they are more rows in swl_wt[] / swl_rt[] / swl_rs[] with a higher
+  * .run and a step function, the checks in swl_wr() do not change.
++ * Run B (patch 0130, sweetwlan=4) copies the image; run C (patch 0131, sweetwlan=5) stores the NVRAM text, the length token and the rTLV below ram_end (rows W11..W13). The words of run C come
++ * from the state (swl_tw_word), not from the caller, and their addresses from ram_end and varsize (swl_geo_get): swl_wr() recomputes both for every store.
+  *
+  * swl_wr() checks, in this order: not stopped, tuple exists (space, window, offset, value), run <= level - 2, tuple not consumed,
+  * predecessor done, phase flags set, bank rule state, the 0124 preconditions re-read (link L0, ATU r0/r1/r2, EP Command, BAR0),
+@@ -63,6 +65,18 @@
+ #define SWW_LAST_HI_MAX (SWW_RAM_BASE + SWW_RAM_MAX - 4u - SWW_WIN_TAIL)        /* last RAM word when ram_end > 0x400000: BAR2 offset under window SWW_WIN_TAIL, ram_end <= 0x600000 */
+ _Static_assert(SWW_IMG_MAX + SWW_RAM_VARS == SWW_RAM_MIN && SWW_IMG_MAX == 1764018u, "image bound");
+ 
++/* Run C (patch 0131, docs/research/43 rows W11..W13, boot-arg sweetwlan=5): the tail below ram_end = NVRAM text, length token, rTLV (DHD: dhdpcie_bus_write_vars, dhdpcie_wrt_rnd) */
++#define SWW_NV_DHD_MAX  32768u          /* MAX_NVRAMBUF_SIZE (bcm4389-dhd.h:509): DHD downloads only 0 < len < this (dhd_pcie.c:4208) */
++#define SWW_NV_VARS_MAX 27068u          /* bound of the vars bytes: ROUNDUP(varsz, 4) with varsz <= 27065 for the 27062 B cal text (docs/research/43 s.2 fit arithmetic) */
++#define SWW_NV_BUF      (SWW_NV_VARS_MAX + 8u)  /* scratch of the glue: an input of at most SWW_NV_VARS_MAX bytes plus 8 zero bytes (pad, extra NUL, ROUNDUP) */
++#define SWW_RTLV_RNG    128u            /* BCM_ENTROPY_HOST_NBYTES (include_bcmrand.h:50) */
++#define SWW_RTLV_BYTES  (SWW_RTLV_RNG + 8u)     /* value + length word + type word (dhd_pcie.c:10484-10485) */
++#define SWW_RTLV_WORDS  (SWW_RTLV_BYTES / 4u)
++#define SWW_RTLV_LEN    0x80u           /* length word of the rng rTLV: the size, no checksum (dhd_pcie.c:10497-10502) */
++#define SWW_RTLV_RNGSIG 0xFEEDC0DEu     /* DNGL_RTLV_TYPE_RNG_SIGNATURE (include_dngl_rtlv.h:67) */
++_Static_assert(SWW_NV_VARS_MAX + 4u + SWW_RTLV_BYTES == SWW_RAM_VARS && SWW_NV_VARS_MAX % 4u == 0, "tail bound");
++_Static_assert(SWW_WIN_TAIL >= SWW_IMG_END, "the tail window starts above the image");
++
+ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+ /* phase flags (what the steps proved), required by swl_wt[].need */
+@@ -78,6 +92,10 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ #define SWF_W8      0x200u      /* run B: cfg 0x84 is on the window the last-word store needs (or no window is needed) */
+ #define SWF_W9      0x400u      /* the last RAM word is 0 and cfg 0x84 is back at 0 */
+ #define SWF_W10     0x800u      /* the image is in RAM and its CRC read back equals the container's */
++#define SWF_W11     0x1000u     /* run C: cfg 0x84 is on the tail window and the NVRAM text is stored and read back */
++#define SWF_W12     0x2000u     /* the length token is stored and read back */
++#define SWF_RTLV    0x4000u     /* the rTLV is stored and read back (cfg 0x84 not yet back at 0) */
++#define SWF_W13     0x8000u     /* cfg 0x84 is back at 0 */
+ 
+ #define SWW_RG_ATU2 1u          /* restore groups, armed by the first store of a tuple that names one */
+ #define SWW_RG_SM   2u
+@@ -90,16 +108,22 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ #define SWT_BULK    8u          /* image words: val is the image word, off ascending inside the image; preconditions, live window and the old-value read only on the first word of a 64 KiB chunk, no per-word read-back (the chunk CRC is the read-back) */
+ #define SWT_TAIL    16u         /* only when ram_end > SWW_TCM_BYTES (the last RAM word is beyond the BAR2 window 0) */
+ #define SWT_LAST    32u         /* the last RAM word: off == ram_end - 4 - win */
++#define SWT_TW      64u         /* run C tail word: val is the next word of the tail kind that the address names (swl_tw_kind), off ascending from that kind's base */
++
++#define SWK_VARS    1               /* tail kinds: the NVRAM text (varsize bytes), the length token (the last RAM word), the rTLV (value, length word, type word) */
++#define SWK_TOKEN   2
++#define SWK_RTLV    3
+ 
+ enum {
+ 	SWW_E_STOPPED = 1, SWW_E_DENIED, SWW_E_LEVEL, SWW_E_REPEAT, SWW_E_ORDER, SWW_E_PHASE, SWW_E_BANK, SWW_E_PRE, SWW_E_WIN, SWW_E_RD,
+-	SWW_E_DEAD, SWW_E_OLD, SWW_E_COMP, SWW_E_WR, SWW_E_READBACK, SWW_E_STATE, SWW_E_WAIT, SWW_E_SRPWR, SWW_E_RAM, SWW_E_MAP, SWW_E_IMG, SWW_E_TAIL, SWW_E_LAST
++	SWW_E_DEAD, SWW_E_OLD, SWW_E_COMP, SWW_E_WR, SWW_E_READBACK, SWW_E_STATE, SWW_E_WAIT, SWW_E_SRPWR, SWW_E_RAM, SWW_E_MAP, SWW_E_IMG, SWW_E_TAIL, SWW_E_NV, SWW_E_GEO, SWW_E_RNG, SWW_E_LAST
+ };
+ 
+ enum { SWW_RS_NONE, SWW_RS_OK, SWW_RS_FAILED, SWW_RS_SKIPPED };
+ 
+ struct swl_wt {                 /* one allowed write */
+ 	uint8_t row, run, space, rgrp, flags, pred1;    /* pred1 = predecessor tuple index + 1 (0 none) */
++	uint8_t kind;                                   /* SWT_TW: the tail kind (SWK_*) the tuple stores */
+ 	uint32_t win, off, val, vmask;                  /* BAR0/BAR2 window (0 otherwise), offset, value, read-back mask */
+ 	uint32_t hi;                                    /* last allowed offset (inclusive, 4-aligned steps from off); 0 = off only */
+ 	uint32_t omask, oval;                           /* (old & omask) == oval, omask 0 = no condition */
+@@ -119,6 +143,8 @@ enum {
+ 	SWT_N_A,                                                        /* the run A tuples end here (run B follows) */
+ 	SWT_WIN2_TAIL = SWT_N_A, SWT_LAST_LO, SWT_LAST_HI, SWT_WIN2_ZERO,       /* W8, W9, W8 restore */
+ 	SWT_IMG,                                                        /* W10 */
++	SWT_N_B,                                                        /* the run B tuples end here (run C follows) */
++	SWT_WIN2_TAIL_C = SWT_N_B, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C, /* W11 window, W11 vars, W12, W13, W13 window restore */
+ 	SWT_N
+ };
+ _Static_assert(SWT_N <= 32, "x->done is a 32-bit tuple mask");
+@@ -172,6 +198,20 @@ static const struct swl_wt swl_wt[SWT_N] = {
+ 	[SWT_WIN2_ZERO]  = { .row = 8, .run = 2, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL, .pred1 = SWT_LAST_HI + 1, .off = SWW_CFG_WIN2, .val = 0, .vmask = 0xFFFFFFFFu,
+ 	                    .omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_W8 },
+ 	[SWT_IMG]        = { .row = 10, .run = 2, .space = SWW_BAR2, .flags = SWT_BULK, .win = 0, .off = SWW_RAM_BASE, .hi = SWW_IMG_END - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W9 },
++
++	/* Run C (docs/research/43 rows W11..W13): only in the window SWW_WIN_TAIL (the tail of the observed 0x4a0000 RAM; a RAM end that puts any of it below 0x400000 is refused by swl_geo_get).
++	 * The window is moved once for W11..W13 (the window tuple arms the restore group, which stays armed until W13 is done) and restored after the rTLV; the three tail kinds are stored in the order vars, token, rTLV. A tail tuple has no value of its own: swl_wr() takes the word
++	 * from the processed text / token / rTLV and the address from ram_end and varsize (runtime), the table only bounds them (compile time: the last word of a 6 MiB RAM). */
++	[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL, .vmask = 0xFFFFFFFFu,
++	                     .omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W10 },
++	[SWT_NV_VARS]    = { .row = 11, .run = 3, .space = SWW_BAR2, .flags = SWT_TW, .kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,
++	                     .hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W10 },
++	[SWT_NV_TOKEN]   = { .row = 12, .run = 3, .space = SWW_BAR2, .flags = SWT_TW, .kind = SWK_TOKEN, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,
++	                     .hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W11 },
++	[SWT_NV_RTLV]    = { .row = 13, .run = 3, .space = SWW_BAR2, .flags = SWT_TW, .kind = SWK_RTLV, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,
++	                     .hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W12 },
++	[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL, .pred1 = SWT_WIN2_TAIL_C + 1, .off = SWW_CFG_WIN2, .val = 0, .vmask = 0xFFFFFFFFu,
++	                     .omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_RTLV },
+ };
+ 
+ /* The read allowlist (every read of run A, including the ones of the preconditions). */
+@@ -211,6 +251,7 @@ struct swl_wbus {
+ 	int (*rd)(void *ctx, int space, uint32_t win, uint32_t off, uint32_t *v);       /* nonzero: refused or failed; BAR0/BAR2 compare the live window with win */
+ 	int (*wr)(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v);        /* THE store; nonzero: refused; called only by swl_store() */
+ 	int (*map2)(void *ctx);                                                         /* ml_io_map of BAR2, after region 2 is enabled */
++	int (*rng)(void *ctx, uint8_t *buf, uint32_t n);                                /* run C: n random bytes; nonzero = failed (injectable, the host test is deterministic) */
+ 	void (*delay_us)(void *ctx, unsigned us);
+ 	void *ctx;
+ };
+@@ -222,13 +263,19 @@ struct swl_wx {
+ 	uint32_t done, flags, armed, ram_bytes;
+ 	const uint8_t *img;                             /* run B: the firmware image (container entry, CRC-checked by 0128) */
+ 	uint32_t img_len, img_crc, img_next, img_crc_rb;        /* bytes, the container's CRC32, index of the next word swl_wr() accepts (= words stored), CRC32 of the read-back */
++	const uint8_t *nv_src;                          /* run C: the NVRM container entry (CRC-checked by 0128 and again by swl_nv_prep) */
++	uint32_t nv_src_len, nv_src_crc;
++	uint8_t *nv;                                    /* run C: scratch (owned by the glue) that holds the processed text, at least nv_src_len + 8 bytes */
++	uint32_t nv_cap, nv_varsize, nv_crc, nv_crc_rb, tok;    /* its size, ROUNDUP(varsz, 4) (0 = not prepared), CRC32 of the varsize bytes (source / read back), the length token */
++	uint32_t tn[4];                                 /* run C: index of the next word swl_wr() accepts per tail kind SWK_* */
++	uint8_t rtlv[SWW_RTLV_RNG];                     /* run C: the random bytes of the rTLV */
+ };
+ 
+ static inline const char *
+ swl_ename(int c)
+ {
+ 	static const char *const n[SWW_E_LAST] = { "none", "stopped", "no tuple", "level", "repeat", "order", "phase", "bank rule", "precondition", "window", "read",
+-	                                           "dead read", "old value", "companion", "store", "read-back", "state", "wait", "srpwr", "ram size", "map", "image", "tail window" };
++	                                           "dead read", "old value", "companion", "store", "read-back", "state", "wait", "srpwr", "ram size", "map", "image", "tail window", "nvram", "tail geometry", "entropy" };
+ 	return c > 0 && c < SWW_E_LAST ? n[c] : "?";
+ }
+ 
+@@ -282,6 +329,145 @@ swl_img_word(const struct swl_wx *x, uint32_t w)
+ 	return v;
+ }
+ 
++/* ---- run C helpers: the NVRAM text as DHD makes it, the tail geometry, the tail words ---- */
++
++/* process_nvram_vars() (bcmutils.c:5101-5146) in place on vb[0..len): drops CR, comment lines (# to the end of the line) and empty lines, ends each line with a NUL, pads the result with NULs to a
++ * multiple of 4 only when the padded size still fits in len, zero-fills the rest up to len. Returns the processed length. */
++static inline uint32_t
++swl_nv_process(uint8_t *vb, uint32_t len)
++{
++	uint32_t n, dp = 0, buf_len, pad;
++	int find_nl = 0;
++	uint32_t column = 0;
++
++	for (n = 0; n < len; n++) {
++		if (vb[n] == '\r') {
++			continue;
++		}
++		if (find_nl && vb[n] != '\n') {
++			continue;
++		}
++		find_nl = 0;
++		if (vb[n] == '#') {
++			find_nl = 1;
++			continue;
++		}
++		if (vb[n] == '\n') {
++			if (column == 0) {
++				continue;
++			}
++			vb[dp++] = 0;
++			column = 0;
++			continue;
++		}
++		vb[dp++] = vb[n];
++		column++;
++	}
++	buf_len = dp;
++	if (buf_len % 4u) {
++		pad = 4u - buf_len % 4u;
++		if (buf_len + pad <= len) {
++			buf_len += pad;
++		}
++	}
++	while (dp < len) {
++		vb[dp++] = 0;
++	}
++	return buf_len;
++}
++
++/* The caller of process_nvram_vars() in dhdpcie_download_nvram (dhd_pcie.c:4208-4253): only 0 < len < MAX_NVRAMBUF_SIZE is downloaded, the last input byte is forced to NUL, the text is processed,
++ * its length rounded up to 4, one more NUL follows, and len + 1 bytes go to dhdpcie_downloadvars() (varsz). vb has len + 8 writable bytes; the bytes past len are zeroed first (DHD's buffer past the file
++ * is whatever the allocator gave; the zero is our choice). Returns varsz, 0 = DHD downloads nothing. */
++static inline uint32_t
++swl_nv_dhd(uint8_t *vb, uint32_t len)
++{
++	uint32_t i;
++
++	if (len == 0 || len >= SWW_NV_DHD_MAX) {
++		return 0;
++	}
++	for (i = 0; i < 8u; i++) {
++		vb[len + i] = 0;
++	}
++	vb[len - 1u] = 0;
++	len = swl_nv_process(vb, len);
++	if (len % 4u) {
++		len += 4u - len % 4u;
++	}
++	vb[len] = 0;
++	return len ? len + 1u : 0;
++}
++
++struct swl_geo { uint32_t rt, vars, tok, vwords; };     /* backplane addresses: rTLV value (136 B), NVRAM text (varsize B), the token (the last RAM word); words of the text */
++
++/* The tail below ram_end as DHD lays it out (dhd_pcie.c:10888-10891 vars at ram_end - 4 - varsize, 10485-10487 the first rTLV 136 B below the vars): 0 = usable, else an error code. The whole tail must lie in
++ * the window SWW_WIN_TAIL (offset = backplane - 0x400000); a RAM end that puts a part of it below 0x400000 is refused (not observed, no window logic for it). The regions are adjacent, never overlapping. */
++static inline int
++swl_geo_get(const struct swl_wx *x, struct swl_geo *g)
++{
++	if (x->nv_varsize == 0 || x->nv_varsize > SWW_NV_VARS_MAX || (x->nv_varsize & 3u) != 0) {
++		return SWW_E_NV;
++	}
++	if (x->ram_bytes > SWW_RAM_MAX) {
++		return SWW_E_RAM;
++	}
++	g->tok = SWW_RAM_BASE + x->ram_bytes - 4u;
++	g->vars = g->tok - x->nv_varsize;
++	g->rt = g->vars - SWW_RTLV_BYTES;
++	g->vwords = x->nv_varsize / 4u;
++	return g->rt < SWW_WIN_TAIL ? SWW_E_GEO : 0;
++}
++
++/* the tail kind (SWK_*) that backplane address bp lies in, 0 = none (or no usable geometry) */
++static inline int
++swl_tw_kind(const struct swl_wx *x, uint32_t bp)
++{
++	struct swl_geo g;
++
++	if (swl_geo_get(x, &g)) {
++		return 0;
++	}
++	if (bp >= g.rt && bp < g.vars) {
++		return SWK_RTLV;
++	}
++	if (bp >= g.vars && bp < g.tok) {
++		return SWK_VARS;
++	}
++	return bp == g.tok ? SWK_TOKEN : 0;
++}
++
++static inline uint32_t
++swl_tw_n(const struct swl_geo *g, int k)
++{
++	return k == SWK_VARS ? g->vwords : k == SWK_TOKEN ? 1u : SWW_RTLV_WORDS;
++}
++
++static inline uint32_t
++swl_tw_base(const struct swl_geo *g, int k)
++{
++	return k == SWK_VARS ? g->vars : k == SWK_TOKEN ? g->tok : g->rt;
++}
++
++/* the word that belongs at index i of tail kind k (little endian, the text and the random bytes as DHD copies them; the rTLV: the value, then the length word, then the type word) */
++static inline uint32_t
++swl_tw_word(const struct swl_wx *x, int k, uint32_t i)
++{
++	const uint8_t *b = k == SWK_VARS ? x->nv : x->rtlv;
++	uint32_t v = 0, j;
++
++	if (k == SWK_TOKEN) {
++		return x->tok;
++	}
++	if (k == SWK_RTLV && i >= SWW_RTLV_RNG / 4u) {
++		return i == SWW_RTLV_RNG / 4u ? SWW_RTLV_LEN : SWW_RTLV_RNGSIG;
++	}
++	for (j = 0; j < 4; j++) {
++		v |= (uint32_t)b[4u * i + j] << (8u * j);
++	}
++	return v;
++}
++
+ /* ---- reads ---- */
+ 
+ static inline int
+@@ -312,13 +498,13 @@ swl_rdx(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t *v)
+ 
+ /* ---- the guard ---- */
+ 
+-/* tuple index of (space, window, offset, value) or -1: the whole allowlist decision that needs no state */
++/* tuple index (from i0 on) of (space, window, offset, value) or -1: the whole allowlist decision that needs no state */
+ static inline int
+-swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
++swl_wr_ok_from(unsigned i0, int space, uint32_t win, uint32_t off, uint32_t val)
+ {
+ 	unsigned i;
+ 
+-	for (i = 0; i < SWT_N; i++) {
++	for (i = i0; i < SWT_N; i++) {
+ 		const struct swl_wt *p = &swl_wt[i];
+ 
+ 		if (p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {
+@@ -328,7 +514,7 @@ swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
+ 			if (val < SWW_BANK_ROM) {
+ 				return (int)i;
+ 			}
+-		} else if (p->flags & SWT_BULK) {
++		} else if (p->flags & (SWT_BULK | SWT_TW)) {
+ 			return (int)i;
+ 		} else if (p->val == val) {
+ 			return (int)i;
+@@ -337,6 +523,29 @@ swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
+ 	return -1;
+ }
+ 
++static inline int
++swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
++{
++	return swl_wr_ok_from(0, space, win, off, val);
++}
++
++/* The tuple swl_wr() judges the store by: the first match, except that a later tuple takes over when the first one is a consumed ONCE tuple (the same cfg 0x84 write again in run C, a zero at the last
++ * word after W9) or a tail tuple of another kind than the address lies in. Only a tuple the level allows takes over; when none does, the first match reports (REPEAT, tail word). */
++static inline int
++swl_wr_pick(const struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
++{
++	int first = swl_wr_ok(space, win, off, val), t = first, n;
++
++	while (t >= 0 && (((swl_wt[t].flags & SWT_ONCE) && (x->done & (1u << t))) || ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {
++		n = swl_wr_ok_from((unsigned)t + 1u, space, win, off, val);
++		if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {      /* n < 0: none; the search only moves forward */
++			return first;
++		}
++		t = n;
++	}
++	return t;
++}
++
+ static inline int
+ swl_win_known(uint32_t w)
+ {
+@@ -460,13 +669,14 @@ static inline int
+ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ {
+ 	const struct swl_wt *p;
+-	uint32_t old = 0, comp = 0, live = 0, rb = 0;
+-	int t;
++	struct swl_geo g;
++	uint32_t old = 0, comp = 0, live = 0, rb = 0, ti = 0;
++	int t, first, gr;
+ 
+ 	if (x->stopped) {
+ 		return -SWW_E_STOPPED;
+ 	}
+-	t = swl_wr_ok(space, win, off, val);
++	t = swl_wr_pick(x, space, win, off, val);
+ 	if (t < 0) {
+ 		return swl_stop(x, SWW_E_DENIED);
+ 	}
+@@ -496,7 +706,18 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 	    x->img_next >= (x->img_len + 3u) / 4u || val != swl_img_word(x, x->img_next))) {
+ 		return swl_stop(x, SWW_E_IMG);
+ 	}
+-	if (!(p->flags & SWT_BULK) || ((off - SWW_RAM_BASE) & (4u * SWW_CHUNK_W - 1u)) == 0) {
++	if (p->flags & SWT_TW) {        /* run C: the geometry, the kind's next address and its word are computed here from the state, not taken from the caller */
++		ti = x->tn[p->kind];
++		gr = swl_geo_get(x, &g);
++		if (gr) {
++			return swl_stop(x, gr);
++		}
++		if (ti >= swl_tw_n(&g, p->kind) || win + off != swl_tw_base(&g, p->kind) + 4u * ti || val != swl_tw_word(x, p->kind, ti)) {
++			return swl_stop(x, SWW_E_NV);
++		}
++	}
++	first = !(p->flags & (SWT_BULK | SWT_TW)) || ((p->flags & SWT_BULK) && ((off - SWW_RAM_BASE) & (4u * SWW_CHUNK_W - 1u)) == 0) || ((p->flags & SWT_TW) && ti == 0);
++	if (first) {
+ 		if (swl_wpre(x)) {
+ 			return swl_stop(x, SWW_E_PRE);
+ 		}
+@@ -527,6 +748,10 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 	if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {
+ 		return swl_stop(x, SWW_E_READBACK);
+ 	}
++	if (p->flags & SWT_TW) {
++		x->tn[p->kind]++;
++		return 0;
++	}
+ 	x->done |= 1u << t;
+ 	if (p->flags & SWT_BANK) {
+ 		x->nbank++;
+@@ -808,6 +1033,56 @@ swl_img_check(struct swl_wx *x)
+ 	return 0;
+ }
+ 
++/* Run C, before any store: the NVRM container entry is usable and its CRC32 (computed here from a private copy of the bytes) equals the container's, DHD's processing of it gives a text of at most SWW_NV_VARS_MAX bytes, and the
++ * random bytes of the rTLV are drawn (not all zero). Fills x->nv (the processed text, zero padded to varsize), nv_varsize, tok, nv_crc, rtlv; x->nv_varsize stays 0 on any refusal. */
++static inline int
++swl_nv_prep(struct swl_wx *x)
++{
++	uint32_t i, varsz, varsize, w, src = SWW_CRC_INIT, c = SWW_CRC_INIT, any = 0;
++
++	x->nv_varsize = 0;
++	if (x->nv_src == NULL || x->nv_src_len == 0 || x->nv_src_len > SWW_NV_VARS_MAX || x->nv == NULL || x->nv_cap < x->nv_src_len + 8u) {
++		printf("SWEET WLAN: W%u no usable NVRAM entry (%u bytes, at most %u)\n", x->row, x->nv_src_len, SWW_NV_VARS_MAX);
++		return swl_stop(x, SWW_E_NV);
++	}
++	for (i = 0; i < x->nv_src_len; i++) {
++		x->nv[i] = x->nv_src[i];        /* the CRC is taken over this private copy, so what is checked is what is processed */
++	}
++	for (i = 0; i < x->nv_src_len; i++) {
++		src = swl_crc_b(src, x->nv[i]);
++	}
++	if (~src != x->nv_src_crc) {
++		printf("SWEET WLAN: W%u NVRAM CRC %#010x != container %#010x\n", x->row, ~src, x->nv_src_crc);
++		return swl_stop(x, SWW_E_NV);
++	}
++	varsz = swl_nv_dhd(x->nv, x->nv_src_len);
++	varsize = (varsz + 3u) & ~3u;
++	if (varsz == 0 || varsize > SWW_NV_VARS_MAX) {
++		printf("SWEET WLAN: W%u NVRAM text of %u bytes gives varsz %u (varsize %u, at most %u)\n", x->row, x->nv_src_len, varsz, varsize, SWW_NV_VARS_MAX);
++		return swl_stop(x, SWW_E_NV);
++	}
++	for (i = 0; i < varsize; i++) {
++		c = swl_crc_b(c, x->nv[i]);
++	}
++	if (x->b->rng == NULL || x->b->rng(x->b->ctx, x->rtlv, SWW_RTLV_RNG) != 0) {
++		printf("SWEET WLAN: W%u no random bytes for the rTLV\n", x->row);
++		return swl_stop(x, SWW_E_RNG);
++	}
++	for (i = 0; i < SWW_RTLV_RNG; i++) {
++		any |= x->rtlv[i];
++	}
++	if (any == 0) {
++		printf("SWEET WLAN: W%u the random bytes are all zero\n", x->row);
++		return swl_stop(x, SWW_E_RNG);
++	}
++	w = varsize / 4u;
++	x->tok = (~w << 16) | (w & 0xFFFFu);     /* dhd_pcie.c:10962-10963 */
++	x->nv_crc = ~c;
++	x->nv_varsize = varsize;
++	printf("SWEET WLAN: W%u NVRAM %u bytes -> varsz %u varsize %u token %#010x crc %#010x\n", x->row, x->nv_src_len, varsz, varsize, x->tok, x->nv_crc);
++	return 0;
++}
++
+ /* W8: cfg 0x84 (BAR2 window) := SWW_WIN_TAIL, only when the last RAM word lies beyond BAR2 window 0 (ram_end > 0x400000); armed for restore to 0 until W9 is done */
+ static inline int
+ swl_w8(struct swl_wx *x)
+@@ -879,6 +1154,134 @@ swl_w10(struct swl_wx *x)
+ 	return swl_done(x, SWF_W10);
+ }
+ 
++/* run C: the tail geometry is usable for the prepared text (no store; checked before the image is copied) */
++static inline int
++swl_tail_check(struct swl_wx *x)
++{
++	struct swl_geo g;
++	int rc;
++
++	x->row = 11;
++	rc = swl_geo_get(x, &g);
++	if (rc) {
++		printf("SWEET WLAN: W11 tail geometry refused: ram_end %#x varsize %u (the rTLV, text and token must lie at or above %#x)\n", SWW_RAM_BASE + x->ram_bytes, x->nv_varsize, SWW_WIN_TAIL);
++		return swl_stop(x, rc);
++	}
++	return 0;
++}
++
++/* read the words of tail kind k back (cfg 0x84 on the tail window) and compare each with the word that belongs there */
++static inline int
++swl_tw_verify(struct swl_wx *x, int k)
++{
++	struct swl_geo g;
++	uint32_t i, v;
++	int rc = swl_geo_get(x, &g);
++
++	if (rc) {
++		return swl_stop(x, rc);
++	}
++	for (i = 0; i < swl_tw_n(&g, k); i++) {
++		SWW_RD(x, SWW_BAR2, SWW_WIN_TAIL, swl_tw_base(&g, k) + 4u * i - SWW_WIN_TAIL, v);
++		if (v != swl_tw_word(x, k, i)) {
++			printf("SWEET WLAN: W%u tail kind %d word %u read %#x expected %#x\n", x->row, k, i, v, swl_tw_word(x, k, i));
++			return swl_stop(x, SWW_E_READBACK);
++		}
++	}
++	return 0;
++}
++
++/* read the NVRAM text back and compare the CRC32 of the whole of it with the CRC of the prepared text */
++static inline int
++swl_nv_verify(struct swl_wx *x)
++{
++	struct swl_geo g;
++	uint32_t i, v, c = SWW_CRC_INIT;
++	int rc = swl_geo_get(x, &g);
++
++	if (rc) {
++		return swl_stop(x, rc);
++	}
++	for (i = 0; i < g.vwords; i++) {
++		SWW_RD(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, v);
++		c = swl_crc_word(c, v, i, x->nv_varsize);
++	}
++	x->nv_crc_rb = ~c;
++	if (x->nv_crc_rb != x->nv_crc) {
++		printf("SWEET WLAN: W%u NVRAM read-back CRC %#010x != %#010x\n", x->row, x->nv_crc_rb, x->nv_crc);
++		return swl_stop(x, SWW_E_READBACK);
++	}
++	return 0;
++}
++
++/* W11: cfg 0x84 := SWW_WIN_TAIL (armed for restore until W13 is done), then the NVRAM text at ram_end - 4 - varsize, ascending words, each read back by swl_wr(); then the whole text is read back and its CRC compared */
++static inline int
++swl_w11(struct swl_wx *x)
++{
++	struct swl_geo g;
++	uint32_t i;
++	int rc;
++
++	x->row = 11;
++	rc = swl_geo_get(x, &g);
++	if (rc) {
++		return swl_stop(x, rc);
++	}
++	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, SWW_WIN_TAIL));        /* ref: dhd_pcie.c:6193-6197 (setbar1win) */
++	printf("SWEET WLAN: W11 cfg 0x84 := %#x\n", SWW_WIN_TAIL);
++	for (i = 0; i < g.vwords; i++) {
++		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_VARS, i)));       /* ref: dhd_pcie.c:10902-10905 (membytes of the vars) */
++	}
++	SWW_TRY(swl_nv_verify(x));
++	printf("SWEET WLAN: W11 NVRAM text bp %#x..%#x varsize %u crc %#010x read back\n", g.vars, g.tok - 4u, x->nv_varsize, x->nv_crc_rb);
++	x->flags |= SWF_W11;
++	return 0;
++}
++
++/* W12: the length token at the last RAM word (ram_end - 4), read back */
++static inline int
++swl_w12(struct swl_wx *x)
++{
++	struct swl_geo g;
++	int rc;
++
++	x->row = 12;
++	rc = swl_geo_get(x, &g);
++	if (rc) {
++		return swl_stop(x, rc);
++	}
++	SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.tok - SWW_WIN_TAIL, x->tok));        /* ref: dhd_pcie.c:10969-10970 (token to phys_size - 4); swl_wr() reads the one word back, W13 reads it again */
++	printf("SWEET WLAN: W12 token %#010x at bp %#x read back\n", x->tok, g.tok);
++	x->flags |= SWF_W12;
++	return 0;
++}
++
++/* W13: the rTLV (random value, length word 0x80, type 0xFEEDC0DE) 136 bytes below the text, read back; then the text and the token once more (nothing above it may have changed them); then cfg 0x84 back to 0 */
++static inline int
++swl_w13(struct swl_wx *x)
++{
++	struct swl_geo g;
++	uint32_t i;
++	int rc;
++
++	x->row = 13;
++	rc = swl_geo_get(x, &g);
++	if (rc) {
++		return swl_stop(x, rc);
++	}
++	for (i = 0; i < SWW_RTLV_WORDS; i++) {
++		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.rt + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_RTLV, i)));      /* ref: dhd_pcie.c:10507-10520 (rTLV value, length word, type word) */
++	}
++	SWW_TRY(swl_tw_verify(x, SWK_RTLV));
++	SWW_TRY(swl_nv_verify(x));
++	SWW_TRY(swl_tw_verify(x, SWK_TOKEN));
++	printf("SWEET WLAN: W13 rTLV bp %#x..%#x (value %u B, length word %#x, type %#x) read back\n", g.rt, g.vars - 4u, SWW_RTLV_RNG, SWW_RTLV_LEN, SWW_RTLV_RNGSIG);
++	x->flags |= SWF_RTLV;
++	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, 0u));
++	printf("SWEET WLAN: W13 cfg 0x84 := 0 (window restored)\n");
++	return swl_done(x, SWF_W13);
++}
++
+ /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
+ static inline int
+ swl_stage3(struct swl_wx *x)
+@@ -896,6 +1299,14 @@ swl_stage3(struct swl_wx *x)
+ 			return rc;
+ 		}
+ 	}
++	if (x->level >= SWW_LEVEL0 + 3) {      /* run C: the NVRAM entry is checked and processed and the entropy drawn before any store, like the image */
++		x->row = 11;
++		rc = swl_nv_prep(x);
++		if (rc) {
++			printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
++			return rc;
++		}
++	}
+ 	rc = swl_w0(x);
+ 	rc = rc ? rc : swl_w1(x);
+ 	rc = rc ? rc : swl_w2(x);
+@@ -904,15 +1315,27 @@ swl_stage3(struct swl_wx *x)
+ 	rc = rc ? rc : swl_w5(x);
+ 	rc = rc ? rc : swl_w6(x);
+ 	rc = rc ? rc : swl_w7(x);
++	if (x->level >= SWW_LEVEL0 + 3) {
++		rc = rc ? rc : swl_tail_check(x);
++	}
+ 	if (x->level >= SWW_LEVEL0 + 2) {
+ 		rc = rc ? rc : swl_w8(x);
+ 		rc = rc ? rc : swl_w9(x);
+ 		rc = rc ? rc : swl_w10(x);
+ 	}
++	if (x->level >= SWW_LEVEL0 + 3) {
++		rc = rc ? rc : swl_w11(x);
++		rc = rc ? rc : swl_w12(x);
++		rc = rc ? rc : swl_w13(x);
++	}
+ 	if (rc) {
+ 		printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
+ 		return rc;
+ 	}
++	if (x->level >= SWW_LEVEL0 + 3) {
++		printf("SWEET WLAN: stage 3 level %d done vars=%u token=%#010x crc=%#010x\n", x->level, x->nv_varsize, x->tok, x->nv_crc_rb);
++		return 0;
++	}
+ 	if (x->level >= SWW_LEVEL0 + 2) {
+ 		printf("SWEET WLAN: stage 3 level %d done crc=%#010x words=%u\n", x->level, x->img_crc_rb, x->img_next);
+ 		return 0;
