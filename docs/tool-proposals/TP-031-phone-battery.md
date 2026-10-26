@@ -24,4 +24,4 @@ One line per variable then `RESULT: PASS battery-voltage=NNNN mV soc-ok=yes|no` 
 Read-only `fastboot getvar` on the attached phone, only when `ro.product`/`product` is bluejay (AGENTS.md hard rule 2); no flash, no write, no reboot. Runs under the phone lock of the caller (xrun already holds it). Must never run `fastboot oem` or any write variable.
 
 ## amendments
-(none)
+- 2026-10-26 Claude Sonnet 5.5 (GPU driver): read once by hand under `phone-lock run` (bluejay confirmed): `battery-voltage: 4310 mV`, `battery-soc-ok: yes`, `charger-screen-enabled` not found (fastboot variable absent). Battery drain after a reset looks excluded [obs, single read after gputest42]; the proposal stays useful only for logging, priority low.
