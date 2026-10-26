@@ -41,6 +41,8 @@ while [ $# -gt 0 ]; do case "$1" in
 if [ "$dry" = 1 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
 # run intent (tools/run-intents.json): refuse a run that lacks the flags/boot-args its purpose needs BEFORE it costs a phone cycle (AP-55); the label hint is a warning only
 python3 -I tools/run-preflight --intent-check "$intent" --label "$label" -- tools/xrun ${orig[@]+"${orig[@]}"} || exit 2
+# the camera step needs CAM_HOST from .env (gitignored, absent in a new worktree): fail now, before the build and the phone lock (AP-78)
+[ "$nocam" = 1 ] || [[ " $reader " == *" --esp "* ]] || python3 -I tools/envfile.py require CAM_HOST || exit 2
 [ "$early" = 0 ] || [ ${#stops[@]} -gt 0 ] || stops=("${rawexp[@]}")
 [ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
 [ "$full" = 1 ] || [ ${#stops[@]} -gt 0 ] || [ ${#rawexp[@]} = 0 ] || { early=1; stops=("${rawexp[@]}"); }   # B1 is the default: --expect stops the run when every pattern is seen (--full keeps the old wait)

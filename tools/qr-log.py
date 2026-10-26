@@ -265,14 +265,9 @@ def selftest():
 
 
 def load_env():
-    """CAM_HOST etc. from the repo's .env (gitignored)."""
-    try:
-        for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")):
-            k, _, v = line.strip().partition("=")
-            if k and not k.startswith("#"):
-                os.environ.setdefault(k, v)
-    except OSError:
-        pass
+    """CAM_HOST etc. from the .env of this checkout or of the main clone (tools/envfile.py)."""
+    import envfile
+    envfile.load_into_environ()
 
 
 if __name__ == "__main__":
@@ -295,5 +290,5 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.esp == "":
-        a.esp = os.environ.get("CAM_HOST") or sys.exit("no CAM_HOST in .env")
+        a.esp = os.environ.get("CAM_HOST") or sys.exit("no CAM_HOST in .env (tools/envfile.py path shows the file used)")
     sys.exit(selftest() if a.selftest else run(a))
