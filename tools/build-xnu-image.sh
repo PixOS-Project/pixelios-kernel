@@ -13,7 +13,7 @@
 #   --dvfs K0,K1,K2  shim asks the ACPM firmware for these CPU cluster rates (kHz; table rows below the ceilings, 0 = leave; docs/research/25) before XNU starts; --dvfs read = read the rates only (dvfsr)
 #   --rails      shim switches the touch rails on via ACPM before XNU starts (observed needed for the FTM5, docs/HANDOFF.md session 12)
 #   --gpu-handover  shim switches the GPU shader rail on (ACPM) before XNU starts and leaves it on; boot-arg sweetgpu=0x1C500000 makes patch 0102 read the GPU (docs/research/30)
-#   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, docs/research/42 s.7) and boot-arg sweetwlan=1 (xnu patch 0124: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
+#   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, private notes) and boot-arg sweetwlan=1 (xnu patch 0124: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
 #   --wlanfw FILE  BCM4389 firmware container (tools/pack_wlanfw.py) appended to the payload as /chosen/memory-map WLANFW (needs --wlan-hold; xnu patch 0121 only checks it)
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
 #   --rw         ufsrw=1 rootrw=1 (UFS writes inside userdata, needed to initialise the HFS journal)
