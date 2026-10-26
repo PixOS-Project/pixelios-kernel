@@ -60,7 +60,7 @@ if [ -n "$quick" ]; then
 	[ "$want" = FULL ] && { want=$ALL; quick=; fullnote=" quick: no usable stamp, ran full"; }
 fi
 # step LANE NAME CMD...: skipped unless selected; a failure marks the lane and skips its remaining steps (and, unless --keep-going,
-# everyone's: they stop at their next step boundary). Each step runs under timeout -k 10 (build-wlan 1500 s, other build* 900 s, others 300 s, env GATE_STEP_TIMEOUT)
+# everyone's: they stop at their next step boundary). Each step runs under timeout -k 10 (build-wlan 1500 s, other build* and unit 900 s (the wlan mutant test takes ~4 min), others 300 s, env GATE_STEP_TIMEOUT)
 # and logs to shim/out/gate/NAME.log; steps of one lane may run in parallel (par), so every step writes only its own files.
 step() {
 	l=$1; n=$2; shift 2
@@ -68,7 +68,7 @@ step() {
 	# the gate was interrupted or is gone: never start another step (exits the lane subshell)
 	{ [ -d "$tmp" ] && [ ! -e "$tmp/interrupted" ] && kill -0 $$ 2>/dev/null; } || exit 1
 	if [ -n "$keep" ]; then [ -e "$tmp/$l.lane" ] && return 0; else compgen -G "$tmp/*.fail" >/dev/null && return 0; fi
-	case $n in build-wlan) b=1500 ;; build*) b=900 ;; *) b=300 ;; esac; b=${GATE_STEP_TIMEOUT:-$b}
+	case $n in build-wlan) b=1500 ;; build*|unit) b=900 ;; *) b=300 ;; esac; b=${GATE_STEP_TIMEOUT:-$b}
 	echo "START $n $(date +%s)" >>"$prog"; s=$SECONDS
 	# 9>&- below: a step's children (an adb server, a stub sleep) must not keep the gate lock after the gate ends
 	# bash -c re-dispatches so that the exported shell function `needs` can run under timeout
