@@ -1,16 +1,12 @@
-SWEET WLAN stage 3 run C (patch 0131, W-D3 step 2, docs/research/43 rows W11..W13), behind boot-arg sweetwlan=5 (level 5 = run B of 0130, then W11-W13; levels 1-4 are byte-identical in behaviour to 0130).
-W11 the NVRAM text: the "NVRM" entry of the 0128 container, CRC-checked before W0 (like the image), run through a pure C port of Broadcom's process_nvram_vars() (bcmutils.c:5101-5146) and of what its caller does (dhd_pcie.c:4208-4253: last
-input byte forced to NUL, length rounded up to 4, one more NUL), stored at ram_end - 4 - varsize (varsize = ROUNDUP(len + 1, 4), dhd_pcie.c:10887-10891), zero padded, every word read back, then the whole text read back and its CRC32 compared.
-W12 the length token (~w << 16) | (w & 0xFFFF), w = varsize / 4, at the last RAM word ram_end - 4 (dhd_pcie.c:10962-10970). W13 the rTLV 136 bytes below the text: 128 random bytes, the length word 0x80 (no checksum for the RNG type), the type word
-0xFEEDC0DE (dhd_pcie.c:10480-10520, 17224-17236), read back; then the text and the token are read back once more and cfg 0x84 goes back to 0. The CA7 stays halted; nothing is released.
-Pure part (bsd/dev/sweet_wlan_wr.h): tuples SWT_WIN2_TAIL_C, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C (run 3, flag SWT_TW for the three tail kinds), still the one swl_wr(): a tail tuple carries no value and no address, swl_wr() computes the next
-word of the kind the address lies in (swl_tw_kind, swl_tw_word) and its address from ram_end and varsize (swl_geo_get) for every store; the table only bounds them at compile time. The whole tail must lie in the window 0x400000 (offset = backplane - 0x400000):
-a RAM end that puts any of it lower is refused after W7, before the first image word (the geometry was not observed; deny by default). A consumed ONCE tuple or a tail tuple of another kind hands the store to the next matching tuple of an allowed
-run (swl_wr_pick), so the second cfg 0x84 write and a zero text word at the last-word address need no second table of values. Entropy: swl_wbus.rng, injectable; the glue passes read_random() (bsd/sys/random.h, registered by patch 0014 at
-STARTUP_RANK_FIRST of EARLY_BOOT); a failing or all-zero draw stops before W0.
-Glue (bsd/dev/sweet_wlan.c): sw_fw_note() keeps the NVRM entry too, a 27 KB scratch buffer, sw3_rng(), level 5 accepted. sw3_wr() is unchanged (BAR2 window 0x400000 and cfg 0x84 as 0 / 0x400000 were already allowed by 0130).
-The final line of level 5: "SWEET WLAN: stage 3 level 5 done vars=<varsize> token=<hex> crc=<hex>", crc = CRC32 of the NVRAM region as read back.
-Host tests shim/wlan_wr_host_test.c and shim/wlan_nv_host_test.c (the process_nvram_vars port: hand-derived known answers and a differently structured reference), mutants tools/test_wlan_wr_mutants.py. HW-WRITE path: not yet reviewed.
+SWEET WLAN stage 3 run C (patch 0131, docs/research/43 rows W11..W13), boot-arg sweetwlan=5 (= run B of 0130, then W11-W13; levels 1-4 behave as in 0130).
+W11 NVRAM text: the NVRM entry of the 0128 container (CRC-checked before W0), through a pure C port of process_nvram_vars() (bcmutils.c:5101-5146) and its caller (dhd_pcie.c:4208-4253), stored at ram_end - 4 - varsize, read back.
+W12 length token (~w << 16) | (w & 0xFFFF), w = varsize / 4, at ram_end - 4 (dhd_pcie.c:10962-10970). W13 rTLV 136 bytes below the text: 128 random bytes, length 0x80, type 0xFEEDC0DE (dhd_pcie.c:10480-10520, 17224-17236).
+Then text and token are read back again and cfg 0x84 goes back to 0. The CA7 stays halted; nothing is released.
+Pure part (bsd/dev/sweet_wlan_wr.h): tuples SWT_WIN2_TAIL_C, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C; still the one swl_wr(), tail addresses computed from ram_end and varsize (swl_geo_get), table bounds at compile time.
+The whole tail must lie in window 0x400000; a lower RAM end is refused after W7. Entropy: swl_wbus.rng, the glue passes read_random(); a failing or all-zero draw stops before W0.
+Glue (bsd/dev/sweet_wlan.c): sw_fw_note() keeps the NVRM entry, a 27 KB scratch buffer, sw3_rng(), level 5.
+Final line: "SWEET WLAN: stage 3 level 5 done vars=<varsize> token=<hex> crc=<hex>" (crc of the NVRAM region as read back).
+Tests: shim/wlan_wr_host_test.c, shim/wlan_nv_host_test.c, tools/test_wlan_wr_mutants.py. HW-WRITE path: not yet reviewed.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 index 686f404..734668a 100644
