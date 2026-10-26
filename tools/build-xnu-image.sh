@@ -13,7 +13,7 @@
 #   --dvfs K0,K1,K2  shim asks the ACPM firmware for these CPU cluster rates (kHz; table rows below the ceilings, 0 = leave; docs/research/25) before XNU starts; --dvfs read = read the rates only (dvfsr)
 #   --rails      shim switches the touch rails on via ACPM before XNU starts (observed needed for the FTM5, docs/HANDOFF.md session 12)
 #   --gpu-handover  shim switches the GPU shader rail on (ACPM) before XNU starts and leaves it on; boot-arg sweetgpu=0x1C500000 makes patch 0102 read the GPU (docs/research/30)
-#   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, private notes) and boot-arg sweetwlan=1 (xnu patch 0120: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
+#   --wlan-hold  shim flavor --wlan-hold (PCIe1 link left up, private notes) and boot-arg sweetwlan=1 (xnu patch 0124: READ-ONLY chip attach); --wlan-level 2 adds the three D11 wrapper reads
 #   --wlanfw FILE  BCM4389 firmware container (tools/pack_wlanfw.py) appended to the payload as /chosen/memory-map WLANFW (needs --wlan-hold; xnu patch 0121 only checks it)
 #   --overlay DIR  dev overlay (docs/AUTOMATION.md): pack DIR with tools/mkdevoverlay.py, add it as the payload RAM disk and sweetdev=1 (xnu patch 0117)
 #   --rw         ufsrw=1 rootrw=1 (UFS writes inside userdata, needed to initialise the HFS journal)
@@ -37,7 +37,7 @@ args="debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress 
 case "$qr" in off|0) ;; *[!0-9]*) echo "--qr needs seconds or off" >&2; exit 2 ;; *) args="$args sweetqr=$qr" ;; esac
 [ -n "$restart" ] && args="$args sweetrestart=$restart"
 [ "$handover" = 0 ] || args="$args sweetgpu=0x1C500000"   # patch 0102 reads the GPU; sweetgpujob=1 (patch 0103, WRITES) only via --args
-[ "$wlan" = 0 ] || args="$args sweetwlan=$wlanlvl"   # patch 0120: read-only attach, needs the --wlan-hold shim flavor (link left up)
+[ "$wlan" = 0 ] || args="$args sweetwlan=$wlanlvl"   # patch 0124: read-only attach, needs the --wlan-hold shim flavor (link left up)
 [ -n "$extra" ] && args="$args $extra"
 [ -z "$overlay" ] || case " $args " in *" ufsroot="*) echo "--overlay: ufsroot= in --args is refused (the overlay writes userdata only, AGENTS.md rule 1)" >&2; exit 2 ;; esac   # review 0117 F1
 [ -z "$overlay" ] || case " $args " in *" sweetdev="*) ;; *) args="$args sweetdev=1" ;; esac   # never doubled: an explicit sweetdev= in --args is kept

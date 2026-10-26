@@ -1,10 +1,11 @@
 import os
+import re
 import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from tools import adt, mkadt  # noqa: E402
+from tools import adt, boards, mkadt  # noqa: E402
 
 
 def _kids(n):
@@ -26,6 +27,66 @@ class WlanAdt(unittest.TestCase):
     def test_wlan_node_only_when_asked(self):
         self.assertNotIn(b"wlan\0", _kids(_kids(self.tree())[b"arm-io\0"]))
         self.assertIn(b"wlan\0", _kids(_kids(self.tree(wlan_node=True))[b"arm-io\0"]))
+
+
+def wlan_node(board, **kw):
+    root = adt.parse(adt.serialize(mkadt.build(seed=b"\0" * 64, board=board, **kw)))[0]
+    for c in root.children:
+        props = dict((k, v) for k, _f, v in c.props)
+        if props["name"] == b"sweet-wlan\0":
+            return props
+    return None
+
+
+class SweetWlanNode(unittest.TestCase):
+    def test_bluejay_node_matches_soc_json(self):
+        p = wlan_node("bluejay")
+        w = boards.BOARDS["bluejay"]["wlan"]
+        self.assertEqual(p["compatible"], b"google,gs101-bcm4389-pcie\0")
+        self.assertEqual(p["reg"], mkadt.u64(int(w["mem"], 0), 0x10000))
+        self.assertEqual(p["cfg"], mkadt.u64(int(w["cfg"], 0), 0x1000))
+        self.assertEqual(p["atu"], mkadt.u64(int(w["atu"], 0), 0x1000))
+        self.assertEqual(p["elbi"], mkadt.u64(int(w["elbi"], 0), 0x2000))
+        self.assertEqual(p["pmu-iso"], mkadt.u64(int(w["pmu_pcie1_iso"], 0), 4))
+        # xnu patch 0129: BAR2 (4 MiB) and the offset of outbound iATU region 2 inside the atu block
+        self.assertEqual(p["tcm"], mkadt.u64(int(w["tcm"], 0), int(w["tcm_bytes"], 0)))
+        self.assertEqual(p["atu-r2-off"], mkadt.u32(int(w["atu_r2_off"], 0)))
+
+    def test_pinned_values_of_the_xnu_driver(self):
+        # bsd/dev/sweet_wlan.c refuses any other value (CR-19/CR-20): the observed bluejay addresses, and the SW_* pins of patch 0124 equal them
+        w = boards.BOARDS["bluejay"]["wlan"]
+        self.assertEqual([int(w[k], 0) for k in ("mem", "cfg", "atu", "elbi", "pmu_pcie1_iso")], [0x60000000, 0x60FFE000, 0x14B00000, 0x14520000, 0x17463EC4])
+        patch = open(os.path.join(ROOT, "xnu", "patches", "0124-sweet-wlan-bwfm-core.patch")).read()
+        pins = {k: int(v, 16) for k, v in re.findall(r"^\+#define SW_(MEM|CFG|ATU|ELBI|ISO) +(0x[0-9A-Fa-f]+)ull", patch, re.M)}
+        self.assertEqual(pins, {"MEM": 0x60000000, "CFG": 0x60FFE000, "ATU": 0x14B00000, "ELBI": 0x14520000, "ISO": 0x17463EC4})
+
+    def test_pinned_values_of_the_stage3_writer(self):
+        # xnu patch 0129 pins the BAR2 range and the iATU region-2 offset in its header and checks the ADT properties against them; the pins equal soc.json
+        # and the observed/cited values (BAR2 0x60400004 assigned by S28 and read back: research 43 s.1; rc.h:302-308 region 2 = region 1 + 0x200)
+        w = boards.BOARDS["bluejay"]["wlan"]
+        self.assertEqual([int(w[k], 0) for k in ("tcm", "tcm_bytes", "atu_r2_off")], [0x60400000, 0x400000, 0x400])
+        patch = open(os.path.join(ROOT, "xnu", "patches", "0129-sweet-wlan-chip-writes.patch")).read()
+        pins = {k: int(v, 16) for k, v in re.findall(r"^\+#define SWW_(TCM_PA|TCM_BYTES|ATU_R2) +(0x[0-9A-Fa-f]+)u\b", patch, re.M)}
+        self.assertEqual(pins, {"TCM_PA": 0x60400000, "TCM_BYTES": 0x400000, "ATU_R2": 0x400})
+
+    def test_tcm_is_the_only_new_surface_in_the_node(self):
+        p = wlan_node("bluejay")
+        self.assertEqual(sorted(p), sorted(["name", "compatible", "reg", "cfg", "atu", "elbi", "pmu-iso", "tcm", "atu-r2-off", "AAPL,phandle"]))
+
+    def test_no_tcm_without_the_soc_keys(self):
+        # a board whose soc.json lacks the stage-3 keys keeps the stage-1 node (the driver then has no tcm property and refuses level >= 3)
+        saved = {k: boards.BOARDS["bluejay"]["wlan"].pop(k) for k in ("tcm", "tcm_bytes", "atu_r2_off")}
+        try:
+            p = wlan_node("bluejay")
+        finally:
+            boards.BOARDS["bluejay"]["wlan"].update(saved)
+        self.assertNotIn("tcm", p)
+        self.assertNotIn("atu-r2-off", p)
+        self.assertIn("pmu-iso", p)
+
+    def test_sweet_and_qemu_trees_have_no_wlan_node(self):
+        self.assertIsNone(wlan_node("sweet"))
+        self.assertIsNone(wlan_node("bluejay", qemu=True))
 
 
 if __name__ == "__main__":

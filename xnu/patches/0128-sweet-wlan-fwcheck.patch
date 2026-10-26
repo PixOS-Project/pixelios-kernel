@@ -1,0 +1,165 @@
+SWEET WLAN firmware container check (patch 0128, W-D3 step 1): no hardware access. When boot-arg sweetwlan= and the ADT /sweet-wlan node are present,
+sweet_wlan_init() looks for /chosen/memory-map WLANFW <pa, size> (tools/mkpayload.py --wlanfw, container from tools/pack_wlanfw.py), reads it through
+ml_static_ptovirt, verifies magic/version/offsets/CRC32 of every entry with the pure header bsd/dev/sweet_wlan_fw.h (host test shim/wlan_fw_host_test.c)
+and prints one line per entry plus a summary. Nothing is written or copied; the chip is not touched.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index a57fed7..277e201 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -14,6 +14,7 @@
+ #include <pexpert/device_tree.h>
+ #include <stdint.h>
+ #include "sweet_wlan_chip.h"
++#include "sweet_wlan_fw.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ 
+@@ -89,6 +90,44 @@ sw_prop_is(DTEntry node, const char *name, uint64_t pa, uint64_t len)
+ 	return 1;
+ }
+ 
++/* W-D3 step 1, no hardware access: find the firmware container the payload carries (mkpayload.py --wlanfw), verify it and print what was seen. */
++static void
++sweet_wlan_fwcheck(void)
++{
++	DTEntry mm;
++	void const *p = NULL;
++	unsigned int psize = 0, n = 0, i;
++	uint64_t pa, len;
++	struct swf_entry e[SWF_MAX_ENTRIES];
++	int rc;
++
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "WLANFW", &p, &psize) != kSuccess) {
++		printf("SWEET WLAN: no WLANFW container in /chosen/memory-map\n");
++		return;
++	}
++	if (psize != 2 * sizeof(uint64_t)) {
++		printf("SWEET WLAN: WLANFW property is %u bytes, refused\n", psize);
++		return;
++	}
++	memcpy(&pa, p, sizeof(pa));
++	memcpy(&len, (uint8_t const *)p + sizeof(pa), sizeof(len));
++	if (len < SWF_HDR || len > SWF_MAX_BYTES || pa + len < pa) {
++		printf("SWEET WLAN: WLANFW <%#llx, %#llx> out of bounds, refused\n", pa, len);
++		return;
++	}
++	rc = swf_parse((uint8_t const *)ml_static_ptovirt((vm_offset_t)pa), (size_t)len, e, &n);
++	if (rc != 0) {
++		printf("SWEET WLAN: WLANFW <%#llx, %#llx> refused, code %d\n", pa, len, rc);
++		return;
++	}
++	for (i = 0; i < n; i++) {
++		printf("SWEET WLAN: fw container entry %c%c%c%c length %u offset %#x crc32 %#010x ok\n", e[i].tag[0], e[i].tag[1], e[i].tag[2], e[i].tag[3],
++		    e[i].length, e[i].offset, e[i].crc);
++	}
++	printf("SWEET WLAN: fw container ok at %#llx, %llu bytes, %u entries\n", pa, len, n);
++}
++
+ void
+ sweet_wlan_init(void)
+ {
+@@ -116,6 +155,7 @@ sweet_wlan_init(void)
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+ 		return;
+ 	}
++	sweet_wlan_fwcheck();
+ 	if (!sw_prop_is(node, "reg", SW_MEM, SW_MEM_LEN) || !sw_prop_is(node, "cfg", SW_CFG, 0x1000) ||
+ 	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
+ 		return;
+diff --git a/bsd/dev/sweet_wlan_fw.h b/bsd/dev/sweet_wlan_fw.h
+new file mode 100644
+index 0000000..9aac30c
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_fw.h
+@@ -0,0 +1,89 @@
++/*
++ * BCM4389 firmware container check (docs/research/39 s.3, 42 s.7 U10, W-D3 step 1): the pure part of sweet_wlan.c, host-tested by
++ * shim/wlan_fw_host_test.c. The container is built by tools/pack_wlanfw.py and handed over as /chosen/memory-map WLANFW <pa, size>:
++ *   char magic[8] = "WLANFWB1"; u32 version = 1; u32 count; entry[count] { char tag[4]; u32 length; u32 offset; u32 crc32 }
++ * (little endian, offsets 8-aligned and counted from the container start, crc32 = zlib). Nothing here touches hardware.
++ */
++#ifndef SWEET_WLAN_FW_H
++#define SWEET_WLAN_FW_H
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWF_VERSION     1u
++#define SWF_HDR         16u
++#define SWF_ENTRY       16u
++#define SWF_MAX_ENTRIES 3u
++#define SWF_MAX_BYTES   (4u << 20)      /* the firmware is 1.76 MB; a bigger container is refused, not trusted */
++
++struct swf_entry {
++	uint8_t tag[4];
++	uint32_t length, offset, crc;
++};
++
++static uint32_t
++swf_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint32_t
++swf_crc32(const uint8_t *p, size_t n)
++{
++	uint32_t c = 0xFFFFFFFFu;
++	size_t i;
++	int b;
++
++	for (i = 0; i < n; i++) {
++		c ^= p[i];
++		for (b = 0; b < 8; b++) {
++			c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++/* 0 = ok and e[0..*count) filled (every blob inside the container, CRC verified); else a distinct refusal code. */
++static int
++swf_parse(const uint8_t *buf, size_t len, struct swf_entry e[SWF_MAX_ENTRIES], unsigned *count)
++{
++	static const uint8_t magic[8] = { 'W', 'L', 'A', 'N', 'F', 'W', 'B', '1' };
++	unsigned i, j, n;
++
++	if (len < SWF_HDR || len > SWF_MAX_BYTES) {
++		return 1;
++	}
++	for (i = 0; i < 8; i++) {
++		if (buf[i] != magic[i]) {
++			return 2;
++		}
++	}
++	n = swf_le32(buf + 12);
++	if (swf_le32(buf + 8) != SWF_VERSION || n == 0 || n > SWF_MAX_ENTRIES || SWF_HDR + SWF_ENTRY * n > len) {
++		return 3;
++	}
++	for (i = 0; i < n; i++) {
++		const uint8_t *r = buf + SWF_HDR + SWF_ENTRY * i;
++
++		for (j = 0; j < 4; j++) {
++			e[i].tag[j] = r[j];
++		}
++		e[i].length = swf_le32(r + 4);
++		e[i].offset = swf_le32(r + 8);
++		e[i].crc = swf_le32(r + 12);
++		if (e[i].length == 0 || (e[i].offset & 7u) != 0 || e[i].offset < SWF_HDR + SWF_ENTRY * n || e[i].offset > len ||
++		    e[i].length > len - e[i].offset) {
++			return 4;
++		}
++		for (j = 0; j < i; j++) {
++			if (e[j].tag[0] == e[i].tag[0] && e[j].tag[1] == e[i].tag[1] && e[j].tag[2] == e[i].tag[2] && e[j].tag[3] == e[i].tag[3]) {
++				return 5;
++			}
++		}
++		if (swf_crc32(buf + e[i].offset, e[i].length) != e[i].crc) {
++			return 6;
++		}
++	}
++	*count = n;
++	return 0;
++}
++#endif

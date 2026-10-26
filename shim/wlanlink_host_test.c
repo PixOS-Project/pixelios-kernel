@@ -77,7 +77,7 @@ static int s33_mode, win_fault_v, win_ign_v, win_lat_v, clobber33, fault33;	/* S
 static unsigned mem_illegal, s33_reads, core_reads;	/* BAR0 reads that the test's own (independent) allowlist does not know / reads in the S33 windows / reads of the SYS_MEM core page */
 /* S34..S36 (research 40): the register model of the three cores behind BAR0. Writes are checked by the TEST'S OWN spec (spec_memw, a data table, independent of memw_ok); mem_illegal_w counts writes it rejects (must stay 0) */
 static uint32_t cp_powerctl, sm_io, sm_rc, sm_rs, arm_io, arm_rc, arm_rs, sm_coreinfo, sm_bankidx, sm_bankinfo;
-static unsigned srpwr_cnt, srpwr_after, mem_wr_n, mw_n, mem_illegal_w, mem_wr_unready, mw_log[16];
+static unsigned pc_reads, srpwr_cnt, srpwr_after, mem_wr_n, mw_n, mem_illegal_w, mem_wr_unready, mw_log[16];
 static int chip_mode, mw_kind;	/* chip_mode (N >= 34): 1 SRPWR status never set, 2 SYS_MEM RESET_CTL release does not take, 3 SYS_MEM IOCTL write does not take, 4 RESET_ST stuck 1 after the assert, 5 coreinfo all ones, 6 coreinfo nrb = 1, 7 coreinfo nb = 0, 8 ARM RESET_CTL release does not take, 9 ARM IOCTL write does not take, 10 SYS_MEM IOCTL keeps FGC on the final write, 11 SYS_MEM RESET_ST stuck 1 from the start, 12 powerctl dead (all ones), 13 SRPWR already on, 14 powerctl PowerDomain id [31:28] = 0 (no SRPWR capability); mw_kind: 1 = the mw_n-th BAR0 write is swallowed, 2 = it stores a wrong value */
 static unsigned link_dead_after;	/* review 13 L3: after this many EROM reads every config read answers all ones (link down mid-dump); 0 = off */
 static uint64_t freq, tick, waited_us;
@@ -153,7 +153,7 @@ static void chip_reset(void)
 {
 	cp_powerctl = 0; sm_io = arm_io = 0; sm_rc = arm_rc = 1; sm_rs = arm_rs = 0;	/* observed run w3a-n33: IOCTL 0, RESET_CTL 1, RESET_ST 0 */
 	sm_coreinfo = 0x00000005u; sm_bankidx = 0x3u; sm_bankinfo = 0x00000007u;	/* FAKE: nb = 5, nrb = 0, bankidx not 0 at start, bank size (7 + 1) * 8 KiB */
-	srpwr_cnt = 0; srpwr_after = 3; mem_wr_n = 0; mw_n = 0; mw_kind = 0; mem_illegal_w = mem_wr_unready = 0; chip_mode = 0;
+	pc_reads = 0; srpwr_cnt = 0; srpwr_after = 3; mem_wr_n = 0; mw_n = 0; mw_kind = 0; mem_illegal_w = mem_wr_unready = 0; chip_mode = 0;
 	memset(mw_log, 0, sizeof mw_log);
 }
 
@@ -168,7 +168,7 @@ static uint32_t chip_get(uint32_t win, uint32_t off)	/* the model's register val
 	if (win == 0x18126000u)
 		return off == 0x408u ? sm_io : off == 0x800u ? (s33_mode == 5 ? sm_rc | 0x100u : sm_rc) : (chip_mode == 11 ? 1u : sm_rs);
 	if (win == 0x18001000u)
-		return chip_mode == 12 ? 0xFFFFFFFFu : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
+		return chip_mode == 12 ? 0xFFFFFFFFu : chip_mode == 15 ? 0x00030300u : chip_mode == 16 ? 0x00020000u : chip_mode == 17 ? 0x00000200u : chip_mode == 18 ? 0x30030300u : chip_mode == 19 ? (pc_reads <= 1u ? 0x00030300u : 0x00010300u) : chip_mode == 20 ? (pc_reads <= 1u ? 0x00030300u : 0x00020100u) : (cp_powerctl & 0xF00u) | ((cp_powerctl & 0x200u) && (chip_mode == 13 || (chip_mode != 1 && srpwr_cnt >= srpwr_after)) ? 0x20000u : 0u) | (chip_mode == 14 ? 0u : 0x30000000u);	/* PowerDomain id [31:28] non-zero, ExtPwrStatus bit 17 follows the request after srpwr_after reads */
 	return off == 0u ? sm_coreinfo : off == 0x10u ? sm_bankidx : sm_bankinfo;
 }
 
@@ -191,6 +191,8 @@ static int spec_memw(uint32_t win, uint32_t off, uint32_t old, uint32_t v, uint3
 
 static uint32_t s33_val(uint32_t win, uint32_t off)	/* a BAR0 read: side effects (the SRPWR status follows the reads of powerctl) and the S35 coreinfo knobs */
 {
+	if (win == 0x18001000u)
+		pc_reads++;
 	if (win == 0x18001000u && (cp_powerctl & 0x200u))
 		srpwr_cnt++;
 	if (win == 0x18026000u && off == 0u)
@@ -1815,12 +1817,13 @@ int main(void)
 			EXPECT(r.step <= 36u);
 			if (r.kind == WLK_MMIO_WRITE || r.kind == WLK_MMIO_RMW || r.kind == WLK_GPIO_DAT || r.kind == WLK_GPIO_CON || r.kind == WLK_SMC_ISO) {
 				EXPECT(nwr < nex && r.step == ex[nwr].step && r.blk == ex[nwr].blk && r.off == ex[nwr].off && r.kind == ex[nwr].kind && r.mask == ex[nwr].mask && r.val == ex[nwr].val);
+				EXPECT(r.a == (r.kind == WLK_MMIO_RMW ? 32u : 0u));	/* the S34 SRPWR request row carries the skip flag 32 (skipped once SRP_UP is recorded); no other write row has a flag */
 				wr_rows[nwr++] = i;
 				if (r.blk == WLB_MEM)
 					mw_rows[nmwr++] = i;
 			}
 			if (r.blk == WLB_MEM && r.kind == WLK_READ_ONLY) {
-				EXPECT(r.a == 2u);
+				EXPECT((r.step == 35u && r.off == 0u) ? r.a == 66u : (r.a == 2u || (r.step == 34u && r.off == 0x1E8u && r.a == 18u)));	/* log flag; the S34 powerctl log row also carries the SRP_UP recorder flag 16 */
 				EXPECT(nl3[r.step - 34u] < 12u);
 				lrow[r.step - 34u][nl3[r.step - 34u]++] = i;
 			}
@@ -2056,6 +2059,24 @@ int main(void)
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);
 		teardown_tail_is_table_order(34);
 		baseline_restored();
+		world(); chip_mode = 15;					/* S34 skip (the run w3a-n34 state 0x00030300: id 0, SRPWR domain 1 already requested and up): the request is skipped, NOT written, the read-back and the status wait pass, the run is clean */
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("LINK R34 row=1348 rd=") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 18;					/* the same with PowerDomain id 3: skipped too */
+		EXPECT(wlan_link_run() == 0 && has("skip: SRPWR request") && has("LINK R34 row=1348 rd=") && has("restore=ok") && mem_wr_n == nmw - 1u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 19;					/* review 18 finding 1: after the skip the status wait still runs against the live register: bit 17 drops after the log row -> timeout at row 1347, nothing written */
+		EXPECT(wlan_link_run() == 1 && has("skip: SRPWR request") && has("stopped=timeout at=S34 row=1347") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start"));
+		baseline_restored();
+		world(); chip_mode = 20;					/* the read-back (bit 9) still runs: bit 9 drops after the log row -> refused at row 1346 */
+		EXPECT(wlan_link_run() == 1 && has("skip: SRPWR request") && has("stopped=refused at=S34 row=1346") && has("restore=ok") && mem_wr_n == 0u);
+		baseline_restored();
+		world(); chip_mode = 16;					/* ExtPwrStatus bit 17 alone (PowerOnRequest bit 9 clear, id 0): no skip, the write is refused (id 0), nothing written */
+		EXPECT(wlan_link_run() == 1 && !has("skip: SRPWR request") && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && mem_illegal_w == 0u);
+		baseline_restored();
+		world(); chip_mode = 17;					/* PowerOnRequest bit 9 alone (status bit 17 clear, id 0): no skip, refused, nothing written */
+		EXPECT(wlan_link_run() == 1 && !has("skip: SRPWR request") && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && mem_illegal_w == 0u);
+		baseline_restored();
 		world(); chip_mode = 12;					/* powerctl reads all ones (dead): the RMW is refused (old != 0xFFFFFFFF), nothing written */
 		EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S34") && has("restore=ok") && mem_wr_n == 0u && !has("LINK S35 start") && mem_illegal_w == 0u);
 		teardown_tail_is_table_order(34);
@@ -2079,10 +2100,31 @@ int main(void)
 			world(); chip_mode = 10;				/* the final IOCTL keeps FGC (reads 3): refused at the read-back, the up gate never passes */
 			EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S35") && mem_wr_n == 5u && !wrote(WLAN_CFG + 0x80, FULL_MASK_T, 0x18026000u) && has("restore=ok"));
 			baseline_restored();
-			for (int m = 5; m <= 7; m++) {				/* coreinfo all ones / a ROM bank / no RAM bank: bankidx is REFUSED by the allowlist (nothing written), the run stops, restore ok */
+			for (int m = 5; m <= 7; m++) {				/* coreinfo all ones / no RAM bank: bankidx is REFUSED by the allowlist (nothing written), the run stops, restore ok; a ROM bank (6) is the observed case (run w3a-n35 0x115): the bankidx write and its read-back wait are SKIPPED, no write, and the chain goes on */
+				if (m == 6) continue;
 				world(); chip_mode = m;
 				EXPECT(wlan_link_run() == 1 && has("stopped=refused at=S35") && has("restore=ok") && !has("!!!") && mem_wr_n == 5u && sm_bankidx == 3u && mem_illegal_w == 0u && !has("LINK S36 start"));
 				teardown_tail_is_table_order(35);
+				baseline_restored();
+			}
+			world(); chip_mode = 6;					/* coreinfo shows a ROM bank: bankidx select skipped (write and read-back wait, two skip lines), 4 S35 writes instead of 5, bankidx untouched, the run completes */
+			EXPECT(wlan_link_run() == 0 && has("LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write)") && !has("!!!") && mem_wr_n == nmw - 1u && sm_bankidx == 3u && mem_illegal_w == 0u && sm_io == 1u && sm_rc == 0u && has("restore=ok") && has("stopped=none"));
+			EXPECT(WLAN_LINK_N < 36 ? has("LINK S35 ok") && !has("LINK S36 start") : (arm_io == 0x21u && arm_rc == 0u && arm_rs == 0u && has("LINK S36 ok")));
+			snprintf(b, sizeof b, "LINK R35 row=%u rd=0x%08X", lrow[1][7], 3u); EXPECT(has(b));		/* the bankidx and bankinfo log rows still run after the skip (informative: the unselected bank) */
+			snprintf(b, sizeof b, "LINK R35 row=%u rd=0x%08X", lrow[1][8], 7u); EXPECT(has(b));
+			baseline_restored();
+			for (unsigned k = 0; k < 4u; k++) {			/* the ROM-bank test uses the DHD rev < 12 mask 0x3E0 (not brcmfmac 0xF0, not a narrower one): the observed 0x115 and words whose ROM bits are only 0x100 / only 0x200 / all */
+				static const uint32_t cw[4] = { 0x00000115u, 0x00000105u, 0x00000205u, 0x000003E5u };
+
+				world(); sm_coreinfo = cw[k];
+				EXPECT(wlan_link_run() == 0 && has("LINK S35 skip: bankidx select") && mem_wr_n == nmw - 1u && sm_bankidx == 3u && mem_illegal_w == 0u && has("stopped=none"));
+				baseline_restored();
+			}
+			for (unsigned k = 0; k < 2u; k++) {			/* review 19 finding 1: bits outside 0x3E0 (0x400, the top byte) are not ROM banks: no skip, bankidx := 0 is written */
+				static const uint32_t nw[2] = { 0x00000405u, 0x80FF0005u };
+
+				world(); sm_coreinfo = nw[k];
+				EXPECT(wlan_link_run() == 0 && !has("LINK S35 skip: bankidx select") && mem_wr_n == nmw && sm_bankidx == 0u && has("stopped=none"));
 				baseline_restored();
 			}
 			world(); sm_io = 1u; sm_rc = 0u; sm_bankidx = 0u;		/* SYS_MEM already up (not the observed state): the sequence is idempotent and the run is clean */
@@ -2242,6 +2284,81 @@ int main(void)
 	world(); freq = 1000000;					/* a slow counter does not turn the wait into a hang: still <= 4800 polls */
 	EXPECT(wlan_link_run() == 0 || l0_polls <= 4800u);
 #endif
+	struct wlan_hold H = {0, 0, 0};
+
+	if (WLAN_LINK_N == 30)
+	/* ---- --wlan-hold (wlan_link_hold, research 42 section 7): at N = S30 the teardown is skipped on success, run on any failure ---- */
+	{
+		static struct { int t; uintptr_t pa; uint32_t v; } ref[800];
+		unsigned nref;
+
+		world();
+		EXPECT(wlan_link_run() == 0 && has("restore=ok") && !has("restore=held"));		/* the reference: the normal run tears down */
+		nref = nev;
+		memcpy(ref, ev, sizeof(ref));
+		world();
+		EXPECT(wlan_link_hold(&H) == 0 && has("LINK S30 ok rows=5") && has("LINK summary reached=S30 stopped=none restore=held") && !has("restore=ok") && !has("restore=FAILED") && !has("!!!") && !has("LINK T"));
+		EXPECT(nev > 0 && nev + 8u < nref && memcmp(ev, ref, nev * sizeof(ev[0])) == 0);	/* exactly the forward writes: the reference minus its teardown tail, no T row executed */
+		EXPECT(iso1 == 1 && gh2.con != 0 && (cfgspace[1] & 0xFFFFu) == 2u && cfgspace[0x80 / 4] == 0x18000000u && mem_ready());	/* PHY isolation released, PERST driven, Command MEM, window 0x18000000, BAR0 armed: all still as at S30 */
+		EXPECT(atu[0x04 / 4] != 0 && atu[0x204 / 4] != 0 && mem_reads == 3 && master_writes == 0);	/* ATU regions 0 and 1 still enabled */
+		world(); iso_clear_ret = 2;								/* nothing is restored on a held success: a failing isolation clear is never reached */
+		EXPECT(wlan_link_hold(&H) == 0 && has("restore=held") && !has("restore=FAILED") && iso1 == 1);
+		world(); fault_read_pa = WLAN_DBI + 0x70;						/* S24 fault: the normal teardown, restore=ok, return 1 */
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=fault at=S24") && has("restore=ok") && !has("restore=held") && !has("!!!"));
+		teardown_tail_is_table_order(24);
+		baseline_restored();
+		world(); fault_read_pa = WLAN_CFG + 0x104;						/* S29 fault */
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=fault at=S29") && has("restore=ok") && !has("restore=held") && !has("!!!"));
+		teardown_tail_is_table_order(29);
+		baseline_restored();
+		world(); mem_mode = 3;									/* S30 itself refuses (another chip id): torn down */
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=refused at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		world(); fault_read_pa = WLAN_DBI + 0x70; iso_clear_ret = 2;				/* failure + failing restore: still loud */
+		EXPECT(wlan_link_hold(&H) == 1 && has("restore=FAILED") && has("!!! RESTORE FAILED") && !has("restore=held"));
+		world(); freq = 0;									/* no timer: refused before any write, as the normal run */
+		EXPECT(wlan_link_hold(&H) == 2 && nwrites == 0 && has("no timer") && !has("restore=held"));
+		world(); iso_set_ret = 2;								/* the isolation-release SMC (S05) refuses: torn down, no hold */
+		EXPECT(wlan_link_hold(&H) == 1 && has("at=S05") && has("restore=ok") && !has("restore=held"));
+		baseline_restored();
+		world(); never_l0 = 1;									/* the link never comes up (S23 timeout): torn down, no hold */
+		EXPECT(wlan_link_hold(&H) == 1 && has("stopped=timeout at=S23") && has("restore=ok") && !has("restore=held"));
+		teardown_tail_is_table_order(23);
+		baseline_restored();
+		world(); fault_read_pa = WLAN_MEM + 0x0;						/* a bus fault on the S30 BAR0 read itself: torn down, no hold */
+		EXPECT(wlan_link_hold(&H) == 1 && has("at=S30") && has("restore=ok") && !has("restore=held") && !mem_ready());
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		/* wlan_link_release (review 21 F1): the same T rows after a successful hold; with nothing held it writes nothing */
+		world();
+		EXPECT(wlan_link_hold(&H) == 0 && has("restore=held"));
+		EXPECT(wlan_link_release(&H) == 0 && has("LINK release restore=ok") && !has("restore=FAILED") && !has("!!!"));
+		teardown_tail_is_table_order(30);
+		baseline_restored();
+		{
+			unsigned nw = nwrites;
+
+			EXPECT(wlan_link_release(&H) == 2 && nwrites == nw);				/* a second release: nothing held, nothing written */
+		}
+		world();
+		EXPECT(wlan_link_release(&H) == 2 && nwrites == 0 && nev == 0);
+		world(); fault_read_pa = WLAN_DBI + 0x70;
+		EXPECT(wlan_link_hold(&H) == 1 && has("restore=ok"));
+		{
+			unsigned nw = nwrites;
+
+			EXPECT(wlan_link_release(&H) == 2 && nwrites == nw);				/* a failed hold left nothing held */
+		}
+		world();
+		EXPECT(wlan_link_hold(&H) == 0);
+		iso_clear_ret = 2;									/* the release reports a failing restore */
+		EXPECT(wlan_link_release(&H) == 1 && has("LINK release restore=FAILED"));
+	}
+	else {
+	world();											/* N != S30: the hold is refused, nothing runs */
+	EXPECT(wlan_link_hold(&H) == 2 && nwrites == 0 && nev == 0 && has("hold refused") && !has("LINK table") && !has("restore="));
+	}
 	puts("PASS wlanlink host test N=" WLAN_LINK_N_STR);
 	return 0;
 }

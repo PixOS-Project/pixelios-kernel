@@ -2819,7 +2819,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "2ecd5871c3047730c83f08af5d325e554ea61e133089b5752edf144078222e27"
+_WLAN_SEQ_SHA = "1bdc95bc71495d3a6b531e68358eee63c91e30b52c117d91147d98271361d757"
 _WLAN_SEQ_COUNTS = {"rows": 1412, "teardown": 47, "write_rows": 296, "distinct_targets": 197}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 11, "CFG": 6, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "MEM": 4, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
@@ -2908,7 +2908,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # header = table (the allowlist the interpreter uses is exactly the audited table)
     hdr = _WLAN_HDR_ROW.findall(header)
     want = [(str(r["step"]), r["kind"].upper(), r["blk"] or "NONE", hex(r["off"]), hex(r["mask"]), hex(r["value"]),
-             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0)), str(r["polls"])) for r in rows]
+             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0) | (4 if r.get("eot") else 0) | (8 if r.get("eot") == 2 else 0) | (16 if r.get("srp") == 1 else 0) | (32 if r.get("srp") == 2 else 0) | (64 if r.get("srp") == 3 else 0)), str(r["polls"])) for r in rows]
     want += [(str(t["requires"]), t["kind"].upper(), t["blk"] or "NONE", hex(t["off"]), hex(t["mask"]), hex(t["value"]), str(t["delay_us"]), str(t["polls"])) for t in tear]
     if hdr != want or f'WLAN_SEQ_SHA256 "{sha}"' not in header:
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
@@ -3083,6 +3083,15 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
         got = [key9(r) for r in rows if r["step"] == stp]
         if got != want_s or any(t["requires"] == stp for t in tear):
             raise AssertionError(f"{name}: S{stp} must be exactly the audited write sequence of research 40 s.4 (windows {[hex(c) for c in _WLAN_S34_WINDOWS[stp]]}, every write with its read-back / wait, the up gate before the core page, bankidx only 0, the ARM halt last), no teardown row of its own: {[x for x in got if x not in want_s][:3]} / missing {[x for x in want_s if x not in got][:3]}")
+    # the S34 skip (srp): exactly the powerctl log row (srp = 1) and the SRPWR request row (srp = 2), both S34 BAR0+0x1E8; no other row, no teardown row, carries the flag. The skip only drops the request write; the read-back and the status wait still follow
+    srp_got = [(r["step"], r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["srp"]) for r in rows if "srp" in r]
+    if srp_got != [(34, "read_only", "MEM", 0x1E8, BIGW, 0, 1), (34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, 2), (35, "read_only", "MEM", 0x000, BIGW, 0, 3)] or any("srp" in t for t in tear):
+        raise AssertionError(f"{name}: the srp skip flag must sit on exactly the S34 powerctl log row (1), the S34 SRPWR request row (2) and the S35 coreinfo log row (3): {srp_got}")
+    # (review 19 finding 2: this clause is shadowed by the exact S34-S36 sequence clause and the BAR0 read-only clause above, so no table mutant reaches it; kept as defence in depth)
+    # the S35 bank skip (srp = 3): the run skips every MEM write / wait_eq row at offset 0x10 once ROM banks are recorded; exactly the S35 bankidx write and its read-back wait may match, none in the teardown, so the skip can only drop those two rows
+    bank_got = [(r["step"], r["kind"], r["off"], r["value"]) for r in rows if r["blk"] == "MEM" and r["off"] == 0x10 and r["kind"] in ("mmio_write", "wait_eq")]
+    if bank_got != [(35, "mmio_write", 0x10, 0), (35, "wait_eq", 0x10, 0)] or any(t["blk"] == "MEM" and t["off"] == 0x10 for t in tear):
+        raise AssertionError(f"{name}: the bank skip (srp 3) may only drop the S35 bankidx write and its read-back wait (MEM 0x10): {bank_got}")
     if any(x["blk"] == "ATU" and x["kind"] in _WLAN_WRITE_KINDS and x.get("step", x.get("requires")) not in (26, 29) for x in rows + tear):
         raise AssertionError(f"{name}: ATU writes are only for S26, S29 and their teardown")
     if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36)) for r in rows + tear) or any("log" in t for t in tear):
@@ -3640,6 +3649,12 @@ def wlan_seq_selftest() -> int:
         ("S34 window move to the wrong core page (0x18002000)", set_row(34, "value", 0x18002000, kind="mmio_write", blk="CFG", value=0x18001000), None, "CFG window is read-only"),
         ("S34 window move read-back removed", f_rm(34, kind="wait_eq", blk="CFG", off=0x80, value=0x18001000), None, "S34 must be exactly"),
         ("S34 precondition removed", f_rm(34, kind="wait_eq", blk="CFG", off=0x80, value=0x18126000), None, "S34 must be exactly"),
+        ("S34 skip flag removed from the SRPWR request row", set_row(34, "srp", 0, kind="mmio_rmw", blk="MEM"), None, "srp skip flag"),
+        ("S34 skip flag removed from the powerctl log row", set_row(34, "srp", 0, kind="read_only", blk="MEM", off=0x1E8), None, "srp skip flag"),
+        ("S34 skip flag on another S34 log row", set_row(34, "srp", 1, kind="read_only", blk="CFG", off=0xBC), None, "srp skip flag"),
+        ("S35 bank skip flag removed from the coreinfo log row", set_row(35, "srp", 0, kind="read_only", blk="MEM", off=0x0), None, "srp skip flag"),
+        ("S35 bank skip flag on the bankinfo log row", set_row(35, "srp", 3, kind="read_only", blk="MEM", off=0x40), None, "srp skip flag"),
+        ("S34 skip flag on a wait row", set_row(34, "srp", 2, kind="wait_mask", blk="MEM", off=0x1E8), None, "srp skip flag"),
         ("S34 powerctl log (before) removed", f_rm(34, kind="read_only", blk="MEM", off=0x1E8), None, "S34 must be exactly"),
         ("S34 a teardown row of its own", tear_append(blk="MEM", off=0x1E8, kind="mmio_rmw", mask=0x200, value=0, requires=34), None, "BAR0 (MEM)"),
         ("S35 IOCTL value wrong (0x7)", set_row(35, "value", 7, kind="mmio_write", blk="MEM", off=0x408, value=3), None, "BAR0 (MEM)"),
@@ -3779,12 +3794,16 @@ _WLANLINK_BODY_SHA = {
     "need_probe": "44c0b22ce25cae99db97ca86bcec9e471ebb8fcbfa077005de813f1073652b02",
     "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
     "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
-    "run_row": "03d3e0ed514fba523defc5b89639a8f3f895f3537343f51ba4d2fcbc5e43b96c",
-    "wlan_link_run": "3b3f2e45e3fb2075da616ebe3e1e4463847f8e7b05cee3d6f80c624e93dc08a0",
+    "run_row": "9ab3df59b58faaa74975f1024df30c20ab0ec2ba6082fa3176b860c1c432a0e6",
+    "link_teardown": "483b65fccbdae36e18270fafee9f2a797067ddb06d9ccd20ae7a605cea480bfe",
+    "wlan_link_release": "45610a85d7f1fe53ac6249b2a7ef9f78be2ce00f9fb661ed53e5d2cf5fddc7e9",
+    "link_run": "076f8ff12cced13d2f8398ac5d595f5bb9ed6d95dc434676f1fa05d1dcb94338",
+    "wlan_link_run": "7f92c1ee41940af392ea56a0ca497f754c9dbbd68f3217d555a4c70e4d595593",
+    "wlan_link_hold": "f5cd4c082741b9fe073028d3ab09a3892964dd7aff65decc9dfaf2f9604c94ef",
 }
 
 
-def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
+def check_wlanlink_source_text(src: str, name: str = "wlanlink.c", pins: bool = True) -> None:
     check_usbgadget_source_text(src, name, **_WLANLINK_KW)
     code = _strip_c_comments(src)
     norm = re.sub(r"\s+", "", code)
@@ -3808,7 +3827,7 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
         if body != want:
             raise AssertionError(f"{name}: {fn} is not the audited text: {body}")
     import hashlib
-    for fn, want in _WLANLINK_BODY_SHA.items():
+    for fn, want in (_WLANLINK_BODY_SHA.items() if pins else ()):	# pins=False: the selftest runs the hold mutants against their own needles (review 21 F4), not the SHA
         a, b = _c_function_span(code, fn)
         body = re.sub(r"\s+", "", code[a:b])
         got = hashlib.sha256(body[body.index("{") + 1:-1].encode()).hexdigest()
@@ -3842,20 +3861,37 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
     for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
                  "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
                  "if(r.a==1u)*probed|=need_probe(r.blk);",
-                 "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}returnST_OK;",
+                 "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}if((r.a&16u)&&v!=0xFFFFFFFFu&&(v&0x20200u)==0x20200u)*probed|=SRP_UP;if((r.a&64u)&&v!=0xFFFFFFFFu&&(v&0x3E0u)!=0u)*probed|=BANK_ROM;returnST_OK;",
+                 "if((probed&SRP_UP)&&r.kind==WLK_MMIO_RMW&&(r.a&32u)){step_line('S',s,\"skip:SRPWRrequest,domain1alreadyup(nowrite)\",1,i,1,rd,0,0);continue;}", "#defineSRP_UP(1u<<30)",
+                 "if((probed&BANK_ROM)&&r.blk==WLB_MEM&&r.off==0x10u&&(r.kind==WLK_MMIO_WRITE||r.kind==WLK_WAIT_EQ)){step_line('S',s,\"skip:bankidxselect,SYS_MEMhasROMbanks(nowrite)\",1,i,1,rd,0,0);continue;}", "#defineBANK_ROM(1u<<29)",
                  "if((probed&EOT_SEEN)&&r.kind==WLK_READ_ONLY&&(r.a&4u))continue;", "#defineEOT_SEEN(1u<<31)", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
                  "if(blk==WLB_MEM){uint32_tcr2=0,cmd=0,win=0,r1[4]={1,1,1,1};if(!try_read32(WLAN_CFG+0x80u,&win)||!mem_ok(win,off)||!try_read32(WLAN_ATU+0x204u,&cr2)||cr2!=0x80000000u||!try_read32(WLAN_CFG+4u,&cmd)||(cmd&0xFFFFu)!=0x0002u)return0;if(!try_read32(WLAN_ATU+0x200u,&r1[0])||!try_read32(WLAN_ATU+0x208u,&r1[1])||!try_read32(WLAN_ATU+0x210u,&r1[2])||!try_read32(WLAN_ATU+0x214u,&r1[3])||r1[0]!=0u||r1[1]!=0x60000000u||r1[2]!=0x6000FFFFu||r1[3]!=0x60000000u)return0;}",
                  "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
-                 "if(need_probe(r.blk)&~probed)continue;", "for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){", "if(!get_row(i,1,&r)||r.step>hi)continue;",
+                 "if(need_probe(r.blk)&~*probed)continue;", "for(i=0;i<WLAN_SEQ_NTEAR;i++){", "if(started)tear_bad=link_teardown(hi,&probed,&rd);", "if(!get_row(i,1,&r)||r.step>hi)continue;",
                  "if(!counter_freq()){", "if(stopped==ST_OK)step_line('S',s,\"ok\"", "for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){", "pstore_save();//the lastline"):
         if need.replace("//the lastline", "") not in norm:
             raise AssertionError(f"{name}: lost '{need}'")
-    ra, rb = _c_function_span(code, "wlan_link_run")
+    ra, rb = _c_function_span(code, "link_run")
     run = re.sub(r"\s+", "", code[ra:rb])
-    plan, main, tdn = run.find("for(s=0;s<=WLAN_LINK_N;s++){"), run.find("for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){"), run.find("for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){")
-    if not 0 < plan < main < tdn or run.count("run_row(") != 2 or "if(started&&" in run or "if(stopped" in run[tdn - 40:tdn]:
+    plan, main, tdn = run.find("for(s=0;s<=WLAN_LINK_N;s++){"), run.find("for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){"), run.find("if(started)tear_bad=link_teardown(hi,&probed,&rd);")
+    if not 0 < plan < main < tdn or run.count("run_row(") != 1 or "if(started&&" in run or "if(stopped" in run[tdn - 40:tdn]:
         raise AssertionError(f"{name}: order = plan check, steps, teardown (unconditional)")
-    allowed_for = [r"i<sizeof\(t\)&&v", r"i<digits&&pos\+1<cap", r"pin<8u", r"i<r->b&&i<POLL_CAP", r"i<16u", r"s<=WLAN_LINK_N;", r"s<=WLAN_LINK_N&&stopped==ST_OK", r"i<WLAN_SEQ_NROWS", r"started&&i<WLAN_SEQ_NTEAR"]
+    hold_fn = re.sub(r"\s+", "", code[slice(*_c_function_span(code, "wlan_link_hold"))])
+    rel_fn = re.sub(r"\s+", "", code[slice(*_c_function_span(code, "wlan_link_release"))])
+    run_fn = re.sub(r"\s+", "", code[slice(*_c_function_span(code, "wlan_link_run"))])
+    a_ref, a_run = hold_fn.find("if(WLAN_LINK_N!=WLAN_HOLD_STEP){"), hold_fn.find("returnlink_run(1,h);")
+    if norm.count("#defineWLAN_HOLD_STEP30u") != 1 or norm.count("link_run(1,h)") != 1 or norm.count("link_run(0,0)") != 1 or "returnlink_run(1,h);" not in hold_fn \
+            or a_ref < 0 or a_run < 0 or not a_ref < a_run or "return2;}" not in hold_fn[:a_run] or "returnlink_run(0,0);" not in run_fn \
+            or "held=hold&&WLAN_LINK_N==WLAN_HOLD_STEP&&stopped==ST_OK&&hi==WLAN_HOLD_STEP;" not in run or "if(held)started=0;" not in run \
+            or 'p=put_txt(line,sizeof(line),p,held?"restore=held":tear_bad?"restore=FAILED":"restore=ok");' not in run \
+            or "if(h){h->on=held;h->hi=hi;h->probed=probed;}" not in run or norm.count("h->on=held;") != 1 or norm.count("h->on=0;") != 1 \
+            or "if(!h->on)return2;h->on=0;bad=link_teardown(h->hi,&probed,&rd);" not in rel_fn or "unsignedp,probed=h->probed;" not in rel_fn \
+            or len(re.findall(r"\blink_teardown\s*\(", code)) != 3 or norm.count("run_row(i,1,probed,rd)") != 1:
+        raise AssertionError(f"{name}: --wlan-hold: WLAN_HOLD_STEP is 30u (the S30 step), link_run(1) has exactly one caller, wlan_link_hold, behind its N != S30 refusal; link_run(0) is wlan_link_run's; held state set once (hold run), cleared once (wlan_link_release, which tears down with the table T rows only)")
+    if run.count("held=") != 1 or "held=hold&&WLAN_LINK_N==WLAN_HOLD_STEP&&stopped==ST_OK&&hi==WLAN_HOLD_STEP;if(held)started=0;" not in run or run.count("started=0") != 2 or run.find("if(held)started=0;") > tdn or \
+            'held?"restore=held":tear_bad?"restore=FAILED":"restore=ok"' not in run:
+        raise AssertionError(f"{name}: the teardown may be skipped only by `if (held) started = 0;`, held = hold && N is S30 && no stop && reached S30; the summary then says restore=held")
+    allowed_for = [r"i<sizeof\(t\)&&v", r"i<digits&&pos\+1<cap", r"pin<8u", r"i<r->b&&i<POLL_CAP", r"i<16u", r"s<=WLAN_LINK_N;", r"s<=WLAN_LINK_N&&stopped==ST_OK", r"i<WLAN_SEQ_NROWS", r"i<WLAN_SEQ_NTEAR"]
     for m in re.finditer(r"\bfor\s*\(((?:[^()]|\([^()]*\))*)\)", code):
         h = re.sub(r"\s+", "", m.group(1))
         if not any(re.search(a, h) for a in allowed_for):
@@ -3884,7 +3920,7 @@ def wlanlink_source_selftest() -> int:
         ("no probe rule", good.replace("(need_probe(r.blk) & ~*probed) && ", "0 && ", 1)),
         ("probe never recorded", good.replace("\t\tif (r.a == 1u)\n\t\t\t*probed |= need_probe(r.blk);", "", 1)),
         ("no UNKNOWN-step refusal", good.replace("\t\tif (!nrows) {", "\t\tif (0) {", 1)),
-        ("teardown conditional on the result", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped == ST_OK && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("teardown conditional on the result", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && stopped == ST_OK)\n\t\ttear_bad = link_teardown", 1)),
         ("teardown skips nothing it should run", good.replace("if (!get_row(i, 1, &r) || r.step > hi)", "if (!get_row(i, 1, &r))", 1)),
         ("a second smc call", good.replace("e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);", "e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);\n\t\t(void)wlan_link_iso_set(rd);", 1)),
         ("a retry loop", good.replace("\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", "\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\twhile (st == ST_TIMEOUT)\n\t\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", 1)),
@@ -3894,8 +3930,35 @@ def wlanlink_source_selftest() -> int:
         ("W-C1c: wrong EOT value (0xE)", good.replace("if (v == 0xFu)\n\t\t\t\t*probed", "if (v == 0xEu)\n\t\t\t\t*probed", 1)),
         ("W-C1c: EOT is any non-zero dword", good.replace("if (v == 0xFu)\n\t\t\t\t*probed", "if (v != 0u)\n\t\t\t\t*probed", 1)),
         ("W-C1c: no refusal when the dump ends without an EOT", good.replace("else if (r.a & 8u)\n\t\t\t\treturn ST_REFUSED;", "", 1)),
-        ("W-C1c: restore skipped on the EOT path", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && !(probed & EOT_SEEN) && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("W-C1c: restore skipped on the EOT path", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && !(probed & EOT_SEEN))\n\t\ttear_bad = link_teardown", 1)),
         ("W-C1c: the EOT skip also drops non-dump rows", good.replace("r.kind == WLK_READ_ONLY && (r.a & 4u))\n\t\t\t\tcontinue;", "r.kind == WLK_READ_ONLY)\n\t\t\t\tcontinue;", 1)),
+        ("S34 skip: SRP_UP set on PowerOnRequest alone (bit 17 not required)", good.replace("(v & 0x20200u) == 0x20200u", "(v & 0x200u) == 0x200u", 1)),
+        ("S34 skip: SRP_UP set on ExtPwrStatus alone (bit 9 not required)", good.replace("(v & 0x20200u) == 0x20200u", "(v & 0x20000u) == 0x20000u", 1)),
+        ("S34 skip: SRP_UP set on a dead read (all ones)", good.replace("v != 0xFFFFFFFFu && (v & 0x20200u)", "(v & 0x20200u)", 1)),
+        ("S34 skip: request skipped without SRP_UP", good.replace("if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", "if (r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", 1)),
+        ("S34 skip: every RMW row is skipped once SRP_UP is set", good.replace("if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW && (r.a & 32u)) {", "if ((probed & SRP_UP) && r.kind == WLK_MMIO_RMW) {", 1)),
+        ("S34 skip: SRP_UP set from any logged read", good.replace("if ((r.a & 16u) && v != 0xFFFFFFFFu", "if (v != 0xFFFFFFFFu", 1)),
+        ("S35 bank skip: BANK_ROM set on a dead read (all ones)", good.replace("v != 0xFFFFFFFFu && (v & 0x3E0u)", "(v & 0x3E0u)", 1)),
+        ("S35 bank skip: BANK_ROM with the brcmfmac mask (0xF0)", good.replace("(v & 0x3E0u) != 0u)\n\t\t\t*probed |= BANK_ROM", "(v & 0xF0u) != 0u)\n\t\t\t*probed |= BANK_ROM", 1)),
+        ("S35 bank skip: BANK_ROM set from any logged read", good.replace("if ((r.a & 64u) && v != 0xFFFFFFFFu", "if (v != 0xFFFFFFFFu", 1)),
+        ("S35 bank skip: bankidx skipped without BANK_ROM", good.replace("if ((probed & BANK_ROM) && r.blk == WLB_MEM", "if (r.blk == WLB_MEM", 1)),
+        ("S35 bank skip: the read-back wait is not skipped", good.replace("(r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", "r.kind == WLK_MMIO_WRITE) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", 1)),
+        ("S35 bank skip: the write is not skipped", good.replace("(r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", "r.kind == WLK_WAIT_EQ) {\n\t\t\t\tstep_line('S', s, \"skip: bankidx", 1)),
+        ("S35 bank skip: every MEM row at 0x10 is skipped", good.replace("r.blk == WLB_MEM && r.off == 0x10u && (r.kind == WLK_MMIO_WRITE || r.kind == WLK_WAIT_EQ)", "r.blk == WLB_MEM && r.off == 0x10u", 1)),
+        ("S35 bank skip: every MEM write is skipped once BANK_ROM is set", good.replace("r.blk == WLB_MEM && r.off == 0x10u && (r.kind == WLK_MMIO_WRITE", "r.blk == WLB_MEM && (r.kind == WLK_MMIO_WRITE", 1)),
+        ("hold: teardown skipped on any hold run", good.replace("held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;", "held = hold;", 1)),
+        ("hold: teardown skipped after a failed step", good.replace("held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;", "held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && hi == WLAN_HOLD_STEP;", 1)),
+        ("hold: teardown skipped before S30 is reached", good.replace("held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;", "held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK;", 1)),
+        ("hold: teardown skipped at another N", good.replace("held = hold && WLAN_LINK_N == WLAN_HOLD_STEP && stopped == ST_OK && hi == WLAN_HOLD_STEP;", "held = hold && stopped == ST_OK && hi == WLAN_HOLD_STEP;", 1)),
+        ("hold: release runs with nothing held", good.replace("\tif (!h->on)\n\t\treturn 2;", "\tif (0)\n\t\treturn 2;", 1)),
+        ("hold: release keeps the held state", good.replace("\th->on = 0;\n\tbad =", "\tbad =", 1)),
+        ("hold: release tears down fewer steps", good.replace("link_teardown(h->hi, &probed, &rd)", "link_teardown(0, &probed, &rd)", 1)),
+        ("hold: held state set on a failed run", good.replace("\t\th->on = held;", "\t\th->on = hold;", 1)),
+        ("hold: wlan_link_run holds", good.replace("return link_run(0, 0);", "return link_run(1, 0);", 1)),
+        ("hold: wlan_link_hold has no N refusal", good.replace("if (WLAN_LINK_N != WLAN_HOLD_STEP) {", "if (0) {", 1)),
+        ("hold: another hold step", good.replace("#define WLAN_HOLD_STEP\t30u", "#define WLAN_HOLD_STEP\t31u", 1)),
+        ("hold: summary says restore=ok when held", good.replace('held ? " restore=held" : tear_bad', 'tear_bad', 1)),
+        ("hold: teardown skipped by another route", good.replace("\tif (held)\n\t\tstarted = 0;", "\tif (held)\n\t\thi = 0;", 1)),
         ("longer delay", good.replace("#define DELAY_MAX_US	250000u", "#define DELAY_MAX_US	2500000u", 1)),
         ("another default N", good.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	WLAN_SEQ_LAST", 1)),
         ("teardown never marked started", good.replace("\t\tstarted = 1;\n", "", 1)),
@@ -4035,13 +4098,13 @@ def wlanlink_source_selftest() -> int:
         ("r32: mem_ok result inverted", good.replace("!mem_ok(win, off)", "mem_ok(win, off)", 1)),
         ("r32: mem_ok called with a fixed window", good.replace("!mem_ok(win, off)", "!mem_ok(0x18105000u, off)", 1)),
         ("r32: mem_ok called with a fixed offset", good.replace("!mem_ok(win, off)", "!mem_ok(win, 0u)", 1)),
-        ("teardown skipped after a refusal (S33 gate stops)", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped != ST_REFUSED && i < WLAN_SEQ_NTEAR; i++) {", 1)),
-        ("teardown skipped after a fault (S33 window write fault)", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped != ST_FAULT && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("teardown skipped after a refusal (S33 gate stops)", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && stopped != ST_REFUSED)\n\t\ttear_bad = link_teardown", 1)),
+        ("teardown skipped after a fault (S33 window write fault)", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && stopped != ST_FAULT)\n\t\ttear_bad = link_teardown", 1)),
         ("gate ignored: a one-shot wait that does not hold is not a stop", good.replace("return (st != ST_OK && r.b == 1u) ? (st == ST_TIMEOUT ? ST_REFUSED : st) : st;", "return st == ST_TIMEOUT ? ST_OK : st;", 1)),
         ("gate ignored: the run continues after a refusal", good.replace("for (s = 0; s <= WLAN_LINK_N && stopped == ST_OK; s++) {", "for (s = 0; s <= WLAN_LINK_N && stopped != ST_FAULT; s++) {", 1)),
         ("teardown filter skips the last started step", good.replace("if (!get_row(i, 1, &r) || r.step > hi)", "if (!get_row(i, 1, &r) || r.step >= hi)", 1)),
-        ("teardown only after a clean run", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && !stopped && i < WLAN_SEQ_NTEAR; i++) {", 1)),
-        ("teardown row order reversed", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = WLAN_SEQ_NTEAR; started && i-- > 0;) {", 1)),
+        ("teardown only after a clean run", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && !stopped)\n\t\ttear_bad = link_teardown", 1)),
+        ("teardown row order reversed", good.replace("for (i = 0; i < WLAN_SEQ_NTEAR; i++) {", "for (i = WLAN_SEQ_NTEAR; i-- > 0;) {", 1)),
         # S34-S36 (research 40, W-C3): the first BAR0 writes. AP-16: every defect class as a source mutant (wrong value, extra write, wrong order / missing predecessor, restore skipped, window chain broken, bankidx other than 0, missing guards)
         ("S34: powerctl request writes another bit (0x400)", good.replace("v == (old | 0x200u);", "v == (old | 0x400u);", 1)),
         ("S34: powerctl request may also clear bits", good.replace("(old & 0xF0000000u) != 0u && v == (old | 0x200u);", "(old & 0xF0000000u) != 0u && (v & 0x200u) != 0u;", 1)),
@@ -4110,7 +4173,7 @@ def wlanlink_source_selftest() -> int:
         ("window chain: S36 ARM wrapper page changed", good.replace("(v == 0x18120000u && old == 0x18026000u)", "(v == 0x18121000u && old == 0x18026000u)", 1)),
         ("window chain: the core page 0x18001000 allowed in the teardown without being the original", good.replace("(v == 0x18001000u && (c->tear ||", "(v == 0x18002000u && (c->tear ||", 1)),
         ("window chain: restore to ChipCommon lost from the PCIe core page", good.replace("(v == 0x18000000u && (old == 0x18001000u ||", "(v == 0x18000000u && (old == 0x18002000u ||", 1)),
-        ("restore skipped after a timeout", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped != ST_TIMEOUT && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("restore skipped after a timeout", good.replace("\tif (started)\n\t\ttear_bad = link_teardown", "\tif (started && stopped != ST_TIMEOUT)\n\t\ttear_bad = link_teardown", 1)),
         ("a one-shot wait that does not hold continues (BAR0 read-back ignored)", good.replace("return (st != ST_OK && r.b == 1u) ? (st == ST_TIMEOUT ? ST_REFUSED : st) : st;", "return (st != ST_OK && r.b == 1u) ? ST_OK : st;", 1)),
         ("a wait row that times out continues (SRPWR wait ignored)", good.replace("\treturn ST_TIMEOUT;\n}", "\treturn ST_OK;\n}", 1)),
         ("a raw read of another register", good.replace(ins, "static void evil(uint32_t *v) { (void)try_read32(0x17463EC8UL, v); }\n" + ins, 1)),
@@ -4119,7 +4182,7 @@ def wlanlink_source_selftest() -> int:
     for label, bad in cases:
         assert bad != good, f"wlanlink source selftest case did not mutate: {label}"
         try:
-            check_wlanlink_source_text(bad, "selftest")
+            check_wlanlink_source_text(bad, "selftest", pins=not label.startswith("hold:"))	# hold mutants must die on their own needle, not on the body SHA (review 21 F4)
         except AssertionError as exc:
             caught += 1
             print(f"self-test caught: wlanlink source {label} -> {exc}")
@@ -4146,7 +4209,7 @@ def check_wlan_link_n_sources(link_src: str, build_sh: str, name: str = "wlanlin
     code = re.sub(r"\s+", "", _strip_c_comments(link_src))
     if "#ifndefWLAN_LINK_N#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N#endif" not in code:
         raise AssertionError(f"{name}: WLAN_LINK_N must default to WLAN_SEQ_DEFAULT_N")
-    ra, rb = _c_function_span(_strip_c_comments(link_src), "wlan_link_run")
+    ra, rb = _c_function_span(_strip_c_comments(link_src), "link_run")
     run = re.sub(r"\s+", "", _strip_c_comments(link_src)[ra:rb])
     first = run.find("emit(line,p);")
     want = 'p=put_txt(line,sizeof(line),0,"LINKtablesha=");'
@@ -4158,6 +4221,11 @@ def check_wlan_link_n_sources(link_src: str, build_sh: str, name: str = "wlanlin
     assigns = [l.strip() for l in sh if re.match(r"\s*wlan_link_n=|.*[;)]\s*wlan_link_n=", l) and "wlan_link_n=$" not in l and "wlan_link_n=)" not in l]
     flags = [l.strip() for l in sh if "-DWLAN_LINK_N=" in l]
     ok_assign = [l for l in assigns if l.startswith("--wlan-link=*)") and 'wlan_link_n="${1#--wlan-link=}"' in l]
+    hold_assign = [l for l in assigns if l == "wlan_link_n=30"]	# the --wlan-hold block: the only other assignment, after its own refusal of every other explicit N
+    assigns = [l for l in assigns if l != "wlan_link_n=30"]
+    if len(hold_assign) != 1 or not re.search(r'\[ -z "\$wlan_link_n" \] \|\| \[ "\$wlan_link_n" = 30 \] \|\| \{ echo "--wlan-hold implies --wlan-link=30[^\n]*exit 2; \}\n\twlan_link_n=30\n', build_sh) or not re.search(r'\[ "\$boot_xnu" = 1 \] \|\| \{ echo "--wlan-hold needs --boot-xnu', build_sh) \
+            or build_sh.count("-DWLAN_HOLD") != 1 or not re.search(r'wlan_link_n=30\n\tCFLAGS="\$CFLAGS -DWLAN_HOLD"\nfi', build_sh):
+        raise AssertionError("build.sh: --wlan-hold needs --boot-xnu, refuses every explicit --wlan-link=N except 30, sets wlan_link_n=30 and -DWLAN_HOLD in that one block")
     if len(assigns) != 2 or len(ok_assign) != 1 or sum(1 for l in assigns if l.startswith("wlan_link_n=")) != 1:
         raise AssertionError(f"build.sh: wlan_link_n may be set only by the declaration and `--wlan-link=*)`: {assigns}")
     if len(flags) != 2 or sum(1 for l in flags if l.startswith('[ -z "$wlan_link_n" ] || CFLAGS="$CFLAGS -DWLAN_LINK_N=$wlan_link_n"')) != 1 or sum(1 for l in flags if "wlanlink_host_test" in l) != 1:
@@ -4187,6 +4255,10 @@ def wlan_link_n_selftest() -> int:
         ("a step line before the first LINK line", src.replace("\tp = put_txt(line, sizeof(line), 0, \"LINK table sha=\");", "\tstep_line('S', 0, \"x\", 0, 0, 0, 0, 0, 0);\n\tp = put_txt(line, sizeof(line), 0, \"LINK table sha=\");", 1), sh),
         ("another default N", src.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	22", 1), sh),
         ("bare --wlan-link sets N", src, sh.replace("--wlan-link) wlan_link=1;", "--wlan-link) wlan_link_n=20; wlan_link=1;", 1)),
+        ("hold does not need boot-xnu", src, sh.replace('[ "$boot_xnu" = 1 ] || { echo "--wlan-hold needs --boot-xnu', '[ 1 = 1 ] || { echo "--wlan-hold needs --boot-xnu', 1)),
+        ("hold accepts another explicit N", src, sh.replace('[ -z "$wlan_link_n" ] || [ "$wlan_link_n" = 30 ] || { echo "--wlan-hold implies', '[ -z "$wlan_link_n" ] || [ 1 = 1 ] || { echo "--wlan-hold implies', 1)),
+        ("hold sets another N", src, sh.replace("\twlan_link_n=30\n\tCFLAGS", "\twlan_link_n=19\n\tCFLAGS", 1)),
+        ("WLAN_HOLD defined outside the hold block", src, sh.replace('CFLAGS="$CFLAGS -DBOOT_XNU"', 'CFLAGS="$CFLAGS -DBOOT_XNU -DWLAN_HOLD"', 1)),
         ("N flag unconditional", src, sh.replace('[ -z "$wlan_link_n" ] || CFLAGS="$CFLAGS -DWLAN_LINK_N=$wlan_link_n"', 'CFLAGS="$CFLAGS -DWLAN_LINK_N=${wlan_link_n:-23}"', 1)),
     ]
     for label, bs, bsh in cases:
@@ -4630,13 +4702,31 @@ def check_shim_wlan_sequence(src: str, name: str = "shim.c") -> None:
     code = _strip_c_comments(src)
     norm = re.sub(r"\s+", "", code)
     pos = []
-    for fn, flag in (("wlan_rails", "WLAN_RAILS"), ("wlan_link_run", "WLAN_LINK_RUN"), ("wlan_smc_read", "WLAN_SMC_READ"), ("wlan_iso_run", "WLAN_ISO_RUN"), ("wlan_en_run", "WLAN_EN_RUN")):
-        if len(re.findall(r"\b" + fn + r"\s*\(", code)) != 1 or f"#ifdef{flag}" not in norm or f"(void){fn}();" not in norm:
-            raise AssertionError(f"{name}: {fn}() must be called exactly once, as `(void){fn}();` inside #ifdef {flag}")
+    for fn, flag, guard in (("wlan_rails", "WLAN_RAILS", None), ("wlan_link_run", "WLAN_LINK_RUN", "#ifdefined(WLAN_LINK_RUN)&&!defined(WLAN_HOLD)"), ("wlan_smc_read", "WLAN_SMC_READ", None), ("wlan_iso_run", "WLAN_ISO_RUN", None), ("wlan_en_run", "WLAN_EN_RUN", None)):
+        guard = guard or f"#ifdef{flag}"	# wlan_link_run: a --wlan-hold image runs the chain once, before loader_boot (wlan_link_hold), never again in the fall-through section
+        if len(re.findall(r"\b" + fn + r"\s*\(", code)) != 1 or guard not in norm or f"(void){fn}();" not in norm:
+            raise AssertionError(f"{name}: {fn}() must be called exactly once, as `(void){fn}();` inside {guard}")
         i = norm.find(f"(void){fn}();")
-        if not norm.rfind(f"#ifdef{flag}", 0, i) > norm.find("wlan_probe_l1();") or not i < norm.find("wlan_probe_l2_open()"):
+        if not norm.rfind(guard, 0, i) > norm.find("wlan_probe_l1();") or not i < norm.find("wlan_probe_l2_open()"):
             raise AssertionError(f"{name}: {fn}() must sit in its own #ifdef {flag} block after wlan_probe_l1() and before the level-2 gate")
         pos.append(i)
+    # --wlan-hold: wlan_link_hold() exactly once, as `wlan_hold_rc=wlan_link_hold();` in an #ifdef WLAN_HOLD block that opens after the bluejay_probe boot-XNU section marker, never closes the level of that marker, and sits BEFORE the first loader_boot(dtb) (review 21 F3: the unrelated `#ifdef BOOT_XNU` at the top of the file does not count)
+    hi, mk, lb = norm.find("wlan_hold_rc=wlan_link_hold(&wlan_held);"), norm.find('con_str("SECTION","bootXNU");'), norm.find("loader_boot(dtb)")
+    depth, lowest = 0, 0
+    for m in re.finditer(r"#endif|#if", norm[mk:hi] if 0 <= mk < hi else ""):
+        depth += 1 if m.group(0) == "#if" else -1
+        lowest = min(lowest, depth)
+    ho = norm.rfind("#ifdefWLAN_HOLD", 0, hi)
+    if len(re.findall(r"\bwlan_link_hold\s*\(", code)) != 1 or hi < 0 or not 0 <= mk < ho < hi < lb or lowest < 0 or depth < 1 or "#endif" in norm[ho:hi]:
+        raise AssertionError(f"{name}: wlan_link_hold() must be called exactly once, as `wlan_hold_rc=wlan_link_hold();` inside #ifdef WLAN_HOLD inside the BOOT_XNU section (after its marker, same #if level), before loader_boot(dtb)")
+    # the #error is at file scope (review 21 F2): equal #if / #endif counts before it
+    er = norm.find("#ifdefined(WLAN_HOLD)&&!(defined(WLAN_LINK_RUN)&&defined(BOOT_XNU))#error")
+    depth_at = lambda i: len(re.findall(r"#if", norm[:i])) - len(re.findall(r"#endif", norm[:i]))
+    if er < 0 or mk < 0 or depth_at(er) != depth_at(mk) - 1:	# the marker sits one #ifdef BOOT_XNU level inside the probe function's own level
+        raise AssertionError(f"{name}: --wlan-hold without --wlan-link and --boot-xnu must be an #error in shim.c, outside every conditional of the probe (one level above the boot-XNU section marker)")
+    # a failed loader_boot releases a held link through the audited T rows, only when the hold returned 0 (review 21 F1)
+    if len(re.findall(r"\bwlan_link_release\s*\(", code)) != 1 or "if(wlan_hold_rc==0&&wlan_link_release(&wlan_held)!=0)" not in norm or not lb < norm.find("wlan_link_release("):
+        raise AssertionError(f"{name}: wlan_link_release() must be called exactly once, after loader_boot(dtb) returned, only if wlan_link_hold() returned 0")
     if not re.search(r"#if defined\(WLAN_ISO_RUN\) && defined\(WLAN_EN_RUN\)\n#error", src):
         raise AssertionError(f"{name}: --wlan-iso and --wlan-en must be impossible to combine (#error in shim.c)")
     if not re.search(r"#if defined\(WLAN_LINK_RUN\) && \(defined\(WLAN_ISO_RUN\) \|\| defined\(WLAN_EN_RUN\) \|\| defined\(WLAN_SMC_READ\)\)\n#error", src):
@@ -4646,6 +4736,16 @@ def check_shim_wlan_sequence(src: str, name: str = "shim.c") -> None:
         raise AssertionError(f"{name}: in a WLAN_ISO_RUN image every level-2 read (wlan_probe_l2_open / _group, SUMMARY included) must sit in the #else of `#ifdef WLAN_ISO_RUN` (review 2 F2)")
     if pos != sorted(pos):
         raise AssertionError(f"{name}: order must be wlan_rails (read-only), wlan_smc_read (EL3 reads), wlan_iso_run (EL3 RMW), wlan_en_run (GPIO writer)")
+
+
+def hold_moved(src: str) -> str:
+    """Selftest mutant P1: the whole `#ifdef WLAN_HOLD` hand-over block moved in front of the bluejay_probe `#ifdef BOOT_XNU` (the stray BOOT_XNU at the top of the file must not satisfy the audit)."""
+    a = src.index("#ifdef WLAN_HOLD\n\t/* --boot-xnu --wlan-hold")
+    b = src.index("#endif\n", a) + len("#endif\n")
+    blk = src[a:b]
+    out = src[:a] + src[b:]
+    k = out.index("#ifdef BOOT_XNU", out.index("#ifdef BOOT_XNU") + 1)
+    return out[:k] + blk + out[k:]
 
 
 def wlan_shim_selftest() -> int:
@@ -4662,7 +4762,16 @@ def wlan_shim_selftest() -> int:
         ("level-2 SUMMARY outside the skip", shim_src.replace("\twlan_probe_l2_group(4);\t\t\t/* SUMMARY, also when gated */\n#endif\t/* !(WLAN_ISO_RUN || WLAN_LINK_RUN) */", "#endif\t/* !(WLAN_ISO_RUN || WLAN_LINK_RUN) */\n\twlan_probe_l2_group(4);", 1)),
         ("link combinable with iso", shim_src.replace("#if defined(WLAN_LINK_RUN) && (defined(WLAN_ISO_RUN) || defined(WLAN_EN_RUN) || defined(WLAN_SMC_READ))\n#error", "#if 0\n#error", 1)),
         ("a second wlan_link_run call", shim_src.replace("\t(void)wlan_link_run();\n", "\t(void)wlan_link_run();\n\t(void)wlan_link_run();\n", 1)),
-        ("wlan_link_run outside its flag", shim_src.replace("#ifdef WLAN_LINK_RUN\n\t/* W3a", "#if 1\n\t/* W3a", 1)),
+        ("wlan_link_run outside its flag", shim_src.replace("#if defined(WLAN_LINK_RUN) && !defined(WLAN_HOLD)\n\t/* W3a", "#if 1\n\t/* W3a", 1)),
+        ("wlan_link_run runs a second time in a hold image", shim_src.replace("#if defined(WLAN_LINK_RUN) && !defined(WLAN_HOLD)\n\t/* W3a", "#ifdef WLAN_LINK_RUN\n\t/* W3a", 1)),
+        ("a second wlan_link_hold call", shim_src.replace("\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", "\twlan_hold_rc = wlan_link_hold(&wlan_held);\n\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", 1)),
+        ("wlan_link_hold outside its flag", shim_src.replace("#ifdef WLAN_HOLD\n\t/* --boot-xnu --wlan-hold", "#if 1\n\t/* --boot-xnu --wlan-hold", 1)),
+        ("wlan_link_hold after loader_boot", shim_src.replace("\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", "", 1).replace("\t\tconst char *why = loader_boot(dtb);\n", "\t\tconst char *why = loader_boot(dtb);\n\t\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", 1)),
+        ("hold without link/boot-xnu not an error", shim_src.replace("#if defined(WLAN_HOLD) && !(defined(WLAN_LINK_RUN) && defined(BOOT_XNU))\n#error", "#if 0\n#error", 1)),
+        ("hold #error inside an #if", shim_src.replace("#if defined(WLAN_HOLD) && !(defined(WLAN_LINK_RUN) && defined(BOOT_XNU))\n#error", "#ifdef BOOT_XNU\n#if defined(WLAN_HOLD) && !(defined(WLAN_LINK_RUN) && defined(BOOT_XNU))\n#error", 1).replace('--wlan-hold needs --wlan-link=30 and --boot-xnu"\n#endif', '--wlan-hold needs --wlan-link=30 and --boot-xnu"\n#endif\n#endif', 1)),
+        ("hold block moved in front of the boot-XNU block (P1)", hold_moved(shim_src)),
+        ("release not gated on the hold result", shim_src.replace("if (wlan_hold_rc == 0 && wlan_link_release(&wlan_held) != 0)", "if (wlan_link_release(&wlan_held) != 0)", 1)),
+        ("release called twice", shim_src.replace("pstore_save();\n#endif\n#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)\n\t\tif (gpu_ho == RAIL_ON_OK)", "pstore_save();\n\t\t(void)wlan_link_release(&wlan_held);\n#endif\n#if defined(GPU_HANDOVER) && defined(GPU_RAIL_ON)\n\t\tif (gpu_ho == RAIL_ON_OK)", 1)),
         ("a second wlan_iso_run call", shim_src.replace("\t(void)wlan_iso_run();\n", "\t(void)wlan_iso_run();\n\t(void)wlan_iso_run();\n", 1)),
         ("wlan_iso_run outside its flag", shim_src.replace("#ifdef WLAN_ISO_RUN\n", "#if 1\n", 1)),
     ]

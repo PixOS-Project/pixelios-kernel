@@ -18,6 +18,7 @@ wlan_smc_read=0
 wlan_iso=0
 wlan_link=0
 wlan_link_n=
+wlan_hold=0
 gpu_probe=0
 gpu_power=0
 gpu_stack=0
@@ -48,6 +49,7 @@ while [ "$#" -gt 0 ]; do
 		--wlan-smc-read) wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-probe; two EL3 SMC_CMD_PRIV_REG READs of PMU 0x17463EC4 / 0x17463EC0 (wlansmc.c, docs/research/29 W2a)
 		--wlan-iso) wlan_iso=1; wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-smc-read --wlan-probe; WRITER via EL3: PCIe1 PHY isolation release + restore (wlansmc.c WLAN_ISO_RUN, docs/research/29 W2c)
 		--wlan-link) wlan_link=1; wlan_probe=1; shift ;;	# implies --wlan-probe; the table-driven power-up chain S00..S19 (default: the last step BEFORE the PERST release) + teardown (wlanlink.c, docs/research/29 section 14)
+		--wlan-hold) wlan_hold=1; wlan_link=1; wlan_probe=1; shift ;;	# needs --boot-xnu, gs101; implies --wlan-link=30 (the S30 step); chain up to S30, NO teardown, link left up for XNU (wlanlink.c wlan_link_hold, docs/research/42 section 7)
 		--wlan-link=*) wlan_link=1; wlan_probe=1; wlan_link_n="${1#--wlan-link=}"; shift ;;
 		--wlan-en) wlan_en=1; wlan_probe=1; shift ;;	# implies --wlan-probe; WRITER: WLAN_EN gpp14-2 high for 200 ms and back (wlanen.c, docs/research/29 W2b)
 		--gpu-probe) gpu_probe=1; shift ;;
@@ -116,6 +118,12 @@ fi
 if [ "$wlan_smc_read" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-smc-read needs a gs101 board" >&2; exit 2; }
 	CFLAGS="$CFLAGS -DWLAN_SMC_READ"
+fi
+if [ "$wlan_hold" = 1 ]; then
+	[ "$boot_xnu" = 1 ] || { echo "--wlan-hold needs --boot-xnu (the hold exists to hand the link to XNU)" >&2; exit 2; }
+	[ -z "$wlan_link_n" ] || [ "$wlan_link_n" = 30 ] || { echo "--wlan-hold implies --wlan-link=30 (the S30 step); --wlan-link=$wlan_link_n is refused" >&2; exit 2; }
+	wlan_link_n=30
+	CFLAGS="$CFLAGS -DWLAN_HOLD"
 fi
 if [ "$wlan_link" = 1 ]; then
 	[ "$gs101" = 1 ] || { echo "--wlan-link needs a gs101 board" >&2; exit 2; }
@@ -543,6 +551,23 @@ else
 	awk '$0=="+++ b/bsd/dev/sweet_ftm5.h"{on=1;next} on&&/^--- /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0088-sweet-gs101-touch.patch > $O/sweet_ftm5.h
 	chk "ftm5_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/ftm5_host_test ftm5_host_test.c
 	chk "ftm5_host_test" $O/ftm5_host_test
+	# stage-1 BCM4389 chip layer of xnu patch 0124 (new-file hunk of bsd/dev/sweet_wlan_chip.h): replayed against the values observed on hardware
+	awk '$0=="+++ b/bsd/dev/sweet_wlan_chip.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0124-sweet-wlan-bwfm-core.patch > $O/sweet_wlan_chip.h
+	chk "wlan_xnu_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_xnu_host_test wlan_xnu_host_test.c
+	chk "wlan_xnu_host_test" $O/wlan_xnu_host_test
+	# stage-3 chip WRITER of xnu patches 0129 + 0130 (new-file hunk of bsd/dev/sweet_wlan_wr.h, includes the chip header above): replayed with fault injection (mutants: tools/test_wlan_wr_mutants.py)
+	awk '$0=="+++ b/bsd/dev/sweet_wlan_wr.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0129-sweet-wlan-chip-writes.patch > $O/sweet_wlan_wr.h
+	# patch 0130 (run B) changes that header: apply its hunk for the file on top of the 0129 text, so the test sees the bytes the kernel gets
+	awk '/^diff --git a\/bsd\/dev\/sweet_wlan_wr.h /{on=1;print;next} on&&/^diff --git /{exit} on{print}' ../xnu/patches/0130-sweet-wlan-image-copy.patch > $O/sweet_wlan_wr.0130.diff
+	rm -rf $O/wrp; mkdir -p $O/wrp/bsd/dev; cp $O/sweet_wlan_wr.h $O/wrp/bsd/dev/
+	patch -s -p1 -d $O/wrp < $O/sweet_wlan_wr.0130.diff || { echo "FAIL patch 0130 does not apply to sweet_wlan_wr.h" >&2; exit 1; }
+	cp $O/wrp/bsd/dev/sweet_wlan_wr.h $O/sweet_wlan_wr.h
+	chk "wlan_wr_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_wr_host_test wlan_wr_host_test.c
+	chk "wlan_wr_host_test" $O/wlan_wr_host_test
+	# firmware container parser of xnu patch 0128 (new-file hunk of bsd/dev/sweet_wlan_fw.h)
+	awk '$0=="+++ b/bsd/dev/sweet_wlan_fw.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0128-sweet-wlan-fwcheck.patch > $O/sweet_wlan_fw.h
+	chk "wlan_fw_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/wlan_fw_host_test wlan_fw_host_test.c
+	chk "wlan_fw_host_test" $O/wlan_fw_host_test
 	awk '$0=="+++ b/bsd/dev/sweet_mali_pt.h"{on=1;next} on&&/^--- /{exit} on&&/^diff /{exit} on&&/^@@/{next} on&&/^\+/{print substr($0,2)}' ../xnu/patches/0104-sweet-mali-driver-core.patch > $O/sweet_mali_pt.h
 	chk "mali_pt_host_test (compile)" gcc -O1 -Wall -Wextra -Werror -I$O -o $O/mali_pt_host_test mali_pt_host_test.c
 	chk "mali_pt_host_test" $O/mali_pt_host_test

@@ -299,7 +299,7 @@ STEP_NAMES = {
 }
 
 
-def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False, eot=0):
+def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False, eot=0, srp=0):
     assert kind in KINDS and (blk is None or blk in BLOCKS) and step in STEP_NAMES
     r = {"id": len(rows), "step": step, "kind": kind, "blk": blk, "off": off, "mask": mask & FULL, "value": value & FULL, "delay_us": us, "polls": polls, "restore": restore, "cite": cite, "tag": tag}
     if probe:
@@ -310,6 +310,10 @@ def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="",
     if eot:
         assert kind == "read_only" and log and eot in (1, 2), "eot is for logged read_only rows: 1 = stop the dump after a 0xF dword, 2 = also refuse if the dword is not 0xF (the last row)"
         r["eot"] = eot
+    if srp:
+        if not ((srp == 1 and kind == "read_only" and log) or (srp == 2 and kind == "mmio_rmw") or (srp == 3 and kind == "read_only" and log)):
+            raise ValueError("srp: 1 = logged read_only row that records `SRPWR domain 1 already up`, 2 = the mmio_rmw request row skipped when it was recorded, 3 = logged read_only row (S35 coreinfo) that records `SYS_MEM has ROM banks`: the run then skips the bankidx write and its read-back wait (MEM 0x10)")
+        r["srp"] = srp
     if note:
         r["note"] = note
     rows.append(r)
@@ -646,7 +650,7 @@ def build():
     # ---- S29 / S30 (research 36): region 1, BAR0 window, Command MEM, then the first MEM read; rows come from draft29() ----
     for d in draft29():
         w = d["kind"] in ("wait_eq", "wait_mask")
-        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], us=d.get("us", 0), polls=d.get("polls", 1 if w else 0), cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False), eot=d.get("eot", 0))
+        add(d["step"], d["kind"], d["blk"], d["off"], d["mask"], d["value"], us=d.get("us", 0), polls=d.get("polls", 1 if w else 0), cite=d["cite"], tag=d["tag"], note=d["note"], restore=d.get("restore"), probe=d.get("probe", False), log=d.get("log", False), eot=d.get("eot", 0), srp=d.get("srp", 0))
 
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     # S29 rows FIRST of all (research 36 s.5.2 R2, s.6): region 1 DISABLE (RC-local, cannot stall), Command := 0, BAR0 window := observed original; unconditional (idempotent); the region 1 resets follow the BAR rows
@@ -847,8 +851,8 @@ def draft29():
         row(step, "mmio_write", "CFG", 0x80, FULL, to, f"{r40} (window = 4 KiB core page base, as S33); {cite}; only from {frm:#010x} (cfg_ok)", TAG_GUESS, f"PCI_BAR0_WIN := {to:#010x} ({nm})", restore="bar0win_s32")
         row(step, "wait_eq", "CFG", 0x80, FULL, to, "read-back of the row above (one-shot; our own gate), else STOP + restore", TAG_GUESS, f"read-back PCI_BAR0_WIN must be {to:#010x}")
 
-    def rl(step, off, nm, cite):
-        row(step, "read_only", "MEM", off, FULL, 0, f"{r40}; {nm}: {cite}", TAG_GUESS, f"log {nm} (BAR0+{off:#x})", log=True)
+    def rl(step, off, nm, cite, **kw):
+        row(step, "read_only", "MEM", off, FULL, 0, f"{r40}; {nm}: {cite}", TAG_GUESS, f"log {nm} (BAR0+{off:#x})", log=True, **kw)
 
     def lg(step):
         row(step, "read_only", "CFG", 0xBC, FULL, 0, f"{r40}; as S30", TAG_GUESS, "log EP link control/status after the writes", log=True)
@@ -886,8 +890,8 @@ def draft29():
     stat = an(SBCHIPC, r"define\s+SRPWR_STATUS_SHIFT\s+\(16\)")
     row(34, "wait_eq", "CFG", 0x80, FULL, 0x18126000, f"{r40} precondition: S33 ends with cfg 0x80 = 0x18126000 (the SYS_MEM wrapper, observed run w3a-n33 before the trim)", "observed", "precondition: PCI_BAR0_WIN == 0x18126000 (S33 end state), else STOP + restore")
     mv(34, 0x18126000, 0x18001000, "PCIe core page", f"PCIe core page 0x18001000 decoded from the EROM (observed run w3a-n33, erom-decode); powerctl {pwr} (U-N3: the core page + 0x1E8 is the register DHD reaches via BAR0+0x2000+0x1E8 is a GUESS)")
-    rl(34, 0x1E8, "PCIe powerctl before", f"{pwr}; PowerOnRequest[11:8] {req}, ExtPwrStatus[19:16] {stat}")
-    row(34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, f"{r40}; {srp}; request value 0x2 << 8 = 0x200; allowlist: memw_ok (only bit 0x200, 0 -> 1)", TAG_SRC, "SRPWR domain 1 request: powerctl |= 0x200")
+    rl(34, 0x1E8, "PCIe powerctl before", f"{pwr}; PowerOnRequest[11:8] {req}, ExtPwrStatus[19:16] {stat}; the run records `domain 1 already up` when ExtPwrStatus bit 17 and PowerOnRequest bit 9 are both set and the word is not all ones (observed run w3a-n34: 0x00030300), and then skips the request row (srp)", srp=1)
+    row(34, "mmio_rmw", "MEM", 0x1E8, 0x200, 0x200, f"{r40}; {srp}; request value 0x2 << 8 = 0x200; allowlist: memw_ok (only bit 0x200, 0 -> 1)", TAG_SRC, "SRPWR domain 1 request: powerctl |= 0x200 (skipped when powerctl already shows bits 17 and 9: no write, the read-back and the status wait below still run)", srp=2)
     wq(34, 0x1E8, 0x200, 0x200, "powerctl & 0x200 must read back 1 (the request write took; one-shot)")
     wq(34, 0x1E8, 0x20000, 0x20000, f"ExtPwrStatus bit 17 (domain 1 on) within 15 ms (150 x 100 us); DHD SPINWAITs PMU_MAX_TRANSITION_DLY = 15000 us: {an(SBCHIPC, r'define\s+PMU_MAX_TRANSITION_DLY\s+15000')}; a timeout means domain 1 did not power: STOP + restore, no wrapper write follows", polls=150, us=100, kind="wait_mask", tag=TAG_SRC)
     rl(34, 0x1E8, "PCIe powerctl after", f"{pwr}; status bit 17 set = domain 1 up (U-N3/U-N4)")
@@ -908,7 +912,7 @@ def draft29():
     wq(35, 0x804, FULL, 0, "SYS_MEM up gate 3/3: RESET_ST == 0 (one-shot), else STOP + restore (review 15 finding 2)", tag=TAG_SRC)
     mv(35, 0x18126000, 0x18026000, "SYS_MEM core", "SYS_MEM core base 0x18026000 decoded from the EROM (observed run w3a-n33); entered only after the SYS_MEM up gate")
     ci = f"{an(G4SBSYS, r'uint32\s+coreinfo;')}; rev 9 < 12 uses the OLD masks nb = coreinfo & 0x1F ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_SRNB_MASK\s+0x1f')}), nrb = (coreinfo & 0x3E0) >> 5 ({an(G4SBSYS, r'define\s+SYSMEM_SRCI_ROMNB_MASK\s+0x3e0')}); {an(SIU, r'if .si_corerev.sih. < 12.', 7030)}; brcmfmac decodes the same word with 0xF0 (U-N2)"
-    rl(35, 0x000, "SYS_MEM coreinfo", ci)
+    rl(35, 0x000, "SYS_MEM coreinfo", ci + "; the run records `ROM banks present` when the word is not all ones and (coreinfo & 0x3E0) != 0 (observed run w3a-n35: 0x00000115 = nrb 8, nb 21 by the DHD rev < 12 masks; a read from source, not checked against the chip) and then skips the bankidx write and its read-back wait: the bank size is informative only and S36 does not need a bank (srp)", srp=3)
     row(35, "mmio_write", "MEM", 0x10, FULL, 0, f"{r40}; bankidx := 0 for bank index i + nrb with i = 0 and nrb = 0: {an(SIU, r'W_REG.sii->osh, &regs->bankidx, bankidx.;', 6955)} ({an(G4SBSYS, r'define\s+SYSMEM_BANKIDX_REG\s+0x10')}); allowlist memw_ok: only 0, only if live coreinfo != all ones, nrb == 0 and nb >= 1", TAG_SRC, "bankidx := 0 (select RAM bank 0)")
     dly(35, 10, an(SIU, r"define SI_BANKINFO_DELAY_USEC\s+10u", 6955))
     rl(35, 0x10, "SYS_MEM bankidx", "read back, expect 0 (U-N6)")

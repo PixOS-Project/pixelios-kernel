@@ -62,6 +62,16 @@ class S35Decode(unittest.TestCase):
         for s in ("domain id 3", "bit 17 1", "bank size 65536", "DHD(rev<12): nb 5 nrb 0", "CPUHALT 1", "uniform-bank estimate 320 KiB"):
             self.assertIn(s, out)
 
+    def test_s34_skip_path_passes_with_id_zero(self):
+        ov = {(34, P, 0x1E8, "before"): 0x00030300, (34, P, 0x1E8, "after"): 0x00030300}
+        rc, out, _ = run(log(35, ov) + ["LINK S34 skip: SRPWR request, domain 1 already up (no write) row=1345"])
+        self.assertEqual(rc, 0, out)
+
+    def test_s34_skip_line_with_request_not_up_fails(self):
+        rc, out, _ = run(log(35, {(34, P, 0x1E8, "before"): 0x00020000}) + ["LINK S34 skip: SRPWR request, domain 1 already up (no write) row=1345"])
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL P1", out)
+
     def test_s34_domain_id_zero_fails(self):
         rc, out, _ = run(log(34, {(34, P, 0x1E8, "before"): 0x00000000}))
         self.assertEqual(rc, 1)
@@ -89,6 +99,27 @@ class S35Decode(unittest.TestCase):
             rc, out, _ = run(log(35, {(35, C, 0x000, ""): ci}))
             self.assertEqual(rc, 1, hex(ci))
             self.assertIn(f"FAIL {nm}", out)
+
+    def test_s35_bank_skip_path(self):
+        skip = "LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write) row=1380 rd=0x00000115"
+        ov = {(35, C, 0x000, ""): 0x115, (35, C, 0x010, ""): 3}
+        rc, out, _ = run(log(36, ov) + [skip])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("UNSELECTED bank", out)
+        self.assertNotIn("uniform-bank estimate", out)
+        rc, out, _ = run(log(36, ov))				# the same words without the skip line: the write path was supposed to run, nrb != 0 fails C2 and bankidx 3 fails B1
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL C2", out)
+        self.assertIn("FAIL B1", out)
+        rc, out, _ = run(log(36) + [skip])			# a skip line but coreinfo shows no ROM bank (nrb 0): inconsistent
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL C2", out)
+
+    def test_s35_bank_skip_wrong_row_fails(self):
+        ov = {(35, C, 0x000, ""): 0x115, (35, C, 0x010, ""): 3}
+        rc, out, _ = run(log(36, ov) + ["LINK S35 skip: bankidx select, SYS_MEM has ROM banks (no write) row=1345 rd=0x00000115"])	# review 19 finding 4: a skip line for another row
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL S1 bank skip rows", out)
 
     def test_s35_bankidx_and_bankinfo(self):
         rc, out, _ = run(log(35, {(35, C, 0x010, ""): 3}))
