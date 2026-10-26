@@ -377,6 +377,17 @@ def redact_serials(text):
     return redacted
 
 
+RESET_BL = os.path.join(REPO_ROOT, "tools", "sweet-reset-bl")
+
+
+def resolve_cmd(cmd):
+    """Tests replace the one command that sends a real UDP datagram to the phone (AP-55), as PHONE_STATE_BIN replaces phone-state.
+    Called after assert_command_allowed, so the allowlist still names only the real script."""
+    if tuple(cmd) == (RESET_BL,) and os.environ.get("PHONE_RESET_BL_BIN"):
+        return [os.environ["PHONE_RESET_BL_BIN"]]
+    return list(cmd)
+
+
 def assert_command_allowed(cmd):
     """Safety assertion: verify cmd is in COMMAND_ALLOWLIST.
     Refuses any flashing, wiping, partition modification, or unauthorized operations.
@@ -469,6 +480,7 @@ def safe_device_cmd(cmd, timeout_s=15, logger=None, skip_bluejay_check=False):
     Any non-bluejay target results in refusal and no command being sent.
     """
     assert_command_allowed(cmd)
+    cmd = resolve_cmd(cmd)
 
     if not skip_bluejay_check:
         transport = cmd[0]
