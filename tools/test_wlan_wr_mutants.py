@@ -3,8 +3,11 @@
 Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in a copy of the header (every occurrence of the pattern), the host test
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
+Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; the texts under test are the files after 0124, 0128, 0129, 0130 are applied in order (apply_chain).
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
+import difflib
+import functools
 import os
 import re
 import subprocess
@@ -15,7 +18,54 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATCH0120 = os.path.join(ROOT, "xnu", "patches", "0124-sweet-wlan-bwfm-core.patch")
 PATCH0125 = os.path.join(ROOT, "xnu", "patches", "0129-sweet-wlan-chip-writes.patch")
+PATCH0128 = os.path.join(ROOT, "xnu", "patches", "0128-sweet-wlan-fwcheck.patch")
+PATCH0130 = os.path.join(ROOT, "xnu", "patches", "0130-sweet-wlan-image-copy.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
+HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
+GLUE_PATH = "bsd/dev/sweet_wlan.c"
+
+
+def file_diff(patch, path):
+    """The diff section of one file in a patch (its 'diff --git' line up to the next one); '' when the patch does not touch the file."""
+    out, on = [], False
+    with open(patch, encoding="utf-8") as fh:
+        for line in fh.read().split("\n"):
+            if line.startswith("diff --git "):
+                on = line.endswith(" b/" + path)
+            if on:
+                out.append(line)
+    return "\n".join(out) + "\n" if out else ""
+
+
+@functools.lru_cache(maxsize=None)
+def apply_chain(path, patches):
+    """The text of `path` after the given patches (a tuple of files) are applied in order with patch(1), each only for this file."""
+    with tempfile.TemporaryDirectory() as d:
+        full = os.path.join(d, path)
+        os.makedirs(os.path.dirname(full))
+        for pt in patches:
+            sec = file_diff(pt, path)
+            if not sec:
+                continue
+            r = subprocess.run(["patch", "-s", "-p1", "-d", d], input=sec, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise ValueError("%s does not apply to %s: %s" % (os.path.basename(pt), path, r.stdout + r.stderr))
+        if not os.path.exists(full):
+            raise ValueError("no patch creates " + path)
+        with open(full, encoding="utf-8") as fh:
+            return fh.read()
+
+
+def final_header():
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130))
+
+
+def glue_before():
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128))
+
+
+def glue_after():
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130))
 
 
 def new_file(patch, path):
@@ -67,6 +117,14 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_stage3", "wb.ctx = hw;"),
     ("sweet_wlan_stage3", "x.b = &wb;"),
     ("sweet_wlan_stage3", "x.level = level;"),
+    ("sweet_wlan_stage3", "x.img = sw_fw.p;"),  # patch 0130: the FW entry swf_parse() accepted
+    ("sweet_wlan_stage3", "x.img_len = sw_fw.len;"),
+    ("sweet_wlan_stage3", "x.img_crc = sw_fw.crc;"),
+    ("sw_fw_note", "for (i = 0;"),
+    ("sw_fw_note", 'i++) { if (memcmp(e[i].tag, "", 4) == 0) { sw_fw.p = base + e[i].offset;'),  # string contents are stripped by the scan; audit_store_path pins "FW  "
+    ("sw_fw_note", "sw_fw.p = base + e[i].offset;"),
+    ("sw_fw_note", "sw_fw.len = e[i].length;"),
+    ("sw_fw_note", "sw_fw.crc = e[i].crc;"),
     ("sweet_wlan_init", "hw.level = level > 2 ? 2 : (int)level;"),  # fragments of the function: its header is a context line of the patch
     ("sweet_wlan_init", "hw.atu = atu;"),
     ("sweet_wlan_init", "hw.elbi = elbi;"),
@@ -123,6 +181,10 @@ def audit_store_path(hdr, glue):
     f.extend(audit_assignments(glue))
     if "off != SWW_CFG_WIN" not in body(glue, "sw3_wr") or "SWW_R2(0x14)" not in body(glue, "sw3_wr") or "SWW_SM_BANKIDX" not in body(glue, "sw3_wr"):
         f.append("sw3_wr does not limit the offsets to the table's")
+    if not all(n in body(glue, "sw3_wr") for n in ("SWW_CFG_WIN2", "SWW_WIN_TAIL", "SWW_RAM_BASE", "SWW_LAST_HI_MAX", "space == SWW_BAR2")):
+        f.append("sw3_wr does not limit BAR2 and cfg 0x84 to the table's")
+    if 'memcmp(e[i].tag, "FW  ", 4)' not in body(glue, "sw_fw_note"):
+        f.append("sw_fw_note does not pick the FW entry by its tag")
     if len(re.findall(r"\bsw3_wr\b", glue)) != 2 or "wb.wr = sw3_wr;" not in glue:
         f.append("sw3_wr used other than as the bus wr callback")
     return f
@@ -260,7 +322,7 @@ def build_and_run(hdr, chip, work):
 
 
 def run_all():
-    hdr = new_file(PATCH0125, "bsd/dev/sweet_wlan_wr.h")
+    hdr = final_header()
     chip = new_file(PATCH0120, "bsd/dev/sweet_wlan_chip.h")
     out = {}
     os.makedirs(os.path.join(ROOT, "shim", "out"), exist_ok=True)
@@ -286,20 +348,36 @@ def run_all():
     return base, out
 
 
+_FUNC = re.compile(r"^(\w+)\(.*?^}$", re.S | re.M)
+
+
+def _inserted(a, b):
+    """The lines of b that are not in a, by difflib opcodes."""
+    out = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            out.extend(b[j1:j2])
+    return out
+
+
 def glue_added_lines():
-    """The lines patch 0129 adds to bsd/dev/sweet_wlan.c."""
-    out, on = [], False
-    with open(PATCH0125, encoding="utf-8") as fh:
-        for line in fh.read().split("\n"):
-            if line == "+++ b/bsd/dev/sweet_wlan.c":
-                on = True
-            elif on and line.startswith("diff "):
-                break
-            elif on and line.startswith("+") and not line.startswith("+++"):
-                out.append(line[1:])
+    """What patches 0129 and 0130 add to bsd/dev/sweet_wlan.c: first the added or changed lines outside the functions and inside the functions that already existed after 0128 (fragments, which the
+    audit attributes to sweet_wlan_init), then every function that is new, whole (so the audit sees its first and last line)."""
+    before, after = glue_before(), glue_after()
+    fb = {m.group(1): m.group(0) for m in _FUNC.finditer(before)}
+    fa = {m.group(1): m.group(0) for m in _FUNC.finditer(after)}
+    rest_b, rest_a = _FUNC.sub("", before), _FUNC.sub("", after)
+    out = _inserted(rest_b.split("\n"), rest_a.split("\n"))
+    for name, text in fa.items():
+        if name in fb and text != fb[name]:
+            out.extend(_inserted(fb[name].split("\n"), text.split("\n")))
+    for name, text in fa.items():
+        if name not in fb:
+            out.extend(text.split("\n"))
     if not out:
-        raise ValueError("patch 0129 adds nothing to bsd/dev/sweet_wlan.c")
+        raise ValueError("patches 0129/0130 add nothing to " + GLUE_PATH)
     return "\n".join(out) + "\n"
+
 
 # ---- the glue limit sw3_ptr..sw3_wr, compiled and swept (review 0125 R2-2/R2-3) ----
 GLUE_HARNESS = r"""
@@ -315,15 +393,16 @@ struct sw_hw {
 	int level;
 };
 @GLUE@
-static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[8];
+static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[0x400000 / 4];
 static uint32_t *const arr[] = { cfg, atu, elbi, iso, mem, tcm };
-static const size_t len[] = { 0x1000 / 4, 0x1000 / 4, 0x2000 / 4, 1, 0x1000 / 4, 8 };
-static uint32_t snap[6][0x2000 / 4];
+static const size_t len[] = { 0x1000 / 4, 0x1000 / 4, 0x2000 / 4, 1, 0x1000 / 4, 0x2008 / 4 };
+static uint32_t snap[6][0x2008 / 4];
 
-/* the table's offsets, restated: cfg 0x80; ATU region 2 CR2/LOWER_BASE/LIMIT/LOWER_TARGET; BAR0 bankidx on SYS_MEM, IOCTL + RESET_CTL on the two wrappers */
-static int expect(int space, uint32_t off, uint32_t win, int eq)
+/* the table's offsets, restated: cfg 0x80, cfg 0x84 only as 0 or 0x400000; ATU region 2 CR2/LOWER_BASE/LIMIT/LOWER_TARGET; BAR0 bankidx on SYS_MEM, IOCTL + RESET_CTL on the two wrappers;
+ * BAR2 is swept separately below (its offsets are above 0x200000, the main sweep only reaches 0x2004) */
+static int expect(int space, uint32_t off, uint32_t win, int eq, uint32_t v)
 {
-	if (space == SWW_CFG) return off == 0x80;
+	if (space == SWW_CFG) return off == 0x80 || (off == 0x84 && (v == 0 || v == 0x400000u));
 	if (space == SWW_ATU) return off == 0x404 || off == 0x408 || off == 0x410 || off == 0x414;
 	if (space == SWW_BAR0 && eq) {
 		if (win == SWW_WIN_SYSMEM) return off == 0x10;
@@ -335,7 +414,9 @@ static int expect(int space, uint32_t off, uint32_t win, int eq)
 int main(void)
 {
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 3 };
+	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
+	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4 };
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -343,25 +424,52 @@ int main(void)
 		for (int eq = 0; eq < 2; eq++) {
 			for (int space = 0; space < 8; space++) {
 				for (uint32_t off = 0; off < 0x2004; off++) {
-					for (int a = 0; a < 6; a++) {
-						for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
-						memcpy(snap[a], arr[a], len[a] * 4);
+					for (unsigned vi = 0; vi < (space == SWW_CFG ? 3u : 1u); vi++) {
+						for (int a = 0; a < 6; a++) {
+							for (size_t i = 0; i < len[a]; i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+							memcpy(snap[a], arr[a], len[a] * 4);
+						}
+						cfg[0x80 / 4] = eq ? wins[wi] : wins[wi] ^ 0x1000u;
+						memcpy(snap[0] + 0x80 / 4, &cfg[0x80 / 4], 4);
+						int r = sw3_wr(&hw, space, wins[wi], off, vals[vi]);
+						int ch = 0;
+						for (int a = 0; a < 6; a++)
+							for (size_t i = 0; i < len[a]; i++) ch += arr[a][i] != snap[a][i];
+						int want = expect(space, off, wins[wi], eq, vals[vi]);
+						if ((r == 0) != want || ch != (r == 0 ? 1 : 0)) {
+							if (bad++ < 20) printf("BAD space %d off %#x win %#x live-equal %d val %#x: ret %d changed %d, want accept %d\n", space, off, wins[wi], eq, vals[vi], r, ch, want);
+						}
+						acc += r == 0;
 					}
-					cfg[0x80 / 4] = eq ? wins[wi] : wins[wi] ^ 0x1000u;
-					memcpy(snap[0] + 0x80 / 4, &cfg[0x80 / 4], 4);
-					int r = sw3_wr(&hw, space, wins[wi], off, 0xDEADBEEFu);
-					int ch = 0;
-					for (int a = 0; a < 6; a++)
-						for (size_t i = 0; i < len[a]; i++) ch += arr[a][i] != snap[a][i];
-					int want = expect(space, off, wins[wi], eq);
-					if ((r == 0) != want || ch != (r == 0 ? 1 : 0)) {
-						if (bad++ < 20) printf("BAD space %d off %#x win %#x live-equal %d: ret %d changed %d, want accept %d\n", space, off, wins[wi], eq, r, ch, want);
+				}
+			}
+		}
+	}
+	/* BAR2 (patch 0130): window 0 from 0x200000 to the end of the 4 MiB, window 0x400000 up to offset 0x1FFFFC (the last word of a 6 MiB RAM), only while the live cfg 0x84 equals the window,
+	 * only 4-aligned, and never a store anywhere else: every other word of every array keeps its value (the target word is restored after each call; the sweep ends with a full compare) */
+	for (int a = 0; a < 6; a++)
+		for (size_t i = 0; i < (a == 5 ? 0x400000 / 4 : len[a]); i++) arr[a][i] = 0x10000000u * (a + 1) + (uint32_t)i;
+	for (unsigned wi = 0; wi < 5; wi++) {
+		for (int eq = 0; eq < 2; eq++) {
+			cfg[0x84 / 4] = eq ? bwins[wi] : bwins[wi] ^ 0x1000u;
+			for (uint32_t off = 0; off < 0x400000 + 0x40; off += 4) {
+				for (uint32_t u = 0; u < (eq && wi < 2 && (off & 0xFFF) < 8 ? 4u : 1u); u++) {
+					uint32_t o = off + u, keep = o < 0x400000 ? tcm[o / 4] : 0;
+					int r = sw3_wr(&hw, SWW_BAR2, bwins[wi], o, 0xDEADBEEFu);
+					int want = eq && u == 0 && off < 0x400000 && ((bwins[wi] == 0 && off >= 0x200000) || (bwins[wi] == 0x400000 && off <= 0x1FFFFC));
+					if ((r == 0) != want || (r == 0 && tcm[o / 4] != 0xDEADBEEFu)) {
+						if (bad++ < 20) printf("BAD BAR2 win %#x off %#x live-equal %d: ret %d, want accept %d\n", bwins[wi], o, eq, r, want);
 					}
+					if (o < 0x400000) tcm[o / 4] = keep;
 					acc += r == 0;
 				}
 			}
 		}
 	}
+	cfg[0x84 / 4] = 0x10000000u + 0x84 / 4;
+	for (int a = 0; a < 6; a++)
+		for (size_t i = 0; i < (a == 5 ? 0x400000 / 4 : len[a]); i++)
+			if (arr[a][i] != 0x10000000u * (a + 1) + (uint32_t)i && bad++ < 20) printf("BAD BAR2 sweep changed array %d word %zu\n", a, i);
 	printf("%s accepted %d bad %d\n", bad ? "FAIL" : "PASS", acc, bad);
 	return bad != 0;
 }
@@ -369,21 +477,21 @@ int main(void)
 
 
 def glue_function_text():
-    """sw3_ptr .. the closing brace of sw3_wr from the glue hunk of patch 0129, with the return type of sw3_ptr put back."""
-    g = glue_added_lines()
+    """sw3_ptr .. the closing brace of sw3_wr from the glue after patches 0129 and 0130, with the return type of sw3_ptr put back."""
+    g = glue_after()
     a = re.search(r"^sw3_ptr\(", g, re.M)
     e = re.search(r"^sw3_wr\(.*?^}$", g, re.S | re.M)
     if not a or not e:
-        raise ValueError("sw3_ptr..sw3_wr not found in the glue hunk")
+        raise ValueError("sw3_ptr..sw3_wr not found in the glue")
     return "static volatile uint32_t *\n" + g[a.start():e.end()] + "\n"
 
 
 def run_glue(glue_text, work, extra=()):
     """Compile the glue functions with gcc -Werror against the real header, sweep them. Returns ('pass'|'fail'|'compile', output)."""
     d = tempfile.mkdtemp(dir=work)
-    for patch, path, name in ((PATCH0120, "bsd/dev/sweet_wlan_chip.h", "sweet_wlan_chip.h"), (PATCH0125, "bsd/dev/sweet_wlan_wr.h", "sweet_wlan_wr.h")):
+    for text, name in ((new_file(PATCH0120, "bsd/dev/sweet_wlan_chip.h"), "sweet_wlan_chip.h"), (final_header(), "sweet_wlan_wr.h")):
         with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
-            fh.write(new_file(patch, path))
+            fh.write(text)
     with open(os.path.join(d, "g.c"), "w", encoding="utf-8") as fh:
         fh.write(GLUE_HARNESS.replace("@GLUE@", glue_text))
     c = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-Werror", "-I" + d] + list(extra) + ["-o", os.path.join(d, "g"), os.path.join(d, "g.c")], capture_output=True, text=True)
@@ -393,23 +501,40 @@ def run_glue(glue_text, work, extra=()):
     return ("pass" if r.returncode == 0 else "fail"), r.stdout[-600:]
 
 
-_LIM = "\tif ((space == SWW_CFG && off != SWW_CFG_WIN) ||"
+_LIM = "\tif ((space == SWW_CFG && off != SWW_CFG_WIN &&"
 _MOVE = "@move"  # special: the offset check block is moved behind the store (see test_glue_mutants_are_killed)
-_LIMEND = "off != SWW_SM_BANKIDX)) {\n\t\treturn -1;\n\t}\n"
+_LIMEND = "SWW_LAST_HI_MAX)))) {\n\t\treturn -1;\n\t}\n"
 # (name, [(old, new)]) applied to the glue text; each must change it and the sweep must FAIL (a compile error is a broken mutant, not a kill)
 GLUE_MUTANTS = [
     ("UPPER_BASE writable", [(" || off == SWW_R2(0x0C)", "")]),
     ("CR1 writable", [("off < SWW_R2(0x04)", "off < SWW_R2(0x00)")]),
     ("any BAR0 offset", [("(space == SWW_BAR0 && off != SWL_AGENT_IOCTL", "(space == SWW_BAR0 || off != SWL_AGENT_IOCTL")]),
-    ("silent no-op success", [("off != SWW_SM_BANKIDX)) {\n\t\treturn -1;", "off != SWW_SM_BANKIDX)) {\n\t\treturn 0;")]),
-    ("limit disabled", [(_LIM, "\tif (0 && ((space == SWW_CFG && off != SWW_CFG_WIN) ||"), ("off != SWW_SM_BANKIDX)) {", "off != SWW_SM_BANKIDX))) {")]),
+    ("silent no-op success", [("SWW_LAST_HI_MAX)))) {\n\t\treturn -1;", "SWW_LAST_HI_MAX)))) {\n\t\treturn 0;")]),
+    ("limit disabled", [(_LIM, "\tif (0 && ((space == SWW_CFG && off != SWW_CFG_WIN &&"), ("SWW_LAST_HI_MAX)))) {", "SWW_LAST_HI_MAX))))) {")]),
     ("limit evaluated after the store", [(_MOVE, "")]),
-    ("CFG clause kept as a string needle", [("(space == SWW_CFG && off != SWW_CFG_WIN)", "(space == SWW_CFG && off > 0x1000 && *\"off != SWW_CFG_WIN\")")]),
+    ("CFG clause kept as a string needle", [("(space == SWW_CFG && off != SWW_CFG_WIN && !(", "(space == SWW_CFG && off > 0x1000 && *\"off != SWW_CFG_WIN\" && !(")]),
     # R2-3 and the live-window compare
     ("window binding removed", [("\tif (space == SWW_BAR0 && !(off == SWW_SM_BANKIDX ?", "\tif (0 && !(off == SWW_SM_BANKIDX ?")]),
     ("bankidx bound to the wrapper window", [("off == SWW_SM_BANKIDX ? win == SWW_WIN_SYSMEM :", "off == SWW_SM_BANKIDX ? win == SWW_WIN_SMWRAP :")]),
     ("CA7 window refused", [("win == SWW_WIN_SMWRAP || win == SWW_WIN_CA7WRAP", "win == SWW_WIN_SMWRAP")]),
-    ("live BAR0 window not compared", [("(space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win)) {\n\t\treturn -1;\n\t}\n\t*p = v;", "0) {\n\t\treturn -1;\n\t}\n\t*p = v;")]),
+    ("live BAR0 window not compared", [("(space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win) || (space == SWW_BAR2", "0 || (space == SWW_BAR2")]),
+    # patch 0130: cfg 0x84 and BAR2
+    ("cfg 0x84 not writable", [(" && !(off == SWW_CFG_WIN2 && (v == 0 || v == SWW_WIN_TAIL))", "")]),
+    ("cfg 0x84 any value", [("(v == 0 || v == SWW_WIN_TAIL)", "1")]),
+    ("cfg 0x84 only 0", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == 0)")]),
+    ("cfg 0x84 only the tail window", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == SWW_WIN_TAIL)")]),
+    ("cfg 0x88 writable too", [("(off == SWW_CFG_WIN2 &&", "(off >= SWW_CFG_WIN2 &&")]),
+    ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2) {", "space != SWW_BAR0) {")]),
+    ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
+    ("BAR2 store below the RAM base", [("(win == 0 && off >= SWW_RAM_BASE)", "(win == 0)")]),
+    ("BAR2 store one word below the RAM base", [("off >= SWW_RAM_BASE)", "off >= SWW_RAM_BASE - 4u)")]),
+    ("BAR2 tail window past the last word", [("off <= SWW_LAST_HI_MAX)", "off <= SWW_TCM_BYTES)")]),
+    ("BAR2 tail window one word past the last", [("off <= SWW_LAST_HI_MAX)", "off <= SWW_LAST_HI_MAX + 4u)")]),
+    ("BAR2 any window below the tail bound", [("(win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)", "(off <= SWW_LAST_HI_MAX)")]),
+    ("BAR2 live window not compared", [(" || (space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)", "")]),
+    ("BAR2 compared against the BAR0 window", [("(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)", "(space == SWW_BAR2 && h->cfg[SWW_CFG_WIN / 4] != win)")]),
+    ("store past the 4 MiB window", [("off < SWW_TCM_BYTES ? &h->tcm[off / 4]", "off <= SWW_TCM_BYTES ? &h->tcm[off / 4]")]),
+    ("unaligned BAR2 store", [("if ((off & 3u) != 0) {\n\t\treturn NULL;", "if ((off & 1u) != 0) {\n\t\treturn NULL;")]),
 ]
 
 
@@ -428,10 +553,10 @@ class WlanWrMutants(unittest.TestCase):
         self.assertEqual(len(out), len(MUTANTS))
 
     def test_store_path_audit_is_clean_on_the_patch(self):
-        self.assertEqual(audit_store_path(new_file(PATCH0125, "bsd/dev/sweet_wlan_wr.h"), glue_added_lines()), [])
+        self.assertEqual(audit_store_path(final_header(), glue_added_lines()), [])
 
     def test_store_path_audit_fails_on_a_hostile_corpus(self):
-        hdr = new_file(PATCH0125, "bsd/dev/sweet_wlan_wr.h")
+        hdr = final_header()
         glue = glue_added_lines()
         bad = [
             (hdr + "\nstatic inline void x(void) { __asm__ volatile(\"dsb sy\"); }\n", glue, "inline asm"),
@@ -445,7 +570,12 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("*p = v;", "*p = v;\n\th->cfg[1] = 6;"), "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_x(struct sw_hw *h) { h->atu[0x101] = 0; }\n", "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_q(volatile uint32_t *q) { q[0] = 1; }\n", "assignment outside the allowlist"),
-            (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN) || ", ""), "sw3_wr does not limit the offsets to the table's"),
+            (hdr, glue.replace("(space == SWW_CFG && off != SWW_CFG_WIN && !(off == SWW_CFG_WIN2 && (v == 0 || v == SWW_WIN_TAIL))) || ", ""), "sw3_wr does not limit the offsets to the table's"),
+            (hdr, glue.replace("SWW_LAST_HI_MAX", "SWW_TCM_BYTES"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
+            (hdr, glue.replace("(win == 0 && off >= SWW_RAM_BASE)", "(win == 0)"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
+            (hdr, glue.replace('"FW  "', '"NVRM"'), "sw_fw_note does not pick the FW entry by its tag"),
+            (hdr, glue.replace("sw_fw.p = base + e[i].offset;", "sw_fw.p = base;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("x.img_len = sw_fw.len;", "x.img_len = sw_fw.len + 4;"), "assignment outside the allowlist"),
             (hdr, glue.replace("SWW_R2(0x14)", "SWW_R2(0x18)"), "sw3_wr does not limit the offsets to the table's"),
             (hdr, glue.replace("wb.wr = sw3_wr;", "wb.wr = 0;"), "sw3_wr used other than as the bus wr callback"),
             # review 0125 R2-1: the 12 spellings the old regex missed
@@ -478,7 +608,7 @@ class WlanWrMutants(unittest.TestCase):
                 t = base
                 for old, new in subs:
                     if old == _MOVE:
-                        m = re.search(r"\tif \(\(space == SWW_CFG && off != SWW_CFG_WIN\).*?\n\t}\n", t, re.S)
+                        m = re.search(r"\tif \(\(space == SWW_CFG && off != SWW_CFG_WIN &&.*?\n\t}\n", t, re.S)
                         self.assertTrue(m, name)
                         t = t.replace(m.group(0), "").replace("\t*p = v;\n", "\t*p = v;\n" + m.group(0))
                         continue
