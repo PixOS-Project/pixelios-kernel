@@ -10,6 +10,7 @@ import difflib
 import functools
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -308,6 +309,21 @@ MUTANTS = [
 ]
 
 
+def run_bounded(cmd, d, timeout):
+    """Run a test binary with its output sent to files capped by RLIMIT_FSIZE (1 MiB): a mutant that loops forever and prints must not fill the parent's memory (a captured pipe did, 6.7 GB). Returns (returncode, stderr tail, stdout tail)."""
+    def cap():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
+    with open(os.path.join(d, "out.txt"), "wb") as fo, open(os.path.join(d, "err.txt"), "wb") as fe:
+        rc = subprocess.run(cmd, stdout=fo, stderr=fe, timeout=timeout, preexec_fn=cap).returncode
+    tails = []
+    for n, k in (("err.txt", 200), ("out.txt", 600)):
+        with open(os.path.join(d, n), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - k))
+            tails.append(f.read().decode("utf-8", "replace"))
+    return rc, tails[0], tails[1]
+
+
 def build_and_run(hdr, chip, work):
     d = tempfile.mkdtemp(dir=work)
     for name, text in (("sweet_wlan_chip.h", chip), ("sweet_wlan_wr.h", hdr)):
@@ -317,8 +333,8 @@ def build_and_run(hdr, chip, work):
     cc = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-I" + d, "-o", exe, TEST], capture_output=True, text=True, timeout=120)
     if cc.returncode != 0:
         return "compile", cc.stderr[-400:]
-    r = subprocess.run([exe], capture_output=True, text=True, timeout=120)
-    return ("pass" if r.returncode == 0 else "fail"), r.stderr[-200:]
+    r = run_bounded([exe], d, 120)
+    return ("pass" if r[0] == 0 else "fail"), r[1]
 
 
 def run_all():
@@ -497,8 +513,8 @@ def run_glue(glue_text, work, extra=()):
     c = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-Werror", "-I" + d] + list(extra) + ["-o", os.path.join(d, "g"), os.path.join(d, "g.c")], capture_output=True, text=True)
     if c.returncode != 0:
         return "compile", c.stderr[-600:]
-    r = subprocess.run([os.path.join(d, "g")], capture_output=True, text=True, timeout=300)
-    return ("pass" if r.returncode == 0 else "fail"), r.stdout[-600:]
+    r = run_bounded([os.path.join(d, "g")], d, 300)
+    return ("pass" if r[0] == 0 else "fail"), r[2]
 
 
 _LIM = "\tif ((space == SWW_CFG && off != SWW_CFG_WIN &&"
