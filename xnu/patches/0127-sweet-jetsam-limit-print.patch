@@ -1,4 +1,4 @@
-sweet-jetsam-limit-print (audit 1 item 7, docs/research/50-audit1-items-5-7-8.md): READ-ONLY diagnostic. Prints the per-process
+sweet-jetsam-limit-print (audit 1 item 7 (private notes)): READ-ONLY diagnostic. Prints the per-process
 footprint limit and the current phys footprint (MB) of the process the ledger callback is about to kill with
 JETSAM_REASON_MEMORY_PERPROCESSLIMIT (reason ns 1 code 0x7, e.g. driverkitd), so "reason ns 1 code 0x7: (none)" gains numbers.
 Changes no limit and no kill decision; only a printf in the fatal branch of memorystatus_on_ledger_footprint_exceeded, current_proc()
