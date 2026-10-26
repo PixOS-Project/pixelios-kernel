@@ -49,6 +49,8 @@ struct fake {
 	unsigned win2_stuck;                            /* run B: from this store number on, writes to cfg 0x84 are ignored (0 = never) */
 	unsigned src_flip_at;                           /* run B: after this store number one byte of the source image two words ahead flips (the source changes during the copy; 0 = never) */
 	uint32_t *ram;                                  /* run B: backplane 0..0x5FFFFC as words (BAR2 offset + window = backplane address); NULL = the two words of run A */
+	struct wrec lastw;                              /* run D: the last store that reached the bus (w[] keeps only the first 512) */
+	unsigned rom0;                                  /* run D: a store to backplane address 0 is accepted and ignored (a ROM bank aliased at 0, unknown X4) */
 	unsigned clob_at;                               /* run C: after this store number the RAM word at backplane address clob_bp flips a bit (a later store clobbering an earlier one; 0 = never) */
 	uint32_t clob_bp;
 };
@@ -130,6 +132,7 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	if (f->nw < sizeof f->w / sizeof f->w[0]) {
 		f->w[f->nw].space = space; f->w[f->nw].win = win; f->w[f->nw].off = off; f->w[f->nw].val = v;
 	}
+	f->lastw.space = space; f->lastw.win = win; f->lastw.off = off; f->lastw.val = v;
 	f->nw++;
 	if (f->src_flip_at == f->nw && space == SWW_BAR2 && win == 0 && off >= SWW_RAM_BASE)
 		imgbuf[off - SWW_RAM_BASE + 8] ^= 0x40;
@@ -142,6 +145,8 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	if (space == SWW_CFG && off == SWW_CFG_WIN) { if (!f->win_stuck) f->win0 = v; return 0; }
 	if (space == SWW_CFG && off == SWW_CFG_WIN2) { if (!f->win2_stuck || f->nw < f->win2_stuck) f->win2 = v; return 0; }
 	if (space == SWW_BAR2 && f->ram) {
+		if (f->rom0 && win + off == 0 && f->win2 == win)
+			return 0;
 		if (f->win2 != win || (win + off) / 4 >= RAM_WORDS)
 			return -1;
 		f->ram[(win + off) / 4] = v;
@@ -441,7 +446,7 @@ static void deny_sweep(void)
 	CHECK(swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x200) < 0 && swl_wr_ok(SWW_BAR0, 0x18001000, SWW_SRPWR, 0x00030300) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x400, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18126000, 0x404, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x808, 1) < 0 && swl_wr_ok(SWW_BAR0, 0x18120000, 0x80C, 1) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18120000, 0x408, 0x03) < 0 && swl_wr_ok(SWW_BAR0, 0x18126000, 0x408, 0x23) < 0 && swl_wr_ok(SWW_BAR0, 0x18121000, 0x800, 1) < 0 &&
-	      swl_wr_ok(SWW_BAR0, 0x18000000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18012000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0x1FFFFC, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 0) < 0 &&
+	      swl_wr_ok(SWW_BAR0, 0x18000000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18012000, 0x600, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 0x1FFFFC, 0) < 0 && swl_wr_ok(SWW_BAR2, 0, 4, 0) < 0 &&
 	      swl_wr_ok(SWW_BAR0, 0x18026000, 0x40, 0) < 0 && swl_wr_ok(SWW_BAR0, 0x18026000, 0, 0) < 0);
 	/* a store that matches no row never reaches the bus and latches STOPPED */
 	obs(&f);
@@ -1191,7 +1196,7 @@ static void runb_deny_sweep(void)
 
 				w = wins[wi];
 				if (w == 0)
-					want = off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAB4u || v == 0);
+					want = off == 0 || (off >= 0x200000u && off <= 0x3FFFFCu && (off < 0x3AEAB4u || v == 0));      /* offset 0: the run D reset vector, any value (swl_wr decides the value) */
 				else if (w == 0x400000u)
 					want = off <= 0x1FFFFCu;        /* v == 0: the last word of run B; any v: the run C tail tuples (their address and word are decided at run time) */
 				else
@@ -1208,8 +1213,11 @@ static void runb_deny_sweep(void)
 	/* every run B tuple: run 2, a row of W8..W10; every run C tuple: run 3, a row of W11..W13, and only in the window 0x400000 or on cfg 0x84 */
 	for (v = SWT_N_A; v < SWT_N_B; v++)
 		CHECK(swl_wt[v].run == 2 && swl_wt[v].row >= 8 && swl_wt[v].row <= 10 && (swl_wt[v].space == SWW_BAR2 || swl_wt[v].space == SWW_CFG));
-	for (v = SWT_N_B; v < SWT_N; v++)
+	for (v = SWT_N_B; v < SWT_N_C; v++)
 		CHECK(swl_wt[v].run == 3 && swl_wt[v].row >= 11 && swl_wt[v].row <= 13 && ((swl_wt[v].space == SWW_BAR2 && swl_wt[v].win == 0x400000u) || (swl_wt[v].space == SWW_CFG && swl_wt[v].off == 0x84)));
+	/* the run D tuple: run 4, row 14, once, a reset-vector value decided at run time, BAR2 window 0 offset 0 exactly, after W13 */
+	CHECK(SWT_N == SWT_N_C + 1 && SWT_RESET0 == SWT_N_C && swl_wt[SWT_RESET0].run == 4 && swl_wt[SWT_RESET0].row == 14 && swl_wt[SWT_RESET0].space == SWW_BAR2 && swl_wt[SWT_RESET0].win == 0 && swl_wt[SWT_RESET0].off == 0 &&
+	      swl_wt[SWT_RESET0].hi == 0 && swl_wt[SWT_RESET0].flags == (SWT_ONCE | SWT_RV) && swl_wt[SWT_RESET0].need == SWF_W13 && swl_wt[SWT_RESET0].pred1 == 0 && swl_wt[SWT_RESET0].rgrp == 0);
 	/* reads: the BAR2 words of run B only at level 4, windows 0 and 0x400000, inside the table's ranges */
 	{
 		static struct fake f;
@@ -1633,7 +1641,7 @@ static void runc_deny_sweep(void)
 	CHECK(swl_wr_ok(SWW_BAR2, 0x400000, 0, 0) == SWT_LAST_HI && swl_wr_ok(SWW_BAR2, 0x400000, 0x1FFFFCu, 0) == SWT_LAST_HI);       /* a zero is the last word of run B first */
 	CHECK(swl_wr_ok_from(SWT_LAST_HI + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_VARS && swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x9FFF0u, 0) == SWT_NV_RTLV);
 	CHECK(swl_wr_ok_from(SWT_NV_VARS + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) == SWT_NV_TOKEN && swl_wr_ok_from(SWT_NV_TOKEN + 1, SWW_BAR2, 0x400000, 0x1FFFFCu, 5) < 0);
-	CHECK(swl_wr_ok(SWW_BAR2, 0, 0x3B0000u, 5) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 5) < 0 && swl_wr_ok(SWW_BAR2, 0x200000u, 0, 5) < 0 && swl_wr_ok(SWW_BAR0, 0x400000, 0, 5) < 0 && swl_wr_ok(SWW_ATU, 0x400000, 0, 5) < 0);
+	CHECK(swl_wr_ok(SWW_BAR2, 0, 0x3B0000u, 5) < 0 && swl_wr_ok(SWW_BAR2, 0, 0, 5) == SWT_RESET0 && swl_wr_ok(SWW_BAR2, 0, 4, 5) < 0 && swl_wr_ok(SWW_BAR2, 0x200000u, 0, 5) < 0 && swl_wr_ok(SWW_BAR0, 0x400000, 0, 5) < 0 && swl_wr_ok(SWW_ATU, 0x400000, 0, 5) < 0);
 	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL && swl_wr_ok_from(SWT_WIN2_TAIL + 1, SWW_CFG, 0, 0x84, 0x400000) == SWT_WIN2_TAIL_C && swl_wr_ok_from(SWT_WIN2_TAIL_C + 1, SWW_CFG, 0, 0x84, 0x400000) < 0);
 	CHECK(swl_wr_ok(SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO && swl_wr_ok_from(SWT_WIN2_ZERO + 1, SWW_CFG, 0, 0x84, 0) == SWT_WIN2_ZERO_C && swl_wr_ok_from(SWT_WIN2_ZERO_C + 1, SWW_CFG, 0, 0x84, 0) < 0);
 	{
@@ -1643,7 +1651,7 @@ static void runc_deny_sweep(void)
 			CHECK(((swl_wt[v].flags & SWT_TW) != 0) == (v >= SWT_NV_VARS && v <= SWT_NV_RTLV) && (!(swl_wt[v].flags & SWT_TW) || (swl_wt[v].kind >= SWK_VARS && swl_wt[v].kind <= SWK_RTLV)) &&
 			      (!!(swl_wt[v].flags & SWT_TW) || swl_wt[v].kind == 0));
 	}
-	CHECK(SWT_N == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
+	CHECK(SWT_N == 28 && SWT_N_C == 27 && SWT_N_B == 22 && SWT_WIN2_TAIL_C == 22 && SWT_NV_VARS == 23 && SWT_NV_TOKEN == 24 && SWT_NV_RTLV == 25 && SWT_WIN2_ZERO_C == 26);
 }
 
 /* the stores that reached the bus other than the restore of cfg 0x84 (a refused store with the window moved runs that restore) */
@@ -1878,6 +1886,238 @@ static void runc_gates(void)
 #undef GCN
 }
 
+
+/* ---------------------------------------------------------------- run D (patch 0132): W14, the reset vector at backplane address 0 ---------------------------------------------------------------- */
+
+static uint32_t cstep(uint32_t c, const uint8_t *p, unsigned n)         /* the CRC32 register after n more bytes (no final xor) */
+{
+	unsigned k;
+
+	while (n--) {
+		c ^= *p++;
+		for (k = 0; k < 8; k++)
+			c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
+	}
+	return c;
+}
+
+/* make the CRC32 of buf[0..len) equal target by choosing its last four bytes (the CRC is affine over GF(2): solve the 32 columns): a synthetic blob with the CRC of the real firmware, no firmware byte */
+static void forge(uint8_t *buf, uint32_t len, uint32_t target)
+{
+	uint32_t s = cstep(0xFFFFFFFFu, buf, len - 4u), f0, basis[32], bm[32], v, m, want, b = 0;
+	uint8_t t[4];
+	unsigned j;
+	int bit;
+
+	memset(basis, 0, sizeof basis);
+	memset(t, 0, 4);
+	f0 = cstep(s, t, 4);
+	for (j = 0; j < 32; j++) {
+		memset(t, 0, 4);
+		t[j / 8] = (uint8_t)(1u << (j % 8));
+		v = cstep(s, t, 4) ^ f0;
+		m = 1u << j;
+		for (bit = 31; bit >= 0 && v; bit--) {
+			if (!((v >> bit) & 1u))
+				continue;
+			if (!basis[bit]) {
+				basis[bit] = v; bm[bit] = m;
+				break;
+			}
+			v ^= basis[bit]; m ^= bm[bit];
+		}
+	}
+	want = ~target ^ f0;
+	for (bit = 31; bit >= 0; bit--) {
+		if (((want >> bit) & 1u) && basis[bit]) {
+			want ^= basis[bit]; b ^= bm[bit];
+		}
+	}
+	CHECK(want == 0);
+	for (j = 0; j < 4; j++)
+		buf[len - 4u + j] = (uint8_t)(b >> (8 * j));
+}
+
+static struct fake sf;                                  /* the state after run C on the pinned image: every W14 case starts from it */
+static struct swl_wx sx;
+static uint32_t sram[RAM_WORDS];
+
+static void rd_put(struct fake *f, struct swl_wx *x)
+{
+	*f = sf;
+	*x = sx;
+	memcpy(ramarr, sram, sizeof ramarr);
+	f->ram = ramarr;
+	bus(&cbus, f);
+	cbus.rng = t_rng;
+	x->b = &cbus;
+	x->level = 6;
+	loglen = 0; logbuf[0] = 0;
+}
+
+static void rund(void)
+{
+	static struct fake f, g;
+	struct swl_wx x;
+	const uint32_t len = 1764018u, words = 441005u, pin = 0x1153ccffu;
+	uint32_t w0, n5, k, nrd, keep;
+	char t[256];
+
+	cx_init_rng();
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	CHECK(tcrc(imgbuf, len) == pin && SWW_FW_LEN == 1764018u && SWW_FW_CRC == 0x1153ccffu && SWW_FW_LEN == SWW_IMG_MAX);
+	w0 = iw(0);
+	CHECK(w0 == 0xEA000010u && w0 != PAT);
+	cx_hand(336);
+	/* run C on the pinned image (level 5): the reference; address 0 is untouched and nothing says w14 */
+	obsb(&g, 336);
+	CHECK(runc(&g, &x, 5, len, pin) == 0 && x.flags == CLEVEL5 && ramarr[0] == PAT && x.w14_old == 0 && strstr(logbuf, "w14") == 0 && strstr(logbuf, "W14") == 0 && strstr(logbuf, "level 5 done vars=12") != 0);
+	n5 = g.nw;
+	sf = g; sx = x; memcpy(sram, ramarr, sizeof ramarr);
+	/* level 6, the whole run: one more store than level 5, the first dword of the image at address 0 */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0);
+	CHECK(x.stopped == 0 && x.restore == SWW_RS_NONE && x.flags == (CLEVEL5 | SWF_W14) && x.armed == 0 && f.nw == n5 + 1 && x.nstore == f.nw && f.win2 == 0 && all_allowed(&f));
+	CHECK(f.lastw.space == SWW_BAR2 && f.lastw.win == 0 && f.lastw.off == 0 && f.lastw.val == w0 && x.w14_old == PAT && x.rb == w0 && ramarr[0] == w0);
+	snprintf(t, sizeof t, "SWEET WLAN: stage 3 level 6 done w14 old=0xa5a5a5a5 new=0xea000010 vars=12 token=0xfffc0003 crc=%#010x\n", cx.crc);
+	CHECK(strstr(logbuf, t) != 0 && strstr(logbuf, "level 5 done") == 0 && strstr(logbuf, "W14 backplane 0 reads 0xa5a5a5a5 before the store") != 0);
+	CHECK(strstr(logbuf, "W14 reset vector bp 0 old 0xa5a5a5a5 := 0xea000010 read back 0xea000010") != 0);
+	ramarr[0] = PAT;
+	CHECK(ramc_ok(words, 0));                                       /* everything else is as at level 5 */
+	/* W14 alone from the level-5 state, and its read count */
+	rd_put(&f, &x);
+	nrd = f.nrd;
+	CHECK(swl_w14(&x) == 0 && f.nw == n5 + 1 && ramarr[0] == w0 && x.flags == (CLEVEL5 | SWF_W14));
+	nrd = f.nrd - nrd;
+	CHECK(nrd > 10 && nrd < 60);
+	/* the word read at 0 is all ones: a stop, the value is logged, nothing is stored (DHD dhd_pcie.c:10218) */
+	rd_put(&f, &x);
+	ramarr[0] = 0xFFFFFFFFu;
+	CHECK(swl_w14(&x) == -SWW_E_DEAD && x.stop_code == SWW_E_DEAD && f.nw == n5 && x.restore == SWW_RS_NONE && f.win2 == 0 && ramarr[0] == 0xFFFFFFFFu && !(x.flags & SWF_W14));
+	CHECK(strstr(logbuf, "W14 backplane 0 reads 0xffffffff before the store") != 0 && strstr(logbuf, "W14 STOP: dead read") != 0 && strstr(logbuf, "done") == 0);
+	/* a failing read at every position of W14: never a success, at most the one store, and then the read-back is what stops it */
+	for (k = 1; k <= nrd; k++) {
+		rd_put(&f, &x);
+		f.fail_rd_at = f.nrd + k;
+		CHECK(swl_w14(&x) < 0 && x.stopped && f.nw <= n5 + 1 && (f.nw == n5 || x.stop_code == SWW_E_READBACK) && !(x.flags & SWF_W14) && x.restore == SWW_RS_NONE && f.win2 == 0 && all_allowed(&f));
+	}
+	/* a store the bus refuses */
+	rd_put(&f, &x);
+	f.fail_wr_at = f.nw + 1;
+	CHECK(swl_w14(&x) == -SWW_E_WR && f.nw == n5 + 1 && ramarr[0] == PAT && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14));
+	/* X4: address 0 aliases a ROM bank: the store is accepted and ignored. A clean stop with the read-back printed, one store, nothing else, window 0 */
+	rd_put(&f, &x);
+	f.rom0 = 1;
+	ramarr[0] = 0x12345678u;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && x.stop_code == SWW_E_READBACK && f.nw == n5 + 1 && x.restore == SWW_RS_NONE && f.win2 == 0 && ramarr[0] == 0x12345678u && !(x.flags & SWF_W14) && x.armed == 0);
+	CHECK(strstr(logbuf, "W14 backplane 0 wrote 0xea000010, old 0x12345678, read back 0x12345678") != 0 && strstr(logbuf, "W14 STOP: read-back") != 0 && strstr(logbuf, "done") == 0);
+	/* a word that reads back with a bit flipped */
+	rd_put(&f, &x);
+	f.corrupt_at = f.nw + 1;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && f.nw == n5 + 1 && ramarr[0] == (w0 ^ 1u) && strstr(logbuf, "read back 0xea000011") != 0);
+	/* the whole stage on a ROM-like bank: stops at W14 with restore none, exactly one store more than level 5 */
+	obsb(&f, 336);
+	f.rom0 = 1;
+	CHECK(runc(&f, &x, 6, len, pin) == -SWW_E_READBACK && x.stop_code == SWW_E_READBACK && f.nw == n5 + 1 && x.restore == SWW_RS_NONE && f.win2 == 0 && x.flags == CLEVEL5 && x.row == 14);
+	CHECK(strstr(logbuf, "stage 3 level 6 stopped at W14 restore=none") != 0 && strstr(logbuf, "level 6 done") == 0 && strstr(logbuf, "read back 0xa5a5a5a5") != 0);
+	/* the gates of swl_wr() for the run D tuple, each alone */
+	rd_put(&f, &x);
+	x.flags &= ~SWF_W13;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_PHASE && f.nw == n5);                    /* needs W13 */
+	rd_put(&f, &x);
+	x.level = 5;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_LEVEL && f.nw == n5);                    /* run 4 */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == 0 && f.nw == n5 + 1 && swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_REPEAT && f.nw == n5 + 1);        /* once */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0 ^ 1u) == -SWW_E_IMG && f.nw == n5);                 /* only image word 0 */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, 0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	x.img_crc ^= 1u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);                      /* the pinned CRC */
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);                      /* the pinned length */
+	rd_put(&f, &x);
+	x.img_len = len + 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	x.img = 0;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_IMG && f.nw == n5);
+	rd_put(&f, &x);
+	f.win2 = 0x400000u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_WIN && f.nw == n5);                      /* the live BAR2 window is 0 */
+	rd_put(&f, &x);
+	f.win2 = 0x400000u;
+	CHECK(swl_w14(&x) == -SWW_E_RD && f.nw == n5);
+	rd_put(&f, &x);
+	f.cmd ^= 4u;
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0, w0) == -SWW_E_PRE && f.nw == n5);                      /* the preconditions are read again */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 4, w0) == -SWW_E_DENIED && f.nw == n5);                  /* no other word of window 0 below the RAM */
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0, 0x1FFFFCu, w0) == -SWW_E_DENIED && f.nw == n5);
+	rd_put(&f, &x);
+	CHECK(swl_wr(&x, SWW_BAR2, 0x400000u, 0, w0) < 0 && f.nw == n5);                       /* offset 0 of the tail window is not the reset vector */
+	/* the image and its identity are checked again at W14 (AP-74): a byte of the source changed after W10, with the pinned CRC no longer true */
+	rd_put(&f, &x);
+	imgbuf[len / 2] ^= 1;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "image CRC") != 0);
+	imgbuf[len / 2] ^= 1;
+	rd_put(&f, &x);
+	imgbuf[0] ^= 1;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && ramarr[0] == PAT);                     /* the vector itself */
+	imgbuf[0] ^= 1;
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	x.img_crc = tcrc(imgbuf, len - 4u);                                                     /* a consistent but different image */
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc") != 0);
+	rd_put(&f, &x);
+	imgbuf[100] ^= 1;
+	x.img_crc = tcrc(imgbuf, len);
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764018 bytes crc") != 0 && strstr(logbuf, "is not the pinned 1764018 bytes crc 0x1153ccff") != 0);
+	/* the pin before the first store of the run: a consistent image of another length or content stops at the early check, no read, no store, nothing armed (review 0130 finding 8) */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, tcrc(imgbuf, len)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && x.row == 14 && x.restore == SWW_RS_NONE && x.armed == 0 && x.rb == 0);
+	CHECK(strstr(logbuf, "firmware identity") != 0 && strstr(logbuf, "stage 3 level 6 stopped at W14 restore=none") != 0 && ramarr[0] == PAT);
+	/* ... which level 5 does not do: the same bytes copy (the run is run C) */
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 5, len, tcrc(imgbuf, len)) == 0 && f.nw == n5 && strstr(logbuf, "firmware identity") == 0);
+	imgbuf[100] ^= 1;
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len - 4u, tcrc(imgbuf, len - 4u)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc") != 0);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin ^ 1u) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "image CRC") != 0);     /* a CRC that is not the bytes' CRC stops at the image check */
+	/* a shorter image whose CRC is the pinned one: only the length tells it from the firmware */
+	forge(imgbuf, len - 4u, pin);
+	CHECK(tcrc(imgbuf, len - 4u) == pin);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len - 4u, pin) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	rd_put(&f, &x);
+	x.img_len = len - 4u;
+	x.img_crc = pin;
+	CHECK(swl_w14(&x) == -SWW_E_IMG && f.nw == n5 && strstr(logbuf, "firmware identity 1764014 bytes crc 0x1153ccff is not the pinned") != 0);
+	keep = imglen;
+	mkimg(66);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, 66, tcrc(imgbuf, 66)) == -SWW_E_IMG && f.nw == 0 && f.nrd == 0 && strstr(logbuf, "firmware identity 66 bytes crc") != 0);
+	CHECK(keep == len);
+	/* the NVRAM entry is not pinned: the 17 byte hand text above and the 27062 byte size of the real calibration file both run to the end (the NVRAM is only checked against its container record) */
+	mkimg(len);
+	imgbuf[0] = 0x10; imgbuf[1] = 0; imgbuf[2] = 0; imgbuf[3] = 0xEA;
+	forge(imgbuf, len, pin);
+	cx_plain(27062, 336);
+	CHECK(nvlen == 27062);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && x.nv_src_len == 27062 && x.flags == (CLEVEL5 | SWF_W14) && ramarr[0] == w0 && x.nv_crc_rb == cx.crc);
+	cx_plain(3, 336);
+	obsb(&f, 336);
+	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && ramarr[0] == w0);
+}
+
 int main(void)
 {
 	happy();
@@ -1895,6 +2135,7 @@ int main(void)
 	runc_faults();
 	runc_gates();
 	runc_deny_sweep();
+	rund();
 	if (fails) {
 		fprintf(stderr, "RESULT: FAIL wlan_wr_host_test (%u checks)\n", fails);
 		return 1;
