@@ -5,7 +5,7 @@ at the end against the container's CRC32 over the whole read-back (no constant o
 Pure part (bsd/dev/sweet_wlan_wr.h, tuples SWT_WIN2_TAIL, SWT_LAST_LO, SWT_LAST_HI, SWT_WIN2_ZERO, SWT_IMG, run 2; range field .hi; flags SWT_BULK/SWT_TAIL/SWT_LAST; steps swl_w8..swl_w10):
 every store still goes through the one swl_wr(); a BULK word re-reads the preconditions, the live BAR2 window and the old word only at the first word of each 64 KiB chunk and has no per-word read-back (the chunk CRC is the read-back).
 Glue (bsd/dev/sweet_wlan.c): sw_fw_note() keeps the FW entry swf_parse() accepted, sweet_wlan_stage3() hands it over, sw3_wr() allows cfg 0x84 only as 0/0x400000 and BAR2 only in the table's two windows and bound to the live cfg 0x84.
-Host test shim/wlan_wr_host_test.c, mutants tools/test_wlan_wr_mutants.py. HW-WRITE path: NOT reviewed yet.
+Host test shim/wlan_wr_host_test.c, mutants tools/test_wlan_wr_mutants.py. HW-WRITE path: Opus round 3 SAFE WITH CONDITIONS (super docs/reviews/0130-wlan-image-copy.md); review follow-ups F3 (_Static_assert SWT_N <= 32) and F4 (level 4 refuses an unusable image before W0, no store) added after it, F1/F5 are test-only.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
 index bd468a1..686f404 100644
@@ -95,7 +95,7 @@ index bd468a1..686f404 100644
  	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
  		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
 diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
-index a7f17cd..11d5af7 100644
+index a7f17cd..db50868 100644
 --- a/bsd/dev/sweet_wlan_wr.h
 +++ b/bsd/dev/sweet_wlan_wr.h
 @@ -19,6 +19,7 @@
@@ -160,7 +160,7 @@ index a7f17cd..11d5af7 100644
  	uint32_t omask, oval;                           /* (old & omask) == oval, omask 0 = no condition */
  	uint32_t coff, cmask, cval;                     /* (companion register at coff & cmask) == cval, cmask 0 = none */
  	uint32_t need;                                  /* phase flags required */
-@@ -97,6 +116,9 @@ enum {
+@@ -97,8 +116,12 @@ enum {
  	SWT_BANK_IDX,
  	SWT_CA_ASSERT, SWT_CA_IOCTL_MID, SWT_CA_RELEASE, SWT_CA_IOCTL_END,
  	SWT_WIN_PCIE, SWT_WIN_SMWRAP, SWT_WIN_SYSMEM, SWT_WIN_CA7,
@@ -169,8 +169,11 @@ index a7f17cd..11d5af7 100644
 +	SWT_IMG,                                                        /* W10 */
  	SWT_N
  };
++_Static_assert(SWT_N <= 32, "x->done is a 32-bit tuple mask");
  
-@@ -137,6 +159,18 @@ static const struct swl_wt swl_wt[SWT_N] = {
+ /*
+  * The write allowlist. Deny by default (CR-25): a store that matches no row does not happen. Values: ATU region 2 in the order of
+@@ -137,6 +160,18 @@ static const struct swl_wt swl_wt[SWT_N] = {
  	[SWT_WIN_SMWRAP] = { .row = 4, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_SMWRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W3 },
  	[SWT_WIN_SYSMEM] = { .row = 5, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_SYSMEM, .vmask = 0xFFFFFFFFu, .need = SWF_W4 },
  	[SWT_WIN_CA7]    = { .row = 6, .run = 1, .space = SWW_CFG, .flags = SWT_WIN, .off = SWW_CFG_WIN, .val = SWW_WIN_CA7WRAP, .vmask = 0xFFFFFFFFu, .need = SWF_W5 },
@@ -189,7 +192,7 @@ index a7f17cd..11d5af7 100644
  };
  
  /* The read allowlist (every read of run A, including the ones of the preconditions). */
-@@ -160,6 +194,8 @@ static const struct swl_rt swl_rt[] = {
+@@ -160,6 +195,8 @@ static const struct swl_rt swl_rt[] = {
  	{ 1, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, SWL_AGENT_RESET_ST },
  	{ 1, SWW_BAR2, 0, SWW_RAM_BASE, SWW_RAM_BASE },
  	{ 1, SWW_BAR2, 0, 0, 0 },
@@ -198,7 +201,7 @@ index a7f17cd..11d5af7 100644
  };
  
  /* Restore: what XNU itself writes at a STOP (docs/research/43 s.2 "Restore at STOP"), only for the groups armed by the failing step. */
-@@ -167,6 +203,7 @@ static const struct swl_rs swl_rs[] = {
+@@ -167,6 +204,7 @@ static const struct swl_rs swl_rs[] = {
  	{ SWW_RG_ATU2, SWW_ATU, 0, SWW_R2(0x04), 0u, SWW_ATU_ENABLE },
  	{ SWW_RG_SM, SWW_BAR0, SWW_WIN_SMWRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
  	{ SWW_RG_CA, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, 1u, 1u },
@@ -206,7 +209,7 @@ index a7f17cd..11d5af7 100644
  };
  
  struct swl_wbus {
-@@ -182,13 +219,15 @@ struct swl_wx {
+@@ -182,13 +220,15 @@ struct swl_wx {
  	int level, stopped, stop_code, restore;
  	unsigned row, nbank, nrb, nb, nstore;
  	uint32_t done, flags, armed, ram_bytes;
@@ -223,7 +226,7 @@ index a7f17cd..11d5af7 100644
  	return c > 0 && c < SWW_E_LAST ? n[c] : "?";
  }
  
-@@ -198,6 +237,50 @@ swl_rsname(int r)
+@@ -198,6 +238,50 @@ swl_rsname(int r)
  	return r == SWW_RS_OK ? "ok" : r == SWW_RS_FAILED ? "failed" : r == SWW_RS_SKIPPED ? "skipped" : "none";
  }
  
@@ -274,7 +277,7 @@ index a7f17cd..11d5af7 100644
  /* ---- reads ---- */
  
  static inline int
-@@ -237,13 +320,15 @@ swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
+@@ -237,13 +321,15 @@ swl_wr_ok(int space, uint32_t win, uint32_t off, uint32_t val)
  	for (i = 0; i < SWT_N; i++) {
  		const struct swl_wt *p = &swl_wt[i];
  
@@ -291,7 +294,7 @@ index a7f17cd..11d5af7 100644
  		} else if (p->val == val) {
  			return (int)i;
  		}
-@@ -400,17 +485,29 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+@@ -400,17 +486,29 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
  	if ((p->flags & SWT_BANK) && (x->nrb != SWW_NRB || x->nb != SWW_NB || x->nbank >= x->nb || val != x->nrb + x->nbank)) {
  		return swl_stop(x, SWW_E_BANK);
  	}
@@ -329,7 +332,7 @@ index a7f17cd..11d5af7 100644
  	}
  	if ((p->omask && (old & p->omask) != p->oval) || ((p->flags & SWT_WIN) && !swl_win_known(old))) {
  		return swl_stop(x, SWW_E_OLD);
-@@ -422,6 +519,10 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+@@ -422,6 +520,10 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
  	if (swl_store(x, space, win, off, val)) {
  		return swl_stop(x, SWW_E_WR);
  	}
@@ -340,7 +343,7 @@ index a7f17cd..11d5af7 100644
  	if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {
  		return swl_stop(x, SWW_E_READBACK);
  	}
-@@ -685,6 +786,98 @@ swl_w7(struct swl_wx *x)
+@@ -685,6 +787,98 @@ swl_w7(struct swl_wx *x)
  	return swl_done(x, SWF_W7);
  }
  
@@ -439,7 +442,22 @@ index a7f17cd..11d5af7 100644
  /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
  static inline int
  swl_stage3(struct swl_wx *x)
-@@ -702,10 +895,19 @@ swl_stage3(struct swl_wx *x)
+@@ -694,6 +888,14 @@ swl_stage3(struct swl_wx *x)
+ 	if (x->level < SWW_LEVEL0 + 1) {
+ 		return -SWW_E_LEVEL;
+ 	}
++	if (x->level >= SWW_LEVEL0 + 2) {      /* an unusable image is refused before any store (no store here, nothing armed) */
++		x->row = 8;
++		rc = swl_img_check(x);
++		if (rc) {
++			printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
++			return rc;
++		}
++	}
+ 	rc = swl_w0(x);
+ 	rc = rc ? rc : swl_w1(x);
+ 	rc = rc ? rc : swl_w2(x);
+@@ -702,10 +904,19 @@ swl_stage3(struct swl_wx *x)
  	rc = rc ? rc : swl_w5(x);
  	rc = rc ? rc : swl_w6(x);
  	rc = rc ? rc : swl_w7(x);

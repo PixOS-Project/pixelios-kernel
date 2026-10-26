@@ -325,11 +325,13 @@ MUTANTS = [
     ("run B: preconditions and window not re-read at the first word of a chunk", [("if (!(p->flags & SWT_BULK) || ((off - SWW_RAM_BASE) & (4u * SWW_CHUNK_W - 1u)) == 0) {", "if (!(p->flags & SWT_BULK)) {")], None),
     ("run B: chunk CRC compare dropped", [("if (rc != sc) {", "if (0) {")], None),
     ("run B: final CRC compare dropped", [("if (x->img_crc_rb != x->img_crc || x->img_next != words) {", "if (x->img_next != words) {")],
-     "every chunk's read-back CRC equals the CRC of the source words (rc != sc stops) and swl_img_check proved the source CRC equals the container's, so the whole-image CRC is implied; the final compare is the independent belt for the chunk loop"),
+     None),
     ("run B: chunk and final CRC compares both dropped", [("if (rc != sc) {", "if (0) {"), ("if (x->img_crc_rb != x->img_crc || x->img_next != words) {", "if (x->img_next != words) {")], None),
     ("run B: final word count compare dropped", [("if (x->img_crc_rb != x->img_crc || x->img_next != words) {", "if (x->img_crc_rb != x->img_crc) {")],
      "the loop calls swl_wr for every word 0..words-1 and each success increments img_next by exactly one, a failure returns before the compare, so img_next == words whenever the compare is reached"),
     ("run B: source image CRC not checked before the first store", [("if (~src != x->img_crc) {", "if (0) {")], None),
+    ("run B: unusable image not refused before the first store (W0)", [("if (x->level >= SWW_LEVEL0 + 2) {      /* an unusable", "if (0) {      /* an unusable")], None),
+    ("run B: SWT_LAST_LO lowered into the image range", [(".off = SWW_IMG_END, .hi = SWW_TCM_BYTES - 4u", ".off = SWW_RAM_BASE, .hi = SWW_TCM_BYTES - 4u")], None),
     ("run B: oversize image accepted", [("x->img_len == 0 || x->img_len > SWW_IMG_MAX) {\n\t\tprintf", "x->img_len == 0) {\n\t\tprintf")], None),
 ]
 

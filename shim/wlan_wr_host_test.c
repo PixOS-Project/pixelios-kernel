@@ -33,6 +33,8 @@ static int cap_printf(const char *fmt, ...)
 
 #define RAM_WORDS (0x600000u / 4u)
 
+static uint8_t imgbuf[SWW_IMG_MAX + 1];
+static uint32_t imglen;
 struct wrec { int space; uint32_t win, off, val; };
 struct wrap { uint32_t ioctl, ctl, st; };
 struct fake {
@@ -45,6 +47,7 @@ struct fake {
 	struct wrec w[512];
 	uint32_t ones_win;
 	unsigned win2_stuck;                            /* run B: from this store number on, writes to cfg 0x84 are ignored (0 = never) */
+	unsigned src_flip_at;                           /* run B: after this store number one byte of the source image two words ahead flips (the source changes during the copy; 0 = never) */
 	uint32_t *ram;                                  /* run B: backplane 0..0x5FFFFC as words (BAR2 offset + window = backplane address); NULL = the two words of run A */
 };
 
@@ -126,6 +129,8 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 		f->w[f->nw].space = space; f->w[f->nw].win = win; f->w[f->nw].off = off; f->w[f->nw].val = v;
 	}
 	f->nw++;
+	if (f->src_flip_at == f->nw && space == SWW_BAR2 && win == 0 && off >= SWW_RAM_BASE)
+		imgbuf[off - SWW_RAM_BASE + 8] ^= 0x40;
 	if (f->fail_wr_at == f->nw)
 		return -1;
 	if (f->ignore_writes || f->drop_at == f->nw)
@@ -794,8 +799,6 @@ static void steps(void)
 #define PAT 0xA5A5A5A5u
 #define PATX 0x5A5A5A5Au            /* the RAM word under the image before the copy = image word ^ PATX: never equal, so a dropped store is always visible */
 static uint32_t ramarr[RAM_WORDS];
-static uint8_t imgbuf[SWW_IMG_MAX + 1];
-static uint32_t imglen;
 
 static uint32_t tcrc(const uint8_t *p, uint32_t n)         /* zlib CRC32, written independently of the header (known answer below) */
 {
@@ -827,6 +830,15 @@ static void mkimg(uint32_t len)                             /* a synthetic blob 
 	for (i = 0; i < len; i++) {
 		r = r * 1664525u + 1013904223u;
 		imgbuf[i] = (uint8_t)(r >> 24);
+	}
+	/* real firmware has zero words, and 0xFFFFFFFF is the dead-read value: word 0, the first word of a chunk and a mid-chunk word are 0, word 7 is 0xFFFFFFFF */
+	for (i = 0; i < 4; i++) {
+		static const uint32_t zw[3] = { 0, SWW_CHUNK_W, SWW_CHUNK_W + 5000 };
+
+		if (i < 3 && 4 * zw[i] + 4 <= len)
+			memset(imgbuf + 4 * zw[i], 0, 4);
+		if (i == 3 && 4 * 7 + 4 <= len)
+			memset(imgbuf + 4 * 7, 0xFF, 4);
 	}
 }
 
@@ -956,12 +968,12 @@ static void runb_full(void)
 	obsb(&f, 336);
 	mkimg(SWW_IMG_MAX + 1);
 	obsb(&f, 336);
-	CHECK(runb(&f, &x, 4, SWW_IMG_MAX + 1, tcrc(imgbuf, SWW_IMG_MAX + 1)) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT && f.win2 == 0 && x.row == 8 && ram_ok(0, 0));       /* the CRC is right: only the size bound refuses it */
+	CHECK(runb(&f, &x, 4, SWW_IMG_MAX + 1, tcrc(imgbuf, SWW_IMG_MAX + 1)) < 0 && x.stop_code == SWW_E_IMG && f.nw == 0 && f.win2 == 0 && x.row == 8 && ram_ok(0, 0));       /* the CRC is right: only the size bound refuses it */
 	CHECK(strstr(logbuf, "stopped at W8 restore=none") != 0);
 	obsb(&f, 336);
-	CHECK(runb(&f, &x, 4, 0, 0) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT);
+	CHECK(runb(&f, &x, 4, 0, 0) < 0 && x.stop_code == SWW_E_IMG && f.nw == 0);
 	obsb(&f, 336);
-	CHECK(runb(&f, &x, 4, SWW_IMG_MAX, crc ^ 1u) < 0 && x.stop_code == SWW_E_IMG && f.nw == NWANT && x.img_next == 0 && ram_ok(0, 0));
+	CHECK(runb(&f, &x, 4, SWW_IMG_MAX, crc ^ 1u) < 0 && x.stop_code == SWW_E_IMG && f.nw == 0 && x.img_next == 0 && ram_ok(0, 0));
 	CHECK(strstr(logbuf, "W8 image CRC ") != 0);
 }
 
@@ -995,6 +1007,11 @@ static void runb_faults(void)
 			}
 		}
 	}
+	/* the source changes after swl_img_check: every chunk CRC still equals the (changed) source, only the final compare against the container's CRC catches it */
+	obsb(&f, 336);
+	f.src_flip_at = NWANT + NB_TAIL + 20000;
+	CHECK(runb(&f, &x, 4, len, crc) < 0 && x.stop_code == SWW_E_READBACK && x.row == 10 && f.win2 == 0 && strstr(logbuf, "W10 read-back CRC ") != 0);
+	mkimg(len);
 	/* the restore of cfg 0x84 stays armed from the first window store until W9 is done, whatever fails in between */
 	for (mode = 0; mode < 3; mode++) {
 		for (k = NWANT + 1; k <= NWANT + 3; k++) {
