@@ -213,7 +213,7 @@ int main(void)
 	assert(has_line("GPU PRE_COHERENCY_ENABLE pa=01C500304 v=0000007F") && has_line("GPU PRE_STACK_READY pa=01C500E10 v=00000000") && has_line("GPU OFF_STACK_PWRTRANS pa=01C500E40") && has_line("GPU PRE_STACK_PWRTRANS pa=01C500E40") &&
 	       has_line("GPU PRE_L2_CONFIG pa=01C500048") && has_line("GPU PRE_COHERENCY_ENABLE pa=01C500304") &&
 	       has_line("GPU PRE_GPU_IRQ_MASK pa=01C500028"));
-	assert(has_line(" ticks=") && has_line(" freq=016E3600"));
+	assert(has_line(" ticks=") && has_line(" job=00000000") && has_line(" freq=016E3600"));
 
 	/* ON failures: PWROFF is written only where READY is nonzero */
 	reset(); stuck_tiler_on = 1;

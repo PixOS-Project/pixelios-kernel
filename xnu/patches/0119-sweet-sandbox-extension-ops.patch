@@ -1,0 +1,61 @@
+SWEET Sandbox extension ops (patch 0119): op 5 writes a constant token, op 6 a non-zero handle, so tccd can issue the sandbox extension for a granted TCC request (assetsd Photos, research 44). Layouts read from libsystem_sandbox.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -334,6 +334,46 @@
+ 	return error;
+ }
+ 
++/*
++ * Op 5 (extension issue) and op 6 (extension consume). Argument layouts read from libsystem_sandbox (iOS 16.7.16 DSC):
++ * __sandbox_extension_issue @0x1d1af4f98 passes 7 x u64 {class, type, path, flags, out buffer (always malloc(0x800) @0x1d1af4fcc), caller x4 (0 from issue_file/generic; not a size), w5};
++ * _sandbox_extension_consume @0x1d1af4ecc passes 3 x u64 {token, strlen+1, &handle}. The policy is permissive, so the token is a
++ * constant string (anything but "invalid") and the handle any non-zero value. tccd answers a granted request only if the issue
++ * succeeds ("Failed to issue Sandbox Extension for kTCCServicePhotos", gputest20; docs/research/44-tccd-photos-grant.md).
++ */
++#define SWEET_SBX_TOKEN "sweet-ext"
++
++static int
++sweet_sandbox_ext_issue(user_addr_t arg)
++{
++	uint64_t a[7];
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error) {
++		return error;
++	}
++	if (a[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(SWEET_SBX_TOKEN, (user_addr_t)a[4], sizeof(SWEET_SBX_TOKEN));
++}
++
++static int
++sweet_sandbox_ext_consume(user_addr_t arg)
++{
++	uint64_t a[3];
++	uint64_t handle = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error) {
++		return error;
++	}
++	if (a[2] == 0) {
++		return EINVAL;
++	}
++	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -347,7 +387,9 @@
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_appex_container_path(arg);
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_ext_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_ext_consume(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

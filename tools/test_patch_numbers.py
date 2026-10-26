@@ -50,6 +50,16 @@ class T(unittest.TestCase):
         self.pn("release", "0104")
         self.assertEqual(self.pn("next", "--owner", "z").stdout.splitlines()[0], "0104")
 
+    def test_unnamed_placeholder_reservation_accepts_a_real_patch(self):
+        # `claim N --owner wifi-reserved` (no name) is a placeholder: a real patch file with that number, any name, is not a conflict
+        self.git("checkout", "-q", "main"); self.git("branch", "-D", "wifi")
+        self.assertEqual(self.pn("claim", "0103", "--owner", "wifi-reserved").returncode, 0)
+        self.assertIn("RESERVED by wifi-reserved", self.pn("status").stdout)
+        self.git("checkout", "-q", "gpu"); self.add("0103-sweet-x.patch"); self.git("add", "-A"); self.git("commit", "-qm", "real 0103")
+        r = self.pn("check")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("reserved by", r.stdout)
+
     def test_reserved_number_under_another_name_is_a_conflict(self):
         self.git("checkout", "-q", "main"); self.git("branch", "-D", "wifi")
         n = self.pn("next", "--owner", "x", "--name", "mine").stdout.splitlines()[0]

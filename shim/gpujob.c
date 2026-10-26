@@ -323,7 +323,7 @@ int gpu_job_run(void)
 	struct jctx jc;
 	const struct jctx *j = &jc;
 	uintptr_t sc = gpu_job_scratch();
-	uint32_t v, jraw = 0, mraw = 0, jraw2 = 0, mraw2 = 0, jsst = 0, t_lo = 0, t_hi = 0, hexc = 0, ev;
+	uint32_t v, jraw = 0, mraw = 0, jraw2 = 0, jraw3 = 0, mraw2 = 0, jsst = 0, t_lo = 0, t_hi = 0, hexc = 0, ev;
 	const char *why;
 	char line[RAMLOG_LINE_MAX];
 	unsigned p;
@@ -417,6 +417,7 @@ int gpu_job_run(void)
 		(void)w32(A_JOB_CLEAR, IRQ_SLOT0_BITS, j);
 	if (mraw2 & IRQ_SLOT0_BITS)
 		(void)w32(A_MMU_CLEAR, IRQ_SLOT0_BITS, j);
+	rd("JOB_IRQ_RAWSTAT_CLEARED", A_JOB_RAW, &jraw3);	/* the _END read above is taken BEFORE the clear (G-4 item a): this one shows whether it took */
 	jraw |= jraw2;
 	mraw |= mraw2;
 	p = put_txt(line, sizeof(line), 0, "JOB SUMMARY submit=");

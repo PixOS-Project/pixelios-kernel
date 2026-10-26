@@ -1,0 +1,40 @@
+#!/bin/bash
+# Read-only post-reset evidence from the phone while it sits in recovery / Android (after an unexplained reset), BEFORE `adb reboot bootloader`.
+#   tools/phone-postmortem [--out DIR] [--dry-run]
+# Only runs when `adb shell getprop ro.product.device` says bluejay. Every probe is one fixed read-only `adb shell` command wrapped in
+# `timeout 8` (no write, no flash, no reboot); serials (androidboot.serialno, ro.serialno) are redacted. Saves each probe to DIR/NN-name.txt
+# (default logs/phone/postmortem-<stamp>/) and prints the reset-cause lines. Ends in RESULT: PASS|FAIL|ERROR ... ; exit 0/1/2.
+# FAIL = nothing could be read (the phone is not in a state with adb); ERROR = usage or not a bluejay.
+set -u
+cd "$(dirname "$0")/.." || exit 2
+out=""; dry=0
+while [ $# -gt 0 ]; do case "$1" in --out) out=$2; shift 2 ;; --dry-run) dry=1; shift ;; *) echo "usage: phone-postmortem [--out DIR] [--dry-run]"; echo "RESULT: ERROR bad argument"; exit 2 ;; esac; done
+[ -n "$out" ] || out=logs/phone/postmortem-$(date -u +%Y%m%dT%H%M%SZ)
+# name|command (read-only; fixed list)
+PROBES=(
+"bootreason|getprop ro.boot.bootreason; getprop sys.boot.reason; getprop persist.sys.boot.reason; getprop ro.boot.bootreason_history; getprop ro.boot.reset_reason; getprop ro.boot.mode"
+"cmdline|cat /proc/cmdline"
+"bootconfig|cat /proc/bootconfig"
+"pstore|ls -la /sys/fs/pstore; for f in /sys/fs/pstore/*; do echo \"== \$f\"; tail -c 30000 \"\$f\"; done"
+"last_kmsg|cat /proc/last_kmsg"
+"dmesg-reset|dmesg | grep -iE 'reset|reason|wdt|watchdog|thermal|temp|panic|bootloader|rst_stat|ppm|pmic|s2mpg|brownout|ocp|uvlo|bcl' | tail -n 120"
+"thermal|for z in /sys/class/thermal/thermal_zone*; do echo \"\$z \$(cat \$z/type 2>/dev/null) \$(cat \$z/temp 2>/dev/null)\"; done"
+"power_supply|for f in /sys/class/power_supply/*; do echo \"== \$f\"; cat \$f/uevent 2>/dev/null; done"
+"uptime|cat /proc/uptime; getprop ro.build.fingerprint"
+)
+if [ "$dry" = 1 ]; then printf '%s\n' "${PROBES[@]}" | cut -c1-150; echo "RESULT: PASS dry-run ${#PROBES[@]} probes"; exit 0; fi
+t() { timeout -k 1 8 "$@"; }
+dev=$(t adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
+[ "$dev" = bluejay ] || { echo "RESULT: ERROR adb does not report bluejay (got '${dev:-nothing}'), nothing read"; exit 2; }
+mkdir -p "$out"; n=0; ok=0
+for p in "${PROBES[@]}"; do
+	name=${p%%|*}; cmd=${p#*|}; n=$((n+1)); f=$(printf '%s/%02d-%s.txt' "$out" "$n" "$name")
+	t adb shell "$cmd" 2>&1 | tr -d '\r' | sed -E 's/(androidboot\.serialno=|serialno=)[^ ]*/\1<redacted>/g;s/(ro\.serialno|serialno)(\]: \[|[ =:]+)[^] ]*/\1\2<redacted>/g' > "$f"
+	[ -s "$f" ] && ok=$((ok+1))
+done
+echo "bootreason:"; sed -n 1,8p "$out"/01-bootreason.txt | sed 's/^/  /'
+echo "thermal (mC):"; awk '{print "  "$0}' "$out"/07-thermal.txt | head -12
+echo "battery:"; grep -hE 'POWER_SUPPLY_(NAME|STATUS|CAPACITY|TEMP|VOLTAGE_NOW|HEALTH)=' "$out"/08-power_supply.txt | head -12 | sed 's/^/  /'
+echo "saved: $out ($ok of $n probes non-empty)"
+[ "$ok" -gt 0 ] && { echo "RESULT: PASS postmortem $ok/$n probes saved in $out"; exit 0; }
+echo "RESULT: FAIL no probe returned data"; exit 1

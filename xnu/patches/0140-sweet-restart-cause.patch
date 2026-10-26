@@ -1,0 +1,44 @@
+SWEET restart cause (patch 0140): PE_halt_restart resets into the bootloader (fastboot) instead of a plain reset (panic types at once, no printf/delay); reboot_kernel logs `SWEET REBOOT: reboot_kernel howto 0x.. by NAME[pid]` and waits 500 ms for the USB log BEFORE if_down_all() (review docs/reviews/0140-restart-cause.md: a line printed in sweet_halt_restart would never leave the phone). Splits reboot(2) from panics and from resets XNU did not ask for.
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -71,9 +71,17 @@
+ {
+ 	switch (type) {
+ 	case SWEET_PE_RESTART:
++		/*
++		 * Patch 0140 (docs/HANDOFF.md "OPUS DECISION 2026-10-26 #5", review docs/reviews/0140-restart-cause.md): XNU-requested
++		 * resets land in the bootloader (fastboot, no Android detour, ~95 s saved). The USB log line of a reboot(2) is printed
++		 * earlier, in reboot_kernel (bsd/kern/kern_shutdown.c), because if_down_all() runs before this point. Panic types reset at
++		 * once (no printf/delay in the panic path). fastboot + a `SWEET REBOOT:` line = reboot(2); fastboot without one = a path that
++		 * did not go through reboot_kernel (panic types 4/9 or a direct PE_halt_restart); recovery = XNU did not ask.
++		 */
++		sweet_machine_reset(1);
+ 	case SWEET_PE_PANIC_RESTART:
+ 	case SWEET_PE_PANIC_NOCALL:
+-		sweet_machine_reset(0);
++		sweet_machine_reset(1);
+ 	default:
+ 		return -1;      /* halt etc.: unchanged (the caller spins) */
+ 	}
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -190,6 +190,19 @@
+ 		return EBUSY;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Patch 0140: name who asked for the reboot and give the USB log 500 ms to send it (if_down_all() below takes the
++	 * network down, so the line cannot be sent from sweet_halt_restart). Thread context: delay() blocks, the log thread runs.
++	 */
++	{
++		char sweet_nm[MAXCOMLEN + 1] = "?";
++		proc_selfname(sweet_nm, sizeof(sweet_nm));
++		printf("SWEET REBOOT: reboot_kernel howto 0x%x by %s[%d]\n", howto, sweet_nm, proc_selfpid());
++		delay(500000);
++	}
++#endif
++
+ 	lck_mtx_lock(&vm_swap_data_lock);
+ 
+ 	/* Turn OFF future swapfile reclaimation / compaction etc.*/

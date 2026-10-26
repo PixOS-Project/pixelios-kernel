@@ -1,0 +1,44 @@
+SWEET reset-cause probe (patch 0120): at boot, logs PMU RST_STAT / SYSIP_DAT0 / GSA_INFORM1 / flags (read-only, offsets from the ABL decompile, docs/research/10 s.1.5) so a phone reset we did not ask for (gputest25 +700 s, gputest28 +609 s) carries its cause in the next run log.
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -27,6 +27,7 @@
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ extern int (*PE_halt_restart)(unsigned int type);
+ 
+ #define SWEET_PMU_SMC           0x82000504ULL
+@@ -138,6 +139,24 @@
+ 	}
+ }
+ 
++/*
++ * Read-only reset-cause probe (patch 0120): the previous boot's reset reason survives in PMU registers that ABL itself reads
++ * (docs/research/10 s.1.5, ABL decompile: GS101_RST_STAT = PMU base + 0x3b44, GSA_INFORM(1) = +0x834, flag word +0x830,
++ * SYSIP_DAT0 = +0x810). Printed once so a run that ended in a phone reset we did not ask for carries its cause in the next log.
++ */
++static void
++sweet_rst_probe(uint64_t pmu_pa)
++{
++	volatile uint32_t *lo = (volatile uint32_t *)ml_io_map((vm_offset_t)pmu_pa, 0x1000);
++	volatile uint32_t *hi = (volatile uint32_t *)ml_io_map((vm_offset_t)(pmu_pa + 0x3000), 0x1000);
++	if (lo == NULL || hi == NULL) {
++		printf("SWEET RST: PMU map failed\n");
++		return;
++	}
++	printf("SWEET RST: RST_STAT=0x%08x SYSIP_DAT0=0x%08x GSA_INFORM1=0x%08x flags830=0x%08x\n",
++	    hi[0xb44 / 4], lo[0x810 / 4], lo[0x834 / 4], lo[0x830 / 4]);
++}
++
+ /* Called once from SweetPlatformExpert::start(). Silent no-op on boards without /sweet-reset. */
+ void
+ sweet_restart_start(void)
+@@ -159,6 +178,7 @@
+ 		return;
+ 	}
+ 	sweet_pmu_pa = reg[0];
++	sweet_rst_probe(sweet_pmu_pa);
+ 	if (SecureDTGetProperty(node, "mode-offset", (void const **)&off, &size) != kSuccess || size < 4) {
+ 		return;
+ 	}

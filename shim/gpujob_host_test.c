@@ -227,7 +227,7 @@ int main(void)
 	reset();
 	EXPECT(gpu_job_run() == 0);
 	EXPECT(ram64(SC + 0x4000 + 0x100) == 0x504958454C494F53ull);
-	EXPECT(has("JOB SUMMARY submit=ok wait=done hardstop=no target=MAGIC as0_off=ok") && has("GPU JOB target=504958454C494F53"));
+	EXPECT(has("JOB JOB_IRQ_RAWSTAT_CLEARED pa=01C501000 v=00000000") && has("JOB SUMMARY submit=ok wait=done hardstop=no target=MAGIC as0_off=ok") && has("GPU JOB target=504958454C494F53"));
 	EXPECT(has("GPU JOB JS_PRESENT pa=01C50001C v=00000001") && has("GPU JOB JS0_FEATURES pa=01C5000C0 v=0000020E") && has("GPU JOB JS2_FEATURES pa=01C5000C8") && has("GPU JOB JS0_COMMAND_NEXT pa=01C501860 v=00000000"));
 	EXPECT(has("S2MPU probe_pa=080100000") && has("GPU JOB cfg scratch=080100000 job_va=1000 target_va=1100"));
 	/* the exact GPU register write sequence: AS0, JS0, IRQ clear, AS0 off */

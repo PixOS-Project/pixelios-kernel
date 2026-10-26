@@ -1,0 +1,32 @@
+SWEET framebuffer cache invalidate (patch 0144, boot-arg sweetfb_inv=1, default off): clean+invalidate each presented layer source range before the panel copy, in case GPU-written surface data is hidden by stale CPU cache lines (gputest37: FB content hash constant while the GPU renders).
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -369,6 +369,7 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++extern "C" void flush_dcache64(addr64_t, unsigned, int);   /* osfmk/arm/caches_internal.h, virtual address with phys = 0 */
+ static uint32_t sweet_fb_present_count;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -474,6 +475,20 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			/*
++			 * Boot-arg sweetfb_inv=1 (patch 0144): the GPU writes the surface in DRAM behind the CPU's back; the lines this loop
++			 * pulled into the cache on an earlier present would be served stale (gputest30/37: the sampled hash never changes).
++			 * Clean+invalidate the source range of this layer before reading it.
++			 */
++			static int inv = -1;
++			if (inv < 0) {
++				int v = 0;
++				inv = (PE_parse_boot_argn("sweetfb_inv", &v, sizeof(v)) && v != 0) ? 1 : 0;
++			}
++			if (inv) {
++				flush_dcache64((addr64_t)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
++				    (unsigned)((uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4), FALSE);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
