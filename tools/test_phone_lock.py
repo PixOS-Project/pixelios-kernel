@@ -9,7 +9,8 @@ class T(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.TemporaryDirectory()
         self.lock = os.path.join(self.d.name, "phone.lock")
-        self.env = dict(os.environ, PHONE_LOCK_DIR=self.lock)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("PHONE_LOCK_")}
+        self.env["PHONE_LOCK_DIR"] = self.lock
 
     def tearDown(self):
         self.d.cleanup()
