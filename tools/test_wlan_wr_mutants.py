@@ -3,7 +3,9 @@
 Each guard rule of swl_wr() / swl_wr_ok() / the steps is removed or weakened in a copy of the header (every occurrence of the pattern), the host test
 shim/wlan_wr_host_test.c is built against the copy and must FAIL; a mutant that still passes is a survivor and fails this test, unless it is listed
 EQUIVALENT with the clause that implies it (CR-02). A pattern that matches nothing fails too (the header changed under the mutant list).
-Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; the texts under test are the files after 0124, 0128, 0129, 0130 are applied in order (apply_chain).
+Patch 0130 (run B: W8 window, W9 last word, W10 image copy) changes both files; patch 0131 (run C: W11 NVRAM text, W12 length token, W13 rTLV) changes them again; patch 0132 (run D: W14 reset vector, firmware identity pin) once more; the texts under test are the files
+after 0124, 0128, 0129, 0130, 0131, 0132 are applied in order (apply_chain). Two host tests are built against every mutant (shim/wlan_wr_host_test.c with the fake bus, shim/wlan_nv_host_test.c for the pure
+process_nvram_vars port); a mutant is killed when either fails.
 Run: python3 -B tools/test_wlan_wr_mutants.py  (also picked up by `unittest discover -s tools -p 'test_*.py'`)."""
 import concurrent.futures
 import difflib
@@ -21,7 +23,10 @@ PATCH0120 = os.path.join(ROOT, "xnu", "patches", "0124-sweet-wlan-bwfm-core.patc
 PATCH0125 = os.path.join(ROOT, "xnu", "patches", "0129-sweet-wlan-chip-writes.patch")
 PATCH0128 = os.path.join(ROOT, "xnu", "patches", "0128-sweet-wlan-fwcheck.patch")
 PATCH0130 = os.path.join(ROOT, "xnu", "patches", "0130-sweet-wlan-image-copy.patch")
+PATCH0131 = os.path.join(ROOT, "xnu", "patches", "0131-sweet-wlan-nvram-rtlv.patch")
+PATCH0132 = os.path.join(ROOT, "xnu", "patches", "0132-sweet-wlan-reset-vector.patch")
 TEST = os.path.join(ROOT, "shim", "wlan_wr_host_test.c")
+TEST_NV = os.path.join(ROOT, "shim", "wlan_nv_host_test.c")
 HDR_PATH = "bsd/dev/sweet_wlan_wr.h"
 GLUE_PATH = "bsd/dev/sweet_wlan.c"
 
@@ -58,7 +63,7 @@ def apply_chain(path, patches):
 
 
 def final_header():
-    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130))
+    return apply_chain(HDR_PATH, (PATCH0125, PATCH0130, PATCH0131, PATCH0132))
 
 
 def glue_before():
@@ -66,7 +71,7 @@ def glue_before():
 
 
 def glue_after():
-    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130))
+    return apply_chain(GLUE_PATH, (PATCH0120, PATCH0128, PATCH0125, PATCH0130, PATCH0131, PATCH0132))
 
 
 def new_file(patch, path):
@@ -118,14 +123,30 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_stage3", "wb.ctx = hw;"),
     ("sweet_wlan_stage3", "x.b = &wb;"),
     ("sweet_wlan_stage3", "x.level = level;"),
+    ("sweet_wlan_stage3", "hw->l3 = level;"),  # patch 0132: sw3_wr allows backplane address 0 only at level 6 ...
+    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && sw_fw.len == SWW_FW_LEN && sw_fw.crc == SWW_FW_CRC;"),  # review 0132 F5: the pin, in the glue too
+    ("sweet_wlan_stage3", "hw->rv_done = 0;"),
+    ("sw3_wr", "h->rv_done = 1;"),  # the one store at backplane address 0 is made once
+    ("sweet_wlan_stage3", "hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;"),  # ... and only this word
     ("sweet_wlan_stage3", "x.img = sw_fw.p;"),  # patch 0130: the FW entry swf_parse() accepted
     ("sweet_wlan_stage3", "x.img_len = sw_fw.len;"),
     ("sweet_wlan_stage3", "x.img_crc = sw_fw.crc;"),
+    ("sweet_wlan_stage3", "x.nv_src = sw_nv.p;"),  # patch 0131: the NVRM entry swf_parse() accepted, a scratch buffer, the entropy source
+    ("sweet_wlan_stage3", "x.nv_src_len = sw_nv.len;"),
+    ("sweet_wlan_stage3", "x.nv_src_crc = sw_nv.crc;"),
+    ("sweet_wlan_stage3", "x.nv = sw_nvbuf;"),
+    ("sweet_wlan_stage3", "x.nv_cap = sizeof sw_nvbuf;"),
+    ("sweet_wlan_stage3", "wb.rng = sw3_rng;"),
     ("sw_fw_note", "for (i = 0;"),
     ("sw_fw_note", 'i++) { if (memcmp(e[i].tag, "", 4) == 0) { sw_fw.p = base + e[i].offset;'),  # string contents are stripped by the scan; audit_store_path pins "FW  "
     ("sw_fw_note", "sw_fw.p = base + e[i].offset;"),
     ("sw_fw_note", "sw_fw.len = e[i].length;"),
     ("sw_fw_note", "sw_fw.crc = e[i].crc;"),
+    ("sw_fw_note", "sw_nv.p = base + e[i].offset;"),
+    ("sw_fw_note", "sw_nv.len = e[i].length;"),
+    ("sw_fw_note", "sw_nv.crc = e[i].crc;"),
+    ("sweet_wlan_init", "struct sw_hw hw = { 0 };"),  # review 0132 F6
+    ("sweet_wlan_init", "level = 5;"),  # review 0132 F2: W14 not run where DHD would read the DAR register
     ("sweet_wlan_init", "hw.level = level > 2 ? 2 : (int)level;"),  # fragments of the function: its header is a context line of the patch
     ("sweet_wlan_init", "hw.atu = atu;"),
     ("sweet_wlan_init", "hw.elbi = elbi;"),
@@ -160,6 +181,22 @@ def audit_assignments(glue):
     return f
 
 
+def audit_rev_gate(glue):
+    """Review 0132 F2: in the whole glue, sweet_wlan_init refuses level 6 (runs 5) unless swl_w14_rev_ok(&chip), before it calls sweet_wlan_stage3. Order checks use find() with an explicit -1 test (AP-47)."""
+    f = []
+    b = body(strip_comments(glue), "sweet_wlan_init")
+    gate = b.find("if (level >= 6 && !swl_w14_rev_ok(&chip)) {")
+    lower = b.find("level = 5;")
+    call = b.find("sweet_wlan_stage3(&hw, (int)level)")
+    if gate < 0 or lower < 0 or call < 0 or not gate < lower < call:
+        f.append("sweet_wlan_init does not refuse level 6 on an unchecked PCIe core rev before sweet_wlan_stage3")
+    if b.count("swl_w14_rev_ok(") != 1 or "&chip" not in b[gate:lower]:
+        f.append("the rev gate does not use the stage-1 chip")
+    if "swl_w14_rev_ok(&chip)" in b[:b.find("swl_stage1(")] if b.find("swl_stage1(") >= 0 else True:
+        f.append("the rev gate runs before stage 1 filled the chip")
+    return f
+
+
 def audit_store_path(hdr, glue):
     """Source audit of the store path (docs/research/43 s.5 step 5): the header has no asm and no pointer made from an integer literal, its one bus store
     callback is called only in swl_store(), swl_store() only from swl_wr() and swl_restore(); the glue has exactly one store through a pointer (sw3_wr) and
@@ -184,17 +221,28 @@ def audit_store_path(hdr, glue):
         f.append("sw3_wr does not limit the offsets to the table's")
     if not all(n in body(glue, "sw3_wr") for n in ("SWW_CFG_WIN2", "SWW_WIN_TAIL", "SWW_RAM_BASE", "SWW_LAST_HI_MAX", "space == SWW_BAR2")):
         f.append("sw3_wr does not limit BAR2 and cfg 0x84 to the table's")
+    if "h->l3 >= 6" not in body(glue, "sw3_wr") or "v == h->rv" not in body(glue, "sw3_wr") or "off == 0 &&" not in body(glue, "sw3_wr") or "h->rv_ok && !h->rv_done" not in body(glue, "sw3_wr"):
+        f.append("sw3_wr does not limit backplane address 0 to level 6 and the container's first dword")
     if 'memcmp(e[i].tag, "FW  ", 4)' not in body(glue, "sw_fw_note"):
         f.append("sw_fw_note does not pick the FW entry by its tag")
+    if 'memcmp(e[i].tag, "NVRM", 4)' not in body(glue, "sw_fw_note"):
+        f.append("sw_fw_note does not pick the NVRM entry by its tag")
     if len(re.findall(r"\bsw3_wr\b", glue)) != 2 or "wb.wr = sw3_wr;" not in glue:
         f.append("sw3_wr used other than as the bus wr callback")
+    # review 0131 F1 (AP-74): what is CRC-checked is the private copy that is processed, not the container
+    nvp = body(hdr, "swl_nv_prep")
+    if "x->nv[i] = x->nv_src[i];" not in nvp or "src = swl_crc_b(src, x->nv[i]);" not in nvp or "nv_src[i])" in nvp.replace("x->nv[i] = x->nv_src[i];", ""):
+        f.append("swl_nv_prep does not CRC its private copy")
+    # review 0131 F2: the rTLV entropy is drawn in full
+    if body(glue, "sw3_rng").count("read_random(buf, n);") != 1:
+        f.append("sw3_rng does not draw all n bytes with read_random")
     return f
 
 
 # (name, [(old, new)], equivalent-because or None). Strings are literal; every occurrence is replaced.
 MUTANTS = [
     # --- the allowlist decision
-    ("no deny-by-default (unknown store matches tuple 0)", [("\t}\n\treturn -1;\n}\n\nstatic inline int\nswl_win_known", "\t}\n\treturn 0;\n}\n\nstatic inline int\nswl_win_known")], None),
+    ("no deny-by-default (unknown store matches tuple 0)", [("\t}\n\treturn -1;\n}\n\nstatic inline int\nswl_wr_ok(", "\t}\n\treturn 0;\n}\n\nstatic inline int\nswl_wr_ok(")], None),
     ("value not compared", [("} else if (p->val == val) {", "} else if (1) {")], None),
     ("bank index may be >= 0x80", [("if (val < SWW_BANK_ROM) {", "if (1) {")], None),
     ("space not compared", [("if (p->space != space || p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {", "if (p->win != win || off < p->off || off > (p->hi ? p->hi : p->off) || (off & 3u) != 0) {")], None),
@@ -221,10 +269,10 @@ MUTANTS = [
     ("companion condition ignored", [("if (p->cmask && (swl_rdx(x, space, win, p->coff, &comp) || (comp & p->cmask) != p->cval)) {", "if (0) {")], None),
     ("companion read failure ignored", [("if (p->cmask && (swl_rdx(x, space, win, p->coff, &comp) ||", "if (p->cmask && (0 ||")], None),
     ("store failure ignored", [("if (swl_store(x, space, win, off, val)) {\n\t\treturn swl_stop(x, SWW_E_WR);", "swl_store(x, space, win, off, val);\n\tif (0) {\n\t\treturn swl_stop(x, SWW_E_WR);")], None),
-    ("no read-back compare", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (swl_rdx(x, space, win, off, &rb)) {")], None),
+    ("no read-back compare", [("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
     ("read-back compares all 32 bits", [("((rb ^ val) & p->vmask)", "((rb ^ val) & 0xFFFFFFFFu)")], None),
-    ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {")], None),
-    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (((rb ^ val) & p->vmask)) {")], None),
+    ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {"), ("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
+    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0) {")], None),
     ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\t\treturn swl_stop(x, SWW_E_RD);")], None),
     ("done bit not recorded", [("\tx->done |= 1u << t;\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
@@ -322,7 +370,7 @@ MUTANTS = [
     ("run B: cfg 0x84 never restored to 0 in W9", [("if (win != 0) {\n\t\tx->row = 8;", "if (0) {\n\t\tx->row = 8;")], None),
     ("run B: cfg 0x84 restore group not armed", [("SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL", "SWT_ONCE | SWT_TAIL, .rgrp = 0, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL")], None),
     ("run B: STOP restore table lacks cfg 0x84", [("\t{ SWW_RG_W84, SWW_CFG, 0, SWW_CFG_WIN2, 0u, 0xFFFFFFFFu },\n", "")], None),
-    ("run B: preconditions and window not re-read at the first word of a chunk", [("if (!(p->flags & SWT_BULK) || ((off - SWW_RAM_BASE) & (4u * SWW_CHUNK_W - 1u)) == 0) {", "if (!(p->flags & SWT_BULK)) {")], None),
+    ("run B: preconditions and window not re-read at the first word of a chunk", [("((p->flags & SWT_BULK) && ((off - SWW_RAM_BASE) & (4u * SWW_CHUNK_W - 1u)) == 0)", "(p->flags & SWT_BULK) && 0")], None),
     ("run B: chunk CRC compare dropped", [("if (rc != sc) {", "if (0) {")], None),
     ("run B: final CRC compare dropped", [("if (x->img_crc_rb != x->img_crc || x->img_next != words) {", "if (x->img_next != words) {")],
      None),
@@ -333,6 +381,219 @@ MUTANTS = [
     ("run B: unusable image not refused before the first store (W0)", [("if (x->level >= SWW_LEVEL0 + 2) {      /* an unusable", "if (0) {      /* an unusable")], None),
     ("run B: SWT_LAST_LO lowered into the image range", [(".off = SWW_IMG_END, .hi = SWW_TCM_BYTES - 4u", ".off = SWW_RAM_BASE, .hi = SWW_TCM_BYTES - 4u")], None),
     ("run B: oversize image accepted", [("x->img_len == 0 || x->img_len > SWW_IMG_MAX) {\n\t\tprintf", "x->img_len == 0) {\n\t\tprintf")], None),
+
+    # --- run C (patch 0131): the process_nvram_vars port and the caller's steps (shim/wlan_nv_host_test.c kills these)
+    ("run C nv: CR kept", [("if (vb[n] == '\\r') {", "if (0) {")], None),
+    ("run C nv: comment text kept", [("if (find_nl && vb[n] != '\\n') {", "if (0) {")], None),
+    ("run C nv: a comment never ends", [("\t\tfind_nl = 0;\n\t\tif (vb[n] == '#') {", "\t\tif (vb[n] == '#') {")], None),
+    ("run C nv: '#' is not a comment", [("if (vb[n] == '#') {", "if (0) {")], None),
+    ("run C nv: empty lines kept", [("if (column == 0) {\n\t\t\t\tcontinue;", "if (0) {\n\t\t\t\tcontinue;")], None),
+    ("run C nv: column not counted", [("\t\tvb[dp++] = vb[n];\n\t\tcolumn++;", "\t\tvb[dp++] = vb[n];")], None),
+    ("run C nv: column not reset at a line end", [("\t\t\tvb[dp++] = 0;\n\t\t\tcolumn = 0;\n\t\t\tcontinue;", "\t\t\tvb[dp++] = 0;\n\t\t\tcontinue;")], None),
+    ("run C nv: pad also when it does not fit", [("if (buf_len + pad <= len) {", "if (1) {")], None),
+    ("run C nv: pad only when it fits strictly", [("if (buf_len + pad <= len) {", "if (buf_len + pad < len) {")], None),
+    ("run C nv: pad size", [("pad = 4u - buf_len % 4u;", "pad = 3u - buf_len % 4u;")], None),
+    ("run C nv: no pad", [("\tif (buf_len % 4u) {\n\t\tpad = 4u - buf_len % 4u;", "\tif (0) {\n\t\tpad = 4u - buf_len % 4u;")], None),
+    ("run C nv: rest not zero filled", [("\twhile (dp < len) {\n\t\tvb[dp++] = 0;\n\t}\n\treturn buf_len;", "\treturn buf_len;")], None),
+    ("run C nv: returns the unpadded length", [("\treturn buf_len;\n}\n\n/* The caller", "\treturn dp > buf_len ? dp : buf_len;\n}\n\n/* The caller")], None),
+    ("run C dhd: empty file processed", [("if (len == 0 || len >= SWW_NV_DHD_MAX) {", "if (len >= SWW_NV_DHD_MAX) {")], None),
+    ("run C dhd: no size cap", [("if (len == 0 || len >= SWW_NV_DHD_MAX) {", "if (len == 0) {")], None),
+    ("run C dhd: cap one too high", [("len >= SWW_NV_DHD_MAX", "len > SWW_NV_DHD_MAX")], None),
+    ("run C dhd: last input byte not forced to NUL", [("\tvb[len - 1u] = 0;\n", "")], None),
+    ("run C dhd: only 4 bytes past len zeroed", [("for (i = 0; i < 8u; i++) {\n\t\tvb[len + i] = 0;", "for (i = 0; i < 4u; i++) {\n\t\tvb[len + i] = 0;")], None),
+    ("run C dhd: more than 8 bytes past len zeroed", [("for (i = 0; i < 8u; i++) {\n\t\tvb[len + i] = 0;", "for (i = 0; i < 16u; i++) {\n\t\tvb[len + i] = 0;")], None),
+    ("run C dhd: length not rounded up", [("\tif (len % 4u) {\n\t\tlen += 4u - len % 4u;", "\tif (0) {\n\t\tlen += 4u - len % 4u;")], None),
+    ("run C dhd: no extra NUL in varsz", [("return len ? len + 1u : 0;", "return len;")], None),
+    ("run C dhd: nothing to download gives 1", [("return len ? len + 1u : 0;", "return len + 1u;")], None),
+    ("run C dhd: extra NUL not stored", [("\tvb[len] = 0;\n\treturn len ? len + 1u : 0;", "\treturn len ? len + 1u : 0;")],
+     "the 8 zero bytes past the input and process_nvram_vars' own zero fill already make vb[len] zero (len <= input + 3)"),
+    # --- run C: swl_nv_prep (before W0)
+    ("run C prep: no entry accepted", [("x->nv_src == NULL || ", "")], None),
+    ("run C prep: empty entry accepted", [("x->nv_src_len == 0 || ", "")], None),
+    ("run C prep: input bound dropped", [("x->nv_src_len > SWW_NV_VARS_MAX || ", "")], None),
+    ("run C prep: input bound one too low", [("x->nv_src_len > SWW_NV_VARS_MAX ||", "x->nv_src_len >= SWW_NV_VARS_MAX ||")], None),
+    ("run C prep: no scratch accepted", [("x->nv == NULL || ", "")], None),
+    ("run C prep: scratch size dropped", [(" || x->nv_cap < x->nv_src_len + 8u", "")], None),
+    ("run C prep: scratch one byte short accepted", [("x->nv_cap < x->nv_src_len + 8u", "x->nv_cap < x->nv_src_len + 7u")], None),
+    ("run C prep: scratch one byte too much demanded", [("x->nv_cap < x->nv_src_len + 8u", "x->nv_cap < x->nv_src_len + 9u")], None),
+    ("run C prep: container CRC not compared", [("if (~src != x->nv_src_crc) {", "if (0) {")], None),
+    ("run C prep: container CRC not computed", [("\t\tsrc = swl_crc_b(src, x->nv[i]);\n", "")], None),
+    ("run C prep: text not copied", [("x->nv[i] = x->nv_src[i];", "x->nv[i] = 0;")], None),
+    ("run C prep: nothing left is accepted", [("if (varsz == 0 || varsize > SWW_NV_VARS_MAX) {", "if (varsize > SWW_NV_VARS_MAX) {")], None),
+    ("run C prep: varsize bound dropped", [("if (varsz == 0 || varsize > SWW_NV_VARS_MAX) {", "if (varsz == 0) {")], None),
+    ("run C prep: varsize bound one too low", [("varsize > SWW_NV_VARS_MAX) {\n\t\tprintf(\"SWEET WLAN: W%u NVRAM text", "varsize >= SWW_NV_VARS_MAX) {\n\t\tprintf(\"SWEET WLAN: W%u NVRAM text")], None),
+    ("run C prep: varsize not rounded up", [("varsize = (varsz + 3u) & ~3u;", "varsize = varsz;")], None),
+    ("run C prep: no generator accepted", [("x->b->rng == NULL || ", "")], None),
+    ("run C prep: generator failure ignored", [("x->b->rng(x->b->ctx, x->rtlv, SWW_RTLV_RNG) != 0", "(x->b->rng(x->b->ctx, x->rtlv, SWW_RTLV_RNG), 0)")], None),
+    ("run C prep: all-zero draw accepted", [("if (any == 0) {", "if (0) {")], None),
+    ("run C prep: draw not looked at", [("any |= x->rtlv[i];", "any &= x->rtlv[i];")], None),
+    ("run C prep: token without the complement", [("x->tok = (~w << 16) | (w & 0xFFFFu);", "x->tok = (w << 16) | (w & 0xFFFFu);")], None),
+    ("run C prep: token counts bytes", [("w = varsize / 4u;", "w = varsize;")], None),
+    ("run C prep: token low half", [("x->tok = (~w << 16) | (w & 0xFFFFu);", "x->tok = (~w << 16);")], None),
+    ("run C prep: token low half unmasked", [("x->tok = (~w << 16) | (w & 0xFFFFu);", "x->tok = (~w << 16) | w;")],
+     "w = varsize / 4 <= SWW_NV_VARS_MAX / 4 = 6767 < 0x10000, so the mask is a no-op"),
+    ("run C prep: state of an earlier refusal kept", [("\tx->nv_varsize = 0;\n\tif (x->nv_src == NULL", "\tif (x->nv_src == NULL")], None),
+    ("run C prep: text CRC over varsz, not varsize", [("for (i = 0; i < varsize; i++) {\n\t\tc = swl_crc_b(c, x->nv[i]);", "for (i = 0; i < varsz; i++) {\n\t\tc = swl_crc_b(c, x->nv[i]);")], None),
+    ("run C prep: text CRC not complemented", [("x->nv_crc = ~c;", "x->nv_crc = c;")], None),
+    ("run C prep: state set before the entropy", [("\tx->tok = (~w << 16) | (w & 0xFFFFu);     /* dhd_pcie.c:10962-10963 */\n\tx->nv_crc = ~c;\n\tx->nv_varsize = varsize;", "\tx->tok = (~w << 16) | (w & 0xFFFFu);     /* dhd_pcie.c:10962-10963 */\n\tx->nv_crc = ~c;")], None),
+    # --- run C: geometry, kinds, words
+    ("run C geo: unprepared state accepted", [("if (x->nv_varsize == 0 || x->nv_varsize > SWW_NV_VARS_MAX || (x->nv_varsize & 3u) != 0) {", "if (x->nv_varsize > SWW_NV_VARS_MAX || (x->nv_varsize & 3u) != 0) {")], None),
+    ("run C geo: varsize bound dropped", [("x->nv_varsize == 0 || x->nv_varsize > SWW_NV_VARS_MAX || ", "x->nv_varsize == 0 || ")], None),
+    ("run C geo: varsize alignment dropped", [(" || (x->nv_varsize & 3u) != 0) {\n\t\treturn SWW_E_NV;", ") {\n\t\treturn SWW_E_NV;")], None),
+    ("run C geo: RAM above 4 MiB accepted", [("\tif (x->ram_bytes > SWW_RAM_MAX) {\n\t\treturn SWW_E_RAM;\n\t}\n\tg->tok", "\tg->tok")], None),
+    ("run C geo: tail below the window accepted", [("return g->rt < SWW_WIN_TAIL ? SWW_E_GEO : 0;", "return 0;")], None),
+    ("run C geo: tail may start exactly at the window floor minus nothing (<=)", [("return g->rt < SWW_WIN_TAIL ? SWW_E_GEO : 0;", "return g->rt <= SWW_WIN_TAIL ? SWW_E_GEO : 0;")], None),
+    ("run C geo: only the text must lie in the window", [("return g->rt < SWW_WIN_TAIL ? SWW_E_GEO : 0;", "return g->vars < SWW_WIN_TAIL ? SWW_E_GEO : 0;")], None),
+    ("run C geo: token not the last word", [("g->tok = SWW_RAM_BASE + x->ram_bytes - 4u;", "g->tok = SWW_RAM_BASE + x->ram_bytes - 8u;")], None),
+    ("run C geo: text overlaps the token", [("g->vars = g->tok - x->nv_varsize;", "g->vars = g->tok - x->nv_varsize + 4u;")], None),
+    ("run C geo: gap between text and token", [("g->vars = g->tok - x->nv_varsize;", "g->vars = g->tok - x->nv_varsize - 4u;")], None),
+    ("run C geo: rTLV overlaps the text", [("g->rt = g->vars - SWW_RTLV_BYTES;", "g->rt = g->vars - SWW_RTLV_BYTES + 4u;")], None),
+    ("run C geo: rTLV one word too low", [("g->rt = g->vars - SWW_RTLV_BYTES;", "g->rt = g->vars - SWW_RTLV_BYTES - 4u;")], None),
+    ("run C geo: word count", [("g->vwords = x->nv_varsize / 4u;", "g->vwords = x->nv_varsize / 4u + 1u;")], None),
+    ("run C kind: rTLV floor", [("if (bp >= g.rt && bp < g.vars) {", "if (bp > g.rt && bp < g.vars) {")], None),
+    ("run C kind: rTLV ceiling", [("if (bp >= g.rt && bp < g.vars) {", "if (bp >= g.rt && bp <= g.vars) {")], None),
+    ("run C kind: text floor", [("if (bp >= g.vars && bp < g.tok) {", "if (bp > g.vars && bp < g.tok) {")], None),
+    ("run C kind: text ceiling", [("if (bp >= g.vars && bp < g.tok) {", "if (bp >= g.vars && bp <= g.tok) {")], None),
+    ("run C kind: any other address is the token", [("return bp == g.tok ? SWK_TOKEN : 0;", "return SWK_TOKEN;")], None),
+    ("run C kind: rTLV is the text", [("\t\treturn SWK_RTLV;\n\t}\n\tif (bp >= g.vars", "\t\treturn SWK_VARS;\n\t}\n\tif (bp >= g.vars")], None),
+    ("run C kind: no geometry gives the token kind", [("\tif (swl_geo_get(x, &g)) {\n\t\treturn 0;\n\t}\n\tif (bp >= g.rt", "\tif (swl_geo_get(x, &g)) {\n\t\treturn SWK_TOKEN;\n\t}\n\tif (bp >= g.rt")], None),
+    ("run C words: token count", [("return k == SWK_VARS ? g->vwords : k == SWK_TOKEN ? 1u : SWW_RTLV_WORDS;", "return k == SWK_VARS ? g->vwords : k == SWK_TOKEN ? 2u : SWW_RTLV_WORDS;")], None),
+    ("run C words: rTLV count", [("#define SWW_RTLV_WORDS  (SWW_RTLV_BYTES / 4u)", "#define SWW_RTLV_WORDS  (SWW_RTLV_BYTES / 4u - 1u)")], None),
+    ("run C words: token base", [("return k == SWK_VARS ? g->vars : k == SWK_TOKEN ? g->tok : g->rt;", "return k == SWK_VARS ? g->vars : k == SWK_TOKEN ? g->vars : g->rt;")], None),
+    ("run C words: rTLV base", [("return k == SWK_VARS ? g->vars : k == SWK_TOKEN ? g->tok : g->rt;", "return k == SWK_VARS ? g->vars : k == SWK_TOKEN ? g->tok : g->vars;")], None),
+    ("run C words: big endian", [("v |= (uint32_t)b[4u * i + j] << (8u * j);", "v |= (uint32_t)b[4u * i + j] << (24u - 8u * j);")], None),
+    ("run C words: rTLV value from the text", [("const uint8_t *b = k == SWK_VARS ? x->nv : x->rtlv;", "const uint8_t *b = x->nv;")], None),
+    ("run C words: length word and type swapped", [("return i == SWW_RTLV_RNG / 4u ? SWW_RTLV_LEN : SWW_RTLV_RNGSIG;", "return i == SWW_RTLV_RNG / 4u ? SWW_RTLV_RNGSIG : SWW_RTLV_LEN;")], None),
+    ("run C words: length word index", [("i >= SWW_RTLV_RNG / 4u) {", "i > SWW_RTLV_RNG / 4u) {")], None),
+    ("run C words: length word with a checksum", [("#define SWW_RTLV_LEN    0x80u ", "#define SWW_RTLV_LEN    0xFF7F0080u ")], None),
+    ("run C words: type word", [("#define SWW_RTLV_RNGSIG 0xFEEDC0DEu ", "#define SWW_RTLV_RNGSIG 0xFEEDFE51u ")], None),
+    ("run C words: token is not the stored word", [("\tif (k == SWK_TOKEN) {\n\t\treturn x->tok;\n\t}", "\tif (k == SWK_TOKEN) {\n\t\treturn ~x->tok;\n\t}")], None),
+    # --- run C: swl_wr / pick / table
+    ("run C pick: tuple not replaced when consumed", [("(((swl_wt[t].flags & SWT_ONCE) && (x->done & (1u << t))) || ((swl_wt[t].flags & SWT_TW)", "((0) || ((swl_wt[t].flags & SWT_TW)")], None),
+    ("run C pick: tuple not replaced by kind", [("|| ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {", "|| 0)) {")], None),
+    ("run C pick: kind taken from the offset", [("swl_wt[t].kind != swl_tw_kind(x, win + off)", "swl_wt[t].kind != swl_tw_kind(x, off)")], None),
+    ("run C pick: takeover at a level that does not allow it", [("if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {", "if (n <= t) {")], None),
+    ("run C pick: no match reports DENIED", [("\t\t\treturn first;\n\t\t}\n\t\tt = n;", "\t\t\treturn -1;\n\t\t}\n\t\tt = n;")], None),
+    ("run C pick: not used", [("t = swl_wr_pick(x, space, win, off, val);", "t = swl_wr_ok(space, win, off, val);")], None),
+    ("run C ok: tail tuples need the tuple's value", [("} else if (p->flags & (SWT_BULK | SWT_TW | SWT_RV)) {", "} else if (p->flags & (SWT_BULK | SWT_RV)) {")], None),
+    ("run C wr: geometry not checked", [("\t\tgr = swl_geo_get(x, &g);\n\t\tif (gr) {\n\t\t\treturn swl_stop(x, gr);\n\t\t}\n", "\t\tgr = swl_geo_get(x, &g);\n")], None),
+    ("run C wr: kind index not bounded", [("ti >= swl_tw_n(&g, p->kind) || ", "")], None),
+    ("run C wr: address not the next word of the kind", [("win + off != swl_tw_base(&g, p->kind) + 4u * ti || ", "")], None),
+    ("run C wr: address always the first word", [("win + off != swl_tw_base(&g, p->kind) + 4u * ti", "win + off != swl_tw_base(&g, p->kind)")], None),
+    ("run C wr: word not compared", [(" || val != swl_tw_word(x, p->kind, ti)) {", ") {")], None),
+    ("run C wr: word counter not advanced", [("\tif (p->flags & SWT_TW) {\n\t\tx->tn[p->kind]++;\n\t\treturn 0;\n\t}", "\tif (p->flags & SWT_TW) {\n\t\treturn 0;\n\t}")], None),
+    ("run C wr: word counter advanced by two", [("x->tn[p->kind]++;", "x->tn[p->kind] += 2;")], None),
+    ("run C wr: preconditions only at the first word dropped", [(" || ((p->flags & SWT_TW) && ti == 0);", ";")], None),
+    ("run C wr: preconditions at every tail word", [("first = !(p->flags & (SWT_BULK | SWT_TW)) ||", "first = !(p->flags & SWT_BULK) ||")], None),
+    ("run C wr: preconditions at no tail word but the first of a chunk", [("(p->flags & SWT_TW) && ti == 0", "(p->flags & SWT_TW) && ti == 1000000u")], None),
+    ("run C table: window tuple is run 2", [("[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3,", "[SWT_WIN2_TAIL_C] = { .row = 11, .run = 2,")], None),
+    ("run C table: window tuple not ONCE", [("[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL,", "[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_TAIL,")], None),
+    ("run C table: window tuple without the restore group", [("[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84,", "[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = 0,")], None),
+    ("run C table: window tuple without the tail gate", [("[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL,", "[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE,")], None),
+    ("run C table: window tuple old value not pinned", [("[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL, .vmask = 0xFFFFFFFFu,\n\t                     .omask = 0xFFFFFFFFu,", "[SWT_WIN2_TAIL_C] = { .row = 11, .run = 3, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL, .vmask = 0xFFFFFFFFu,\n\t                     .omask = 0,")], None),
+    ("run C table: window tuple phase", [(".omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W10 },\n\t[SWT_NV_VARS]", ".omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W9 },\n\t[SWT_NV_VARS]")], None),
+    ("run C table: text tuple is run 2", [("[SWT_NV_VARS]    = { .row = 11, .run = 3,", "[SWT_NV_VARS]    = { .row = 11, .run = 2,")], None),
+    ("run C table: token tuple is run 2", [("[SWT_NV_TOKEN]   = { .row = 12, .run = 3,", "[SWT_NV_TOKEN]   = { .row = 12, .run = 2,")], None),
+    ("run C table: rTLV tuple is run 2", [("[SWT_NV_RTLV]    = { .row = 13, .run = 3,", "[SWT_NV_RTLV]    = { .row = 13, .run = 2,")], None),
+    ("run C table: restore tuple is run 2", [("[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3,", "[SWT_WIN2_ZERO_C] = { .row = 13, .run = 2,")], None),
+    ("run C table: text tuple without order", [(".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1,", ".kind = SWK_VARS,")], None),
+    ("run C table: token tuple without order", [(".kind = SWK_TOKEN, .pred1 = SWT_WIN2_TAIL_C + 1,", ".kind = SWK_TOKEN,")], None),
+    ("run C table: rTLV tuple without order", [(".kind = SWK_RTLV, .pred1 = SWT_WIN2_TAIL_C + 1,", ".kind = SWK_RTLV,")], None),
+    ("run C table: restore tuple without order", [(".flags = SWT_ONCE | SWT_TAIL, .pred1 = SWT_WIN2_TAIL_C + 1, .off = SWW_CFG_WIN2, .val = 0,", ".flags = SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = 0,")], None),
+    ("run C table: text tuple needs no image", [(".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,\n\t                     .hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W10 },", ".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,\n\t                     .hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W9 },")], None),
+    ("run C table: token tuple needs no text", [(".hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W11 },", ".hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W10 },")], None),
+    ("run C table: rTLV tuple needs no token", [(".hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W12 },", ".hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W11 },")], None),
+    ("run C table: restore tuple needs no rTLV", [(".omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_RTLV },", ".omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_W12 },")], None),
+    ("run C table: restore tuple old value not pinned", [(".omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_RTLV },", ".omask = 0, .oval = SWW_WIN_TAIL, .need = SWF_RTLV },")], None),
+    ("run C table: restore tuple not ONCE", [("[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL,", "[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_TAIL,")], None),
+    ("run C table: restore tuple without the tail gate", [("[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL,", "[SWT_WIN2_ZERO_C] = { .row = 13, .run = 3, .space = SWW_CFG, .flags = SWT_ONCE,")], None),
+    ("run C table: text tuple in window 0", [(".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL,", ".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = 0,")], None),
+    ("run C table: token tuple in window 0", [(".kind = SWK_TOKEN, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL,", ".kind = SWK_TOKEN, .pred1 = SWT_WIN2_TAIL_C + 1, .win = 0,")], None),
+    ("run C table: rTLV tuple in window 0", [(".kind = SWK_RTLV, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL,", ".kind = SWK_RTLV, .pred1 = SWT_WIN2_TAIL_C + 1, .win = 0,")], None),
+    ("run C table: text tuple range too high", [(".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,\n\t                     .hi = SWW_LAST_HI_MAX - 4u,", ".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,\n\t                     .hi = SWW_LAST_HI_MAX,")], None),
+    ("run C table: token tuple range too high", [(".hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W11 },", ".hi = SWW_LAST_HI_MAX + 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W11 },")], None),
+    ("run C table: rTLV tuple range too high", [(".hi = SWW_LAST_HI_MAX - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W12 },", ".hi = SWW_LAST_HI_MAX, .vmask = 0xFFFFFFFFu, .need = SWF_W12 },")], None),
+    ("run C table: text tuple range starts above 0", [(".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 0,", ".kind = SWK_VARS, .pred1 = SWT_WIN2_TAIL_C + 1, .win = SWW_WIN_TAIL, .off = 4,")], None),
+    ("run C table: text tuple kind", [(".kind = SWK_VARS,", ".kind = SWK_RTLV,")], None),
+    ("run C table: token tuple kind", [(".kind = SWK_TOKEN,", ".kind = SWK_VARS,")], None),
+    # --- run C: the steps
+    ("run C W11: window not moved", [("\tSWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, SWW_WIN_TAIL));        /* ref: dhd_pcie.c:6193-6197 (setbar1win) */\n", "")], None),
+    ("run C W11: one word short", [("for (i = 0; i < g.vwords; i++) {\n\t\tSWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.vars", "for (i = 0; i + 1 < g.vwords; i++) {\n\t\tSWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.vars")], None),
+    ("run C W11: text not verified", [("\tSWW_TRY(swl_nv_verify(x));\n\tprintf(\"SWEET WLAN: W11 NVRAM text", "\tprintf(\"SWEET WLAN: W11 NVRAM text")], None),
+    ("run C W11: phase not recorded", [("\tx->flags |= SWF_W11;\n", "")], None),
+    ("run C W11: geometry not looked at", [("\tx->row = 11;\n\trc = swl_geo_get(x, &g);\n\tif (rc) {\n\t\treturn swl_stop(x, rc);\n\t}\n\tSWW_TRY(swl_wr(x, SWW_CFG", "\tx->row = 11;\n\trc = swl_geo_get(x, &g);\n\tSWW_TRY(swl_wr(x, SWW_CFG")], None),
+    ("run C W12: phase not recorded", [("\tx->flags |= SWF_W12;\n", "")], None),
+    ("run C W13: one rTLV word short", [("for (i = 0; i < SWW_RTLV_WORDS; i++) {\n\t\tSWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.rt", "for (i = 0; i + 1 < SWW_RTLV_WORDS; i++) {\n\t\tSWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.rt")], None),
+    ("run C W13: rTLV not verified", [("\tSWW_TRY(swl_tw_verify(x, SWK_RTLV));\n\tSWW_TRY(swl_nv_verify(x));", "\tSWW_TRY(swl_nv_verify(x));")], None),
+    ("run C W13: text not verified again", [("\tSWW_TRY(swl_nv_verify(x));\n\tSWW_TRY(swl_tw_verify(x, SWK_TOKEN));", "\tSWW_TRY(swl_tw_verify(x, SWK_TOKEN));")], None),
+    ("run C W13: token not verified again", [("\tSWW_TRY(swl_nv_verify(x));\n\tSWW_TRY(swl_tw_verify(x, SWK_TOKEN));\n", "\tSWW_TRY(swl_nv_verify(x));\n")], None),
+    ("run C W13: window not restored", [("\tx->flags |= SWF_RTLV;\n\tSWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, 0u));\n", "\tx->flags |= SWF_RTLV;\n")], None),
+    ("run C W13: restore group left armed", [("\treturn swl_done(x, SWF_W13);", "\tx->flags |= SWF_W13;\n\treturn 0;")], None),
+    ("run C verify: last word of a kind not read", [("for (i = 0; i < swl_tw_n(&g, k); i++) {", "for (i = 0; i + 1 < swl_tw_n(&g, k); i++) {")], None),
+    ("run C verify: first word of a kind not read", [("for (i = 0; i < swl_tw_n(&g, k); i++) {", "for (i = 1; i < swl_tw_n(&g, k); i++) {")], None),
+    ("run C verify: word not compared", [("\t\tif (v != swl_tw_word(x, k, i)) {", "\t\tif (0) {")], None),
+    ("run C verify: text CRC not compared", [("\tif (x->nv_crc_rb != x->nv_crc) {", "\tif (0) {")], None),
+    ("run C verify: text CRC over one byte less", [("c = swl_crc_word(c, v, i, x->nv_varsize);", "c = swl_crc_word(c, v, i, x->nv_varsize - 1u);")], None),
+    ("run C verify: last text word not read", [("\tfor (i = 0; i < g.vwords; i++) {\n\t\tSWW_RD(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, v);", "\tfor (i = 0; i + 1 < g.vwords; i++) {\n\t\tSWW_RD(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, v);")], None),
+    ("run C stage: tail geometry not checked after W7", [("\t\trc = rc ? rc : swl_tail_check(x);\n", "")], None),
+    ("run C stage: tail check does not refuse", [("\tif (rc) {\n\t\tprintf(\"SWEET WLAN: W11 tail geometry refused", "\tif (0) {\n\t\tprintf(\"SWEET WLAN: W11 tail geometry refused")], None),
+    ("run C stage: NVRAM not prepared", [("\t\trc = swl_nv_prep(x);\n\t\tif (rc) {", "\t\trc = 0;\n\t\tif (rc) {")], None),
+    ("run C stage: preparation refusal ignored", [("\t\trc = swl_nv_prep(x);\n\t\tif (rc) {\n\t\t\tprintf(\"SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\\n\", x->level, x->row, swl_rsname(x->restore));\n\t\t\treturn rc;\n\t\t}", "\t\trc = swl_nv_prep(x);\n\t\tif (rc) {\n\t\t\tprintf(\"SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\\n\", x->level, x->row, swl_rsname(x->restore));\n\t\t}")], None),
+    ("run C stage: prepared at level 4", [("if (x->level >= SWW_LEVEL0 + 3) {      /* run C: the NVRAM entry is checked", "if (x->level >= SWW_LEVEL0 + 2) {      /* run C: the NVRAM entry is checked")], None),
+    ("run C stage: prepared only above level 5", [("if (x->level >= SWW_LEVEL0 + 3) {      /* run C: the NVRAM entry is checked", "if (x->level >= SWW_LEVEL0 + 4) {      /* run C: the NVRAM entry is checked")], None),
+    ("run C stage: W11..W13 at level 4", [("if (x->level >= SWW_LEVEL0 + 3) {\n\t\trc = rc ? rc : swl_w11(x);", "if (x->level >= SWW_LEVEL0 + 2) {\n\t\trc = rc ? rc : swl_w11(x);")], None),
+    ("run C stage: W11..W13 above level 5 only", [("if (x->level >= SWW_LEVEL0 + 3) {\n\t\trc = rc ? rc : swl_w11(x);", "if (x->level >= SWW_LEVEL0 + 4) {\n\t\trc = rc ? rc : swl_w11(x);")], None),
+    ("run C stage: W12 skipped", [("\t\trc = rc ? rc : swl_w12(x);\n", "")], None),
+    ("run C stage: final line of level 5 missing", [("if (x->level >= SWW_LEVEL0 + 3) {\n\t\tprintf(\"SWEET WLAN: stage 3 level %d done vars", "if (0) {\n\t\tprintf(\"SWEET WLAN: stage 3 level %d done vars")], None),
+    ("run C stage: final line without the read-back CRC", [("x->level, x->nv_varsize, x->tok, x->nv_crc_rb);", "x->level, x->nv_varsize, x->tok, 0u);")], None),
+    ("run C stage: final line token", [("x->level, x->nv_varsize, x->tok, x->nv_crc_rb);", "x->level, x->nv_varsize, ~x->tok, x->nv_crc_rb);")], None),
+    # --- run D (patch 0132): the reset vector at backplane address 0 and the firmware identity pin
+    ("run D tuple: no phase requirement", [(".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .need = 0 }")], None),
+    # review 0132 F1/F3/F4: DHD parity for the vector word, the whole word must stick, a failed read-back read is not a chip value
+    ("run D tuple: secured bit not tested", [(".omask = SWW_SEC_SBOOT, .oval = 0, ", "")], None),
+    ("run D tuple: secured mask 0x1", [("#define SWW_SEC_SBOOT   0x2u", "#define SWW_SEC_SBOOT   0x1u")], None),
+    ("run D tuple: secured value required set", [(".omask = SWW_SEC_SBOOT, .oval = 0,", ".omask = SWW_SEC_SBOOT, .oval = SWW_SEC_SBOOT,")], None),
+    ("run D tuple: only the low half of the word compared", [(".vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT", ".vmask = 0xFFFFu, .omask = SWW_SEC_SBOOT")], None),
+    ("run D swl_wr: read-back read failure named read-back", [("\t\tx->rb = 0;      /* review 0132 F4: a failed read is not a chip value; the stop name says so */\n\t\treturn swl_stop(x, SWW_E_RD);", "\t\tx->rb = 0;      /* review 0132 F4: a failed read is not a chip value; the stop name says so */\n\t\treturn swl_stop(x, SWW_E_READBACK);")], None),
+    ("run D swl_wr: read-back read failure ignored", [("\tif (swl_rdx(x, space, win, off, &rb)) {\n\t\tx->rb = 0;", "\tif (swl_rdx(x, space, win, off, &rb) && 0) {\n\t\tx->rb = 0;")], None),
+    ("run D rev gate: rev 74 accepted", [("p->rev < 74 ||", "p->rev < 75 ||")], None),
+    ("run D rev gate: rev 73 refused", [("p->rev < 74 ||", "p->rev < 73 ||")], None),
+    ("run D rev gate: rev 128 refused", [("|| p->rev == 128", "")], None),
+    ("run D rev gate: any core", [("swl_core(c, SWW_CORE_PCIE2, 0);", "swl_core(c, SWL_CORE_CC, 0);")], None),
+    ("run D rev gate: missing core accepted", [("return p != 0 && (", "return p == 0 || (")], None),
+    ("run D tuple: run 3", [(".row = 14, .run = 4,", ".row = 14, .run = 3,")], None),
+    ("run D tuple: not once", [(".flags = SWT_ONCE | SWT_RV,", ".flags = SWT_RV,")], None),
+    ("run D tuple: the whole of window 0", [(".win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".win = 0, .off = 0, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }")], None),
+    ("run D tuple: value from the table", [("SWT_ONCE | SWT_RV, .win = 0", "SWT_ONCE, .win = 0")], None),
+    ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV)", "(SWT_BULK | SWT_TW)")], None),
+    ("run D swl_wr: guard removed", [("if ((p->flags & SWT_RV) && (x->img == NULL", "if (0 && (x->img == NULL")], None),
+    ("run D swl_wr: no image", [("(p->flags & SWT_RV) && (x->img == NULL || x->img_len != SWW_FW_LEN", "(p->flags & SWT_RV) && (x->img_len != SWW_FW_LEN")], None),
+    ("run D swl_wr: length not pinned", [("|| x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0)", "|| x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0)")], None),
+    ("run D swl_wr: CRC not pinned", [("|| x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0)", "|| x->img_len != SWW_FW_LEN || val != swl_img_word(x, 0)")], None),
+    ("run D swl_wr: value not image word 0", [("|| x->img_crc != SWW_FW_CRC || val != swl_img_word(x, 0)))", "|| x->img_crc != SWW_FW_CRC))")], None),
+    ("run D pin: length not compared", [("if (x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (x->img_crc != SWW_FW_CRC) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
+    ("run D pin: CRC not compared", [("if (x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (x->img_len != SWW_FW_LEN) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
+    ("run D pin: always passes", [("if (x->img_len != SWW_FW_LEN || x->img_crc != SWW_FW_CRC) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity", "if (0) {\n\t\tprintf(\"SWEET WLAN: W%u firmware identity")], None),
+    ("run D pin: another CRC constant", [("#define SWW_FW_CRC      0x1153ccffu", "#define SWW_FW_CRC      0x1153ccfeu")], None),
+    ("run D stage: pin before the first store removed", [("if (x->level >= SWW_LEVEL0 + 4) {      /* run D: the firmware identity", "if (0) {      /* run D: the firmware identity")], None),
+    ("run D stage: pin from level 5", [("if (x->level >= SWW_LEVEL0 + 4) {      /* run D: the firmware identity", "if (x->level >= SWW_LEVEL0 + 3) {      /* run D: the firmware identity")], None),
+    ("run D stage: pin refusal ignored", [("\t\trc = swl_fw_pin(x);\n\t\tif (rc) {\n\t\t\tprintf(\"SWEET WLAN: stage 3 level %d stopped", "\t\trc = swl_fw_pin(x);\n\t\tif (0) {\n\t\t\tprintf(\"SWEET WLAN: stage 3 level %d stopped")], None),
+    ("run D stage: W14 at level 5", [("if (x->level >= SWW_LEVEL0 + 4) {\n\t\trc = rc ? rc : swl_w14(x);", "if (x->level >= SWW_LEVEL0 + 3) {\n\t\trc = rc ? rc : swl_w14(x);")], None),
+    ("run D stage: W14 above level 6 only", [("if (x->level >= SWW_LEVEL0 + 4) {\n\t\trc = rc ? rc : swl_w14(x);", "if (x->level >= SWW_LEVEL0 + 5) {\n\t\trc = rc ? rc : swl_w14(x);")], None),
+    ("run D stage: W14 skipped", [("\t\trc = rc ? rc : swl_w14(x);\n", "")], None),
+    ("run D stage: final line of level 6 missing", [("if (x->level >= SWW_LEVEL0 + 4) {\n\t\tprintf(\"SWEET WLAN: stage 3 level %d done w14", "if (0) {\n\t\tprintf(\"SWEET WLAN: stage 3 level %d done w14")], None),
+    ("run D stage: final line old and new swapped", [("x->level, x->w14_old, x->rb, x->nv_varsize", "x->level, x->rb, x->w14_old, x->nv_varsize")], None),
+    ("run D stage: final line without the CRC", [("x->level, x->w14_old, x->rb, x->nv_varsize, x->tok, x->nv_crc_rb);", "x->level, x->w14_old, x->rb, x->nv_varsize, x->tok, 0u);")], None),
+    ("run D W14: image not checked again", [("\tSWW_TRY(swl_img_check(x));\n\tSWW_TRY(swl_fw_pin(x));\n\tSWW_RD(", "\tSWW_TRY(swl_fw_pin(x));\n\tSWW_RD(")], None),
+    ("run D W14: pin not checked again", [("\tSWW_TRY(swl_fw_pin(x));\n\tSWW_RD(x, SWW_BAR2, 0, 0, x->w14_old);", "\tSWW_RD(x, SWW_BAR2, 0, 0, x->w14_old);")], None),
+    ("run D W14: old value not read", [("\tSWW_RD(x, SWW_BAR2, 0, 0, x->w14_old);\n", "")], None),
+    ("run D W14: read failure ignored", [("\tSWW_RD(x, SWW_BAR2, 0, 0, x->w14_old);\n", "\tswl_rd(x, SWW_BAR2, 0, 0, &x->w14_old);\n")], None),
+    ("run D W14: refusal ignored", [("\trc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 0));\n\tif (rc) {", "\trc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 0));\n\tif (0) {")], None),
+    ("run D W14: read-back value not printed", [("if (rc == -SWW_E_READBACK) {", "if (0) {")], None),
+    ("run D W14: flag not set", [("return swl_done(x, SWF_W14);", "return swl_done(x, 0);")], None),
+    ("run D W14: stored value is not image word 0", [("rc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 0));", "rc = swl_wr(x, SWW_BAR2, 0, 0, swl_img_word(x, 1));")], None),
+    ("run D swl_wr: read-back word not kept (failure)", [("\t\tx->rb = rb;     /* run D logs the word that did not stick */\n", "")], None),
+    ("run D swl_wr: read-back word not kept (success)", [("\t}\n\tx->rb = rb;\n", "\t}\n")], None),
 ]
 
 
@@ -356,12 +617,17 @@ def build_and_run(hdr, chip, work):
     for name, text in (("sweet_wlan_chip.h", chip), ("sweet_wlan_wr.h", hdr)):
         with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
             fh.write(text)
-    exe = os.path.join(d, "t")
-    cc = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-I" + d, "-o", exe, TEST], capture_output=True, text=True, timeout=120)
-    if cc.returncode != 0:
-        return "compile", cc.stderr[-400:]
-    r = run_bounded([exe], d, 120)
-    return ("pass" if r[0] == 0 else "fail"), r[1]
+    res = []
+    for i, test in enumerate((TEST_NV, TEST)):         # the cheap pure test first
+        exe = os.path.join(d, "t%d" % i)
+        cc = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-I" + d, "-o", exe, test], capture_output=True, text=True, timeout=120)
+        if cc.returncode != 0:
+            return "compile", cc.stderr[-400:]
+        r = run_bounded([exe], d, 120)
+        if r[0] != 0:
+            return "fail", r[1]
+        res.append(r[1])
+    return "pass", res[-1]
 
 
 def run_all():
@@ -434,6 +700,10 @@ struct sw_hw {
 	volatile uint32_t *cfg, *atu, *elbi, *iso, *mem, *tcm;
 	uint32_t win;
 	int level;
+	int l3;
+	uint32_t rv;
+	int rv_ok;
+	int rv_done;
 };
 @GLUE@
 static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[0x400000 / 4];
@@ -459,7 +729,7 @@ int main(void)
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
 	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
 	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4 };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0 };
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -513,6 +783,41 @@ int main(void)
 	for (int a = 0; a < 6; a++)
 		for (size_t i = 0; i < (a == 5 ? 0x400000 / 4 : len[a]); i++)
 			if (arr[a][i] != 0x10000000u * (a + 1) + (uint32_t)i && bad++ < 20) printf("BAD BAR2 sweep changed array %d word %zu\n", a, i);
+	/* run D (patch 0132): backplane address 0 (BAR2 window 0, offset 0) only at stage 3 level 6 or above, only while the live cfg 0x84 is 0, only with the container's first dword;
+	 * the words next to it, other windows and other values are refused (the tail window rules above stay as they are) */
+	for (int l3 = 0; l3 < 9; l3++) {
+		static const uint32_t rvv[3] = { 0xEA000010u, 0xEA000011u, 0u };
+
+		for (int st = 0; st < 3; st++) {      /* review 0132 F5: pinned (rv_ok) and not yet stored (rv_done), each alone; st 0 = both fine, 1 = not pinned, 2 = already stored */
+			hw.l3 = l3;
+			hw.rv = 0xEA000010u;
+			for (unsigned wi = 0; wi < 5; wi++) {
+				for (int eq = 0; eq < 2; eq++) {
+					for (unsigned vi = 0; vi < 3; vi++) {
+						for (uint32_t off = 0; off < 16; off += 4) {
+							hw.rv_ok = st != 1;
+							hw.rv_done = st == 2;
+							cfg[0x84 / 4] = eq ? bwins[wi] : bwins[wi] ^ 0x1000u;
+							for (int i = 0; i < 4; i++) tcm[i] = 0x77777777u;
+							int r = sw3_wr(&hw, SWW_BAR2, bwins[wi], off, rvv[vi]);
+							int want = eq && ((bwins[wi] == 0x400000u) || (l3 >= 6 && st == 0 && bwins[wi] == 0 && off == 0 && vi == 0));
+							int ch = 0;
+							for (int i = 0; i < 4; i++) ch += tcm[i] != 0x77777777u;
+							if ((r == 0) != want || (r == 0 && (ch != 1 || tcm[off / 4] != rvv[vi])) || (r != 0 && ch != 0)) {
+								if (bad++ < 20) printf("BAD run D l3 %d st %d win %#x off %#x live-equal %d val %#x: ret %d changed %d, want accept %d\n", l3, st, bwins[wi], off, eq, rvv[vi], r, ch, want);
+							}
+							/* rv_done is set by the one store at address 0 and by nothing else */
+							if (hw.rv_done != (st == 2 || (r == 0 && bwins[wi] == 0 && off == 0))) {
+								if (bad++ < 20) printf("BAD run D rv_done st %d win %#x off %#x: ret %d, rv_done %d\n", st, bwins[wi], off, r, hw.rv_done);
+							}
+							acc += r == 0;
+						}
+					}
+				}
+			}
+		}
+	}
+	for (int i = 0; i < 4; i++) tcm[i] = 0x10000000u * 6 + (uint32_t)i;
 	printf("%s accepted %d bad %d\n", bad ? "FAIL" : "PASS", acc, bad);
 	return bad != 0;
 }
@@ -568,7 +873,18 @@ GLUE_MUTANTS = [
     ("cfg 0x84 only the tail window", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == SWW_WIN_TAIL)")]),
     ("cfg 0x88 writable too", [("(off == SWW_CFG_WIN2 &&", "(off >= SWW_CFG_WIN2 &&")]),
     ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2) {", "space != SWW_BAR0) {")]),
-    ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
+    ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && h->rv_ok && !h->rv_done && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
+    # patch 0132: the one word at backplane address 0
+    ("reset vector: no level gate", [("off == 0 && h->l3 >= 6 && h->rv_ok", "off == 0 && h->rv_ok")]),
+    ("reset vector: level 5 is enough", [("h->l3 >= 6", "h->l3 >= 5")]),
+    ("reset vector: once dropped", [("h->rv_ok && !h->rv_done && v == h->rv", "h->rv_ok && v == h->rv")]),
+    ("reset vector: pin dropped", [("h->rv_ok && !h->rv_done && v == h->rv", "!h->rv_done && v == h->rv")]),
+    ("reset vector: done flag never set", [("\tif (space == SWW_BAR2 && win == 0 && off == 0) {\n\t\th->rv_done = 1;\n\t}\n", "")]),
+    ("reset vector: done flag set by every BAR2 store", [("if (space == SWW_BAR2 && win == 0 && off == 0) {\n\t\th->rv_done = 1;", "if (space == SWW_BAR2) {\n\t\th->rv_done = 1;")]),
+    ("reset vector: any value", [("h->rv_ok && !h->rv_done && v == h->rv", "h->rv_ok && !h->rv_done")]),
+    ("reset vector: any window", [("(win == 0 && off == 0 && h->l3", "(off == 0 && h->l3")]),
+    ("reset vector: any of the first words", [("off == 0 && h->l3 >= 6", "off < 16 && h->l3 >= 6")]),
+    ("reset vector: any word below the RAM base", [("off == 0 && h->l3 >= 6", "off < SWW_RAM_BASE && h->l3 >= 6")]),
     ("BAR2 store below the RAM base", [("(win == 0 && off >= SWW_RAM_BASE)", "(win == 0)")]),
     ("BAR2 store one word below the RAM base", [("off >= SWW_RAM_BASE)", "off >= SWW_RAM_BASE - 4u)")]),
     ("BAR2 tail window past the last word", [("off <= SWW_LAST_HI_MAX)", "off <= SWW_TCM_BYTES)")]),
@@ -595,6 +911,17 @@ class WlanWrMutants(unittest.TestCase):
         self.assertEqual(bad, [], "\n".join(bad))
         self.assertEqual(len(out), len(MUTANTS))
 
+    def test_nvram_entry_is_not_pinned(self):
+        """Patch 0132: only the firmware identity is a compile-time constant. The NVRAM entry (27062 bytes, crc 0xdf5db558 in the lab) is checked against its container record and nothing else (docs/research/43b);
+        host test: wlan_wr_host_test.c rund() runs level 6 with a 27062 byte and a 3 byte text."""
+        code = strip_comments(final_header())
+        self.assertNotIn("27062", code)
+        self.assertNotIn("0xdf5db558", code.lower())
+        self.assertIsNone(re.search(r"nv_src_len\s*[!=]=\s*[1-9]", code))
+        self.assertIsNone(re.search(r"nv_src_crc\s*[!=]=\s*(?:0x[0-9A-Fa-f]+|\d)", code))
+        self.assertIsNotNone(re.search(r"#define SWW_FW_LEN\s+1764018u", code))
+        self.assertIsNotNone(re.search(r"#define SWW_FW_CRC\s+0x1153ccffu", code))
+
     def test_store_path_audit_is_clean_on_the_patch(self):
         self.assertEqual(audit_store_path(final_header(), glue_added_lines()), [])
 
@@ -617,6 +944,9 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("SWW_LAST_HI_MAX", "SWW_TCM_BYTES"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
             (hdr, glue.replace("(win == 0 && off >= SWW_RAM_BASE)", "(win == 0)"), "sw3_wr does not limit BAR2 and cfg 0x84 to the table's"),
             (hdr, glue.replace('"FW  "', '"NVRM"'), "sw_fw_note does not pick the FW entry by its tag"),
+            (hdr, glue.replace('"NVRM"', '"CLM "'), "sw_fw_note does not pick the NVRM entry by its tag"),
+            (hdr, glue.replace("sw_nv.p = base + e[i].offset;", "sw_nv.p = base;"), "assignment outside the allowlist"),
+            (hdr, glue.replace("x.nv_cap = sizeof sw_nvbuf;", "x.nv_cap = sizeof sw_nvbuf + 64;"), "assignment outside the allowlist"),
             (hdr, glue.replace("sw_fw.p = base + e[i].offset;", "sw_fw.p = base;"), "assignment outside the allowlist"),
             (hdr, glue.replace("x.img_len = sw_fw.len;", "x.img_len = sw_fw.len + 4;"), "assignment outside the allowlist"),
             (hdr, glue.replace("SWW_R2(0x14)", "SWW_R2(0x18)"), "sw3_wr does not limit the offsets to the table's"),
@@ -634,9 +964,35 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("*p = v;", "*p = v;\n\tuint32_t a = h->cfg[1] = 6;"), "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_w(struct sw_hw *hw, struct swl_wbus wb) { void *w_ = wb.wr; w_(hw, SWW_CFG, 0, 4, 6); }\n", "wr callback used other than by wb.wr = sw3_wr;"),
             (hdr, glue + "\nstatic void sw3_r(struct sw_hw *h) { uint32_t t_; sw_rd(h, 0x18000000u + 0x804u, &t_); }\n", "call of sw_rd in the added glue"),
+            (hdr.replace("src = swl_crc_b(src, x->nv[i]);", "src = swl_crc_b(src, x->nv_src[i]);"), glue, "swl_nv_prep does not CRC its private copy"),
+            (hdr, glue.replace("read_random(buf, n);", "read_random(buf, n / 2);"), "sw3_rng does not draw"),
+            (hdr, glue.replace("read_random(buf, n);", "(void)buf;"), "sw3_rng does not draw"),
         ]
         for h, g, want in bad:
             self.assertTrue(any(x.startswith(want) for x in audit_store_path(h, g)), want)
+
+    def test_rev_gate_is_wired(self):
+        g = glue_after()
+        self.assertEqual(audit_rev_gate(g), [])
+        bad = [
+            g.replace("level >= 6 && !swl_w14_rev_ok(&chip)", "level >= 7 && !swl_w14_rev_ok(&chip)"),
+            g.replace("level >= 6 && !swl_w14_rev_ok(&chip)", "level >= 6 && swl_w14_rev_ok(&chip)"),
+            g.replace("\t\t\tlevel = 5;\n", ""),
+            g.replace("\t\t\tlevel = 5;\n", "\t\t\tlevel = 6;\n"),
+            g.replace("!swl_w14_rev_ok(&chip)", "!swl_w14_rev_ok(&chip) && 0"),
+            g.replace("if (level >= 6 && !swl_w14_rev_ok(&chip)) {", "if (0) {"),
+            g.replace("swl_w14_rev_ok(&chip)", "swl_w14_rev_ok(0)"),
+        ]
+        for i, m in enumerate(bad):
+            self.assertNotEqual(m, g, i)
+            self.assertNotEqual(audit_rev_gate(m), [], "rev gate mutant %d survived: %s" % (i, m[:0]))
+        # moved behind the stage-3 call: the order check must catch it
+        blk = re.search(r"\t\tif \(level >= 6 && !swl_w14_rev_ok\(&chip\)\) \{.*?\n\t\t}\n", g, re.S)
+        self.assertTrue(blk)
+        moved = g.replace(blk.group(0), "")
+        moved = moved.replace("\t\t\tsweet_wlan_stage3(&hw, (int)level);\n\t\t}\n", "\t\t\tsweet_wlan_stage3(&hw, (int)level);\n\t\t}\n" + blk.group(0))
+        self.assertNotEqual(moved, g)
+        self.assertNotEqual(audit_rev_gate(moved), [])
 
     def test_glue_sweep_accepts_exactly_the_table(self):
         with tempfile.TemporaryDirectory() as work:
