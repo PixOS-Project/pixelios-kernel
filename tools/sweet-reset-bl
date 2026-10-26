@@ -1,4 +1,15 @@
 #!/bin/bash
 # Ask a running iOS image (boot-arg sweetremote=1, xnu patch 0100) to reset into the bootloader. Sends one UDP datagram
 # to the phone's USB-net address; no reply, so success is only visible as the phone reaching fastboot (tools/phone).
+# Backstop (AP-55): refuses unless the caller holds the phone lock (PHONE_LOCK_TOKEN, as tools/phone goto does) or passes
+# --force-unlocked, so a test or a stray gate step cannot reset another owner's live run.
+here=$(dirname "$(readlink -f "$0")")
+if [ "$1" != "--force-unlocked" ]; then
+    if ! msg=$("$here/phone-lock" check 2>&1); then
+        echo "${msg%%$'\n'*}"
+        echo "RESULT: ERROR sweet-reset-bl refused: phone lock not held by this caller (use phone-lock run, or --force-unlocked)"
+        exit 2
+    fi
+fi
 printf 'SWEET-RESET-BL' > /dev/udp/192.168.7.2/5141
+echo "RESULT: PASS sweet-reset-bl sent"

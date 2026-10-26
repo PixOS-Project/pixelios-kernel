@@ -10,6 +10,7 @@ tools/hang-recover
 tools/probe-run
 tools/run-probe.sh
 tools/xrun
+tools/envfile.py
 tools/xrun_report.py
 tools/usb-log.py
 tools/usbnet-log.py
