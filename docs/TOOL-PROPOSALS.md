@@ -57,3 +57,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-030 | tools/check_rules/r30_license.py (rule R30 of tools/check-rules.py) | building |
 | TP-031 | tools/phone-battery | proposed (amended) |
 | TP-032 | tools/phone-postmortem | proposed |
+| TP-033 | tools/artifacts-prune | proposed |
