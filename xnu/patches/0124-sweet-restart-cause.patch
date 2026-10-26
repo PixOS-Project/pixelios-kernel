@@ -1,0 +1,23 @@
+SWEET restart cause (patch 0124): PE_halt_restart resets into the bootloader (fastboot) instead of a plain reset; a normal restart (type 1) first logs `SWEET RESTART: PE type N` and waits 500 ms for the USB log, panic types reset at once. Splits XNU-requested resets (reboot(2)) from panics and from resets XNU did not ask for. Only sweet_halt_restart changes.
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -71,9 +71,18 @@
+ {
+ 	switch (type) {
+ 	case SWEET_PE_RESTART:
++		/*
++		 * Patch 0124 (docs/HANDOFF.md "OPUS DECISION 2026-10-26 #5"): a restart requested by XNU (reboot(2)) now resets into the
++		 * bootloader (fastboot, no Android detour, ~95 s saved) after tagging the log line; the wait lets the USB log send it.
++		 * Panic types reset at once (no printf/delay in the panic path). fastboot + this line = reboot(2); fastboot without it =
++		 * a panic; recovery = XNU did not ask.
++		 */
++		printf("SWEET RESTART: PE type %u\n", type);
++		delay(500000);
++		sweet_machine_reset(1);
+ 	case SWEET_PE_PANIC_RESTART:
+ 	case SWEET_PE_PANIC_NOCALL:
+-		sweet_machine_reset(0);
++		sweet_machine_reset(1);
+ 	default:
+ 		return -1;      /* halt etc.: unchanged (the caller spins) */
+ 	}
