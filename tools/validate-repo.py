@@ -32,7 +32,8 @@ def bad(header, findings):
 
 
 NAME_RE = re.compile(r"^(\d{4})-(.+)\.patch$")
-HELD_RE = re.compile(r"^(\d{4})  (\1-\S+\.patch) ")
+# a number is held when a branch has the patch file OR a reservation (`claim`/`next`) covers it ("(not committed anywhere)   RESERVED by ...")
+HELD_RE = re.compile(r"^(\d{4})  (?:\1-\S+\.patch |\(not committed anywhere\)\s+RESERVED )")
 
 
 def held_elsewhere():
