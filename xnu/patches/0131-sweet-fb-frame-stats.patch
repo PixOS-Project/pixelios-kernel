@@ -1,0 +1,65 @@
+SWEET frame statistics (patch 0131, boot-arg sweetfps=1, default off): at every IOMFB swap samples a 32x32 grid of layer 0 and logs once per second `SWEET FPS: swaps N distinct M max_gap_ms G` (distinct = swaps whose content differs from the previous one, max_gap = longest gap between distinct frames): a render-rate/jank measure that is not capped by the 60/s swap pacing (G-10). Read-only.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -390,6 +390,61 @@
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	/*
++	 * Frame statistics (patch 0131, boot-arg sweetfps=1, default off; G-10): CoreAnimation swaps every vsync even when nothing
++	 * changes, so the swap rate is not a render rate. Sample a 32x32 grid of layer 0's surface at every swap, count the swaps whose
++	 * content differs from the previous one ("distinct") and the longest gap between distinct frames in the second ("jank"). One
++	 * line per second that had a distinct frame (an idle second prints every 10th). Read-only.
++	 */
++	static int fps_on = -1;
++	if (fps_on < 0) {
++		int v = 0;
++		fps_on = (PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0) ? 1 : 0;
++	}
++	if (!fps_on) {
++		return;
++	}
++	static uint32_t last_hash, n_swaps, n_dist, idle_secs;
++	static uint64_t sec_start, last_dist_t, max_gap_ns;
++	uint64_t now_ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	uint32_t id = get32(rec, 0x54);
++	SweetSurface *s = id ? sweet_surface_copy(id) : NULL;
++	if (s != NULL && s != fSurface && s->kernelAddress() != 0 && s->memory != NULL && s->elementWidth == 1 &&
++	    s->elementHeight == 1 && s->width >= 32 && s->height >= 32 &&
++	    (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow <= s->memory->getLength()) {
++		uint32_t hash = 2166136261u;
++		for (uint32_t gy = 0; gy < 32; gy++) {
++			const uint8_t *row = (const uint8_t *)(s->kernelAddress() + s->offset +
++			    (uint64_t)((uint64_t)gy * (s->height - 1) / 31) * s->bytesPerRow);
++			for (uint32_t gx = 0; gx < 32; gx++) {
++				uint32_t px;
++				memcpy(&px, row + (uint64_t)((uint64_t)gx * (s->width - 1) / 31) * 4, 4);
++				hash = (hash ^ px) * 16777619u;
++			}
++		}
++		n_swaps++;
++		if (hash != last_hash) {
++			n_dist++;
++			if (last_dist_t != 0 && now_ns - last_dist_t > max_gap_ns) {
++				max_gap_ns = now_ns - last_dist_t;
++			}
++			last_dist_t = now_ns;
++			last_hash = hash;
++		}
++	}
++	OSSafeReleaseNULL(s);
++	if (sec_start == 0) {
++		sec_start = now_ns;
++	}
++	if (now_ns - sec_start >= 1000000000ull) {
++		if (n_dist > 0 || (++idle_secs % 10) == 0) {
++			IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000));
++		}
++		n_swaps = n_dist = 0;
++		max_gap_ns = 0;
++		sec_start = now_ns;
++	}
+ }
+ 
+ void
