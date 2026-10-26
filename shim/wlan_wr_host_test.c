@@ -145,6 +145,10 @@ static int f_wr(void *c, int space, uint32_t win, uint32_t off, uint32_t v)
 	if (space == SWW_CFG && off == SWW_CFG_WIN) { if (!f->win_stuck) f->win0 = v; return 0; }
 	if (space == SWW_CFG && off == SWW_CFG_WIN2) { if (!f->win2_stuck || f->nw < f->win2_stuck) f->win2 = v; return 0; }
 	if (space == SWW_BAR2 && f->ram) {
+		if (f->rom0 == 2 && win + off == 0 && f->win2 == win) {
+			f->ram[0] = (f->ram[0] & 0xFFFF0000u) | (v & 0xFFFFu);   /* a partial stick: only the low 16 bits (review 0132 F3) */
+			return 0;
+		}
 		if (f->rom0 && win + off == 0 && f->win2 == win)
 			return 0;
 		if (f->win2 != win || (win + off) / 4 >= RAM_WORDS)
@@ -1217,7 +1221,8 @@ static void runb_deny_sweep(void)
 		CHECK(swl_wt[v].run == 3 && swl_wt[v].row >= 11 && swl_wt[v].row <= 13 && ((swl_wt[v].space == SWW_BAR2 && swl_wt[v].win == 0x400000u) || (swl_wt[v].space == SWW_CFG && swl_wt[v].off == 0x84)));
 	/* the run D tuple: run 4, row 14, once, a reset-vector value decided at run time, BAR2 window 0 offset 0 exactly, after W13 */
 	CHECK(SWT_N == SWT_N_C + 1 && SWT_RESET0 == SWT_N_C && swl_wt[SWT_RESET0].run == 4 && swl_wt[SWT_RESET0].row == 14 && swl_wt[SWT_RESET0].space == SWW_BAR2 && swl_wt[SWT_RESET0].win == 0 && swl_wt[SWT_RESET0].off == 0 &&
-	      swl_wt[SWT_RESET0].hi == 0 && swl_wt[SWT_RESET0].flags == (SWT_ONCE | SWT_RV) && swl_wt[SWT_RESET0].need == SWF_W13 && swl_wt[SWT_RESET0].pred1 == 0 && swl_wt[SWT_RESET0].rgrp == 0);
+	      swl_wt[SWT_RESET0].hi == 0 && swl_wt[SWT_RESET0].flags == (SWT_ONCE | SWT_RV) && swl_wt[SWT_RESET0].need == SWF_W13 && swl_wt[SWT_RESET0].pred1 == 0 && swl_wt[SWT_RESET0].rgrp == 0 &&
+	      swl_wt[SWT_RESET0].vmask == 0xFFFFFFFFu && swl_wt[SWT_RESET0].omask == 0x2u && swl_wt[SWT_RESET0].oval == 0);   /* review 0132 F1 (secured bit) and F3 (whole word) */
 	/* reads: the BAR2 words of run B only at level 4, windows 0 and 0x400000, inside the table's ranges */
 	{
 		static struct fake f;
@@ -2001,7 +2006,9 @@ static void rund(void)
 	for (k = 1; k <= nrd; k++) {
 		rd_put(&f, &x);
 		f.fail_rd_at = f.nrd + k;
-		CHECK(swl_w14(&x) < 0 && x.stopped && f.nw <= n5 + 1 && (f.nw == n5 || x.stop_code == SWW_E_READBACK) && !(x.flags & SWF_W14) && x.restore == SWW_RS_NONE && f.win2 == 0 && all_allowed(&f));
+		CHECK(swl_w14(&x) < 0 && x.stopped && f.nw <= n5 + 1 && (f.nw == n5 || x.stop_code == SWW_E_READBACK || x.stop_code == SWW_E_RD) && !(x.flags & SWF_W14) && x.restore == SWW_RS_NONE && f.win2 == 0 && all_allowed(&f));
+		/* review 0132 F4: a read-back read that fails is the stop "read" and prints no chip value */
+		CHECK(!(f.nw == n5 + 1 && x.stop_code == SWW_E_RD) || strstr(logbuf, "read back 0x") == 0);
 	}
 	/* a store the bus refuses */
 	rd_put(&f, &x);
@@ -2013,6 +2020,21 @@ static void rund(void)
 	ramarr[0] = 0x12345678u;
 	CHECK(swl_w14(&x) == -SWW_E_READBACK && x.stop_code == SWW_E_READBACK && f.nw == n5 + 1 && x.restore == SWW_RS_NONE && f.win2 == 0 && ramarr[0] == 0x12345678u && !(x.flags & SWF_W14) && x.armed == 0);
 	CHECK(strstr(logbuf, "W14 backplane 0 wrote 0xea000010, old 0x12345678, read back 0x12345678") != 0 && strstr(logbuf, "W14 STOP: read-back") != 0 && strstr(logbuf, "done") == 0);
+	/* review 0132 F3: a partial stick (only the low 16 bits of the word take) is a read-back stop that prints what was read */
+	rd_put(&f, &x);
+	f.rom0 = 2;
+	CHECK(swl_w14(&x) == -SWW_E_READBACK && f.nw == n5 + 1 && ramarr[0] == 0xa5a50010u && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14) && strstr(logbuf, "read back 0xa5a50010") != 0);
+	/* review 0132 F4: the last read of W14 is the read-back; when it fails the stop is "read" (stop_code RD) and no read back value is printed */
+	rd_put(&f, &x);
+	f.fail_rd_at = f.nrd + nrd;
+	CHECK(swl_w14(&x) == -SWW_E_RD && x.stop_code == SWW_E_RD && f.nw == n5 + 1 && x.rb == 0 && strstr(logbuf, "read back 0x") == 0 && strstr(logbuf, "W14 STOP: read (code") != 0);
+	/* review 0132 F1: a vector word with the secured bit (DAR_SEC_SBOOT_MASK, bit 1) set is refused as DHD refuses it, before any store, at the old-value test */
+	rd_put(&f, &x);
+	ramarr[0] = 0xba3ef002u;
+	CHECK(swl_w14(&x) == -SWW_E_OLD && x.stop_code == SWW_E_OLD && f.nw == n5 && ramarr[0] == 0xba3ef002u && x.restore == SWW_RS_NONE && !(x.flags & SWF_W14) && strstr(logbuf, "W14 STOP: old value") != 0);
+	rd_put(&f, &x);
+	ramarr[0] = 0xba3ef000u;
+	CHECK(swl_w14(&x) == 0 && f.nw == n5 + 1 && ramarr[0] == w0);                          /* the observed word (bit 1 clear) still goes */
 	/* a word that reads back with a bit flipped */
 	rd_put(&f, &x);
 	f.corrupt_at = f.nw + 1;
@@ -2118,8 +2140,29 @@ static void rund(void)
 	CHECK(runc(&f, &x, 6, len, pin) == 0 && x.nv_varsize == cx.varsize && ramarr[0] == w0);
 }
 
+/* review 0132 F2: W14 runs only when stage 1 listed PCIe core 0x83c with rev < 74 or == 128 (DHD does not read the DAR security register there, dhd_pcie.c:11735-11745) */
+static void rev_gate(void)
+{
+	static struct swl_chip c;
+	static const unsigned revs[] = { 0, 72, 73, 74, 75, 127, 128, 129, 255 };
+	static const int want[] = { 1, 1, 1, 0, 0, 0, 1, 0, 0 };
+	unsigned i;
+
+	CHECK(swl_w14_rev_ok(&c) == 0);                                 /* no cores listed */
+	c.ncores = 2;
+	c.cores[0].id = SWL_CORE_CC; c.cores[0].rev = 72;
+	c.cores[1].id = 0x83d; c.cores[1].rev = 72;                     /* another core with a good rev does not count */
+	CHECK(swl_w14_rev_ok(&c) == 0);
+	c.cores[1].id = SWW_CORE_PCIE2;
+	for (i = 0; i < sizeof revs / sizeof revs[0]; i++) {
+		c.cores[1].rev = (uint8_t)revs[i];
+		CHECK(swl_w14_rev_ok(&c) == want[i]);
+	}
+}
+
 int main(void)
 {
+	rev_gate();
 	happy();
 	fault_sweeps();
 	deny_sweep();

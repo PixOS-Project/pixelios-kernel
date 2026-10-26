@@ -124,7 +124,10 @@ GLUE_ASSIGNS = sorted([
     ("sweet_wlan_stage3", "x.b = &wb;"),
     ("sweet_wlan_stage3", "x.level = level;"),
     ("sweet_wlan_stage3", "hw->l3 = level;"),  # patch 0132: sw3_wr allows backplane address 0 only at level 6 ...
-    ("sweet_wlan_stage3", "hw->rv = (level >= 6 && sw_fw.p != NULL && sw_fw.len >= 4) ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;"),  # ... and only this word
+    ("sweet_wlan_stage3", "hw->rv_ok = level >= 6 && sw_fw.p != NULL && sw_fw.len == SWW_FW_LEN && sw_fw.crc == SWW_FW_CRC;"),  # review 0132 F5: the pin, in the glue too
+    ("sweet_wlan_stage3", "hw->rv_done = 0;"),
+    ("sw3_wr", "h->rv_done = 1;"),  # the one store at backplane address 0 is made once
+    ("sweet_wlan_stage3", "hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;"),  # ... and only this word
     ("sweet_wlan_stage3", "x.img = sw_fw.p;"),  # patch 0130: the FW entry swf_parse() accepted
     ("sweet_wlan_stage3", "x.img_len = sw_fw.len;"),
     ("sweet_wlan_stage3", "x.img_crc = sw_fw.crc;"),
@@ -142,6 +145,8 @@ GLUE_ASSIGNS = sorted([
     ("sw_fw_note", "sw_nv.p = base + e[i].offset;"),
     ("sw_fw_note", "sw_nv.len = e[i].length;"),
     ("sw_fw_note", "sw_nv.crc = e[i].crc;"),
+    ("sweet_wlan_init", "struct sw_hw hw = { 0 };"),  # review 0132 F6
+    ("sweet_wlan_init", "level = 5;"),  # review 0132 F2: W14 not run where DHD would read the DAR register
     ("sweet_wlan_init", "hw.level = level > 2 ? 2 : (int)level;"),  # fragments of the function: its header is a context line of the patch
     ("sweet_wlan_init", "hw.atu = atu;"),
     ("sweet_wlan_init", "hw.elbi = elbi;"),
@@ -176,6 +181,22 @@ def audit_assignments(glue):
     return f
 
 
+def audit_rev_gate(glue):
+    """Review 0132 F2: in the whole glue, sweet_wlan_init refuses level 6 (runs 5) unless swl_w14_rev_ok(&chip), before it calls sweet_wlan_stage3. Order checks use find() with an explicit -1 test (AP-47)."""
+    f = []
+    b = body(strip_comments(glue), "sweet_wlan_init")
+    gate = b.find("if (level >= 6 && !swl_w14_rev_ok(&chip)) {")
+    lower = b.find("level = 5;")
+    call = b.find("sweet_wlan_stage3(&hw, (int)level)")
+    if gate < 0 or lower < 0 or call < 0 or not gate < lower < call:
+        f.append("sweet_wlan_init does not refuse level 6 on an unchecked PCIe core rev before sweet_wlan_stage3")
+    if b.count("swl_w14_rev_ok(") != 1 or "&chip" not in b[gate:lower]:
+        f.append("the rev gate does not use the stage-1 chip")
+    if "swl_w14_rev_ok(&chip)" in b[:b.find("swl_stage1(")] if b.find("swl_stage1(") >= 0 else True:
+        f.append("the rev gate runs before stage 1 filled the chip")
+    return f
+
+
 def audit_store_path(hdr, glue):
     """Source audit of the store path (docs/research/43 s.5 step 5): the header has no asm and no pointer made from an integer literal, its one bus store
     callback is called only in swl_store(), swl_store() only from swl_wr() and swl_restore(); the glue has exactly one store through a pointer (sw3_wr) and
@@ -200,7 +221,7 @@ def audit_store_path(hdr, glue):
         f.append("sw3_wr does not limit the offsets to the table's")
     if not all(n in body(glue, "sw3_wr") for n in ("SWW_CFG_WIN2", "SWW_WIN_TAIL", "SWW_RAM_BASE", "SWW_LAST_HI_MAX", "space == SWW_BAR2")):
         f.append("sw3_wr does not limit BAR2 and cfg 0x84 to the table's")
-    if "h->l3 >= 6" not in body(glue, "sw3_wr") or "v == h->rv" not in body(glue, "sw3_wr") or "off == 0 &&" not in body(glue, "sw3_wr"):
+    if "h->l3 >= 6" not in body(glue, "sw3_wr") or "v == h->rv" not in body(glue, "sw3_wr") or "off == 0 &&" not in body(glue, "sw3_wr") or "h->rv_ok && !h->rv_done" not in body(glue, "sw3_wr"):
         f.append("sw3_wr does not limit backplane address 0 to level 6 and the container's first dword")
     if 'memcmp(e[i].tag, "FW  ", 4)' not in body(glue, "sw_fw_note"):
         f.append("sw_fw_note does not pick the FW entry by its tag")
@@ -248,10 +269,10 @@ MUTANTS = [
     ("companion condition ignored", [("if (p->cmask && (swl_rdx(x, space, win, p->coff, &comp) || (comp & p->cmask) != p->cval)) {", "if (0) {")], None),
     ("companion read failure ignored", [("if (p->cmask && (swl_rdx(x, space, win, p->coff, &comp) ||", "if (p->cmask && (0 ||")], None),
     ("store failure ignored", [("if (swl_store(x, space, win, off, val)) {\n\t\treturn swl_stop(x, SWW_E_WR);", "swl_store(x, space, win, off, val);\n\tif (0) {\n\t\treturn swl_stop(x, SWW_E_WR);")], None),
-    ("no read-back compare", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (swl_rdx(x, space, win, off, &rb)) {")], None),
+    ("no read-back compare", [("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
     ("read-back compares all 32 bits", [("((rb ^ val) & p->vmask)", "((rb ^ val) & 0xFFFFFFFFu)")], None),
-    ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {")], None),
-    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb) || ((rb ^ val) & p->vmask)) {", "if (((rb ^ val) & p->vmask)) {")], None),
+    ("read-back removed entirely", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0 && swl_rdx(x, space, win, off, &rb)) {"), ("if ((rb ^ val) & p->vmask) {", "if (0) {")], None),
+    ("read-back read failure ignored", [("if (swl_rdx(x, space, win, off, &rb)) {", "if (0) {")], None),
     ("old read failure ignored", [("if (swl_rdx(x, space, win, off, &old)) {\n\t\t\treturn swl_stop(x, SWW_E_RD);", "if (0) {\n\t\t\treturn swl_stop(x, SWW_E_RD);")], None),
     ("done bit not recorded", [("\tx->done |= 1u << t;\n", "")], None),
     ("bank count not recorded", [("\t\tx->nbank++;\n", "")], None),
@@ -527,10 +548,22 @@ MUTANTS = [
     ("run C stage: final line without the read-back CRC", [("x->level, x->nv_varsize, x->tok, x->nv_crc_rb);", "x->level, x->nv_varsize, x->tok, 0u);")], None),
     ("run C stage: final line token", [("x->level, x->nv_varsize, x->tok, x->nv_crc_rb);", "x->level, x->nv_varsize, ~x->tok, x->nv_crc_rb);")], None),
     # --- run D (patch 0132): the reset vector at backplane address 0 and the firmware identity pin
-    ("run D tuple: no phase requirement", [(".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .need = SWF_W13 }", ".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .need = 0 }")], None),
+    ("run D tuple: no phase requirement", [(".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .need = 0 }")], None),
+    # review 0132 F1/F3/F4: DHD parity for the vector word, the whole word must stick, a failed read-back read is not a chip value
+    ("run D tuple: secured bit not tested", [(".omask = SWW_SEC_SBOOT, .oval = 0, ", "")], None),
+    ("run D tuple: secured mask 0x1", [("#define SWW_SEC_SBOOT   0x2u", "#define SWW_SEC_SBOOT   0x1u")], None),
+    ("run D tuple: secured value required set", [(".omask = SWW_SEC_SBOOT, .oval = 0,", ".omask = SWW_SEC_SBOOT, .oval = SWW_SEC_SBOOT,")], None),
+    ("run D tuple: only the low half of the word compared", [(".vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT", ".vmask = 0xFFFFu, .omask = SWW_SEC_SBOOT")], None),
+    ("run D swl_wr: read-back read failure named read-back", [("\t\tx->rb = 0;      /* review 0132 F4: a failed read is not a chip value; the stop name says so */\n\t\treturn swl_stop(x, SWW_E_RD);", "\t\tx->rb = 0;      /* review 0132 F4: a failed read is not a chip value; the stop name says so */\n\t\treturn swl_stop(x, SWW_E_READBACK);")], None),
+    ("run D swl_wr: read-back read failure ignored", [("\tif (swl_rdx(x, space, win, off, &rb)) {\n\t\tx->rb = 0;", "\tif (swl_rdx(x, space, win, off, &rb) && 0) {\n\t\tx->rb = 0;")], None),
+    ("run D rev gate: rev 74 accepted", [("p->rev < 74 ||", "p->rev < 75 ||")], None),
+    ("run D rev gate: rev 73 refused", [("p->rev < 74 ||", "p->rev < 73 ||")], None),
+    ("run D rev gate: rev 128 refused", [("|| p->rev == 128", "")], None),
+    ("run D rev gate: any core", [("swl_core(c, SWW_CORE_PCIE2, 0);", "swl_core(c, SWL_CORE_CC, 0);")], None),
+    ("run D rev gate: missing core accepted", [("return p != 0 && (", "return p == 0 || (")], None),
     ("run D tuple: run 3", [(".row = 14, .run = 4,", ".row = 14, .run = 3,")], None),
     ("run D tuple: not once", [(".flags = SWT_ONCE | SWT_RV,", ".flags = SWT_RV,")], None),
-    ("run D tuple: the whole of window 0", [(".win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .need = SWF_W13 }", ".win = 0, .off = 0, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .need = SWF_W13 }")], None),
+    ("run D tuple: the whole of window 0", [(".win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }", ".win = 0, .off = 0, .hi = SWW_TCM_BYTES - 4u, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 }")], None),
     ("run D tuple: value from the table", [("SWT_ONCE | SWT_RV, .win = 0", "SWT_ONCE, .win = 0")], None),
     ("run D tuple: allowlist match ignores the value flag", [("(SWT_BULK | SWT_TW | SWT_RV)", "(SWT_BULK | SWT_TW)")], None),
     ("run D swl_wr: guard removed", [("if ((p->flags & SWT_RV) && (x->img == NULL", "if (0 && (x->img == NULL")], None),
@@ -669,6 +702,8 @@ struct sw_hw {
 	int level;
 	int l3;
 	uint32_t rv;
+	int rv_ok;
+	int rv_done;
 };
 @GLUE@
 static uint32_t cfg[0x1000 / 4], atu[0x1000 / 4], elbi[0x2000 / 4], iso[1], mem[0x1000 / 4], tcm[0x400000 / 4];
@@ -694,7 +729,7 @@ int main(void)
 	static const uint32_t wins[] = { SWW_WIN_PCIE, SWW_WIN_SYSMEM, SWW_WIN_SMWRAP, SWW_WIN_CA7WRAP, 0x18004000u };
 	static const uint32_t vals[] = { 0xDEADBEEFu, 0u, 0x400000u };
 	static const uint32_t bwins[] = { 0u, 0x400000u, 0x200000u, 0x800000u, 0x18001000u };
-	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0 };
+	struct sw_hw hw = { cfg, atu, elbi, iso, mem, tcm, 0, 4, 0, 0, 0, 0 };
 	int bad = 0, acc = 0;
 
 	(void)sw3_rd;
@@ -753,22 +788,30 @@ int main(void)
 	for (int l3 = 0; l3 < 9; l3++) {
 		static const uint32_t rvv[3] = { 0xEA000010u, 0xEA000011u, 0u };
 
-		hw.l3 = l3;
-		hw.rv = 0xEA000010u;
-		for (unsigned wi = 0; wi < 5; wi++) {
-			for (int eq = 0; eq < 2; eq++) {
-				for (unsigned vi = 0; vi < 3; vi++) {
-					for (uint32_t off = 0; off < 16; off += 4) {
-						cfg[0x84 / 4] = eq ? bwins[wi] : bwins[wi] ^ 0x1000u;
-						for (int i = 0; i < 4; i++) tcm[i] = 0x77777777u;
-						int r = sw3_wr(&hw, SWW_BAR2, bwins[wi], off, rvv[vi]);
-						int want = eq && ((bwins[wi] == 0x400000u) || (l3 >= 6 && bwins[wi] == 0 && off == 0 && vi == 0));
-						int ch = 0;
-						for (int i = 0; i < 4; i++) ch += tcm[i] != 0x77777777u;
-						if ((r == 0) != want || (r == 0 && (ch != 1 || tcm[off / 4] != rvv[vi])) || (r != 0 && ch != 0)) {
-							if (bad++ < 20) printf("BAD run D l3 %d win %#x off %#x live-equal %d val %#x: ret %d changed %d, want accept %d\n", l3, bwins[wi], off, eq, rvv[vi], r, ch, want);
+		for (int st = 0; st < 3; st++) {      /* review 0132 F5: pinned (rv_ok) and not yet stored (rv_done), each alone; st 0 = both fine, 1 = not pinned, 2 = already stored */
+			hw.l3 = l3;
+			hw.rv = 0xEA000010u;
+			for (unsigned wi = 0; wi < 5; wi++) {
+				for (int eq = 0; eq < 2; eq++) {
+					for (unsigned vi = 0; vi < 3; vi++) {
+						for (uint32_t off = 0; off < 16; off += 4) {
+							hw.rv_ok = st != 1;
+							hw.rv_done = st == 2;
+							cfg[0x84 / 4] = eq ? bwins[wi] : bwins[wi] ^ 0x1000u;
+							for (int i = 0; i < 4; i++) tcm[i] = 0x77777777u;
+							int r = sw3_wr(&hw, SWW_BAR2, bwins[wi], off, rvv[vi]);
+							int want = eq && ((bwins[wi] == 0x400000u) || (l3 >= 6 && st == 0 && bwins[wi] == 0 && off == 0 && vi == 0));
+							int ch = 0;
+							for (int i = 0; i < 4; i++) ch += tcm[i] != 0x77777777u;
+							if ((r == 0) != want || (r == 0 && (ch != 1 || tcm[off / 4] != rvv[vi])) || (r != 0 && ch != 0)) {
+								if (bad++ < 20) printf("BAD run D l3 %d st %d win %#x off %#x live-equal %d val %#x: ret %d changed %d, want accept %d\n", l3, st, bwins[wi], off, eq, rvv[vi], r, ch, want);
+							}
+							/* rv_done is set by the one store at address 0 and by nothing else */
+							if (hw.rv_done != (st == 2 || (r == 0 && bwins[wi] == 0 && off == 0))) {
+								if (bad++ < 20) printf("BAD run D rv_done st %d win %#x off %#x: ret %d, rv_done %d\n", st, bwins[wi], off, r, hw.rv_done);
+							}
+							acc += r == 0;
 						}
-						acc += r == 0;
 					}
 				}
 			}
@@ -830,11 +873,15 @@ GLUE_MUTANTS = [
     ("cfg 0x84 only the tail window", [("(v == 0 || v == SWW_WIN_TAIL)", "(v == SWW_WIN_TAIL)")]),
     ("cfg 0x88 writable too", [("(off == SWW_CFG_WIN2 &&", "(off >= SWW_CFG_WIN2 &&")]),
     ("BAR2 refused", [("space != SWW_BAR0 && space != SWW_BAR2) {", "space != SWW_BAR0) {")]),
-    ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
+    ("BAR2 not limited", [(" ||\n\t    (space == SWW_BAR2 && !((win == 0 && off >= SWW_RAM_BASE) || (win == 0 && off == 0 && h->l3 >= 6 && h->rv_ok && !h->rv_done && v == h->rv) || (win == SWW_WIN_TAIL && off <= SWW_LAST_HI_MAX)))", "")]),
     # patch 0132: the one word at backplane address 0
-    ("reset vector: no level gate", [("off == 0 && h->l3 >= 6 && v == h->rv", "off == 0 && v == h->rv")]),
+    ("reset vector: no level gate", [("off == 0 && h->l3 >= 6 && h->rv_ok", "off == 0 && h->rv_ok")]),
     ("reset vector: level 5 is enough", [("h->l3 >= 6", "h->l3 >= 5")]),
-    ("reset vector: any value", [("h->l3 >= 6 && v == h->rv", "h->l3 >= 6")]),
+    ("reset vector: once dropped", [("h->rv_ok && !h->rv_done && v == h->rv", "h->rv_ok && v == h->rv")]),
+    ("reset vector: pin dropped", [("h->rv_ok && !h->rv_done && v == h->rv", "!h->rv_done && v == h->rv")]),
+    ("reset vector: done flag never set", [("\tif (space == SWW_BAR2 && win == 0 && off == 0) {\n\t\th->rv_done = 1;\n\t}\n", "")]),
+    ("reset vector: done flag set by every BAR2 store", [("if (space == SWW_BAR2 && win == 0 && off == 0) {\n\t\th->rv_done = 1;", "if (space == SWW_BAR2) {\n\t\th->rv_done = 1;")]),
+    ("reset vector: any value", [("h->rv_ok && !h->rv_done && v == h->rv", "h->rv_ok && !h->rv_done")]),
     ("reset vector: any window", [("(win == 0 && off == 0 && h->l3", "(off == 0 && h->l3")]),
     ("reset vector: any of the first words", [("off == 0 && h->l3 >= 6", "off < 16 && h->l3 >= 6")]),
     ("reset vector: any word below the RAM base", [("off == 0 && h->l3 >= 6", "off < SWW_RAM_BASE && h->l3 >= 6")]),
@@ -923,6 +970,29 @@ class WlanWrMutants(unittest.TestCase):
         ]
         for h, g, want in bad:
             self.assertTrue(any(x.startswith(want) for x in audit_store_path(h, g)), want)
+
+    def test_rev_gate_is_wired(self):
+        g = glue_after()
+        self.assertEqual(audit_rev_gate(g), [])
+        bad = [
+            g.replace("level >= 6 && !swl_w14_rev_ok(&chip)", "level >= 7 && !swl_w14_rev_ok(&chip)"),
+            g.replace("level >= 6 && !swl_w14_rev_ok(&chip)", "level >= 6 && swl_w14_rev_ok(&chip)"),
+            g.replace("\t\t\tlevel = 5;\n", ""),
+            g.replace("\t\t\tlevel = 5;\n", "\t\t\tlevel = 6;\n"),
+            g.replace("!swl_w14_rev_ok(&chip)", "!swl_w14_rev_ok(&chip) && 0"),
+            g.replace("if (level >= 6 && !swl_w14_rev_ok(&chip)) {", "if (0) {"),
+            g.replace("swl_w14_rev_ok(&chip)", "swl_w14_rev_ok(0)"),
+        ]
+        for i, m in enumerate(bad):
+            self.assertNotEqual(m, g, i)
+            self.assertNotEqual(audit_rev_gate(m), [], "rev gate mutant %d survived: %s" % (i, m[:0]))
+        # moved behind the stage-3 call: the order check must catch it
+        blk = re.search(r"\t\tif \(level >= 6 && !swl_w14_rev_ok\(&chip\)\) \{.*?\n\t\t}\n", g, re.S)
+        self.assertTrue(blk)
+        moved = g.replace(blk.group(0), "")
+        moved = moved.replace("\t\t\tsweet_wlan_stage3(&hw, (int)level);\n\t\t}\n", "\t\t\tsweet_wlan_stage3(&hw, (int)level);\n\t\t}\n" + blk.group(0))
+        self.assertNotEqual(moved, g)
+        self.assertNotEqual(audit_rev_gate(moved), [])
 
     def test_glue_sweep_accepts_exactly_the_table(self):
         with tempfile.TemporaryDirectory() as work:
