@@ -1,4 +1,4 @@
-SWEET framebuffer cache invalidate (patch 0123, boot-arg sweetfb_inv=1, default off): clean+invalidate each presented layer source range before the panel copy, in case GPU-written surface data is hidden by stale CPU cache lines (gputest37: FB content hash constant while the GPU renders).
+SWEET framebuffer cache invalidate (patch 0144, boot-arg sweetfb_inv=1, default off): clean+invalidate each presented layer source range before the panel copy, in case GPU-written surface data is hidden by stale CPU cache lines (gputest37: FB content hash constant while the GPU renders).
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -369,6 +369,7 @@
@@ -14,7 +14,7 @@ SWEET framebuffer cache invalidate (patch 0123, boot-arg sweetfb_inv=1, default 
  		}
  		if (src != 0 && bpe == 4) {
 +			/*
-+			 * Boot-arg sweetfb_inv=1 (patch 0123): the GPU writes the surface in DRAM behind the CPU's back; the lines this loop
++			 * Boot-arg sweetfb_inv=1 (patch 0144): the GPU writes the surface in DRAM behind the CPU's back; the lines this loop
 +			 * pulled into the cache on an earlier present would be served stale (gputest30/37: the sampled hash never changes).
 +			 * Clean+invalidate the source range of this layer before reading it.
 +			 */

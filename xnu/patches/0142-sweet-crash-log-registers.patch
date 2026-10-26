@@ -1,11 +1,11 @@
-SWEET crash log registers (patch 0121): x0-x28 and 16 stack words in the CRASH report, to read the arguments of a faulting memmove (gputest30: backboardd SIGSEGV in util_copy_rect <- glTexImage2D, far = end of a read-only mapping).
+SWEET crash log registers (patch 0142): x0-x28 and 16 stack words in the CRASH report, to read the arguments of a faulting memmove (gputest30: backboardd SIGSEGV in util_copy_rect <- glTexImage2D, far = end of a read-only mapping).
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -858,6 +858,22 @@
  	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
  	    (uint64_t)saved_state64(ss)->far);
  
-+	/* x0-x28 and the first 16 stack words: the arguments of the faulting memmove/memcpy and the locals of its callers (patch 0121) */
++	/* x0-x28 and the first 16 stack words: the arguments of the faulting memmove/memcpy and the locals of its callers (patch 0142) */
 +	for (unsigned r = 0; r < 29; r += 6) {
 +		printf("CRASH %s x%u 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n", name, r,
 +		    get_saved_state_reg(ss, r), get_saved_state_reg(ss, r + 1), get_saved_state_reg(ss, r + 2),

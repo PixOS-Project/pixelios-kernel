@@ -1,4 +1,4 @@
-SWEET shmem import size probe (patch 0122): logs initial size, named-entry size, offset and page shifts for tag-51 (LayerKit) mach_vm_map imports >= 4 MiB, to find why backboardd maps 0x4e4000 bytes of a 0x4e4e40 byte CoreAnimation image (gputest31 SIGSEGV in memmove).
+SWEET shmem import size probe (patch 0143): logs initial size, named-entry size, offset and page shifts for tag-51 (LayerKit) mach_vm_map imports >= 4 MiB, to find why backboardd maps 0x4e4000 bytes of a 0x4e4e40 byte CoreAnimation image (gputest31 SIGSEGV in memmove).
 --- a/osfmk/vm/vm_map.c
 +++ b/osfmk/vm/vm_map.c
 @@ -4115,6 +4115,15 @@
@@ -6,7 +6,7 @@ SWEET shmem import size probe (patch 0122): logs initial size, named-entry size,
  			return KERN_INVALID_ARGUMENT;
  		}
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+		/* Diagnostic (patch 0122): CoreAnimation shared-memory imports (tag 51) of a few MB, to see which size ends up mapped. */
++		/* Diagnostic (patch 0143): CoreAnimation shared-memory imports (tag 51) of a few MB, to see which size ends up mapped. */
 +		if (vmk_flags.vm_tag == 51 && initial_size >= 0x400000) {
 +			printf("SWEET VMMAP: %s tag51 initial 0x%llx entry_size 0x%llx offset 0x%llx is_copy %d map_shift %d kernel_shift %d\n",
 +			    get_bsdtask_info(current_task()) ? proc_name_address(get_bsdtask_info(current_task())) : "?",
