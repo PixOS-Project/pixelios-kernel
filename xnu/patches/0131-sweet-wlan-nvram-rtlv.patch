@@ -1,6 +1,6 @@
-SWEET WLAN stage 3 run C (patch 0131, docs/research/43 rows W11..W13), boot-arg sweetwlan=5 (= run B of 0130, then W11-W13; levels 1-4 behave as in 0130).
+SWEET WLAN stage 3 run C (patch 0131, docs/research/43a-xnu-stage3-chip-writes.md rows W11..W13), boot-arg sweetwlan=5 (= run B of 0130, then W11-W13; levels 1-4 behave as in 0130).
 W11 NVRAM text: the NVRM entry of the 0128 container (CRC-checked before W0), through a pure C port of process_nvram_vars() (bcmutils.c:5101-5146) and its caller (dhd_pcie.c:4208-4253), stored at ram_end - 4 - varsize, read back.
-W12 length token (~w << 16) | (w & 0xFFFF), w = varsize / 4, at ram_end - 4 (dhd_pcie.c:10962-10970). W13 rTLV 136 bytes below the text: 128 random bytes, length 0x80, type 0xFEEDC0DE (dhd_pcie.c:10480-10520, 17224-17236).
+W12 length token (~w << 16) | (w & 0xFFFF), w = varsize / 4, at ram_end - 4 (dhd_pcie.c:10962-10972). W13 rTLV 136 bytes below the text: 128 random bytes, length 0x80, type 0xFEEDC0DE (dhd_pcie.c:10480-10523, 17224-17236).
 Then text and token are read back again and cfg 0x84 goes back to 0. The CA7 stays halted; nothing is released.
 Pure part (bsd/dev/sweet_wlan_wr.h): tuples SWT_WIN2_TAIL_C, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C; still the one swl_wr(), tail addresses computed from ram_end and varsize (swl_geo_get), table bounds at compile time.
 The whole tail must lie in window 0x400000; a lower RAM end is refused after W7. Entropy: swl_wbus.rng, the glue passes read_random(); a failing or all-zero draw stops before W0.
@@ -9,7 +9,7 @@ Final line: "SWEET WLAN: stage 3 level 5 done vars=<varsize> token=<hex> crc=<he
 Tests: shim/wlan_wr_host_test.c, shim/wlan_nv_host_test.c, tools/test_wlan_wr_mutants.py. HW-WRITE path: not yet reviewed.
 
 diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
-index 686f404..734668a 100644
+index 686f404..a914c1c 100644
 --- a/bsd/dev/sweet_wlan.c
 +++ b/bsd/dev/sweet_wlan.c
 @@ -8,6 +8,8 @@
@@ -55,6 +55,15 @@ index 686f404..734668a 100644
  	}
  }
  
+@@ -205,7 +220,7 @@ sw3_rd(void *ctx, int space, uint32_t win, uint32_t off, uint32_t *v)
+ 	return 0;
+ }
+ 
+-/* THE store of stage 3 (called only by swl_store()): config space, ATU and BAR0 only, BAR0 only on the live window the tuple named; ref: aiutils.c W_REG + R_REG, dsb sy before the read-back (osfmk/arm/atomic.h DSB_SY 0xf) */
++/* THE store of stage 3 (called only by swl_store()): config space (0x80, 0x84), ATU region 2, BAR0, BAR2, BAR0 only on the live window the tuple named; ref: aiutils.c W_REG + R_REG, dsb sy before the read-back (osfmk/arm/atomic.h DSB_SY 0xf) */
+ static int
+ sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
+ {
 @@ -243,6 +258,15 @@ sw3_map2(void *ctx)
  	return h->tcm == NULL;
  }
@@ -79,7 +88,7 @@ index 686f404..734668a 100644
  	wb.delay_us = sw3_delay;
  	wb.ctx = hw;
  	memset(&x, 0, sizeof x);
-@@ -267,7 +292,12 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+@@ -267,8 +292,14 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
  	x.img = sw_fw.p;
  	x.img_len = sw_fw.len;
  	x.img_crc = sw_fw.crc;
@@ -91,9 +100,11 @@ index 686f404..734668a 100644
 +	x.nv_cap = sizeof sw_nvbuf;
 +	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 4 ? "C" : level > 3 ? "B" : "A");
  	(void)swl_stage3(&x);
++	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
  }
  
-@@ -292,7 +322,7 @@ sweet_wlan_init(void)
+ void
+@@ -292,7 +323,7 @@ sweet_wlan_init(void)
  	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
  		return;
  	}
@@ -103,7 +114,7 @@ index 686f404..734668a 100644
  	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
  		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
 diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
-index db50868..0d209c7 100644
+index db50868..a9d19ac 100644
 --- a/bsd/dev/sweet_wlan_wr.h
 +++ b/bsd/dev/sweet_wlan_wr.h
 @@ -9,6 +9,8 @@
@@ -536,7 +547,7 @@ index db50868..0d209c7 100644
  /* W8: cfg 0x84 (BAR2 window) := SWW_WIN_TAIL, only when the last RAM word lies beyond BAR2 window 0 (ram_end > 0x400000); armed for restore to 0 until W9 is done */
  static inline int
  swl_w8(struct swl_wx *x)
-@@ -879,6 +1154,134 @@ swl_w10(struct swl_wx *x)
+@@ -879,6 +1154,138 @@ swl_w10(struct swl_wx *x)
  	return swl_done(x, SWF_W10);
  }
  
@@ -570,7 +581,11 @@ index db50868..0d209c7 100644
 +	for (i = 0; i < swl_tw_n(&g, k); i++) {
 +		SWW_RD(x, SWW_BAR2, SWW_WIN_TAIL, swl_tw_base(&g, k) + 4u * i - SWW_WIN_TAIL, v);
 +		if (v != swl_tw_word(x, k, i)) {
-+			printf("SWEET WLAN: W%u tail kind %d word %u read %#x expected %#x\n", x->row, k, i, v, swl_tw_word(x, k, i));
++			if (k != SWK_RTLV || i >= SWW_RTLV_RNG / 4u) {
++				printf("SWEET WLAN: W%u tail kind %d word %u read %#x expected %#x\n", x->row, k, i, v, swl_tw_word(x, k, i));
++			} else {
++				printf("SWEET WLAN: W%u tail kind %d word %u mismatch\n", x->row, k, i);   /* the random bytes are not logged */
++			}
 +			return swl_stop(x, SWW_E_READBACK);
 +		}
 +	}
@@ -616,7 +631,7 @@ index db50868..0d209c7 100644
 +	SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, SWW_WIN_TAIL));        /* ref: dhd_pcie.c:6193-6197 (setbar1win) */
 +	printf("SWEET WLAN: W11 cfg 0x84 := %#x\n", SWW_WIN_TAIL);
 +	for (i = 0; i < g.vwords; i++) {
-+		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_VARS, i)));       /* ref: dhd_pcie.c:10902-10905 (membytes of the vars) */
++		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.vars + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_VARS, i)));       /* ref: dhd_pcie.c:10903 (membytes of the vars) */
 +	}
 +	SWW_TRY(swl_nv_verify(x));
 +	printf("SWEET WLAN: W11 NVRAM text bp %#x..%#x varsize %u crc %#010x read back\n", g.vars, g.tok - 4u, x->nv_varsize, x->nv_crc_rb);
@@ -636,7 +651,7 @@ index db50868..0d209c7 100644
 +	if (rc) {
 +		return swl_stop(x, rc);
 +	}
-+	SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.tok - SWW_WIN_TAIL, x->tok));        /* ref: dhd_pcie.c:10969-10970 (token to phys_size - 4); swl_wr() reads the one word back, W13 reads it again */
++	SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.tok - SWW_WIN_TAIL, x->tok));        /* ref: dhd_pcie.c:10971-10972 (token to phys_size - 4); swl_wr() reads the one word back, W13 reads it again */
 +	printf("SWEET WLAN: W12 token %#010x at bp %#x read back\n", x->tok, g.tok);
 +	x->flags |= SWF_W12;
 +	return 0;
@@ -656,7 +671,7 @@ index db50868..0d209c7 100644
 +		return swl_stop(x, rc);
 +	}
 +	for (i = 0; i < SWW_RTLV_WORDS; i++) {
-+		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.rt + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_RTLV, i)));      /* ref: dhd_pcie.c:10507-10520 (rTLV value, length word, type word) */
++		SWW_TRY(swl_wr(x, SWW_BAR2, SWW_WIN_TAIL, g.rt + 4u * i - SWW_WIN_TAIL, swl_tw_word(x, SWK_RTLV, i)));      /* ref: dhd_pcie.c:10507-10523 (rTLV value, length word, type word) */
 +	}
 +	SWW_TRY(swl_tw_verify(x, SWK_RTLV));
 +	SWW_TRY(swl_nv_verify(x));
@@ -671,7 +686,7 @@ index db50868..0d209c7 100644
  /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
  static inline int
  swl_stage3(struct swl_wx *x)
-@@ -896,6 +1299,14 @@ swl_stage3(struct swl_wx *x)
+@@ -896,6 +1303,14 @@ swl_stage3(struct swl_wx *x)
  			return rc;
  		}
  	}
@@ -686,7 +701,7 @@ index db50868..0d209c7 100644
  	rc = swl_w0(x);
  	rc = rc ? rc : swl_w1(x);
  	rc = rc ? rc : swl_w2(x);
-@@ -904,15 +1315,27 @@ swl_stage3(struct swl_wx *x)
+@@ -904,15 +1319,27 @@ swl_stage3(struct swl_wx *x)
  	rc = rc ? rc : swl_w5(x);
  	rc = rc ? rc : swl_w6(x);
  	rc = rc ? rc : swl_w7(x);

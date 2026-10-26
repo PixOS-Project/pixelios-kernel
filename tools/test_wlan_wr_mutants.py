@@ -203,6 +203,13 @@ def audit_store_path(hdr, glue):
         f.append("sw_fw_note does not pick the NVRM entry by its tag")
     if len(re.findall(r"\bsw3_wr\b", glue)) != 2 or "wb.wr = sw3_wr;" not in glue:
         f.append("sw3_wr used other than as the bus wr callback")
+    # review 0131 F1 (AP-74): what is CRC-checked is the private copy that is processed, not the container
+    nvp = body(hdr, "swl_nv_prep")
+    if "x->nv[i] = x->nv_src[i];" not in nvp or "src = swl_crc_b(src, x->nv[i]);" not in nvp or "nv_src[i])" in nvp.replace("x->nv[i] = x->nv_src[i];", ""):
+        f.append("swl_nv_prep does not CRC its private copy")
+    # review 0131 F2: the rTLV entropy is drawn in full
+    if body(glue, "sw3_rng").count("read_random(buf, n);") != 1:
+        f.append("sw3_rng does not draw all n bytes with read_random")
     return f
 
 
@@ -823,6 +830,9 @@ class WlanWrMutants(unittest.TestCase):
             (hdr, glue.replace("*p = v;", "*p = v;\n\tuint32_t a = h->cfg[1] = 6;"), "assignment outside the allowlist"),
             (hdr, glue + "\nstatic void sw3_w(struct sw_hw *hw, struct swl_wbus wb) { void *w_ = wb.wr; w_(hw, SWW_CFG, 0, 4, 6); }\n", "wr callback used other than by wb.wr = sw3_wr;"),
             (hdr, glue + "\nstatic void sw3_r(struct sw_hw *h) { uint32_t t_; sw_rd(h, 0x18000000u + 0x804u, &t_); }\n", "call of sw_rd in the added glue"),
+            (hdr.replace("src = swl_crc_b(src, x->nv[i]);", "src = swl_crc_b(src, x->nv_src[i]);"), glue, "swl_nv_prep does not CRC its private copy"),
+            (hdr, glue.replace("read_random(buf, n);", "read_random(buf, n / 2);"), "sw3_rng does not draw"),
+            (hdr, glue.replace("read_random(buf, n);", "(void)buf;"), "sw3_rng does not draw"),
         ]
         for h, g, want in bad:
             self.assertTrue(any(x.startswith(want) for x in audit_store_path(h, g)), want)
