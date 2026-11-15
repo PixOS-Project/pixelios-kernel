@@ -1,0 +1,11 @@
+diff --git a/shim/shim.c b/shim/shim.c
+--- a/shim/shim.c
++++ b/shim/shim.c
+@@ -128,6 +128,7 @@ static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+ 			 :
+ 			 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+ 			   "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	ramlog_line("smc done");
+ 	return x0;
+ }
+

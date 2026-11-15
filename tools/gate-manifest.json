@@ -1,0 +1,1535 @@
+{
+ "schema": 1,
+ "generated_by": "tools/gate-manifest --write",
+ "totals_s": {
+  "quick": 360,
+  "formal": 600,
+  "cold": 1100
+ },
+ "inert": [
+  "docs/*",
+  "*.md",
+  "LICENSE*",
+  "LICENSES/*",
+  ".gitignore",
+  ".github/*",
+  "xnu/patches-archive/*"
+ ],
+ "completes_full": [
+  "lint-c",
+  "xnu-build",
+  "stack-apply",
+  "mutant-needles",
+  "boot-markers"
+ ],
+ "selector_inputs": [
+  "tools/check-all.sh",
+  "tools/gate_select.py",
+  "tools/gate-manifest",
+  "tools/gate-manifest.json",
+  "tools/gate-manifest-ceilings.json",
+  "tools/unit_select.py",
+  "tools/gate-unit-shards"
+ ],
+ "mutant_tables": {
+  "test_audit_memo_selfmutants.py:BOOT_MUTANTS": "tools/test_audit_memo_selfmutants.py",
+  "test_audit_memo_selfmutants.py:LOCK_MUTANTS": "tools/test_audit_memo_selfmutants.py",
+  "test_audit_memo_selfmutants.py:POOL_MUTANTS": "tools/test_audit_memo_selfmutants.py",
+  "test_audit_memo_selfmutants.py:WIRING_MUTANTS": "tools/test_audit_memo_selfmutants.py",
+  "test_chg_mon_refused_mutants.py:CHG_MON_REFUSED_MUTANTS": "tools/test_chg_mon_refused_mutants.py",
+  "test_devd_mutants.py:DEVSH_MUTANTS": "tools/test_devd_mutants.py",
+  "test_lint_mutant_needles.py:GLUE_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:G2_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:G2L_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:D4B_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:G2VA_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:G2HOST_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:G2FIX_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:X_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_lint_mutant_needles.py:Y_MUTANTS": "tools/test_lint_mutant_needles.py",
+  "test_resident_mutants.py:CORE_MUTANTS": "tools/test_resident_mutants.py",
+  "test_resident_mutants.py:SESSION_MUTANTS": "tools/test_resident_mutants.py",
+  "test_resident_mutants.py:FIT_MUTANTS": "tools/test_resident_mutants.py",
+  "test_resident_mutants.py:THERMAL_MUTANTS": "tools/test_resident_mutants.py",
+  "test_safety_mutants.py:LIB_MUTANTS": "tools/test_safety_mutants.py",
+  "test_safety_mutants.py:CLI_MUTANTS": "tools/test_safety_mutants.py",
+  "test_wdt_early_mutants.py:WDT_EARLY_MUTANTS": "tools/test_wdt_early_mutants.py",
+  "test_wlan_mutant_pool.py:POOL_MUTANTS": "tools/test_wlan_mutant_pool.py",
+  "test_wlan_mutants_cache.py:GATE_WIRING_MUTANTS": "tools/test_wlan_mutants_cache.py",
+  "test_wlan_wr_mutants.py:GLUE_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:G2L_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:G2_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:D4B_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:G2VA_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:G2HOST_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:T8EDE_MUTANTS": "tools/test_wlan_wr_mutants.py",
+  "test_wlan_wr_mutants.py:G2FIX_MUTANTS": "tools/test_wlan_wr_mutants.py"
+ },
+ "steps": [
+  {
+   "step": "build",
+   "lane": "A",
+   "class": "quick",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    "xnu/patches/0087*",
+    "xnu/patches/0088*",
+    "xnu/patches/0093*",
+    "xnu/patches/0104*",
+    "xnu/patches/0124*",
+    "xnu/patches/0128*",
+    "xnu/patches/0129*",
+    "xnu/patches/0130*",
+    "xnu/patches/0131*",
+    "xnu/patches/0132*",
+    "xnu/patches/0133*",
+    "xnu/patches/0134*",
+    "xnu/patches/0135*",
+    "xnu/patches/0136*",
+    "xnu/patches/0137*",
+    "xnu/patches/0167*",
+    "xnu/patches/0174*",
+    "xnu/patches/0185*",
+    "xnu/patches/0198*",
+    "xnu/patches/0199*",
+    "xnu/patches/0200*",
+    "xnu/patches/0201*",
+    "xnu/patches/0206*",
+    "xnu/patches/0268*",
+    "xnu/patches/0329*",
+    "xnu/patches/0348*",
+    "soc/*",
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md"
+     ]
+    }
+   ],
+   "note": "first build: cold audit memo 120-190 s observed, 60 s is the S3 warm target"
+  },
+  {
+   "step": "build-fast",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-usb",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-wlan",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": []
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/wlan[!_]*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    "soc/*/wlan_seq*"
+   ],
+   "note": "obs 378-598 s cold, 59 s warm (S3 target 60)"
+  },
+  {
+   "step": "build-gpu",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-gpupower",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-gpuclk",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-gpurails",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-gpurailon",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-gpujob",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/gpu*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-touch",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/touch*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/acpm*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "build-udump",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 60,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    {
+     "glob": "soc/*",
+     "except": [
+      "soc/*/wlan_seq*"
+     ]
+    },
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md",
+      "shim/*_host_test.c",
+      "shim/sweet_wlan_*.h",
+      "shim/gpu*",
+      "shim/wlan[!_]*",
+      "shim/touch*",
+      "shim/udump*",
+      "shim/usbproto*",
+      "shim/usbgadget*",
+      "shim/acpm*"
+     ]
+    },
+    {
+     "glob": "shim/usbproto*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/usbgadget*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    },
+    {
+     "glob": "shim/udump*",
+     "except": [
+      "shim/*_host_test.c"
+     ]
+    }
+   ]
+  },
+  {
+   "step": "host-tests",
+   "lane": "A",
+   "class": "quick",
+   "budget_s": 30,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    "xnu/patches/0087*",
+    "xnu/patches/0088*",
+    "xnu/patches/0093*",
+    "xnu/patches/0104*",
+    "xnu/patches/0124*",
+    "xnu/patches/0128*",
+    "xnu/patches/0129*",
+    "xnu/patches/0130*",
+    "xnu/patches/0131*",
+    "xnu/patches/0132*",
+    "xnu/patches/0133*",
+    "xnu/patches/0134*",
+    "xnu/patches/0135*",
+    "xnu/patches/0136*",
+    "xnu/patches/0137*",
+    "xnu/patches/0167*",
+    "xnu/patches/0174*",
+    "xnu/patches/0185*",
+    "xnu/patches/0198*",
+    "xnu/patches/0199*",
+    "xnu/patches/0200*",
+    "xnu/patches/0201*",
+    "xnu/patches/0206*",
+    "xnu/patches/0268*",
+    "xnu/patches/0329*",
+    "xnu/patches/0348*",
+    "soc/*",
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md"
+     ]
+    }
+   ],
+   "note": "obs 16 s"
+  },
+  {
+   "step": "boot-safety",
+   "lane": "A",
+   "class": "always",
+   "budget_s": 90,
+   "inputs": [
+    "tools/imgmeta*",
+    "tools/mk*",
+    "tools/test-bluejay-boot.py*",
+    "tools/check-all.sh*",
+    "tools/gate_select.py*",
+    "tools/gate-manifest*",
+    "tools/audit_memo.py*",
+    "tools/audit_pool.py*",
+    "tools/gpuclk_audit.py*",
+    "tools/mifclk_audit.py*",
+    "tools/pmicsrc_audit.py*",
+    "tools/audit_memo.py",
+    "tools/boards.py",
+    "tools/gen-wlan-a80211-patch",
+    "tools/gen-wlan-en0-patch",
+    "tools/gen-wlan-hunks",
+    "tools/gen-wlan-registry-patch",
+    "tools/imgmeta.py",
+    "tools/replay",
+    "tools/test-bluejay-boot.py",
+    "tools/testdata",
+    "tools/third_party",
+    "tools/wlan-tbl-gen",
+    "xnu/patches/0087*",
+    "xnu/patches/0088*",
+    "xnu/patches/0093*",
+    "xnu/patches/0104*",
+    "xnu/patches/0124*",
+    "xnu/patches/0128*",
+    "xnu/patches/0129*",
+    "xnu/patches/0130*",
+    "xnu/patches/0131*",
+    "xnu/patches/0132*",
+    "xnu/patches/0133*",
+    "xnu/patches/0134*",
+    "xnu/patches/0135*",
+    "xnu/patches/0136*",
+    "xnu/patches/0137*",
+    "xnu/patches/0167*",
+    "xnu/patches/0174*",
+    "xnu/patches/0185*",
+    "xnu/patches/0198*",
+    "xnu/patches/0199*",
+    "xnu/patches/0200*",
+    "xnu/patches/0201*",
+    "xnu/patches/0206*",
+    "xnu/patches/0268*",
+    "xnu/patches/0329*",
+    "xnu/patches/0348*",
+    "soc/*",
+    "device/*",
+    {
+     "glob": "shim/*",
+     "except": [
+      "shim/*.md"
+     ]
+    }
+   ],
+   "note": "audit of every built image; obs 82-83 s"
+  },
+  {
+   "step": "unit",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 180,
+   "inputs": [
+    "tools/*",
+    "soc/*",
+    "device/*",
+    "qrlog/*",
+    "xnu/qr/*",
+    "shim/wlan_*",
+    "xnu/patches/*"
+   ],
+   "note": "obs 155-173 s"
+  },
+  {
+   "step": "wlan-tbl",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 10,
+   "inputs": [
+    "soc/google/gs101/wlan_msgbuf_l22.tsv",
+    "shim/sweet_wlan_tbl_data.h",
+    "tools/wlan-tbl-gen"
+   ],
+   "note": "T-8b3c: header-check of the committed msgbuf table against its TSV (tools/wlan-tbl-gen); seconds"
+  },
+  {
+   "step": "wlan-mutants",
+   "lane": "C",
+   "class": "quick",
+   "budget_s": 300,
+   "inputs": [
+    "shim/sweet_wlan_g2.h",
+    "shim/sweet_wlan_g2d.h",
+    "shim/sweet_wlan_g2e.h",
+    "shim/sweet_wlan_g2r.h",
+    "shim/sweet_wlan_join.h",
+    "shim/sweet_wlan_join_fw.h",
+    "shim/sweet_wlan_l25_wl.h",
+    "shim/wlan_g2_host_dongle.h",
+    "shim/wlan_g2_host_l24.h",
+    "shim/wlan_g2_host_l25wl.h",
+    "shim/wlan_g2_host_test.c",
+    "shim/wlan_nv_host_test.c",
+    "shim/wlan_wr_host_test.c",
+    "tools/test_wlan_wr_mutants.py",
+    "tools/wlan_glue_harness_a.py",
+    "tools/wlan_glue_harness_b.py",
+    "tools/wlan_mutant_cache.py",
+    "tools/wlan_mutant_pool.py",
+    "xnu/patches/0124-sweet-wlan-bwfm-core.patch",
+    "xnu/patches/0128-sweet-wlan-fwcheck.patch",
+    "xnu/patches/0129-sweet-wlan-chip-writes.patch",
+    "xnu/patches/0130-sweet-wlan-image-copy.patch",
+    "xnu/patches/0131-sweet-wlan-nvram-rtlv.patch",
+    "xnu/patches/0132-sweet-wlan-reset-vector.patch",
+    "xnu/patches/0133-sweet-wlan-arm-release.patch",
+    "xnu/patches/0134-sweet-wlan-run-f1-dumps.patch",
+    "xnu/patches/0135-sweet-wlan-run-f2-low-window.patch",
+    "xnu/patches/0136-sweet-wlan-run-f3-live-low-window.patch",
+    "xnu/patches/0137-sweet-wlan-gap-report.patch",
+    "xnu/patches/0167-sweet-wlan-g1-host-dma.patch",
+    "xnu/patches/0174-sweet-wlan-g2-first-dma.patch",
+    "xnu/patches/0124-*",
+    "xnu/patches/0128-*",
+    "xnu/patches/0129-*",
+    "xnu/patches/0130-*",
+    "xnu/patches/0131-*",
+    "xnu/patches/0132-*",
+    "xnu/patches/0133-*",
+    "xnu/patches/0134-*",
+    "xnu/patches/0135-*",
+    "xnu/patches/0136-*",
+    "xnu/patches/0137-*",
+    "xnu/patches/0167-*",
+    "xnu/patches/0174-*",
+    "xnu/patches/0185-*",
+    "xnu/patches/0198-*",
+    "xnu/patches/0199-*",
+    "xnu/patches/0201-*",
+    "xnu/patches/0206-*",
+    "xnu/patches/0268-*",
+    "xnu/patches/0273-*",
+    "xnu/patches/0281-*",
+    "xnu/patches/0282-*",
+    "xnu/patches/0288-*",
+    "xnu/patches/0292-*",
+    "xnu/patches/0293-*",
+    "xnu/patches/0313-*",
+    "xnu/patches/0347-*",
+    "xnu/patches/0349-*",
+    "xnu/patches/0350-*",
+    "xnu/patches/0351-*",
+    "xnu/patches/0357-*",
+    "xnu/patches/0363-*"
+   ],
+   "patch_edits": [
+    "bsd/dev/sweet_wlan"
+   ],
+   "only": null,
+   "only_note": "GATE_MUT_ONLY exists in tools/test_wlan_wr_mutants.py but no header|glue subset is derivable from a changed file: all mutants run",
+   "note": "formal budget 300 s (obs 1402-1755 s before the S1 pooled runner)"
+  },
+  {
+   "step": "phone-state",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 30,
+   "inputs": [
+    "tools/probe-run*",
+    "tools/xrun*",
+    "tools/fboot*",
+    "tools/phone*",
+    "tools/plock.sh",
+    "tools/fflash-userdata.sh",
+    "tools/hang-recover*",
+    "tools/to-fastboot.sh",
+    "tools/usb-log.py",
+    "tools/usb-port",
+    "tools/runs*",
+    "tools/simseams.py",
+    "shim/build.sh",
+    "tools/test_probe*",
+    "tools/test_phone*",
+    "tools/test_xrun*",
+    "tools/test_fflash*",
+    "tools/test_hang*",
+    "tools/test_plock*"
+   ]
+  },
+  {
+   "step": "hang-recover",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 30,
+   "inputs": [
+    "tools/probe-run*",
+    "tools/xrun*",
+    "tools/fboot*",
+    "tools/phone*",
+    "tools/plock.sh",
+    "tools/fflash-userdata.sh",
+    "tools/hang-recover*",
+    "tools/to-fastboot.sh",
+    "tools/usb-log.py",
+    "tools/usb-port",
+    "tools/runs*",
+    "tools/simseams.py",
+    "shim/build.sh",
+    "tools/test_probe*",
+    "tools/test_phone*",
+    "tools/test_xrun*",
+    "tools/test_fflash*",
+    "tools/test_hang*",
+    "tools/test_plock*"
+   ]
+  },
+  {
+   "step": "probe-run",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 75,
+   "inputs": [
+    "tools/probe-run*",
+    "tools/xrun*",
+    "tools/fboot*",
+    "tools/phone*",
+    "tools/plock.sh",
+    "tools/fflash-userdata.sh",
+    "tools/hang-recover*",
+    "tools/to-fastboot.sh",
+    "tools/usb-log.py",
+    "tools/usb-port",
+    "tools/runs*",
+    "tools/simseams.py",
+    "shim/build.sh",
+    "tools/test_probe*",
+    "tools/test_phone*",
+    "tools/test_xrun*",
+    "tools/test_fflash*",
+    "tools/test_hang*",
+    "tools/test_plock*"
+   ],
+   "note": "obs 73-74 s"
+  },
+  {
+   "step": "phone-converge",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 20,
+   "inputs": [
+    "tools/*",
+    "soc/*",
+    "device/*",
+    "qrlog/*",
+    "xnu/qr/*",
+    "shim/wlan_*"
+   ],
+   "note": "R38 lint: a readiness check in a run path; reads the run-path tools"
+  },
+  {
+   "step": "rootless",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 30,
+   "inputs": [
+    "tools/*",
+    "soc/*",
+    "device/*",
+    "qrlog/*",
+    "xnu/qr/*",
+    "shim/wlan_*"
+   ]
+  },
+  {
+   "step": "public-split",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 10,
+   "inputs": [
+    "*"
+   ],
+   "note": "secret/firmware placement, ~1 s"
+  },
+  {
+   "step": "validate",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 60,
+   "inputs": [
+    "*"
+   ]
+  },
+  {
+   "step": "rules",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 30,
+   "inputs": [
+    "*"
+   ]
+  },
+  {
+   "step": "public-guard",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 15,
+   "inputs": [
+    "*"
+   ],
+   "note": "T-6070: tip tree vs tools/public-push-guard-baseline.tsv; obs ~2 s"
+  },
+  {
+   "step": "shellcheck",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 30,
+   "inputs": [],
+   "predicate": "shell",
+   "note": "every changed shell file"
+  },
+  {
+   "step": "lint-c",
+   "lane": "A",
+   "class": "formal",
+   "budget_s": 75,
+   "inputs": [],
+   "note": "WARN-only, full gate only; obs 47-68 s"
+  },
+  {
+   "step": "xnu-build",
+   "lane": "A",
+   "class": "quick",
+   "budget_s": 90,
+   "inputs": [
+    {
+     "glob": "xnu/patches/*",
+     "except": [
+      "*.md"
+     ]
+    },
+    "tools/gate-xnu-build",
+    "tools/xnu-local-build",
+    "tools/xnu-remote-build",
+    "tools/xnub-line.sh",
+    "tools/xnu-src-mirror",
+    "tools/check-all.sh"
+   ],
+   "note": "AP-257; obs 63 s cold, 8 s warm (stack tree hash)"
+  },
+  {
+   "step": "stack-apply",
+   "lane": "A",
+   "class": "quick",
+   "budget_s": 60,
+   "inputs": [
+    {
+     "glob": "xnu/patches/*",
+     "except": [
+      "*.md"
+     ]
+    },
+    "tools/stack-apply"
+   ],
+   "note": "AP-258"
+  },
+  {
+   "step": "mutant-needles",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 20,
+   "inputs": [
+    "tools/test_*mutant*",
+    "tools/lint-mutant-needles",
+    "shim/sweet_wlan_g2.h",
+    "shim/sweet_wlan_g2d.h",
+    "shim/sweet_wlan_g2e.h",
+    "shim/sweet_wlan_g2r.h",
+    "shim/sweet_wlan_join.h",
+    "shim/sweet_wlan_join_fw.h",
+    "shim/sweet_wlan_l25_wl.h",
+    "shim/wlan_g2_host_dongle.h",
+    "shim/wlan_g2_host_l24.h",
+    "shim/wlan_g2_host_l25wl.h",
+    "shim/wlan_g2_host_test.c",
+    "shim/wlan_nv_host_test.c",
+    "shim/wlan_wr_host_test.c",
+    "tools/test_wlan_wr_mutants.py",
+    "tools/wlan_glue_harness_a.py",
+    "tools/wlan_glue_harness_b.py",
+    "tools/wlan_mutant_cache.py",
+    "tools/wlan_mutant_pool.py",
+    "xnu/patches/0124-sweet-wlan-bwfm-core.patch",
+    "xnu/patches/0128-sweet-wlan-fwcheck.patch",
+    "xnu/patches/0129-sweet-wlan-chip-writes.patch",
+    "xnu/patches/0130-sweet-wlan-image-copy.patch",
+    "xnu/patches/0131-sweet-wlan-nvram-rtlv.patch",
+    "xnu/patches/0132-sweet-wlan-reset-vector.patch",
+    "xnu/patches/0133-sweet-wlan-arm-release.patch",
+    "xnu/patches/0134-sweet-wlan-run-f1-dumps.patch",
+    "xnu/patches/0135-sweet-wlan-run-f2-low-window.patch",
+    "xnu/patches/0136-sweet-wlan-run-f3-live-low-window.patch",
+    "xnu/patches/0137-sweet-wlan-gap-report.patch",
+    "xnu/patches/0167-sweet-wlan-g1-host-dma.patch",
+    "xnu/patches/0174-sweet-wlan-g2-first-dma.patch",
+    "xnu/patches/0124-*",
+    "xnu/patches/0128-*",
+    "xnu/patches/0129-*",
+    "xnu/patches/0130-*",
+    "xnu/patches/0131-*",
+    "xnu/patches/0132-*",
+    "xnu/patches/0133-*",
+    "xnu/patches/0134-*",
+    "xnu/patches/0135-*",
+    "xnu/patches/0136-*",
+    "xnu/patches/0137-*",
+    "xnu/patches/0167-*",
+    "xnu/patches/0174-*",
+    "xnu/patches/0185-*",
+    "xnu/patches/0198-*",
+    "xnu/patches/0199-*",
+    "xnu/patches/0201-*",
+    "xnu/patches/0206-*",
+    "xnu/patches/0268-*",
+    "xnu/patches/0273-*",
+    "xnu/patches/0281-*",
+    "xnu/patches/0282-*",
+    "xnu/patches/0288-*",
+    "xnu/patches/0292-*",
+    "xnu/patches/0293-*",
+    "xnu/patches/0313-*",
+    "xnu/patches/0347-*",
+    "xnu/patches/0349-*",
+    "xnu/patches/0350-*",
+    "xnu/patches/0351-*",
+    "xnu/patches/0357-*",
+    "xnu/patches/0363-*",
+    "shim/el2.c",
+    "shim/el2_print_host_test.c",
+    "shim/el2h.c",
+    "tools/boards.py"
+   ],
+   "patch_edits": [
+    "bsd/dev/sweet_wlan"
+   ],
+   "note": "AP-281; seconds"
+  },
+  {
+   "step": "boot-markers",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 20,
+   "inputs": [
+    "xnu/patches/*.patch",
+    "tools/lint-boot-markers",
+    "tools/xrun_report.py"
+   ],
+   "note": "AP-229; seconds"
+  },
+  {
+   "step": "lint-silent",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 20,
+   "inputs": [
+    "tools/lint-silent",
+    "tools/lint-silent-allow.txt",
+    {
+     "glob": "shim/*",
+     "except": [
+      "*.md"
+     ]
+    },
+    {
+     "glob": "xnu/patches/*",
+     "except": [
+      "*.md"
+     ]
+    },
+    {
+     "glob": "tools/*",
+     "except": [
+      "*.md"
+     ]
+    }
+   ],
+   "note": "rule 8 / AP-102; obs ~4 s"
+  },
+  {
+   "step": "consumed",
+   "lane": "B",
+   "class": "quick",
+   "budget_s": 20,
+   "inputs": [
+    "tools/pack_wlanfw.py",
+    "tools/mkpayload.py",
+    "tools/mkdevoverlay.py",
+    "tools/lint-consumed",
+    "tools/lint-consumed-allow.txt",
+    "shim/*.c",
+    "shim/*.h",
+    "shim/*.cpp",
+    "xnu/patches/*.patch"
+   ],
+   "note": "R48 row 2; seconds"
+  },
+  {
+   "step": "inputs",
+   "lane": "B",
+   "class": "always",
+   "budget_s": 10,
+   "inputs": [],
+   "follows": [
+    "build",
+    "build-fast",
+    "build-usb",
+    "build-wlan",
+    "build-gpu",
+    "build-gpupower",
+    "build-gpuclk",
+    "build-gpurails",
+    "build-gpurailon",
+    "build-gpujob",
+    "build-touch",
+    "build-udump",
+    "host-tests",
+    "boot-safety",
+    "unit",
+    "xnu-build"
+   ],
+   "note": "AP-11/144; ms"
+  }
+ ]
+}

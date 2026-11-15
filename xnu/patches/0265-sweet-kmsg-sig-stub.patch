@@ -1,0 +1,14 @@
+SWEET kmsg signature stub (patch 0265, sprint-gpu 2026-11-08): on ARM64_BOARD_CONFIG_SWEET (no ptrauth) osfmk/ipc/ipc_kmsg.c takes the existing stubbed ikm_init_sig/ikm_chunk_sig/ikm_finalize_sig implementation that x86_64 uses (signature 0, sign and validate still run and match) instead of SHA-256 per Mach message; observed cost before: ccsha256_ltc_compress under ikm_sign / ikm_validate_sig_internal = 11.5% of backboardd render-thread kernel samples (PCSAMP, run gputest-nav23). No hardware access.
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -539,7 +539,9 @@
+ 	return *scratchp;
+ }
+ 
+-#elif defined(CRYPTO_SHA2) && !defined(__x86_64__)
++#elif defined(CRYPTO_SHA2) && !defined(__x86_64__) && !defined(ARM64_BOARD_CONFIG_SWEET)
++/* patch 0265 (sprint-gpu 2026-11-08): the SWEET board (no ptrauth) takes the stub below, as x86_64 does; the SHA-256 kmsg signature cost
++ * 11.5% of backboardd's render-thread kernel samples (PCSAMP nav23: ccsha256_ltc_compress under ikm_sign / ikm_validate_sig_internal). */
+ 
+ typedef SHA256_CTX ikm_sig_scratch_t;
+ 

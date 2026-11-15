@@ -266,14 +266,14 @@ static const char *precheck(void)
 		return "present-unreadable";
 	if (v != GPU_SHADER_PRESENT || mt != GPU_TILER_PRESENT || mc != GPU_L2_PRESENT)
 		return "present-mismatch";
-	for (unsigned i = 0; i < 3; i++) {	/* PRESENT HI words 0x104/114/124 */
+	for (uintptr_t i = 0; i < 3; i++) {	/* PRESENT HI words 0x104/114/124 */
 		if (!r32(GPU_MALI + 0x104u + 0x10u * i, &v))
 			return "present-unreadable";
 		if (v)
 			return "present-hi-nonzero";
 	}
-	for (unsigned i = 0; i < 3; i++) {	/* READY 0x140/150/160 and PWRTRANS 0x200/210/220, LO then HI word */
-		for (unsigned h = 0; h < 2; h++) {
+	for (uintptr_t i = 0; i < 3; i++) {	/* READY 0x140/150/160 and PWRTRANS 0x200/210/220, LO then HI word */
+		for (uintptr_t h = 0; h < 2; h++) {
 			if (!r32(GPU_MALI + 0x140u + 0x10u * i + 4u * h, &v) || !r32(GPU_MALI + 0x200u + 0x10u * i + 4u * h, &w))
 				return "core-state-unreadable";
 			if (v || w)
@@ -333,8 +333,9 @@ static const char *dname(int code, unsigned blk)
 	case 2: return blk == 0 ? "partial:shader" : blk == 3 ? "partial:stack" : "partial:l2";
 	case 3: return blk == 0 ? "fault:shader" : blk == 3 ? "fault:stack" : "fault:l2";
 	case 4: return blk == 0 ? "refused:shader" : blk == 3 ? "refused:stack" : "refused:l2";
+	case 0: return "ok";
+	default: return "unknown-code";	/* power_off()/gpu_power_cycle() give 0..4 only: show anything else in the POWER line and fail the cycle (down[0] != 'o') */
 	}
-	return "ok";
 }
 
 static const char *uname(int e, const char *refused, const char *fault)
@@ -342,13 +343,39 @@ static const char *uname(int e, const char *refused, const char *fault)
 	return e == -2 ? refused : fault;
 }
 
+/* The ON sequence (never retried): each write only after the previous step came up, else the first failing step is returned and nothing more is written. Returns "ok" on success. */
+static const char *power_on(void)
+{
+	int e = w32(G_TILER_ON, GPU_TILER_PRESENT);
+
+	if (e)
+		return uname(e, "refused:tiler", "fault:tiler");
+	if (!wait_for(G_TILER_RDY, GPU_TILER_PRESENT, G_TILER_TR))
+		return "timeout:tiler";
+	if (!wait_for(G_L2_RDY, GPU_L2_PRESENT, G_L2_TR))
+		return "timeout:l2";
+#ifdef GPU_POWER_STACK
+	e = w32(G_STACK_ON, GPU_STACK_PRESENT);	/* corestack_driver_control path: pm_driver.c:2646-2649, wait 2656-2657 */
+	if (e)
+		return uname(e, "refused:stack", "fault:stack");
+	if (!wait_for(G_STACK_RDY, GPU_STACK_PRESENT, G_STACK_TR))
+		return "timeout:stack";
+#endif
+	e = w32(G_SHADER_ON, GPU_SHADER_PRESENT);
+	if (e)
+		return uname(e, "refused:shader", "fault:shader");
+	if (!wait_for(G_SHADER_RDY, GPU_SHADER_PRESENT, G_SHADER_TR))
+		return "timeout:shader";
+	return "ok";
+}
+
 int gpu_power_cycle(void)
 {
-	const char *up = "ok", *down, *why = precheck();
+	const char *up, *down, *why = precheck();
 	char line[RAMLOG_LINE_MAX];
 	uint64_t t0, t1, t2, tj = 0;
 	unsigned p, blk = 0;
-	int e, d;
+	int d;
 
 	if (why) {
 		say("POWER refused: ", why, "", "");
@@ -366,22 +393,7 @@ int gpu_power_cycle(void)
 	dump("PRE_", "L2_MMU_CONFIG", G_L2MMU_CFG);
 	t0 = touch_ticks();
 	/* ON (never retried; a failure goes straight to the OFF sequence) */
-	if ((e = w32(G_TILER_ON, GPU_TILER_PRESENT)))
-		up = uname(e, "refused:tiler", "fault:tiler");
-	else if (!wait_for(G_TILER_RDY, GPU_TILER_PRESENT, G_TILER_TR))
-		up = "timeout:tiler";
-	else if (!wait_for(G_L2_RDY, GPU_L2_PRESENT, G_L2_TR))
-		up = "timeout:l2";
-#ifdef GPU_POWER_STACK
-	else if ((e = w32(G_STACK_ON, GPU_STACK_PRESENT)))	/* corestack_driver_control path: pm_driver.c:2646-2649, wait 2656-2657 */
-		up = uname(e, "refused:stack", "fault:stack");
-	else if (!wait_for(G_STACK_RDY, GPU_STACK_PRESENT, G_STACK_TR))
-		up = "timeout:stack";
-#endif
-	else if ((e = w32(G_SHADER_ON, GPU_SHADER_PRESENT)))
-		up = uname(e, "refused:shader", "fault:shader");
-	else if (!wait_for(G_SHADER_RDY, GPU_SHADER_PRESENT, G_SHADER_TR))
-		up = "timeout:shader";
+	up = power_on();
 	t1 = touch_ticks();
 	dump_all("");
 #ifdef GPU_JOB

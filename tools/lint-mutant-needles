@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Presence pass over every mutant table in tools/test_*mutants*.py (AP-281, AP-277): each needle (the text a mutant replaces) must still exist in the file it targets.
+Why: an edit to a line a mutant anchors on makes the mutant's needle vanish; the suites report `pattern not found` / `nomatch` only after a compile+run per mutant (minutes to hours),
+and a harness that counts an unmatched needle as "survived" sends the reader hunting a test gap that is not there. Nothing is compiled or run here: it takes seconds.
+Do instead of an edit that breaks a needle: re-anchor the mutant on the unique tail of the new statement (`grep -c` it) or delete it as obsolete with the reason in the commit.
+Counts: 0 = MUTANT NEEDLE MISSING (FAIL). More than one is printed as MUTANT NEEDLE MULTI (a note, no FAIL): wlan `_f`/`_fx`/MUTANTS and the el2 table replace EVERY occurrence by design
+(tools/test_wlan_wr_mutants.py:run_all `m.replace(o, n)`, tools/test_el2_mutants.py docstring + `re.subn`); --once makes MULTI a FAIL for a table that must be unique.
+A table in a tools/test_*mutants*.py that has no adapter below is a FAIL (rule 8: a new table must be registered here, not silently skipped).
+G4 (PLAN-GATE-2X, AST, nothing imported): every table named *MUTANTS in tools/test_wlan_wr_mutants.py and tools/test_wlan_dma_mutants.py must be an argument of
+wlan_mutant_pool.run_set (pooled, cached, spot-checked) or be on POOL_ALLOW with a reason; a `for .. in X_MUTANTS` loop whose body runs a compiler (directly or through a
+function of the file that does) is `MUTANT SET UNPOOLED <table>`. Do instead: build the mutated texts in the loop, run them through run_set (tools/wlan_mutant_pool.py docstring).
+G4 also follows aliases (ALIAS = TABLE, T = list(TABLE)), comprehensions, annotated assignments (X_MUTANTS: list = ...), tables named *_MUTS, a call that hands the table to a compiler-running
+function, and resolves run_set to wlan_mutant_pool (a local `def run_set`, a rebinding or an import from another module is a finding). LIMITS (a tripwire, not a proof; S2 must not rely on it as
+one): it does not follow a table through an attribute, a function return value, getattr/globals()/exec, a table imported from another file, a table whose name does not end in MUTANTS/MUTS,
+or a loop whose compiler call hides behind a name that is neither a subprocess call, the string "gcc"/"cc", nor a function of the same file (review gate-2x-s1-r1 F2).
+  tools/lint-mutant-needles [--tools DIR] [--root DIR] [--once]
+Exit 0 PASS, 1 FAIL (MUTANT NEEDLE MISSING / unregistered table / import error), 2 usage. Last line: RESULT: PASS|FAIL mutant-needles tables=N needles=M missing=K multi=J"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import ast
+import glob
+import importlib.util
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load(path):
+    """Import a test module by path (its module-level code builds the tables; none of them runs a mutant)."""
+    sys.path.insert(0, os.path.dirname(path))
+    try:
+        spec = importlib.util.spec_from_file_location("lmn_" + os.path.basename(path)[:-3], path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.path.pop(0)
+
+
+def wlan_rows(mod):
+    """MUTANTS = (label, [(old, new)...], equiv) against the final sweet_wlan_wr.h: every `old` against the unmutated text (run_all's `o not in m`)."""
+    text = mod.final_header()
+    for label, subs, _eq in mod.MUTANTS:
+        for old, _new in subs:
+            yield "bsd/dev/sweet_wlan_wr.h", label, old, text.count(old)
+
+
+def wlan_glue_rows(mod):
+    """GLUE_MUTANTS = (label, [(old, new)...]) against glue_function_text(); the substitutions apply in order (test_glue_mutants_are_killed), @move is the special block move."""
+    base = mod.glue_function_text()
+    for label, subs in mod.GLUE_MUTANTS:
+        t = base
+        for old, new in subs:
+            if old == mod._MOVE:
+                continue
+            yield "bsd/dev/sweet_wlan.c (glue function)", label, old, t.count(old)
+            t = t.replace(old, new)
+
+
+def fw_gap_rows(mod):
+    """MUTANTS = (label, old, new) against the final sweet_wlan_fw.h (0128 + 0185): every `old` against the unmutated text (test_every_gap_mutant_is_killed `assertIn`)."""
+    text = mod.final_header()
+    for label, old, _new in mod.MUTANTS:
+        yield "bsd/dev/sweet_wlan_fw.h", label, old, text.count(old)
+
+
+def en0_rows(mod):
+    """MUTANTS = (name, row, old, new) against shim/wlan_en0.h (the runner itself refuses a pattern that does not occur exactly once)."""
+    with open(mod.HDR, encoding="utf-8") as fh:
+        text = fh.read()
+    for name, _row, old, _new in mod.MUTANTS:
+        yield "shim/wlan_en0.h", name, old, text.count(old)
+
+
+def el2_rows(mod, root=None):
+    """MUTANTS = (id, path, regex, replacement, kind, why): re.subn(pattern, ..., flags=re.M) on ROOT/path (test_every_mutant_is_killed)."""
+    root = root or mod.ROOT
+    for mid, path, pat, _rep, _kind, _why in mod.MUTANTS:
+        try:
+            with open(os.path.join(root, path)) as fh:
+                n = len(re.findall(pat, fh.read(), flags=re.M))
+        except OSError as e:
+            yield path, mid, "(file unreadable: %s)" % e, 0
+            continue
+        yield path, mid, pat, n
+
+
+def _seq_rows(table, base_fn, target, alt=None):
+    """(name, [(old, new) | (old, new, "wr")...]) applied IN ORDER to base_fn(mod) (the table's own test: `old in t` then t = t.replace(old, new));
+    a third element "wr" targets alt=(target, base_fn) instead (G2_MUTANTS rows on sweet_wlan_wr.h, g2_kill_test)."""
+    def rows(mod):
+        for name, subs in getattr(mod, table):
+            texts = {}
+            for sub in subs:
+                key = "alt" if len(sub) > 2 and alt is not None else "main"
+                tgt, fn = (alt if key == "alt" else (target, base_fn))
+                if key not in texts:
+                    texts[key] = fn(mod)
+                yield tgt, name, sub[0], texts[key].count(sub[0])
+                texts[key] = texts[key].replace(sub[0], sub[1])
+    return rows
+
+
+def dp15_rows(mod):
+    """tools/test_wlan_dp15_mutants.py MUTANTS = (clause, name, old, new) against the G2 header extracted from the patches (main(): src.count(old) must be 1, each mutant on the unmutated text). T-866b."""
+    text = mod.extracted_headers(mod.load_wr_helpers())["sweet_wlan_g2.h"]
+    for _clause, name, old, _new in mod.MUTANTS:
+        yield "bsd/dev/sweet_wlan_g2.h (dp15)", name, old, text.count(old)
+
+
+def _shim_hdr_rows(mod, rows, target):
+    """HDR_FILES of the l25 / rsne mutant tests are read from shim/ (main(): srcs = {h: open(SHIM/h)}); rows = (name, header or None, old). T-866b."""
+    srcs = {}
+    for h in mod.HDR_FILES:
+        with open(os.path.join(mod.SHIM, h), encoding="utf-8") as fh:
+            srcs[h] = fh.read()
+    for name, hdr, old in rows:
+        yield target, name, old, (srcs[hdr].count(old) if hdr else sum(t.count(old) for t in srcs.values()))
+
+
+def l25_rows(mod):
+    """tools/test_wlan_l25_mutants.py MUTANTS = (clause, name, old, new): exactly once in exactly one of HDR_FILES (shim/sweet_wlan_l25.h, sweet_wlan_l25_hs.h). T-866b."""
+    return _shim_hdr_rows(mod, [(n, None, o) for _c, n, o, _w in mod.MUTANTS], "shim/sweet_wlan_l25*.h")
+
+
+def rsne_rows(mod):
+    """tools/test_wlan_rsne_mutants.py MUTANTS = (clause, name, hdr, old, new): exactly once in shim/<hdr>. T-866b."""
+    return _shim_hdr_rows(mod, [(n, h, o) for _c, n, h, o, _w in mod.MUTANTS], "shim/sweet_wlan_l25_rsne.h, sweet_wlan_g2.h, sweet_wlan_l25_glue.h")
+
+
+def scanrec_rows(mod):
+    """tools/test_wlan_scanrec_mutants.py MUTANTS = (clause, name, hdr, old, new): exactly once in shim/<hdr> (sweet_wlan_radio.h, sweet_wlan_sta.h)."""
+    return _shim_hdr_rows(mod, [(n, h, o) for _c, n, h, o, _w in mod.MUTANTS], "shim/sweet_wlan_radio.h, sweet_wlan_sta.h")
+
+
+def dma_rows(mod):
+    """tools/test_wlan_dma_mutants.py MUTANTS = (label, [(regex, repl)...], equiv): re.sub(rx, rep, flags=re.S) in order on header() (test_every_mutant_is_killed)."""
+    for label, subs, _eq in mod.MUTANTS:
+        m = mod.header()
+        for rx, rep in subs:
+            yield "bsd/dev/sweet_wlan_dma.h", label, rx, len(re.findall(rx, m, re.S))
+            m = re.sub(rx, rep, m, flags=re.S)
+
+def wlan_wiring_rows(mod):
+    """GATE_WIRING_MUTANTS = (name, old, new, scenario) of test_wlan_mutants_cache.py: `old` must occur exactly once in the SOURCE of test_wlan_wr_mutants.py (test_gate_wiring_mutants_are_killed asserts src.count(old) == 1)."""
+    with open(mod.M.__file__) as fh:
+        src = fh.read()
+    for name, old, _new, _scenario in mod.GATE_WIRING_MUTANTS:
+        yield "tools/test_wlan_wr_mutants.py", name, old, src.count(old)
+
+
+def bt_uart_rows(mod):
+    """tools/test_sweet_bt_uart_mutants.py MUTANTS = (name, old, new): every `old` must occur in the 0189 patch text (main(): `text.count(old) < 1` is 'pattern not found')."""
+    text = mod.PATCH.read_text()
+    for name, old, _new in mod.MUTANTS:
+        yield "xnu/patches/0189-sweet-bt-transport.patch", name, old, text.count(old)
+
+
+def _devd_seq_rows(path, table):
+    """devd/devsh rows (id, what, [(anchor, replacement)...], killers[, reason]): apply_mutant() in test_devd_mutants.py applies the edits IN ORDER, each
+    anchor counted in the text the previous edits produced (and must be exactly 1 there, so a MULTI here is an ERROR in that suite)."""
+    with open(path) as fh:
+        base = fh.read()
+    target = "tools/" + os.path.basename(path)
+    for row in table:
+        mid, edits = row[0], row[2]
+        t = base
+        for anchor, repl in edits:
+            n = t.count(anchor)
+            yield target, mid, anchor, n
+            if n == 0:
+                break
+            t = t.replace(anchor, repl, 1)
+
+
+def devd_rows(mod):
+    """MUTANTS of test_devd_mutants.py against tools/devd.c (DEVD_SRC)."""
+    return _devd_seq_rows(mod.DEVD_SRC, mod.MUTANTS)
+
+
+def devsh_rows(mod):
+    """DEVSH_MUTANTS of test_devd_mutants.py against tools/devsh (DEVSH_SRC)."""
+    return _devd_seq_rows(mod.DEVSH_SRC, mod.DEVSH_MUTANTS)
+
+
+def _src_rows(table, src_attr):
+    """Rows (name, needle, replacement) applied once to the file at mod.<src_attr> (tools/test_resident_mutants.py: str.replace, count must be 1)."""
+    def rows(mod):
+        path = getattr(mod, src_attr)
+        with open(path) as fh:
+            text = fh.read()
+        for name, old, _new in getattr(mod, table):
+            yield "tools/" + os.path.basename(path), name, old, text.count(old)
+    return rows
+
+
+def wdt_early_rows(mod):
+    """tools/test_wdt_early_mutants.py WDT_EARLY_MUTANTS = (name, kind, old, new, case[, extra]): kind "patch" -> `old` ('\\n' -> '\\n+') exactly once in the 0333 patch text;
+    kind "reset" -> `old` (and the extra edit's before-text) exactly once in the extracted patched sweet_machine_reset_x (test_0333_wdt_early.py: compile_and_run asserts count == 1 for the extra edit)."""
+    base = load(os.path.join(os.path.dirname(mod.__file__), "test_wdt_build.py"))
+    with open(base.PATCH_EARLY) as fh:
+        text = fh.read()
+    rsrc = base.extract_reset_source(text)
+    for name, kind, old, _new, _case, *extra in mod.WDT_EARLY_MUTANTS:
+        if kind == "patch":
+            old = old.replace("\n", "\n+")
+            yield "xnu/patches/0333-sweet-wdt-early-arm.patch", name, old, text.count(old)
+        else:
+            yield "0333 sweet_machine_reset_x (bsd/dev/sweet_restart.c)", name, old, rsrc.count(old)
+            for e in extra:
+                yield "0333 sweet_machine_reset_x (bsd/dev/sweet_restart.c)", name + " (extra edit)", e[0], rsrc.count(e[0])
+
+
+def chg_mon_refused_rows(mod):
+    """tools/test_chg_mon_refused_mutants.py CHG_MON_REFUSED_MUTANTS = (name, old, new): `old` exactly once in sweet_chg_i2c.c as patched by 0284..0339 (mod.source())."""
+    text = mod.source()
+    for name, old, _new in mod.CHG_MON_REFUSED_MUTANTS:
+        yield "sweet_chg_i2c.c (stack 0284..0339)", name, old, text.count(old)
+
+
+# (test file, table name) -> rows(module); the order is the output order
+def rxpool_rows(mod):
+    """tools/test_wlan_rxpool_mutants.py MUTANTS = (file, name, old, new, tests): old exactly once in shim/<file> (main(): srcs[rel].count(old) must be 1). 0357."""
+    srcs = {}
+    for rel, name, old, _new, _tests in mod.MUTANTS:
+        if rel not in srcs:
+            with open(os.path.join(mod.SHIM, rel), encoding="utf-8") as fh:
+                srcs[rel] = fh.read()
+        yield "shim/" + rel, name, old, srcs[rel].count(old)
+
+
+ADAPTERS = {
+    ("test_wlan_wr_mutants.py", "MUTANTS"): wlan_rows,
+    ("test_wlan_wr_mutants.py", "GLUE_MUTANTS"): wlan_glue_rows,
+    ("test_el2_mutants.py", "MUTANTS"): el2_rows,
+    # W-D4 G2 tables (wip/w4-* branches; absent on trunk = never looked up)
+    ("test_wlan_wr_mutants.py", "G2_MUTANTS"): _seq_rows("G2_MUTANTS", lambda m: m.g2_header(), "bsd/dev/sweet_wlan_g2.h", ("bsd/dev/sweet_wlan_wr.h", lambda m: m.final_header())),
+    ("test_wlan_wr_mutants.py", "G2L_MUTANTS"): _seq_rows("G2L_MUTANTS", lambda m: m.glue_core_text() + m.g2_list_text(), "bsd/dev/sweet_wlan.c (G2 glue core + list)"),      # T-866b: the test applies a row to core+list (T-1142: E_NREP / E_BUFSZ sit in the core text)
+    ("test_wlan_wr_mutants.py", "D4B_MUTANTS"): _seq_rows("D4B_MUTANTS", lambda m: m.d4b_text(), "bsd/dev/sweet_wlan_d4b.h"),
+    ("test_wlan_wr_mutants.py", "G2VA_MUTANTS"): _seq_rows("G2VA_MUTANTS", lambda m: m.glue_after(), "bsd/dev/sweet_wlan.c (glue after 0174)"),
+    ("test_wlan_wr_mutants.py", "G2HOST_MUTANTS"): _seq_rows("G2HOST_MUTANTS", lambda m: m.glue_after(), "bsd/dev/sweet_wlan.c (glue after 0174)"),
+    ("test_wlan_wr_mutants.py", "G2FIX_MUTANTS"): _seq_rows("G2FIX_MUTANTS", lambda m: m.glue_after(), "bsd/dev/sweet_wlan.c (glue after 0174)"),
+    ("test_wlan_wr_mutants.py", "T8EDE_MUTANTS"): _seq_rows("T8EDE_MUTANTS", lambda m: m.glue_after(), "bsd/dev/sweet_wlan.c (glue after 0174)"),      # T-8ede: the T-4a7f rule mutants
+    ("test_wlan_dma_mutants.py", "MUTANTS"): dma_rows,
+    ("test_wlan_dp15_mutants.py", "MUTANTS"): dp15_rows,
+    ("test_wlan_l25_mutants.py", "MUTANTS"): l25_rows,
+    ("test_wlan_rsne_mutants.py", "MUTANTS"): rsne_rows,
+    ("test_wlan_scanrec_mutants.py", "MUTANTS"): scanrec_rows,
+    ("test_wlan_mutants_cache.py", "GATE_WIRING_MUTANTS"): wlan_wiring_rows,
+    ("test_wlan_fw_gap_mutants.py", "MUTANTS"): fw_gap_rows,
+    ("test_sweet_bt_uart_mutants.py", "MUTANTS"): bt_uart_rows,
+    ("test_wlan_en0_mutants.py", "MUTANTS"): en0_rows,
+    ("test_wlan_rxpool_mutants.py", "MUTANTS"): rxpool_rows,
+    ("test_sweetprobe_wifi_mutants.py", "MUTANTS"): rxpool_rows,   # 0363: same row shape (file, name, old, new, tests) read from shim/<file>
+    ("test_devd_mutants.py", "MUTANTS"): devd_rows,
+    ("test_devd_mutants.py", "DEVSH_MUTANTS"): devsh_rows,
+    ("test_wdt_early_mutants.py", "WDT_EARLY_MUTANTS"): wdt_early_rows,
+    ("test_chg_mon_refused_mutants.py", "CHG_MON_REFUSED_MUTANTS"): chg_mon_refused_rows,
+    ("test_resident_mutants.py", "CORE_MUTANTS"): _src_rows("CORE_MUTANTS", "CORE_SRC"),
+    ("test_resident_mutants.py", "SESSION_MUTANTS"): _src_rows("SESSION_MUTANTS", "SESSION_SRC"),
+    ("test_resident_mutants.py", "FIT_MUTANTS"): _src_rows("FIT_MUTANTS", "FIT_SRC"),
+    ("test_resident_mutants.py", "THERMAL_MUTANTS"): _src_rows("THERMAL_MUTANTS", "THERMAL_SRC"),
+    ("test_safety_mutants.py", "LIB_MUTANTS"): _src_rows("LIB_MUTANTS", "LIB_SRC"),
+    ("test_safety_mutants.py", "CLI_MUTANTS"): _src_rows("CLI_MUTANTS", "CLI_SRC"),
+}
+
+
+def tables_of(mod):
+    """Module-level list/tuple attributes named *MUTANTS (test_wlan_mutants_cache.py has GATE_WIRING_MUTANTS, K1 review F2)."""
+    return [k for k, v in vars(mod).items() if k.endswith("MUTANTS") and isinstance(v, (list, tuple)) and not k.startswith("_")]
+
+
+def check(tools, root=None, once=False, out=print, adapters=None):
+    """Returns (tables, needles, missing, multi, problems)."""
+    adapters = ADAPTERS if adapters is None else adapters
+    tables = needles = missing = multi = problems = 0
+    for path in sorted(glob.glob(os.path.join(tools, "test_*mutants*.py"))):
+        base = os.path.basename(path)
+        try:
+            mod = load(path)
+        except Exception as e:      # a needle helper (wlan _t/_f/_fx) raises ValueError at import when its text is gone: that is the same defect, say it loudly
+            out("MUTANT NEEDLE MISSING %s: import failed (a table helper could not find its needle): %s: %s" % (base, type(e).__name__, str(e)[:300]))
+            problems += 1
+            continue
+        for tname in tables_of(mod):
+            fn = adapters.get((base, tname))
+            if fn is None:
+                out("MUTANT TABLE UNREGISTERED %s:%s (add an adapter to tools/lint-mutant-needles ADAPTERS; AP-281)" % (base, tname))
+                problems += 1
+                continue
+            tables += 1
+            try:
+                rows = list(fn(mod, root) if fn is el2_rows else fn(mod))
+            except Exception as e:
+                out("MUTANT NEEDLE MISSING %s:%s: adapter failed: %s: %s" % (base, tname, type(e).__name__, str(e)[:300]))
+                problems += 1
+                continue
+            for target, label, needle, n in rows:
+                needles += 1
+                if n == 0:
+                    missing += 1
+                    out("MUTANT NEEDLE MISSING %s:%s %r -> %s: %s" % (base, tname, label, target, repr(needle)[:160]))
+                elif n > 1:
+                    multi += 1
+                    if once:
+                        missing += 1
+                    out("MUTANT NEEDLE %s %s:%s %r x%d -> %s: %s" % ("MULTI-FAIL" if once else "MULTI", base, tname, label, n, target, repr(needle)[:100]))
+    return tables, needles, missing, multi, problems
+
+
+# G4: (file, table) -> why it is not passed to run_set. MUTANTS is the header set: run_all() pools it (ThreadPoolExecutor), caches it (make_key) and spot-checks it.
+POOL_ALLOW = {("test_wlan_wr_mutants.py", "MUTANTS"): "header set: pooled, cached and spot-checked by run_all()"}
+POOL_FILES = ("test_wlan_wr_mutants.py", "test_wlan_dma_mutants.py")
+_SUBPROC = {"run", "call", "check_call", "check_output", "Popen", "run_cpu_limited", "run_bounded"}
+
+
+def _callee(node):
+    f = node.func
+    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+
+
+def _names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _compiler_funcs(tree):
+    """Names of the file's functions that run a compiler: a subprocess call or the string "gcc" in the body, or a call of such a function (fixed point)."""
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    hot = {k for k, f in funcs.items() if any((isinstance(x, ast.Call) and _callee(x) in _SUBPROC) or (isinstance(x, ast.Constant) and x.value in ("gcc", "cc")) for x in ast.walk(f))}
+    while True:
+        more = {k for k, f in funcs.items() if k not in hot and any(isinstance(x, ast.Call) and _callee(x) in hot for x in ast.walk(f))}
+        if not more:
+            return hot
+        hot |= more
+
+
+def _runs_compiler(body, hot):
+    for stmt in body:
+        for x in ast.walk(stmt):
+            if (isinstance(x, ast.Call) and (_callee(x) in hot or _callee(x) in _SUBPROC)) or (isinstance(x, ast.Constant) and x.value in ("gcc", "cc")):
+                return True
+    return False
+
+
+def _pool_names(tree):
+    """-> (module names bound to wlan_mutant_pool, function names bound to its run_set, [(line, what)] shadows).
+    A shadow is a local `def run_set` / `run_set = ...` or `from <other module> import run_set`: a call of it is NOT the pool (bypass c, review gate-2x-s1-r1 F2)."""
+    mods, funcs, shadows = {"wlan_mutant_pool"}, {"run_set"}, []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods |= {(a.asname or a.name) for a in n.names if a.name == "wlan_mutant_pool"}
+        elif isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if a.name == "run_set":
+                    if n.module == "wlan_mutant_pool":
+                        funcs.add(a.asname or a.name)
+                    else:
+                        shadows.append((n.lineno, "imports run_set from %r, not wlan_mutant_pool" % n.module))
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "run_set":
+            shadows.append((n.lineno, "defines its own `%s run_set`" % ("class" if isinstance(n, ast.ClassDef) else "def")))
+        elif isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "run_set" for t in n.targets):
+            shadows.append((n.lineno, "rebinds the name run_set"))
+    if shadows:
+        funcs.discard("run_set")           # the bare name is not the pool's; an alias imported from wlan_mutant_pool stays
+    return mods, funcs, shadows
+
+
+def _is_pool_call(x, mods, funcs):
+    if not isinstance(x, ast.Call):
+        return False
+    f = x.func
+    return (isinstance(f, ast.Name) and f.id in funcs) or (isinstance(f, ast.Attribute) and f.attr == "run_set" and isinstance(f.value, ast.Name) and f.value.id in mods)
+
+
+def _tables(tree):
+    """Module-level `NAME = ...`, `NAME += ...`, `NAME: T = ...` with NAME ending MUTANTS or MUTS -> {name: line}."""
+    out = {}
+    for n in tree.body:
+        if isinstance(n, ast.AnnAssign):
+            tg = [n.target] if n.value is not None else []
+        else:
+            tg = [n.target] if isinstance(n, ast.AugAssign) else n.targets if isinstance(n, ast.Assign) else []
+        for t in tg:
+            if isinstance(t, ast.Name) and t.id.endswith(("MUTANTS", "MUTS")) and not t.id.startswith("_"):
+                out.setdefault(t.id, n.lineno)
+    return out
+
+
+_WRAP = {"list", "tuple", "sorted", "reversed", "enumerate", "iter", "set", "frozenset", "dict", "filter", "map", "zip", "chain", "copy", "deepcopy"}
+
+
+def _alias_sources(val, taint):
+    """Tables that `val` is a plain re-export of: a tainted name, a wrapper call (list(T), sorted(T), enumerate(T) ...), a display of tainted items ([*A, *B], A + B), or a pure copy/filter comprehension
+    ([m for m in T if ..]). Anything else (a formatted string, a method result, `t = t.replace(..)`) is not an alias: name-based taint on generic names would flag half the file."""
+    if isinstance(val, ast.Name):
+        return set(taint.get(val.id, ()))
+    if isinstance(val, ast.Starred):
+        return _alias_sources(val.value, taint)
+    if isinstance(val, (ast.List, ast.Tuple, ast.Set)):
+        return set().union(*[_alias_sources(e, taint) for e in val.elts]) if val.elts else set()
+    if isinstance(val, ast.BinOp) and isinstance(val.op, ast.Add):
+        return _alias_sources(val.left, taint) | _alias_sources(val.right, taint)
+    if isinstance(val, ast.Call) and _callee(val) in _WRAP:
+        return set().union(*[_alias_sources(a, taint) for a in val.args]) if val.args else set()
+    if isinstance(val, (ast.ListComp, ast.GeneratorExp, ast.SetComp)) and len(val.generators) == 1:
+        tgt = {n.id for n in ast.walk(val.generators[0].target) if isinstance(n, ast.Name)}
+        if isinstance(val.elt, (ast.Name, ast.Tuple)) and {n.id for n in ast.walk(val.elt) if isinstance(n, ast.Name)} <= tgt:
+            return _alias_sources(val.generators[0].iter, taint)
+    if isinstance(val, ast.IfExp):
+        return _alias_sources(val.body, taint) | _alias_sources(val.orelse, taint)
+    return set()
+
+
+def _taint(scope_nodes, tables, mods, funcs, seed=None):
+    """-> {name: {tables it is an alias of}} within one scope (its nodes), seeded with the enclosing scope: the tables themselves plus `ALIAS = TABLE`, `T = list(TABLE)`, `x = [m for m in TABLE]`.
+    The result of a pooled run_set call is not tainted (it is a list of verdicts)."""
+    taint = {k: set(v) for k, v in (seed or {t: {t} for t in tables}).items()}
+    while True:
+        changed = False
+        for n in scope_nodes:
+            if isinstance(n, ast.Assign):
+                tg, val = n.targets, n.value
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and n.value is not None:
+                tg, val = [n.target], n.value
+            else:
+                continue
+            if _is_pool_call(val, mods, funcs):
+                continue
+            src = _alias_sources(val, taint)
+            for t in tg:
+                if isinstance(t, ast.Name) and src - taint.get(t.id, set()):
+                    taint.setdefault(t.id, set()).update(src)
+                    changed = True
+        if not changed:
+            return taint
+
+
+def _scopes(tree):
+    """-> [(nodes, is_function)]: the module's own nodes (not inside any def) and, per def (nested ones included in the outer def too), all its nodes."""
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    mod_nodes, stack = [], list(tree.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, defs):
+            continue
+        mod_nodes.append(n)
+        stack.extend(ast.iter_child_nodes(n))
+    return [(mod_nodes, False)] + [(list(ast.walk(f)), True) for f in ast.walk(tree) if isinstance(f, defs)]
+
+
+def pooling_problems(tools, out=print, allow=None):
+    """-> number of MUTANT SET UNPOOLED findings in POOL_FILES of `tools` (see the docstring, G4).
+    Tripwire, not a proof: it follows names (aliases, comprehensions, annotated assignments, `*_MUTS`), resolves run_set to wlan_mutant_pool and flags a local run_set. It does NOT follow a table
+    through an attribute, a function return value, getattr/globals()/exec, an import from another file, or a runner that is handed to a pool other than run_set while a different compiler-running
+    helper is not named in the same call; S2 must not rely on G4 as proof that nothing compiles outside run_set."""
+    allow = POOL_ALLOW if allow is None else allow
+    found = 0
+    for base in POOL_FILES:
+        path = os.path.join(tools, base)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), path)
+        mods, funcs, shadows = _pool_names(tree)
+        for line, what in shadows:
+            found += 1
+            out("MUTANT SET UNPOOLED run_set (%s:%d): the file %s: a mutant table passed to it is not pooled, cached or spot-checked (import wlan_mutant_pool and call wlan_mutant_pool.run_set)" % (base, line, what))
+        tables = _tables(tree)
+        scopes = _scopes(tree)
+        mod_taint = _taint(scopes[0][0], tables, mods, funcs)
+        taints = [mod_taint] + [_taint(nodes, tables, mods, funcs, mod_taint) for nodes, _f in scopes[1:]]
+        pooled = set()
+        for (nodes, _f), taint in zip(scopes, taints):
+            for x in nodes:
+                if _is_pool_call(x, mods, funcs):
+                    for a in list(x.args) + [k.value for k in x.keywords]:
+                        pooled |= {t for nm in _names(a) for t in taint.get(nm, ())}
+        hot = _compiler_funcs(tree)
+        for tname, line in tables.items():
+            if tname not in pooled and (base, tname) not in allow:
+                found += 1
+                out("MUTANT SET UNPOOLED %s (%s:%d): not an argument of run_set and not on POOL_ALLOW (AP-327 family; pool it: tools/wlan_mutant_pool.py)" % (tname, base, line))
+        reported = set()
+
+        def flag(tname, lineno, what):
+            nonlocal found
+            if (tname, lineno, what) not in reported:
+                reported.add((tname, lineno, what))
+                found += 1
+                out("MUTANT SET UNPOOLED %s (%s:%d): %s" % (tname, base, lineno, what))
+
+        for (nodes, _f), taint in zip(scopes, taints):
+            def derived(node):
+                return sorted({t for nm in _names(node) for t in taint.get(nm, ()) if (base, t) not in allow})
+            inside_pool = {id(y) for x in nodes if _is_pool_call(x, mods, funcs) for y in ast.walk(x)}
+            for x in nodes:
+                if isinstance(x, (ast.For, ast.AsyncFor)) and _runs_compiler(x.body, hot):
+                    for t in derived(x.iter):
+                        flag(t, x.lineno, "a serial loop over the table runs a compiler outside run_set")
+                elif isinstance(x, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                    elts = [x.key, x.value] if isinstance(x, ast.DictComp) else [x.elt]
+                    if _runs_compiler(elts, hot):
+                        for g in x.generators:
+                            for t in derived(g.iter):
+                                flag(t, x.lineno, "a comprehension over the table runs a compiler outside run_set")
+                elif isinstance(x, ast.Call) and id(x) not in inside_pool:
+                    args = list(x.args) + [k.value for k in x.keywords]
+                    for t in sorted({t for a in args for t in derived(a)}):
+                        if _callee(x) in hot or any(_runs_compiler([a], hot) or (_names(a) & hot) for a in args):
+                            flag(t, x.lineno, "the table is handed to a call that runs a compiler outside run_set")
+    return found
+
+
+def main(argv):
+    tools, root, once = HERE, None, False
+    a = list(argv)
+    while a:
+        k = a.pop(0)
+        if k == "--tools" and a:
+            tools = a.pop(0)
+        elif k == "--root" and a:
+            root = a.pop(0)
+        elif k == "--once":
+            once = True
+        else:
+            print("usage: lint-mutant-needles [--tools DIR] [--root DIR] [--once]", file=sys.stderr)
+            return 2
+    tables, needles, missing, multi, problems = check(tools, root, once)
+    problems += pooling_problems(tools)
+    ok = not (missing or problems) and tables > 0
+    print("RESULT: %s mutant-needles tables=%d needles=%d missing=%d multi=%d%s" % (
+        "PASS" if ok else "FAIL", tables, needles, missing, multi,
+        " problems=%d" % problems if problems else (" (no mutant table found in %s)" % tools if tables == 0 else "")))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,59 @@
+#!/bin/sh
+# PixOS kernel repo pre-commit (TP-054). Two rules, both always run; the first failure does not hide the second.
+#  (a) xnu patch numbers must not overlap across worktrees (TP-022): carried over unchanged from the untracked .git/hooks/pre-commit
+#      (tools/patch-numbers precommit; only rc 3 blocks, an internal error is a loud note and lets the commit through).
+#  (b) trunk guard (E10, the Gemini incident: ungated direct commit 7d7a4cd on trunk): a non-merge commit on branch trunk is denied.
+#      Do instead: git worktree add -b tools/NAME ~/.t3/worktrees/NAME trunk; commit there; gate; merge into trunk (merge commits are allowed).
+#      Escape (a tool or the driver, one command): PIXOS_TRUNK_DIRECT="reason" git commit ...
+#      The census commit after a merge is such a tool commit: PIXOS_TRUNK_DIRECT="census-write after BRANCH merge" git commit --trailer "PixOS-Worker: ROLE" -- tools/TOOLS.md tools/tools-status.tsv tools/super-callers.tsv
+#  (c) public by default (T-6070, RULES R7): the added lines and new paths of the staged diff go through tools/public-push-guard staged (host names,
+#      private IPs, home paths, .env values, Wi-Fi/serial/IMEI/key patterns). No bypass: a false positive is fixed in tools/public-push-guard.rules.
+#      Do instead of committing a value: put it in the gitignored .env / local config and commit a *.example with placeholders.
+rc=0
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+T=$TOP/tools/patch-numbers   # the committing worktree's own copy: it reads that worktree's index (the old shared worktree is gone, AP-241)
+if [ -n "$TOP" ] && [ -f "$T" ]; then
+	if command -v python3 >/dev/null 2>&1; then
+		python3 "$T" precommit
+		prc=$?
+		[ $prc = 3 ] && rc=1
+		[ $prc = 0 ] || [ $prc = 3 ] || echo "patch-numbers: internal error (rc=$prc), patch numbers NOT checked for this commit" >&2
+	else
+		echo "patch-numbers: python3 not found, patch numbers NOT checked for this commit" >&2
+	fi
+else
+	echo "patch-numbers: ${TOP:+$T }${TOP:-not inside a work tree: }not found, patch numbers NOT checked for this commit (merge trunk into this branch)" >&2
+fi
+PG=$TOP/tools/public-push-guard
+if [ -n "$TOP" ] && [ -f "$PG" ] && command -v python3 >/dev/null 2>&1; then
+	python3 "$PG" staged >&2 || { [ $? = 1 ] && rc=1 || echo "public-push-guard: internal error, staged diff NOT checked for this commit" >&2; }
+else
+	echo "public-push-guard: ${TOP:+$PG }${TOP:-not inside a work tree: }not found or python3 missing, staged diff NOT checked for public-by-default (merge trunk into this branch)" >&2
+fi
+NT=$TOP/tools/new-tool
+if [ -n "$TOP" ] && [ -f "$NT" ] && command -v python3 >/dev/null 2>&1; then
+	python3 "$NT" --check-staged >&2 || { [ $? = 1 ] && rc=1 || echo "new-tool: internal error, staged new tools NOT checked for this commit" >&2; }
+fi
+AT=$TOP/tools/affected-tests   # R30: a small change runs the tests it can break NOW; a big selection is left to the gate pre-check (loud NOTE)
+if [ -n "$TOP" ] && [ -f "$AT" ] && [ "${PIXOS_SKIP_AFFECTED:-}" = "" ] && command -v python3 >/dev/null 2>&1 && git diff --cached --name-only | grep -q "^tools/"; then
+	( for v in $(env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p'); do unset "$v"; done; python3 "$AT" --max 12 >&2 ) || { [ $? = 1 ] && rc=1 || echo "affected-tests: internal error, tests NOT run for this commit" >&2; }
+fi
+TC=$TOP/tools/tool-census   # R30: TOOLS.md is a generated file; a tools/ change with a stale one failed three gates on 2026-11-02 (census check, ~15 s, only when tools/ is staged)
+if [ -n "$TOP" ] && [ -f "$TC" ] && command -v python3 >/dev/null 2>&1 && git diff --cached --name-only | grep -q "^tools/"; then
+	python3 "$TC" --check >/dev/null 2>&1 || { echo "pre-commit: DENIED, tools/TOOLS.md or the census is out of date for this tools/ change. Do instead: python3 tools/tool-census --write && git add tools/TOOLS.md tools/super-callers.tsv, then commit again; the reason: python3 tools/tool-census --check" >&2; rc=1; }
+fi
+branch=$(git symbolic-ref -q HEAD 2>/dev/null || { rc=$?; [ $rc = 1 ] || echo "pre-commit GAP: git symbolic-ref failed rc=$rc" >&2; })   # full ref: `--short` prints heads/trunk when a tag trunk exists (review kernel-hooks-r1 F3)
+if [ "$branch" = refs/heads/trunk ] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+	if [ -n "${PIXOS_TRUNK_DIRECT:-}" ]; then
+		echo "pre-commit: NOTE direct commit on trunk allowed by PIXOS_TRUNK_DIRECT=\"$PIXOS_TRUNK_DIRECT\"" >&2
+	else
+		{
+			echo "pre-commit: DENIED, a non-merge commit on trunk (E10: trunk only moves by gated merges; the Gemini commit 7d7a4cd was an ungated direct commit)."
+			echo "  do instead: git worktree add -b tools/NAME ~/.t3/worktrees/NAME trunk; commit there; run the gate; then merge that branch into trunk (merge commits are allowed)."
+			echo "  escape (a tool or the driver, with a reason): PIXOS_TRUNK_DIRECT=\"why\" git commit ..."
+			echo "  census commit after a merge: PIXOS_TRUNK_DIRECT=\"census-write after BRANCH merge\" git commit --trailer \"PixOS-Worker: ROLE\" -- tools/TOOLS.md tools/tools-status.tsv tools/super-callers.tsv"
+		} >&2
+		rc=1
+	fi
+fi
+exit $rc

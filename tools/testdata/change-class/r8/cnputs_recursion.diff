@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0300-sweet-console-trace.patch b/xnu/patches/0300-sweet-console-trace.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-sweet-console-trace.patch
+@@ -0,0 +1,10 @@
++diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -304,5 +304,6 @@
++ #if defined(ARM64_BOARD_CONFIG_SWEET)
++ 	sweet_log_append(c, size);
+++	printf("cnputs %d\n", size);
++ 	sweet_mute_early_check();
++ 	if (sweet_console_muted && !panic_active()) {
++ 		return;

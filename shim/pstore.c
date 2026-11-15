@@ -72,7 +72,8 @@
 /* The linked image includes both stacks (shim.ld places _stack_top and
  * _sec_stacks below _end), so the image range gate below covers the
  * stacks and every exception frame pushed beneath them. */
-extern char _head[], _end[];
+/* Linker-script symbols: _head = start.S:4 label (ENTRY, shim.ld:1), _end = shim.ld:19; names fixed by start.S/shim.ld/build.sh, so no rename. */
+extern char _head[], _end[]; // NOLINT(bugprone-reserved-identifier)
 
 #define PSTORE_SIG		0x43474244u	/* 'DBGC' LE in memory */
 #define PSTORE_HDR		12u		/* sig + start + size */
@@ -203,6 +204,7 @@ static void zone_put32(uint32_t off, uint32_t v)
 
 static uint32_t pow2_floor(uint32_t v)
 {
+	/* bounded: v &= v - 1 clears one set bit per pass, at most 32 passes */
 	while (v && (v & (v - 1)))
 		v &= v - 1;
 	return v;
@@ -516,6 +518,7 @@ void pstore_save(void)
 	dsb_sy();
 
 	unsigned marker_len = 0;
+	/* bounded: pstore_marker is a string literal, ends at its NUL */
 	while (pstore_marker[marker_len])
 		marker_len++;
 

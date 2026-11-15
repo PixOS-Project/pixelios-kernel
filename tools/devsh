@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+devsh: PixOS Hot-Reload CLI (TP-027)
+===================================
+Communicates with org.pixelios.devd over ue0 (192.168.7.2:41140) or test port.
+
+Subcommands:
+  devsh ping                  Test connectivity
+  devsh push <src> <dst>      Push local file to device atomically
+  devsh pull <src> <dst>      Pull remote file to host
+  devsh run /abs/prog [args]  Execute a remote program (no shell) and stream output
+  devsh signal <pid> <signo>  Send signal to remote process (devd allows HUP INT KILL USR1 USR2 TERM)
+
+(see BRICK_RISK below, also printed by --help)
+
+Replacing a daemon (there is no `reload`: RUN has no shell and launchctl is outside the RUN allowlist):
+  devsh push build/mydaemon /usr/local/bin/mydaemon     (atomic: temp file + rename)
+  devsh signal <old pid> 15                              (SIGTERM stops the old instance)
+  devsh run /usr/local/bin/mydaemon <args>               (starts the new one; no shell, max 16 args;
+                                                          devd kills the RUN's whole process group when the RUN
+                                                          ends, so a daemon must setsid() to stay alive)
+
+Every subcommand ends with one `RESULT: PASS|FAIL <subcommand> ...` line on stdout.
+Exit codes: 0 ok, 1 the command failed (devd answered ERR, remote RC != 0),
+2 usage / connection / internal error / refused by a safety gate.
+
+Safety (review gemini-devd-r1 F1/F5): push/pull/run/signal act on the phone, so they
+  - need the phone lock: tools/phone-lock check must pass (token in $PHONE_LOCK_TOKEN, which
+    `tools/phone-lock run --owner NAME -- ...` exports); loopback host tests alone may set
+    DEVSH_TEST_LOOPBACK=1, accepted only with --host 127.0.0.1;
+  - refuse a target other than 127.0.0.1 unless $DEVSH_RUNPLAN names an existing
+    docs/runplans/<label>.md (AGENTS rule 9).
+ping is read-only and needs neither.
+
+Auth (review gemini-devd-r1 F1, research 111): devd answers every connection with
+`CHALLENGE <32 hex>`; devsh replies `AUTH <HMAC-SHA256(key, challenge) hex>` using the key in
+$DEVD_KEY_FILE (default <repo>/logs/devd/devd.key, 64 lowercase hex chars). A missing or malformed
+key file ends with RESULT: FAIL, exit 2, before any connect. `run` answers are framed
+`RUNID <hex>` ... `RUNEND <same hex> RC: <n>` (review devd-r1 F3); the status is taken only from that
+exact last line followed by EOF, so a program printing "RC: 0" or killing devd cannot fake a pass. `run` sends `RUN /abs/prog arg ...`:
+devd splits on single spaces, executes without a shell, and only under /usr/local/ or
+/private/var/dev/ (max 16 args).
+"""
+
+import argparse
+import hashlib
+import hmac
+import os
+import re
+import socket
+import subprocess
+import sys
+
+MAX_FILE_BYTES = 40 * 1024 * 1024  # devd rejects nothing larger by itself; bounded here.
+ADDR_MAX = 511  # devd.c parses paths into char[512] with %511s
+default_timeout = lambda: float(os.environ.get("PIXOS_DEVD_TIMEOUT", "10"))
+
+
+
+
+LOOPBACK_HOST = "127.0.0.1"
+PHONE_LOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phone-lock")
+# <repo>/tools/devsh -> <repo>/logs/devd/devd.key (resolved from this script, never from the cwd)
+DEFAULT_KEY_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "logs", "devd", "devd.key")
+RUN_MAX_ARGS = 16
+
+
+class Fail(Exception):
+    """Ends the subcommand with RESULT: FAIL; code 2 = usage/connection/gate, 1 = command failed."""
+
+    def __init__(self, msg: str, code: int = 2):
+        super().__init__(msg)
+        self.code = code
+
+
+BRICK_RISK = """\
+BRICK RISK (review devd-r1 F4): `push` can replace /usr/lib/* (dyld, libSystem), the launchd plist and
+org.pixelios.* LaunchDaemons; a bad file there can stop the userland from booting (userdata only, so it is
+reversible). devd keeps the first original of a replaced file as <dst>.sweetorig. Recovery: (1) a kernel
+overlay RAM boot carrying the original file (tools/mkdevoverlay.py; sweetdev=1 copies it back before launchd,
+sweetdev=restore renames .sweetorig back; the restore step has not run on hardware yet), or (2) the
+pre-approved userdata reflash (tools/fflash-userdata.sh). devd refuses .sweetorig/.sweettmp names, symlink
+components and components over 245 bytes, like the kernel overlay. A replaced file keeps its own mode
+(review devd-r2 N1); a new file gets 0755 under /usr/local/ and /private/var/dev/, 0644 elsewhere.
+"""
+
+RELOAD_HINT = ("there is no `devsh reload` (devd RUN has no shell, launchctl is outside its allowlist). "
+               "Use: devsh push SRC /usr/local/bin/NAME ; devsh signal OLDPID 15 ; devsh run /usr/local/bin/NAME ARGS")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        if "'reload'" in message:
+            message = f"{message}; {RELOAD_HINT}"
+        raise Fail(f"usage: {message}")
+
+
+def check_remote_path(path: str, what: str) -> None:
+    """Reject any device path that is not absolute or that escapes upward.
+
+    devd.c joins the raw line token into open()/stat(), so `..`, `.` and an
+    empty segment would let the client reach outside the intended directory.
+    """
+    problems = []
+    if not path.startswith("/"):
+        problems.append("must start with '/'")
+    if not path.isascii() or any(c.isspace() for c in path):
+        problems.append("must be ASCII with no whitespace (the protocol splits on spaces)")
+    if "\n" in path or "\r" in path or "\0" in path:
+        problems.append("must not contain control characters")
+    # devd.c formats the line into char[1024] and scans the path with %511s.
+    if len(f"PUSH {path} {MAX_FILE_BYTES}") >= 1024 or len(f"PULL {path}") >= 1024 or len(path) > ADDR_MAX:
+        problems.append("is too long for the devd command buffer")
+    segments = path.split("/")
+    if any(seg in ("..", ".") for seg in segments):
+        problems.append("must not contain '..' or '.' segments")
+    if any(seg == "" for seg in segments[1:]):
+        problems.append("must not contain empty segments")
+    if problems:
+        raise Fail(f"invalid {what} path {path!r}: " + "; ".join(problems))
+
+
+def check_size(size: int, label: str) -> None:
+    if size > MAX_FILE_BYTES:
+        raise Fail(f"{label} is {size} bytes, exceeds the {MAX_FILE_BYTES} byte ({MAX_FILE_BYTES // (1024 * 1024)} MiB) limit")
+
+
+def runplan_dir() -> str:
+    """The super repo's docs/runplans/: $PIXOS_RUNPLAN_DIR, else ~/.t3/projects/pixelios/docs/runplans
+    (the same resolution as tools/run-preflight c_runplan)."""
+    return os.environ.get("PIXOS_RUNPLAN_DIR") or os.path.expanduser("~/.t3/projects/pixelios/docs/runplans")
+
+
+def hardware_gate(args) -> None:
+    """Refuse (Fail, code 2) unless the phone lock is held by this caller and, for a
+    non-loopback target, a run plan is named. Runs before any connect()."""
+    loopback_test = os.environ.get("DEVSH_TEST_LOOPBACK") == "1"
+    if loopback_test and args.host != LOOPBACK_HOST:
+        raise Fail(f"DEVSH_TEST_LOOPBACK=1 is accepted only with --host {LOOPBACK_HOST} (got {args.host})")
+    if not loopback_test:
+        try:
+            r = subprocess.run([PHONE_LOCK, "check"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Fail(f"cannot run {PHONE_LOCK} check: {e}")
+        if r.returncode != 0:
+            raise Fail("refused: the phone lock is not held by this caller "
+                       "(run under `tools/phone-lock run --owner NAME -- ...`; "
+                       f"phone-lock check exit {r.returncode}: {(r.stdout + r.stderr).strip()[:160]})")
+    if args.host != LOOPBACK_HOST:
+        plan = os.environ.get("DEVSH_RUNPLAN", "")
+        real = os.path.realpath(plan) if plan else ""
+        plans = runplan_dir()
+        # review devd-r1 F9: the plan must live in the super repo's docs/runplans/ (a /tmp/docs/runplans/x.md decoy
+        # is not a plan); the directory is resolved like tools/run-preflight does (c_runplan)
+        ok = (real.endswith(".md") and os.path.isfile(real) and os.path.isdir(plans)
+              and os.path.dirname(real) == os.path.realpath(plans))
+        if not ok:
+            raise Fail(f"refused: target {args.host} is not {LOOPBACK_HOST}; set DEVSH_RUNPLAN to an existing "
+                       f"<label>.md directly inside {plans} (AGENTS rule 9), got {plan!r}")
+
+
+def load_key() -> bytes:
+    """The 32-byte devd key from $DEVD_KEY_FILE; Fail (exit 2) when absent or malformed."""
+    path = os.environ.get("DEVD_KEY_FILE") or DEFAULT_KEY_FILE
+    try:
+        # review devd-r1 F11: the key must be private to the caller; checked on the opened fd (no path race)
+        with open(path) as f:
+            st = os.fstat(f.fileno())
+            if st.st_mode & 0o077 or st.st_uid != os.getuid():
+                raise Fail(f"refused: devd key file {path} must be owned by you with mode 0600 (it is "
+                           f"mode {st.st_mode & 0o7777:04o}, uid {st.st_uid}); chmod 600 it or run tools/devd-stage")
+            text = f.read().strip()
+    except OSError as e:
+        raise Fail(f"cannot read the devd key file {path} ({e}); set DEVD_KEY_FILE or run tools/devd-stage")
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise Fail(f"devd key file {path} is not 64 lowercase hex chars")
+    return bytes.fromhex(text)
+
+
+PHONE_HOST = "192.168.7.2"          # the phone's ue0 address (header line 5)
+PHONE_MAC = "02:00:5e:77:ee:01"     # host side of the phone's CDC-ECM gadget (tools/sweet-usbnet.sh:9, tools/usbroot-host.py:27)
+CONNECT_TIMEOUT = 5.0               # the TCP connect only; a live phone on the USB link answers in milliseconds
+
+
+def usbnet_state(net="/sys/class/net"):
+    """'up' | 'down' | 'absent' for the host interface with PHONE_MAC; None when NET cannot be read (then no fast verdict)."""
+    try:
+        names = os.listdir(net)
+    except OSError as e:
+        print(f"devsh: GAP cannot list {net} ({e}): no USB-net link check, the connect timeout decides", file=sys.stderr)
+        return None
+    for n in names:
+        try:
+            with open(os.path.join(net, n, "address")) as f:
+                if f.read().strip().lower() != PHONE_MAC:
+                    continue
+            with open(os.path.join(net, n, "flags")) as f:
+                return "up" if int(f.read().strip(), 16) & 0x1 else "down"   # IFF_UP
+        except (OSError, ValueError):   # lint-silent: expected the interface vanished during the scan (phone reset): next one
+            continue
+    return "absent"
+
+
+def get_socket(host: str, port: int, timeout: float = 10.0) -> socket.socket:
+    """Connect and answer devd's challenge; the returned socket is ready for one command.
+    The phone's address fails AT ONCE when the host has no USB-net link to it (phone in fastboot/recovery/absent): without that
+    check the connect left by the default route and waited the whole timeout, and a retry loop kept the phone lock for an hour
+    (gputest-fcap6, 2026-11-09). The connect itself has its own short timeout; the transfer keeps TIMEOUT."""
+    if host == PHONE_HOST:
+        net = os.environ.get("DEVSH_SYS_CLASS_NET") or "/sys/class/net"
+        if net != "/sys/class/net":
+            print(f"SIM SEAM ACTIVE: DEVSH_SYS_CLASS_NET={net}", file=sys.stderr)
+        st = usbnet_state(net)
+        if st in ("absent", "down"):
+            raise Fail(f"no USB-net link to the phone: the interface with MAC {PHONE_MAC} is {st} (phone not running iOS, or the "
+                       f"host USBNET step was not run); not waiting {timeout:.0f} s")
+    key = load_key()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(min(timeout, CONNECT_TIMEOUT))
+    try:
+        s.connect((host, port))
+        s.settimeout(timeout)
+        line = b""
+        while not line.endswith(b"\n") and len(line) < 64:
+            c = s.recv(1)
+            if not c:
+                break
+            line += c
+        m = re.fullmatch(r"CHALLENGE ([0-9a-f]{32})\n", line.decode(errors="replace"))
+        if not m:
+            raise Fail(f"no CHALLENGE from devd (got {line!r}); is this devd 1.3+?")
+        mac = hmac.new(key, bytes.fromhex(m.group(1)), hashlib.sha256).hexdigest()
+        s.sendall(f"AUTH {mac}\n".encode())
+    except BaseException:
+        s.close()
+        raise
+    return s
+
+
+def recv_reply(s: socket.socket) -> str:
+    """One short reply (first recv); "" when the peer closed without answering."""
+    return s.recv(1024).decode(errors="replace").strip()
+
+
+def cmd_ping(args):
+    with get_socket(args.host, args.port) as s:
+        s.sendall(b"PING\n")
+        resp = recv_reply(s)
+    if not resp.startswith("PONG"):
+        raise Fail(f"unexpected ping reply {resp!r}" if resp else "connection closed without a reply", 1 if resp else 2)
+    print(f"devd online: {resp}")
+    return 0, f"reply={resp!r}"
+
+
+def cmd_push(args):
+    hardware_gate(args)
+    check_remote_path(args.dst, "destination")
+    if not os.path.isfile(args.src):
+        raise Fail(f"source file {args.src} does not exist or is not a regular file")
+
+    # review devd-r1 F1: read the file ONCE and send exactly len(data) bytes. getsize() can differ from
+    # the bytes read (a growing file, /proc); extra bytes after the declared length would reach devd's
+    # command parser.
+    try:
+        with open(args.src, "rb") as f:
+            data = f.read(MAX_FILE_BYTES + 1)
+    except OSError as e:
+        raise Fail(f"cannot read source file {args.src}: {e}")
+    size = len(data)
+    if size == 0:
+        raise Fail(f"source file {args.src} is empty (0 bytes): devd refuses a zero-length push")
+    check_size(size, f"source file {args.src}")
+    with get_socket(args.host, args.port, timeout=args.timeout * 3) as s:
+        header = f"PUSH {args.dst} {size}\n".encode()
+        send_err = None
+        try:
+            s.sendall(header)
+            s.sendall(data)
+        except OSError as e:  # devd may cut the connection after an ERR: read the verdict below
+            send_err = e
+        try:
+            resp = recv_reply(s)
+        except OSError as e:  # no verdict: reported in the Fail line below as reply='<recv error ...>'
+            resp = f"<recv error {e!r}>"
+    if resp == "OK" and send_err is None:
+        print(f"Pushed {args.src} -> {args.dst} ({size} bytes) [OK]")
+        if args.host == PHONE_HOST:
+            ledger_note(args.dst)
+        return 0, f"bytes={size}"
+    if resp.startswith("ERR"):
+        raise Fail(f"push rejected: {resp}", 1)
+    raise Fail(f"push failed: reply={resp!r} send_error={send_err!r}")
+
+
+def ledger_note(dst):
+    """a push stays on userdata: tools/overlay_std.py puts the standard copy back in the next boot's overlay (user 2026-11-09)."""
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay_std.py")
+    if not os.path.isfile(tool):
+        print(f"devsh: GAP {tool} missing: the push of {dst} is not in the standard-root ledger (the next boot does not undo it)", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run([sys.executable, "-I", tool, "note", dst, "--by", "devsh push"], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or r.stdout.strip():
+            print(f"devsh: {(r.stdout + r.stderr).strip()[-300:]}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"devsh: GAP ledger note for {dst} failed: {e}", file=sys.stderr)
+
+
+def cmd_pull(args):
+    hardware_gate(args)
+    check_remote_path(args.src, "source")
+    with get_socket(args.host, args.port, timeout=args.timeout * 3) as s:
+        s.sendall(f"PULL {args.src}\n".encode())
+        hdr = b""
+        while b"\n" not in hdr:
+            if len(hdr) > 64:
+                raise Fail(f"response header too long: {hdr!r}")
+            c = s.recv(1)
+            if not c:
+                break
+            hdr += c
+        hdr_str = hdr.decode(errors="replace").strip()
+        if hdr_str.startswith("ERR"):
+            raise Fail(f"pull rejected: {hdr_str}", 1)
+        if not hdr_str.startswith("OK "):
+            raise Fail(f"pull failed: {hdr_str or 'connection closed before header'}")
+        try:
+            total_len = int(hdr_str[3:].strip())
+        except ValueError:
+            raise Fail(f"malformed length in header {hdr_str!r}")
+        check_size(total_len, f"remote file {args.src}")
+
+        received = 0
+        with open(args.dst, "wb") as f:
+            while received < total_len:
+                to_read = min(16384, total_len - received)
+                chunk = s.recv(to_read)
+                if not chunk:
+                    break
+                f.write(chunk)
+                received += len(chunk)
+
+    if received != total_len:
+        raise Fail(f"expected {total_len} bytes, received {received} (truncated transfer, {args.dst} left incomplete)")
+    print(f"Pulled {args.src} -> {args.dst} ({received} bytes) [OK]")
+    return 0, f"bytes={received}"
+
+
+def run_remote(args):
+    """RUN and stream the output. devd frames every RUN (review devd-r1 F3): `RUNID <16 hex>` first, the
+    program's output, then `RUNEND <same id> RC: <n>` as the LAST line, followed by EOF. The status is read
+    only from that exact line: program output can print "RC: 0" but never knows the id, and a connection
+    that ends without the line (devd killed, dropped) is a FAIL, never a pass. The write side is shut down
+    after the request so devd closes the connection after the RUNEND line."""
+    cmd_str = " ".join(args.cmd)
+    if not cmd_str.strip():
+        raise Fail("usage: run needs a program")
+    tokens = cmd_str.split(" ")
+    if any(t == "" for t in tokens) or not cmd_str.isascii() or not cmd_str.isprintable():
+        raise Fail("usage: run arguments are split on single spaces (no empty argument, printable ASCII only)")
+    if not tokens[0].startswith("/"):
+        raise Fail("usage: run needs an absolute program path (devd has no shell and no PATH)")
+    if len(tokens) - 1 > RUN_MAX_ARGS:
+        raise Fail(f"usage: run takes at most {RUN_MAX_ARGS} arguments")
+    run_id = None
+    pending = None  # last complete line, held back: it may be the RUNEND line
+    tail = b""      # bytes after the last newline
+    with get_socket(args.host, args.port, timeout=args.timeout) as s:
+        s.sendall(f"RUN {cmd_str}\n".encode())
+        s.shutdown(socket.SHUT_WR)
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            tail += chunk
+            while b"\n" in tail:
+                line, tail = tail.split(b"\n", 1)
+                if run_id is None:  # the first line decides: RUNID (ran), ERR (refused) or neither (a devd without RUNID framing)
+                    text = line.decode(errors="replace")
+                    m = re.fullmatch(r"RUNID ([0-9a-f]{16})", text)
+                    if m:
+                        run_id = m.group(1)
+                        continue
+                    if text.startswith("ERR"):
+                        raise Fail(f"run rejected: {text}", 1)
+                    raise Fail(f"no RUNID line from devd (got {text[:80]!r}); is this a devd with RUNID framing (review devd-r1 F3)?")
+                if pending is not None:
+                    print(pending.decode(errors="replace"), flush=True)
+                pending = line
+    if run_id is None:
+        raise Fail("connection closed before the RUNID line")
+    if tail:  # no newline after the last bytes: the RUNEND line (always newline-terminated) never came
+        if pending is not None:
+            print(pending.decode(errors="replace"), flush=True)
+        print(tail.decode(errors="replace"), flush=True)
+        raise Fail("connection dropped before the RUNEND line")
+    last = pending.decode(errors="replace") if pending is not None else ""
+    m = re.fullmatch(r"RUNEND " + run_id + r" RC: (-?\d+)", last)
+    if not m:
+        if last:
+            print(last, flush=True)
+        raise Fail("connection dropped before the RUNEND line for this run (devd died or the output is not framed)")
+    rc = int(m.group(1))
+    if rc != 0:
+        raise Fail(f"remote rc={rc}", 1)
+    return 0, "rc=0"
+
+
+def cmd_run(args):
+    hardware_gate(args)
+    return run_remote(args)
+
+
+def cmd_signal(args):
+    hardware_gate(args)
+    with get_socket(args.host, args.port, timeout=args.timeout) as s:
+        s.sendall(f"SIGNAL {args.pid} {args.signo}\n".encode())
+        resp = recv_reply(s)
+    if resp == "OK":
+        print(f"Signaled PID {args.pid} with {args.signo} [OK]")
+        return 0, f"pid={args.pid} signo={args.signo}"
+    if resp.startswith("ERR"):
+        raise Fail(f"signal rejected: {resp}", 1)
+    raise Fail(f"signal failed: reply={resp!r}")
+
+
+def main():
+    parser = Parser(description="PixOS Hot-Reload CLI",
+                    epilog="Replace a daemon: devsh push SRC /usr/local/bin/NAME ; devsh signal OLDPID 15 "
+                           "(SIGTERM allowed) ; devsh run /usr/local/bin/NAME ARGS\n\n" + BRICK_RISK,
+                    formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default=os.environ.get("PIXOS_DEVD_HOST", "192.168.7.2"), help="devd host IP")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PIXOS_DEVD_PORT", "41140")), help="devd port")
+    parser.add_argument("--timeout", type=float, default=default_timeout(), metavar="S",
+                        help="connect/read timeout in seconds (default 10, or $PIXOS_DEVD_TIMEOUT; push/pull allow 3x)")
+
+    sub = parser.add_subparsers(dest="subcommand", required=True, parser_class=Parser)
+
+    sub.add_parser("ping", help="Ping devd daemon")
+
+    p_push = sub.add_parser("push", help="Push file to device")
+    p_push.add_argument("src", help="Host source path")
+    p_push.add_argument("dst", help="Device destination path (absolute, no '.'/'..' segments)")
+
+    p_pull = sub.add_parser("pull", help="Pull file from device")
+    p_pull.add_argument("src", help="Device source path (absolute, no '.'/'..' segments)")
+    p_pull.add_argument("dst", help="Host destination path")
+
+    p_run = sub.add_parser("run", help="Run a remote program (absolute path, no shell)")
+    p_run.add_argument("cmd", nargs=argparse.REMAINDER, help="/abs/program and args")
+
+    p_sig = sub.add_parser("signal", help="Send signal to process")
+    p_sig.add_argument("pid", type=int, help="Target process PID")
+    p_sig.add_argument("signo", type=int, help="Signal number")
+
+    handlers = {
+        "ping": cmd_ping,
+        "push": cmd_push,
+        "pull": cmd_pull,
+        "run": cmd_run,
+        "signal": cmd_signal,
+    }
+
+    name = "usage"
+    try:
+        args = parser.parse_args()
+        name = args.subcommand
+        if args.timeout <= 0:
+            raise Fail("usage: --timeout must be positive")
+        rc, msg = handlers[name](args)
+    except Fail as e:
+        rc, msg = e.code, str(e)
+        print(f"devsh: {msg}", file=sys.stderr)
+    except SystemExit as e:  # argparse --help: not a failure
+        if e.code in (0, None):
+            raise
+        rc, msg = 2, f"usage error (exit {e.code})"
+    except OSError as e:
+        rc, msg = 2, f"connection/io error: {e}"
+        print(f"devsh: {msg}", file=sys.stderr)
+    print(f"RESULT: {'PASS' if rc == 0 else 'FAIL'} {name} {msg}".rstrip())
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

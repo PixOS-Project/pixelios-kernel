@@ -9,6 +9,8 @@
 #  2. the whole dump: SHA-256 of the latest logs/udump-*.bin (written by
 #     tools/udump-recv.py) vs SHA-256 of the same number of leading blocks read
 #     from Android. Exits nonzero on mismatch.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -euo pipefail
 cd "$(dirname "$0")/.."
 log=$(ls -t logs/usb-*.txt | head -1)

@@ -1,6 +1,13 @@
 #pragma once
 #include <stdint.h>
 
+/* SuperSpeed (port of xnu patch 0173) is the DEFAULT; build.sh --usb2
+ * defines USB_GADGET_HS_ONLY, which keeps the HS-only gadget byte for
+ * byte. USB_GADGET_SS is the internal switch every SS block tests. */
+#if !defined(USB_GADGET_HS_ONLY) && !defined(USB_GADGET_SS)
+#define USB_GADGET_SS
+#endif
+
 /*
  * usbproto.h - pure USB protocol logic for the stage-2 CDC-ACM log
  * gadget: the descriptor set as
@@ -49,6 +56,16 @@
 extern const uint8_t usbproto_device_desc[USBPROTO_DEVICE_DESC_LEN];
 extern const uint8_t usbproto_qualifier_desc[USBPROTO_QUALIFIER_DESC_LEN];
 extern const uint8_t usbproto_config_desc[USBPROTO_CONFIG_DESC_LEN];
+#ifdef USB_GADGET_SS
+/* SuperSpeed set (build flag USB_GADGET_SS), served only while st->ss.
+ * Config: 9 + if0 (9 + 5 + 5 + 4 + 5 + int ep 7 + companion 6) + if1
+ * (9 + 2 x (bulk ep 7 + companion 6)) = 85. BOS: 5 + 7 + 10 = 22. */
+#define USBPROTO_SS_CONFIG_DESC_LEN 85u
+#define USBPROTO_SS_BOS_DESC_LEN    22u
+extern const uint8_t usbproto_ss_device_desc[USBPROTO_DEVICE_DESC_LEN];
+extern const uint8_t usbproto_ss_config_desc[USBPROTO_SS_CONFIG_DESC_LEN];
+extern const uint8_t usbproto_ss_bos_desc[USBPROTO_SS_BOS_DESC_LEN];
+#endif
 extern const uint8_t usbproto_string0_desc[USBPROTO_STRING0_DESC_LEN];
 extern const uint8_t usbproto_string1_desc[USBPROTO_STRING1_DESC_LEN];
 extern const uint8_t usbproto_string2_desc[USBPROTO_STRING2_DESC_LEN];
@@ -65,6 +82,13 @@ extern const uint8_t usbproto_string3_desc[USBPROTO_STRING3_DESC_LEN];
 					 * st->line_coding (SET_LINE_CODING) */
 #define USBPROTO_OK_SET_ADDRESS    3	/* zero-length status stage, THEN
 						 * apply st->address to DCFG */
+#ifdef USB_GADGET_SS
+#define USBPROTO_OK_SET_SEL        4	/* SuperSpeed SET_SEL: receive the 6
+					 * data bytes and DISCARD them (not
+					 * line_coding), then status */
+#define USBPROTO_OK_ISOCH_DELAY    5	/* SuperSpeed SET_ISOCH_DELAY: status
+					 * only; wValue = delay in ns */
+#endif
 
 /* ep0 device state the caller keeps across transfers. */
 struct usbproto {
@@ -73,6 +97,10 @@ struct usbproto {
 	uint8_t alt[2];			/* altsetting of interface 0 / 1 */
 	uint8_t line_coding[USBPROTO_LINE_CODING_LEN];
 	uint8_t dtr, rts;		/* SET_CONTROL_LINE_STATE wValue bits */
+	uint8_t ss;			/* set by the gadget at a SuperSpeed
+					 * ConnectDone (DSTS.CONNECTSPD >= 4);
+					 * only read under USB_GADGET_SS, else
+					 * the HS set is always served */
 };
 
 /* Post-reset state: address 0, unconfigured, altsetting 0, default

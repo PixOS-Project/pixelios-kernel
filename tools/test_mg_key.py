@@ -7,7 +7,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "mg-key")
 try:
     import capstone
-except ImportError:
+except ImportError:   # lint-silent: expected capstone is optional: the tests that need it are skipUnless(capstone) and say so
     capstone = None
 
 _l = importlib.machinery.SourceFileLoader("mgkey", TOOL)

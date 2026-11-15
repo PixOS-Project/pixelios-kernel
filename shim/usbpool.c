@@ -7,6 +7,7 @@ static int overlaps(uint64_t b1, uint64_t e1, uint64_t b2, uint64_t e2)
 
 static int has_prefix(const char *s, const char *prefix)
 {
+	/* bounded: prefix is a string literal, ends at its NUL */
 	while (*prefix) {
 		if (*s++ != *prefix++)
 			return 0;

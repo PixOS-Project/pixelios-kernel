@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""wlan-tbl-gen: turns the proven Wi-Fi G2 run log into the msgbuf store table (TSV and C header) and checks a table against its log; called by tools/test_wlan_tbl_gen.py and shim/build.sh
+
+Usage:
+  tools/wlan-tbl-gen gen   --run DIR|LOG --label L [--tsv OUT.tsv] [--hdr OUT.h] [--slice OUT.log]
+  tools/wlan-tbl-gen check --run DIR|LOG --tsv TABLE.tsv
+  tools/wlan-tbl-gen sha   --tsv TABLE.tsv
+  tools/wlan-tbl-gen header-check --tsv TABLE.tsv --hdr shim/sweet_wlan_tbl_data.h   (the committed C table is the generator's output for the TSV)
+  tools/wlan-tbl-gen --self-test    inline checks (also run by tools/test_wlan_tbl_gen.py)
+
+Input: the stores of the proven run, L1..L22 (`SWEET WLAN: G2 store ...` lines, `restore space ...` lines, the `G2 undo ok` line).
+NOT soc/google/gs101/wlan_seq_l16.json (wrong epoch words, no teardown; review gemini-plan-decision-r1).
+Table columns: seq kind sp name addr old val mask cls cite tag restore timeout_ms win flags rowsha
+  kind S store (read old, compare, write, read back), D doorbell store (no read), R teardown restore, T marker, P poll, X read, W delay.
+  rowsha = sha256(previous rowsha + the fields before it); table_sha256 = the last rowsha (a changed, dropped or reordered row moves it).
+Rules (each prints `WIFI GAP:` and fails; one failing mutant each in tools/test_wlan_tbl_gen.py):
+  UNPARSED  a ` := ` store line of the G2 scope that no pattern parses     MISSING-RESTORE  window/rc/ep stores without their teardown row
+  MBX-PAIR  a slot store not followed by its doorbell row                  EPOCH  item headers whose epoch byte is constant where the log counts
+  OUTSIDE   a store class with no reviewed envelope row                    TIMEOUT  a poll row without timeout_ms
+Tags: obs = value observed in the proven run; cite = the review that covers the class (docs/reviews).
+Last line: RESULT: PASS|FAIL wlan-tbl-gen ..."""
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+HEX = r"(?:0x[0-9a-fA-F]+|0)"
+RE_ST = re.compile(r"SWEET WLAN: G2 store (?P<name>.+?) (?P<sp>off|bp|host) (?P<a>%s)(?: old (?P<old>%s))? := (?P<v>%s)(?: read back (?P<rb>%s))?(?P<tail>.*)$" % (HEX, HEX, HEX, HEX))
+RE_RS = re.compile(r"SWEET WLAN: restore space (?P<sp>\d+) win (?P<win>%s) off (?P<off>%s) := (?P<v>%s) ok" % (HEX, HEX, HEX))
+RE_UNDO = re.compile(r"SWEET WLAN: G2 undo ok")
+COLS = "seq kind sp name addr old val mask cls cite tag restore timeout_ms win flags rowsha".split()
+HEXCOLS = ("addr", "old", "val", "mask", "win")
+# class -> (store name pattern, the review that covers it). A store whose name matches no row is OUTSIDE the envelope.
+ENVELOPE = [
+    ("g2", r"flags2|host_cap|host_trap_addr|(?:h2d|d2h)_[wr]_idx_hostaddr|scratch .*|ring[0-4] .*|rc command|ep command|hostready", "0174-g2-hwwrite-r4"),
+    ("d4b", r"d4b .*", "0174-w-d4b-hwwrite-r2"),
+    ("d4c", r"d4c .*", "0174-w-d4c-hwwrite-r2"),
+    ("d4d", r"d4d .*", "0174-w-d4d-hwwrite-r1"),
+    ("d4e", r"d4e .*", "0174-w-d4e-scan24-l21-hwwrite-r2"),
+]
+CLS_ID = {"g2": 1, "d4b": 2, "d4c": 3, "d4d": 4, "d4e": 5, "rs": 6}
+KIND_C = {"S": "SWT_K_STORE", "D": "SWT_K_DOORBELL", "R": "SWT_K_RESTORE", "P": "SWT_K_POLL", "T": "SWT_K_MARK", "X": "SWT_K_READ", "W": "SWT_K_DELAY"}
+SP_C = {"bp": "SWT_SP_BP", "host": "SWT_SP_HOST", "rc": "SWT_SP_RC", "ep": "SWT_SP_EP", "pcie": "SWT_SP_PCIE", "1": "SWT_SP_R1", "2": "SWT_SP_R2", "3": "SWT_SP_R3", "undo": "SWT_SP_UNDO"}
+
+
+def gap(msg):
+    print("WIFI GAP: %s" % msg)
+
+
+def log_path(p):
+    if os.path.isdir(p):
+        for n in ("usbnet.log", "merged.log"):
+            if os.path.isfile(os.path.join(p, n)):
+                return os.path.join(p, n)
+        raise SystemExit("RESULT: ERROR no usbnet.log/merged.log in %s" % p)
+    return p
+
+
+def num(s):
+    return int(s, 16) if s != "0" else 0
+
+
+def classify(name):
+    for cls, pat, cite in ENVELOPE:
+        if re.fullmatch(pat, name):
+            return cls, cite
+    return None, None
+
+
+def row(kind, sp, name, addr, old, val, mask, cls, cite, flags="-", win=0, timeout=0):
+    return dict(kind=kind, sp=sp, name=name, addr=addr, old=old, val=val, mask=mask, cls=cls, cite=cite, tag="obs", restore="-", timeout_ms=timeout, win=win, flags=flags)
+
+
+def parse_store(n, line, m):
+    """-> (row|None, gap|None)"""
+    name, sp = m.group("name"), m.group("sp")
+    cls, cite = classify(name)
+    if cls is None:
+        return None, "OUTSIDE line %d: store '%s' is in no reviewed envelope class" % (n, name)
+    a, v = num(m.group("a")), num(m.group("v"))
+    db = "golden writes only" in m.group("tail")
+    old = 0 if db else num(m.group("old") or "0")
+    rb = v if db else num(m.group("rb") or "0")
+    mask = 0xFFFFFFFF
+    if not db and rb != v:
+        mask = 0xFFFF
+        if (old & 0xFFFF0000) | (v & 0xFFFF) != rb:
+            return None, "UNPARSED line %d: read back %#x is not old %#x under a 16-bit mask with %#x" % (n, rb, old, v)
+    if sp == "off":
+        sp = "rc" if name == "rc command" else "ep" if name == "ep command" else "pcie"   # SWG_SP_RC / SWG_SP_EP / SWG_SP_PCIE (swg_g2 table)
+    return row("D" if db else "S", sp, name, a, old, v, mask, cls, cite, ("w16" if "16-bit store" in m.group("tail") else "noold" if not db and m.group("old") is None else "-")), None
+
+
+def parse(path):
+    """-> (rows, gaps[str], slice_lines); the scope starts at the first `G2 store` line."""
+    rows, gaps, sl, started = [], [], [], False
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if "SWEET WLAN:" not in line:
+                continue
+            m = RE_ST.search(line)
+            if "G2 store " in line and not m and " := " in line:
+                gaps.append("UNPARSED line %d: %s" % (n, line[:160]))
+            elif m:
+                started = True
+                sl.append(line)
+                r, g = parse_store(n, line, m)
+                if g:
+                    gaps.append(g)
+                else:
+                    rows.append(r)
+            elif started and RE_RS.search(line):
+                sl.append(line)
+                r = RE_RS.search(line)
+                rows.append(row("R", r.group("sp"), "restore", num(r.group("off")), 0, num(r.group("v")), 0xFFFFFFFF, "rs", "0129-sweet-wlan-chip-writes", win=num(r.group("win"))))
+            elif started and RE_UNDO.search(line):
+                sl.append(line)
+                rows.append(row("T", "undo", "undo ok", 0, 0, 0, 0, "rs", "0174-g2-hwwrite-r4", "undo"))
+    return rows, gaps, sl
+
+
+def rules(rows):
+    """The table rules over rows; returns gap strings."""
+    g = []
+    rs = [r for r in rows if r["kind"] == "R"]
+    if any(r["name"] in ("rc command", "ep command") for r in rows) and not any(r["flags"] == "undo" for r in rows):
+        g.append("MISSING-RESTORE: rc/ep command stores without the `G2 undo ok` teardown row")
+    if any(r["sp"] == "bp" and r["addr"] >= 0x400000 for r in rows) and not any(r["sp"] == "1" and r["addr"] == 0x84 and r["val"] == 0 for r in rs):
+        g.append("MISSING-RESTORE: no `restore space 1 ... off 0x84 := 0` (BAR2 window) teardown row")
+    for r in rows:
+        if r["kind"] == "P" and r["timeout_ms"] <= 0:
+            g.append("TIMEOUT: poll row %s has no timeout_ms" % r["name"])
+    for i, r in enumerate(rows):
+        if re.fullmatch(r"d4[cd] .*(h2d_w|d2h_r) slot.*", r["name"]) and r["kind"] == "S":
+            nx = rows[i + 1] if i + 1 < len(rows) else None
+            if nx is None or nx["kind"] != "D":
+                g.append("MBX-PAIR: row %d (%s) is not followed by its doorbell row" % (i, r["name"]))
+            elif (nx["val"] & 0xFFFF) != (r["val"] & 0xFFFF) or (nx["val"] >> 16) not in (0xFF00, 0xDD02):
+                g.append("MBX-PAIR: row %d doorbell %#x does not carry slot value %#x" % (i + 1, nx["val"], r["val"]))
+    hdr, run = [], 0
+    for r in rows:
+        if r["name"] == "d4d item word":
+            if run % 10 == 0:
+                hdr.append(r["val"] >> 24)
+            run += 1
+        else:
+            run = 0
+    if len(hdr) > 2 and len(set(hdr)) == 1:
+        g.append("EPOCH: all %d item headers carry epoch byte %#x (constant where a counter is required)" % (len(hdr), hdr[0]))
+    return g
+
+
+def cell(r, c):
+    return "%#x" % r[c] if c in HEXCOLS else str(r[c])
+
+
+def chain(rows):
+    prev = "0" * 64
+    for i, r in enumerate(rows):
+        r["seq"] = i
+        prev = hashlib.sha256((prev + "\t".join(cell(r, c) for c in COLS[:-1])).encode()).hexdigest()
+        r["rowsha"] = prev
+    return prev
+
+
+def load_tsv(path):
+    rows, sha = [], None
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line.startswith("# table_sha256 "):
+            sha = line.split()[2]
+        if not line or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) != len(COLS):
+            raise SystemExit("RESULT: ERROR table line has %d columns, want %d: %s" % (len(f), len(COLS), line[:80]))
+        r = dict(zip(COLS, f))
+        for c in ("seq", "timeout_ms"):
+            r[c] = int(r[c])
+        for c in HEXCOLS:
+            r[c] = int(r[c], 16)
+        rows.append(r)
+    return rows, sha
+
+
+def table_text(rows, label, sha):
+    h = ["# wlan msgbuf store table, run %s" % label, "# columns: " + " ".join(COLS), "# table_sha256 %s" % sha, "# rows %d" % len(rows)]
+    return "\n".join(h + ["\t".join(cell(r, c) for c in COLS) for r in rows]) + "\n"
+
+
+def c_header(rows, sha):
+    o = ["/* generated by tools/wlan-tbl-gen from the proven run; do not edit (the host test checks the sha) */",
+         "#define SWT_TABLE_SHA256 \"%s\"" % sha, "#define SWT_TABLE_ROWS %du" % len(rows),
+         "static const struct swt_row swt_table[SWT_TABLE_ROWS] = {"]
+    for r in rows:
+        o.append("\t{ %s, %s, %d, %d, %#x, %#x, %#x, %#x, %du, %#x, \"%s\" }," % (
+            KIND_C[r["kind"]], SP_C.get(r["sp"], "SWT_SP_R1"), CLS_ID[r["cls"]], {"w16": 1, "noold": 2}.get(r["flags"], 0),
+            r["addr"], r["old"], r["val"], r["mask"], r["timeout_ms"], r["win"], r["name"]))
+    return "\n".join(o + ["};"]) + "\n"
+
+
+def cmd_gen(a):
+    rows, gaps, sl = parse(log_path(a.run))
+    gaps += rules(rows)
+    if not rows and not gaps:
+        gaps.append("UNPARSED: no G2 store line in the input")
+    for x in gaps:
+        gap(x)
+    if gaps:
+        print("RESULT: FAIL wlan-tbl-gen gen gaps=%d" % len(gaps))
+        return 2
+    sha = chain(rows)
+    for path, text in ((a.tsv, table_text(rows, a.label, sha)), (a.hdr, c_header(rows, sha)), (a.slice, "\n".join(sl) + "\n")):
+        if path:
+            open(path, "w").write(text)
+    cnt = {}
+    for r in rows:
+        k = "%s/%s" % (r["cls"], r["sp"])
+        cnt[k] = cnt.get(k, 0) + 1
+    print("classes: " + " ".join("%s=%d" % kv for kv in sorted(cnt.items())))
+    print("RESULT: PASS wlan-tbl-gen gen rows=%d table_sha256=%s gaps=0" % (len(rows), sha))
+    return 0
+
+
+def cmd_check(a):
+    log_rows, gaps, _ = parse(log_path(a.run))
+    tbl, want = load_tsv(a.tsv)
+    gaps += rules(tbl)
+    sha = chain([dict(r) for r in tbl])
+    if want and sha != want:
+        gaps.append("SHA: the rows chain to %s, the header says %s (a row was changed, dropped or reordered)" % (sha[:12], want[:12]))
+    key = lambda r: (r["kind"], r["sp"], r["name"], r["addr"], r["old"], r["val"], r["mask"])
+    lk, tk = [key(r) for r in log_rows], [key(r) for r in tbl]
+    if len(lk) != len(tk):
+        gaps.append("DROPPED: the log has %d rows, the table %d" % (len(lk), len(tk)))
+    for i, (x, y) in enumerate(zip(lk, tk)):
+        if x != y:
+            gaps.append("%s: row %d log %s != table %s" % ("REORDER" if y in lk else "CHANGED", i, x[2:], y[2:]))
+            break
+    for x in gaps:
+        gap(x)
+    if gaps:
+        print("RESULT: FAIL wlan-tbl-gen check gaps=%d" % len(gaps))
+        return 1
+    print("RESULT: PASS wlan-tbl-gen check rows=%d table_sha256=%s gaps=0" % (len(tbl), sha))
+    return 0
+
+
+def cmd_header_check(a):
+    tbl, want = load_tsv(a.tsv)
+    sha = chain(tbl)
+    ok = sha == want and open(a.hdr).read() == c_header(tbl, sha)
+    print("RESULT: %s wlan-tbl-gen header-check table_sha256=%s" % ("PASS" if ok else "FAIL", sha))
+    return 0 if ok else 1
+
+
+def cmd_sha(a):
+    tbl, want = load_tsv(a.tsv)
+    sha = chain(tbl)
+    ok = want in (None, sha)
+    print("RESULT: %s wlan-tbl-gen sha table_sha256=%s" % ("PASS" if ok else "FAIL", sha))
+    return 0 if ok else 1
+
+
+def self_test():
+    """Minimal inline fixture (the full proven-run mutant matrix is tools/test_wlan_tbl_gen.py)."""
+    import tempfile
+    log = ["[1.0] SWEET WLAN: G2 store rc command off 0x4 old 0x100000 := 0x507 read back 0x100507",
+           "[1.1] SWEET WLAN: G2 store ring0 base bp 0x427f5c old 0 := 0x84db4000 read back 0x84db4000",
+           "[1.2] SWEET WLAN: G2 undo ok (ep restored)",
+           "[1.3] SWEET WLAN: restore space 1 win 0 off 0x84 := 0 ok"]
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "x.log")
+    open(p, "w").write("\n".join(log) + "\n")
+    rows, gaps, _ = parse(p)
+    ok = len(rows) == 4 and not gaps and not rules(rows) and rows[0]["mask"] == 0xFFFF
+    open(p, "w").write("\n".join(log[:2] + ["[1.0] SWEET WLAN: G2 store zzz bp 0x1 := ??"] + log[2:]) + "\n")
+    ok = ok and bool(parse(p)[1])
+    print("RESULT: %s wlan-tbl-gen self-test" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    p = argparse.ArgumentParser()
+    s = p.add_subparsers(dest="cmd", required=True)
+    g = s.add_parser("gen")
+    g.add_argument("--run", required=True)
+    g.add_argument("--label", default="?")
+    for k in ("tsv", "hdr", "slice"):
+        g.add_argument("--" + k)
+    c = s.add_parser("check")
+    c.add_argument("--run", required=True)
+    c.add_argument("--tsv", required=True)
+    k = s.add_parser("header-check")
+    k.add_argument("--tsv", required=True)
+    k.add_argument("--hdr", required=True)
+    h = s.add_parser("sha")
+    h.add_argument("--tsv", required=True)
+    a = p.parse_args(argv)
+    return {"gen": cmd_gen, "check": cmd_check, "sha": cmd_sha, "header-check": cmd_header_check}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

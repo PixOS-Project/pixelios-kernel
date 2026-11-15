@@ -128,6 +128,7 @@ def check_dt():
     assert "ip-ver = <0x984500>" in DT_PCIE.read_text()
     soc = json.loads(SOC.read_text())["wlan"]
     assert re.search(r"0x0\s+0x14800000\s+0x301000\s*/\*\s*DBI base", DT_PCIE.read_text()), "pcie_1 DBI reg is no longer 0x14800000 size 0x301000"
+    __import__("gen_wlan_h1").check_hsi2_pair(DT_PCIE, soc)
     assert int(soc["atu"], 0) == int(soc["dbi"], 0) + 0x300000, "soc.json wlan atu must be dbi + 0x300000 (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20; inside the 0x301000 DBI reg)"
     assert re.search(r"0x0\s+0x60FFE000\s+0x2000\s*/\*\s*configuration space", DT_PCIE.read_text()), "pcie_1 config reg is no longer 0x60FFE000 size 0x2000"
     pcie1 = DT_PCIE.read_text()
@@ -136,8 +137,7 @@ def check_dt():
     assert int(soc["mem"], 0) == 0x60000000, "soc.json wlan mem must be the pcie_1 MEM range start 0x60000000 (pcie.dtsi:76)"
     b = dt_blocks()
     assert int(soc["cfg"], 0) == b["configuration space"] == 0x60FFE000, "soc.json wlan cfg must be the pcie_1 'config' reg 0x60FFE000 (pcie.dtsi:62; pcie_0 has 0x40FFE000 at :20)"
-    want = {"elbi base": soc["elbi"], "phy base": soc["pma"], "sysreg base": soc["sysreg"], "DBI base": soc["dbi"], "phy pcs base": soc["pcs"], "I/A space": soc["ia"]}
-    for k, v in want.items():
+    for k, v in {"elbi base": soc["elbi"], "phy base": soc["pma"], "sysreg base": soc["sysreg"], "DBI base": soc["dbi"], "phy pcs base": soc["pcs"], "I/A space": soc["ia"]}.items():
         assert b[k] == int(v, 0), f"soc.json wlan {k} {v} != pcie.dtsi {b[k]:#x}"
     return b
 

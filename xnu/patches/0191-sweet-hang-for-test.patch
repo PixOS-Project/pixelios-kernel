@@ -1,0 +1,78 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,51 @@
+ uint64_t sweet_ufs_stat[6];
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
++extern int sweet_restart_armed(void);   /* bsd/dev/sweet_restart.c (patch 0191) */
++extern uint32_t processor_avail_count;  /* osfmk/kern/processor.c */
++
++/*
++ * Test hook for the recovery path (T-c170): boot-arg sweethang=1 stops this thread (the kernel bootstrap thread, bound to
++ * the boot CPU) in a spin loop right before the USB device is started, so USB never comes up. Only another kernel thread can
++ * then fire the sweetrestart timer: the QR thread (boot-arg sweetqr=N polls it, sweet_qr.c) on a secondary CPU. The hook
++ * therefore REFUSES (logged, no hang) unless sweetqr > 0, the timer is armed and at least 2 CPUs are online (it waits up
++ * to 10 s for all of them), so a hang that nothing could end never happens. Absent or 0 = off; any other value is
++ * logged and ignored (no silent ignore); a bare `sweethang` token parses as 1.
++ */
++static void
++sweet_hang_for_test(void)
++{
++	uint32_t hang = 0, qr = 0;
++	unsigned want, i;
++
++	if (!PE_parse_boot_argn("sweethang", &hang, sizeof(hang)) || hang == 0) {
++		return;
++	}
++	if (hang != 1) {
++		printf("SWEET HANG GAP: sweethang=%u unknown (only 1 = spin before USB), ignored\n", hang);
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetqr", &qr, sizeof(qr));
++	if (qr == 0 || !sweet_restart_armed()) {
++		printf("SWEET HANG GAP: sweethang=1 refused: sweetqr=%u restart-armed=%d, no thread would fire sweetrestart, not hanging\n",
++		    qr, sweet_restart_armed());
++		return;
++	}
++	want = ml_get_cpu_count();
++	for (i = 0; i < 100 && os_atomic_load(&processor_avail_count, relaxed) < want; i++) {
++		delay(100 * 1000);
++	}
++	if (want < 2 || os_atomic_load(&processor_avail_count, relaxed) < 2) {
++		printf("SWEET HANG GAP: sweethang=1 refused: %u/%u CPUs online, the QR thread could not run, not hanging\n",
++		    os_atomic_load(&processor_avail_count, relaxed), want);
++		return;
++	}
++	printf("SWEET HANG: sweethang=1, hanging on purpose before the USB device starts (%u/%u CPUs online, sweetqr=%u; test of the recovery path)\n",
++	    os_atomic_load(&processor_avail_count, relaxed), want, qr);
++	for (;;) {
++		__asm__ volatile ("yield");
++	}
++}
+ extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
+ extern void sweet_touch_gs101_init(void);
+ extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
+@@ -660,6 +705,7 @@
+ 	static bool usb_probed;
+ 	if (!usb_probed) {
+ 		usb_probed = true;
++		sweet_hang_for_test();
+ 		sweet_usb_probe();
+ 	}
+ 
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -90,6 +90,13 @@
+ static uint64_t sweet_restart_deadline;       /* mach absolute time, 0 = off */
+ static int sweet_restart_bl;
+ 
++/* 1 while the sweetrestart timer is armed and has not fired (patch 0191: the hang test hook refuses without it). */
++int
++sweet_restart_armed(void)
++{
++	return sweet_restart_deadline != 0;
++}
++
+ /*
+  * Polled from threads that are known to run (the persistent-log thread in sweet_ufs.c and the QR thread): a dedicated
+  * sleeping thread never fired on hardware in 3 of 4 runs (cause unknown), a missed reset costs a button press.

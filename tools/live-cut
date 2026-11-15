@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""live-cut: one run dir per hot-reload iteration, cut out of a LIVE session's USB log (user 2026-11-09: GPU/BT loops on hot reload).
+
+A hot-reload session is one long boot (`tools/phone-lock run --detach -- tools/xrun --overlay TREE --duration S`, devd in the tree,
+`tools/hot` pushes/restarts). xrun keeps appending the phone's UDP log to <session run dir>/usbnet.log. The scorers read a run dir
+(tools/gpu-fps-bench RUN_DIR, tools/gpu-nav-score RUN_DIR: both only usbnet.log), so an iteration needs its own slice of that log:
+
+  live-cut begin LABEL [--session DIR]   remember the session's current end of usbnet.log for LABEL (state in DIR/live-cuts.json)
+  live-cut end LABEL [--session DIR]     write logs/runs/<UTC>-LABEL/ with usbnet.log = the bytes since `begin` (whole lines),
+                                         run.json {label, session, from, to, live_cut: 1}; prints `LIVE CUT: <dir> ...`; score it with
+                                         tools/gpu-fps-bench <dir> / tools/gpu-nav-score <dir>
+  live-cut list [--session DIR]          the cuts of the session
+
+Shared hot session (tools/hot_shared.py): with `--owner ME` (else $HOT_OWNER) `begin` waits for ME's turn in the FIFO queue (guests and the owner take
+turns, `--turn-wait S`, cap = the session --turn-max) and `end` hands the turn on; without --owner a shared session refuses (the cut would mix iterations).
+The session dir defaults to the shared session's run dir, so a guest in another checkout finds it.
+--session default: the newest logs/runs/*/ of this checkout whose usbnet.log grew in the last 120 s (the live session); none = exit 2.
+Last line RESULT: PASS|FAIL|ERROR live-cut ...; exit 0 ok, 2 usage/no session. Stdlib only, host only (never touches the phone).
+"""
+import argparse, json, os, re, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hot_shared as hs  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNS = os.path.join(ROOT, "logs", "runs")
+
+
+def out(code, msg):
+    print(msg)
+    print("RESULT: %s live-cut" % ("PASS" if code == 0 else "ERROR"))
+    return code
+
+
+def live_session():
+    best = None
+    try:
+        names = os.listdir(RUNS)
+    except FileNotFoundError:   # lint-silent: expected no run dir in this checkout yet: no session (decided by the caller)
+        return None
+    for n in names:
+        p = os.path.join(RUNS, n, "usbnet.log")
+        try:
+            m = os.stat(p).st_mtime
+        except FileNotFoundError:   # lint-silent: expected a run dir without a USB log (--no-usbnet run): not a session
+            continue
+        if os.path.exists(os.path.join(RUNS, n, "live-cut.marker")):   # a cut made by this tool, never a session
+            continue
+        if time.time() - m < 120 and (best is None or m > best[0]):
+            best = (m, os.path.join(RUNS, n))
+    return best[1] if best else None
+
+
+def state(sess):
+    p = os.path.join(sess, "live-cuts.json")
+    try:
+        with open(p) as f:
+            return p, json.load(f)
+    except FileNotFoundError:   # lint-silent: expected no cut was begun in this session yet
+        return p, {}
+
+
+def save(p, st):
+    tmp = p + ".%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="live-cut")
+    ap.add_argument("op", choices=("begin", "end", "list"))
+    ap.add_argument("label", nargs="?")
+    ap.add_argument("--session")
+    ap.add_argument("--owner", default=os.environ.get("HOT_OWNER"))
+    ap.add_argument("--turn-wait", type=float, default=1800)
+    a = ap.parse_args()
+    shared = hs.active_or_none() if a.op in ("begin", "end") else None
+    if shared:
+        if not a.owner:
+            return out(2, "live-cut: a shared hot session of %s runs: pass --owner NAME (or $HOT_OWNER) so the cut takes its turn; guests: tools/hot join first" % shared[0]["owner"])
+        try:
+            hs.role(a.owner)
+        except hs.Refused as e:
+            return out(2, "live-cut: %s" % e)
+    sess = a.session or (shared and hs.run_dir(shared[0])) or live_session()
+    if not sess or not os.path.isfile(os.path.join(sess, "usbnet.log")):
+        return out(2, "live-cut: no live session (no logs/runs/*/usbnet.log written in the last 120 s here; pass --session DIR)")
+    p, st = state(sess)
+    log = os.path.join(sess, "usbnet.log")
+    if a.op == "list":
+        for k, v in sorted(st.items()):
+            print("cut %s from %s to %s%s" % (k, v.get("from"), v.get("to", "-"), (" dir " + v["dir"]) if v.get("dir") else ""))
+        return out(0, "live-cut: session %s, %d cut(s)" % (sess, len(st)))
+    if not a.label or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", a.label):
+        return out(2, "live-cut: %s needs a LABEL of letters, digits, . _ -" % a.op)
+    size = os.path.getsize(log)
+    if a.op == "begin":
+        if shared:
+            try:
+                hs.take(a.owner, a.turn_wait)   # explicit turn (cap only): kept until `end`, so the iteration is not interleaved
+            except hs.Refused as e:
+                return out(2, "live-cut: %s" % e)
+            size = os.path.getsize(log)   # the turn may have waited: begin where MY iteration starts
+        st[a.label] = {"from": size, "began": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        if shared:
+            st[a.label]["owner"] = a.owner
+        save(p, st)
+        return out(0, "live-cut: %s begins at byte %d of %s" % (a.label, size, log))
+    if a.label not in st:
+        return out(2, "live-cut: no `begin %s` in session %s" % (a.label, sess))
+    start = st[a.label]["from"]
+    with open(log, "rb") as f:
+        f.seek(start)
+        data = f.read(size - start)
+    cut = data.rfind(b"\n") + 1   # whole lines only: the next line may still be arriving
+    data = data[:cut]
+    d = os.path.join(RUNS, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + a.label)
+    os.makedirs(d)
+    with open(os.path.join(d, "usbnet.log"), "wb") as f:
+        f.write(data)
+    open(os.path.join(d, "live-cut.marker"), "w").close()
+    with open(os.path.join(d, "run.json"), "w") as f:
+        json.dump({"label": a.label, "session": sess, "from": start, "to": start + len(data), "live_cut": "1"}, f, indent=1)
+    st[a.label].update({"to": start + len(data), "dir": d})
+    save(p, st)
+    if shared:
+        try:
+            hs.release(a.owner)
+        except hs.Refused as e:   # the turn cap expired mid-iteration: the cut may include another thread's lines
+            print("SWEET GAP: live-cut: %s (the cut %s may contain the next thread's iteration)" % (e, d))
+    return out(0, "LIVE CUT: %s (%d bytes, %d lines of %s)" % (d, len(data), data.count(b"\n"), log))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

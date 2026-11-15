@@ -1,0 +1,7 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,5 +1,6 @@
+ {
++	printf("%d", dev->ops->read32(a));
+ }

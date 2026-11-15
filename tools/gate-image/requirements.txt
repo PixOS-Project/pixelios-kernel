@@ -1,0 +1,5 @@
+# pip wheels of the gate image (lab-host versions 2026-10-29); installed offline: pip install --no-index --no-deps --require-hashes --find-links wheels -r requirements.txt
+lz4==4.4.5 --hash=sha256:451039b609b9a88a934800b5fc6ee401c89ad9c175abf2f4d9f8b2e4ef1afc64
+numpy==2.5.4 --hash=sha256:6ffa07666f8da0eef81d149934a626d0d95fbd6838432a33e66245423a9062c0
+opencv_python_headless==5.0.0.93 --hash=sha256:09a872a157c1376ab922a69bbf22f9a95bcc7b658a9d8b436a60212b02b2eeb4
+pillow==12.3.0 --hash=sha256:0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3

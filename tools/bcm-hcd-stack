@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""bcm-hcd-stack: build a LOCAL patch stack that fills the empty BCM.hcd slot of patch 0218 (T-86c9, W-BTUP). The firmware never enters git (rule 4).
+
+    tools/bcm-hcd-stack --hcd FILE --out DIR [--sha256 HEX | --any-sha256] [--stack xnu/patches]
+    tools/xnu-local-build --stack DIR --label NAME
+
+DIR (outside the repo, e.g. under the artifacts dir) gets symlinks to every file of the stack plus `9000-sweet-bt-hcd-image.patch`, a generated diff of
+bsd/dev/sweet_bt_hcd.c (stub from patch 0218 -> the bytes of FILE). The stack hash of xnu-local-build covers the generated patch, so a different FILE rebuilds.
+Refuses (exit 2, nothing written) when: FILE is not a record stream of 0xfc4c writes + one final 0xfc4e launch (4 bytes), the sha256 differs from --sha256 (default: the stock
+BP31 BCM.hcd hash; --any-sha256 skips the comparison and the kernel then logs `stock=no` + a BT GAP), DIR (or its first existing ancestor) is inside a git work tree or cannot be
+checked (fail closed), DIR exists, is not empty and is not a directory this tool made (marker `.bcm-hcd-stack`; review T-60ed F1: nothing in a foreign directory is deleted).
+A rerun removes only the symlinks and the generated patch of its own directory.
+Prints `RESULT: PASS bcm-hcd-stack sha256=<h> size=<n> records=<n> stack=<DIR>` (exit 0).
+"""
+import argparse, hashlib, os, pathlib, subprocess, sys
+
+STOCK_SHA = "450f8c66f76b96da65c83f5d380922f55e1e4a4e661cd61b0109c53249e0d8d1"     # the stock BP31 BCM.hcd (a hash, not firmware); docs/research/BT-rom-vs-patched.md
+MARKER = ".bcm-hcd-stack"
+GEN = "9000-sweet-bt-hcd-image.patch"
+
+HERE = pathlib.Path(__file__).resolve().parent
+STUB_PREFIX = 3     # first context line of the hunk in the 0218 stub (see the patch)
+
+
+def scan(b):
+    off, nw, nl = 0, 0, 0
+    while off < len(b):
+        if len(b) - off < 3:
+            raise ValueError(f"{len(b) - off} trailing bytes at {off} are not a record header")
+        op, pl = b[off] | b[off + 1] << 8, b[off + 2]
+        if len(b) - off < 3 + pl:
+            raise ValueError(f"record at {off} claims {pl} bytes, {len(b) - off - 3} left")
+        if op == 0xfc4c and nl == 0:
+            nw += 1
+        elif op == 0xfc4e and nl == 0 and pl == 4 and off + 3 + pl == len(b):
+            nl += 1
+        else:
+            raise ValueError(f"record at {off} has opcode {op:#06x} plen {pl} (only 0xfc4c writes and one final 4-byte 0xfc4e are allowed)")
+        off += 3 + pl
+    if nw == 0 or nl != 1:
+        raise ValueError(f"{nw} write and {nl} launch records")
+    return nw + nl
+
+
+def gen_patch(b, sha):
+    rows = ["\t" + ", ".join(f"0x{x:02x}" for x in b[i:i + 16]) + "," for i in range(0, len(b), 16)]
+    rows[-1] = rows[-1][:-1]
+    new = 6 + len(rows)
+    out = ["diff --git a/bsd/dev/sweet_bt_hcd.c b/bsd/dev/sweet_bt_hcd.c", "--- a/bsd/dev/sweet_bt_hcd.c", "+++ b/bsd/dev/sweet_bt_hcd.c",
+           f"@@ -{STUB_PREFIX},7 +{STUB_PREFIX},{new} @@",
+           " #include <stdint.h>", " #include <stddef.h>", " const uint8_t sweet_bt_hcd_data[] = {", "-\t0"]
+    out += ["+" + r for r in rows]
+    out += [" };", "-const size_t sweet_bt_hcd_len = 0;", '-const char sweet_bt_hcd_sha256[] = "none";',
+            f"+const size_t sweet_bt_hcd_len = {len(b)};", f'+const char sweet_bt_hcd_sha256[] = "{sha}";']
+    return "\n".join(out) + "\n"
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--hcd", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--sha256")
+    ap.add_argument("--any-sha256", action="store_true", help="do not compare with the stock hash (a non-stock file is then NOT what the HAL sends)")
+    ap.add_argument("--stack", default=str(HERE.parent / "xnu" / "patches"))
+    a = ap.parse_args(argv)
+    b = pathlib.Path(a.hcd).read_bytes()
+    sha = hashlib.sha256(b).hexdigest()
+    try:
+        n = scan(b)
+    except ValueError as e:
+        print(f"RESULT: ERROR bcm-hcd-stack: {a.hcd} is not a BCM.hcd record stream: {e}")
+        return 2
+    if a.any_sha256 and a.sha256:
+        print("RESULT: ERROR bcm-hcd-stack: --sha256 and --any-sha256 exclude each other")
+        return 2
+    expected = None if a.any_sha256 else (a.sha256 or STOCK_SHA).lower()
+    if expected is not None and expected != sha:
+        print(f"RESULT: ERROR bcm-hcd-stack: sha256 {sha} differs from the expected {expected}; this is not the file the stock HAL sends (a different vendor build? --any-sha256 overrides)")
+        return 2
+    out = pathlib.Path(a.out).resolve()
+    probe = out
+    while not probe.exists():       # review T-60ed F2: check the first existing ancestor, the parent of a missing DIR may not exist either
+        probe = probe.parent
+    try:
+        g = subprocess.run(["git", "-C", str(probe), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+    except OSError as e:
+        print(f"RESULT: ERROR bcm-hcd-stack: cannot run git to check that {out} is outside a work tree ({e}); refusing (fail closed)")
+        return 2
+    if g.returncode == 0:
+        print(f"RESULT: ERROR bcm-hcd-stack: {out} is inside a git work tree; firmware must stay outside git (rule 4). Use a directory under the artifacts dir")
+        return 2
+    if "not a git repository" not in g.stderr:
+        print(f"RESULT: ERROR bcm-hcd-stack: git could not tell whether {out} is outside a work tree (rc {g.returncode}); refusing (fail closed)")
+        return 2
+    stack = pathlib.Path(a.stack).resolve()
+    if not (stack / "0228-bt-patchram.patch").is_file():
+        print(f"RESULT: ERROR bcm-hcd-stack: {stack} has no 0228-bt-patchram.patch (patch 0218 carried as 0228, T-0d4e)")
+        return 2
+    if out.exists() and (not out.is_dir() or (any(out.iterdir()) and not (out / MARKER).is_file())):
+        print(f"RESULT: ERROR bcm-hcd-stack: {out} exists and is not a directory made by this tool (no {MARKER}); nothing deleted. Use a new or empty directory")
+        return 2
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.iterdir():
+        if old.is_symlink() or old.name == GEN:
+            old.unlink()
+    (out / MARKER).write_text("directory of tools/bcm-hcd-stack; its symlinks and the generated patch are replaced on a rerun\n")
+    for f in sorted(stack.iterdir()):
+        if f.is_file() and f.suffix in (".patch", ".sh"):
+            (out / f.name).symlink_to(f)
+    (out / GEN).write_text(gen_patch(b, sha))
+    print(f"RESULT: PASS bcm-hcd-stack sha256={sha} size={len(b)} records={n} stack={out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,115 @@
+#!/bin/bash
+# gate-request: start a formal gate on a checkout, but only after its seconds-long lint steps pass (AP-278, R42 2nd occurrence).
+#   tools/gate-request --repo DIR --label L [--formal] [--reason "why a formal gate on this head"]
+# 0. (T-db59 L2 layer rule; T-cb93 built it) the formal gate runs on the trunk merge SHA only: HEAD must be a merge commit (>=2 parents) or equal the tip of a trunk ref
+#    (GATE_TRUNK_REFS, default "trunk main master"); any other head is refused (RESULT: FAIL gate-request head=SHA not-merge-not-trunk) unless --reason "..." (non-empty; echoed
+#    as "gate-request: L2 override head=SHA reason=...").
+#    A refusal first prints `REFUSED: formal is L2 (merge SHA or nightly); run tools/gate --quick, or --reason "..."`. --formal is accepted and changes nothing (this tool only starts the formal gate).
+# 1. refuses a dirty tree anywhere (check-all.sh marks any dirty path +dirty and writes no stamp; the gate sees HEAD only): RESULT: FAIL gate-request dirty=N (N = porcelain lines, untracked included).
+# 1b. (T-1386) tools/gate-trunk-check --repo DIR: gate tooling (check-all.sh, heavy-job, ...) behind trunk -> RESULT: FAIL gate-request gate-trunk-check, no gate.
+# 2. runs tools/gate-lint-first --repo DIR; on FAIL prints its RESULT line (prefixed "gate-request: not started:") and exits 1 WITHOUT a gate.
+# 3. on PASS: tools/heavy-job detach --label L --log /tmp/gate-L-<epoch>-<pid>.log (symlink /tmp/gate-L.log -> latest) -- bash -c "DIR/tools/gate-xnu-build --repo DIR --label L; echo xrc=$?;
+#    HEAVY_JOB_WAIT=7200 DIR/tools/check-all.sh; echo rc=$?" (T-c68c: wrapped in heavy-job run --class gate --remote-cmd: the remote host first, local only when the remote host is unreachable/refuses) and prints the unit name and log path.
+# Env GATE_REQUEST_DRY=1: print the heavy-job command line ("DRY: ...") instead of running it (used by tools/test_gate_lint_first.py).
+# Exit 0 started (or DRY) / 1 refused / 2 usage or heavy-job error. LABEL is [A-Za-z0-9][A-Za-z0-9._-]* (as gate-xnu-build) and DIR a path without quotes or spaces (they go into a bash -c string).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+repo=; label=; reason=; have_reason=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	--repo) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-request --repo needs a value"; exit 2; }; repo=$2; shift 2 ;;
+	--label) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-request --label needs a value"; exit 2; }; label=$2; shift 2 ;;
+	--formal) shift ;;
+	--reason) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-request --reason needs a value"; exit 2; }; reason=$2; have_reason=1; shift 2 ;;
+	*) echo "usage: tools/gate-request --repo DIR --label L [--formal] [--reason TEXT]"; echo "RESULT: ERROR gate-request unknown argument '$1'"; exit 2 ;;
+	esac
+done
+[ -n "$repo" ] && [ -n "$label" ] || { echo "usage: tools/gate-request --repo DIR --label L [--formal] [--reason TEXT]"; echo "RESULT: ERROR gate-request needs --repo and --label"; exit 2; }
+if [ "$have_reason" = 1 ] && [ -z "$(printf '%s' "$reason" | tr -d '[:space:]')" ]; then echo "RESULT: ERROR gate-request --reason must not be empty"; exit 2; fi
+[ -d "$repo" ] || { echo "RESULT: ERROR gate-request no such directory $repo"; exit 2; }
+repo=$(cd "$repo" && pwd -P)
+case $label in [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) echo "RESULT: ERROR gate-request label '$label' is not [A-Za-z0-9][A-Za-z0-9._-]*"; exit 2 ;; esac
+case $repo in *[!A-Za-z0-9._/+-]*) echo "RESULT: ERROR gate-request path '$repo' has a character outside [A-Za-z0-9._/+-]"; exit 2 ;; esac
+
+st=$(git -C "$repo" status --porcelain 2>&1) || { echo "RESULT: ERROR gate-request git status failed in $repo: $st"; exit 2; }
+if [ -n "$st" ]; then
+	n=$(printf '%s\n' "$st" | wc -l)
+	printf '%s\n' "$st" | head -10 | sed 's/^/  dirty: /'
+	echo "RESULT: FAIL gate-request dirty=$n (commit or stash: the gate sees HEAD only and a +dirty PASS writes no stamp)"
+	exit 1
+fi
+
+# L2 layer rule (T-db59): merge SHA or trunk tip, else --reason.
+head=$(git -C "$repo" rev-parse --verify -q HEAD 2>/dev/null) || { echo "RESULT: ERROR gate-request no HEAD commit in $repo"; exit 2; }
+nparents=$(git -C "$repo" rev-list --parents -n 1 HEAD | wc -w)   # words = sha + parents
+l2ok=0
+[ "$nparents" -ge 3 ] && l2ok=1
+for r in ${GATE_TRUNK_REFS:-trunk main master}; do
+	t=$(git -C "$repo" rev-parse --verify -q "refs/heads/$r" 2>/dev/null) && [ "$t" = "$head" ] && l2ok=1
+done
+if [ "$l2ok" = 0 ]; then
+	if [ "$have_reason" = 0 ]; then
+		echo 'REFUSED: formal is L2 (merge SHA or nightly); run tools/gate --quick, or --reason "..."'
+		echo "RESULT: FAIL gate-request head=${head:0:12} not-merge-not-trunk (L2 formal gate runs on the trunk merge SHA or the nightly; merge first, or pass --reason \"why this head\" for a branch-head gate)"
+		exit 1
+	fi
+	echo "gate-request: L2 override head=${head:0:12} reason=$reason"
+fi
+
+# T-1386: the gate runs $repo/tools/check-all.sh and heavy-job; a branch whose gate tooling is behind trunk is refused (tools/gate-trunk-check), so a gate fix reaches every branch.
+tc=$("$here/gate-trunk-check" --repo "$repo" 2>&1); trc=$?
+printf '%s\n' "$tc"
+if [ $trc -ne 0 ]; then
+	echo "RESULT: FAIL gate-request gate-trunk-check rc=$trc (no gate slot used; merge trunk first, or GATE_TOOLING_OVERRIDE=\"why\")"
+	exit 1
+fi
+
+# R30: the shared repo and its hooks are audited first (core.bare, local user config, hook copies, fixture leftovers, stray root files, stale index): a corrupted repo costs every gate after it
+if [ -f "$here/repo-health" ]; then
+	python3 "$here/repo-health" --repair-index --repo "$repo" >/dev/null 2>&1   # the dispatcher advances trunk by ref update, which leaves the shared checkout's index stale: repair it first (refuses anything that is not provably a stale index)
+	rh=$(python3 "$here/repo-health" --repo "$repo" 2>&1); rhrc=$?
+	if [ "$rhrc" != 0 ]; then
+		printf '%s\n' "$rh" | grep -E '^(FAIL|RESULT)' | head -n 6
+		echo "RESULT: FAIL gate-request repo-health rc=$rhrc (no gate slot used; fix the FAIL lines above; a stale index: tools/repo-health --repair-index)"
+		exit 1
+	fi
+fi
+out=$(python3 "$here/gate-lint-first" --repo "$repo" 2>&1); rc=$?
+printf '%s\n' "$out"
+if [ $rc -ne 0 ]; then
+	echo "gate-request: not started: $(printf '%s\n' "$out" | tail -1)"
+	echo "RESULT: FAIL gate-request lint-first rc=$rc (no gate slot used)"
+	exit 1
+fi
+
+# T-7dff: one log file per request (a reused /tmp/gate-L.log made agents read an older run's RESULT: 14 of 369 incidents); /tmp/gate-$label.log stays as a symlink to the latest
+log=/tmp/gate-$label-$(date +%s)-$$.log
+# T-45 (ALL-ON 2026-11-12): the local command EXITS with the gate's verdict (check-all rc, else the xnu build rc). It used to end in `echo rc=$?`, so heavy-job's
+# DETACHED-END said rc=0 after a GATE FAIL and two threads read a failed gate as passed (t06-land1, resident-bl2048c).
+# 2026-11-14 (gate lowclk-land4): the chg/thermal unit tests read a patched XNU tree; without CHG_STACK_TREE they took the NEWEST localbuild work tree by mtime
+# (another thread's kernel, with a patch this checkout lacks) and failed. The tree gate-xnu-build just made from HEAD (label $label) is the one to test, as the remote path mounts its own.
+# 2026-11-14 (gate lowclk-storm): gate-xnu-build gets --always: it SKIPS when HEAD:xnu/patches equals trunk's and then leaves no work/$label/xnu tree
+# for CHG_STACK_TREE (test_sweet_thermal / test_chg_icl / test_chg_probe failed on the missing tree); a cached rebuild costs ~25-60 s.
+cst=${CHG_STACK_TREE:-${LOCALBUILD:-${ARTIFACTS:-$HOME/pixelios-artifacts}/localbuild}/work/$label/xnu}
+local_inner="$repo/tools/gate-xnu-build --always --repo $repo --label $label; x=\$?; echo xrc=\$x; CHG_STACK_TREE=$cst HEAVY_JOB_WAIT=7200 $repo/tools/check-all.sh; r=\$?; echo rc=\$r; [ \$r != 0 ] || r=\$x; exit \$r"
+# T-c68c (user 2026-11-01): the remote host FIRST. heavy-job run --class gate probes the remote host once: admitted -> the remote string below runs (gate-pre on the remote host, then the formal import: only a formal PASS is imported);
+# T-3f7e: REMOTE_JOB_REPO=$repo pins the commit under test (bundle, sha, logs/remote-jobs) to --repo; remote-job otherwise gates the checkout of the repo holding the tool, so a worktree or branch --repo was labelled with one sha and gated as another.
+# unreachable or refused -> ONE "heavy-job: ROUTE local: remote host <reason>" line in the log and the local gate (local_inner) runs as before. the remote host is never required.
+remote_inner="cd $repo && REMOTE_JOB_REPO=$repo $here/remote-job --where auto gate-pre && $here/gate-import-remote $repo/logs/remote-jobs/gate-pre/out $repo"
+inner="$here/heavy-job run --class gate --label $label --wait 7200 --remote-cmd '$remote_inner' -- bash -c '$local_inner'"
+if [ "${GATE_REQUEST_DRY:-}" = 1 ]; then
+	echo "DRY: $here/heavy-job detach --label $label --log $log -- bash -c \"$inner\""
+	echo "RESULT: PASS gate-request dry label=$label"
+	exit 0
+fi
+hj=$("$here/heavy-job" detach --label "$label" --log "$log" -- bash -c "$inner" 2>&1); hrc=$?
+printf '%s\n' "$hj"
+if [ $hrc -ne 0 ]; then echo "RESULT: ERROR gate-request heavy-job detach rc=$hrc"; exit 2; fi
+unit=$(printf '%s\n' "$hj" | sed -n 's/.*unit=\([^ ]*\).*/\1/p' | head -1)
+latest=/tmp/gate-$label.log
+if [ -e "$latest" ] && [ ! -L "$latest" ]; then mv -f "$latest" "$latest.prev-$(date +%s)-$$" && echo "gate-request: note: old plain $latest moved to $latest.prev-*"; fi
+ln -sfn "${log##*/}" "$latest" || echo "gate-request: GAP: cannot link $latest -> $log (read the log path below, not $latest)"
+echo "RESULT: PASS gate-request started unit=${unit:-unknown} log=$log"
+exit 0

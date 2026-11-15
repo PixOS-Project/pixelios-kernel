@@ -1,0 +1,320 @@
+SWEET USB root disk RAM copy-on-write overlay (patch 0158, research 62 option 1): with rootrw=1 the driver of patch 0157 accepts writes into a bounded RAM block map (boot-arg usbrootcow=MiB, default 64, 1..512, 4 KiB blocks, ENOSPC at the cap); reads of written blocks come from RAM, the rest from the host; no write ever reaches the host (no new opcode). Without rootrw=1 the driver stays read-only. The whole pool (data blocks + hash table) is allocated once in ur_rootdev before any I/O, so the strategy path never allocates; allocation failure or any later ur_rootdev error frees it and leaves the root read-only. Applies on top of 0149. Unbuilt, untested on hardware.
+diff --git a/bsd/dev/sweet_usbroot.c b/bsd/dev/sweet_usbroot.c
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -1,5 +1,5 @@
+ /*
+- * SWEET USB root disk (strictly read-only): the BSD disk usbroot0 (rusbroot0) whose sectors come from a
++ * SWEET USB root disk (read-only towards the host; optional RAM copy-on-write overlay, patch 0158): the BSD disk usbroot0 (rusbroot0) whose sectors come from a
+  * host file over the USB CDC-ECM link (bsd/dev/sweet_usb.c), so a root image can change without flashing
+  * userdata. Selected by rd=usbroot0 (IOKitBSDInit.cpp); needs sweetusb=2. Mutually exclusive with the
+  * UFS root (bsd/dev/sweet_ufs.c): each side refuses when the other started. Host side: tools/usbroot-host.py.
+@@ -26,6 +26,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ 
+@@ -53,6 +54,13 @@
+ #define UR_LINK_WAIT_MS 30000
+ #define UR_TX_MIN       60              /* request frames are padded to the Ethernet minimum */
+ 
++/* RAM copy-on-write overlay (rootrw=1): written 4 KiB blocks live only in kernel memory, never on the host. */
++#define UR_COW_BLK      UR_READ_MIN
++#define UR_COW_DEF_MIB  64              /* boot-arg usbrootcow=MiB, default */
++#define UR_COW_MAX_MIB  512
++#define UR_COW_LOG_N    8               /* the first writes are logged */
++#define UR_COW_LOG_MS   5000            /* dirty-count log interval while it changes */
++
+ #define UR_OP_INFO      1
+ #define UR_OP_READ      2
+ 
+@@ -71,6 +79,11 @@
+ 
+ enum { EX_IDLE, EX_WAITING, EX_DONE };
+ 
++struct ur_cow_ent {
++	uint32_t key;                   /* block number + 1; 0 = empty */
++	uint32_t slot;                  /* index into ur.cow_blk */
++};
++
+ static LCK_GRP_DECLARE(ur_grp, "sweet_usbroot");
+ static LCK_MTX_DECLARE(ur_lock, &ur_grp);       /* one block request at a time */
+ static LCK_SPIN_DECLARE(ur_spin, &ur_grp);      /* exchange state shared with the USB thread; never held across a sleep */
+@@ -104,6 +117,17 @@
+ 	uint32_t timeouts;
+ 	uint64_t fail_until;            /* uptime ms */
+ 	uint32_t bad_frames;
++	/* RAM overlay; every field below is under ur_lock. Off unless rootrw=1 and usbrootcow>0. */
++	bool cow;
++	uint32_t cow_cap;               /* blocks */
++	uint32_t cow_dirty;
++	uint32_t cow_tsize;             /* hash slots, power of two >= 2 * cow_cap */
++	struct ur_cow_ent *cow_tab;
++	uint8_t *cow_pool;              /* cow_cap * UR_COW_BLK bytes, allocated once in ur_rootdev; slot k = block k of the pool */
++	uint32_t cow_writes;
++	uint32_t cow_log_dirty;
++	uint64_t cow_log_ms;
++	bool cow_full_logged;
+ } ur;
+ 
+ static inline void
+@@ -329,13 +353,112 @@
+ 	return 0;
+ }
+ 
++/* Slot of block key in the overlay hash: true and *idx set when present, false with *idx the empty slot to use
++ * (UINT32_MAX if the table were full, which cow_dirty <= cow_cap <= cow_tsize / 2 rules out). ur_lock held. */
++static bool
++ur_cow_find(uint32_t key, uint32_t *idx)
++{
++	uint32_t mask = ur.cow_tsize - 1, i = (key * 2654435761u) & mask;
++
++	for (uint32_t n = 0; n < ur.cow_tsize; n++, i = (i + 1) & mask) {
++		if (ur.cow_tab[i].key == key) {
++			*idx = i;
++			return true;
++		}
++		if (ur.cow_tab[i].key == 0) {
++			*idx = i;
++			return false;
++		}
++	}
++	*idx = UINT32_MAX;
++	return false;
++}
++
++/* The 4 KiB block at byte pos (a multiple of UR_COW_BLK) as the host has it, through the read window. ur_lock held. */
++static int
++ur_cow_base(uint64_t pos, uint8_t *out)
++{
++	if (!ur.cache_valid || pos < ur.cache_off || pos + UR_COW_BLK > ur.cache_off + ur.cache_len) {
++		int error = ur_fill(pos);
++		if (error) {
++			return error;
++		}
++	}
++	if (pos < ur.cache_off || pos + UR_COW_BLK > ur.cache_off + ur.cache_len) {
++		return EIO;
++	}
++	memcpy(out, ur.buf + (pos - ur.cache_off), UR_COW_BLK);
++	return 0;
++}
++
++/* Store n bytes at offset boff of block blk (boff + n <= UR_COW_BLK). ENOSPC at the cap. ur_lock held. */
++static int
++ur_cow_put(uint32_t blk, uint32_t boff, const uint8_t *src, uint32_t n)
++{
++	uint32_t idx = UINT32_MAX;
++	uint8_t *p;
++
++	if (boff >= UR_COW_BLK || n == 0 || n > UR_COW_BLK - boff) {
++		return EINVAL;
++	}
++	if (ur_cow_find(blk + 1, &idx)) {
++		memcpy(ur.cow_pool + (size_t)ur.cow_tab[idx].slot * UR_COW_BLK + boff, src, n);
++		return 0;
++	}
++	if (idx == UINT32_MAX) {
++		return EIO;
++	}
++	if (ur.cow_dirty >= ur.cow_cap) {
++		if (!ur.cow_full_logged) {
++			ur.cow_full_logged = true;
++			printf("SWEET USBROOT: RAM overlay full (%u blocks), writes now fail with ENOSPC\n", ur.cow_cap);
++		}
++		return ENOSPC;
++	}
++	p = ur.cow_pool + (size_t)ur.cow_dirty * UR_COW_BLK;   /* preallocated: the strategy path never allocates */
++	if (n < UR_COW_BLK) {
++		/* partial block: start from the host's bytes */
++		int error = ur_cow_base((uint64_t)blk * UR_COW_BLK, p);
++		if (error) {
++			return error;
++		}
++	}
++	memcpy(p + boff, src, n);
++	ur.cow_tab[idx].key = blk + 1;
++	ur.cow_tab[idx].slot = ur.cow_dirty;
++	ur.cow_dirty++;
++	return 0;
++}
++
++/* Free the overlay and clear every field of it (also the error paths of ur_rootdev). ur.cow off = read-only root. */
++static void
++ur_cow_free(void)
++{
++	if (ur.cow_tab != NULL) {
++		kfree_data(ur.cow_tab, (size_t)ur.cow_tsize * sizeof(*ur.cow_tab));
++	}
++	if (ur.cow_pool != NULL) {
++		kfree_data(ur.cow_pool, (size_t)ur.cow_cap * UR_COW_BLK);
++	}
++	ur.cow = false;
++	ur.cow_cap = ur.cow_dirty = ur.cow_tsize = 0;
++	ur.cow_tab = NULL;
++	ur.cow_pool = NULL;
++}
++
+ static int
+ ur_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
+ 	if (!ur.ready) {
+ 		return ENXIO;
+ 	}
+-	return (flags & FWRITE) ? EROFS : 0;
++	if (flags & FWRITE) {
++		if (!ur.cow) {
++			return EROFS;
++		}
++		printf("SWEET USBROOT: open for write (flags 0x%x), RAM overlay\n", flags);
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -354,7 +477,8 @@
+ 	uint64_t off = 0;
+ 
+ 	buf_setresid(bp, count);
+-	if (!(buf_flags(bp) & B_READ)) {
++	bool is_write = !(buf_flags(bp) & B_READ);
++	if (is_write && !ur.cow) {
+ 		error = EROFS;
+ 		goto done;
+ 	}
+@@ -375,20 +499,46 @@
+ 		goto done;
+ 	}
+ 	lck_mtx_lock(&ur_lock);
++	if (is_write && ur.cow_writes < UR_COW_LOG_N) {
++		printf("SWEET USBROOT: cow write #%u lba %lld count %u flags 0x%x\n", ++ur.cow_writes, (long long)blkno, count,
++		    buf_flags(bp));
++	}
++	/* One 4 KiB overlay block at a time: a block is either all from the overlay or all from the host window. */
+ 	for (uint32_t got = 0; got < count;) {
+ 		uint64_t pos = off + got;
+-		if (!ur.cache_valid || pos < ur.cache_off || pos >= ur.cache_off + ur.cache_len) {
+-			error = ur_fill(pos & ~(uint64_t)(UR_READ_MIN - 1));
++		uint32_t boff = (uint32_t)(pos % UR_COW_BLK);
++		uint32_t n = MIN(count - got, UR_COW_BLK - boff);
++		uint32_t idx = 0;
++		if (is_write) {
++			error = ur_cow_put((uint32_t)(pos / UR_COW_BLK), boff, (const uint8_t *)vaddr + got, n);
+ 			if (error) {
+ 				break;
+ 			}
++		} else if (ur.cow && ur_cow_find((uint32_t)(pos / UR_COW_BLK) + 1, &idx)) {
++			memcpy(vaddr + got, ur.cow_pool + (size_t)ur.cow_tab[idx].slot * UR_COW_BLK + boff, n);
++		} else {
++			if (!ur.cache_valid || pos < ur.cache_off || pos >= ur.cache_off + ur.cache_len) {
++				error = ur_fill(pos & ~(uint64_t)(UR_READ_MIN - 1));
++				if (error) {
++					break;
++				}
++			}
++			uint32_t skip = (uint32_t)(pos - ur.cache_off);
++			n = MIN(n, ur.cache_len - skip);
++			memcpy(vaddr + got, ur.buf + skip, n);
+ 		}
+-		uint32_t skip = (uint32_t)(pos - ur.cache_off);
+-		uint32_t n = MIN(count - got, ur.cache_len - skip);
+-		memcpy(vaddr + got, ur.buf + skip, n);
+ 		got += n;
+ 		buf_setresid(bp, count - got);
+ 	}
++	if (is_write && ur.cow_dirty != ur.cow_log_dirty) {
++		uint64_t now = ur_uptime_ms();
++		if (now - ur.cow_log_ms >= UR_COW_LOG_MS) {
++			ur.cow_log_ms = now;
++			ur.cow_log_dirty = ur.cow_dirty;
++			printf("SWEET USBROOT: cow dirty %u blocks (%u KiB of %u KiB)\n", ur.cow_dirty,
++			    ur.cow_dirty * (UR_COW_BLK / 1024), ur.cow_cap * (UR_COW_BLK / 1024));
++		}
++	}
+ 	lck_mtx_unlock(&ur_lock);
+ 	buf_unmap(bp);
+ 
+@@ -427,7 +577,7 @@
+ 		*o = ur.nbytes / ur.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+-		*f = 0;
++		*f = ur.cow ? 1 : 0;
+ 		return 0;
+ 	case DKIOCSYNCHRONIZE:
+ 	case DKIOCSYNCHRONIZECACHE:
+@@ -436,7 +586,7 @@
+ 		*o = ur.max_read / ur.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = 0;
++		*o = ur.cow ? ur.max_read / ur.secsize : 0;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+@@ -472,9 +622,12 @@
+ }
+ 
+ static int
+-ur_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++ur_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return EROFS;
++	if (!ur.cow) {
++		return EROFS;
++	}
++	return physio(ur_strategy, NULL, dev, B_WRITE, minphys, uio, (int)ur.secsize);
+ }
+ 
+ static const struct bdevsw ur_bdevsw = {
+@@ -532,10 +685,26 @@
+ 		printf("SWEET USBROOT: needs boot-arg sweetusb=2\n");
+ 		return EINVAL;
+ 	}
+-	/* A read-only disk cannot carry a root mounted read-write (vfs_subr.c, patch 0031). */
++	/* A read-only disk cannot carry a root mounted read-write (vfs_subr.c, patch 0031): only with the RAM overlay. */
+ 	if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw) {
+-		printf("SWEET USBROOT: rootrw=1 conflicts with a read-only root\n");
+-		return EROFS;
++		uint32_t mib = UR_COW_DEF_MIB;
++		(void)PE_parse_boot_argn("usbrootcow", &mib, sizeof(mib));
++		if (mib == 0 || mib > UR_COW_MAX_MIB) {
++			printf("SWEET USBROOT: rootrw=1 needs usbrootcow=1..%u (MiB), got %u\n", UR_COW_MAX_MIB, mib);
++			return EROFS;
++		}
++		ur.cow_cap = mib * (1u << 20) / UR_COW_BLK;
++		ur.cow_tsize = 1;
++		while (ur.cow_tsize < 2 * ur.cow_cap) {
++			ur.cow_tsize <<= 1;
++		}
++		ur.cow_tab = kalloc_data((size_t)ur.cow_tsize * sizeof(*ur.cow_tab), Z_WAITOK_ZERO);
++		ur.cow_pool = kalloc_data((size_t)ur.cow_cap * UR_COW_BLK, Z_WAITOK_ZERO);
++		if (ur.cow_tab == NULL || ur.cow_pool == NULL) {
++			printf("SWEET USBROOT: no memory for the %u MiB overlay, root stays read-only\n", mib);
++			return ENOMEM;                  /* sweet_usbroot_rootdev frees what was allocated */
++		}
++		ur.cow = true;
+ 	}
+ 	/* Board check first, by ADT only: a non-gs101 board must not reach the Qualcomm path of sweet_usb_probe(). */
+ 	if (!sweet_usb_board_is_gs101()) {
+@@ -595,7 +764,8 @@
+ 	devfs_make_node(ur.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0440, "usbroot0");
+ 	devfs_make_node(makedev(ur.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0440, "rusbroot0");
+ 	ur.ready = true;
+-	printf("SWEET USBROOT: usbroot0 %llu MiB read-only, max read %u\n", ur.nbytes >> 20, ur.max_read);
++	printf("SWEET USBROOT: usbroot0 %llu MiB %s, max read %u\n", ur.nbytes >> 20,
++	    ur.cow ? "read-only host, RAM overlay" : "read-only", ur.max_read);
+ 	*dev = ur.bdev;
+ 	return 0;
+ }
+@@ -606,6 +776,7 @@
+ 	int error = ur_rootdev(dev);
+ 
+ 	if (error) {
++		ur_cow_free();                  /* every error path: no overlay, ur.cow off */
+ 		/* IOFindBSDRoot panics on an error and the live log goes out every 100 ms: let the trace leave first. */
+ 		UR_TRACE("rootdev failed: %d", error);
+ 		ur_sleep_ms(500);

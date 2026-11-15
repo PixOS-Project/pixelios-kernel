@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# usbroot-serve: (root) kill stale usbroot-host.py servers, start a fresh one detached, check it is up.
+# Usage: sudo ~/.t3/worktrees/usbroot-probe/tools/usbroot-serve [IMG] [--dry-run]
+# Exit: 0 PASS, 1 FAIL, 2 usage/precondition. The server holds a raw AF_PACKET socket only
+# (usbroot-host.py "bound IFACE" line); no gadget/device handle is documented, so none is released.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+img=/tank/pixelios/ios-root4-inj6.img
+dry=0
+for a in "$@"; do
+  case $a in
+    --dry-run) dry=1 ;;
+    -*) echo "RESULT: FAIL unknown option $a (usage: usbroot-serve [IMG] [--dry-run])"; exit 2 ;;
+    *) img=$a ;;
+  esac
+done
+# Installed as a service (tools/usbroot-service-install)? Then just restart it (sudoers allows it without a password).
+if [ "$dry" = 0 ] && systemctl cat usbroot-host >/dev/null 2>&1; then
+  if [ "$img" != /tank/pixelios/ios-root4-inj6.img ]; then
+    echo "note: the service serves IMG from /etc/usbroot-host.env; the IMG argument is ignored (edit the file, no root needed)"
+  fi
+  if [ "$(id -u)" = 0 ]; then systemctl restart usbroot-host; else sudo -n systemctl restart usbroot-host; fi || { echo "RESULT: FAIL systemctl restart usbroot-host"; exit 1; }
+  exec "$root/tools/usbroot-status"
+fi
+if [ "$dry" = 0 ] && [ "$(id -u)" != 0 ]; then
+  echo "usbroot-serve must run as root. Run:"
+  echo "  sudo $root/tools/usbroot-serve [IMG]"
+  echo "RESULT: FAIL not root"; exit 2
+fi
+[ -f "$img" ] || { echo "RESULT: FAIL image not found: $img"; exit 2; }
+
+# The [u] bracket keeps pgrep (and this script) from matching their own command lines.
+# Only sudo/python processes count, so an unrelated shell that merely mentions the script is never killed.
+pids=()
+while read -r p; do
+  [ "$p" = "$$" ] && continue
+  case $(cat "/proc/$p/comm" 2>/dev/null) in sudo|python3|python) pids+=("$p") ;; esac
+done < <(pgrep -f '[u]sbroot-host\.py')
+if [ "${#pids[@]}" -eq 0 ]; then
+  echo "no stale usbroot-host.py servers"
+else
+  for p in "${pids[@]}"; do echo "stale: $p $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"; done
+fi
+n=1
+while [ -e "$root/logs/usbroot-host-$n.log" ]; do n=$((n + 1)); done
+log=$root/logs/usbroot-host-$n.log
+cmd=(python3 "$root/tools/usbroot-host.py" "$img" --max-seconds 0)
+
+if [ "$dry" = 1 ]; then
+  echo "DRY-RUN: would SIGTERM ${#pids[@]} PID(s), wait <=5 s, SIGKILL survivors"
+  echo "DRY-RUN: would start: setsid nohup ${cmd[*]} > $log 2>&1 &"
+  echo "RESULT: PASS dry-run (nothing killed or started)"; exit 0
+fi
+
+if [ "${#pids[@]}" -gt 0 ]; then
+  kill -TERM "${pids[@]}" 2>/dev/null
+  for _ in 1 2 3 4 5; do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && break
+    sleep 1
+  done
+  for p in "${pids[@]}"; do
+    if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; echo "killed (SIGKILL): $p"; else echo "killed (SIGTERM): $p"; fi
+  done
+fi
+
+mkdir -p "$root/logs"
+setsid nohup "${cmd[@]}" > "$log" 2>&1 < /dev/null &
+spid=$!
+echo "started PID $spid, log $log"
+state=none
+for _ in 1 2 3 4 5; do
+  sleep 1
+  kill -0 "$spid" 2>/dev/null || break
+  if grep -q 'usbroot-host: bound ' "$log"; then state=bound; break; fi
+  grep -q 'waiting for the interface' "$log" && state=waiting
+done
+echo "tail: tail -f $log"
+if ! kill -0 "$spid" 2>/dev/null; then echo "RESULT: FAIL server exited (see $log)"; exit 1; fi
+case $state in
+  bound) echo "RESULT: PASS server PID $spid listening ($log)"; exit 0 ;;
+  waiting) echo "RESULT: PASS server PID $spid alive, waiting for the phone's USB interface ($log)"; exit 0 ;;
+  *) echo "RESULT: FAIL server alive but no ready line within 5 s ($log)"; exit 1 ;;
+esac

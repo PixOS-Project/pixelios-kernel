@@ -1,0 +1,589 @@
+SWEET WLAN stage 3 run E (patch 0133, docs/research/43a-xnu-stage3-chip-writes.md rows W15-W17, docs/research/43c-run-e-release.md), boot-arg sweetwlan=7 (= run D of 0132, then W16 + W17; levels 1-6 behave as in 0132). THE FIRST TIME A CPU RUNS ON THE CHIP.
+W15 (cfg 0x88 |= 0x300, DHD dhd_pcie.c:2223-2228) is NOT implemented: a config write DHD makes at attach, effect on this run unknown (43c X5), a halted-core bus hang cannot be bounded; the poll may then see a stale word (informative timeout).
+W16: checks (image, pin, vector at bp 0 still there, PCIe core mailbox mask 0xC34 must be 0 and the host controller's ELBI IRQ0/1/2 enables 0x10/0x14/0x18 must all be 0 = IRQ gate, read only; poll window cfg 0x84, token baseline), then the CA7 release = DHD si_core_reset(0,0): RESET_CTL 1, IOCTL 0x3, RESET_CTL 0, IOCTL 0x1 (aiutils.c:1242-1325). W17: poll ram_end-4, 100 x 50 ms, every change printed; shared address checked, version byte read; ALWAYS the stop action (CA7 RESET_CTL := 1 read back, cfg 0x84 := 0) on success and on every failure.
+Pure part (bsd/dev/sweet_wlan_wr.h): 6 new deny-by-default tuples (run 5, once; release tuples need SWF_RELOK), done mask 64 bit, two new read ranges (mailbox, ELBI irq block), swl_idle_wait in swl_restore, swl_w16_rev_ok. Review 0133 F1-F4: restore re-halts the CA7 when only the EP Command check failed and memory decode is on and BAR0 is unchanged; config restore rows are skipped when the link checks 1..4 fail; SWF_W16 is set just before the starting store; the CA7 summary and halted use the CA7 row's own read-back (ca_ok). Glue (bsd/dev/sweet_wlan.c): sw3_ca7_ok/sw3_ca7_bit limit the CA7 wrapper stores (CPUHALT-clear IOCTL and the starting RESET_CTL := 0 only at level 7, each once, in order); level 7 runs as 6 unless PCIe core rev 64..73.
+Final line: "SWEET WLAN: stage 3 level 7 done shared=<hex> version=<n> polls=<n> halted=1". HW-WRITE path: Opus review round 1 applied (docs/reviews/0133-wlan-arm-release.md), not yet re-reviewed.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index a775678..4c1c1a7 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -12,6 +12,8 @@
+  * all through the same swl_wr(); the glue adds only the NVRM entry, a scratch buffer and sw3_rng() (read_random()).
+  * Patch 0132 (run D, sweetwlan=6 = run C + row W14): the image's first dword at backplane address 0 (BAR2 window 0, offset 0). The glue only allows that one word, at level 6, with the value the container
+  * entry holds (sw3_wr, independent of the header's tuple).
++ * Patch 0133 (run E, sweetwlan=7 = run D + rows W16, W17): the CA7 is released, the shared-area word is polled and the CA7 is reset again; the glue only adds the independent limit of the CA7 wrapper stores (sw3_ca7_ok:
++ * values that let the CPU run only at level 7, each once, in order) and the PCIe core rev gate for level 7. docs/research/43c-run-e-release.md.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -44,6 +46,7 @@ struct sw_hw {
+ 	uint32_t rv;    /* patch 0132: the first dword of the FW container entry (the reset vector), little endian */
+ 	int rv_ok;      /* patch 0132 (review 0132 F5): level 6 and the container's FW entry is the pinned length and CRC */
+ 	int rv_done;    /* the one store of rv at backplane address 0 has been made */
++	uint32_t rel;   /* patch 0133: the CA7 stores that let it run, as made: bit 0 IOCTL := 0x3, bit 1 IOCTL := 0x1, bit 2 the RESET_CTL := 0 after bit 0 */
+ };
+ 
+ static int
+@@ -226,6 +229,33 @@ sw3_rd(void *ctx, int space, uint32_t win, uint32_t off, uint32_t *v)
+ 	return 0;
+ }
+ 
++/* patch 0133 (run E): the CA7 wrapper stores, limited here independently of the header's tuples. IOCTL: 0x23 and 0x21 (CPUHALT set: run A) always, 0x3 (CPUHALT clear) only at level 7 and once, 0x1 only at level 7, once, after the release
++ * (bit 2); RESET_CTL: 1 always (halt, restore), 0 while the release IOCTL 0x3 has not been stored (the CPU is halted) or, at level 7, once after it (the one store that starts the CPU). 1 = allowed. */
++static int
++sw3_ca7_ok(const struct sw_hw *h, int space, uint32_t win, uint32_t off, uint32_t v)
++{
++	if (space != SWW_BAR0 || win != SWW_WIN_CA7WRAP) {
++		return 1;
++	}
++	if (off == SWL_AGENT_IOCTL) {
++		return v == 0x23u || v == 0x21u || (h->l3 >= 7 && ((v == SWW_REL_MID && !(h->rel & 1u)) || (v == SWW_REL_END && (h->rel & 5u) == 5u && !(h->rel & 2u))));
++	}
++	return off == SWL_AGENT_RESET_CTL && (v == 1u || (v == 0u && (!(h->rel & 1u) || (h->l3 >= 7 && !(h->rel & 4u)))));
++}
++
++/* the bit of h->rel that a store of (win, off, v) sets once it has been made */
++static uint32_t
++sw3_ca7_bit(const struct sw_hw *h, int space, uint32_t win, uint32_t off, uint32_t v)
++{
++	if (space != SWW_BAR0 || win != SWW_WIN_CA7WRAP) {
++		return 0;
++	}
++	if (off == SWL_AGENT_IOCTL) {
++		return v == SWW_REL_MID ? 1u : v == SWW_REL_END ? 2u : 0u;
++	}
++	return off == SWL_AGENT_RESET_CTL && v == 0u && (h->rel & 1u) ? 4u : 0u;
++}
++
+ /* THE store of stage 3 (called only by swl_store()): config space (0x80, 0x84), ATU region 2, BAR0, BAR2, BAR0 only on the live window the tuple named; ref: aiutils.c W_REG + R_REG, dsb sy before the read-back (osfmk/arm/atomic.h DSB_SY 0xf) */
+ static int
+ sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
+@@ -246,12 +276,16 @@ sw3_wr(void *ctx, int space, uint32_t win, uint32_t off, uint32_t v)
+ 	if (space == SWW_BAR0 && !(off == SWW_SM_BANKIDX ? win == SWW_WIN_SYSMEM : (win == SWW_WIN_SMWRAP || win == SWW_WIN_CA7WRAP))) {
+ 		return -1;
+ 	}
++	if (!sw3_ca7_ok(h, space, win, off, v)) {
++		return -1;
++	}
+ 	p = sw3_ptr(h, space, off);
+ 	if (p == NULL || (space == SWW_BAR0 && h->cfg[SWW_CFG_WIN / 4] != win) || (space == SWW_BAR2 && h->cfg[SWW_CFG_WIN2 / 4] != win)) {
+ 		return -1;
+ 	}
+ 	*p = v;
+ 	__builtin_arm_dsb(0xf);
++	h->rel |= sw3_ca7_bit(h, space, win, off, v);
+ 	if (space == SWW_BAR2 && win == 0 && off == 0) {
+ 		h->rv_done = 1;
+ 	}
+@@ -301,6 +335,7 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	hw->l3 = level;
+ 	hw->rv_ok = level >= 6 && sw_fw.p != NULL && sw_fw.len == SWW_FW_LEN && sw_fw.crc == SWW_FW_CRC;
+ 	hw->rv_done = 0;
++	hw->rel = 0;
+ 	hw->rv = hw->rv_ok ? ((uint32_t)sw_fw.p[0] | (uint32_t)sw_fw.p[1] << 8 | (uint32_t)sw_fw.p[2] << 16 | (uint32_t)sw_fw.p[3] << 24) : 0;
+ 	x.img = sw_fw.p;
+ 	x.img_len = sw_fw.len;
+@@ -310,7 +345,7 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	x.nv_src_crc = sw_nv.crc;
+ 	x.nv = sw_nvbuf;
+ 	x.nv_cap = sizeof sw_nvbuf;
+-	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
++	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 6 ? "E" : level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
+ 	(void)swl_stage3(&x);
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+@@ -336,7 +371,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 6 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 7 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+@@ -401,6 +436,10 @@ sweet_wlan_init(void)
+ 			printf("SWEET WLAN: W14 needs the DAR security register (PCIe core 0x83c missing or rev not < 74 or 128), not implemented, running level 5\n");
+ 			level = 5;
+ 		}
++		if (level >= 7 && !swl_w16_rev_ok(&chip)) {
++			printf("SWEET WLAN: run E needs the PCIe core 0x83c mailbox registers at 0xC30/0xC34 (rev >= 64) and W14's vector test (rev < 74), not implemented for this rev, running level 6\n");
++			level = 6;
++		}
+ 		if (level >= 3) {
+ 			sweet_wlan_stage3(&hw, (int)level);
+ 		}
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+index ff842b9..9831f9c 100644
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -86,6 +86,27 @@ _Static_assert(SWW_WIN_TAIL >= SWW_IMG_END, "the tail window starts above the im
+ #define SWW_CORE_PCIE2  0x83c           /* PCIE2_CORE_ID, include_hndsoc.h:200; the core whose rev is DHD's buscorerev */
+ _Static_assert(SWW_FW_LEN == SWW_IMG_MAX, "the pinned firmware is the largest accepted image");
+ 
++/* Run E (patch 0133, docs/research/43c-run-e-release.md rows W16, W17; boot-arg sweetwlan=7): the first time a CPU runs on the chip. The release is DHD's si_core_reset(sih, 0, 0) of the CA7 (dhd_pcie.c:10343-10346) = _ai_core_reset(0, 0)
++ * (aiutils.c:1242-1325): RESET_CTL := 1, IOCTL := bits | resetbits | SICF_FGC | SICF_CLOCK_EN = 0x3 (CPUHALT clear), RESET_CTL := 0 (the CPU starts here), IOCTL := bits | SICF_CLOCK_EN = 0x1; SICF_FGC 0x2 and SICF_CLOCK_EN 0x1
++ * are include_hndsoc.h:266-267. The poll is DHD's dhdpcie_readshared (dhd_pcie.c:13637-13705) and OpenBSD's bwfm_pci_load_microcode (if_bwfm_pci.c:866-883). The firmware is NOT kept running: the run ends with CA7 RESET_CTL := 1. */
++#define SWW_REL_MID     0x3u            /* IOCTL while the reset is released: SICF_FGC | SICF_CLOCK_EN, no SICF_CPUHALT (aiutils.c:1268) */
++#define SWW_REL_END     0x1u            /* IOCTL after the release: SICF_CLOCK_EN (aiutils.c:1312-1314) */
++#define SWW_MBMASK      0xC34u          /* PCIMailBoxMask(rev), PCIe core rev >= 64 (include_pcie_core.h:33, 1047; dhd_pcie.c:1725): the host side interrupt mask of the dongle's PCIe core, in the BAR0 window SWW_WIN_PCIE */
++#define SWW_RC_IRQ0     0x000u          /* host controller ELBI interrupt status 0 (PCIE_IRQ0, pcie-exynos-rc.h:19); IRQ1 0x004 (:25), IRQ2 0x008 (:27); the enables are PCIE_IRQ0_EN 0x010 (:31), IRQ1_EN 0x014 (:36), IRQ2_EN 0x018 (:39) */
++#define SWW_RC_IRQ0_EN  0x010u
++#define SWW_RC_IRQ1_EN  0x014u
++#define SWW_RC_IRQ2_EN  0x018u
++#define SWW_RC_INTX_EN  0x00154000u     /* IRQ0_EN: INTA/B/C/D enable, bits 14/16/18/20 (pcie-exynos-rc.h:32-35; exynos_pcie_rc_enable_interrupts, pcie-exynos-rc.c:2175: INTx at :2184-2189, only when !use_msi (:2185)) */
++#define SWW_RC_LDOWN_EN 0x00000400u     /* IRQ1_EN: link down, bit 10 (pcie-exynos-rc.h:37-38, set at pcie-exynos-rc.c:2193-2195) */
++#define SWW_RC_MSI_EN   0x01030000u     /* IRQ2_EN: MSI falling/rising edge (bits 16/17) and completion timeout (bit 24) (pcie-exynos-rc.h:41-43; completion timeout set at pcie-exynos-rc.c:2198-2200, MSI rising edge :2985-2990, falling edge set nowhere in this source) */
++#define SWW_MBINT       0xC30u          /* PCIMailBoxInt(rev), rev >= 64 (include_pcie_core.h:1046) */
++#define SWW_PCIE_REV_MIN 64u            /* REV_GE_64 (include_pcie_core.h:33): below it the two registers sit at 0x48/0x4C */
++#define SWW_UP_POLLS    100u            /* OpenBSD: 100 reads, 50 ms apart (if_bwfm_pci.c:866-870) = 5 s; DHD waits MAX_READ_TIMEOUT 2 s (dhd_pcie.c:598) */
++#define SWW_UP_US       50000u
++#define SWW_VER_MASK    0xFFu           /* the version is the low byte of the first shared word (brcmfmac-pcie.c:215, 1622: BRCMF_PCIE_SHARED_VERSION_MASK); DHD's own mask is not in the references */
++#define SWW_VER_MIN     5u              /* brcmfmac-pcie.c:211-212; dhd_pcie.c:13575-13579 accepts 5..7 */
++#define SWW_VER_MAX     7u
++
+ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+ /* phase flags (what the steps proved), required by swl_wt[].need */
+@@ -106,6 +127,9 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ #define SWF_RTLV    0x4000u     /* the rTLV is stored and read back (cfg 0x84 not yet back at 0) */
+ #define SWF_W13     0x8000u     /* cfg 0x84 is back at 0 */
+ #define SWF_W14     0x10000u    /* run D: the reset vector is stored at backplane address 0 and read back */
++#define SWF_RELOK   0x20000u    /* run E: everything the release needs is proven (vector, mailbox mask, token baseline, poll window); required by the release tuples */
++#define SWF_W16     0x40000u    /* run E: the store that starts the CA7 (RESET_CTL := 0 with CPUHALT clear) is about to be made (the CPU may run from here until the stop action) */
++#define SWF_W17     0x80000u    /* run E: the poll found a shared structure and the CA7 is in reset again (read back) */
+ 
+ #define SWW_RG_ATU2 1u          /* restore groups, armed by the first store of a tuple that names one */
+ #define SWW_RG_SM   2u
+@@ -127,7 +151,7 @@ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+ enum {
+ 	SWW_E_STOPPED = 1, SWW_E_DENIED, SWW_E_LEVEL, SWW_E_REPEAT, SWW_E_ORDER, SWW_E_PHASE, SWW_E_BANK, SWW_E_PRE, SWW_E_WIN, SWW_E_RD,
+-	SWW_E_DEAD, SWW_E_OLD, SWW_E_COMP, SWW_E_WR, SWW_E_READBACK, SWW_E_STATE, SWW_E_WAIT, SWW_E_SRPWR, SWW_E_RAM, SWW_E_MAP, SWW_E_IMG, SWW_E_TAIL, SWW_E_NV, SWW_E_GEO, SWW_E_RNG, SWW_E_LAST
++	SWW_E_DEAD, SWW_E_OLD, SWW_E_COMP, SWW_E_WR, SWW_E_READBACK, SWW_E_STATE, SWW_E_WAIT, SWW_E_SRPWR, SWW_E_RAM, SWW_E_MAP, SWW_E_IMG, SWW_E_TAIL, SWW_E_NV, SWW_E_GEO, SWW_E_RNG, SWW_E_IRQ, SWW_E_UP, SWW_E_SHARED, SWW_E_HALT, SWW_E_LAST
+ };
+ 
+ enum { SWW_RS_NONE, SWW_RS_OK, SWW_RS_FAILED, SWW_RS_SKIPPED };
+@@ -158,9 +182,12 @@ enum {
+ 	SWT_WIN2_TAIL_C = SWT_N_B, SWT_NV_VARS, SWT_NV_TOKEN, SWT_NV_RTLV, SWT_WIN2_ZERO_C, /* W11 window, W11 vars, W12, W13, W13 window restore */
+ 	SWT_N_C,                                                        /* the run C tuples end here (run D follows) */
+ 	SWT_RESET0 = SWT_N_C,                                           /* W14 */
++	SWT_WIN2_TAIL_E,                                                /* W16: the poll window */
++	SWT_REL_ASSERT, SWT_REL_IOCTL_MID, SWT_REL_RELEASE, SWT_REL_IOCTL_END,  /* W16: the CA7 release */
++	SWT_WIN2_ZERO_E,                                                /* W17: the window of the shared structure below the tail */
+ 	SWT_N
+ };
+-_Static_assert(SWT_N <= 32, "x->done is a 32-bit tuple mask");
++_Static_assert(SWT_N <= 64, "x->done is a 64-bit tuple mask");
+ 
+ /*
+  * The write allowlist. Deny by default (CR-25): a store that matches no row does not happen. Values: ATU region 2 in the order of
+@@ -228,6 +255,23 @@ static const struct swl_wt swl_wt[SWT_N] = {
+ 
+ 	/* Run D (row W14, once): the image's first dword at backplane address 0 (BAR2 window 0, offset 0), only after W13 (cfg 0x84 is back at 0). The value is not in the table: swl_wr() takes it from the pinned image. */
+ 	[SWT_RESET0]     = { .row = 14, .run = 4, .space = SWW_BAR2, .flags = SWT_ONCE | SWT_RV, .win = 0, .off = 0, .vmask = 0xFFFFFFFFu, .omask = SWW_SEC_SBOOT, .oval = 0, .need = SWF_W13 },
++
++	/* Run E (rows W16, W17, boot-arg sweetwlan=7, once each; the first time a CPU runs on the chip). The poll window first (cfg 0x84 := SWW_WIN_TAIL, old 0, armed for restore), then the CA7 release as DHD's
++	 * si_core_reset(0, 0) does it (aiutils.c:1242-1325, the same steps as the halt of W6 with IOCTL 0x3/0x1 instead of 0x23/0x21): the CA7 must be in the state W6 left (IOCTL 0x21, RESET_CTL 0); every store of the
++	 * release needs SWF_RELOK (the mailbox mask is 0, the token baseline and the vector were read). The same values at the same window as the W6 tuples: swl_wr_pick() moves from the consumed W6 tuple to these.
++	 * The window back to 0 (W17) only for a shared structure below the tail window; the restore row of group W84 does it otherwise. */
++	[SWT_WIN2_TAIL_E]  = { .row = 16, .run = 5, .space = SWW_CFG, .rgrp = SWW_RG_W84, .flags = SWT_ONCE | SWT_TAIL, .off = SWW_CFG_WIN2, .val = SWW_WIN_TAIL, .vmask = 0xFFFFFFFFu,
++	                       .omask = 0xFFFFFFFFu, .oval = 0, .need = SWF_W14 },
++	[SWT_REL_ASSERT]     = { .row = 16, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 1u, .vmask = 1u,
++	                         .omask = 1u, .oval = 0u, .coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = 0x21u, .need = SWF_W14 | SWF_RELOK },
++	[SWT_REL_IOCTL_MID]  = { .row = 16, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_REL_ASSERT + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_IOCTL, .val = SWW_REL_MID, .vmask = SWW_IOCTL_MASK,
++	                         .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 1u, .need = SWF_W14 | SWF_RELOK },
++	[SWT_REL_RELEASE]    = { .row = 16, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_REL_IOCTL_MID + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_RESET_CTL, .val = 0u, .vmask = 1u,
++	                         .coff = SWL_AGENT_IOCTL, .cmask = SWW_IOCTL_MASK, .cval = SWW_REL_MID, .need = SWF_W14 | SWF_RELOK },
++	[SWT_REL_IOCTL_END]  = { .row = 16, .run = 5, .space = SWW_BAR0, .rgrp = SWW_RG_CA, .flags = SWT_ONCE, .pred1 = SWT_REL_RELEASE + 1, .win = SWW_WIN_CA7WRAP, .off = SWL_AGENT_IOCTL, .val = SWW_REL_END, .vmask = SWW_IOCTL_MASK,
++	                         .omask = SWW_IOCTL_MASK, .oval = SWW_REL_MID, .coff = SWL_AGENT_RESET_CTL, .cmask = 1u, .cval = 0u, .need = SWF_W14 | SWF_RELOK },
++	[SWT_WIN2_ZERO_E]  = { .row = 17, .run = 5, .space = SWW_CFG, .flags = SWT_ONCE | SWT_TAIL, .pred1 = SWT_WIN2_TAIL_E + 1, .off = SWW_CFG_WIN2, .val = 0, .vmask = 0xFFFFFFFFu,
++	                       .omask = 0xFFFFFFFFu, .oval = SWW_WIN_TAIL, .need = SWF_W16 },
+ };
+ 
+ /* The read allowlist (every read of run A, including the ones of the preconditions). */
+@@ -253,6 +297,8 @@ static const struct swl_rt swl_rt[] = {
+ 	{ 1, SWW_BAR2, 0, 0, 0 },
+ 	{ 2, SWW_BAR2, 0, SWW_RAM_BASE, SWW_TCM_BYTES - 4u },                   /* W9/W10: the old and read-back words of the image and of the last word (window 0) */
+ 	{ 2, SWW_BAR2, SWW_WIN_TAIL, 0, SWW_LAST_HI_MAX },                      /* W9: the last word beyond window 0 */
++	{ 5, SWW_ELBI, 0, SWW_RC_IRQ0, SWW_RC_IRQ2_EN },                        /* run E (review 0133 F2): the host controller's interrupt status 0x00..0x08 and enables 0x10..0x18, read before the release */
++	{ 5, SWW_BAR0, SWW_WIN_PCIE, SWW_MBINT, SWW_MBMASK },                   /* run E: the dongle's host interrupt status and mask, read before the release */
+ };
+ 
+ /* Restore: what XNU itself writes at a STOP (docs/research/43 s.2 "Restore at STOP"), only for the groups armed by the failing step. */
+@@ -276,7 +322,8 @@ struct swl_wx {
+ 	const struct swl_wbus *b;
+ 	int level, stopped, stop_code, restore;
+ 	unsigned row, nbank, nrb, nb, nstore;
+-	uint32_t done, flags, armed, ram_bytes;
++	uint64_t done;                                  /* tuple mask (patch 0133: 64 bits, run E has more than 32 tuples) */
++	uint32_t flags, armed, ram_bytes;
+ 	const uint8_t *img;                             /* run B: the firmware image (container entry, CRC-checked by 0128) */
+ 	uint32_t img_len, img_crc, img_next, img_crc_rb;        /* bytes, the container's CRC32, index of the next word swl_wr() accepts (= words stored), CRC32 of the read-back */
+ 	const uint8_t *nv_src;                          /* run C: the NVRM container entry (CRC-checked by 0128 and again by swl_nv_prep) */
+@@ -286,13 +333,16 @@ struct swl_wx {
+ 	uint32_t tn[4];                                 /* run C: index of the next word swl_wr() accepts per tail kind SWK_* */
+ 	uint8_t rtlv[SWW_RTLV_RNG];                     /* run C: the random bytes of the rTLV */
+ 	uint32_t w14_old, rb;                           /* run D: the word read at address 0 before the store; the word swl_wr() last read back */
++	uint32_t shared, version, polls;                /* run E: the last word polled at ram_end - 4 (the shared address once it is one), the version byte of the shared structure, the reads of the poll */
++	int halted;                                     /* run E: the CA7 is in reset again, proven by the read-back of the re-halt (swl_restore) */
++	int ca_ok;                                      /* run E (review 0133 F3): the CA7 RESET_CTL := 1 of swl_restore was stored and read back */
+ };
+ 
+ static inline const char *
+ swl_ename(int c)
+ {
+ 	static const char *const n[SWW_E_LAST] = { "none", "stopped", "no tuple", "level", "repeat", "order", "phase", "bank rule", "precondition", "window", "read",
+-	                                           "dead read", "old value", "companion", "store", "read-back", "state", "wait", "srpwr", "ram size", "map", "image", "tail window", "nvram", "tail geometry", "entropy" };
++	                                           "dead read", "old value", "companion", "store", "read-back", "state", "wait", "srpwr", "ram size", "map", "image", "tail window", "nvram", "tail geometry", "entropy", "interrupt unmasked", "firmware did not come up", "shared address", "halt not confirmed" };
+ 	return c > 0 && c < SWW_E_LAST ? n[c] : "?";
+ }
+ 
+@@ -553,7 +603,7 @@ swl_wr_pick(const struct swl_wx *x, int space, uint32_t win, uint32_t off, uint3
+ {
+ 	int first = swl_wr_ok(space, win, off, val), t = first, n;
+ 
+-	while (t >= 0 && (((swl_wt[t].flags & SWT_ONCE) && (x->done & (1u << t))) || ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {
++	while (t >= 0 && (((swl_wt[t].flags & SWT_ONCE) && (x->done & (1ull << t))) || ((swl_wt[t].flags & SWT_TW) && swl_wt[t].kind != swl_tw_kind(x, win + off)))) {
+ 		n = swl_wr_ok_from((unsigned)t + 1u, space, win, off, val);
+ 		if (n <= t || (int)swl_wt[n].run > x->level - SWW_LEVEL0) {      /* n < 0: none; the search only moves forward */
+ 			return first;
+@@ -627,13 +677,42 @@ swl_store(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t v)
+ 	return x->b->wr(x->b->ctx, space, win, off, v);
+ }
+ 
+-/* restore of the groups the failing step armed; each write from swl_rs[], read back, BAR0 ones only while the preconditions still hold */
++/* patch 0133: the CA7 was released, so the reset is asserted the way DHD asserts one on a running core: after the wait for pending backplane operations (SPINWAIT 300 us on RESET_ST, aiutils.c:1257 and
++ * ai_core_disable 1209-1217); the reset is asserted whatever RESET_ST says. The window of the wrapper is selected by the caller. */
++static inline void
++swl_idle_wait(struct swl_wx *x, uint32_t win)
++{
++	uint32_t st = 0xFFFFFFFFu;
++	unsigned i;
++
++	for (i = 0; i < 30; i++) {
++		if (swl_rdx(x, SWW_BAR0, win, SWL_AGENT_RESET_ST, &st) == 0 && st == 0) {
++			break;
++		}
++		x->b->delay_us(x->b->ctx, 10);
++	}
++	printf("SWEET WLAN: restore: CA7 RESET_ST %#x after %u waits, asserting the reset\n", st, i);
++}
++
++/* review 0133 F1: 1 when the EP still decodes memory (Command bit 1) and BAR0 is where the preconditions want it: the one reading of a failed precondition 5 (the firmware changed its own Command, for
++ * example set bus mastering) under which the CA7 re-halt is still as safe as any earlier BAR0 store; the link checks (1..4) came first in swl_wpre() and passed to return 5 */
++static inline int
++swl_cmd_mem(struct swl_wx *x, uint32_t *cmd)
++{
++	uint32_t b0 = 0xFFFFFFFFu, b1 = 0xFFFFFFFFu;      /* a read that fails leaves a value the checks below refuse */
++
++	*cmd = 0;
++	return swl_rdx(x, SWW_CFG, 0, 0x04u, cmd) == 0 && swl_rdx(x, SWW_CFG, 0, 0x10u, &b0) == 0 && swl_rdx(x, SWW_CFG, 0, 0x14u, &b1) == 0 && (*cmd & 0x2u) != 0 && swl_pre_ep(0x2u, b0, b1) == 0;
++}
++
++/* restore of the groups the failing step armed; each write from swl_rs[], read back, BAR0 ones only while the preconditions still hold (from the release on, the config ones too while the link is not known to be down:
++ * review 0133 F4; and the CA7 row also when only the Command check failed and memory decode is on: F1) */
+ static inline void
+ swl_restore(struct swl_wx *x)
+ {
+ 	unsigned i;
+-	uint32_t live, rb;
+-	int bad = 0, did = 0, skipped = 0, pre = -1, ok;
++	uint32_t live, rb, cmd;
++	int bad = 0, did = 0, skipped = 0, pre = -1, ok, rpre;
+ 
+ 	for (i = 0; i < sizeof swl_rs / sizeof swl_rs[0]; i++) {
+ 		const struct swl_rs *r = &swl_rs[i];
+@@ -642,15 +721,22 @@ swl_restore(struct swl_wx *x)
+ 			continue;
+ 		}
+ 		x->armed &= ~r->grp;
+-		if (r->space == SWW_BAR0) {
++		if (r->space == SWW_BAR0 || (r->space == SWW_CFG && (x->flags & SWF_W16))) {
+ 			if (pre < 0) {
+ 				pre = swl_wpre(x);
+ 			}
+-			if (pre) {
+-				printf("SWEET WLAN: restore of group %u skipped, precondition %d\n", r->grp, pre);
++			rpre = pre;
++			if (rpre == 5 && r->space == SWW_BAR0 && r->grp == SWW_RG_CA && (x->flags & SWF_W16) && swl_cmd_mem(x, &cmd)) {
++				printf("SWEET WLAN: restore: EP command %#x changed, re-halting the CA7 anyway\n", cmd);
++				rpre = 0;
++			}
++			if (r->space == SWW_BAR0 ? rpre != 0 : ((rpre >= 1 && rpre <= 4) || rpre == 8)) {
++				printf("SWEET WLAN: restore of group %u skipped, precondition %d\n", r->grp, rpre);
+ 				skipped = 1;
+ 				continue;
+ 			}
++		}
++		if (r->space == SWW_BAR0) {
+ 			if (swl_rdx(x, SWW_CFG, 0, SWW_CFG_WIN, &live)) {
+ 				bad = 1;
+ 				continue;
+@@ -660,9 +746,15 @@ swl_restore(struct swl_wx *x)
+ 				continue;
+ 			}
+ 		}
++		if (r->grp == SWW_RG_CA && (x->flags & SWF_W16)) {
++			swl_idle_wait(x, r->win);
++		}
+ 		did = 1;
+ 		ok = !swl_store(x, r->space, r->win, r->off, r->val) && !swl_rdx(x, r->space, r->win, r->off, &rb) && !((rb ^ r->val) & r->vmask);
+ 		printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", r->space, r->win, r->off, r->val, ok ? "ok" : "FAILED");
++		if (r->grp == SWW_RG_CA) {
++			x->ca_ok = ok;
++		}
+ 		bad |= !ok;
+ 	}
+ 	x->restore = bad ? SWW_RS_FAILED : skipped ? SWW_RS_SKIPPED : did ? SWW_RS_OK : SWW_RS_NONE;
+@@ -701,10 +793,10 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 	if ((int)p->run > x->level - SWW_LEVEL0) {
+ 		return swl_stop(x, SWW_E_LEVEL);
+ 	}
+-	if ((p->flags & SWT_ONCE) && (x->done & (1u << t))) {
++	if ((p->flags & SWT_ONCE) && (x->done & (1ull << t))) {
+ 		return swl_stop(x, SWW_E_REPEAT);
+ 	}
+-	if (p->pred1 && !(x->done & (1u << (p->pred1 - 1u)))) {
++	if (p->pred1 && !(x->done & (1ull << (p->pred1 - 1u)))) {
+ 		return swl_stop(x, SWW_E_ORDER);
+ 	}
+ 	if ((x->flags & p->need) != p->need) {
+@@ -778,7 +870,7 @@ swl_wr(struct swl_wx *x, int space, uint32_t win, uint32_t off, uint32_t val)
+ 		x->tn[p->kind]++;
+ 		return 0;
+ 	}
+-	x->done |= 1u << t;
++	x->done |= 1ull << t;
+ 	if (p->flags & SWT_BANK) {
+ 		x->nbank++;
+ 	}
+@@ -1356,6 +1448,206 @@ swl_w14(struct swl_wx *x)
+ 	return swl_done(x, SWF_W14);
+ }
+ 
++/* run E: RESET_ST read up to 30 times, 10 us apart, until it is 0 (DHD's SPINWAIT(... != 0, 300), which goes on when the status stays: a core that runs may have operations pending); a failed read is a stop */
++static inline int
++swl_st_spin(struct swl_wx *x, uint32_t win, uint32_t *st)
++{
++	unsigned i;
++
++	for (i = 0; i < 30; i++) {
++		SWW_RD(x, SWW_BAR0, win, SWL_AGENT_RESET_ST, *st);
++		if (*st == 0) {
++			break;
++		}
++		if (i + 1 < 30) {
++			swl_delay(x, 10);
++		}
++	}
++	return 0;
++}
++
++/* run E: _ai_core_reset(0, 0) of the CA7 wrapper as DHD runs it for the release (aiutils.c:1242-1325, dhd_pcie.c:10343-10346): swl_core_reset()'s sequence with the values SWW_REL_MID/SWW_REL_END, except that after the reset is
++ * released (the CPU starts there) RESET_ST is only waited on (swl_st_spin) and only the IOCTL and RESET_CTL read-backs decide: a running CPU may have operations pending, DHD never checks the status afterwards. */
++static inline int
++swl_core_release(struct swl_wx *x, uint32_t win)
++{
++	uint32_t io, ctl, st = 0;
++
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 1u));
++	swl_delay(x, 10);
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_CTL, 1u, 1u, 1, 0));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_IOCTL, SWW_REL_MID));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_IOCTL, SWW_IOCTL_MASK, SWW_REL_MID, 1, 0));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_ST, 0xFFFFFFFFu, 0u, 30, 10));
++	x->flags |= SWF_W16;                                                /* the CPU may run from the next store on (review 0133 F3): a stop before this point never released it */
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, 0u));        /* the CPU starts here (CPUHALT is clear) */
++	SWW_TRY(swl_st_spin(x, win, &st));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_RESET_CTL, 1u, 0u, 10, 10));
++	SWW_TRY(swl_wr(x, SWW_BAR0, win, SWL_AGENT_IOCTL, SWW_REL_END));
++	SWW_TRY(swl_wait(x, win, SWL_AGENT_IOCTL, SWW_IOCTL_MASK, SWW_REL_END, 1, 0));
++	swl_delay(x, 1);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_IOCTL, io);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_RESET_CTL, ctl);
++	SWW_RD(x, SWW_BAR0, win, SWL_AGENT_RESET_ST, st);
++	printf("SWEET WLAN: W%u wrapper %#x after the release: ioctl %#x reset_ctl %#x reset_st %#x\n", x->row, win, io, ctl, st);
++	if ((io & SWW_IOCTL_MASK) != SWW_REL_END || (ctl & 1u) != 0) {
++		return swl_stop(x, SWW_E_STATE);
++	}
++	return 0;
++}
++
++/* run E, 1 when stage 1 listed the PCIe core 0x83c with a rev in the range where DHD's PCIMailBoxMask is at 0xC34 (REV_GE_64) and W14's vector test is DHD's (rev < 74): the caller then runs level 7, else level 6 */
++static inline int
++swl_w16_rev_ok(const struct swl_chip *c)
++{
++	const struct swl_core *p = swl_core(c, SWW_CORE_PCIE2, 0);
++
++	return p != 0 && p->rev >= SWW_PCIE_REV_MIN && p->rev < 74;
++}
++
++/* W16: what the release needs is proven first, nothing is stored before the last of these: (the image and its identity again, AP-74: swl_w16 below) the reset vector still there, the dongle's host interrupt mask is 0 and no interrupt of the host controller (ELBI IRQ0/1/2 enables) is on (the IRQ gate: a
++ * firmware that comes up cannot raise INTx/MSI through the mailbox bits while the mask is 0; a mask that is not 0 is a stop with nothing released), the poll window set and the token still the baseline. Then the CA7 is released. From
++ * the store that starts the CPU SWF_W16 is set: the CPU may run, every stop runs the CA7 reset again (swl_restore, group CA, armed by the first release store and kept armed until W17 is over). */
++static inline int
++swl_w16_go(struct swl_wx *x)
++{
++	uint32_t end = SWW_RAM_BASE + x->ram_bytes, win = end > SWW_TCM_BYTES ? SWW_WIN_TAIL : 0u, mask, mint, v, rc0, rc1, rc2, en0, en1, en2;
++
++	x->row = 16;
++	SWW_RD(x, SWW_BAR2, 0, 0, v);
++	if (v != swl_img_word(x, 0)) {
++		printf("SWEET WLAN: W16 backplane 0 reads 0x%08x, not the reset vector 0x%08x\n", v, swl_img_word(x, 0));
++		return swl_stop(x, SWW_E_READBACK);
++	}
++	SWW_TRY(swl_win(x, SWW_WIN_PCIE));
++	SWW_RD(x, SWW_BAR0, SWW_WIN_PCIE, SWW_MBINT, mint);
++	SWW_RD(x, SWW_BAR0, SWW_WIN_PCIE, SWW_MBMASK, mask);
++	printf("SWEET WLAN: W16 PCIe core mailbox int %#x mask %#x\n", mint, mask);
++	if (mask == 0xFFFFFFFFu || mint == 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	if (mask != 0) {
++		return swl_stop(x, SWW_E_IRQ);
++	}
++	/* review 0133 F2: the host controller's own gates, read only: an enabled INTx, link-down or MSI/completion-timeout interrupt would reach the GIC from the chip's pins; nothing is released then */
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ0, rc0);
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ0 + 4u, rc1);
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ0 + 8u, rc2);
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ0_EN, en0);
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ1_EN, en1);
++	SWW_RD(x, SWW_ELBI, 0, SWW_RC_IRQ2_EN, en2);
++	printf("SWEET WLAN: W16 RC irq0 %#x/%#x irq1 %#x/%#x irq2 %#x/%#x\n", rc0, en0, rc1, en1, rc2, en2);
++	if ((en0 & SWW_RC_INTX_EN) != 0) {
++		return swl_stop(x, SWW_E_IRQ);
++	}
++	if ((en1 & SWW_RC_LDOWN_EN) != 0) {
++		return swl_stop(x, SWW_E_IRQ);
++	}
++	if ((en2 & SWW_RC_MSI_EN) != 0) {
++		return swl_stop(x, SWW_E_IRQ);
++	}
++	if ((en0 | en1 | en2) != 0) {
++		printf("SWEET WLAN: W16 RC interrupt enable bits outside the INTx/link-down/MSI masks are set\n");
++		return swl_stop(x, SWW_E_IRQ);
++	}
++	if (win != 0) {
++		SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, win));
++	}
++	SWW_RD(x, SWW_BAR2, win, end - 4u - win, v);
++	if (v != x->tok) {
++		printf("SWEET WLAN: W16 shared word bp %#x reads 0x%08x before the release, not the token 0x%08x\n", end - 4u, v, x->tok);
++		return swl_stop(x, SWW_E_READBACK);
++	}
++	x->flags |= SWF_RELOK;
++	SWW_TRY(swl_win(x, SWW_WIN_CA7WRAP));
++	SWW_TRY(swl_core_release(x, SWW_WIN_CA7WRAP));
++	printf("SWEET WLAN: W16 CA7 released\n");
++	return 0;
++}
++
++/* W16 as the stage runs it: the image and its identity are proven again (the CRC over the image bytes: the slow part, the host test runs swl_w16_go() alone in its fault sweeps), then swl_w16_go() */
++static inline int
++swl_w16(struct swl_wx *x)
++{
++	x->row = 16;
++	SWW_TRY(swl_img_check(x));
++	SWW_TRY(swl_fw_pin(x));
++	return swl_w16_go(x);
++}
++
++/* W17: the CA7 ran for the first time. Poll the shared-area word (ram_end - 4, the token until the firmware replaces it) 100 times, 50 ms apart (OpenBSD if_bwfm_pci.c:866-883; DHD
++ * dhd_pcie.c:13637-13705: loop while the word is 0 or the token, all-ones is the link-down error): every change is printed. A shared address must be 4-aligned and inside [SWW_RAM_BASE, ram_end - 4); its first word
++ * is read (the version byte is printed, a version outside 5..7 only logged). A timeout prints the last word and the CA7 wrapper state and stops. Whatever happens the run ends with the stop action
++ * (swl_restore: CA7 RESET_CTL := 1 read back, cfg 0x84 := 0): the firmware is not kept running, and the run is only a success when the read-back of the re-halt holds. */
++static inline int
++swl_w17(struct swl_wx *x)
++{
++	uint32_t end = SWW_RAM_BASE + x->ram_bytes, win = end > SWW_TCM_BYTES ? SWW_WIN_TAIL : 0u, v = 0, prev = 0, sh, fl, io = 0, ctl = 0, st = 0, c88 = 0, sw;
++	unsigned i;
++	int seen = 0, rd;
++
++	x->row = 17;
++	x->polls = 0;
++	x->shared = 0;
++	for (i = 0; i < SWW_UP_POLLS; i++) {
++		if (swl_wpre(x)) {
++			return swl_stop(x, SWW_E_PRE);
++		}
++		SWW_RD(x, SWW_BAR2, win, end - 4u - win, v);
++		x->polls = i + 1;
++		x->shared = v;
++		if (!seen || v != prev) {
++			printf("SWEET WLAN: W17 poll %u (%u ms after the release) word 0x%08x\n", i + 1, i * (SWW_UP_US / 1000u), v);
++			seen = 1;
++			prev = v;
++		}
++		if (v == 0xFFFFFFFFu) {
++			return swl_stop(x, SWW_E_DEAD);
++		}
++		if (v != 0 && v != x->tok) {
++			break;
++		}
++		if (i + 1 < SWW_UP_POLLS) {
++			swl_delay(x, SWW_UP_US);
++		}
++	}
++	if (v == 0 || v == x->tok) {
++		rd = swl_rdx(x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_IOCTL, &io) | swl_rdx(x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_CTL, &ctl) |
++		     swl_rdx(x, SWW_BAR0, SWW_WIN_CA7WRAP, SWL_AGENT_RESET_ST, &st) | swl_rdx(x, SWW_CFG, 0, 0x88u, &c88);
++		printf("SWEET WLAN: W17 no shared address after %u polls (%u ms): word 0x%08x (token 0x%08x), CA7 ioctl %#x reset_ctl %#x reset_st %#x, cfg 0x88 %#x%s\n",
++		       x->polls, x->polls * (SWW_UP_US / 1000u), v, x->tok, io, ctl, st, c88, rd ? " (a state read failed)" : "");
++		return swl_stop(x, SWW_E_UP);
++	}
++	sh = v;
++	if ((sh & 3u) != 0 || sh < SWW_RAM_BASE || sh >= end - 4u) {
++		printf("SWEET WLAN: W17 shared address 0x%08x is not a word in [%#x, %#x)\n", sh, SWW_RAM_BASE, end - 4u);
++		return swl_stop(x, SWW_E_SHARED);
++	}
++	sw = sh >= SWW_WIN_TAIL ? SWW_WIN_TAIL : 0u;
++	if (sw != win) {
++		SWW_TRY(swl_wr(x, SWW_CFG, 0, SWW_CFG_WIN2, sw));
++	}
++	SWW_RD(x, SWW_BAR2, sw, sh - sw, fl);
++	if (fl == 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	x->version = fl & SWW_VER_MASK;
++	printf("SWEET WLAN: W17 shared structure bp %#x after %u polls: flags 0x%08x version %u%s\n", sh, x->polls, fl, x->version,
++	       x->version < SWW_VER_MIN || x->version > SWW_VER_MAX ? " (outside 5..7, not accepted by DHD)" : "");
++	swl_restore(x);
++	x->halted = x->ca_ok;
++	if (!x->halted) {
++		x->stopped = 1;
++		x->stop_code = SWW_E_HALT;
++		printf("SWEET WLAN: W17 STOP: %s (code %d), restore=%s\n", swl_ename(SWW_E_HALT), SWW_E_HALT, swl_rsname(x->restore));
++		return -SWW_E_HALT;
++	}
++	x->flags |= SWF_W17;
++	return 0;
++}
++
+ /* run A: W0..W7 in order; 0 = done, else negative (STOPPED, restore state in x->restore) */
+ static inline int
+ swl_stage3(struct swl_wx *x)
+@@ -1413,10 +1705,21 @@ swl_stage3(struct swl_wx *x)
+ 	if (x->level >= SWW_LEVEL0 + 4) {
+ 		rc = rc ? rc : swl_w14(x);
+ 	}
++	if (x->level >= SWW_LEVEL0 + 5) {      /* run E: the release and the poll; ends with the stop action */
++		rc = rc ? rc : swl_w16(x);
++		rc = rc ? rc : swl_w17(x);
++	}
+ 	if (rc) {
+ 		printf("SWEET WLAN: stage 3 level %d stopped at W%u restore=%s\n", x->level, x->row, swl_rsname(x->restore));
++		if (x->level >= SWW_LEVEL0 + 5) {      /* run E: say what state the CA7 is left in */
++			printf("SWEET WLAN: stage 3 level %d CA7 %s\n", x->level, !(x->flags & SWF_W16) ? "never released, halted=1" : x->ca_ok ? "released and reset again (read back), halted=1" : "RELEASED AND NOT CONFIRMED IN RESET, halted=0");
++		}
+ 		return rc;
+ 	}
++	if (x->level >= SWW_LEVEL0 + 5) {
++		printf("SWEET WLAN: stage 3 level %d done shared=%#x version=%u polls=%u halted=%d\n", x->level, x->shared, x->version, x->polls, x->halted);
++		return 0;
++	}
+ 	if (x->level >= SWW_LEVEL0 + 4) {
+ 		printf("SWEET WLAN: stage 3 level %d done w14 old=%#010x new=%#010x vars=%u token=%#010x crc=%#010x\n", x->level, x->w14_old, x->rb, x->nv_varsize, x->tok, x->nv_crc_rb);
+ 		return 0;

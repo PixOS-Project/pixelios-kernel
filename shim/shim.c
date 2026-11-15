@@ -12,11 +12,14 @@
 #include "loader.h"
 #include "fdt.h"
 #include "pstore.h"
+#include "shim_assert.h"
+#include "pr3run.h"
 #include "ufs.h"
 #include "ufsinit.h"
 #include "usbprobe.h"
 #include "wlanprobe.h"
 #include "wlanrails.h"
+#include "pmicsrc.h"
 #include "wlanen.h"
 #include "wlansmc.h"
 #include "wlanlink.h"
@@ -28,6 +31,9 @@
 #include "gpus2mpu.h"
 #include "gpujob.h"
 #include "touchprobe.h"
+#ifdef EL2_TRAP
+#include "el2.h"
+#endif
 #ifdef BOOT_XNU
 #include "loader.h"
 #endif
@@ -41,6 +47,31 @@
 #endif
 #include "udump.h"
 #endif
+#endif
+
+#if defined(TOUCH_DVFS)
+/* The CPU DVFS result (L-28): owned here, not in touchprobe.o (the audit allows no
+ * writable static state there); loader.c reads it. */
+#ifdef TOUCH_DVFS_WRITE
+struct touch_dvfs_res touch_dvfs_res_g;
+#define DVFS_RES (&touch_dvfs_res_g)
+#else
+#define DVFS_RES ((struct touch_dvfs_res *)0)
+#endif
+static struct touch_dvfs_res *dvfs_res_fresh(void)
+{
+#ifdef TOUCH_DVFS_WRITE
+	touch_dvfs_res_init(&touch_dvfs_res_g);
+	SHIM_ASSERT(touch_dvfs_res_g.rc == 4u);
+	SHIM_ASSERT(touch_dvfs_res_g.on == 0u);
+#endif
+	return DVFS_RES;
+}
+#endif
+
+#ifdef PMIC_SRC
+/* .bss: empty until pmic_src() ran; loader.c appends it to the XNU command line */
+char pmic_src_tok[PMIC_SRC_TOK_MAX];
 #endif
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -212,18 +243,39 @@ static void report_bluejay_watchdog(const char *label, const struct wdt_state *s
  * (0x17463a00 bit 1) through the same SMC. No flash/misc write; ABL clears the register on the next boot.
  * Unverified on hardware until the first run: every step prints its result, and we never reset unless the
  * readback is 0xfc. */
-static void bluejay_reset_bootloader(void)
+static uint32_t rbl_arm_after = 0xdead;	/* SYSIP_DAT0 readback after the arm SMC, for the print only */
+static int rbl_armed;			/* set before the SMC: the arm runs at most once, even if the readback faults */
+
+/* Arm step: the SYSIP_DAT0 write + readback, done while the USB gadget still serves (before
+ * usb_gadget_finish) so the result reaches the host log, not only the screen. Nothing resets in
+ * between; ABL clears the register on the next boot (docs/research/10). Runs at most once. */
+static void bluejay_bootloader_arm(void)
 {
-	const uintptr_t sysip = 0x17460810UL, swreset = 0x17463a00UL;
+	const uintptr_t sysip = 0x17460810UL;
 	uint32_t before = 0xdead, after = 0xdead, rst = 0xdead;
+	if (rbl_armed)
+		return;
+	rbl_armed = 1;
 	try_read32(sysip, &before);
 	try_read32(0x17463b44UL, &rst);
 	uint64_t r1 = smc(0x82000504UL, sysip, 1, 0xfc);
 	try_read32(sysip, &after);
+	rbl_arm_after = after;
 	con_hex2("REBOOT_BL SYSIP before", "", before, "RST_STAT", rst);
 	con_hex2("REBOOT_BL SMC ret", "", (uint32_t)r1, "after", after);
+	if (after != 0xfc)
+		con_str("REBOOT_BL", "arm FAILED: register not 0xfc, the end reset will not go to the bootloader");
+}
+
+static void bluejay_reset_bootloader(void)
+{
+	const uintptr_t sysip = 0x17460810UL, swreset = 0x17463a00UL;
+	uint32_t now = 0xdead;
+	bluejay_bootloader_arm();		/* no-op when the gadget path armed it already */
+	try_read32(sysip, &now);
+	con_hex2("REBOOT_BL SYSIP at reset", "", now, "armed", rbl_arm_after);
 	wait_ticks(counter_freq() * 8);		/* leave the numbers on screen for the camera */
-	if (after != 0xfc) {
+	if (now != 0xfc) {
 		con_str("REBOOT_BL", "register not 0xfc: no bootloader reset");
 		wait_ticks(counter_freq() * 8);
 		return;
@@ -248,6 +300,7 @@ static void __attribute__((noreturn)) bluejay_reset_chain(void)
 		wait_ticks(counter_freq());
 	}
 	con_str("RESET", "all resets failed: hold Power+VolDown");
+	/* bounded: halt on purpose: all resets failed, wait for the hold-power reset */
 	for (;;) __asm__ volatile("wfi");
 }
 
@@ -309,7 +362,6 @@ static int prepare_bluejay_cpu(unsigned cpu)
 	con_hex("PMU intr-gen success", ok);
 	return ok;
 }
-
 
 #ifdef USB_GADGET
 /* ---- stage-2 USB CDC-ACM log gadget (build flag --usb-gadget, default OFF) ----
@@ -478,7 +530,6 @@ static void usb_gadget_finish(void)
 	usbg_on = 0;
 	usbgadget_stop();
 }
-
 #ifdef UDUMP
 /* Userdata dump (build flag --udump): stream the first N MiB of
  * the GPT 'userdata' partition as framed records over the gadget, read-
@@ -538,6 +589,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	con_clear(0xff000000U);
 	con_str("FB", live_framebuffer ? "from live FDT" : "board fallback");
 	con_hex("ENTRY EL", probe_entry_el);
+	pr3_marker_run();	/* style-allow: func-len legacy */ /* style-allow: sized-types legacy */
 	/* Locate the ramoops console zone before anything can crash: from
 	 * here on every checkpoint save (and the panic path) hands the log
 	 * to Android through pstore. */
@@ -547,6 +599,17 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	report_bluejay_watchdog("WDT CL1", &wdt_cl1);
 	decon_rearm_trigger();
 	pstore_save();			/* checkpoint 2: watchdog + DECON */
+#ifdef PMIC_SRC
+	/* READ-ONLY (--pmic-src, pmicsrc.c, docs/research/139): the PMIC reset-source latches through
+	 * the audited ACPM FUNC_READ allowlist, before any other PMIC use (the --boot-xnu rail steps
+	 * below included), so a silent hardware reset of the previous run leaves a readable record.
+	 * Nothing is cleared. */
+	con_str("SECTION", "PMIC reset source");
+	/* the tokens go to the XNU command line in loader.c (the console never reaches the host in a
+	 * handover boot) */
+	(void)pmic_src(pmic_src_tok, sizeof(pmic_src_tok));
+	pstore_save();
+#endif
 #ifdef BOOT_XNU
 	/* --boot-xnu: hand over to the SWEETXNU payload (found in the ABL
 	 * ramdisk) right after the display/watchdog setup. loader_boot()
@@ -576,13 +639,13 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	 * firmware for those rates (volatile, table rows below the ceilings, docs/research/25), so XNU boots at them. Any refusal or failure is logged and
 	 * XNU boots anyway. */
 	{
-		int dvfs_e = touch_probe_dvfs(0);
+		int dvfs_e = touch_probe_dvfs(0, dvfs_res_fresh());
 
 		if (!dvfs_e)
-			dvfs_e = touch_probe_dvfs(1);
+			dvfs_e = touch_probe_dvfs(1, DVFS_RES);
 #ifdef TOUCH_DVFS_WRITE
 		if (!dvfs_e)
-			(void)touch_probe_dvfs(2);
+			(void)touch_probe_dvfs(2, DVFS_RES);
 #endif
 		pstore_save();
 	}
@@ -595,21 +658,21 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	/* --boot-xnu --gpu-handover: switch the shader rail BUCK2S on (audited ACPM writer, gpurailon.c: zero writes unless it reads exactly off with OUT1 in the
 	 * window) and LEAVE it on for XNU, which has no ACPM client (docs/research/30; patch 0103 powers the cores through the GPU registers, 0102 only reads).
 	 * A refusal is logged and XNU boots anyway; an UNVERIFIED or MISMATCH result is put back (gpurailon.h, review M1); a verified rail stays on. */
-	int gpu_ho;
+	int gpu_ho;	/* style-allow: sized-types legacy int status codes of the whole probe flow */
 
-	con_str("SECTION", "GPU handover (rail on, left on)");
-	gpu_ho = gpu_rail_enable();
+	con_str("SECTION", "GPU handover (rail on, left on)");	/* style-allow: func-len legacy */
+	gpu_ho = gpu_rail_enable();	/* style-allow: assert a stop here leaves the rail on, unrestored */
 	con_hex("GPU handover rail (0=on)", (uint32_t)gpu_ho);
 	if (gpu_ho == RAIL_UNVERIFIED || gpu_ho == RAIL_MISMATCH)
 		gpu_rail_restore(gpu_ho, RAIL_POWER_NONE);
-	pstore_save();
+	gpu_clk_handover(gpu_ho == RAIL_ON_OK);	/* --gpu-clk-level DVFS pair (gpuclk.c); saves pstore */
 #endif
 #ifdef WLAN_HOLD
 	/* --boot-xnu --wlan-hold (docs/research/42 section 7): power PCIe1 + the BCM4389 up to the end of S30 with the audited table interpreter and LEAVE the link up for the XNU driver.
 	 * wlan_link_hold() skips the teardown only when steps 0 to the hold step all ran ok; on any failure it tears down (restore=ok|FAILED) and XNU boots anyway. No new writer here. */
 	con_str("SECTION", "WLAN link hold");
 	wlan_hold_rc = wlan_link_hold(&wlan_held);
-	pstore_save();
+	wlan_h1_after_hold(wlan_hold_rc);	/* style-allow: assert stop path (STYLE-C.md) */
 #endif
 	{
 		const char *why = loader_boot(dtb);
@@ -632,6 +695,15 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 #ifdef USB_GADGET
 	usb_gadget_start(dtb);		/* live log from here on */
 #endif
+#if defined(EL2_TRAP) && !defined(EL2_RESIDENT)	/* EL2_RESIDENT (SPEC 3.4 (b) design item 1 (ii)): the T1/T2 test reads are compiled out, there is no trap page */
+	/* --el2-trap (SPEC 3.3.9): stage 2 is on since the first EL1 instruction. The two test reads are n=1 (T1, a dedicated page in .bss) and n=2 (T2 = GICD_TYPER, ipa GICD_BASE + 4);
+	 * the existing GICD_TYPER / GICD_CTLR reads below are n=3 and n=4, so the predicted `EL2 RESULT` is traps=00000004. No other access to a trapped page is on this path (SPEC 3.3.9, AP-159).
+	 * Only if stage 2 is on (el2_t1_pa is 0 after a fallback). A discarded volatile load stays a single `ldr w` (ISV = 1); tools/el2_audit.py checks the disassembly. */
+	if (el2_s2_on) {
+		(void)rd32(el2_t1_pa);
+		(void)rd32(GICD_BASE + 4);
+	}
+#endif
 
 	delay_ms(3000);
 	con_clear(0xff000000U);
@@ -639,6 +711,9 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	report_cpu(0);
 	con_hex("GICD_TYPER", rd32(GICD_BASE + 4));
 	con_hex("GICD_CTLR", rd32(GICD_BASE));
+#ifdef EL2_TRAP
+	el2_print_report();		/* census, S2 readbacks, the ring, EL2 RESULT (SPEC 3.3.9) */
+#endif
 	uintptr_t redistributor = find_gicr();
 	if (redistributor) con_hex("GICR_TYPER", rd64(redistributor + GICR_TYPER));
 	else con_str("GICR", "not found");
@@ -821,7 +896,7 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	gpu_rails();
 	pstore_save();
 #endif
-#ifdef GPU_CLK
+#if defined(GPU_CLK) && !defined(GPU_CLK_LEVEL)	/* level images: gpu_clk_handover() */
 	/* Opt-in (--gpu-clk, docs/research/27): ask the ACPM DVFS channel for the G3DL2 / G3D init rate (gpuclk.c), print the CMU words again;
 	 * refuses with zero writes unless the ACPM gates are set. Runs before the power cycle. A failure (review M2) skips the power cycle. */
 	con_str("SECTION", "GPU clk");
@@ -897,16 +972,16 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	con_clear(0xff000000U);
 	con_str("SECTION", "TOUCH dvfs (ACPM)");
 	{
-		int dvfs_e = touch_probe_dvfs(0);
+		int dvfs_e = touch_probe_dvfs(0, dvfs_res_fresh());
 
 		pstore_save();
 		if (!dvfs_e) {
-			dvfs_e = touch_probe_dvfs(1);
+			dvfs_e = touch_probe_dvfs(1, DVFS_RES);
 			pstore_save();
 		}
 #ifdef TOUCH_DVFS_WRITE
 		if (!dvfs_e) {
-			(void)touch_probe_dvfs(2);
+			(void)touch_probe_dvfs(2, DVFS_RES);
 			pstore_save();
 		}
 #endif
@@ -925,6 +1000,9 @@ static void __attribute__((noreturn)) bluejay_probe(uintptr_t dtb)
 	pstore_save();			/* checkpoint: dump result */
 #endif
 #ifdef USB_GADGET
+#ifdef REBOOT_BL
+	bluejay_bootloader_arm();	/* readback goes out over USB in the remaining gadget window */
+#endif
 	usb_gadget_finish();
 	pstore_save();			/* checkpoint: gadget window over */
 #endif
@@ -957,7 +1035,9 @@ static void delay_ms(unsigned ms)
 	wait_ticks((counter_freq() / 1000) * ms);
 }
 
-#if defined(TOUCH_PROBE) || defined(GPU_POWER) || defined(GPU_CLK) || defined(GPU_RAILS) || defined(GPU_RAIL_ON) || defined(GPU_JOB) || defined(WLAN_RAILS) || defined(WLAN_LINK_RUN)
+#if defined(TOUCH_PROBE) || defined(GPU_POWER) || defined(GPU_CLK) || defined(GPU_RAILS) \
+	|| defined(GPU_RAIL_ON) || defined(GPU_JOB) || defined(WLAN_RAILS) || defined(PMIC_SRC) \
+	|| defined(WLAN_LINK_RUN) || defined(SWEET_PROBE)
 uint64_t touch_ticks(void)	/* touchprobe.c / gpupower.c: bounded waits (CNTPCT) */
 {
 	return now();
@@ -987,9 +1067,58 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	wr32(PSHOLD, 0);
+	/* bounded: halt on purpose: the reset was requested, wait for it to take effect */
 	for (;;)
 		__asm__ volatile("wfe");
 #endif
+}
+
+/*
+ * SHIM_ASSERT stop (shim_assert.h): the panic handler's tail, so an assertion ends exactly like
+ * an unexpected exception: pstore checkpoint, then reset(40) (live screen, log replay, reset
+ * chain).
+ */
+void __attribute__((noreturn)) shim_stop(void)
+{
+	/* style-allow: assert the stop path must not depend on an assertion */
+	pstore_panic_save();
+	reset(40);
+}
+
+/*
+ * Terminal stop for an assertion that failed inside the stop's own logging (shim_assert.c depth 2):
+ * the same reset writes as the end of reset(), with no console, ramlog or pstore call that could
+ * assert again.
+ */
+void __attribute__((noreturn)) shim_halt(void)
+{
+	/* style-allow: assert the terminal stop must not depend on an assertion */
+#if SOC_GS101
+	(void)smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	(void)smc(PSCI_SYSTEM_RESET2, 0x80000000UL, 0, 0);
+	if (WDT_CL0_BASE) {
+		(void)try_write32(WDT_CL0_BASE + 4, 1);
+		(void)try_write32(WDT_CL0_BASE + 8, 1);
+		(void)try_write32(WDT_CL0_BASE, (3U << 3) | (1U << 5) | 1U);
+	}
+#else
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+	(void)smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	wr32(PSHOLD, 0);
+#endif
+	/* bounded: the reset did not happen, nothing is left to do but wait for it */
+	for (;;)
+		__asm__ volatile("wfi");
+}
+
+/* This CPU's SHIM_ASSERT depth slot: MPIDR Aff1 (cpu_report[] index); 0 when out of range. */
+uint32_t shim_cpu_slot(void)
+{
+	/* style-allow: assert the slot lookup runs inside the assertion reporter */
+	uint32_t aff1 = (uint32_t)((rsr("mpidr_el1") >> 8) & 0xffu);
+
+	return aff1 < NR_CPUS ? aff1 : 0u;
 }
 
 /* ---- exceptions ---- */
@@ -1103,7 +1232,7 @@ static void __attribute__((unused)) test_smp(void)
 	int64_t ret[NR_CPUS];
 
 	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
+		ret[i] = (int64_t)smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);	/* x0 reinterpreted as signed (same bits); only (uint32_t)ret[i] is printed below */
 	delay_ms(500);
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";

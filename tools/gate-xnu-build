@@ -1,0 +1,98 @@
+#!/bin/bash
+# gate-xnu-build (TP-039, AP-147): compile the COMMITTED xnu/patches stack of a checkout as a real XNU kernel (tools/xnu-local-build)
+# BEFORE a formal gate. The gate itself only compiles extracted pure headers, so a glue file that does not compile (0167: undeclared
+# pmap_find_phys) passed a 25 min gate. Host only: no phone, no flash, no root, no network once the toolchain AND $ARTIFACTS/git-mirror hold everything (tools/xnu-src-mirror seeds it on the first networked build).
+#   tools/gate-xnu-build [--repo DIR] [--label NAME] [--jobs N] [--always]
+#   --repo DIR    checkout whose HEAD:xnu/patches is built (default: the repo holding this tool). Uncommitted edits are NOT built
+#                 (the gate sees HEAD); they are listed loudly.
+#   --label NAME  xnu-local-build work tree (default gate-<checkout dir name>). The first build of a new label is a fresh work tree (no object reuse; 54 s on lab-host,
+#                 32-35 s on offload-host [obs 2026-10-29], 71 s in docs/LOCAL-BUILD.md); later patch changes are incremental (~17 s measured, TP-039). One run per label at a time
+#                 (flock on $LOCALBUILD/work/.<label>.gate-lock; busy = ERROR, never a shared tree).
+#   --always      build even when HEAD:xnu/patches is the same git tree as trunk:xnu/patches (default: that case prints SKIPPED).
+# The kernel is reported from the label's work tree (xnu-local-build removes it before make, tools/xnu-local-build:610), never from the
+# shared $LOCALBUILD/out copy, which still holds an older kernel after a failed build. Its sha256 must equal the one xnu-local-build printed.
+# Last line: RESULT: PASS xnu-build sha=<sha256> ... Ns where=W [fallback=lab-host] [dirty=N] | RESULT: PASS xnu-build SKIPPED ... | RESULT: FAIL xnu-build errors=N first=FILE:LINE ... Ns where=W ...
+#            | RESULT: ERROR xnu-build ...   Exit 0 / 1 / 2. Full log: $LOCALBUILD/work/.<label>.gate-xnu-build.<head12>.<utc>.<pid>.log (printed; .<label>.gate-xnu-build.log = the newest run)
+# Where it builds (R26): tools/xnu-local-build sends the build to offload-host (tools/xnu-remote-build) and falls back to this host loudly; the `XNU REMOTE ...` lines of the log are repeated on stdout,
+#   and the kernel is copied back to $LOCALBUILD/work/<label>/fakeroot/System/Library/Kernels (read below) with its sha256 verified, so this tool parses the same report either way.
+#   where= comes from the build's own RESULT line (tools/xnu-remote-build: offload-host | lab-host-fallback | lab-host-local; `offload-slot` inside the offload-host container; `unknown` when the build printed none,
+#   e.g. a replaced build tool); fallback=lab-host marks a build that fell back from offload-host, dirty=N a build from a tree with N changed files under tools/ or xnu/patches; tools/check-all.sh
+#   repeats a non-offload-host where=, fallback= and dirty= on the GATE line (review xnu-remote-build-r1 F7).
+# Env (tests only, printed loudly when set): GATE_XNU_LOCAL_BUILD replaces tools/xnu-local-build.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd) || exit 2
+repo=$(dirname "$here"); label=""; jobs=4; always=0
+err() { echo "RESULT: ERROR xnu-build: $*"; exit 2; }
+while [ $# -gt 0 ]; do case $1 in
+	--repo) repo=${2:-}; shift 2 ;; --label) label=${2:-}; shift 2 ;; --jobs) jobs=${2:-}; shift 2 ;; --always) always=1; shift ;;
+	*) err "unknown option '$1' (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" ;; esac; done
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || err "--jobs needs a positive integer"
+cd "$repo" 2>/dev/null || err "--repo '$repo' is not a directory"
+git rev-parse --verify -q 'HEAD^{commit}' >/dev/null || err "$repo is not a git checkout with a commit"
+ht=$(git rev-parse --verify -q 'HEAD:xnu/patches') || err "HEAD has no xnu/patches"
+if [ "$always" = 0 ] && tt=$(git rev-parse --verify -q 'trunk:xnu/patches') && [ "$tt" = "$ht" ]; then
+	echo "RESULT: PASS xnu-build SKIPPED: HEAD:xnu/patches is the same tree as trunk's (${ht:0:12}); --always builds it anyway"; exit 0
+fi
+dirty=$(git status --porcelain -- xnu/patches)
+[ -z "$dirty" ] || { echo "xnu-build: WARNING uncommitted/untracked changes in xnu/patches are NOT built (the gate sees HEAD):"; printf '%s\n' "$dirty" | head -n 10; }
+[ -n "$label" ] || label=gate-$(basename "$(git rev-parse --show-toplevel)")
+label=$(printf %s "$label" | tr -c 'A-Za-z0-9._-' _)
+xlb=${GATE_XNU_LOCAL_BUILD:-$here/xnu-local-build}
+[ -z "${GATE_XNU_LOCAL_BUILD:-}" ] || echo "xnu-build: WARNING tools/xnu-local-build replaced by GATE_XNU_LOCAL_BUILD=$xlb (host test only)"
+[ -x "$xlb" ] || err "$xlb is not executable"
+lb=${LOCALBUILD:-${ARTIFACTS:-$HOME/pixelios-artifacts}/localbuild}
+mkdir -p "$lb/work" || err "cannot create $lb/work"
+exec 9>>"$lb/work/.$label.gate-lock" || err "cannot open the label lock"
+flock -n 9 || err "label $label is busy (another gate-xnu-build on it); wait for it or pass --label"
+stack=$(mktemp -d "${TMPDIR:-/tmp}/gate-xnu-stack.XXXXXX") || err "mktemp failed"
+trap 'rm -rf -- "$stack"' EXIT
+trap 'exit 143' TERM INT   # review F5. Observed (bash 5.2.37, 2026-10-29): the EXIT trap ALSO runs after a default-action TERM/HUP, so this line is not what makes the cleanup run; it pins exit 143 for TERM/INT (runs when the foreground "$xlb" returns).
+git archive HEAD xnu/patches | tar -x -C "$stack" || err "cannot extract HEAD:xnu/patches"
+# One log PER RUN (2026-11-11: label gate-xnu is shared by every gate, and the next gate overwrote a failed gate's log before anyone read it);
+# .<label>.gate-xnu-build.log is a symlink to the newest run; the 20 newest per-run logs of the label are kept
+log=$lb/work/.$label.gate-xnu-build.$(git rev-parse --short=12 HEAD).$(date -u +%Y%m%dT%H%M%SZ).$$.log
+ln -sfn "${log##*/}" "$lb/work/.$label.gate-xnu-build.log" || echo "xnu-build: WARNING could not point $lb/work/.$label.gate-xnu-build.log at $log"
+ls -1t "$lb/work/.$label.gate-xnu-build."*.log 2>/dev/null | tail -n +21 | while read -r o; do rm -f -- "$o" "$o.stale"; done
+echo "xnu-build: HEAD $(git rev-parse --short HEAD), xnu/patches tree ${ht:0:12}, label $label (log $log)"
+t0=$SECONDS
+"$xlb" --stack "$stack/xnu/patches" --label "$label" --jobs "$jobs" >"$log" 2>&1 </dev/null; rc=$?
+# 2026-11-11 (offload-abort gate): the shared label's incremental make left objects stale after a stack switch (XNU BUILD GUARD F3: not
+# recompiled although their sources changed). The guard is right and stays: rebuild ONCE from scratch (--fresh, ~1 min cold) instead of failing the gate.
+if [ "$rc" = 1 ] && grep -aq '^RESULT: FAIL stale-object guard' "$log"; then
+	echo "xnu-build: STALE-OBJECT GUARD failed on work tree $label after an incremental build: one --fresh rebuild (first log kept as $log.stale)"
+	grep -a 'F3 STALE' "$log" | head -n 3 | cut -c1-200
+	mv -f "$log" "$log.stale"
+	"$xlb" --stack "$stack/xnu/patches" --label "$label" --jobs "$jobs" --fresh >"$log" 2>&1 </dev/null; rc=$?
+fi
+secs=$((SECONDS - t0))
+grep -a -E '^XNU REMOTE|^XNUB:' "$log" | sort -u   # R26: where it was built (offload-host / SKIP / FALLBACK) shows on the gate console, never only in the log
+res=$(grep -a '^RESULT: ' "$log" | tail -n 1)
+wh=$(grep -a -o -m1 ' where=[^ ]*' <<<"$res" | head -n 1); wh=${wh# where=}
+[ -n "$wh" ] || { if [ "${XNUB_IN_SLOT:-}" = 1 ]; then wh=offload-slot; else wh=unknown; fi; }
+wx="where=$wh"; grep -aq ' fallback=lab-host' <<<"$res" && wx="$wx fallback=lab-host"
+dx=$(grep -a -o -m1 ' dirty=[^ ]*' <<<"$res" | head -n 1); [ -z "$dx" ] || [ "$dx" = " dirty=0" ] || wx="$wx${dx}"
+hres=$(grep -a '^heavy-job: RESULT ' "$log" | tail -n 1)   # TP-042 F3: heavy-job's own (lock/memory) verdict, never taken as xnu-local-build's RESULT
+case $rc in
+0)
+	[[ $res == "RESULT: PASS"* ]] || err "xnu-local-build exit 0 without a PASS line (${secs}s): ${res:-no RESULT line}"
+	sha=$(sed -n 's/^sha256: \([0-9a-f]\{64\}\)$/\1/p' "$log" | tail -n 1)
+	[ -n "$sha" ] || err "xnu-local-build PASS without a sha256 line (${secs}s)"
+	k=$lb/work/$label/fakeroot/System/Library/Kernels/kernel.development.sweet
+	[ -f "$k" ] || err "PASS but no kernel in the work tree ($k)"
+	ks=$(sha256sum "$k" | cut -d' ' -f1)
+	[ "$ks" = "$sha" ] || err "work-tree kernel sha256 $ks differs from the reported $sha (stale or concurrent build)"
+	echo "kernel: $k"
+	echo "RESULT: PASS xnu-build sha=$sha label=$label stack=${ht:0:12} ${secs}s $wx" ;;
+1)
+	n=$(sed -n 's/^RESULT: FAIL .*(\([0-9][0-9]*\) error lines.*/\1/p' <<<"$res")
+	first=$(grep -a -m1 -E '^[^ :]+:[0-9]+(:[0-9]+)?: (fatal )?error:' "$log" | sed -E 's#^([^ :]+):([0-9]+).*#\1:\2#; s#^.*/work/[^/]*/xnu/##')
+	grep -a -m8 -E '(^|: )(fatal )?error:|undefined' "$log" | cut -c1-220
+	echo "RESULT: FAIL xnu-build errors=${n:-unknown} first=${first:-unknown} label=$label stack=${ht:0:12} ${secs}s $wx (do not ask for a formal gate: AP-147)"
+	exit 1 ;;
+*)
+	tail -n 5 "$log" | cut -c1-220
+	detail=${res#RESULT: }; [ -n "$res" ] || detail=$hres
+	err "xnu-local-build exit $rc after ${secs}s: $detail" ;;
+esac

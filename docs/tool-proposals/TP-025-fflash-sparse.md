@@ -5,11 +5,13 @@ status: approved
 proposed_by: "Claude Sonnet 5.5 (implementer, from decisions-s36.md)"
 date: 2026-10-24
 exposed_by: "flash of the userdata root sends the full raw image (PLAN-BOOT-SPEED M7: bytes sent not logged); tools-audit.md:25,64"
-extends: "tools/sparsediff.py"
+extends: ""
 related: "TP-020"
 usage: "tools/fflash-userdata.sh IMG --yes-erase-userdata [--force] [--sparse]"
 refs: "-"
 ---
+Originally extended tools/sparsediff.py (deprecated 2026-10-29, removed 2026-11-13 by the census STALE-DEPRECATED rule).
+
 
 ## checked
 decisions-s36.md section T3 (lines 94-108). tools-audit.md:139: must extend `tools/sparsediff.py` (shared writer), not copy it. `fflash-userdata.sh` is the only flashing tool and has no test.

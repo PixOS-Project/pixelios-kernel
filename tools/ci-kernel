@@ -4,6 +4,8 @@
 #   --out DIR   download there instead of ~/pixelios-artifacts/xnu-<short sha> (and do not prune old artifact dirs)
 # Prunes ~/pixelios-artifacts/xnu-<7 hex> dirs older than the 3 newest (only the ones this tool names; xnu-0089 etc. stay).
 # Progress: ~/pixelios-artifacts/scratch/ci-kernel-<short>.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -euo pipefail
 cd "$(dirname "$0")/.."
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
@@ -11,7 +13,7 @@ commit=HEAD; dispatch=0; out=""; wait_min=25; strs=()
 while [ $# -gt 0 ]; do case "$1" in
 	--commit) commit=$2; shift 2 ;; --dispatch) dispatch=1; shift ;; --expect-string) strs+=("$2"); shift 2 ;;
 	--out) out=$2; shift 2 ;; --wait) wait_min=$2; shift 2 ;;
-	*) echo "unknown option $1 (see the header of tools/ci-kernel)" >&2; exit 2 ;; esac; done
+	*) echo "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
 
 sha=$(git rev-parse "$commit^{commit}" 2>/dev/null) || { echo "RESULT: ERROR cannot resolve commit '$commit'"; exit 2; }
 short=${sha:0:7}; mkdir -p "$A/scratch"; LOG=$A/scratch/ci-kernel-$short.log; : >"$LOG"
@@ -36,7 +38,7 @@ fi
 deadline=$(( $(date +%s) + wait_min * 60 ))
 while :; do
 	# a push-triggered run is cancelled by the dispatched one: skip cancelled runs, the dispatched run is the real one
-	run=$(gh run list --workflow xnu.yml --commit "$sha" --limit 10 --json databaseId,conclusion --jq '[.[] | select(.conclusion != "cancelled")][0].databaseId // empty' 2>>"$LOG" || true)
+	run=$(gh run list --workflow xnu.yml --commit "$sha" --limit 10 --json databaseId,conclusion --jq '[.[] | select(.conclusion != "cancelled")][0].databaseId // empty' 2>>"$LOG" || { rc=$?; echo "ci-kernel GAP: gh run list failed rc=$rc (see the log); polling again" >>"$LOG"; })
 	[ -n "$run" ] && break
 	[ "$(date +%s)" -lt "$deadline" ] || finish ERROR "no xnu.yml run for $short appeared within ${wait_min} min (not pushed? paths filter?)"
 	echo "waiting for a run of $short" >>"$LOG"; sleep 20
@@ -56,13 +58,13 @@ if ! (cd "$out" && sha256sum -c --quiet SHA256SUMS) >>"$LOG" 2>&1; then     # al
 	rm -f "$out"/kernel.* "$out"/SHA256SUMS
 	gh run download "$run" -n xnu-kernel -D "$out" >>"$LOG" 2>&1 || finish ERROR "artifact xnu-kernel download failed for run $run" "RUN: $run $concl $url"
 fi
-kernel=$out/kernel.development.sweet; [ -f "$kernel" ] || kernel=$(compgen -G "$out/kernel.*" | grep -v '\.link$' | head -1 || true)
+kernel=$out/kernel.development.sweet; [ -f "$kernel" ] || kernel=$(compgen -G "$out/kernel.*" | grep -v '\.link$' | head -1 || { rc=$?; [ $rc = 1 ] || echo "ci-kernel GAP: grep failed rc=$rc" >&2; })
 [ -f "$kernel" ] || finish ERROR "artifact has no kernel.* file" "RUN: $run $concl $url"
 sums=ok; (cd "$out" && sha256sum -c SHA256SUMS >>"$LOG" 2>&1) || sums=MISMATCH
 lines=("RUN: $run (success) $url" "KERNEL: $kernel | sha256 $(sha256sum "$kernel" | cut -c1-16) | $(stat -c %s "$kernel") bytes | SHA256SUMS $sums")
 miss=0
 for s in ${strs[@]+"${strs[@]}"}; do
-	n=$(strings -a "$kernel" | grep -cF -- "$s" || true)
+	n=$(strings -a "$kernel" | grep -cF -- "$s" || { rc=$?; [ $rc = 1 ] || echo "ci-kernel GAP: grep failed rc=$rc" >&2; })
 	if [ "$n" -gt 0 ]; then lines+=("STRING FOUND   \"$s\" ($n hits)"); else lines+=("STRING MISSING \"$s\""); miss=$((miss + 1)); fi
 done
 if [ "$default_out" = 1 ]; then

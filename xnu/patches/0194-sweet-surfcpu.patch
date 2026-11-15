@@ -1,0 +1,585 @@
+SWEET IOSurface user-client time + single-thread sampler (patch 0194, R0 log only, no register writes, both default off; PLAN-60FPS P-G1 slice 4, research 125, ticket T-f98f). Boot-arg sweetsurfcpu=1: calls and wall time inside IOSurfaceRootUserClient::externalMethod (per selector) and the six external traps (trap 0 = 0+1, 4 = 4+5), backboardd callers only, printed once per second as `SWEET SURFCPU: sel N calls C us U` / `trap N ...`, and the same for the target thread as `SWEET SURFCPU: tid 0xT sel N calls C us U`. Boot-arg sweetthrsample=<tid>|auto@<hz>: 1..100 Hz sample of one backboardd thread (user pc/lr/sp + 6 frame-pointer callers from the saved user state), busy samples as `SMP backboardd tN pc .. lr .. sp .. bt .. tid 0xT st 0xS` rows (tools/rea/smp-sym.py reads them), one `SWEET THRSAMPLE: sec S tid .. samples N busy B idle I miss M` line per second. Needs patch 0187 (sweet_thrcpu_task, used by `auto`). Code: bsd/dev/sweet_surfcpu.c (new), osfmk/kern/exception.c (sweet_thrsample_task), iokit/Kernel/arm/SweetSurface.cpp (scope guards), bsd/dev/sweet_ufs.c (start), bsd/conf/files.
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_thrcpu.c			standard
++bsd/dev/sweet_surfcpu.c		standard
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_thrcpu_start(void);   /* patch 0187, bsd/dev/sweet_thrcpu.c */
++extern void sweet_surfcpu_start(void);  /* patch 0194, bsd/dev/sweet_surfcpu.c */
+ extern void sweet_cpustat_start(void);
+ extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+ /* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+@@ -783,6 +784,7 @@
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	sweet_thrcpu_start();         /* no-op without boot-arg sweetthrcpu=1 */
++	sweet_surfcpu_start();        /* no-op without boot-arg sweetsurfcpu=1 / sweetthrsample= */
+ 	sweet_cpustat_start();
+ 	sweet_el2_start();
+ 	sweet_keys_gs101_start();
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1093,6 +1093,80 @@
+ 	return kr;
+ }
+ 
++/*
++ * SWEET single-thread sampler (patch 0194, bsd/dev/sweet_surfcpu.c, boot-arg sweetthrsample): one sample of thread `tid` of `task`: user pc/lr/sp from the saved
++ * user state (find_user_regs, same source as sweet_sample_task above, so the pc is the one of the last kernel entry), THREAD_BASIC_INFO run_state/flags, the
++ * task's thread-queue index (= the tN of the SMP rows), the shared-cache slide and main-binary mach header, and up to 6 frame-pointer callers. The queue walk
++ * and thread_info_internal run under task_lock exactly as in sweet_thrcpu_task; the frame walk (vm_map_read_user, may fault) runs after the lock is dropped, on
++ * the registers copied under it: the caller holds a proc reference, so task and map stay valid. Returns 0 ok, 1 tid not in the task, 2 no 64-bit user state,
++ * 3 thread_info_internal failed. No printf here.
++ */
++struct sweet_thrsmp {
++	uint64_t pc, lr, sp, slide, mh;
++	uint32_t run_state, flags;
++	int idx, nbt;
++	uint64_t bt[6];
++};
++int sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o);
++
++int
++sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o)
++{
++	vm_map_t map = get_task_map(task);
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	thread_t thread;
++	uint64_t fp = 0;
++	int idx = 0;
++	int rc = 1;
++
++	bzero(o, sizeof(*o));
++	if (sr != NULL) {
++		o->slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	o->mh = task->mach_header_vm_address;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (thread_tid(thread) == tid) {
++			arm_saved_state_t *ss = find_user_regs(thread);
++			thread_basic_info_data_t bi;
++			mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
++
++			if (thread_info_internal(thread, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS) {
++				rc = 3;
++			} else if (ss == NULL || !is_saved_state64(ss)) {
++				rc = 2;
++			} else {
++				o->run_state = (uint32_t)bi.run_state;
++				o->flags = (uint32_t)bi.flags;
++				o->idx = idx;
++				o->pc = get_saved_state_pc(ss);
++				o->lr = get_saved_state_lr(ss);
++				o->sp = get_saved_state_sp(ss);
++				fp = get_saved_state_fp(ss);
++				rc = 0;
++			}
++			break;
++		}
++		idx++;
++	}
++	task_unlock(task);
++
++	for (int i = 0; rc == 0 && i < 6 && fp != 0 && (fp & 7) == 0; i++) {
++		uint64_t frame[2];
++		if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++			break;
++		}
++		o->bt[o->nbt++] = frame[1];
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	return rc;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -73,6 +73,21 @@
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
++/*
++ * Patch 0194 (bsd/dev/sweet_surfcpu.c, boot-arg sweetsurfcpu=1, default off, log only): calls and wall time inside externalMethod (kind 0, index =
++ * selector) and the traps (kind 1; trapUseCount covers traps 0 and 1 and trapRelease 4 and 5, both counted under the lower index). Off = one load
++ * and a branch; only calls by backboardd are counted.
++ */
++extern "C" uint64_t sweet_surfcpu_enter(void);
++extern "C" void sweet_surfcpu_leave(int kind, uint32_t idx, uint64_t t0);
++struct SweetSurfCpuScope {
++	uint64_t t0;
++	int kind;
++	uint32_t idx;
++	SweetSurfCpuScope(int k, uint32_t i) : t0(sweet_surfcpu_enter()), kind(k), idx(i) {}
++	~SweetSurfCpuScope() { sweet_surfcpu_leave(kind, idx, t0); }
++};
++
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+@@ -1038,6 +1053,7 @@
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
++	SweetSurfCpuScope cpuScope(0, selector);   /* patch 0194 */
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 
+ 	switch (selector) {
+@@ -1125,6 +1141,7 @@
+ IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+     void *, void *, void *, void *)
+ {
++	SweetSurfCpuScope cpuScope(1, 0);   /* patch 0194: traps 0 and 1 */
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -1161,6 +1178,7 @@
+ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+     void *, void *, void *)
+ {
++	SweetSurfCpuScope cpuScope(1, 2);   /* patch 0194 */
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+@@ -1182,6 +1200,7 @@
+ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
++	SweetSurfCpuScope cpuScope(1, 3);   /* patch 0194 */
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+@@ -1199,6 +1218,7 @@
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
++	SweetSurfCpuScope cpuScope(1, 4);   /* patch 0194: traps 4 and 5 */
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+--- /dev/null
++++ b/bsd/dev/sweet_surfcpu.c
+@@ -0,0 +1,406 @@
++/*
++ * SWEET IOSurface user-client time + single-thread sampler (patch 0194; PLAN-60FPS P-G1 slice 4, research 125). R0: log only, no register writes,
++ * both parts default off.
++ *
++ * Boot-arg sweetsurfcpu=1: iokit/Kernel/arm/SweetSurface.cpp brackets IOSurfaceRootUserClient::externalMethod (kind "sel") and the six external
++ * traps (kind "trap": 0/1 use count, 2 lock, 3 unlock, 4/5 release) with sweet_surfcpu_enter/leave. Only calls made by a process named backboardd
++ * are counted: calls and elapsed mach_absolute_time (wall time inside the function, including any sleep on a lock; it excludes the Mach trap and
++ * argument-marshalling code around the function), per selector/trap index, twice: [0] all backboardd threads, [1] the target thread (below).
++ * Once per second the deltas of that second are printed, only for entries with calls:
++ *   SWEET SURFCPU: sel N calls C us U         (all backboardd threads; N = 63 means 63 and above)
++ *   SWEET SURFCPU: trap N calls C us U
++ *   SWEET SURFCPU: tid 0xT sel N calls C us U (the target thread only; same for trap)
++ * Loud once: `on`, `no target tid` (tid lines are off), `target tid ... -> ...` (the tid baseline restarts), `cap reached`.
++ *
++ * Boot-arg sweetthrsample=<tid>@<hz> or auto@<hz> (hz default 50, 1..100; tid decimal or 0x hex): every 1/hz s one sample of the target thread of
++ * backboardd: user pc/lr/sp from the saved user state (osfmk/kern/exception.c sweet_thrsample_task, same source as the 0054 SMP rows) and a
++ * frame-pointer backtrace of 6 callers. `auto` picks, once per second, the backboardd thread with the largest user+sys CPU delta of the last second
++ * (kept unless another thread beats it by 1.5x), because the tid of the CA render thread (0x27d in run 115a) is not known before the boot.
++ * Output, per second:
++ *   SWEET THRSAMPLE: sec S tid 0xT hz H samples N busy B idle I miss M
++ *   SMP backboardd[pid] slide S mh M          (header, then one row per BUSY sample, readable by tools/rea/smp-sym.py as is)
++ *   SMP backboardd tIDX pc 0x.. lr 0x.. sp 0x.. bt 0x.. ... tid 0xT st 0xS
++ * busy = THREAD_BASIC_INFO run_state RUNNING (running or runnable, st = flags << 8 | run_state as in SWEET THRCPU); idle samples are only counted.
++ * Limit (read from source): a user pc comes from the saved state, which is written at kernel entry (syscall, trap, interrupt): a thread that runs in
++ * user mode between two entries shows its last entry, not its live pc. Loud once: tid not found, no task, no user state, cap reached.
++ *
++ * One kernel thread does both (like bsd/dev/sweet_thrcpu.c, patch 0187); it never holds a lock while printing.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern task_t proc_task(proc_t);
++extern char *proc_name_address(void *p);      /* bsd/kern/kern_proc.c */
++extern int hz;
++extern int sweet_thrcpu_task(task_t task, uint64_t *out, int max, int *total);   /* osfmk/kern/exception.c (patch 0187) */
++
++struct sweet_thrsmp {                          /* osfmk/kern/exception.c (this patch) */
++	uint64_t pc, lr, sp, slide, mh;
++	uint32_t run_state, flags;
++	int idx, nbt;
++	uint64_t bt[6];
++};
++extern int sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o);
++
++extern void sweet_surfcpu_start(void);
++extern uint64_t sweet_surfcpu_enter(void);
++extern void sweet_surfcpu_leave(int kind, uint32_t idx, uint64_t t0);
++
++#define SC_SEL      64         /* index SC_SEL - 1 = "that and above" */
++#define SC_THR_MAX  128
++#define SC_HZ_MAX   100
++#define SC_LINE_CAP 50000      /* SURFCPU lines per boot */
++#define SC_ROW_CAP  40000      /* busy SMP rows per boot */
++
++static int sc_on;                              /* sweetsurfcpu=1 */
++static uint64_t sc_calls[2][2][SC_SEL];        /* [all|target][sel|trap][index] */
++static uint64_t sc_abs[2][2][SC_SEL];
++static uint64_t sc_target;                     /* target tid, 0 = none (read by sweet_surfcpu_leave) */
++
++uint64_t
++sweet_surfcpu_enter(void)
++{
++	if (!sc_on) {
++		return 0;
++	}
++	if (strncmp(proc_name_address(current_proc()), "backboardd", MAXCOMLEN) != 0) {
++		return 0;
++	}
++	return mach_absolute_time();
++}
++
++void
++sweet_surfcpu_leave(int kind, uint32_t idx, uint64_t t0)
++{
++	if (t0 == 0) {
++		return;
++	}
++	uint64_t dt = mach_absolute_time() - t0;
++	uint64_t tg = os_atomic_load(&sc_target, relaxed);
++	if (idx >= SC_SEL) {
++		idx = SC_SEL - 1;
++	}
++	os_atomic_add(&sc_calls[0][kind][idx], 1, relaxed);
++	os_atomic_add(&sc_abs[0][kind][idx], dt, relaxed);
++	if (tg != 0 && thread_tid(current_thread()) == tg) {
++		os_atomic_add(&sc_calls[1][kind][idx], 1, relaxed);
++		os_atomic_add(&sc_abs[1][kind][idx], dt, relaxed);
++	}
++}
++
++static int bb_pid = -1;
++
++static int
++sc_find_cb(proc_t p, __unused void *arg)
++{
++	if (strncmp(proc_name_address(p), "backboardd", MAXCOMLEN) == 0) {
++		bb_pid = proc_pid(p);
++	}
++	return PROC_RETURNED;
++}
++
++static uint64_t
++sc_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/* auto target: the thread with the largest user+sys delta since the last call (cur kept unless beaten by 1.5x; < 50 ms of CPU in the second = keep cur). */
++static uint64_t ap_tid[SC_THR_MAX], ap_tot[SC_THR_MAX];
++static int ap_n;
++
++static uint64_t
++sc_auto_pick(const uint64_t *ent, int kept, uint64_t cur)
++{
++	uint64_t best = 0, bd = 0, curd = 0;
++	for (int i = 0; i < kept; i++) {
++		uint64_t tid = ent[i * 4], tot = ent[i * 4 + 1] + ent[i * 4 + 2], prev = 0;
++		for (int j = 0; j < ap_n; j++) {
++			if (ap_tid[j] == tid) {
++				prev = ap_tot[j];
++				break;
++			}
++		}
++		uint64_t d = tot >= prev ? tot - prev : 0;
++		if (tid == cur) {
++			curd = d;
++		}
++		if (d > bd) {
++			bd = d;
++			best = tid;
++		}
++	}
++	for (int i = 0; i < kept; i++) {
++		ap_tid[i] = ent[i * 4];
++		ap_tot[i] = ent[i * 4 + 1] + ent[i * 4 + 2];
++	}
++	ap_n = kept;
++	if (best == 0 || bd < 50000) {
++		return cur;
++	}
++	return (cur == 0 || best == cur || bd * 2 > curd * 3) ? best : cur;
++}
++
++static uint64_t sc_prev_c[2][2][SC_SEL], sc_prev_a[2][2][SC_SEL];   /* baselines of the last print, [all|target][sel|trap][index] */
++static unsigned sc_lines;
++
++static void
++sc_print_scope(int scope, uint64_t tid)
++{
++	static const char *const kn[2] = { "sel", "trap" };
++	for (int k = 0; k < 2; k++) {
++		for (int i = 0; i < SC_SEL; i++) {
++			uint64_t c = os_atomic_load(&sc_calls[scope][k][i], relaxed);
++			uint64_t a = os_atomic_load(&sc_abs[scope][k][i], relaxed);
++			uint64_t dc = c - sc_prev_c[scope][k][i], da = a - sc_prev_a[scope][k][i];
++			sc_prev_c[scope][k][i] = c;
++			sc_prev_a[scope][k][i] = a;
++			if (dc == 0 || sc_lines >= SC_LINE_CAP) {
++				continue;
++			}
++			if (scope == 0) {
++				printf("SWEET SURFCPU: %s %d calls %llu us %llu\n", kn[k], i, dc, sc_us(da));
++			} else {
++				printf("SWEET SURFCPU: tid 0x%llx %s %d calls %llu us %llu\n", tid, kn[k], i, dc, sc_us(da));
++			}
++			if (++sc_lines == SC_LINE_CAP) {
++				printf("SWEET SURFCPU: cap reached %d\n", SC_LINE_CAP);
++			}
++		}
++	}
++}
++
++static void
++sc_rebase_target(void)
++{
++	for (int k = 0; k < 2; k++) {
++		for (int i = 0; i < SC_SEL; i++) {
++			sc_prev_c[1][k][i] = os_atomic_load(&sc_calls[1][k][i], relaxed);
++			sc_prev_a[1][k][i] = os_atomic_load(&sc_abs[1][k][i], relaxed);
++		}
++	}
++}
++
++static int sm_on;                      /* sweetthrsample given and valid */
++static int sm_auto;
++static uint64_t sm_tid;                /* explicit tid */
++static int sm_hz = 50;
++
++#define SM_BUF (SC_HZ_MAX + 8)
++static struct sweet_thrsmp sm_buf[SM_BUF];     /* busy samples of the current second */
++
++/* one sample of the target thread into sm_buf; counts via the pointers */
++static void
++sc_sample_once(uint64_t target, int *nsamp, int *nbusy, int *nmiss, unsigned *said)
++{
++	proc_t p = bb_pid >= 0 ? proc_find(bb_pid) : PROC_NULL;
++	task_t task = p != PROC_NULL ? proc_task(p) : TASK_NULL;
++	if (task == TASK_NULL || target == 0) {
++		(*nmiss)++;
++	} else {
++		struct sweet_thrsmp s;
++		int rc = sweet_thrsample_task(task, target, &s);
++		if (rc == 0) {
++			(*nsamp)++;
++			if (s.run_state == 1 /* TH_STATE_RUNNING */ && *nbusy < SM_BUF) {
++				sm_buf[(*nbusy)++] = s;
++			}
++		} else {
++			(*nmiss)++;
++			if (!(*said & (1u << rc))) {
++				*said |= 1u << rc;
++				if (rc == 1) {
++					printf("SWEET THRSAMPLE: tid 0x%llx not found in backboardd pid %d\n", target, bb_pid);
++				} else if (rc == 2) {
++					printf("SWEET THRSAMPLE: tid 0x%llx has no 64-bit user state\n", target);
++				} else {
++					printf("SWEET THRSAMPLE: unavailable (thread_info error rc %d, tid 0x%llx)\n", rc, target);
++				}
++			}
++		}
++	}
++	if (p != PROC_NULL) {
++		proc_rele(p);
++	}
++}
++
++static void
++sweet_surfcpu_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	static uint64_t ent[SC_THR_MAX * 4];
++	uint64_t sec_abs, last_print, cur_target = 0, shown_target = 0;
++	unsigned sec = 0, rows = 0, said = 0;
++	int ticks = sm_on ? ((hz / sm_hz) > 0 ? (hz / sm_hz) : 1) : hz;
++	int nsamp = 0, nbusy = 0, nmiss = 0, said_nt = 0;
++
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec_abs);
++	last_print = mach_absolute_time();
++	if (sm_on && !sm_auto) {
++		cur_target = sm_tid;
++	}
++	if (sc_on) {
++		printf("SWEET SURFCPU: on (sel = IOSurfaceRootUserClient::externalMethod selector, trap = external trap index; us = wall time inside the function, backboardd calls only; sel/trap 63 = 63 and above; trap 0 = traps 0+1, trap 4 = traps 4+5; per-second deltas)\n");
++		if (!sm_on) {
++			printf("SWEET SURFCPU: no target tid (sweetthrsample unset): the `tid` lines are off\n");
++		}
++	}
++	if (sm_on) {
++		printf("SWEET THRSAMPLE: on target %s hz %d (rows are SMP lines with a trailing `tid`/`st`)\n", sm_auto ? "auto" : "explicit", sm_hz);
++	}
++	if (cur_target != 0) {
++		shown_target = cur_target;
++		os_atomic_store(&sc_target, cur_target, relaxed);
++	}
++
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetsurf", ticks);
++		if (sm_on) {
++			sc_sample_once(cur_target, &nsamp, &nbusy, &nmiss, &said);
++		}
++		uint64_t now = mach_absolute_time();
++		if (now - last_print < sec_abs) {
++			continue;
++		}
++		last_print = now;
++		sec++;
++
++		/* once per second: find backboardd, choose the target, print. No lock is held below. */
++		bb_pid = -1;
++		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, sc_find_cb, NULL, NULL, NULL);
++		if (sm_on && sm_auto && bb_pid >= 0) {
++			proc_t p = proc_find(bb_pid);
++			task_t task = p != PROC_NULL ? proc_task(p) : TASK_NULL;
++			int n = 0;
++			if (task != TASK_NULL && sweet_thrcpu_task(task, ent, SC_THR_MAX, &n) == KERN_SUCCESS) {
++				cur_target = sc_auto_pick(ent, n < SC_THR_MAX ? n : SC_THR_MAX, cur_target);
++			}
++			if (p != PROC_NULL) {
++				proc_rele(p);
++			}
++		}
++		if (cur_target != shown_target) {
++			if (sc_on || sm_on) {
++				printf("SWEET SURFCPU: target tid 0x%llx -> 0x%llx (tid counters restart)\n", shown_target, cur_target);
++			}
++			shown_target = cur_target;
++			os_atomic_store(&sc_target, cur_target, relaxed);
++			sc_rebase_target();
++		}
++		if (sc_on) {
++			sc_print_scope(0, 0);
++			if (cur_target != 0) {
++				sc_print_scope(1, cur_target);
++			} else if (!said_nt && sm_on) {
++				said_nt = 1;
++				printf("SWEET SURFCPU: no target tid yet (auto: no backboardd thread used >= 50 ms CPU in a second)\n");
++			}
++		}
++		if (sm_on) {
++			printf("SWEET THRSAMPLE: sec %u tid 0x%llx hz %d samples %d busy %d idle %d miss %d\n", sec, cur_target, sm_hz, nsamp, nbusy,
++			    nsamp - nbusy, nmiss);
++			if (nbusy > 0 && rows < SC_ROW_CAP) {
++				printf("SMP backboardd[%d] slide 0x%llx mh 0x%llx\n", bb_pid, sm_buf[0].slide, sm_buf[0].mh);
++				for (int i = 0; i < nbusy && rows < SC_ROW_CAP; i++) {
++					struct sweet_thrsmp *s = &sm_buf[i];
++					char line[240];
++					int l = snprintf(line, sizeof(line), "SMP backboardd t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", s->idx, s->pc, s->lr, s->sp);
++					for (int b = 0; b < s->nbt && l < (int)sizeof(line) - 48; b++) {
++						l += snprintf(line + l, sizeof(line) - l, " 0x%llx", s->bt[b]);
++					}
++					snprintf(line + l, sizeof(line) - l, " tid 0x%llx st 0x%x", cur_target, (s->flags << 8) | (s->run_state & 0xff));
++					printf("%s\n", line);
++					if (++rows == SC_ROW_CAP) {
++						printf("SWEET THRSAMPLE: cap reached %d rows\n", SC_ROW_CAP);
++					}
++				}
++			}
++		}
++		nsamp = nbusy = nmiss = 0;
++	}
++}
++
++/* sweetthrsample=<tid>@<hz> | auto@<hz>; tid decimal or 0x hex */
++static int
++sc_parse_sample(const char *s)
++{
++	const char *p = s;
++	if (strncmp(p, "auto", 4) == 0) {
++		sm_auto = 1;
++		p += 4;
++	} else {
++		int base = 10;
++		uint64_t v = 0;
++		int nd = 0;
++		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++			base = 16;
++			p += 2;
++		}
++		for (;; p++) {
++			int d;
++			if (*p >= '0' && *p <= '9') {
++				d = *p - '0';
++			} else if (base == 16 && *p >= 'a' && *p <= 'f') {
++				d = *p - 'a' + 10;
++			} else if (base == 16 && *p >= 'A' && *p <= 'F') {
++				d = *p - 'A' + 10;
++			} else {
++				break;
++			}
++			v = v * base + d;
++			nd++;
++		}
++		if (nd == 0 || v == 0) {
++			return -1;
++		}
++		sm_tid = v;
++	}
++	if (*p == '@') {
++		int h = 0;
++		for (p++; *p >= '0' && *p <= '9'; p++) {
++			h = h * 10 + (*p - '0');
++		}
++		if (h < 1 || h > SC_HZ_MAX) {
++			return -1;
++		}
++		sm_hz = h;
++	}
++	return *p == '\0' ? 0 : -1;
++}
++
++void
++sweet_surfcpu_start(void)
++{
++	int v = 0;
++	char arg[40];
++	thread_t thread;
++
++	sc_on = (PE_parse_boot_argn("sweetsurfcpu", &v, sizeof(v)) && v != 0);
++	if (PE_parse_boot_argn("sweetthrsample", arg, sizeof(arg))) {
++		if (sc_parse_sample(arg) == 0) {
++			sm_on = 1;
++		} else {
++			printf("SWEET THRSAMPLE: unavailable (bad boot-arg sweetthrsample='%s', want <tid>@<hz> or auto@<hz>)\n", arg);
++		}
++	}
++	if (!sc_on && !sm_on) {
++		return;
++	}
++	if (kernel_thread_start(sweet_surfcpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET SURFCPU: unavailable (kernel_thread_start failed)\n");
++		sc_on = 0;
++	}
++}

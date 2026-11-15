@@ -9,8 +9,20 @@ Builds the patched xnu-8796.141.3 `kernel.development.sweet` on this Linux box, 
 tools/xnu-local-build [--fresh] [--stack DIR] [--label NAME] [--jobs N] [--timeout SEC] [--compare CI_KERNEL] [--deps-only] [--make-args STR]
 ```
 
+## Where it builds (R26, user 2026-10-29)
+
+Every build runs on **<offload-host>** (the second build host): `tools/xnu-local-build` first calls `tools/xnu-remote-build`, which takes a <offload-host> queue slot (`tools/heavy-job <offload-host> run`, FIFO,
+`XNU_REMOTE_WAIT` default 5400 s, or under the gate's xnu-build step the step timeout minus 1500 s via `GATE_STEP_BUDGET`; when the wait runs out: a refusing load probe or a held <lab-host> lock (the gate) = loud fallback, otherwise `RESULT: ERROR` naming the holder), ships the stack and the current `tools/` to a job dir, builds inside the pinned `pixos-xnub` container
+(offline, toolchain and `git-mirror` staged by `tools/offload-stage-xnub`), copies the kernel back to `out/<label>/` and `work/<label>/fakeroot/System/Library/Kernels/` and verifies its sha256
+against the one the remote build printed. The report is the same as a local one, with a first line `XNU REMOTE: built on <offload-host> in Ns (label L, xnub image ID)`. This holds for the gate's xnu
+step (`tools/check-all.sh` -> `tools/gate-xnu-build`) and for a hand-started build before a phone run, so the <lab-host> heavy-job lock queue no longer holds the phone.
+- Fallback to this host only when <offload-host> is unavailable *before* the build starts (unreachable, image/toolchain/mirror not staged, rsync failed): `XNU REMOTE FALLBACK: <reason>; building on <lab-host> (lock queue)` on stdout and stderr, then the build below (heavy-job class build, `HEAVY_JOB_WAIT` default 10800 s). A compile failure on <offload-host> is `RESULT: FAIL`, never a fallback; waiting in the <offload-host> queue is not a fallback reason.
+- `XNU_BUILD_WHERE=auto` (default) | `<offload-host>` (no fallback, exit 2 when unavailable) | `local`. `--deps-only`, `--compare`, `--make-args`, `--timeout` are not supported remotely: `XNU REMOTE SKIP: <flag> not supported on <offload-host>, building on <lab-host>`. `XNUB_IN_SLOT=1` (set inside the container) never dispatches again.
+- Ledger `$LOCALBUILD/built-on.tsv` (`date<TAB>sha256<TAB>label<TAB><offload-host>|<lab-host>-fallback|<lab-host>-local<TAB>reason`; reason = fallback cause `|` `head=<sha> dirty=<N> stack=<hash12>`); `tools/xrun --kernel` prints `XNU BUILD: <where> (label L)[ DIRTY] reason: ...` (or `XNU BUILD: unknown (no ledger entry)`) and keeps it in the run summary. A kernel built from a tree with changed files under `tools/` or `xnu/patches` says DIRTY in that line, in a WARNING and on the RESULT line (`dirty=N`); the identity actually verified is the sha256 of the kernel. The RESULT line ends `where=<<offload-host>|<lab-host>-fallback|<lab-host>-local>` (+ `fallback=<lab-host>`); `tools/gate-xnu-build` repeats it and `tools/check-all.sh` tags the GATE line when it is not a plain <offload-host> build. A ledger write that fails after a verified build is a WARNING + `ledger=FAILED`, not a lost build.
+- Tests: `tools/test_xnu_remote_build.sh` (run by the gate's unit step through `tools/test_xnu_remote_build.py`; fake ssh/rsync/docker, fish-like `bash -s` trap, real heavy-job queue; observed in a sandbox, not yet on the real <offload-host>; the header lists what stays UNVERIFIED until the <offload-host> `--validate` staging run). Tags: the flow above is *read from source*; no real <offload-host> build through this path has been run (*guess* until the first one).
+
 One command, no prompts. Ends with one `RESULT: PASS|FAIL|ERROR ...` line; exit 0 / 1 (build failed) / 2 (setup problem, timeout).
-Output kernel: `~/pixelios-artifacts/localbuild/out/kernel.development.sweet` (feed it to `tools/xrun --kernel` / `tools/build-xnu-image.sh`).
+Output kernel: `~/pixelios-artifacts/localbuild/out/<label>/kernel.development.sweet` (per label since 2026-10-28; label default `main`, allowed `[A-Za-z0-9][A-Za-z0-9._-]*`; the old shared `out/kernel.development.sweet` is deleted by every build) (feed it to `tools/xrun --kernel` / `tools/build-xnu-image.sh`).
 Logs: `~/pixelios-artifacts/scratch/xnu-local-build.log` (progress) and `~/pixelios-artifacts/localbuild/work/<label>/build.log` (make).
 Not part of `tools/check-all.sh` (slow, needs the downloads below).
 
@@ -91,7 +103,9 @@ Compared against CI kernel `xnu-6980340` (same xnu/patches as `main`, verified w
      Passing `-mcpu=cortex-a76` in `tools/xnu-local-build` eliminates all `xpaci` (0), `ldapur`/`stlur` (0), SHA3 (0), and SVE (0) instructions
      (*observed* in binary). `__builtin_return_address(0)` lowers to `xpaclri` (`hint #7`, opcode `0xd50320ff`), which architecturally executes
      as a NOP on all ARMv8.0/8.1/8.2 cores (*read* from ARM ARM). `--compare` now scans for and asserts 0 unsupported instructions.
-     Status: matches CI kernel instruction set; ready for hardware boot-test.
+     Status: matches CI kernel instruction set. Update 2026-10-29: locally built kernels boot on hardware; e.g. run wlan-runG2-0174
+     (2026-10-29) booted kernel sha256 e247a909fb7c..., built by `tools/gate-xnu-build` (which calls `tools/xnu-local-build`) for commit cc651a5
+     (*observed*: run report kernel sha and the build record in the maintainer's handoff).
 - The sha256 differs on every build (the Mach-O UUID), sizes: CI 17,245,776 B, local 15,447,808 B (CTF and symbol tables account for most).
 
 ## Troubleshooting

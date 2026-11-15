@@ -4,10 +4,28 @@
   phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...   take the lock, run CMD, release (also on signals)
   phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N] [--token T]
   phone-lock release [--owner NAME | --token T]
-  phone-lock status                       exit 0 free, 1 held
+  phone-lock status                       exit 0 free, 1 held; a lock whose pid and process group are both dead is removed first
+                                          (loud `phone-lock STALE:` line), so every caller of status sees the phone as free
   phone-lock check [--token T]            exit 0 only if T (else $PHONE_LOCK_TOKEN) is the token of the live lock: the guard that
-                                          fboot/fflash-userdata/phone goto/run-probe/pstore-pull call before touching the phone
+                                          fboot/fflash-userdata/phone goto/probe-run/pstore-pull call before touching the phone
   phone-lock force-release --yes
+  phone-lock watch [--duration S]         T-2ebf: inotify the lock's parent dir; a removal no phone-lock path recorded is written to <lock>.history
+                                          with the processes started in the last 5 s (run it as a user unit while hunting a vanishing lock)
+  phone-lock waiter add --role ROLE --hook LABEL | rm --role ROLE | list     register an agent to be WOKEN (no polling) when the phone is free
+  phone-lock tick                         STALE: dead holder -> remove the lock and wake the head waiter; OVERDUE: lock held past
+                                          its ttl by a live pid -> wake the head waiter once per lock (the queue tick calls this)
+
+Waiter wake (R37, T-a5b5; docs/recipes/local-webhook.md): `waiter add` stores ROLE -> hook LABEL in $PHONE_LOCK_DIR.waiters (0600, the label only;
+the secret `<encoded task id>/<token>` stays in ~/.t3/scratch_sec/LABEL.hook, written by the waiter). On release (also the end of `run`) the OLDEST
+waiter is woken once through tools/wake (POST /api/hooks/<id>/<token>, event `phone-lock released`) and removed; a live `--wait` process that queued
+earlier is served first and wakes the next one itself. A failed wake (non-202, refused, no hook file) prints `phone-lock: WAKE FAIL: <code> hook=<label>`,
+KEEPS the entry (polling fallback stays valid) and makes `release`/`tick`/`waiter` exit 3; `run` keeps CMD's own exit code (a wake problem must not turn
+a good flash into a failure) but prints the line. A waiter that recreates its scheduled task has a NEW id AND token: it rewrites its hook file.
+tools/wake: $PHONE_LOCK_WAKE, else <super repo>/tools/wake found through the kernel repo's git common dir.
+
+History (T-2ebf): every removal (RELEASE, FORCE-RELEASE, RUN-END, STALE-REMOVE) appends a JSON line to <lock>.history (pid, ppid, cmd, ancestors,
+path, holder); status/check/tick/acquire print `phone-lock VANISHED:` and log VANISHED when the lock written last (<lock>.seen) is gone while its
+holder lives and no path above removed it (REPLACED when a new lock was written over such a lock).
 
 Take the lock only when ready to use the phone (image built, gates done): xrun and probe-run build first and acquire after.
 Identity is a TOKEN, not the owner name (the name is a label for humans; two agents may share one). `run` and the self-locking tools
@@ -20,22 +38,39 @@ Lock = directory $PHONE_LOCK_DIR (default ~/pixelios-artifacts/phone.lock), made
 is left (`run` starts CMD in its own group, so a SIGKILLed `run` does not free the phone while xrun's fastboot still runs); the ttl
 NEVER frees a lock with a pid (a live flash must not be taken over) and only ends a pid-less lock. A bare `acquire` without --pid is
 ttl-only (its process exits at once): it prints a warning and cannot be checked from other processes; prefer `run`.
-Owner label: --owner, else $PHONE_OWNER, else agent-<pid>. Defaults: ttl 1800, wait 0 (capped at 3600).
+Owner label: --owner, else $PHONE_OWNER, else agent-<pid>. Defaults: ttl 1800, wait 0 (capped at 7200, said so on stderr when a larger --wait is cut).
+adb server (AP-230): before CMD, `run` checks 127.0.0.1:$ANDROID_ADB_SERVER_PORT (5037); none listening -> `systemd-run --user --scope --collect
+--unit=pixos-adb-server-<epoch> adb start-server`, so the shared, daemonized server lives in its own unit and not in CMD's cgroup (else a
+detached run's scope stays "active running" after its end line, and stopping that scope kills the adb server of every later run). Each
+outcome prints one `phone-lock: adb-server ...` line; not started in its own unit = a loud WARN, CMD still runs. Done by `run` and by a
+successful `acquire` (xrun/probe-run take the lock through plock_take = acquire). Only for the real lock: a PHONE_LOCK_DIR other than the
+default skips it unless PHONE_LOCK_ADB_SERVER=on (a WARN line, silent only for a lock dir under $TMPDIR = host tests); =off skips it with a WARN. PHONE_LOCK_SYSTEMD_RUN (test hook) replaces systemd-run.
 Last line: RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns. Exit 0 ok, 1 busy (or CMD failed: CMD's own code), 2 error.
-"""
-import argparse, fcntl, json, os, re, shutil, signal, subprocess, sys, time, uuid
+Sim seam (env only, default unchanged, prints `SIM SEAM ACTIVE: PIXOS_SLEEP_SCALE=V` on stderr, a bad value is exit 2 at start): PIXOS_SLEEP_SCALE=F multiplies the queue poll sleep of `acquire` only (floor 5 ms, never past the --wait end); the 30 s process-group grace of `run` and the lease are real time. Helper: tools/simseams.py.
 
-LOCK = os.environ.get("PHONE_LOCK_DIR") or os.path.expanduser("~/pixelios-artifacts/phone.lock")
+Run end, hard limit, park, end, detach/follow/notify: tools/phone_lock_end.py (its docstring; user 2026-11-09).
+"""
+import argparse, fcntl, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, time, uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import simseams  # noqa: E402  (test seam PIXOS_SLEEP_SCALE: the queue poll below; default = real time)
+import phone_lock_end as ple  # noqa: E402  (run, tick, end, park, detach/follow: the 2026-11-09 run-end half)
+
+DEFAULT_LOCK = simseams.DEFAULT_LOCK   # one definition: the sim-seam sandbox check must know the real lock
+LOCK = os.environ.get("PHONE_LOCK_DIR") or DEFAULT_LOCK
 INFO = os.path.join(LOCK, "info.json")
 QUEUE = LOCK + ".queue"
 MUTEX = LOCK + ".mutex"
-MAXWAIT = 3600
+HISTORY = LOCK + ".history"   # T-2ebf: append-only JSON lines, one per lock removal/replacement/vanish: who (pid, ppid, cmd, ancestors) and which lock
+SEEN = LOCK + ".seen"         # T-2ebf: the last lock written through this tool (token, pid, pgid): a lock that is gone while this holder lives was removed behind our back
+WAITERS = LOCK + ".waiters"   # R37: role -> hook label of agents to wake on release (label only, never the token)
+MAXWAIT = 7200   # 2026-11-11: = the hold hard-limit cap (phone_lock_end --max <= 7200): holds of other threads run up to 2 h, a 3600 cap expired a queued run unannounced (wd6-rec1)
 
 
 def result(code, owner, held, msg=None):
     if msg:
         print(msg)
-    print("RESULT: %s owner=%s held_for=%ds" % (("PASS", "FAIL", "ERROR")[min(code, 2)], owner, held))
+    print("RESULT: %s owner=%s held_for=%ds" % (("PASS", "FAIL", "ERROR")[min(code, 2)] if code != 3 else "FAIL", owner, held))
     return code
 
 
@@ -46,7 +81,10 @@ def read():
     try:
         with open(INFO) as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:   # lint-silent: expected the mkdir -> write gap: the lock dir exists, info.json is not written yet (no info)
+        return {}
+    except (OSError, ValueError) as _err:
+        print(f"phone-lock GAP: {type(_err).__name__} ignored in read(): {_err}: the lock info is unreadable and counts as empty", file=sys.stderr)
         return {}
 
 
@@ -55,11 +93,11 @@ def alive(pid):
         return True  # pid 0 = ttl-only lock
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except ProcessLookupError:   # lint-silent: expected the pid is dead: the lock holder is gone (False = not alive)
         return False
-    except PermissionError:
+    except PermissionError:   # lint-silent: expected kill(0) denied: the process exists under another uid (alive)
         pass
-    return True
+    return not ple.zombie(pid)
 
 
 def group_alive(pgid):
@@ -67,10 +105,39 @@ def group_alive(pgid):
         return False
     try:
         os.killpg(pgid, 0)
-    except ProcessLookupError:
+    except ProcessLookupError:   # lint-silent: expected the process group is gone (False = not alive)
         return False
-    except PermissionError:
-        pass
+    except PermissionError:   # lint-silent: expected kill(0) denied: the process exists under another uid (alive)
+        return True
+    live = ple.group_members_live(pgid)
+    return True if live is None else live   # only zombies left = the group is done with the phone
+
+
+INIT_PIDNS = "pid:[4026531836]"   # the initial PID namespace always has this fixed inode (PROC_PID_INIT_INO)
+_NS_WARNED = set()
+
+
+def pidns():
+    """this process's PID namespace id ('pid:[inode]'), '' when /proc has no ns link."""
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError as _err:
+        print(f"phone-lock GAP: cannot read /proc/self/ns/pid: {_err}: the holder pid namespace is not recorded or compared", file=sys.stderr)
+        return ""
+
+
+def foreign_ns(i):
+    """True when I's holder pid cannot be judged here: the lock was taken in another PID namespace (info.json pidns; no field = initial namespace).
+    kill(pid, 0) there answers about unrelated processes: T-b9a3, kernel-hooks mutants in `unshare -p` deleted the real lock under live holders.
+    The lock then counts as held, with one loud line."""
+    mine, theirs = pidns(), i.get("pidns") or INIT_PIDNS
+    if not i.get("pid") or mine == theirs:   # T-fa98: mine == '' (no /proc ns link) is unverifiable too: never judged by kill(), the lock counts as HELD
+        return False
+    key = (i.get("token"), mine)
+    if key not in _NS_WARNED:
+        _NS_WARNED.add(key)
+        print("phone-lock NAMESPACE: lock of %s (pid %s) taken in %s%s, this process is in %s: pid unverifiable here, the lock counts as HELD" % (
+            i.get("owner", "?"), i.get("pid"), theirs, "" if i.get("pidns") else " (assumed: no pidns field)", mine or "an unreadable namespace"), file=sys.stderr)
     return True
 
 
@@ -78,9 +145,11 @@ def stale(i):
     if not i:  # no info: only stale once it has sat there longer than any mkdir->write gap
         try:
             return time.time() - os.stat(LOCK).st_mtime > 10
-        except OSError:
+        except OSError:   # lint-silent: expected the lock directory vanished between mkdir and stat: not stale (False)
             return False
     if i.get("pid"):
+        if foreign_ns(i):
+            return False
         return not (alive(i["pid"]) or group_alive(i.get("pgid", 0)))  # a live pid or leftover child keeps the lock, whatever the ttl
     return time.time() > i["start"] + i["ttl"]
 
@@ -89,12 +158,120 @@ def age(i):
     return int(time.time() - i["start"]) if i else 0
 
 
-def write(owner, pid, ttl, cmd, token, pgid=0):
+def proc_cmd(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()[:300]
+    except OSError:   # lint-silent: expected the process is gone or unreadable: the caller prints '?' (a missing name, not a missing event)
+        return "?"
+
+
+def ancestry(pid, depth=6):
+    """['pid:cmdline', ...] from PID up to DEPTH ancestors: names the script or agent that ran this tool."""
+    out = []
+    for _ in range(depth):
+        if pid <= 1:
+            break
+        out.append("%d:%s" % (pid, proc_cmd(pid)))
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):   # lint-silent: expected the chain ends at a vanished or unreadable parent
+            break
+    return out
+
+
+def hist(event, i=None, note=""):
+    """T-2ebf: one JSON line in HISTORY for every lock removal/replacement/vanish: pid, ppid, cmd, ancestors, path, the lock's holder. Never raises;
+    a write failure is a loud GAP line (rule 8), the lock operation itself goes on."""
+    i = i or {}
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, "pid": os.getpid(), "ppid": os.getppid(),
+           "cmd": " ".join(sys.argv)[:300], "ancestors": ancestry(os.getppid()), "path": LOCK,
+           "holder": {"owner": i.get("owner"), "pid": i.get("pid"), "pgid": i.get("pgid"), "token": (i.get("token") or "")[:8],
+                      "age": age(i) if i.get("start") else None,
+                      "pid_alive": bool(i.get("pid")) and alive(i["pid"]), "group_alive": group_alive(i.get("pgid", 0))},
+           "note": note}
+    try:
+        fd = os.open(HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(rec) + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as _err:
+        print(f"phone-lock GAP: could not append to {HISTORY}: {_err}: the removal of the lock is NOT recorded", file=sys.stderr)
+
+
+def seen_read():
+    try:
+        with open(SEEN) as f:
+            return json.load(f)
+    except FileNotFoundError:   # lint-silent: expected no lock was written through this tool yet (or its removal was recorded): nothing to compare
+        return None
+    except (OSError, ValueError) as _err:
+        print(f"phone-lock GAP: {type(_err).__name__} ignored in seen_read(): {_err}: vanished-lock detection is off for this call", file=sys.stderr)
+        return None
+
+
+def forget_seen():
+    try:
+        os.unlink(SEEN)
+    except FileNotFoundError:   # lint-silent: expected the sidecar is already gone
+        pass
+
+
+def holder_live(s):
+    """True when the process holding the lock described by S is still running (a pid-less ttl lock has no holder process to compare with)."""
+    return bool(s.get("pid")) and (alive(s["pid"]) or group_alive(s.get("pgid", 0)))
+
+
+def check_vanished():
+    """T-2ebf: the last lock written through this tool is gone, was not removed by a logged path (those call forget_seen first) and its holder
+    lives -> something outside this tool removed it. Loud line + history record, once. Returns the vanished info or None."""
+    if os.path.isdir(LOCK):
+        return None
+    s = seen_read()
+    if s is None:
+        return None
+    forget_seen()
+    if not holder_live(s):
+        return None
+    print("phone-lock VANISHED: the lock of %s (pid %s alive, token %s, age %ds) is gone and no phone-lock release/takeover removed it; "
+          "see %s" % (s.get("owner", "?"), s.get("pid"), (s.get("token") or "")[:8], age(s), HISTORY), file=sys.stderr)
+    hist("VANISHED", s, "lock directory absent while its holder is alive; removed by a process outside tools/phone-lock")
+    return s
+
+
+def write(owner, pid, ttl, cmd, token, pgid=0, deadline=None, kind=None, runid=None):
+    old = seen_read()
+    if old and old.get("token") != token and holder_live(old):   # a live holder's lock was replaced without a recorded removal
+        hist("REPLACED", old, "a new lock (owner %s) was written over a lock whose holder is alive and whose removal was not recorded" % owner)
+        print("phone-lock VANISHED: the lock of %s (pid %s alive) was replaced by %s without a recorded release; see %s" % (
+            old.get("owner", "?"), old.get("pid"), owner, HISTORY), file=sys.stderr)
+    info = {"owner": owner, "token": token, "pid": pid, "pgid": pgid, "start": int(time.time()), "ttl": ttl, "cmd": cmd}
+    if deadline:
+        info["deadline"] = int(deadline)   # HARD LIMIT: past this the run is stopped and the phone parked (run itself, else tick)
+    if kind:
+        info["kind"] = kind                # run | acquire | park: how `end` and `tick` stop the holder
+    if runid:
+        info["runid"] = runid
+    if pid:
+        info["pidns"] = pidns()   # T-b9a3: the namespace in which `pid` means this process
     tmp = INFO + ".%d" % os.getpid()
     with open(tmp, "w") as f:
-        json.dump({"owner": owner, "token": token, "pid": pid, "pgid": pgid, "start": int(time.time()), "ttl": ttl, "cmd": cmd}, f)
+        json.dump(info, f)
     os.chmod(tmp, 0o600)  # the token is the lock's identity
     os.replace(tmp, INFO)
+    stmp = SEEN + ".%d" % os.getpid()
+    try:
+        with open(stmp, "w") as f:
+            json.dump(info, f)
+        os.chmod(stmp, 0o600)
+        os.replace(stmp, SEEN)
+    except OSError as _err:
+        print(f"phone-lock GAP: could not write {SEEN}: {_err}: vanished-lock detection is off for this lock", file=sys.stderr)
+
+
+_BAD_TICKETS = set()
 
 
 def queue():
@@ -107,15 +284,20 @@ def queue():
     for n in names:
         try:
             ts, pid = int(n.split("-")[0]), int(n.split("-")[1])
-        except (IndexError, ValueError):
+        except (IndexError, ValueError) as _err:
+            if n not in _BAD_TICKETS:   # a malformed name stays in the queue dir and is seen on every poll: say it once
+                _BAD_TICKETS.add(n)
+                print(f"phone-lock GAP: (IndexError, ValueError) ignored in queue() for ticket {n!r}: {_err}", file=sys.stderr)
             continue
         if alive(pid) and time.time_ns() - ts < (MAXWAIT + 60) * 10**9:
             out.append((n, n.split("-", 2)[2]))
         else:
             try:
                 os.unlink(os.path.join(QUEUE, n))
-            except OSError:
+            except FileNotFoundError:   # another waiter already removed the same dead ticket   # lint-silent: expected another waiter already removed the same dead ticket
                 pass
+            except OSError as _err:
+                print(f"phone-lock GAP: OSError ignored in queue(): {_err}", file=sys.stderr)
     return out
 
 
@@ -129,7 +311,7 @@ def take_over_stale(i):
         old = "%s.stale.%d" % (LOCK, os.getpid())
         try:
             os.rename(LOCK, old)
-        except OSError:
+        except OSError:   # lint-silent: expected another taker already renamed the stale lock away: this one lost the race (False)
             return False
         try:
             with open(os.path.join(old, "info.json")) as f:
@@ -139,17 +321,31 @@ def take_over_stale(i):
         if not same:  # we moved a different lock away: put it back
             try:
                 os.rename(old, LOCK)
-            except OSError:
-                pass
+            except OSError as _err:
+                print(f"phone-lock GAP: could not put the moved lock back ({old} -> {LOCK}): {_err}", file=sys.stderr)
             return False
+        forget_seen()
+        hist("STALE-REMOVE", i, "holder dead (pid and process group gone) or pid-less past ttl")
         shutil.rmtree(old, ignore_errors=True)
         return True
 
 
-def acquire(owner, wait, ttl, pid, cmd, token=None, pgid=0):
+def try_mkdir_lock():
+    """mkdir is the atomic test-and-set: True = we created LOCK, False = it exists (the normal contended case, read it next)."""
+    try:
+        os.mkdir(LOCK)
+        return True
+    except FileExistsError:   # lint-silent: expected the lock directory exists: the lock is held (False = not acquired, the mkdir mutex)
+        return False
+
+
+def acquire(owner, wait, ttl, pid, cmd, token=None, pgid=0, maxhold=None, kind=None, runid=None):
     """(code, message). 0 = the lock is held by the caller now. Waiters are served in arrival order."""
+    check_vanished()
     os.makedirs(os.path.dirname(LOCK), exist_ok=True)
     token = token or str(uuid.uuid4())
+    if wait > MAXWAIT:
+        print("phone-lock GAP: --wait %ds capped at %ds" % (wait, MAXWAIT), file=sys.stderr)   # rule 7: never cut a wait silently
     wait = min(max(wait, 0), MAXWAIT)
     end = time.time() + wait
     ticket = None
@@ -164,9 +360,10 @@ def acquire(owner, wait, ttl, pid, cmd, token=None, pgid=0):
             if my_turn:
                 try:
                     os.mkdir(LOCK)
-                    write(owner, pid, ttl, cmd, token, pgid)
+                    lim = maxhold if maxhold else (min(ttl, ple.MAXHOLD) if pid else None)   # the clock starts now, after the --wait
+                    write(owner, pid, ttl, cmd, token, pgid, int(time.time()) + lim if lim else None, kind, runid)
                     return 0, None
-                except FileExistsError:
+                except FileExistsError:   # lint-silent: expected another waiter created the lock first: the loop reads its info below
                     pass
             i = read()
             if i and i.get("token") and i["token"] == token:
@@ -182,12 +379,12 @@ def acquire(owner, wait, ttl, pid, cmd, token=None, pgid=0):
                 return 1, "busy: held by %s pid=%s age=%ds ttl=%ds cmd=%s%s" % (
                     i.get("owner", "?"), i.get("pid", "?"), age(i), i.get("ttl", 0), i.get("cmd", ""),
                     " queue=%s" % ",".join(ahead) if ahead else "")
-            time.sleep(min(0.2, max(0.02, end - time.time())))
+            simseams.poll(min(0.2, max(0.02, end - time.time())), limit=end - time.time())   # the scaled poll never outlasts --wait
     finally:
         if ticket:
             try:
                 os.unlink(os.path.join(QUEUE, ticket))
-            except OSError:
+            except FileNotFoundError:   # lint-silent: expected the waiting ticket is already gone (dropped as dead by another waiter)
                 pass
 
 
@@ -205,6 +402,112 @@ def check(token):
     return 0, None
 
 
+LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def wake_tool():
+    """path of tools/wake (T-76a1): $PHONE_LOCK_WAKE, else <super>/tools/wake through the kernel repo's git common dir; None if missing."""
+    p = os.environ.get("PHONE_LOCK_WAKE")
+    if p:
+        return p if os.path.isfile(p) else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        c = subprocess.run(["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):   # lint-silent: expected git absent or not a repo: no wake script is configured, the caller skips the wake
+        return None
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(c))), "tools", "wake") if c else ""
+    return p if os.path.isfile(p) else None
+
+
+def waiters():
+    """registered waiters, oldest first: [(entry name, role, hook label)]."""
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(WAITERS) if not n.startswith("."))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(WAITERS, n)) as f:
+                label = f.read().strip()
+        except OSError:   # lint-silent: expected a waiter file that vanished between listdir and open belongs to a waiter that just left
+            continue
+        out.append((n, n.split("-", 1)[1] if "-" in n else n, label))
+    return out
+
+
+def waiter_add(role, label):
+    if not LABEL_RE.match(role or "") or not LABEL_RE.match(label or ""):
+        return 2, "refused: --role and --hook are plain labels (letters, digits, . _ -; <= 64)"
+    os.makedirs(WAITERS, mode=0o700, exist_ok=True)
+    for n in os.listdir(WAITERS):   # overdue marks of locks that are gone
+        if n.startswith(".overdue-"):
+            os.unlink(os.path.join(WAITERS, n))
+    for n, r, _ in waiters():   # one registration per role: a re-register replaces the old one (new task = new label/hook file)
+        if r == role:
+            os.unlink(os.path.join(WAITERS, n))
+    name = "%020d-%s" % (time.time_ns(), role)
+    fd = os.open(os.path.join(WAITERS, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(label + "\n")
+    hook = os.path.join(os.environ.get("WAKE_SECRETS_DIR") or os.path.expanduser("~/.t3/scratch_sec"), label + ".hook")
+    note = "" if os.path.exists(hook) else "; WARN hook file %s.hook not found yet (create it per docs/recipes/local-webhook.md or the wake will fail)" % label
+    return 0, "waiter registered: role=%s hook=%s%s" % (role, label, note)
+
+
+def wake_next(event, ident=""):
+    """Wake the oldest registered waiter once. 0 = woken or nobody to wake, 3 = WAKE FAIL (entry kept). Always one visible line when it tried."""
+    ws = waiters()
+    if not ws:
+        return 0
+    name, role, label = ws[0]
+    ahead = [n for n, _ in queue() if n < name]   # a live --wait process that came first takes the lock itself
+    if ahead:
+        print("phone-lock: wake skipped: live waiter %s queued before %s; it is served first" % (ahead[0].split("-", 2)[2], role))
+        return 0
+    tool = wake_tool()
+    if not tool:
+        print("phone-lock: WAKE FAIL: tool-missing hook=%s (tools/wake not found; set PHONE_LOCK_WAKE); waiter %s kept, poll instead" % (label, role))
+        return 3
+    try:
+        r = subprocess.run([sys.executable, "-I", tool, label, "--event", event, "--id", ident or role], capture_output=True, text=True, timeout=30)
+        rc, err = r.returncode, (r.stderr or "").strip().splitlines()
+    except (OSError, subprocess.SubprocessError) as e:
+        rc, err = 1, ["%s: %s" % (type(e).__name__, e)]
+    if rc == 0:
+        try:
+            os.unlink(os.path.join(WAITERS, name))
+        except OSError:   # lint-silent: expected the waiter file is already gone: the thing the unlink wanted
+            pass
+        print("phone-lock: WAKE ok: role=%s hook=%s event=%s" % (role, label, event))
+        return 0
+    why = " ".join(err[-1:]) if err else "no output"
+    m = re.search(r"http (\d+)", why)
+    code = m.group(1) if m else ("off" if "WAKE OFF" in why else "noanswer")
+    print("phone-lock: WAKE FAIL: %s hook=%s waiter=%s kept, poll instead (%s)" % (code, label, role, why[:160]))
+    return 3
+
+
+def read_live():
+    """read(), but a stale lock (holder dead) counts as no lock, with one loud line; the in-process view for tools/agent-guard."""
+    i = read()
+    if i is not None and stale(i):
+        print("phone-lock STALE: the lock of %s (pid %s dead) is treated as free" % (i.get("owner", "?"), i.get("pid", "?")), file=sys.stderr)
+        return None
+    return i
+
+
+def reap_stale():
+    """Remove the lock if its holder is dead (pid and process group gone, or a pid-less lock past its ttl), through take_over_stale (mutex +
+    verified rename, so a lock replaced meanwhile is never removed). Returns the removed info dict, or None. Always one visible line when it removed."""
+    i = read()
+    if i is None or not stale(i) or not take_over_stale(i):
+        return None
+    print("phone-lock STALE: removed the lock of %s (pid %s dead, age %ds, cmd %s); the phone is free" % (
+        i.get("owner", "?"), i.get("pid", "?"), age(i), i.get("cmd", "?")), file=sys.stderr)
+    return i
+
+
 def release(owner, token, force):
     i = read()
     if i is None:
@@ -213,57 +516,142 @@ def release(owner, token, force):
     mine = (token and i.get("token") == token) or (not token and not i.get("pid") and owner and i.get("owner") == owner)
     if not force and not mine:
         return result(2, owner, age(i), "refused: lock is held by %s; release needs its token (force-release --yes to override)" % i.get("owner", "?"))
+    forget_seen()
+    hist("FORCE-RELEASE" if force else "RELEASE", i, "force-release --yes" if force else "token/owner matched")
     shutil.rmtree(LOCK, ignore_errors=True)
-    return result(0, owner, age(i), "released lock of %s" % i.get("owner", "?"))
+    print("released lock of %s" % i.get("owner", "?"))
+    return result(wake_next("phone-lock released", i.get("owner", "")), owner, age(i))
 
 
-def run(a):
-    token = str(uuid.uuid4())
-    code, msg = acquire(a.owner, a.wait, a.ttl, os.getpid(), " ".join(a.cmd), token)
-    if msg:
-        print(msg)
-    if code:
-        return result(code, a.owner, 0)
-    t0 = time.time()
-    child = None
-    os.environ["PHONE_LOCK_TOKEN"] = token  # xrun/probe-run/fboot inside CMD see that the lock is already ours
-    os.environ["PHONE_LOCK_OWNER"] = a.owner
-    os.environ["PHONE_OWNER"] = a.owner
-
-    def fwd(sig, _frame):
-        if child and child.poll() is None:
-            child.send_signal(sig)  # the child's death ends wait(); we release below
-        else:
-            raise SystemExit(128 + sig)
-
-    rc = 2
+def adb_server():
+    """Start the adb server in its own systemd user scope unless one already listens (AP-230). One line per outcome, never raises."""
+    mode = os.environ.get("PHONE_LOCK_ADB_SERVER", "")
+    if mode == "off" or (mode != "on" and LOCK != DEFAULT_LOCK):
+        tmp = os.path.realpath(tempfile.gettempdir()) + os.sep
+        if mode == "off" or not os.path.realpath(LOCK).startswith(tmp):   # r1 F2: silent only for host-test lock dirs under $TMPDIR
+            print("phone-lock: WARN adb-server step SKIPPED (%s); the first adb call in CMD starts it inside CMD's cgroup (AP-230)"
+                  % ("PHONE_LOCK_ADB_SERVER=off" if mode == "off" else "PHONE_LOCK_DIR is not the default lock"))
+        return
     try:
-        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(s, fwd)
-        child = subprocess.Popen(a.cmd, start_new_session=True)  # own process group: leftovers keep the lock if `run` is SIGKILLed
-        cur = read()
-        if cur and cur.get("token") == token:  # never overwrite a lock somebody force-released and retook
-            write(a.owner, os.getpid(), a.ttl, " ".join(a.cmd), token, child.pid)
-        rc = child.wait()
-        for _ in range(60):  # children left in the group (a backgrounded fastboot) still use the phone: keep the lock up to 30 s
-            if not group_alive(child.pid):
-                break
-            time.sleep(0.5)
-        rc = 128 - rc if rc < 0 else rc  # killed by signal N -> 128+N
-    except OSError as e:
-        print("cannot run %s: %s" % (a.cmd[0], e))
-        rc = 127
-    except SystemExit as e:
-        rc = e.code
-    finally:
-        i = read()
-        if i and i.get("token") == token:  # not if it was force-released and taken meanwhile
-            shutil.rmtree(LOCK, ignore_errors=True)
-    result(0 if rc == 0 else 1, a.owner, int(time.time() - t0), "command exit %d" % rc if rc else None)
-    return rc
+        port = int(os.environ.get("ANDROID_ADB_SERVER_PORT") or 5037)
+    except ValueError:   # r1 F1: never raise
+        print("phone-lock: WARN adb-server step SKIPPED (ANDROID_ADB_SERVER_PORT=%r is not a port)" % os.environ.get("ANDROID_ADB_SERVER_PORT"))
+        return
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        listening = True
+    except OSError:   # lint-silent: expected nothing listens on the port: the normal case that starts the server below
+        listening = False
+    if listening:
+        print("phone-lock: adb-server already listening on %d" % port)
+        return
+    sr = os.environ.get("PHONE_LOCK_SYSTEMD_RUN") or shutil.which("systemd-run")
+    adb = shutil.which("adb")
+    if not sr or not adb:
+        print("phone-lock: WARN adb-server not started in its own unit (%s missing); the first adb call in CMD starts it inside CMD's cgroup"
+              % ("systemd-run" if not sr else "adb"))
+        return
+    unit = "pixos-adb-server-%d-%d" % (int(time.time()), os.getpid())
+    try:
+        r = subprocess.run([sr, "--user", "--scope", "--collect", "--quiet", "--unit=" + unit, adb, "start-server"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, text=True)
+        rc, tail = r.returncode, (r.stdout or "").strip().splitlines()[-1:] or [""]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        rc, tail = -1, [str(e)]
+    if rc == 0:
+        print("phone-lock: adb-server started in unit %s" % unit)
+    else:
+        print("phone-lock: WARN adb-server start in unit %s failed rc=%d (%s); the first adb call in CMD starts it inside CMD's cgroup"
+              % (unit, rc, tail[0]))
+
+
+IN_MOVED_FROM, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF = 0x40, 0x100, 0x200, 0x400, 0x800
+
+
+def recent_procs(max_age=5.0):
+    """[(pid, ppid, age_s, cmdline)] of processes younger than MAX_AGE plus any whose command line names the lock (candidates for a remover)."""
+    try:
+        up = float(open("/proc/uptime").read().split()[0])
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError) as _err:
+        print(f"phone-lock GAP: watch cannot read /proc/uptime: {_err}", file=sys.stderr)
+        return []
+    out = []
+    base = os.path.basename(LOCK)
+    for n in os.listdir("/proc"):
+        if not n.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % n) as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            ppid, start = int(fields[1]), int(fields[19])
+        except (OSError, ValueError, IndexError):   # lint-silent: expected the process exited while scanning
+            continue
+        a = up - start / hz
+        c = proc_cmd(int(n))
+        if a <= max_age or base in c or "phone-lock" in c:
+            out.append((int(n), ppid, round(a, 2), c))
+    return out
+
+
+def watch(duration):
+    """T-2ebf: inotify on the lock's parent directory (stdlib ctypes, no root). A delete or move-away of the lock directory that no
+    phone-lock path recorded (its own removals call forget_seen first, so SEEN is gone) is logged to HISTORY with the processes started within
+    5 s and every process naming the lock: the remover itself, if it is still running, or its parent. Runs until killed or --duration."""
+    import ctypes, select, struct
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK)
+    if fd < 0:
+        return result(2, "-", 0, "watch: inotify_init1 failed: errno %d" % ctypes.get_errno())
+    parent, base = os.path.dirname(LOCK) or ".", os.path.basename(LOCK)
+    os.makedirs(parent, exist_ok=True)
+    if libc.inotify_add_watch(fd, parent.encode(), IN_DELETE | IN_MOVED_FROM | IN_CREATE) < 0:
+        return result(2, "-", 0, "watch: cannot watch %s: errno %d" % (parent, ctypes.get_errno()))
+    wd_lock = [-1]
+
+    def watch_lock():
+        if os.path.isdir(LOCK):
+            wd_lock[0] = libc.inotify_add_watch(fd, LOCK.encode(), IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF)
+
+    watch_lock()
+    print("watch: %s (lock dir %s)" % ("running", LOCK), flush=True)
+    end = time.time() + duration if duration else None
+    reported = set()   # one record per removed lock: rm -rf fires an event per entry
+    while end is None or time.time() < end:
+        if not select.select([fd], [], [], 1.0)[0]:
+            continue
+        try:
+            buf = os.read(fd, 65536)
+        except BlockingIOError:   # lint-silent: expected spurious wakeup, nothing to read
+            continue
+        off = 0
+        while off < len(buf):
+            _wd, mask, _cookie, ln = struct.unpack_from("iIII", buf, off)
+            name = buf[off + 16:off + 16 + ln].split(b"\0", 1)[0].decode("utf-8", "replace")
+            off += 16 + ln
+            if mask & IN_CREATE and name == base:
+                watch_lock()
+            elif (mask & (IN_DELETE | IN_MOVED_FROM) and name == base) or mask & (IN_DELETE_SELF | IN_MOVE_SELF) or (_wd == wd_lock[0] and mask & IN_DELETE):
+                s = seen_read()
+                if s is None or s.get("token") in reported:   # None: a recorded removal (release/takeover/run end) forgot SEEN first: expected
+                    continue
+                reported.add(s.get("token"))
+                cands = recent_procs()
+                rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": "WATCH-REMOVED", "pid": os.getpid(), "path": LOCK,
+                       "inotify": {"mask": hex(mask), "name": name}, "holder": {k: s.get(k) for k in ("owner", "pid", "pgid")},
+                       "holder_alive": holder_live(s), "candidates": ["%d ppid=%d age=%ss %s" % c for c in cands][:60]}
+                try:
+                    with open(HISTORY, "a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                except OSError as _err:
+                    print(f"phone-lock GAP: could not append to {HISTORY}: {_err}", file=sys.stderr)
+                print("phone-lock WATCH: lock removed outside phone-lock (holder %s pid %s alive=%s); %d candidate processes in %s" % (
+                    s.get("owner"), s.get("pid"), holder_live(s), len(cands), HISTORY), flush=True)
+    return result(0, "-", 0, "watch: ended")
 
 
 def main():
+    simseams.scale()   # a bad PIXOS_SLEEP_SCALE is exit 2 now, before any lock or command (review xrun-seams-r1 F6)
     p = argparse.ArgumentParser(prog="phone-lock")
     sub = p.add_subparsers(dest="op", required=True)
     for n in ("acquire", "release", "run"):
@@ -277,41 +665,84 @@ def main():
             s.add_argument("--pgid", type=int, default=0, help="process group whose members keep the lock after --pid dies")
         if n in ("acquire", "release"):
             s.add_argument("--token", default=None)
-        if n == "run":
-            s.add_argument("cmd", nargs=argparse.REMAINDER)
+        ple.add_lock_args(n, s)
     sub.add_parser("status")
     sub.add_parser("check").add_argument("--token", default=os.environ.get("PHONE_LOCK_TOKEN") or "")
     sub.add_parser("force-release").add_argument("--yes", action="store_true")
+    sub.add_parser("tick")
+    ple.add_parsers(sub)
+    sub.add_parser("watch").add_argument("--duration", type=float, default=0, help="seconds to watch (0 = until killed)")
+    w = sub.add_parser("waiter")
+    wsub = w.add_subparsers(dest="wop", required=True)
+    wa = wsub.add_parser("add")
+    wa.add_argument("--role", required=True)
+    wa.add_argument("--hook", required=True)
+    wsub.add_parser("rm").add_argument("--role", required=True)
+    wsub.add_parser("list")
     try:
         a = p.parse_args()
+        ple.seams_check()
+        if a.op in ple.OPS:
+            return ple.dispatch(a)
         if a.op == "acquire":
-            code, msg = acquire(a.owner, a.wait, a.ttl, a.pid, "acquire", a.token, a.pgid)
+            code, msg = acquire(a.owner, a.wait, a.ttl, a.pid, "acquire", a.token, a.pgid, maxhold=min(a.max, ple.MAXHOLD) if a.max else None, kind="acquire")
+            if code == 0:
+                adb_server()
             if code == 0 and not a.pid:
                 msg = (msg + "; " if msg else "") + "warning: ttl-only lock (%ds), not checkable from other processes; prefer phone-lock run" % a.ttl
             return result(code, a.owner, 0, msg)
         if a.op == "release":
             return release(a.owner, a.token, False)
         if a.op == "check":
+            check_vanished()
             code, msg = check(a.token)
             i = read() or {}
             return result(code, i.get("owner", "-"), age(i) if code == 0 else 0, msg)
         if a.op == "status":
+            check_vanished()
+            reap_stale()
             i = read()
             q = ",".join(o for _, o in queue())
             if i is None:
                 return result(0, "-", 0, "free" + (" (queued: %s)" % q if q else ""))
-            return result(1, i.get("owner", "-"), age(i), "held by %s pid=%s age=%ds ttl=%ds%s cmd=%s%s" % (
-                i.get("owner", "?"), i.get("pid"), age(i), i.get("ttl", 0), " (stale)" if stale(i) else "", i.get("cmd", ""),
+            return result(1, i.get("owner", "-"), age(i), "held by %s pid=%s age=%ds ttl=%ds%s%s cmd=%s%s" % (
+                i.get("owner", "?"), i.get("pid"), age(i), i.get("ttl", 0), " (stale)" if stale(i) else "", ple.limit_note(i), i.get("cmd", ""),
                 " queue=%s" % q if q else ""))
+        if a.op == "watch":
+            return watch(a.duration)
+        if a.op == "waiter":
+            if a.wop == "add":
+                code, msg = waiter_add(a.role, a.hook)
+                return result(code, a.role, 0, msg)
+            if a.wop == "rm":
+                n = 0
+                for name, r, _ in waiters():
+                    if r == a.role:
+                        os.unlink(os.path.join(WAITERS, name))
+                        n += 1
+                return result(0, a.role, 0, "waiter removed: %d" % n)
+            for _, r, label in waiters():
+                print("waiter role=%s hook=%s" % (r, label))
+            return result(0, "-", 0)
         if a.op == "force-release":
             return release("-", None, True) if a.yes else result(2, "-", 0, "force-release needs --yes")
-        a.cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
-        return run(a) if a.cmd else result(2, a.owner, 0, "run needs a command after --")
+        return ple.run_cmd(a)
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 2
     except Exception as e:  # noqa: BLE001 - one report line, exit 2
         return result(2, "-", 0, "error: %s" % e)
 
+
+def run(a):   # the run half lives in phone_lock_end (tests and old callers call phone-lock's run)
+    return ple.run(a)
+
+
+class _Core:   # live view of this module for phone_lock_end (works when loaded under any name, e.g. by tools/agent-guard)
+    def __getattr__(self, name):
+        return globals()[name]
+
+
+ple.bind(_Core())
 
 if __name__ == "__main__":
     sys.exit(main())

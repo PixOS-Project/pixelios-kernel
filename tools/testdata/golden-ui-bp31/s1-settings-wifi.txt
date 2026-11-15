@@ -1,0 +1,42 @@
+  mCurrentFocus=Window{b4b176a u0 com.android.settings/com.android.settings.SubSettings}
+WINDOW MANAGER WINDOWS (dumpsys window windows)
+  Window #0 Window{1c01a09 u0 ScreenDecorOverlayBottom}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=true
+  Window #1 Window{62398b0 u0 ScreenDecorOverlay}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=true
+  Window #2 Window{dc5e0f4 u0 EdgeBackGestureHandler0}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=false
+  Window #3 Window{fd469c2 u0 Taskbar}:
+    mOwnerUid=10210 showForAllUsers=true package=com.google.android.apps.nexuslauncher appop=NONE
+    isVisible=true
+  Window #4 Window{8ec51f2 u0 NotificationShade}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=false
+  Window #5 Window{ba5ac23 u0 StatusBar}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=true
+  Window #6 Window{5466a00 u0 ShellDropTarget}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=SYSTEM_ALERT_WINDOW
+    isVisible=false
+  Window #7 Window{5b1ccd8 u0 InputMethod}:
+    mOwnerUid=10183 showForAllUsers=false package=com.google.android.inputmethod.latin appop=NONE
+    isVisible=false
+  Window #8 Window{b4b176a u0 com.android.settings/com.android.settings.SubSettings}:
+    mOwnerUid=1000 showForAllUsers=false package=com.android.settings appop=NONE
+    isVisible=true
+  Window #9 Window{3c8e31c u0 com.android.settings/com.android.settings.SubSettings}:
+    mOwnerUid=1000 showForAllUsers=false package=com.android.settings appop=NONE
+    isVisible=false
+  Window #10 Window{bdf474 u0 com.android.settings/com.android.settings.homepage.SettingsHomepageActivity}:
+    mOwnerUid=1000 showForAllUsers=false package=com.android.settings appop=NONE
+    isVisible=false
+  Window #11 Window{2a20454 u0 com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity}:
+    mOwnerUid=10210 showForAllUsers=false package=com.google.android.apps.nexuslauncher appop=NONE
+    isVisible=false
+  Window #12 Window{7557b7 u0 com.android.systemui.wallpapers.ImageWallpaper}:
+    mOwnerUid=10244 showForAllUsers=true package=com.android.systemui appop=NONE
+    isVisible=false
+WINDOW MANAGER TRACE (dumpsys window trace)

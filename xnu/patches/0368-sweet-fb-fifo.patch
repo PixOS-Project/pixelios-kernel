@@ -1,0 +1,574 @@
+sweet-fb-fifo (lowclk 2026-11-15, research 166 levers 1-3): swap FIFO, completion-kicked gate and a per-second presents row for the panel copy of AppleCLCD (iokit/Kernel/arm/SweetFramebuffer.cpp) and a kick hook in the Mali completion thread (bsd/dev/sweet_mali.c, sweet_mali.h). CODE ONLY: no register access, no new hardware write, no firmware command, no bus store; the panel copy is the same CPU row memcpy into the same panel memory as before. The new write path is unreviewed (AGENTS rule 8 is not triggered by software queueing, the driver decides). Boot-args default off = behaviour unchanged (only never-taken branches, new members, one extra loop over four NULL pointers in present()).
+Boot-arg sweetfb_fifo=N (0 or absent = latest wins as today; 1..254 = FIFO capped at N standing ticks; 255 = uncapped; any other value = GAP line, off): swap() used to overwrite the single pending record (fPending), so a 2nd swap before the tick replaced the 1st, which was never shown [read from research 166 s.1.1, SF swap()]. Now the head (fPending) stays and the 2nd swap waits in one HOLD slot (fHold, fHoldSeq) for the next tick (counted held); a 3rd swap replaces the HOLD (latest wins inside the second slot, counted replaced and fifo_full). The tick takes the head (the gate tests the head's seqno as before); after a present that leaves a HOLD, the HOLD becomes the head and `standing` counts that tick. Cap: with N < 255, when standing >= N and the HOLD is GPU-complete (seq_done >= fHoldSeq, or no gate, or Mali unavailable = fail open) the head is dropped and the HOLD is shown instead (counted catchup and replaced), so the added latency is bounded by N ticks. The queue logic is the pure block SFQ-PURE-BEGIN/END (sfq_arrive, sfq_catchup, sfq_take, sfq_row_take), host-tested by tools/test_sweet_fifo368.py with mutants.
+Surface lifetime [read from source]: a swap record holds only surface IDs; present() used to look them up in the surface table at copy time (sweet_surface_copy: retain under the table lock; the table entry is dropped when the last user goes, SweetSurface.cpp:195-215). With sweetfb_fifo >= 1, swap() takes that reference on every masked layer surface of a record it queues (head or HOLD), moves it with the record (promoteHold, takeHead), releases it when the record is replaced or dropped (after the unlock) and hands it to present() through fPresentSurf, which surfFor() checks before the table. So a held swap's surface object, memory and kernel mapping stay valid until its copy is done, even when CoreAnimation destroyed the IOSurface meanwhile. LIMIT, said plainly: a reference keeps the memory alive, it does not stop CoreAnimation from drawing into a reused buffer while the swap waits (SwapWait returns at once and nothing tells CA when a swap was shown, today's rule), so a swap held one tick longer than before can show newer pixels than it was swapped with; the 0361 skip rule and the SWEET FPS hash see what is really copied. Default off keeps the old window (one tick).
+Boot-arg sweetfb_gatekick=1 (0/absent off; needs sweetfb_gate=1 and sweetfb_hz >= 60, else a GAP line and off): when the gate defers the head at a tick because the GPU is still busy (research 166 point 2: 1.0-1.2/s), the tick arms the deferred seqno in Mali (sweet_mali_kick_arm). sm_thread calls sm_kick_tick() after each loop pass, after its unlock; when seq_done >= the armed seqno, exactly one of the arm and the hook fires (seq_cst store/fence/load pairs + compare-exchange, see the comment above sm_kick_tick) the registered function sweet_fb_kick_cb, which enters a one-shot IOTimerEventSource with timeout 0 on the fb workloop. kickFired() then copies the head once if nothing was copied since the last tick (fLastPresentCount < the tick count, so still at most one copy per tick interval), the tick deferred it (fDeferred) and seq_done really passed it (otherwise counted stale or notdone and re-armed). No poll loop, no new timer period; Mali not up / dead = arm returns -1, GAP line, the next tick copies as before.
+Row (once per second while something flows; on with sweetfb_copytime=1, sweetfb_drawn=1, sweetfb_fifo or sweetfb_gatekick): `SWEET FB: presents P drawn D held H replaced R gatekick K fifo_full F`. presents = panel copies made (tick + kick, counted when the head is taken, the same events as the `panel copy` total); drawn = presents whose swap had MORE than 4 GPU jobs since the previous swap (jobs = Mali submitted seqno at this swap minus at the previous swap, the rule of tools/fps-wholerun JOBS_DRAWN and SWEET SWAPT; unknown seqno = not drawn; a redraw without a swap = not drawn); held = swaps put in the HOLD; replaced = swaps discarded unshown (overwritten head, overwritten HOLD, catchup drops); gatekick = presents made by the kick; fifo_full = swaps that found the HOLD full. Invariant (tested): swaps = presents + replaced + still queued. With sweetfb_fifo also `SWEET FB: fifo cap N catchup C standing S`; with sweetfb_gatekick also `SWEET FB: gatekick armed A fired F stale S notdone N unavail U`. Which count D1 means (presents P or drawn D) is the user's call (research 166 s.5). The SWAPT, PACE, GATE and `panel copy` row formats are not touched.
+Rule 7: unknown or unusable boot-arg values, a refused arm, a failed allocation and a missing hook are GAP lines; every fallback has a counter (replaced, fifo_full, catchup, stale, notdone, unavail). Not run on hardware.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -1261,2 +1261,59 @@
+ 
++/*
++ * Patch 0368 (sweetfb_gatekick=1, default off: no hook registered, the sm_thread loop pays one load of a NULL pointer): tell the framebuffer driver when the in-order
++ * completion watermark (seq_done) passes a seqno it armed, instead of leaving it to find out at its next 60 Hz tick. sweet_mali_kick_arm(seq) stores the seqno, then
++ * re-reads seq_done (both seq_cst); sm_kick_tick() (sm_thread, after the unlock, so after the seq_done store of finish()) fences, then reads the armed seqno. Either the
++ * arm sees the completion (returns 1: the caller kicks itself, the hook will not) or the hook sees the arm (compare-exchange to 0 decides who fires, exactly one does).
++ * The hook runs with no Mali lock held and only calls the registered function (a one-shot timer enter in the framebuffer driver, no sleep, no register access).
++ * Not armed / Mali not up: sweet_mali_kick_arm returns -1 and the caller keeps today's behaviour (the next tick copies). No polling: the hook runs when sm_thread has run anyway.
++ */
++static void (*volatile sm_kick_fn)(void);
++static volatile uint64_t sm_kick_seq;
++
++int
++sweet_mali_kick_register(void (*fn)(void))
++{
++	if (fn == NULL) {
++		return EINVAL;
++	}
++	__atomic_store_n(&sm_kick_fn, fn, __ATOMIC_RELEASE);
++	return 0;
++}
++
++int
++sweet_mali_kick_arm(uint64_t seq)
++{
++	if (!sm.up || sm.dead || __atomic_load_n(&sm_kick_fn, __ATOMIC_ACQUIRE) == NULL) {
++		return -1;
++	}
++	if (seq == 0) {
++		return 1;
++	}
++	__atomic_store_n(&sm_kick_seq, seq, __ATOMIC_SEQ_CST);
++	if (__atomic_load_n(&sm.seq_done, __ATOMIC_SEQ_CST) >= seq) {
++		uint64_t exp = seq;
++		if (__atomic_compare_exchange_n(&sm_kick_seq, &exp, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static void
++sm_kick_tick(void)
++{
++	void (*fn)(void) = __atomic_load_n(&sm_kick_fn, __ATOMIC_ACQUIRE);
++	if (fn == NULL) {
++		return;
++	}
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	uint64_t ks = __atomic_load_n(&sm_kick_seq, __ATOMIC_SEQ_CST);
++	if (ks == 0 || __atomic_load_n(&sm.seq_done, __ATOMIC_SEQ_CST) < ks) {
++		return;
++	}
++	if (__atomic_compare_exchange_n(&sm_kick_seq, &ks, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++		fn();
++	}
++}
++
+ static void
+@@ -1373,2 +1430,3 @@
+ 		lck_mtx_unlock(&sm_lock);
++		sm_kick_tick();   /* patch 0368 */
+ 		sm_perf_tick();
+--- a/bsd/dev/sweet_mali.h
++++ b/bsd/dev/sweet_mali.h
+@@ -37,2 +37,6 @@
+ int sweet_mali_seq_peek(uint64_t *submitted, uint64_t *done);
++/* patch 0368 (sweetfb_gatekick=1): register a no-lock, no-sleep function that sm_thread calls once seq_done reaches the seqno armed with sweet_mali_kick_arm. register: 0 ok, EINVAL.
++ * arm: 0 armed (the function will be called), 1 seq already complete (not armed, the caller acts itself), -1 Mali not up / dead / no function registered. */
++int sweet_mali_kick_register(void (*fn)(void));
++int sweet_mali_kick_arm(uint64_t seq);
+ /* patch 0221 (log only): lock-free per-swap witnesses. busy_us/wait_us are monotonic sums (job busy; submitters blocked behind the previous job); call1_ns = entry of the first
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -171,2 +171,108 @@
+ 
++/*
++ * Patch 0368 (lowclk, research 166 levers 1-2, boot-args sweetfb_fifo=N and sweetfb_gatekick=1, both default off = behaviour unchanged; counters and the per-second row
++ * `SWEET FB: presents P drawn D held H replaced R gatekick K fifo_full F` with sweetfb_copytime=1, sweetfb_drawn=1 or either lever on): the swap queue accounting.
++ * Two entries at most: the HEAD (fPending, shown at the next tick) and one HOLD (fHold). sweetfb_fifo=0: a swap that arrives while the head is unshown replaces it
++ * (latest wins, counted replaced). N >= 1: it goes to the HOLD instead (counted held) and the head is shown first; a 3rd swap replaces the HOLD (counted replaced and
++ * fifo_full). After a present that leaves a HOLD, the HOLD becomes the head and `standing` counts that tick; N = 1..254 caps the queue: when standing >= N and the HOLD
++ * is complete on the GPU, the head is dropped (counted catchup and replaced) and the HOLD is shown instead. N = 255: never. Pure logic, host-tested (tools/test_sweet_fifo368.py).
++ */
++/* SFQ-PURE-BEGIN */
++#define SFQ_UNCAPPED    255u
++#define SFQ_JOBS_UNK    0xffffffffu
++#define SFQ_DRAWN_JOBS  4u      /* a present is "drawn" when its swap had MORE than this many GPU jobs since the previous swap (tools/fps-wholerun JOBS_DRAWN) */
++enum { SFQ_A_HEAD = 0, SFQ_A_HOLD, SFQ_A_REPL_HEAD, SFQ_A_REPL_HOLD };
++struct sfq_row {
++	uint32_t presents, drawn, held, replaced, kicks, fifo_full, catchup, standing;
++	uint32_t k_armed, k_stale, k_notdone;
++};
++struct sfq {
++	uint32_t fifo;          /* 0 = latest wins, 1..254 = cap in standing ticks, 255 = uncapped */
++	bool     head_valid;    /* an unshown swap is in fPending (a redraw with no new swap is not one) */
++	bool     hold_valid;
++	uint32_t head_jobs, hold_jobs;   /* GPU jobs since the previous swap, SFQ_JOBS_UNK = unknown */
++	uint32_t standing;      /* consecutive presents that left a HOLD behind */
++	struct sfq_row r;       /* this second */
++};
++
++/* a swap arrives: which slot it goes to; the caller moves the record and the surfaces the same way */
++static int
++sfq_arrive(struct sfq *q, uint32_t jobs)
++{
++	if (!q->head_valid) {
++		q->head_valid = true;
++		q->head_jobs = jobs;
++		return SFQ_A_HEAD;
++	}
++	if (q->fifo == 0) {
++		q->head_jobs = jobs;
++		q->r.replaced++;
++		return SFQ_A_REPL_HEAD;
++	}
++	if (!q->hold_valid) {
++		q->hold_valid = true;
++		q->hold_jobs = jobs;
++		q->r.held++;
++		return SFQ_A_HOLD;
++	}
++	q->hold_jobs = jobs;
++	q->r.replaced++;
++	q->r.fifo_full++;
++	return SFQ_A_REPL_HOLD;
++}
++
++/* tick start: true = the head must be dropped and the HOLD becomes the head (the caller moves record, seqno and surfaces) */
++static bool
++sfq_catchup(struct sfq *q, bool hold_ready)
++{
++	if (q->fifo == 0 || q->fifo == SFQ_UNCAPPED || !q->hold_valid || !hold_ready || q->standing < q->fifo) {
++		return false;
++	}
++	q->head_jobs = q->hold_jobs;
++	q->hold_valid = false;
++	q->standing = 0;
++	q->r.catchup++;
++	q->r.replaced++;
++	return true;
++}
++
++/* the head was copied out to be shown: true = the HOLD became the head (the caller moves record, seqno and surfaces) */
++static bool
++sfq_take(struct sfq *q, bool by_kick)
++{
++	q->r.presents++;
++	if (by_kick) {
++		q->r.kicks++;
++	}
++	if (q->head_valid && q->head_jobs != SFQ_JOBS_UNK && q->head_jobs > SFQ_DRAWN_JOBS) {   /* a redraw with no swap behind it is not a drawn present */
++		q->r.drawn++;
++	}
++	q->head_valid = false;
++	if (q->hold_valid) {
++		q->head_valid = true;
++		q->head_jobs = q->hold_jobs;
++		q->hold_valid = false;
++		q->standing++;
++		return true;
++	}
++	q->standing = 0;
++	return false;
++}
++
++/* once per second: hand out the counters of the second and start the next */
++static void
++sfq_row_take(struct sfq *q, struct sfq_row *o)
++{
++	*o = q->r;
++	o->standing = q->standing;
++	memset(&q->r, 0, sizeof(q->r));
++}
++
++static bool
++sfq_row_nonzero(const struct sfq_row *o)
++{
++	return (o->presents | o->held | o->replaced | o->kicks | o->fifo_full | o->catchup | o->k_armed | o->k_stale | o->k_notdone) != 0;
++}
++/* SFQ-PURE-END */
++
+ class IOMobileFramebuffer : public IOService {
+@@ -194,2 +300,3 @@
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void kickFired(OSObject *owner, IOTimerEventSource *sender);   /* patch 0368 */
+ 
+@@ -217,2 +324,13 @@
+ 	volatile bool fForceCopy;     /* patch 0361: a panel event (power change, QR hold) happened: the next present() copies; atomic exchange */
++	struct sfq    fQ;             /* patch 0368: swap queue accounting; fLock */
++	uint8_t       fHold[SWEET_FB_SWAP_REC_SIZE];   /* patch 0368: the 2nd swap, held for the next tick (sweetfb_fifo >= 1); fLock */
++	uint64_t      fHoldSeq;       /* patch 0368: as fSwapSeq, for fHold; fLock */
++	SweetSurface *fPendSurf[SWEET_FB_LAYERS];      /* patch 0368: references on the surfaces of fPending while it waits (sweetfb_fifo >= 1 only); fLock */
++	SweetSurface *fHoldSurf[SWEET_FB_LAYERS];      /* patch 0368: same for fHold; fLock */
++	SweetSurface *fPresentSurf[SWEET_FB_LAYERS];   /* patch 0368: references on the surfaces of the record present() is copying; only the vsync workloop touches them */
++	IOTimerEventSource *fKick;    /* patch 0368: one-shot "the GPU completed the deferred swap" event on the vsync workloop (sweetfb_gatekick=1) */
++	uint64_t      fRowT0;         /* patch 0368: ns of the last SWEET FB presents row; fLock */
++	uint64_t      fJobSeqPrev;    /* patch 0368: Mali submitted seqno at the previous swap; fLock */
++	bool          fJobSeqOk;      /* patch 0368: fJobSeqPrev is valid (a previous swap saw the Mali seqno); fLock */
++	bool          fDeferred;      /* patch 0368: the gate deferred the head and a kick may copy it; set by the tick, cleared by takeQueue; fLock */
+ 	struct sweet_fb_last fLast;   /* patch 0361: what the last panel copy saw; only present() (the vsync thread) touches it */
+@@ -225,2 +343,6 @@
+ 	void present(const uint8_t *rec);
++	void takeHead(uint64_t count, uint8_t *rec, SweetSurface **surf, bool by_kick);   /* patch 0368: fLock held */
++	void takeQueue(SweetSurface **surf, bool by_kick);   /* patch 0368: fLock held */
++	void promoteHold(SweetSurface **old_surf);   /* patch 0368: fLock held */
++	SweetSurface *surfFor(uint32_t id);   /* patch 0368 */
+ 	int panelReadback(void *req);   /* patch 0276 */
+@@ -252,2 +374,21 @@
+ /*
++ * Patch 0368 globals. gSweetFbFifo = boot-arg sweetfb_fifo (0 off, 1..255), gSweetFbKick = sweetfb_gatekick=1, gSweetFbRow = the per-second row is on (sweetfb_copytime=1,
++ * sweetfb_drawn=1, or a lever on); read once in start(). Surface lifetime: the record fPending holds only surface IDs; with sweetfb_fifo >= 1 swap() takes a reference
++ * (sweet_surface_copy: retain under the table lock) on every surface of a queued record and present() uses those references, so a surface that CoreAnimation destroyed
++ * while its swap waited (the table entry is dropped on the last user) is still mapped and valid until the copy is done. A reference keeps the MEMORY alive; it does not stop
++ * CoreAnimation from drawing into a reused buffer while the swap waits (SwapWait returns at once and no completion is sent, today's rule): a held swap can show newer pixels.
++ */
++static int gSweetFbFifo, gSweetFbKick, gSweetFbRow;
++static IOTimerEventSource *gSweetFbKickTimer;
++static uint32_t sweet_fb_kick_unavail;   /* fLock: arm refused (Mali not up / dead / no hook): the next tick copies as before */
++static void
++sweet_fb_kick_cb(void)   /* patch 0368: called by sm_thread after seq_done passed the armed seqno; no lock held, no sleep */
++{
++	IOTimerEventSource *t = gSweetFbKickTimer;
++	if (t != NULL) {
++		t->setTimeoutUS(0);
++	}
++}
++
++/*
+  * configd's InterfaceNamer (the "network stack" part of SCNetworkInterfaceCopyAll, which Settings -> About calls on the main
+@@ -408,2 +549,60 @@
+ 	}
++	{   /* patch 0368 */
++		int fv = 0, kv = 0, dv = 0, cv = 0;
++		memset(&fQ, 0, sizeof(fQ));
++		memset(fPendSurf, 0, sizeof(fPendSurf));
++		memset(fHoldSurf, 0, sizeof(fHoldSurf));
++		memset(fPresentSurf, 0, sizeof(fPresentSurf));
++		fHoldSeq = 0;
++		fKick = NULL;
++		fRowT0 = 0;
++		fJobSeqPrev = 0;
++		fJobSeqOk = false;
++		fDeferred = false;
++		if (PE_parse_boot_argn("sweetfb_fifo", &fv, sizeof(fv)) && fv != 0) {
++			if (fv >= 1 && fv <= (int)SFQ_UNCAPPED) {
++				gSweetFbFifo = fv;
++				IOLog("SWEET FB: swap fifo ON (sweetfb_fifo=%d, patch 0368): a 2nd swap before the tick waits for the next tick, %s\n", fv,
++				    fv == (int)SFQ_UNCAPPED ? "uncapped" : "capped at that many standing ticks");
++			} else {
++				IOLog("SWEET FB: GAP sweetfb_fifo=%d is not 0..255: swap fifo OFF (latest wins)\n", fv);
++			}
++		}
++		fQ.fifo = (uint32_t)gSweetFbFifo;
++		if (PE_parse_boot_argn("sweetfb_gatekick", &kv, sizeof(kv)) && kv != 0) {
++			if (kv != 1) {
++				IOLog("SWEET FB: GAP sweetfb_gatekick=%d is not 0 or 1: gate kick OFF\n", kv);
++			} else if (!gSweetFbGate) {
++				IOLog("SWEET FB: GAP sweetfb_gatekick=1 needs sweetfb_gate=1 (nothing is deferred without the gate): gate kick OFF\n");
++			} else if (fFlushTicks != 1) {
++				IOLog("SWEET FB: GAP sweetfb_gatekick=1 needs sweetfb_hz >= 60 (one copy per tick); fFlushTicks=%u: gate kick OFF\n", fFlushTicks);
++			} else {
++				fKick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::kickFired);
++				if (fKick == NULL || fWorkLoop->addEventSource(fKick) != kIOReturnSuccess) {
++					IOLog("SWEET FB: GAP sweetfb_gatekick=1: no kick event source: gate kick OFF\n");
++					OSSafeReleaseNULL(fKick);
++				} else {
++					gSweetFbKickTimer = fKick;
++					if (sweet_mali_kick_register(sweet_fb_kick_cb) != 0) {
++						IOLog("SWEET FB: GAP sweetfb_gatekick=1: Mali kick hook refused: gate kick OFF\n");
++						gSweetFbKickTimer = NULL;
++						fWorkLoop->removeEventSource(fKick);
++						OSSafeReleaseNULL(fKick);
++					} else {
++						gSweetFbKick = 1;
++						IOLog("SWEET FB: gate kick ON (sweetfb_gatekick=1, patch 0368): a swap the gate deferred is copied when its GPU jobs complete, once per tick interval\n");
++					}
++				}
++			}
++		}
++		(void)PE_parse_boot_argn("sweetfb_drawn", &dv, sizeof(dv));
++		(void)PE_parse_boot_argn("sweetfb_copytime", &cv, sizeof(cv));
++		gSweetFbRow = (dv != 0 || cv != 0 || gSweetFbFifo != 0 || gSweetFbKick != 0) ? 1 : 0;
++		if (dv != 0 && dv != 1) {
++			IOLog("SWEET FB: GAP sweetfb_drawn=%d is not 0 or 1: treated as 1\n", dv);
++		}
++		if (gSweetFbRow) {
++			IOLog("SWEET FB: presents row ON (patch 0368): `SWEET FB: presents P drawn D held H replaced R gatekick K fifo_full F` once per second while swaps flow\n");
++		}
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -576,2 +775,12 @@
+ 	}
++	SweetSurface *tsurf[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};   /* patch 0368: references on the surfaces of the record shown now */
++	SweetSurface *rsurf[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};   /* patch 0368: references of a dropped head, released after the unlock */
++	uint64_t kick_seq = 0;   /* patch 0368: the gate deferred this tick: ask Mali to kick the fb workloop when this seqno completes */
++	if (gSweetFbFifo != 0 && fb->fQ.hold_valid && fb->fQ.standing >= fb->fQ.fifo && fb->fQ.fifo != SFQ_UNCAPPED) {   /* patch 0368: capped queue, see sfq_catchup */
++		uint64_t hq = 0, hd = 0;
++		bool hold_ready = !gSweetFbGate || fb->fHoldSeq == 0 || sweet_mali_seq_peek(&hq, &hd) != 0 || hd >= fb->fHoldSeq;
++		if (sfq_catchup(&fb->fQ, hold_ready)) {
++			fb->promoteHold(rsurf);
++		}
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -591,2 +800,6 @@
+ 					flush = false;
++					if (gSweetFbKick) {
++						kick_seq = fb->fSwapSeq;
++						fb->fDeferred = true;
++					}
+ 				} else {
+@@ -613,3 +826,22 @@
+ 				sweet_fb_gate_shown++;
+ 			}
++			if (gSweetFbRow) {
++				fb->takeQueue(tsurf, false);   /* patch 0368 */
++			}
++		}
++	}
++	bool row_log = false;   /* patch 0368: the per-second presents row */
++	struct sfq_row row = {};
++	uint32_t row_unavail = 0;
++	if (gSweetFbRow) {
++		uint64_t rn;
++		absolutetime_to_nanoseconds(now, &rn);
++		if (fb->fRowT0 == 0) {
++			fb->fRowT0 = rn;
++		} else if (rn - fb->fRowT0 >= 1000000000ull) {
++			sfq_row_take(&fb->fQ, &row);
++			row_unavail = sweet_fb_kick_unavail;
++			sweet_fb_kick_unavail = 0;
++			row_log = sfq_row_nonzero(&row) || row_unavail != 0;
++			fb->fRowT0 = rn;
+ 		}
+@@ -634,3 +867,13 @@
+ 	}
++	if (row_log) {
++		IOLog("SWEET FB: presents %u drawn %u held %u replaced %u gatekick %u fifo_full %u\n", row.presents, row.drawn, row.held, row.replaced, row.kicks, row.fifo_full);
++		if (gSweetFbFifo != 0) {
++			IOLog("SWEET FB: fifo cap %d catchup %u standing %u\n", gSweetFbFifo, row.catchup, row.standing);
++		}
++		if (gSweetFbKick) {
++			IOLog("SWEET FB: gatekick armed %u fired %u stale %u notdone %u unavail %u\n", row.k_armed, row.kicks, row.k_stale, row.k_notdone, row_unavail);
++		}
++	}
+ 	if (rec != NULL) {
++		memcpy(fb->fPresentSurf, tsurf, sizeof(tsurf));   /* patch 0368: present() looks up the held references first */
+ 		sweet_panel_lock();   /* patch 0276: a panel readback never sees half a copy */
+@@ -638,4 +881,29 @@
+ 		sweet_panel_unlock();
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			fb->fPresentSurf[i] = NULL;
++			OSSafeReleaseNULL(tsurf[i]);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		OSSafeReleaseNULL(rsurf[i]);
++	}
++	if (kick_seq != 0) {   /* patch 0368 */
++		int ka = sweet_mali_kick_arm(kick_seq);
++		IOLockLock(fb->fLock);
++		if (ka < 0) {
++			sweet_fb_kick_unavail++;
++		} else {
++			fb->fQ.r.k_armed++;
++		}
++		IOLockUnlock(fb->fLock);
++		if (ka < 0) {
++			static uint32_t kick_gap;
++			if (++kick_gap <= 5) {
++				IOLog("SWEET FB: GAP gatekick: Mali refused the arm for seq %llu (not up / dead / no hook): the next tick copies (%u)\n", kick_seq, kick_gap);
++			}
++		} else if (ka == 1) {
++			fb->fKick->setTimeoutUS(0);   /* already complete at arm time: no completion will come, fire the kick ourselves */
++		}
++	}
+ 	if (again) {
+@@ -648,2 +916,122 @@
+ /*
++ * Patch 0368: copy the head out to be shown (fLock held; the tick and the kick share it). The first five statements are the old inline block of vsyncFired. With the
++ * queue on, the references on the head's surfaces move to the caller (surf), the HOLD becomes the head when there is one, and the presents/drawn counters advance.
++ */
++void
++AppleCLCD::takeHead(uint64_t count, uint8_t *rec, SweetSurface **surf, bool by_kick)
++{
++	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = false;
++	fGateTicks = 0;
++	fLastPresentCount = count;
++	if (gSweetFbGate) {
++		sweet_fb_gate_shown++;
++	}
++	takeQueue(surf, by_kick);
++}
++
++/* patch 0368 (fLock held, right after the record of the head was copied out and fDirty cleared): hand the head's surface references to the caller, count the present,
++ * and let the HOLD become the head. The tick runs the old inline copy lines itself (patch 0366 adds lines to them) and calls this one. */
++void
++AppleCLCD::takeQueue(SweetSurface **surf, bool by_kick)
++{
++	fDeferred = false;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		surf[i] = fPendSurf[i];
++		fPendSurf[i] = NULL;
++	}
++	if (sfq_take(&fQ, by_kick)) {
++		SweetSurface *none[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};
++		promoteHold(none);
++	}
++}
++
++/* patch 0368 (fLock held): the HOLD becomes the head; the head's own references (if still there) go to old_surf for the caller to release after the unlock */
++void
++AppleCLCD::promoteHold(SweetSurface **old_surf)
++{
++	memcpy(fPending, fHold, SWEET_FB_SWAP_REC_SIZE);
++	fSwapSeq = fHoldSeq;
++	fHoldSeq = 0;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		old_surf[i] = fPendSurf[i];
++		fPendSurf[i] = fHoldSurf[i];
++		fHoldSurf[i] = NULL;
++	}
++	fDirty = true;
++	fGateTicks = 0;
++}
++
++/* patch 0368: the surface present() copies from: the reference swap() took when the record was queued, else the table (today's lookup) */
++SweetSurface *
++AppleCLCD::surfFor(uint32_t id)
++{
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		SweetSurface *h = fPresentSurf[i];
++		if (h != NULL && h->id == id) {
++			h->retain();
++			return h;
++		}
++	}
++	return sweet_surface_copy(id);
++}
++
++/*
++ * Patch 0368, boot-arg sweetfb_gatekick=1: the Mali completion thread (sm_thread, bsd/dev/sweet_mali.c) fires this one-shot timer when seq_done passes the seqno the gate
++ * deferred at a tick, instead of waiting for the next tick. Runs on the fb workloop, so it never overlaps vsyncFired. It copies only if nothing was copied since the last tick
++ * (fLastPresentCount < the tick count: one copy per tick interval, so the presents counter keeps its meaning), the tick deferred the head (fDeferred) and the GPU really completed its seqno
++ * (a stale kick for a head that has been replaced or already copied is counted stale, one whose seqno is not yet complete re-arms for the new seqno, counted notdone). Fail open: no kick ever means the next tick copies as before.
++ */
++void
++AppleCLCD::kickFired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	SweetSurface *tsurf[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};
++	uint8_t *rec = NULL;
++	uint64_t rearm = 0;
++	IOLockLock(fb->fLock);
++	uint64_t count = fb->fVsyncCount;
++	if (fb->fDirty && fb->fDeferred && !fb->fPowerOff && !sweet_qr_hold && fb->fLastPresentCount < count) {
++		uint64_t sq = 0, dn = 0;
++		bool done = fb->fSwapSeq == 0 || sweet_mali_seq_peek(&sq, &dn) != 0 || dn >= fb->fSwapSeq;
++		if (!done) {
++			rearm = fb->fSwapSeq;
++			fb->fQ.r.k_notdone++;
++		} else {
++			rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++			if (rec != NULL) {
++				fb->takeHead(count, rec, tsurf, true);
++			} else {
++				fb->fQ.r.k_stale++;
++				IOLog("SWEET FB: GAP gatekick: no memory for the record, the next tick copies\n");
++			}
++		}
++	} else {
++		fb->fQ.r.k_stale++;   /* a tick already copied this interval, or nothing is waiting */
++	}
++	IOLockUnlock(fb->fLock);
++	if (rec != NULL) {
++		memcpy(fb->fPresentSurf, tsurf, sizeof(tsurf));
++		sweet_panel_lock();
++		fb->present(rec);
++		sweet_panel_unlock();
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			fb->fPresentSurf[i] = NULL;
++			OSSafeReleaseNULL(tsurf[i]);
++		}
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	}
++	if (rearm != 0) {
++		int ka = sweet_mali_kick_arm(rearm);
++		if (ka == 1) {
++			fb->fKick->setTimeoutUS(0);
++		} else if (ka < 0) {
++			IOLockLock(fb->fLock);
++			sweet_fb_kick_unavail++;
++			IOLockUnlock(fb->fLock);
++		}
++	}
++}
++
++/*
+  * Patch 0190 (X-G7): the timer re-arms only while something needs it: a registered client (vsync
+@@ -983,6 +1371,44 @@
+ 	sweet_fb_last_surface = get32(rec, 0x54);   /* patch 0269: the surface the nav probe reads (layer 0 of the last swap) */
++	/* patch 0368: references on the surfaces of the record (sweetfb_fifo only) and the Mali seqno for the jobs-since-previous-swap count, taken before the lock */
++	SweetSurface *nsurf[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};
++	SweetSurface *osurf[SWEET_FB_LAYERS] = {NULL, NULL, NULL, NULL};
++	uint64_t qsq = 0, qdn = 0;
++	bool qok = false;
++	if (gSweetFbFifo != 0) {
++		uint32_t qmask = get32(rec, 0x104);
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			uint32_t qid = get32(rec, 0x54 + 4 * i);
++			nsurf[i] = ((qmask & (1u << i)) && qid != 0) ? sweet_surface_copy(qid) : NULL;
++		}
++	}
++	if (gSweetFbRow) {
++		qok = (sweet_mali_seq_peek(&qsq, &qdn) == 0);
++	}
+ 	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
+-	if (gSweetFbGate) {   /* patch 0343: the GPU work this frame needs = everything submitted so far (in-order queue); 0 = no gate for this swap */
++	int qact = SFQ_A_HEAD;
++	if (gSweetFbRow) {
++		uint32_t qjobs = (qok && fJobSeqOk && qsq >= fJobSeqPrev) ? (uint32_t)(qsq - fJobSeqPrev) : SFQ_JOBS_UNK;
++		fJobSeqPrev = qok ? qsq : 0;
++		fJobSeqOk = qok;
++		qact = sfq_arrive(&fQ, qjobs);
++	}
++	bool qhold = (qact == SFQ_A_HOLD || qact == SFQ_A_REPL_HOLD);
++	if (qhold) {   /* patch 0368: the head stays, this swap waits in the HOLD slot for the next tick */
++		memcpy(fHold, rec, SWEET_FB_SWAP_REC_SIZE);
++		fHoldSeq = (qok && gSweetFbGate) ? qsq : 0;
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			osurf[i] = fHoldSurf[i];
++			fHoldSurf[i] = nsurf[i];
++		}
++	} else if (gSweetFbFifo != 0) {
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			osurf[i] = fPendSurf[i];
++			fPendSurf[i] = nsurf[i];
++		}
++	}
++	if (!qhold) {
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = true;
++	}
++	if (gSweetFbGate && !qhold) {   /* patch 0343: the GPU work this frame needs = everything submitted so far (in-order queue); 0 = no gate for this swap */
+ 		uint64_t gsq = 0, gdn = 0;
+@@ -991,2 +1417,5 @@
+ 	IOLockUnlock(fLock);
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {   /* patch 0368: a replaced entry's references */
++		OSSafeReleaseNULL(osurf[i]);
++	}
+ 	sweet_fb_last_swap_abs = mach_absolute_time();   /* patch 0260 */
+@@ -1283,3 +1712,3 @@
+ 			if ((mask & (1u << layer)) && lid != 0) {
+-				SweetSurface *ls = sweet_surface_copy(lid);
++				SweetSurface *ls = surfFor(lid);   /* patch 0368: was sweet_surface_copy */
+ 				sk_seed[layer] = ls != NULL ? sweet_surface_seed_peek(ls) : 0xffffffffu;
+@@ -1333,3 +1762,3 @@
+ 		}
+-		SweetSurface *s = sweet_surface_copy(id);
++		SweetSurface *s = surfFor(id);   /* patch 0368: was sweet_surface_copy */
+ 		if (sweet_fb_swaps_logged < 16) {

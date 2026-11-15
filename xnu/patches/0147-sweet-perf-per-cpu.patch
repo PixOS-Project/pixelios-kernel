@@ -1,0 +1,48 @@
+SWEET per-CPU busy in the perf line (patch 0147, under sweetperf=1, read-only): appends `cpus c0..c7` (busy % of each CPU over the last second from processor_cpu_load_info, 10 ms tick resolution) to the SWEET PERF line of patch 0145, to tell a single-thread-bound render path (one core near 100%) from a saturated or idle machine (G-10).
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -229,6 +229,9 @@
+  */
+ extern host_t host_self(void);
+ extern kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);   /* osfmk/kern/host.c, as used by bsd/kern/kern_memorystatus.c */
++extern processor_t cpu_to_processor(int cpu);                         /* osfmk/kern/processor.h:692 */
++extern void processor_cpu_load_info(processor_t, natural_t *ticks);   /* osfmk/kern/processor.h:514: ADDS the processor's user/system/idle ticks to ticks[] (zero it first) */
++extern unsigned int ml_get_cpu_count(void);
+ static uint64_t perf_jobs, perf_busy_us, perf_max_us, perf_subwait_us, perf_start_us;
+ static int perf_on = -1;
+ 
+@@ -339,8 +342,33 @@
+ 		last_total = total;
+ 	}
+ 	last_us = now;
++	/* per-CPU busy % (patch 0147): which cores run hot (a single-thread-bound render path shows ONE core near 100 while the total stays low) */
++	int cpct[16];
++	{
++		static uint64_t last_c_idle[16], last_c_total[16];
++		unsigned nc = ml_get_cpu_count();
++		if (nc > 16) {
++			nc = 16;
++		}
++		for (unsigned c = 0; c < nc; c++) {
++			natural_t tk[CPU_STATE_MAX] = { 0 };
++			cpct[c] = -1;
++			processor_t pr = cpu_to_processor((int)c);
++			if (pr == PROCESSOR_NULL) {
++				continue;
++			}
++			processor_cpu_load_info(pr, tk);
++			uint64_t idle = tk[CPU_STATE_IDLE], total = (uint64_t)tk[CPU_STATE_USER] + tk[CPU_STATE_SYSTEM] + tk[CPU_STATE_IDLE];
++			if (last_c_total[c] != 0 && total > last_c_total[c]) {
++				cpct[c] = (int)(100 - (100 * (idle - last_c_idle[c])) / (total - last_c_total[c]));
++			}
++			last_c_idle[c] = idle;
++			last_c_total[c] = total;
++		}
++	}
+ 	if (jobs > 0 || (++quiet % 10) == 0) {
+-		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d\n", jobs, busy / 1000, mx, sw / 1000, pct);
++		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d cpus %d %d %d %d %d %d %d %d\n", jobs, busy / 1000, mx, sw / 1000, pct,
++		    cpct[0], cpct[1], cpct[2], cpct[3], cpct[4], cpct[5], cpct[6], cpct[7]);
+ 	}
+ }
+ 

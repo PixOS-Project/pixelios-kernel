@@ -1,0 +1,460 @@
+SWEET WDT early arm (patch 0333, ALL-ON T-53, rule 8: no NEW register; incident resident-201401-b1): a second arming + petting caller for the SoC watchdog (patch 0278) that needs no USB, and a panic stop. Before this patch the watchdog was armed ONLY from the top of the USB-log drain loop (SPEC-WDT SQ5 "the only arming caller"), so a boot whose USB gadget never started, or that panicked first, had NO watchdog: the panic reset path faulted again (register dump printed twice, then nothing) and the phone hung until the user pressed Power+VolDown. Now sweet_wdt_setup (called by sweet_restart_start in thread context, after the read-only SQ2 setup) starts a thread_call (osfmk/kern/thread_call.h xnu-8796.141.3: thread_call_allocate_with_priority(THREAD_CALL_PRIORITY_KERNEL_HIGH), thread_call_enter for the first tick, thread_call_enter_delayed from its own callback) that runs the unchanged wdt_poll(may_arm=1) every min(5 s, period/6) (>= 1 s): the first tick arms (wdt_arm_now, same WTDAT/WTCNT/WTCON writes in the same order, same SYSIP_DAT0 = 0xFC SMC), later ticks pet through the same pet-slot CAS. The USB-log drain loop and sweet_restart_poll stay extra callers. No lock, no allocation in the poll; the callback only re-enters the thread_call. One new line at the first arm: "SWEET WDT: arm/pet source = timer (no USB needed)" (or "... = USB-log drain loop (the timer had not armed yet)" when the drain loop wins), and a "WDT GAP: timer pet source has not run N ms after its start" from the drain loop if the timer never fires (rule 7). The parse line no longer says "arm waits for the first USB-log poll" (it was untrue after this patch). Panic: sweet_wdt_panic_note() (one atomic store) at the top of panic_trap_to_debugger stops every pet, every arm and the timer; other CPUs are halted by the SIGPdebug IPI (osfmk/arm/model_dep.c DebuggerXCallEnter) but a CPU that does not acknowledge (debugger_sync != 0) or an immediate-halt panic leaves them running, so the flag is the explicit stop; the watchdog then bites one period after the last pet (the last pet is at most one timer interval before the panic) when the 3 s panic reset faults. The panic hold prints sweet_wdt_panic_text() (a constant string: armed / NOT armed / off) next to "SWEET PANIC HOLD". GAP, stated and not fixed: a panic BEFORE sweet_restart_start (SweetPlatformExpert::start) has no watchdog; arming earlier needs a shim register write, a separate reviewed patch. The panic hold (sweetpanichold, default 20 s, tools/xrun refuses period <= stall + 2 + hold + 10) must stay below the period because pets stop at the panic. Test hook: sweetwdtabort=<s> (1..600, test only, WDT GAP line at start, refused unless the watchdog is armed) panics from the timer s seconds after it started: with USB off (sweetusb=0 or 1, the gadget never starts, 0195 sweetpanic refuses without the USB log thread), sweetwdt=60,stop=600 (the stop= form exempts the xrun period guard) and sweetpanichold=120 the reset must come within about 60 s of the panic instead of after the 120 s hold. FAILED PARK (user 2026-11-12 'No boot should ever need me'): sweet_wdt_stop_pets() (one atomic store, no lock/print/register; sweet_wdt_panic_note() calls it) is also the FIRST statement of sweet_machine_reset (bsd/dev/sweet_restart.c, patches 0083/0140/0182/0279/0309; every software reset: reboot(2) types 1, panic types 4/9, sweetrestart, sweetremote), before the bootloader-mode write and the PMU SWRESET SMC: if the SMC is refused, returns, or the CPU spins in the wfe loop, the other CPUs keep running but no pet source (timer, USB-log drain loop, sweet_restart_poll) pets again (nothing ever stores 0 to the flag) and the SoC watchdog bites within one period after the last pet (sweetwdt=60 -> <= 60 s + last pet interval). Test hook sweetwdtparkfail=<s> (1..600, test only, refused with a GAP unless the watchdog is armed, ignored with a GAP when sweetwdtabort is set too): s seconds after the timer started the timer calls sweet_restart_test_park_fail() = sweet_machine_reset(bootloader) with ONLY the SWRESET SMC skipped (a simulated refusal; no new write), logs 'SWEET WDT TEST: park SMC skipped, pets stopped, watchdog must reset within N s' and spins in the thread_call worker: pass = reset into the bootloader about one period after that line. Host test tools/wdt_host_test.c (compiles the patched sweet_machine_reset_x too) + tools/test_wdt_build.py + tools/test_0333_wdt_early.py. Not run on hardware.
+--- a/bsd/dev/sweet_wdt.c
++++ b/bsd/dev/sweet_wdt.c
+@@ -9,6 +9,22 @@
+  * Writes: WTCON, WTDAT, WTCNT of the cluster-0 block, and ONE SMC write (SYSIP_DAT0 = 0xFC) through sweet_restart.c. Everything
+  * else is a read. No PMU gate write (D3), cluster 1 untouched (D5), no UFS/flash write, no dedicated sleeping thread (D2).
+  * The logic is portable C so tools/wdt_host_test.c compiles this very file on the host (SWEET_WDT_HOST) with a fake register file.
++ *
++ * Patch 0333 (ALL-ON T-53; incident resident-201401-b1): a SECOND arming/petting caller that needs no USB. A thread_call (osfmk/kern/thread_call.h:
++ * thread_call_allocate_with_priority + thread_call_enter / thread_call_enter_delayed) is started from sweet_wdt_setup (thread context, called by
++ * sweet_restart_start) and calls the same sweet_wdt_poll(may_arm = 1) path every min(5 s, period/6) (>= WDT_PET_MS); it re-arms itself from its own
++ * callback. Before 0333 only the USB-log drain loop armed, so a boot whose USB gadget never started (or that panicked first) had NO watchdog and a
++ * failed panic reset hung forever. No new register, no new value, no new write site: the arm (wdt_arm_now) and the pet-slot CAS are unchanged.
++ * Panic: sweet_wdt_panic_note() (called at the top of panic_trap_to_debugger) stops every pet and the timer, so the watchdog bites one period
++ * after the last pet if the 3 s panic reset itself faults; sweet_wdt_panic_text() says on the panic screen whether it was armed.
++ * GAP (stated, not fixed): a panic BEFORE sweet_restart_start (platform expert start) has no watchdog; the shim could arm earlier, but that is a
++ * new shim register write and needs its own reviewed patch. The hold (sweetpanichold) must stay below the period: pets stop at the panic.
++ * Test hook: sweetwdtabort=<s> (1..600, test only) panics from the timer s seconds after it started, only when the WDT is armed.
++ * Failed park (patch 0333, same patch): sweet_wdt_stop_pets() is the one atomic store that stops every pet, arm and timer tick; the panic path calls it through
++ * sweet_wdt_panic_note(), and sweet_machine_reset (bsd/dev/sweet_restart.c, every software reset: reboot(2), panic types 4/9, sweetrestart, sweetremote) calls it
++ * BEFORE its first reset write, so if the PMU SWRESET SMC is refused or returns, the watchdog bites one period after the last pet. Nothing ever stores 0 again.
++ * Test hook: sweetwdtparkfail=<s> (1..600, test only, only when the WDT is armed) runs the park path s seconds after the timer started with the SWRESET SMC SKIPPED
++ * (a simulated refusal; it only skips a write, writes nothing new) and spins: the watchdog must reset the phone within one period.
+  */
+ #include <stdint.h>
+ static uint32_t wdt_off_mask, wdt_off_cnt, wdt_off_rst, wdt_off_sysip;   /* PMU offsets from the ADT /sweet-wdt and /sweet-reset (set by wdt_map) */
+@@ -24,6 +40,8 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <kern/debug.h>
++#include <kern/thread_call.h>
+ #include <stdint.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+@@ -77,6 +95,54 @@
+ 
+ #define wdt_log(...)    printf(__VA_ARGS__)
+ 
++/* literal name in the call (tools/run-preflight --gen-bootargs): the test-only panic of patch 0333 */
++#define wdt_boot_arg_sweetwdtabort(v) PE_parse_boot_argn("sweetwdtabort", (v), sizeof(*(v)))
++#define wdt_boot_arg_sweetwdtparkfail(v) PE_parse_boot_argn("sweetwdtparkfail", (v), sizeof(*(v)))
++extern void sweet_restart_test_park_fail(void) __attribute__((noreturn));   /* bsd/dev/sweet_restart.c (patch 0333): sweet_machine_reset(bootloader) minus the SWRESET SMC */
++
++/* ---- patch 0333: the timer vehicle. thread_call: osfmk/kern/thread_call.h (xnu-8796.141.3); thread_call_initialize runs at STARTUP_SUB_THREAD_CALL, long before IOKit matching ---- */
++static thread_call_t wdt_tcall;
++static void wdt_timer_fire(void);
++
++static void
++wdt_tcall_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	wdt_timer_fire();
++}
++
++static int
++wdt_timer_init(void)
++{
++	wdt_tcall = thread_call_allocate_with_priority(wdt_tcall_fire, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH);       /* HIGH-ish: a starved pet would reset a healthy phone */
++	return wdt_tcall == NULL ? -1 : 0;
++}
++
++/* ms == 0: run as soon as a worker is free; else after ms. Re-armed from the callback itself (the header allows that; sweet_wdt_poll is safe against two invocations). */
++static void
++wdt_timer_in(unsigned ms)
++{
++	uint64_t deadline;
++
++	if (ms == 0) {
++		(void)thread_call_enter(wdt_tcall);
++		return;
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)thread_call_enter_delayed(wdt_tcall, deadline);
++}
++
++static void
++wdt_test_panic_now(unsigned s)
++{
++	panic("SWEET WDT TEST: sweetwdtabort=%u elapsed (test only; the SoC watchdog must reset the phone, pets are stopped)", s);
++}
++
++static void
++wdt_test_park_fail_now(void)
++{
++	sweet_restart_test_park_fail();
++}
++
+ static uint32_t
+ wdt_rd(uint32_t off)
+ {
+@@ -257,6 +323,21 @@
+ static uint64_t wdt_arm_ms, wdt_last_poll_ms, wdt_last_pet_ms, wdt_last_report_ms, wdt_stop_at_ms;
+ static uint32_t wdt_pets, wdt_max_gap_ms;
+ 
++/* patch 0333: timer vehicle + panic stop. Sources of a sweet_wdt_poll call (for the arm line and the silent-timer GAP only; the arm/pet logic is the same). */
++enum { WDT_SRC_POLL = 0, WDT_SRC_TIMER = 1 };
++#define WDT_TIMER_MAX_MS 5000u          /* pet interval of the timer; period/6 below 30 s so it stays under the period/3 gap threshold */
++#define WDT_TEST_PANIC_MAX 600u
++static uint32_t wdt_timer_ms;           /* interval, 0 = no timer (started only when setup passed) */
++static uint64_t wdt_timer_start_ms;
++static int wdt_timer_started, wdt_timer_fired, wdt_timer_gap_said;
++static int wdt_panicked;                /* set (release) by sweet_wdt_stop_pets (panic path, sweet_machine_reset, park-fail hook), never cleared: no pet, no arm, no timer after it */
++static uint64_t wdt_test_panic_at_ms;   /* sweetwdtabort: absolute ms of the test panic, 0 = off */
++static unsigned wdt_test_panic_s;
++static uint64_t wdt_test_park_at_ms;    /* sweetwdtparkfail: absolute ms of the failed-park test, 0 = off */
++static unsigned wdt_test_park_s;
++static void wdt_timer_start(void);
++void sweet_wdt_stop_pets(void);
++
+ #define ALOAD(p)        __atomic_load_n((p), __ATOMIC_ACQUIRE)
+ #define ASTORE(p, v)    __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+ #define ACAS(p, old, v) ({ __typeof__(*(p)) _o = (old); __atomic_compare_exchange_n((p), &_o, (v), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); })
+@@ -291,7 +372,7 @@
+ 	wdt_stop = stp;
+ 	wdt_threshold_ms = per * 1000u / 3u;
+ 	wdt_parse_ms = wdt_now_ms();
+-	wdt_log("SWEET WDT: sweetwdt=%u stop=%u parsed, arm waits for the first USB-log poll\n", per, stp);
++	wdt_log("SWEET WDT: sweetwdt=%u stop=%u parsed, arm follows the first poll of the timer (no USB needed) or of the USB-log drain loop\n", per, stp);
+ 	ASTORE(&wdt_mode, WDT_PARSED);
+ }
+ 
+@@ -339,6 +420,7 @@
+ 	}
+ 	wdt_log("SWEET WDT: cluster 1 left stopped by the shim (D5)\n");
+ 	ASTORE(&wdt_mode, WDT_READY);
++	wdt_timer_start();                                                  /* patch 0333: the USB-independent vehicle; setup stays write-free (the first tick arms) */
+ }
+ 
+ /* [spec SQ3, SQ4, SQ6] runs once from the first drain-thread poll. Returns with wdt_armed published iff the WDT runs and SYSIP_DAT0 is verified or a stop failed. */
+@@ -393,11 +475,12 @@
+ }
+ 
+ /*
+- * [spec SQ5] called from sweet_restart_poll (may_arm = 0) and from the top of the USB-log drain loop (may_arm = 1, the only arming caller).
+- * Takes no lock of its own, allocates nothing; prints are state changes + one line per 60 s (never one per poll).
++ * [spec SQ5] called from sweet_restart_poll (may_arm = 0), from the top of the USB-log drain loop (may_arm = 1) and, since patch 0333, from the
++ * timer (may_arm = 1, src = WDT_SRC_TIMER; needs no USB). Takes no lock of its own, allocates nothing; prints are state changes + one line per
++ * 60 s (never one per poll).
+  */
+-void
+-sweet_wdt_poll(int may_arm)
++static void
++wdt_poll(int may_arm, int src)
+ {
+ 	uint64_t now, prev, lastpet;
+ 	uint32_t gap, mx;
+@@ -405,8 +488,16 @@
+ 	if (ALOAD(&wdt_mode) != WDT_READY) {
+ 		return;                                                         /* default-off fast path: one load, no register */
+ 	}
++	if (ALOAD(&wdt_panicked)) {
++		return;                                                         /* patch 0333: a panic stops every pet (and the arm): the watchdog is the backstop of the panic reset */
++	}
+ 	now = wdt_now_ms();
+ 	prev = __atomic_exchange_n(&wdt_last_poll_ms, now, __ATOMIC_ACQ_REL);
++	if (src == WDT_SRC_POLL && ALOAD(&wdt_timer_started) && !ALOAD(&wdt_timer_fired) && now - wdt_timer_start_ms > 3u * wdt_timer_ms + 1000u &&
++	    ACAS(&wdt_timer_gap_said, 0, 1)) {
++		wdt_log("WDT GAP: timer pet source has not run %u ms after its start (interval %u ms): the watchdog depends on the USB-log drain loop again\n",
++		    (unsigned)(now - wdt_timer_start_ms), wdt_timer_ms);
++	}
+ 	if (!ALOAD(&wdt_armed)) {
+ 		if (!may_arm) {
+ 			return;
+@@ -415,6 +506,11 @@
+ 			wdt_log("SWEET WDT: first poll at +%u ms after parse\n", (unsigned)(now - wdt_parse_ms));
+ 		}
+ 		if (ACAS(&wdt_arm_started, 0, 1)) {
++			if (src == WDT_SRC_TIMER) {
++				wdt_log("SWEET WDT: arm/pet source = timer (no USB needed)\n");
++			} else {
++				wdt_log("SWEET WDT: arm/pet source = USB-log drain loop (the timer had not armed yet)\n");
++			}
+ 			wdt_arm_now(now);
+ 		}
+ 		return;                                                         /* the first pet follows on the next poll */
+@@ -466,3 +562,145 @@
+ 	}
+ }
+ 
++
++/* [spec SQ5] the callers of 0278 (sweet_restart_poll may_arm = 0, USB-log drain loop may_arm = 1): unchanged entry point */
++void
++sweet_wdt_poll(int may_arm)
++{
++	wdt_poll(may_arm, WDT_SRC_POLL);
++}
++
++/* ---- patch 0333: timer vehicle (portable; the thread_call itself is wdt_timer_init/wdt_timer_in above, a stub in the host test) ---- */
++
++/*
++ * One tick of the timer, in thread context: arm (first tick) or pet through the same wdt_poll as every other caller, run the test panic when due,
++ * then re-arm itself. No lock, no allocation, no register of its own. Returns without re-arming once a panic was noted or the WDT mode left READY.
++ */
++static void
++wdt_timer_fire(void)
++{
++	unsigned next = wdt_timer_ms;
++	uint64_t now;
++
++	if (ALOAD(&wdt_mode) != WDT_READY || ALOAD(&wdt_panicked)) {
++		return;
++	}
++	(void)ACAS(&wdt_timer_fired, 0, 1);
++	wdt_poll(1, WDT_SRC_TIMER);
++	if (wdt_test_panic_at_ms != 0) {
++		now = wdt_now_ms();
++		if (!ALOAD(&wdt_armed)) {
++			wdt_log("WDT GAP: sweetwdtabort=%u refused: the watchdog is not armed, the abort would prove nothing and could freeze the phone\n", wdt_test_panic_s);
++			wdt_test_panic_at_ms = 0;
++		} else if (now >= wdt_test_panic_at_ms) {
++			unsigned s = wdt_test_panic_s;
++
++			wdt_test_panic_at_ms = 0;
++			wdt_log("SWEET WDT TEST: sweetwdtabort=%u: aborting now (test only); pets stop, reset expected within %u s\n", s, wdt_period);
++			wdt_test_panic_now(s);                                  /* does not return in the kernel */
++		} else if (wdt_test_panic_at_ms - now < next) {
++			next = (unsigned)(wdt_test_panic_at_ms - now) + 1u;     /* land on the due time, not up to one interval late */
++		}
++	}
++	if (wdt_test_park_at_ms != 0) {
++		now = wdt_now_ms();
++		if (!ALOAD(&wdt_armed)) {
++			wdt_log("WDT GAP: sweetwdtparkfail=%u refused: the watchdog is not armed, the test would prove nothing and could freeze the phone\n", wdt_test_park_s);
++			wdt_test_park_at_ms = 0;
++		} else if (now >= wdt_test_park_at_ms) {
++			unsigned s = wdt_test_park_s;
++
++			wdt_test_park_at_ms = 0;
++			sweet_wdt_stop_pets();                                  /* the same store sweet_machine_reset does first; before the line so the line is true */
++			wdt_log("SWEET WDT TEST: park SMC skipped, pets stopped, watchdog must reset within %u s (sweetwdtparkfail=%u, test only)\n", wdt_period, s);
++			wdt_test_park_fail_now();                               /* sweet_machine_reset(bootloader) without the SWRESET SMC, then spins: does not return in the kernel */
++		} else if (wdt_test_park_at_ms - now < next) {
++			next = (unsigned)(wdt_test_park_at_ms - now) + 1u;
++		}
++	}
++	wdt_timer_in(next);
++}
++
++/* called once from sweet_wdt_setup when it reached READY (thread context). A failed start is a GAP; the drain loop then stays the only vehicle, as before 0333. */
++static void
++wdt_timer_start(void)
++{
++	unsigned t = WDT_TIMER_MAX_MS, tp = 0;
++
++	if (wdt_timer_init() != 0) {
++		wdt_log("WDT GAP: timer pet source not started (thread_call_allocate failed): arm/pet depends on the USB-log drain loop\n");
++		return;
++	}
++	if (wdt_threshold_ms / 2u < t) {
++		t = wdt_threshold_ms / 2u;
++	}
++	if (t < WDT_PET_MS) {
++		t = WDT_PET_MS;
++	}
++	wdt_timer_ms = t;
++	wdt_timer_start_ms = wdt_now_ms();
++	if (wdt_boot_arg_sweetwdtabort(&tp)) {
++		if (tp == 0) {
++			wdt_log("SWEET WDT: sweetwdtabort=0: no test abort\n");
++		} else if (tp > WDT_TEST_PANIC_MAX) {
++			wdt_log("WDT GAP: sweetwdtabort=%u above %u, ignored (no test abort)\n", tp, WDT_TEST_PANIC_MAX);
++		} else {
++			wdt_test_panic_s = tp;
++			wdt_test_panic_at_ms = wdt_timer_start_ms + (uint64_t)tp * 1000u;
++			wdt_log("WDT GAP: sweetwdtabort=%u set (test only): this boot aborts on purpose %u s after the timer started\n", tp, tp);
++		}
++	}
++	tp = 0;
++	if (wdt_boot_arg_sweetwdtparkfail(&tp)) {
++		if (tp == 0) {
++			wdt_log("SWEET WDT: sweetwdtparkfail=0: no failed-park test\n");
++		} else if (tp > WDT_TEST_PANIC_MAX) {
++			wdt_log("WDT GAP: sweetwdtparkfail=%u above %u, ignored (no failed-park test)\n", tp, WDT_TEST_PANIC_MAX);
++		} else if (wdt_test_panic_at_ms != 0) {
++			wdt_log("WDT GAP: sweetwdtparkfail=%u ignored: sweetwdtabort is set too (one proof per boot)\n", tp);
++		} else {
++			wdt_test_park_s = tp;
++			wdt_test_park_at_ms = wdt_timer_start_ms + (uint64_t)tp * 1000u;
++			wdt_log("WDT GAP: sweetwdtparkfail=%u set (test only): this boot runs the park path WITHOUT the SWRESET SMC %u s after the timer started\n", tp, tp);
++		}
++	}
++	ASTORE(&wdt_timer_started, 1);
++	wdt_log("SWEET WDT: timer pet source started: every %u ms, first tick now (no USB needed; patch 0333)\n", t);
++	wdt_timer_in(0);
++}
++
++/*
++ * The ONE stop: no pet, no arm, no timer tick after this (every caller of wdt_poll and the timer check the flag; nothing ever stores 0). One atomic store: no printf, no
++ * lock, no allocation, no register, so it is safe as the first statement of a panic or of sweet_machine_reset (bsd/dev/sweet_restart.c), which calls it before its first
++ * reset write: if the PMU SWRESET SMC is refused or returns, the watchdog is the backstop (one period after the last pet). Idempotent.
++ */
++void
++sweet_wdt_stop_pets(void)
++{
++	ASTORE(&wdt_panicked, 1);
++}
++
++/* panic hook (osfmk/kern/debug.c panic_trap_to_debugger, before anything can hang): the same stop. Idempotent. */
++void
++sweet_wdt_panic_note(void)
++{
++	sweet_wdt_stop_pets();
++}
++
++/* the on-screen state line of the panic hold (debug.c sweet_panic_hold): a constant string, so it is safe in the panic path; says whether the backstop exists */
++const char *
++sweet_wdt_panic_text(void)
++{
++	switch (ALOAD(&wdt_mode)) {
++	case WDT_OFF:
++		return "SWEET WDT: off (no sweetwdt, or its setup failed: see the WDT GAP lines above): if the reset below faults, nothing resets the phone";
++	case WDT_PARSED:
++		return "SWEET WDT GAP: panic before the watchdog setup (patch 0333 gap: before sweet_restart_start): no backstop if the reset below faults";
++	default:
++		break;
++	}
++	if (!ALOAD(&wdt_armed)) {
++		return "SWEET WDT GAP: NOT armed at this panic (arm not reached or refused, see the WDT GAP lines above): no backstop if the reset below faults";
++	}
++	return "SWEET WDT: armed, pets stopped by this panic: the SoC watchdog resets the phone within its period if the reset below faults";
++}
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -36,74 +36,97 @@
+ /* IOPlatformExpert.h enum: kPEHaltCPU 0, kPERestartCPU 1, kPEPanicRestartCPU 4, kPEPanicRestartCPUNoCallouts 9 */
+ #define SWEET_PE_RESTART        1u
+ #define SWEET_PE_PANIC_RESTART  4u
+ #define SWEET_PE_PANIC_NOCALL   9u
+ 
+ static uint64_t sweet_pmu_pa, sweet_mode_off, sweet_swreset_off;
+ 
+ /* Patch 0193 (bsd/dev/sweet_wdt.c, SPEC-WDT SQ1/SQ2/SQ5/SQ6): the SoC watchdog block. */
+ extern void sweet_wdt_parse(void);
+ extern void sweet_wdt_missing(const char *what);
+ extern void sweet_wdt_setup(uint64_t pmu_pa, uint32_t sysip_off);
+ extern void sweet_stall_start(void);   /* bsd/dev/sweet_stall.c (patch 0279) */
+ extern void sweet_stall_tick(int src);
+ extern void sweet_wdt_poll(int may_arm);
++extern void sweet_wdt_stop_pets(void);   /* patch 0333: one atomic store, stops every pet/arm/timer tick for good */
+ 
+ static uint64_t
+ sweet_pmu_write(uint64_t pa, uint64_t val)
+ {
+ 	register uint64_t x0 __asm__("x0") = SWEET_PMU_SMC;
+ 	register uint64_t x1 __asm__("x1") = pa;
+ 	register uint64_t x2 __asm__("x2") = 1;
+ 	register uint64_t x3 __asm__("x3") = val;
+ 	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+ 	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+ 	    "x14", "x15", "x16", "x17", "cc", "memory");
+ 	return x0;
+ }
+ 
+ /* SPEC-WDT SQ6/D4: SYSIP_DAT0 = 0xFC (fastboot) through the existing SMC form; the only PMU write of the watchdog block. */
+ void
+ sweet_set_bootloader_mode(void)
+ {
+ 	uint64_t rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
+ 	if (rc != 0) {   /* patch 0309 (audit finding 4): a refused write was invisible */
+ 		printf("SWEET RESTART GAP: PMU SMC bootloader-mode write refused x0=0x%llx: the next reset may not land in fastboot\n", rc);
+ 	}
+ }
+ 
+-/* No locks, no allocation: usable from the panic path. Does not return. */
++/*
++ * No locks, no allocation: usable from the panic path. Does not return.
++ * Patch 0333 (SPEC-WDT SQ8): sweet_wdt_stop_pets() FIRST, before any reset write: one atomic store (no lock, no print, no register). From then on the SoC watchdog
++ * (patch 0278/0333, when armed) is the backstop of every software reset: if the SWRESET SMC is refused, returns, or the CPU spins in the wfe loop, no pet source
++ * (timer, USB-log drain loop, sweet_restart_poll) pets any more and the watchdog bites within one period. Nothing below stores to the pet state again.
++ * test_skip_swreset (only sweet_restart_test_park_fail, boot-arg sweetwdtparkfail): skip the SWRESET SMC (a simulated refusal); nothing is written that was not before.
++ */
+ static void __attribute__((noreturn))
+-sweet_machine_reset(int to_bootloader)
++sweet_machine_reset_x(int to_bootloader, int test_skip_swreset)
+ {
+ 	uint64_t rc;
+ 
++	sweet_wdt_stop_pets();
+ 	if (to_bootloader) {
+ 		rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
+ 		if (rc != 0) {   /* patch 0309 (audit finding 4) */
+ 			printf("SWEET RESTART GAP: PMU SMC bootloader-mode write refused x0=0x%llx\n", rc);
+ 		}
+ 	}
+-	rc = sweet_pmu_write(sweet_pmu_pa + sweet_swreset_off, SWEET_SWRESET);
+-	/* patch 0309 (audit finding 4): returning here means the reset did not happen; the result was discarded and the phone froze in the
+-	 * wfe loop with no line. Say so (console = USB log / pstore / panic screen); then the same wait as before (the SoC watchdog of
+-	 * patch 0278, when armed, is the backstop). No new register is written. */
+-	printf("SWEET RESTART GAP: PMU SMC software reset returned x0=0x%llx instead of resetting: phone frozen until the SoC watchdog fires (if armed)\n", rc);
++	if (!test_skip_swreset) {
++		rc = sweet_pmu_write(sweet_pmu_pa + sweet_swreset_off, SWEET_SWRESET);
++		/* patch 0309 (audit finding 4): returning here means the reset did not happen; the result was discarded and the phone froze in the
++		 * wfe loop with no line. Say so (console = USB log / pstore / panic screen); then the same wait as before. Patch 0333: the pets are
++		 * stopped above, so the SoC watchdog of patch 0278 (when armed) resets the phone within its period. No new register is written. */
++		printf("SWEET RESTART GAP: PMU SMC software reset returned x0=0x%llx instead of resetting: pets stopped, the SoC watchdog (if armed) resets the phone within its period\n", rc);
++	}
+ 	for (;;) {
+ 		__asm__ volatile ("wfe");
+ 	}
+ }
+ 
++static void __attribute__((noreturn))
++sweet_machine_reset(int to_bootloader)
++{
++	sweet_machine_reset_x(to_bootloader, 0);
++}
++
++/* boot-arg sweetwdtparkfail (bsd/dev/sweet_wdt.c, patch 0333, test only): the park path of a bootloader reset with the SWRESET SMC skipped; the watchdog must reset the phone. */
++void __attribute__((noreturn))
++sweet_restart_test_park_fail(void)
++{
++	sweet_machine_reset_x(1, 1);
++}
++
+ static int
+ sweet_halt_restart(unsigned int type)
+ {
+ 	switch (type) {
+ 	case SWEET_PE_RESTART:
+ 		/*
+ 		 * Patch 0140 (docs/HANDOFF.md "OPUS DECISION 2026-10-26 #5", review docs/reviews/0140-restart-cause.md): XNU-requested
+ 		 * resets land in the bootloader (fastboot, no Android detour, ~95 s saved). The USB log line of a reboot(2) is printed
+ 		 * earlier, in reboot_kernel (bsd/kern/kern_shutdown.c), because if_down_all() runs before this point. Panic types reset at
+ 		 * once (no printf/delay in the panic path). fastboot + a `SWEET REBOOT:` line = reboot(2); fastboot without one = a path that
+ 		 * did not go through reboot_kernel (panic types 4/9 or a direct PE_halt_restart); recovery = XNU did not ask.
+ 		 */
+ 		sweet_machine_reset(1);
+ 	case SWEET_PE_PANIC_RESTART:
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -336,6 +336,9 @@
+ #define SWEET_PANIC_HOLD_DEFAULT_S 20
+ #define SWEET_PANIC_HOLD_MAX_S     120
+ static TUNABLE(unsigned int, sweet_panic_hold_s, "sweetpanichold", SWEET_PANIC_HOLD_DEFAULT_S);
++/* Patch 0333 (bsd/dev/sweet_wdt.c, docs/specs/SPEC-WDT.md): the panic stops the SoC-watchdog pets; the hold says whether the watchdog is armed. */
++extern void sweet_wdt_panic_note(void);
++extern const char *sweet_wdt_panic_text(void);
+ 
+ /*
+  * PixOS patch 0242 (T-9d99, capture taken from the T-da01 WIP): with no panic region debug_buf_size is 0 and debug_putc
+@@ -1126,6 +1129,11 @@
+ {
+ #pragma clang diagnostic pop
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Patch 0333 (SPEC-WDT): stop every SoC-watchdog pet first of all, so the watchdog is the backstop if the panic reset itself faults. One atomic store: no printf, no lock, no register. */
++	sweet_wdt_panic_note();
++#endif
++
+ #if defined(SWEET)
+ 	/* No CPU/thread/debugger state is required for this first panic copy. */
+ 	sweet_early_panic(panic_format_str, panic_args);
+@@ -1427,6 +1435,7 @@
+ #pragma clang diagnostic pop
+ 		panic_debugger_log("\n");
+ 	}
++	panic_debugger_log("%s\n", sweet_wdt_panic_text());    /* patch 0333: armed or not, on the screen next to the hold */
+ 	panic_debugger_log("SWEET PANIC HOLD: reset in %u s\n", secs);
+ 	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &interval);
+ 	end = mach_absolute_time() + interval;

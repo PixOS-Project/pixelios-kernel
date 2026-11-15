@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""gen-wlan-registry-patch: regenerates xnu/patches/0200-sweet-wlan-registry.patch from the host-tested shim sources (wlan_registry.h, wlan_registry_glue.cpp.in); called by hand when those change and by shim/build.sh --check
+
+Maps (T-2144; the patch and shim/ cannot drift because shim/build.sh runs --check):
+  iokit/Kernel/arm/SweetWlanRegistry.h   = shim/wlan_registry.h            byte for byte
+  iokit/Kernel/arm/SweetWlanRegistry.cpp = shim/wlan_registry_glue.cpp.in  byte for byte
+  iokit/conf/files.arm64                 + one line
+  iokit/Kernel/arm/SweetPlatformExpert.cpp + one block (declares and calls sweet_wlan_registry_publish() after the IORTC block of patch 0123)
+
+  tools/gen-wlan-registry-patch [--out FILE]   write the patch (default xnu/patches/0200-sweet-wlan-registry.patch)
+  tools/gen-wlan-registry-patch --check        exit 1 when the patch on disk differs from what would be written
+  tools/gen-wlan-registry-patch --self-test    inline checks (also run by tools/test_gen_wlan_registry_patch.py)
+Last line: RESULT: PASS|FAIL gen-wlan-registry-patch ..."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import hashlib
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, "xnu", "patches", "0200-sweet-wlan-registry.patch")
+
+FILES = [
+    ("iokit/Kernel/arm/SweetWlanRegistry.h", "shim/wlan_registry.h"),
+    ("iokit/Kernel/arm/SweetWlanRegistry.cpp", "shim/wlan_registry_glue.cpp.in"),
+]
+
+MSG = """Publish the IO80211 controller and the en0 interface object that wifid and configd look for (P-W4, T-2144; SPEC-WIFI Part F rows W1-W3).
+
+Cause: wifid matches {IOPropertyMatch: {IO80211InterfaceRole: Infrastructure}} and reads IOInterfaceName (or IOInterfaceNamePrefix + IOInterfaceUnit) from the matched
+service and an IOService-plane parent; configd tests IOObjectConformsTo(parent, "IO80211Controller") with IOInterfaceType == 6 and reads IOMACAddress from that parent
+(docs/research/110 s.4.1/4.4 and W-D7-wifid-startup-reads D-1..D-10, all from the iOS 16.7 binaries). This kernel has no IONetworkingFamily/IO80211Family, so nothing
+published any of it: wifid found no interface and configd would have typed en0 as wired Ethernet.
+Fix: new iokit/Kernel/arm/SweetWlanRegistry.h (verbatim shim/wlan_registry.h: the property and class-chain tables, host-tested by
+shim/wlan_registry_host_test.c) and SweetWlanRegistry.cpp (verbatim shim/wlan_registry_glue.cpp.in): empty IOService stand-ins IONetworkController >
+IO80211Controller > SweetWLANController and IONetworkInterface > SweetWLANInterface (precedent: IONetworkStack, patch 0099), the controller attached under the
+IOService root with IOMACAddress copied from /chosen mac-address-wifi0, the interface attached under it with IOInterfaceName/Prefix/Unit/Type and
+IO80211InterfaceRole, both registerService()d. SweetPlatformExpert::start calls it after the IORTC block; it publishes only when the ADT has a node named `wlan`
+(the gate launchd evaluates) and boot-arg sweetwlanreg is not 0. Every read that is traced but not decided (BSD Name, IOPrimaryInterface, IOLocation, IOFeatures,
+user client) is a `WIFI GAP:` line at publish time. Not compiled against a device here (CI builds the tree), not run on hardware.
+"""
+
+CALL_BLOCK = [
+    "\t{",
+    "\t\t/*",
+    "\t\t * Wi-Fi registry (patch 0200, T-2144): the IO80211 controller and the en0 interface object wifid/configd look for. Gated on the ADT `wlan` node;",
+    "\t\t * boot-arg sweetwlanreg=0 skips it. The ifnet itself (patch 0199) is a separate step.",
+    "\t\t */",
+    "\t\tsweet_wlan_registry_publish();",
+    "\t}",
+]
+PE_DECL_BEFORE = ["#include <IOKit/IOLib.h>", "", 'extern "C" void sweet_restart_start(void);   /* bsd/dev/sweet_restart.c */']
+PE_DECL_ADD = 'extern "C" void sweet_wlan_registry_publish(void);   /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */'
+PE_DECL_AFTER = ["", "class SweetPlatformExpert : public IODTPlatformExpert {", "\tOSDeclareDefaultStructors(SweetPlatformExpert);"]
+FILES_ARM64_BEFORE = ["iokit/Kernel/arm/SweetFramebuffer.cpp", "iokit/Kernel/arm/SweetBattery.cpp", "iokit/Kernel/arm/SweetMali.cpp"]
+FILES_ARM64_AFTER = ["iokit/Kernel/arm/hid/SweetHID.cpp", "iokit/Kernel/arm/hid/IOHIDEvent.cpp", "iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp"]
+FILES_ARM64_ADD = "iokit/Kernel/arm/SweetWlanRegistry.cpp"
+PE_BEFORE = ['\t\t\tIOLog("SWEET RTC: sweetiortc=0, IORTC not published (30 s wait stays)\\n");', "\t\t}", "\t}"]
+PE_AFTER = ['\tIOLog("SWEET: platform expert registered\\n");', "\treturn true;", "}"]
+
+
+def col(path):
+    return path + " " * (65 - len(path)) + "optional iokitcpp"
+
+
+def blob_id(data):
+    h = hashlib.sha1(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()[:7]
+
+
+def source(path):
+    with open(os.path.join(ROOT, path), "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def new_file_hunk(dest, text):
+    data = text.encode("utf-8")
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    out = ["diff --git a/%s b/%s" % (dest, dest), "new file mode 100644", "index 0000000..%s" % blob_id(data),
+           "--- /dev/null", "+++ b/%s" % dest, "@@ -0,0 +1,%d @@" % len(lines)]
+    out.extend("+" + ln for ln in lines)
+    return "\n".join(out) + "\n"
+
+
+def build():
+    parts = [MSG, "\n"]
+    parts.append("diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64\n--- a/iokit/conf/files.arm64\n+++ b/iokit/conf/files.arm64\n@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp\toptional iokitcpp\n")
+    parts.extend(" " + col(p) + "\n" for p in FILES_ARM64_BEFORE)
+    parts.append("+" + col(FILES_ARM64_ADD) + "\n")
+    parts.extend(" " + col(p) + "\n" for p in FILES_ARM64_AFTER)
+    parts.append("diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp\n--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp\n+++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp\n@@ -11,6 +11,7 @@\n")
+    parts.extend(" " + ln + "\n" for ln in PE_DECL_BEFORE)
+    parts.append("+" + PE_DECL_ADD + "\n")
+    parts.extend(" " + ln + "\n" for ln in PE_DECL_AFTER)
+    parts.append("@@ -47,6 +48,13 @@ SweetPlatformExpert::start(IOService *provider)\n")
+    parts.extend(" " + ln + "\n" for ln in PE_BEFORE)
+    parts.extend("+" + ln + "\n" for ln in CALL_BLOCK)
+    parts.extend(" " + ln + "\n" for ln in PE_AFTER)
+    for dest, src in FILES:
+        parts.append(new_file_hunk(dest, source(src)))
+    return "".join(parts)
+
+
+def self_test():
+    sample = "line one\n\tline two\n"
+    hunk = new_file_hunk("iokit/x.h", sample)
+    body = [ln[1:] for ln in hunk.split("\n") if ln.startswith("+") and not ln.startswith("+++")]
+    ok = body == ["line one", "\tline two"] and "@@ -0,0 +1,2 @@" in hunk and hunk.startswith("diff --git a/iokit/x.h b/iokit/x.h\n")
+    ok = ok and blob_id(b"") == "e69de29"
+    ok = ok and len(FILES_ARM64_BEFORE) == 3 and len(FILES_ARM64_AFTER) == 3 and len(PE_BEFORE) == 3 and len(PE_AFTER) == 3
+    ok = ok and len(CALL_BLOCK) + 6 == 13 and len(PE_DECL_BEFORE) == 3 and len(PE_DECL_AFTER) == 3   # hunk headers say -11,6 +11,7 and -47,6 +48,13
+    ok = ok and col(FILES_ARM64_ADD).startswith(FILES_ARM64_ADD + " ") and col(FILES_ARM64_ADD).endswith("optional iokitcpp")
+    print("RESULT: %s gen-wlan-registry-patch self-test" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    out = argv[argv.index("--out") + 1] if "--out" in argv else OUT
+    text = build()
+    if "--check" in argv:
+        try:
+            with open(out, "r", encoding="utf-8") as fh:
+                same = fh.read() == text
+        except OSError as e:
+            print("GAP: gen-wlan-registry-patch --check cannot read %s: %s" % (out, e), file=sys.stderr)
+            same = False
+        print("RESULT: %s gen-wlan-registry-patch --check %s" % ("PASS" if same else "FAIL (stale: run tools/gen-wlan-registry-patch)", os.path.basename(out)))
+        return 0 if same else 1
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print("RESULT: PASS gen-wlan-registry-patch wrote %s (%d bytes)" % (os.path.basename(out), len(text)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

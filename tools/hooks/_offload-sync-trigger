@@ -1,0 +1,14 @@
+#!/bin/sh
+# Shared body of the kernel post-commit / post-merge / post-rewrite hooks (TP-055, USER ORDER R63): start the one-way lab-host -> offload-host mirror in the
+# background. Never blocks, never fails a commit (always exit 0). tools/offload-sync takes its own lock and coalesces overlapping runs; its failures are
+# lines in logs/offload-sync.log that the next `tools/offload-sync --check` prints. A missing tool is a loud line in that log, not silence (rule 8).
+# Runs from the hook copy in <git-common-dir>/pixos-hooks (tools/install-hooks), so it finds the tool in the MAIN checkout, not next to itself.
+main=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+[ -n "$main" ] || exit 0
+t=$main/tools/offload-sync
+if [ -x "$t" ]; then
+	"$t" --background </dev/null >/dev/null 2>&1 &
+else
+	{ mkdir -p "$main/logs" && printf '%s OFFLOAD-HOST GAP: hook: %s is missing (tools/offload-sync is not merged into the main checkout)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$t" >>"$main/logs/offload-sync.log"; } 2>/dev/null
+fi
+exit 0

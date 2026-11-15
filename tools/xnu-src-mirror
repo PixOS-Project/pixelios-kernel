@@ -1,0 +1,120 @@
+#!/bin/bash
+# Local bare git mirrors of the commits the XNU stagers (xnu/patches/*.sh) fetch from the network, so tools/xnu-local-build needs no
+# network once the mirrors are seeded (AP: the stagers ran `git fetch --depth 1 <url> <pinned sha>` on EVERY build).
+#   tools/xnu-src-mirror seed [--stack DIR] [--dir MIRRORDIR]   fetch each pinned commit once into MIRRORDIR/<Name>.git as refs/pinned/<sha>
+#                                                               (offline and no-op when every ref exists); needs the network only for missing ones
+#   tools/xnu-src-mirror env  [--stack DIR] [--dir MIRRORDIR]   print `export GIT_CONFIG_COUNT/KEY_i/VALUE_i` lines (printf %q) that make git
+#                                                               rewrite each mirrored https URL to its mirror (url.<mirror>.insteadOf); eval them
+#                                                               before running a stager. A source whose mirror lacks the pinned sha is listed on
+#                                                               stderr (`xnu-src-mirror: NOT mirrored: <name> <sha>`) and gets no rewrite, so a
+#                                                               networked build still works. If GIT_CONFIG_COUNT is already set the indexes continue.
+# (url, sha) are DERIVED from each stager in DIR (default <repo>/xnu/patches) by parsing its ONE fetch call: after joining `\` continuation
+# lines and dropping comment lines the stager must hold exactly one `git ... fetch|clone` line, exactly one https:// token (the url in
+# that call, directly followed by the sha variable `"$var"`) and exactly one `var=<40 hex>` assignment of that variable. No hand-kept
+# table: anything else (several fetches or assignments, a url only in a comment or behind a variable, a stray https:// token, an invalid
+# mirror name) is RESULT: ERROR naming the stager, never a guess (review xnub-mirror-r1 F1).
+# seed serialises on flock MIRRORDIR/.seed.lock (wait bounded by XNU_MIRROR_LOCK_WAIT seconds, default 600; loud when it waits and on timeout).
+# env lists a mirror that git would refuse to serve (`git upload-pack` on it fails, typically "dubious ownership" after an rsync as another
+# uid) as NOT mirrored, with the reason on stderr. safe.directory in GIT_CONFIG_* does NOT help: git strips GIT_CONFIG_COUNT/PARAMETERS for
+# local-path fetches [observed, git 2.47.3], so the mirror must be owned by the build uid (offload-host: rsync so the container uid owns it, or
+# --userns=keep-id) or be listed in the global git config of the build user.
+# Mirror name = last path component of the url ([A-Za-z0-9._-]+). MIRRORDIR default ${ARTIFACTS:-$HOME/pixelios-artifacts}/git-mirror.
+# Last line: RESULT: PASS|FAIL|ERROR ... (stdout for seed, stderr for env because stdout is eval'd). Exit 0 PASS, 1 FAIL (a seed fetch failed), 2 ERROR.
+# Caller: tools/xnu-local-build. Host test: tools/test_xnu_src_mirror.sh.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+ROOT=$(dirname "$(readlink -f "$0")")/..
+cmd=${1:-}; [ $# -gt 0 ] && shift
+stack=$ROOT/xnu/patches; dir=${ARTIFACTS:-$HOME/pixelios-artifacts}/git-mirror
+while [ $# -gt 0 ]; do case $1 in
+	--stack) [ $# -ge 2 ] || { echo "RESULT: ERROR --stack needs a value" >&2; exit 2; }; stack=$2; shift 2 ;;
+	--dir) [ $# -ge 2 ] || { echo "RESULT: ERROR --dir needs a value" >&2; exit 2; }; dir=$2; shift 2 ;;
+	*) echo "RESULT: ERROR unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
+dir=$(realpath -m -- "$dir")   # insteadOf needs an absolute path
+case $cmd in seed|env) ;; *) echo "RESULT: ERROR usage: xnu-src-mirror seed|env [--stack DIR] [--dir MIRRORDIR]" >&2; exit 2 ;; esac
+fail() { echo "RESULT: ERROR $*" >&2; exit 2; }   # stderr for both subcommands: only a PASS/FAIL seed line goes to stdout
+
+names=(); urls=(); shas=(); files=()
+shopt -s nullglob
+stagers=("$stack"/*.sh)
+[ ${#stagers[@]} -le 1 ] || mapfile -t stagers < <(printf '%s\n' "${stagers[@]}" | LC_ALL=C sort)   # glob order follows the locale (container C.UTF-8 vs host en_US): fixed to C so the stager order, the url/sha list and the stack hash are the same everywhere
+[ ${#stagers[@]} -gt 0 ] || fail "no *.sh stagers in $stack"
+# parse_stager FILE: sets url and sha from the stager's ONE fetch call, else fail naming the file (review xnub-mirror-r1 F1)
+parse_stager() {
+	local f=$1 body fetches nf toks var asg re
+	# join `\` continuation lines, drop comment lines; everything below sees only live code
+	body=$(sed -e ':a' -e '/\\$/{N;s/\\\n[[:space:]]*/ /;ba}' "$f" | sed -E '/^[[:space:]]*#/d')
+	fetches=$(grep -E '(^|[^[:alnum:]_./-])git[[:space:]]([^|;&]*[[:space:]])?(fetch|clone)([[:space:]]|$)' <<<"$body") || { rc=$?; [ $rc = 1 ] || echo "xnu-src-mirror GAP: grep failed rc=$rc" >&2; }
+	nf=$(grep -c . <<<"$fetches") || { rc=$?; [ $rc = 1 ] || echo "xnu-src-mirror GAP: grep failed rc=$rc" >&2; }
+	[ "$nf" = 1 ] || fail "$f has $nf git fetch/clone calls outside comments, expected exactly 1 (stager drift: this tool derives url and sha from the one fetch call)"
+	toks=$(grep -oE 'https://[^[:space:]"'\'']+' <<<"$body") || { rc=$?; [ $rc = 1 ] || echo "xnu-src-mirror GAP: grep failed rc=$rc" >&2; }
+	[ -n "$toks" ] || fail "$f has no https:// url outside comments (a url only in a comment or behind a variable cannot be resolved; stager drift)"
+	[ "$(grep -c . <<<"$toks")" = 1 ] || fail "$f has several https:// tokens outside comments, expected only the url of its fetch call: $(tr '\n' ' ' <<<"$toks")"
+	re='(https://[^[:space:]"'"'"']+)["'"'"']?[[:space:]]+"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?([[:space:]]|$)'
+	[[ $fetches =~ $re ]] || fail "$f: its fetch call is not '... URL \"\$var\"' with the https:// url directly followed by the sha variable (stager drift; the url must be on the fetch call, not in a variable)"
+	url=${BASH_REMATCH[1]}; var=${BASH_REMATCH[2]}
+	[ "$url" = "$toks" ] || fail "$f: the url of the fetch call ($url) is not the only https:// token ($toks)"
+	asg=$(grep -E "^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+|local[[:space:]]+)?$var\\+?=" <<<"$body") || { rc=$?; [ $rc = 1 ] || echo "xnu-src-mirror GAP: grep failed rc=$rc" >&2; }
+	[ "$(grep -c . <<<"$asg")" = 1 ] || fail "$f has $(grep -c . <<<"$asg") assignments of \$$var outside comments, expected exactly 1 (stager drift)"
+	re='=["'"'"']?([0-9a-f]{40})([^0-9a-f]|$)'
+	[[ $asg =~ $re ]] || fail "$f: \$$var is not assigned a <40 hex> sha (stager drift: this tool derives url and sha from the stagers)"
+	sha=${BASH_REMATCH[1]}
+}
+for f in "${stagers[@]}"; do
+	url="" sha=""; parse_stager "$f"
+	name=${url##*/}
+	[[ $name =~ ^[A-Za-z0-9._-]+$ && $name != . && $name != .. ]] || fail "$f: invalid mirror name '$name' from $url"
+	for i in "${!names[@]}"; do
+		[ "${names[$i]}" != "$name" ] || [ "${urls[$i]}" = "$url" ] || fail "$f: mirror name $name used by two urls (${urls[$i]}, $url)"
+	done
+	names+=("$name"); urls+=("$url"); shas+=("$sha"); files+=("$f")
+done
+have() { git --git-dir="$dir/$1.git" rev-parse -q --verify "refs/pinned/$2^{commit}" >/dev/null 2>&1; }
+# servable NAME: the process a stager's local-path fetch spawns (git upload-pack) accepts the mirror. Config from GIT_CONFIG_COUNT/PARAMETERS is
+# removed on purpose: git drops it for local-path fetches, so only the global/system config can grant safe.directory (F6, observed)
+servable() { (unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS; git upload-pack --advertise-refs "$dir/$1.git" >/dev/null 2>&1); }
+
+if [ "$cmd" = seed ]; then
+	seeded=0 present=0 failed=0
+	missing=0; for i in "${!names[@]}"; do have "${names[$i]}" "${shas[$i]}" || missing=1; done
+	if [ $missing = 1 ]; then   # F4: two seeds on one mirror dir (two builds, a hand seed) must not interleave; the loop below re-checks have() under the lock
+		lock=$dir/.seed.lock; lw=${XNU_MIRROR_LOCK_WAIT:-600}
+		[[ $lw =~ ^[0-9]+$ ]] || fail "XNU_MIRROR_LOCK_WAIT='$lw' is not a number of seconds"
+		mkdir -p "$dir" && exec 7>>"$lock" || fail "cannot create $lock (mirror dir not writable?)"
+		flock -n 7 || {
+			echo "xnu-src-mirror: another seed holds $lock; waiting up to ${lw}s"
+			flock -w "$lw" 7 || { echo "xnu-src-mirror: $lock still held after ${lw}s"; echo "RESULT: FAIL seeded=0 present=0 failed=${#names[@]} lock-timeout dir=$dir"; exit 1; }; }
+	fi
+	for i in "${!names[@]}"; do
+		n=${names[$i]} u=${urls[$i]} s=${shas[$i]}
+		if have "$n" "$s"; then present=$((present + 1)); echo "xnu-src-mirror: present $n $s"; continue; fi
+		m=$dir/$n.git
+		if mkdir -p "$dir" && { [ -d "$m" ] || git init -q --bare "$m"; } &&
+			git --git-dir="$m" fetch -q --depth 1 "$u" "$s" &&
+			[ "$(git --git-dir="$m" rev-parse FETCH_HEAD)" = "$s" ] &&
+			git --git-dir="$m" update-ref "refs/pinned/$s" FETCH_HEAD; then
+			seeded=$((seeded + 1)); echo "xnu-src-mirror: seeded $n $s"
+		else failed=$((failed + 1)); echo "xnu-src-mirror: seed FAILED $n $s from $u (network? stager ${files[$i]})"; fi
+	done
+	if [ $failed = 0 ]; then echo "RESULT: PASS seeded=$seeded present=$present dir=$dir"; exit 0; fi
+	echo "RESULT: FAIL seeded=$seeded present=$present failed=$failed dir=$dir"; exit 1
+fi
+
+# env: build every line first so a failure never leaves a partial export set on stdout
+k=${GIT_CONFIG_COUNT:-0}; [[ $k =~ ^[0-9]+$ ]] || fail "GIT_CONFIG_COUNT='$k' is not a number"
+out=""; mirrored=0
+for i in "${!names[@]}"; do
+	n=${names[$i]} s=${shas[$i]}
+	if have "$n" "$s" && ! servable "$n"; then
+		echo "xnu-src-mirror: $dir/$n.git is not servable by git (git upload-pack on it fails: dubious ownership after an rsync as another uid? chown it to $(id -un) or list it in that user's global git config)" >&2
+		echo "xnu-src-mirror: NOT mirrored: $n $s" >&2
+	elif have "$n" "$s"; then
+		out+="export GIT_CONFIG_KEY_$k=$(printf %q "url.$dir/$n.git.insteadOf")"$'\n'
+		out+="export GIT_CONFIG_VALUE_$k=$(printf %q "${urls[$i]}")"$'\n'
+		k=$((k + 1)); mirrored=$((mirrored + 1))
+	else echo "xnu-src-mirror: NOT mirrored: $n $s" >&2; fi
+done
+[ $mirrored = 0 ] || out+="export GIT_CONFIG_COUNT=$k"$'\n'
+printf %s "$out"
+echo "RESULT: PASS mirrored=$mirrored of ${#names[@]} dir=$dir" >&2

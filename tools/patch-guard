@@ -6,13 +6,77 @@ format-patch), unless refs/patch-numbers/NNNN reserves that number for that slug
 always allowed. The repo that is checked is the one the PATH belongs to (the last `cd DIR` before the path in the command, else the session cwd), and a repo without
 tools/patch-numbers (a temp repo, the super repo) is not guarded. Heredoc bodies are ignored. A broken guard fails OPEN (exit 0, no decision).
 Guard rail, not a sandbox; the git pre-commit hook (`tools/patch-numbers install-hook`) catches what a script wrote without this hook seeing it.
+Second rule (RULES R11, T-eff6): any Write/Edit/MultiEdit, and any Bash command that writes (redirect, cp/mv/tee/install/rsync/ln/rm/touch/chmod/truncate/patch/dd/mkdir, sed -i, git apply/checkout/restore/mv/rm/am),
+under the FETCHED upstream XNU tree is denied in every repo: `xnu-pristine/` (Apple's xnu tag, docs/LOCAL-BUILD.md) and `localbuild/work/<label>/xnu/` (the staged copy xnu-local-build patches; tools/xnu-local-build:540).
+Reads (cat, grep, diff, cp OUT of the tree) pass. Escape: none from the agent (change the patch in xnu/patches/ and rebuild; a human may edit the tree by hand).
 Stdin: the hook JSON. Stdout: a deny decision or nothing. Always exit 0. Test: tools/test_patch_guard.py.
 """
-import importlib.machinery, importlib.util, json, os, re, subprocess, sys
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import importlib.machinery, importlib.util, json, os, re, shlex, subprocess, sys
 
 TOK = re.compile(r"(\S*xnu/patches/(\d{4})-([^/\s'\"]+?)\.patch)")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 WRITER = re.compile(r"^\s*(sudo\s+)?(cp|mv|tee|install|rsync|ln)\b|^\s*git\s+(mv|checkout|restore|apply)\b|format-patch|\bsed\s+[^;|&]*\bw\s")
+
+
+UPSTREAM = re.compile(r"(?:^|/)(?:xnu-pristine|localbuild/work/[^/]+/xnu)(?:/|$)")
+SEP = re.compile(r"&&|\|\||;|\||\n")
+ALL_ARGS = {"mv", "tee", "rm", "touch", "chmod", "chown", "truncate", "patch", "mkdir", "rmdir", "unlink", "shred"}
+DEST_ONLY = {"cp", "install", "rsync", "ln"}
+GIT_WRITE = {"apply", "checkout", "restore", "mv", "rm", "am", "clean", "reset", "stash", "cherry-pick", "merge", "pull"}
+UP_WHY = ("%s is under the fetched upstream XNU tree (RULES R11): that tree is Apple's source, changes live only as numbered patches in xnu/patches/ (tools/patch-numbers next), "
+          "and a hand edit is lost on the next xnu-local-build / CI fetch. Instead: edit or add the patch in xnu/patches/ (get the patched tree from the xnu-buildtree CI artifact or a `tools/xnu-local-build` work tree to diff), "
+          "then rebuild. Escape: none (a human may edit the tree by hand outside the agent).")
+
+
+def is_upstream(path, base):
+    p = os.path.normpath(path if os.path.isabs(path) else os.path.join(base, path))
+    return bool(UPSTREAM.search(p + "/"))
+
+
+def upstream_write(cmd, cwd):
+    """-> the first path a WRITING command in CMD puts under the upstream XNU tree, else ''. Parsed words, so a command that only reads or quotes the path passes."""
+    cmd = HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd)
+    base = cwd
+    for seg in SEP.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        for m in re.finditer(r"(?<![0-9&>])>>?\s*([^\s&|;<>]+)", seg):
+            t = os.path.expanduser(m.group(1).strip("'\""))
+            if is_upstream(t, base):
+                return t
+        try:
+            w = shlex.split(seg)
+        except ValueError:
+            w = seg.split()
+        while w and (w[0] in ("sudo", "env", "command", "nohup", "time", "nice") or re.fullmatch(r"\w+=\S*", w[0])):
+            w = w[1:]
+        if not w:
+            continue
+        h, args = os.path.basename(w[0]), [os.path.expanduser(x) for x in w[1:]]
+        if h in ("cd", "pushd") and args:
+            base = os.path.normpath(os.path.join(base, args[0]))
+            continue
+        ops = [x for x in args if not x.startswith("-") and not re.fullmatch(r"\w+=\S*", x)]
+        if h == "dd":
+            ops = [x[3:] for x in args if x.startswith("of=")]
+            hit = [x for x in ops if is_upstream(x, base)]
+        elif h == "sed" and any(re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*|--in-place.*", x) for x in args):
+            hit = [x for x in ops if is_upstream(x, base)]
+        elif h == "git" and ops and ops[0] in GIT_WRITE:
+            hit = [x for x in ops[1:] if is_upstream(x, base)] or ([base] if is_upstream(base, "/") else [])
+        elif h in ALL_ARGS or h in DEST_ONLY:
+            pick = ops[-1:] if h in DEST_ONLY else ops
+            hit = [x for x in pick if is_upstream(x, base)]
+            if h == "patch" and not hit and is_upstream(base, "/"):
+                hit = [base]      # `cd xnu-pristine && patch -p1 < x` has no path operand
+        else:
+            hit = []
+        if hit:
+            return hit[0]
+    return ""
 
 
 def repo_of(path):
@@ -69,6 +133,15 @@ def main():
         ti = d.get("tool_input") or {}
         cwd = d.get("cwd") or os.getcwd()
         targets = []
+        up = ""
+        if d.get("tool_name") in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            fp = os.path.normpath(ti.get("file_path", "") or ti.get("notebook_path", ""))
+            up = fp if is_upstream(fp, cwd) else ""
+        elif d.get("tool_name") == "Bash":
+            up = upstream_write(ti.get("command", ""), cwd)
+        if up:
+            deny(UP_WHY % up)
+            return 0
         if d.get("tool_name") in ("Write", "Edit", "MultiEdit"):
             fp = os.path.normpath(ti.get("file_path", ""))
             m = TOK.search(fp)
@@ -87,7 +160,8 @@ def main():
                      "(branches diverge, so \"the next number\" collides; see docs/AUTOMATION.md 'One numbering for xnu/patches'). Already wrote it? `tools/patch-numbers claim %s --owner NAME --name %s`."
                      % (num, slug, slug, num, slug))
                 return 0
-    except Exception:  # noqa: BLE001 - a broken guard must not block work
+    except Exception as _err:  # noqa: BLE001 - a broken guard must not block work
+        print(f"patch-guard GAP: guard crashed ({type(_err).__name__}: {_err}): the patch number was NOT checked", file=sys.stderr)
         return 0
     return 0
 

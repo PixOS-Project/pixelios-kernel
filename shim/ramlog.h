@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 
 /*
  * RAM log for the probe console: every console line is also appended here
@@ -24,7 +25,7 @@ unsigned ramlog_lines(void);
 
 /* Copy retained line `index` (0 = oldest) into dst, NUL-terminated and
  * truncated to cap. Returns the copied length; 0 for an absent line. */
-unsigned ramlog_copy_line(unsigned index, char *dst, unsigned cap);
+uint32_t ramlog_copy_line(uint32_t index, char *dst, uint32_t cap);
 
 /* Pages needed at rows_per_page rows; 0 when the log is empty. */
 unsigned ramlog_page_count(unsigned rows_per_page);

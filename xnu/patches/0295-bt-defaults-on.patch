@@ -1,0 +1,169 @@
+SWEET Bluetooth: patch 0295 (bt/defaults 2026-11-11), the four boot-args every proven Bluetooth boot passed are ON by default: sweetbt, sweetbtkeepbaud, sweetbtpatchram, sweetbtlefeat (patches 0189/0215/0228/0274). Absent = on, =1 = on, =0 = off with one `BT GAP: <knob>=0: default-on knob switched off by boot-arg: <effect>` line per knob at attach, any other value = on plus a BT GAP. One helper sbu_knob_default_on() replaces the five PE_parse_boot_argn(...) && v == 1 reads. Every diagnostic BT knob (sweetbtrfwit, sweetbtromread, sweetbtvsc, sweetbtnopcf, sweetbtpubscan, ...) keeps its default. Companion in the same branch: tools/mkadt.py PIXOS_ADT_AUDIO default on. Applies after 0285.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index b8ed3b7..86f5d86 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1555,6 +1555,46 @@ sbu_patchram(const struct sbu_cand *cand)
+ 	return 0;
+ }
+ 
++/*
++ * patch 0295 (bt/defaults 2026-11-11): the four boot-args every proven Bluetooth boot passed (sweetbt, sweetbtkeepbaud, sweetbtpatchram, sweetbtlefeat; bt-va2 and the
++ * A2DP/pairing runs) are ON by default. Absent = on; 0 = off (one `BT GAP:` line naming the knob, sbu_defaults_log); 1 = on; any other value = on plus a BT GAP (never a
++ * silent switch). Every other BT knob (sweetbtrfwit, sweetbtromread, sweetbtvsc, sweetbtnopcf, ...) keeps its own default: off.
++ */
++static int
++sbu_knob_default_on(const char *name)
++{
++	int v = 0;
++
++	if (!PE_parse_boot_argn(name, &v, sizeof(v))) {
++		return 1;
++	}
++	return v != 0;
++}
++
++static void
++sbu_defaults_log(void)
++{
++	static const struct { const char *name, *off; } k[] = {
++		{ "sweetbt", "the controller is not powered, kctl and /dev/bt* fail every transfer" },
++		{ "sweetbtkeepbaud", "TIOCSETA moves the host UART to bluetoothd's requested baud although nobody ran the controller's baud-change VSC" },
++		{ "sweetbtpatchram", "no patchram download, bluetoothd meets the unpatched ROM" },
++		{ "sweetbtlefeat", "no LE feature bit 13 clearing, bluetoothd's 0x204a can make the controller refuse every legacy LE command" },
++	};
++
++	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
++		int v = 0;
++
++		if (!PE_parse_boot_argn(k[i].name, &v, sizeof(v))) {
++			continue;
++		}
++		if (v == 0) {
++			printf("BT GAP: %s=0: default-on knob switched off by boot-arg: %s\n", k[i].name, k[i].off);
++		} else if (v != 1) {
++			printf("BT GAP: %s=%d is not 0 or 1: treated as on (the default)\n", k[i].name, v);
++		}
++	}
++}
++
+ /*
+  * patch 0274 (sprint-bt 2026-11-09), boot-arg sweetbtlefeat=1: controller bring-up step, NOT a rewrite of bluetoothd's stream. bluetoothd runs this phone with the D22
+  * (iPhone X) platform profile: legacy scanning, chipset enum outside 0x13..0x17 so "BT chip support for extended scans / advertising sets" is off [bin bluetoothd
+@@ -1571,10 +1611,8 @@ sbu_patchram(const struct sbu_cand *cand)
+ static void
+ sbu_lefeat_unused(const char *why)
+ {
+-	int v = 0;
+-
+-	if (PE_parse_boot_argn("sweetbtlefeat", &v, sizeof(v)) && v == 1) {
+-		printf("BT GAP: sweetbtlefeat=1 ignored: %s (the step runs only after a verified patchram download)\n", why);
++	if (sbu_knob_default_on("sweetbtlefeat")) {
++		printf("BT GAP: sweetbtlefeat (on) ignored: %s (the step runs only after a verified patchram download)\n", why);
+ 	}
+ }
+ 
+@@ -2502,8 +2540,6 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ 	int e = sbu_patchram(cand);
+ 
+ 	if (e == 0) {
+-		int v = 0;
+-
+ 		printf("BT UART: patchram download verified; bluetoothd will meet the patched controller\n");
+ 		{
+ 			int rr = 0;
+@@ -2511,11 +2547,11 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ 			if (PE_parse_boot_argn("sweetbtromread", &rr, sizeof(rr)) && (rr == 1 || rr == 2))      /* patch 0277: read-only, before the 0274 step */
+ 				sbu_romread_patched();
+ 		}
+-		if (PE_parse_boot_argn("sweetbtlefeat", &v, sizeof(v)) && v == 1) {      /* patch 0274 */
++		if (sbu_knob_default_on("sweetbtlefeat")) {      /* patch 0274 */
+ 			int le = sbu_lefeat();
+ 
+ 			if (le != 0) {
+-				printf("BT GAP: sweetbtlefeat=1 FAILED (error %d); bluetoothd meets the patched controller with its own LE feature set\n", le);
++				printf("BT GAP: sweetbtlefeat FAILED (error %d); bluetoothd meets the patched controller with its own LE feature set\n", le);
+ 			}
+ 		}
+ 		sbu_vsc_attach();       /* patch 0285 */
+@@ -2543,10 +2579,8 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ static void
+ sbu_patchram_unused(const char *why)
+ {
+-	int v = 0;
+-
+-	if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1) {
+-		printf("BT GAP: sweetbtpatchram=1 ignored: %s\n", why);
++	if (sbu_knob_default_on("sweetbtpatchram")) {
++		printf("BT GAP: sweetbtpatchram (on) ignored: %s\n", why);
+ 	}
+ }
+ 
+@@ -3053,11 +3087,10 @@ sbu_termios_set(const void *buf, size_t len)
+ 	 */
+ 	static int keep = -1;
+ 	if (keep < 0) {
+-		int v = 0;
+-		keep = (PE_parse_boot_argn("sweetbtkeepbaud", &v, sizeof(v)) && v == 1) ? 1 : 0;
++		keep = sbu_knob_default_on("sweetbtkeepbaud") ? 1 : 0;      /* patch 0295: default on */
+ 	}
+ 	if (keep == 1) {
+-		SBU_GAP(SG_OTHER, "TIOCSETA speed %lu NOT applied (sweetbtkeepbaud=1): the controller was not booted, it still talks %u baud; UBRDIV/UFRACVAL unchanged", (unsigned long)t->c_ospeed, sbu.baud);
++		SBU_GAP(SG_OTHER, "TIOCSETA speed %lu NOT applied (sweetbtkeepbaud on): the controller was not booted, it still talks %u baud; UBRDIV/UFRACVAL unchanged", (unsigned long)t->c_ospeed, sbu.baud);
+ 	} else if ((e = sbu_set_baud((uint32_t)t->c_ospeed)) != 0) {       /* baud first: a refused speed leaves UMCON untouched */
+ 		return e;
+ 	}
+@@ -3415,18 +3448,17 @@ sbu_nopcf_parse(void)       /* patch 0231: own function so the host test runs th
+ void
+ sweet_bt_uart_attach(void)
+ {
+-	int want = 0;
+-
+ 	if (sbu.attached) {
+ 		return;
+ 	}
+ 	sbu.attached = true;
+-	if (!PE_parse_boot_argn("sweetbt", &want, sizeof(want)) || want != 1) {
+-		printf("BT GAP: hci uart backend present but not enabled (boot-arg sweetbt=1 powers the controller); kctl and /dev/bt* are registered but every transfer fails\n");
++	sbu_defaults_log();     /* patch 0295: one BT GAP per default-on knob switched off */
++	if (!sbu_knob_default_on("sweetbt")) {
++		printf("BT GAP: hci uart backend present but not enabled (boot-arg sweetbt=0; the default powers the controller); kctl and /dev/bt* are registered but every transfer fails\n");
+ 		return;
+ 	}
+ 	if (!sweet_usb_board_is_gs101()) {      /* the /bluetooth ADT node is emitted for every board; the addresses below are gs101-only (review r1 F1) */
+-		printf("BT GAP: hci uart backend is gs101-only (board is not gs101); sweetbt=1 ignored, no register touched\n");
++		printf("BT GAP: hci uart backend is gs101-only (board is not gs101); sweetbt (on) ignored, no register touched\n");
+ 		return;
+ 	}
+ 	if (sbu.hw.rd == NULL) {        /* the host test presets sbu.hw with a fake register file */
+@@ -3540,13 +3572,14 @@ sweet_bt_uart_attach(void)
+ 			{       /* patch 0218 (T-86c9): boot-arg sweetbtpatchram=1; bluetoothd then meets the PATCHED controller (no power-cycle after a good download). Runs after the 0216/0217 probes and their power-cycle. */
+ 				int v = 0;
+ 
+-				if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1 && sbu_patchram_attach(&use[win]) != 0) {
++				v = sbu_knob_default_on("sweetbtpatchram") ? 1 : 0;
++				if (v == 1 && sbu_patchram_attach(&use[win]) != 0) {
+ 					sbu_rfwit_unused("the backend did not start after the patchram step");
+ 					return;
+ 				}
+ 				if (v != 1) {
+-					sbu_lefeat_unused("sweetbtpatchram=1 is not set");      /* patch 0274 */
+-					sbu_vsc_unused("sweetbtpatchram=1 is not set (the adapter runs only after a verified patchram download)");      /* patch 0285 */
++					sbu_lefeat_unused("sweetbtpatchram is off");      /* patch 0274 */
++					sbu_vsc_unused("sweetbtpatchram is off (the adapter runs only after a verified patchram download)");      /* patch 0285 */
+ 				}
+ 			}
+ 			{       /* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness (LE scan 100% duty + classic Inquiry) on the controller bluetoothd will meet; before the rx thread */
+@@ -3565,9 +3598,8 @@ sweet_bt_uart_attach(void)
+ 		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
+ 			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
+ 		}
+-		v = 0;
+-		if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1) {
+-			printf("BT GAP: sweetbtpatchram=1 ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
++		if (sbu_knob_default_on("sweetbtpatchram")) {
++			printf("BT GAP: sweetbtpatchram (on) ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
+ 		}
+ 		sbu_rfwit_unused("the baud probe did not settle the clock");
+ 		sbu_vsc_unused("the baud probe did not settle the clock");      /* patch 0285 */

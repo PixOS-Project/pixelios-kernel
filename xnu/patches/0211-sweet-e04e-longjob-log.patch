@@ -1,0 +1,55 @@
+SWEET T-e04e log-only witness (patch 0211, PLAN-60FPS G-F20 climb 7): with boot-arg sweetperf=1 every GPU job whose submit -> completion seen is >= 2000 us is printed once as `SWEET PERF: longjob seq S us D t T` (ring of 128 drained by the 1 s perf tick; a full ring prints `SWEET GAP: PERF longjob_dropped N`). seq is the Mali seqno = the `gpu_seq` of SWEET SWAPT (patch 0186), so offline each long job maps to its swap, its swipe class and its index inside the swap. No register write, no behaviour change, no new boot-arg. Decides H6 of T-e04e (few heavy passes per swap).
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -244,6 +244,14 @@
+ #define PERF_NH 7
+ static uint64_t perf_hist[PERF_NH];
+ extern void sweet_gpu_pll_reprint(unsigned sec);   /* bsd/dev/sweet_gpu_gs101.c, patch 0209: read-only PLL re-print */
++/* patch 0210 (T-e04e, log only): every job whose submit -> completion seen is >= PERF_LONG_US is queued (ring, drained by sm_perf_tick) and printed as
++ * `SWEET PERF: longjob seq S us D t T` (seq = the Mali seqno, the same counter as `gpu_seq` in SWEET SWAPT, so a job maps to its swap and its index inside the swap offline;
++ * D includes the <= 200 us poll latency like jobhist; T = submit time, now_us()). A full ring is never silent: the dropped count is printed (`longjob_dropped`). */
++#define PERF_LONG_US 2000
++#define PERF_LONG_N 128
++static struct { uint64_t seq, us, t; } perf_long[PERF_LONG_N];
++static unsigned perf_long_n;
++static uint64_t perf_long_drop;
+ 
+ static void
+ perf_job_done(void)
+@@ -253,6 +261,16 @@
+ 	perf_jobs++;
+ 	perf_busy_us += d;
+ 	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
++	if (d >= PERF_LONG_US) {   /* patch 0210, lock held */
++		if (perf_long_n < PERF_LONG_N) {
++			perf_long[perf_long_n].seq = sm.busy_seq;
++			perf_long[perf_long_n].us = d;
++			perf_long[perf_long_n].t = perf_start_us;
++			perf_long_n++;
++		} else {
++			perf_long_drop++;
++		}
++	}
+ 	if (d > perf_max_us) {
+ 		perf_max_us = d;
+ 	}
+@@ -530,7 +548,19 @@
+ 	memcpy(hist, perf_hist, sizeof(hist));
+ 	bzero(perf_hist, sizeof(perf_hist));
+ 	perf_jobs = perf_busy_us = perf_max_us = perf_subwait_us = 0;
++	struct { uint64_t seq, us, t; } lj[PERF_LONG_N];   /* patch 0210: take the long-job ring under the lock, print outside it */
++	unsigned ljn = perf_long_n;
++	uint64_t ljdrop = perf_long_drop;
++	memcpy(lj, perf_long, ljn * sizeof(lj[0]));
++	perf_long_n = 0;
++	perf_long_drop = 0;
+ 	lck_mtx_unlock(&sm_lock);
++	for (unsigned i = 0; i < ljn; i++) {
++		printf("SWEET PERF: longjob seq %llu us %llu t %llu\n", lj[i].seq, lj[i].us, lj[i].t);
++	}
++	if (ljdrop != 0) {
++		printf("SWEET GAP: PERF longjob_dropped %llu (ring of %d full, this second)\n", ljdrop, PERF_LONG_N);
++	}
+ 
+ 	host_cpu_load_info_data_t li;
+ 	mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;

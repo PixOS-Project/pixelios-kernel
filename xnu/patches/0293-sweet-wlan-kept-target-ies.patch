@@ -1,0 +1,26 @@
+SWEET WLAN kept link: Get 103 carries the join target's real IEs from the first answer (patch 0293, run wd6-rec1: Settings showed "Weak Security" on the joined WPA2-PSK network). Cause [obs-RE docs/research/W-D3-weak-security.md]: Settings snapshots the Get 103 record ONCE at link-up and never refreshes it; our record had the privacy bit and ie_len 0 until the first keep scan ended, so IO80211 marked it WEP. The L23 scan (or the WLC_GET_BSS_INFO answer of patch 0288) already reads the join target's whole record; swl25r_keep (sweet_wlan_l25_rsne.h, patch 0206) now also keeps its IE block (<= 1024 B), rates, beacon period, noise, SNR and chanspec in struct swl25_tgt. sw_keep_capture hands them to sweet_wlan_a80211_kept_target (patch 0201), which holds them until the radio is attached; swr_kept_target (sweet_wlan_radio.h) cuts the IEs to 512 B at an IE boundary with the scan record's GAP rules, and Get 103 prefers the scan-list entry of the joined BSSID if it has IEs, else this record. Never privacy-set with ie_len 0 silently: with no IEs source a GAP says Settings will show Weak Security (the privacy bit stays). Also Get 2 AUTH_TYPE answers lower 1 / upper 8 while joined with WPA2-PSK (metrics only). Not run on hardware.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2280,6 +2280,7 @@ extern int sweet_wlan_a80211_kept_link(int up);
+ extern int sweet_wlan_registry_set_bsd_name(const char *name);                                                                 /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
+ extern void sweet_wlan_a80211_scan_event(uint32_t status, const uint8_t *res, uint32_t len);                                    /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0292): one ESCAN_RESULT event of the live scan */
+ extern int sweet_wlan_a80211_scan_done(uint32_t kind, uint32_t ms, uint32_t ev);                                               /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0292): the live scan ended, swap the list in and post SCAN_DONE */
++extern void sweet_wlan_a80211_kept_target(const uint8_t *bssid, const uint8_t *ie, uint32_t ie_len, uint32_t ie_short, uint32_t chspec, uint32_t beacon, int32_t noise, int32_t snr, const uint8_t *rates, uint32_t nrates);     /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0293): the join target's record (IEs, rates, ...) for Get 103 */
+ int sweet_wlan_keep_scan_request(void);
+ 
+ /* patch 0292 (WIFI-COVERAGE D3/D4, Settings > Wi-Fi lists networks): the keep-phase scan state (sweet_wlan_l25_hs.h swl25_sc_*). Set 10 reaches sweet_wlan_keep_scan_request from the iOS ioctl thread (through sweet_wlan_a80211.c); that sets ONE flag and touches no engine state, no lock.
+@@ -2393,6 +2394,13 @@ sw_keep_capture(void)
+ 	sw_keep_join.ok = 1u;
+ 	printf("SWEET WLAN: keep: firmware link values (SSID len %u, BSSID, chan %u, rssi %d, ok %#x) captured for the Apple80211 radio\n", (unsigned)sw_keep_join.ssid_len,
+ 	    (unsigned)sw_keep_join.chan, (int)sw_keep_join.rssi, (unsigned)sw_keep_join.live);
++	/* patch 0293 (W-D3-weak-security): Settings snapshots the Get 103 record ONCE, so it must carry the join target's IEs from the first answer. The L25 target record (the L23 scan's, or WLC_GET_BSS_INFO's) is still valid here (the disarm below wipes it); only for the BSSID the firmware reports */
++	if (sw_l25g.tgt.xf && sw_l25g.tgt.state == SWL25R_OK && memcmp(sw_l25g.tgt.bssid, sw_keep_join.bssid, 6) == 0) {
++		sweet_wlan_a80211_kept_target(sw_l25g.tgt.bssid, sw_l25g.tgt.ie, sw_l25g.tgt.ie_len, sw_l25g.tgt.ie_short, sw_l25g.tgt.chspec, sw_l25g.tgt.beacon, sw_l25g.tgt.noise, sw_l25g.tgt.snr, sw_l25g.tgt.rates, sw_l25g.tgt.nrates);
++	} else {
++		swl_gap("keep", "no L25 target record for the kept BSSID: Get 103 will carry no IEs, Settings shows Weak Security", "high");
++		printf("WIFI GAP: keep: no L25 target record (xf %u, state %u) for the firmware's BSSID: the kept link's Get 103 carries no IEs, Settings will show Weak Security\n", (unsigned)sw_l25g.tgt.xf, (unsigned)sw_l25g.tgt.state);
++	}
+ }
+ 
+ /* patch 0282: copy the PMK, the join payload (and the four security values) and the boot RSNEs out of the tables the hook is about to wipe (the L25 cfg by swl25g_disarm, sw_jc by the init scrub) into sw_rj, once, in the kept case. A GAP is printed by swl25_rj_arm when

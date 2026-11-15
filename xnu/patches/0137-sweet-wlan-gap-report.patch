@@ -1,0 +1,481 @@
+SWEET WLAN gap report (patch 0137, USER ORDER 2026-10-27 "no more silent failures; errors must scream").
+Why: the Wi-Fi path refuses, skips and degrades in about 35 places that print an ordinary "SWEET WLAN:" line, and sweet_wlan_stage3()'s result was discarded ((void)swl_stage3).
+What: swl_gap(area, what, sev) in sweet_wlan_wr.h prints "WIFI GAP: <area> <what> x<count> [<sev>]" at count 1, 2, 4, 8 ..., the text carries no run values so the key is stable between runs;
+swl_gap_summary() (every exit of sweet_wlan_init that touched the chip path) prints "WIFI GAPS: N distinct, M total" and every entry with its final count. Calls sit right before every "refused", "not read", "not touched", "skipped",
+"not implemented", "STOP" printf of sweet_wlan.c and sweet_wlan_wr.h, plus the unconditional W15 gap (cfg 0x88 |= 0x300 is not implemented, 0133 header) and a gap when swl_stage3() returns an error.
+No register access, no behaviour change: logging only. Severity strings are PROPOSALS (guess). tools/xrun_report.py collects the lines; docs/KNOWN-GAPS-WIFI.md (super repo) is the list NEW is judged against.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -62,17 +62,20 @@
+ 	uint32_t win = a & ~0xFFFu, off = a & 0xFFFu;
+ 
+ 	if (!swl_win_ok(win, h->level) || !swl_rd_ok(win, off, h->level)) {
++		swl_gap("rd", "BAR0 read refused (window/allowlist)", "medium");
+ 		printf("SWEET WLAN: read of %#x refused\n", a);
+ 		return -1;
+ 	}
+ 	if (win != h->win) {
+ 		/* shim cfg_ok(): the EP must still be MEM-only with BAR0 where ATU region 1 points before every window change */
+ 		if (swl_pre_ep(h->cfg[0x04 / 4], h->cfg[0x10 / 4], h->cfg[0x14 / 4]) != 0) {
++			swl_gap("rd", "EP Command/BAR0 changed, window refused", "high");
+ 			printf("SWEET WLAN: EP Command/BAR0 changed, window %#x refused\n", win);
+ 			return -1;
+ 		}
+ 		h->cfg[0x80 / 4] = win;
+ 		if (h->cfg[0x80 / 4] != win) {
++			swl_gap("rd", "BAR0 window select did not take", "high");
+ 			printf("SWEET WLAN: BAR0 window did not take %#x\n", win);
+ 			return -1;
+ 		}
+@@ -93,6 +96,7 @@
+ 	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
+ 
+ 	if (va == 0) {
++		swl_gap("map", "ml_io_map failed", "high");
+ 		printf("SWEET WLAN: ml_io_map(%#llx) failed\n", pa);
+ 		return NULL;
+ 	}
+@@ -107,6 +111,7 @@
+ 	unsigned int sz = 0;
+ 
+ 	if (SecureDTGetProperty(node, name, (void const **)&p, &sz) != kSuccess || sz < 2 * sizeof(uintptr_t) || p[0] != pa || p[1] != len) {
++		swl_gap("adt", "/sweet-wlan reg property mismatch, refused", "high");
+ 		printf("SWEET WLAN: /sweet-wlan %s is not %#llx+%#llx, refused\n", name, pa, len);
+ 		return 0;
+ 	}
+@@ -158,21 +163,25 @@
+ 
+ 	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
+ 	    SecureDTGetProperty(mm, "WLANFW", &p, &psize) != kSuccess) {
++		swl_gap("fw", "no WLANFW container in /chosen/memory-map", "high");
+ 		printf("SWEET WLAN: no WLANFW container in /chosen/memory-map\n");
+ 		return;
+ 	}
+ 	if (psize != 2 * sizeof(uint64_t)) {
++		swl_gap("fw", "WLANFW property wrong size, refused", "high");
+ 		printf("SWEET WLAN: WLANFW property is %u bytes, refused\n", psize);
+ 		return;
+ 	}
+ 	memcpy(&pa, p, sizeof(pa));
+ 	memcpy(&len, (uint8_t const *)p + sizeof(pa), sizeof(len));
+ 	if (len < SWF_HDR || len > SWF_MAX_BYTES || pa + len < pa) {
++		swl_gap("fw", "WLANFW container out of bounds, refused", "high");
+ 		printf("SWEET WLAN: WLANFW <%#llx, %#llx> out of bounds, refused\n", pa, len);
+ 		return;
+ 	}
+ 	rc = swf_parse((uint8_t const *)ml_static_ptovirt((vm_offset_t)pa), (size_t)len, e, &n);
+ 	if (rc != 0) {
++		swl_gap("fw", "WLANFW container check failed, refused", "high");
+ 		printf("SWEET WLAN: WLANFW <%#llx, %#llx> refused, code %d\n", pa, len, rc);
+ 		return;
+ 	}
+@@ -192,6 +201,7 @@
+ 	unsigned int sz = 0;
+ 
+ 	if (SecureDTGetProperty(node, name, (void const **)&p, &sz) != kSuccess || sz != sizeof(uint32_t) || *p != v) {
++		swl_gap("adt", "/sweet-wlan scalar property mismatch, refused", "high");
+ 		printf("SWEET WLAN: /sweet-wlan %s is not %#x, refused\n", name, v);
+ 		return 0;
+ 	}
+@@ -355,7 +365,12 @@
+ 	x.nv = sw_nvbuf;
+ 	x.nv_cap = sizeof sw_nvbuf;
+ 	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 9 ? "F3" : level > 8 ? "F2" : level > 7 ? "F1" : level > 6 ? "E" : level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
+-	(void)swl_stage3(&x);
++	if (level >= 7) {
++		swl_miss("w15", SWL_M_W15, "medium");
++	}
++	if (swl_stage3(&x) != 0) {
++		swl_gap("stage3", "stage 3 returned an error (stopped, see the STOP line)", "high");
++	}
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+ 
+@@ -383,25 +398,32 @@
+ 	if (level > 10 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
++		swl_gap("adt", "no usable /sweet-wlan node, chip not touched", "high");
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	sweet_wlan_fwcheck();
+ 	if (!sw_prop_is(node, "reg", SW_MEM, SW_MEM_LEN) || !sw_prop_is(node, "cfg", SW_CFG, 0x1000) ||
+ 	    !sw_prop_is(node, "atu", SW_ATU, 0x1000) || !sw_prop_is(node, "elbi", SW_ELBI, 0x2000) || !sw_prop_is(node, "pmu-iso", SW_ISO, 4)) {
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	if (level >= 3 && (!sw_prop_is(node, "tcm", SWW_TCM_PA, SWW_TCM_BYTES) || !sw_prop_u32_is(node, "atu-r2-off", SWW_ATU_R2))) {
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	volatile uint32_t *isop = sw_map(SW_ISO & ~0xFFFull, 0x1000);
+ 	if (isop == NULL) {
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	iso = isop[(SW_ISO & 0xFFFull) / 4];
+ 	printf("SWEET WLAN: PCIe1 PHY isolation word %#x\n", iso);
+ 	if (!(iso & 1u)) {
++		swl_gap("link", "PCIe1 PHY still isolated, chip not touched", "high");
+ 		printf("SWEET WLAN: PHY still isolated (no --wlan-hold link), not touched\n");
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	volatile uint32_t *atu = sw_map(SW_ATU, 0x1000);
+@@ -409,6 +431,7 @@
+ 	hw.cfg = sw_map(SW_CFG, 0x1000);
+ 	hw.mem = sw_map(SW_MEM, 0x1000);
+ 	if (atu == NULL || elbi == NULL || hw.cfg == NULL || hw.mem == NULL) {
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	/* shim r32() and the chain before S30, all RC-local (no TLP): link in L0, ATU region 0 (config) and region 1 (BAR0) as the shim left them */
+@@ -421,7 +444,9 @@
+ 	printf("SWEET WLAN: ATU r1 %#x %#x %#x %#x %#x %#x %#x\n", a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6]);
+ 	bad = swl_pre_link(iso, ltssm, a0, a1);
+ 	if (bad) {
++		swl_gap("link", "link precondition failed, chip not touched", "high");
+ 		printf("SWEET WLAN: link precondition %d failed (shim --wlan-hold state not there), not touched\n", bad);
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	/* first config TLPs, only now that the link and region 0 are proven */
+@@ -434,7 +459,9 @@
+ 	printf("SWEET WLAN: EP Command/Status %#x BAR0 %#x %#x window %#x\n", hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4], hw.win);
+ 	bad = swl_pre_ep(hw.cfg[0x04 / 4], hw.cfg[0x10 / 4], hw.cfg[0x14 / 4]);
+ 	if (bad) {
++		swl_gap("link", "endpoint precondition failed, chip not touched", "high");
+ 		printf("SWEET WLAN: endpoint precondition %d failed, not touched\n", bad);
++		swl_gap_summary();
+ 		return;
+ 	}
+ 	bus.rd = sw_rd;
+@@ -442,10 +469,12 @@
+ 	if (swl_stage1(&bus, &chip, hw.level) == 0) {
+ 		printf("SWEET WLAN: stage 1 done level %u (read-only)\n", (unsigned)hw.level);
+ 		if (level >= 6 && !swl_w14_rev_ok(&chip)) {
++			swl_gap("w14", "DAR security register path not implemented for this chip rev", "medium");
+ 			printf("SWEET WLAN: W14 needs the DAR security register (PCIe core 0x83c missing or rev not < 74 or 128), not implemented, running level 5\n");
+ 			level = 5;
+ 		}
+ 		if (level >= 7 && !swl_w16_rev_ok(&chip)) {
++			swl_gap("w16", "PCIe mailbox/vector path not implemented for this chip rev", "medium");
+ 			printf("SWEET WLAN: run E needs the PCIe core 0x83c mailbox registers at 0xC30/0xC34 (rev >= 64) and W14's vector test (rev < 74), not implemented for this rev, running level 6\n");
+ 			level = 6;
+ 		}
+@@ -453,8 +482,10 @@
+ 			sweet_wlan_stage3(&hw, (int)level);
+ 		}
+ 	} else {
++		swl_gap("stage1", "stage 1 stopped", "high");
+ 		printf("SWEET WLAN: stage 1 stopped\n");
+ 	}
++	swl_gap_summary();
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -24,6 +24,135 @@
+ #include <stddef.h>
+ #include "sweet_wlan_chip.h"
+ 
++/* USER ORDER 2026-10-27: no silent failure. Every stub / refused value / unsupported case / swallowed error in the Wi-Fi path calls swl_gap() (text WITHOUT run values, so the
++ * key is stable between runs); it prints "WIFI GAP: <area> <what> x<count> [<sev>]" at count 1, 2, 4, 8 ... and swl_gap_summary() prints every entry once more with its final
++ * count. tools/xrun_report.py collects the lines (GAPS: N distinct, M total; NEW = not in docs/KNOWN-GAPS-WIFI.md). The severity is a PROPOSAL (guess). */
++#define SWL_GAP_MAX 64u
++struct swl_gap_ent {
++	char area[12];
++	char what[64];
++	char sev[8];
++	uint32_t n;
++};
++static struct swl_gap_ent swl_gap_tab[SWL_GAP_MAX];
++static uint32_t swl_gap_nd, swl_gap_tot, swl_gap_over;
++
++static inline void
++swl_gap(const char *area, const char *what, const char *sev)
++{
++	uint32_t i;
++	struct swl_gap_ent *e;
++
++	swl_gap_tot++;
++	for (i = 0; i < swl_gap_nd; i++) {
++		if (strcmp(swl_gap_tab[i].area, area) == 0 && strcmp(swl_gap_tab[i].what, what) == 0) {
++			break;
++		}
++	}
++	if (i == swl_gap_nd) {
++		if (i == SWL_GAP_MAX) {
++			swl_gap_over++;
++			printf("WIFI GAP: gaps table full, not recorded: %s %s x%u [high]\n", area, what, swl_gap_over);
++			return;
++		}
++		swl_gap_nd++;
++		memset(&swl_gap_tab[i], 0, sizeof swl_gap_tab[i]);
++		snprintf(swl_gap_tab[i].area, sizeof swl_gap_tab[i].area, "%s", area);
++		snprintf(swl_gap_tab[i].what, sizeof swl_gap_tab[i].what, "%s", what);
++		snprintf(swl_gap_tab[i].sev, sizeof swl_gap_tab[i].sev, "%s", sev);
++	}
++	e = &swl_gap_tab[i];
++	e->n++;
++	if ((e->n & (e->n - 1u)) == 0) {
++		printf("WIFI GAP: %s %s x%u [%s]\n", e->area, e->what, e->n, e->sev);
++	}
++}
++
++/* W-D4b gaps (standing order: a gap prints only while its condition is true): a MISS is a gap whose word a later reader, G2 (sweet_wlan_g2.h), may still read. With swl_miss_defer set (sweetwlan >= 12)
++ * swl_miss() only records it; G2 calls swl_miss_resolve() for every word it read, and swl_gap_summary() turns each unresolved miss into the gap (swl_miss_flush), so the gap prints iff nobody read the word.
++ * With swl_miss_defer 0 it is a plain swl_gap(). A full table is a gap at once (never lost). The keys are the SWL_M_* texts (area + what, as in swl_gap_tab). */
++#define SWL_MISS_MAX 12u
++#define SWL_M_F1_CON  "console pointer outside the RAM window, console not read"
++#define SWL_M_F1_MB   "mailbox data pointers not readable (outside window 2), not read"
++#define SWL_M_F1_RI   "rings_info_ptr not a readable range, not read"
++#define SWL_M_F2_MB   "mailbox data pointers not readable in window 0, not read"
++#define SWL_M_F2_RI   "rings_info_ptr not readable in window 0, not read"
++#define SWL_M_W15     "cfg 0x88 OR 0x300 (DHD attach write) not implemented"
++#define SWL_M_G1      "rw_index_sz and the ring counts are pinned from run F3, not re-read from the dongle"
++#define SWL_M_G2HOST  "host block not read (D4b read did not run)"
++struct swl_miss_ent {
++	const char *area, *what, *sev;
++	uint32_t res;
++};
++static struct swl_miss_ent swl_miss_tab[SWL_MISS_MAX];
++static uint32_t swl_miss_n, swl_miss_defer;
++
++static inline void
++swl_miss(const char *area, const char *what, const char *sev)
++{
++	uint32_t i;
++
++	if (!swl_miss_defer || swl_miss_n == SWL_MISS_MAX) {
++		swl_gap(area, what, sev);
++		return;
++	}
++	for (i = 0; i < swl_miss_n; i++) {
++		if (strcmp(swl_miss_tab[i].area, area) == 0 && strcmp(swl_miss_tab[i].what, what) == 0) {
++			return;
++		}
++	}
++	swl_miss_tab[swl_miss_n].area = area;
++	swl_miss_tab[swl_miss_n].what = what;
++	swl_miss_tab[swl_miss_n].sev = sev;
++	swl_miss_tab[swl_miss_n].res = 0;
++	swl_miss_n++;
++	printf("SWEET WLAN: miss %s %s (deferred: a G2 read may resolve it)\n", area, what);
++}
++
++/* 1 = a recorded, still open miss (area, what) is now resolved (the reader read the word); 0 = none such */
++static inline int
++swl_miss_resolve(const char *area, const char *what)
++{
++	uint32_t i;
++
++	for (i = 0; i < swl_miss_n; i++) {
++		if (strcmp(swl_miss_tab[i].area, area) == 0 && strcmp(swl_miss_tab[i].what, what) == 0 && !swl_miss_tab[i].res) {
++			swl_miss_tab[i].res = 1;
++			printf("SWEET WLAN: F1/F2 miss %s %s resolved by G2 read\n", area, what);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static inline void
++swl_miss_flush(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < swl_miss_n; i++) {
++		if (!swl_miss_tab[i].res) {
++			swl_gap(swl_miss_tab[i].area, swl_miss_tab[i].what, swl_miss_tab[i].sev);
++		}
++	}
++	swl_miss_n = 0;
++}
++
++static inline void
++swl_gap_summary(void)
++{
++	uint32_t i;
++
++	swl_miss_flush();
++	if (swl_gap_tot == 0 && swl_gap_over == 0) {
++		return;
++	}
++	printf("WIFI GAPS: %u distinct, %u total\n", swl_gap_nd + (swl_gap_over ? 1u : 0u), swl_gap_tot + swl_gap_over);
++	for (i = 0; i < swl_gap_nd; i++) {
++		printf("WIFI GAP: %s %s x%u [%s]\n", swl_gap_tab[i].area, swl_gap_tab[i].what, swl_gap_tab[i].n, swl_gap_tab[i].sev);
++	}
++}
++
+ /* Pinned values (CR-04): tcm and atu_r2_off equal soc.json wlan (tools/test_mkadt_wlan.py compares them); the rest is cited at the use. */
+ #define SWW_TCM_PA      0x60400000u     /* BAR2 CPU range = soc.json wlan.tcm: assigned by S28 (cfg 0x18 := 0x60400004), PCI address == CPU address */
+ #define SWW_TCM_BYTES   0x400000u       /* soc.json wlan.tcm_bytes: 4 MiB, S28 sizing readback 0xFFC00000 */
+@@ -608,6 +737,7 @@
+ 	int i = swl_rd_find(space, win, off);
+ 
+ 	if (i < 0 || (int)swl_rt[i].run > x->level - SWW_LEVEL0) {
++		swl_gap("rd", "BAR read refused by the level/allowlist", "medium");
+ 		printf("SWEET WLAN: read space %d win %#x off %#x refused\n", space, win, off);
+ 		return -1;
+ 	}
+@@ -778,10 +908,12 @@
+ 			}
+ 			rpre = pre;
+ 			if (rpre == 5 && r->space == SWW_BAR0 && r->grp == SWW_RG_CA && (x->flags & SWF_W16) && swl_cmd_mem(x, &cmd)) {
++				swl_gap("restore", "EP command changed, re-halting the CA7 anyway", "high");
+ 				printf("SWEET WLAN: restore: EP command %#x changed, re-halting the CA7 anyway\n", cmd);
+ 				rpre = 0;
+ 			}
+ 			if (r->space == SWW_BAR0 ? rpre != 0 : ((rpre >= 1 && rpre <= 4) || rpre == 8)) {
++				swl_gap("restore", "register group restore skipped (precondition)", "high");
+ 				printf("SWEET WLAN: restore of group %u skipped, precondition %d\n", r->grp, rpre);
+ 				skipped = 1;
+ 				continue;
+@@ -818,6 +950,7 @@
+ 	if (!x->stopped) {
+ 		x->stopped = 1;
+ 		x->stop_code = code;
++		{ char gb[48]; snprintf(gb, sizeof gb, "W%u STOP: %s", x->row, swl_ename(code)); swl_gap("stop", gb, "high"); }
+ 		printf("SWEET WLAN: W%u STOP: %s (code %d)\n", x->row, swl_ename(code), code);
+ 		swl_restore(x);
+ 	}
+@@ -976,6 +1109,7 @@
+ 			swl_delay(x, us);
+ 		}
+ 	}
++	swl_gap("wait", "register wait failed (value not reached)", "high");
+ 	printf("SWEET WLAN: W%u wait win %#x off %#x & %#x == %#x failed (last %#x)\n", x->row, win, off, mask, want, v);
+ 	return swl_stop(x, SWW_E_WAIT);
+ }
+@@ -1333,6 +1467,7 @@
+ 	x->row = 11;
+ 	rc = swl_geo_get(x, &g);
+ 	if (rc) {
++		swl_gap("nvram", "tail geometry refused", "high");
+ 		printf("SWEET WLAN: W11 tail geometry refused: ram_end %#x varsize %u (the rTLV, text and token must lie at or above %#x)\n", SWW_RAM_BASE + x->ram_bytes, x->nv_varsize, SWW_WIN_TAIL);
+ 		return swl_stop(x, rc);
+ 	}
+@@ -1742,6 +1877,7 @@
+ 	int rc;
+ 
+ 	if (!swl_f1_span_ok(end, sw, cons, SWW_CON_IDX + 4u)) {
++		swl_miss("f1", SWL_M_F1_CON, "medium");
+ 		printf("SWEET WLAN: F1 console pointer %#x is not a hnd_cons_t in the RAM window, not read\n", cons);
+ 		return 0;
+ 	}
+@@ -1754,10 +1890,12 @@
+ 	idx = h[2];
+ 	printf("SWEET WLAN: F1 console %#x: buffer %#x size %u write index %u\n", cons, buf, size, idx);
+ 	if (size == 0 || (size & 3u) != 0 || !swl_f1_span_ok(end, sw, buf, size)) {
++		swl_gap("f1", "console buffer misaligned/outside the RAM window, not read", "medium");
+ 		printf("SWEET WLAN: F1 console buffer %#x size %u is not a word aligned part of the RAM window, not read\n", buf, size);
+ 		return 0;
+ 	}
+ 	if (idx > size) {                       /* review 0134 F5: DHD refuses a write index beyond the buffer as corrupt (dhd_pcie.c:4732-4734) */
++		swl_gap("f1", "console write index beyond size, not read", "medium");
+ 		printf("SWEET WLAN: F1 console write index %u beyond size %u (DHD refuses it), not read\n", idx, size);
+ 		return 0;
+ 	}
+@@ -1878,6 +2016,7 @@
+ 		x->f2p[2] = sd[SWW_SH_RINGINFO];
+ 		x->f2p[3] = sd[SWW_SH_CONSOLE];
+ 	} else {
++		swl_gap("f1", "shared structure not a readable range, not read", "high");
+ 		printf("SWEET WLAN: F1 shared structure %#x is not a readable range, not read\n", sh);
+ 	}
+ 	ok0 = swl_f1_block(x, sw, sd[SWW_SH_H2D_MB], 1, &mb[0]);
+@@ -1889,6 +2028,7 @@
+ 		printf("SWEET WLAN: F1 mailbox data: host to dongle [%#x] = %#x, dongle to host [%#x] = %#x\n", sd[SWW_SH_H2D_MB], mb[0], sd[SWW_SH_D2H_MB], mb[1]);
+ 		x->f1 |= SWW_F1_MB;
+ 	} else {
++		swl_miss("f1", SWL_M_F1_MB, "high");
+ 		printf("SWEET WLAN: F1 mailbox data pointers %#x %#x are not readable words, not read\n", sd[SWW_SH_H2D_MB], sd[SWW_SH_D2H_MB]);
+ 	}
+ 	rc = swl_f1_block(x, sw, sd[SWW_SH_RINGINFO], SWW_RI_WORDS, ri);
+@@ -1909,9 +2049,11 @@
+ 			}
+ 			x->f1 |= SWW_F1_RM;
+ 		} else {
++			swl_gap("f1", "ringmem_ptr not a readable range, not read", "high");
+ 			printf("SWEET WLAN: F1 ringmem_ptr %#x is not a readable range, not read\n", ri[0]);
+ 		}
+ 	} else {
++		swl_miss("f1", SWL_M_F1_RI, "high");
+ 		printf("SWEET WLAN: F1 rings_info_ptr %#x is not a readable range, not read\n", sd[SWW_SH_RINGINFO]);
+ 	}
+ 	if (swl_wpre(x)) {                      /* review 0134 F4: the firmware may have turned on bus mastering during the ~1100 reads */
+@@ -1955,6 +2097,7 @@
+ 	}
+ 	SWW_RD(x, SWW_CFG, 0, SWW_CFG_WIN2, c84);
+ 	if (c84 != 0) {
++		swl_gap("f2", "cfg 0x84 not 0, low window not read", "medium");
+ 		printf("SWEET WLAN: F2 low window: cfg 0x84 is %#x, not 0, not read\n", c84);
+ 		return 0;
+ 	}
+@@ -1965,6 +2108,7 @@
+ 		return swl_stop(x, SWW_E_DEAD);
+ 	}
+ 	if (w0 != want || want == 0xFFFFFFFFu) {
++		swl_gap("f2", "RAM changed while the CA7 ran, not read", "medium");
+ 		printf("SWEET WLAN: F2 the RAM changed while the CA7 ran, not read\n");
+ 		return 0;
+ 	}
+@@ -1988,6 +2132,7 @@
+ 		printf("SWEET WLAN: F2 mailbox data: host to dongle [%#x] = %#x, dongle to host [%#x] = %#x\n", x->f2p[0], mb[0], x->f2p[1], mb[1]);
+ 		x->f2 |= SWW_F2_MB;
+ 	} else {
++		swl_miss("f2", SWL_M_F2_MB, "high");
+ 		printf("SWEET WLAN: F2 mailbox data pointers %#x %#x are not readable words in window 0, not read\n", x->f2p[0], x->f2p[1]);
+ 	}
+ 	rc = swl_f1_block(x, 0, x->f2p[2], SWW_RI_WORDS, ri);
+@@ -2008,9 +2153,11 @@
+ 			}
+ 			x->f2 |= SWW_F2_RM;
+ 		} else {
++			swl_gap("f2", "ringmem_ptr not readable in window 0, not read", "high");
+ 			printf("SWEET WLAN: F2 ringmem_ptr %#x is not a readable range in window 0, not read\n", ri[0]);
+ 		}
+ 	} else {
++		swl_miss("f2", SWL_M_F2_RI, "high");
+ 		printf("SWEET WLAN: F2 rings_info_ptr %#x is not a readable range in window 0, not read\n", x->f2p[2]);
+ 	}
+ 	if (swl_wpre(x)) {
+@@ -2053,6 +2200,7 @@
+ 	}
+ 	SWW_RD(x, SWW_CFG, 0, SWW_CFG_WIN2, c84);
+ 	if (c84 != 0) {
++		swl_gap("f3", "live window: cfg 0x84 not 0, dumps not made", "medium");
+ 		printf("SWEET WLAN: F3 live window 0: cfg 0x84 is %#x, not 0, not read\n", c84);
+ 		return 0;
+ 	}
+@@ -2060,6 +2208,7 @@
+ 	want = x->img != NULL && x->img_len >= 4u ? swl_img_word(x, 0) : 0xFFFFFFFFu;
+ 	printf("SWEET WLAN: F3 live window 0: cfg 0x84 %#x, [%#x] %#x, image word 0 %#x (not required to be equal: the firmware runs)\n", c84, SWW_RAM_BASE, w0, want);
+ 	if (w0 == 0xFFFFFFFFu) {
++		swl_gap("f3", "RAM base reads all ones with the CA7 running, dumps not made", "high");
+ 		printf("SWEET WLAN: F3 [%#x] reads all ones with the CA7 running, window 0 dumps not made\n", SWW_RAM_BASE);
+ 		return 0;
+ 	}
+@@ -2139,6 +2288,7 @@
+ 	if (!x->halted) {
+ 		x->stopped = 1;
+ 		x->stop_code = SWW_E_HALT;
++		swl_gap("stop", "W17 STOP: CA7 re-halt not confirmed", "high");
+ 		printf("SWEET WLAN: W17 STOP: %s (code %d), restore=%s\n", swl_ename(SWW_E_HALT), SWW_E_HALT, swl_rsname(x->restore));
+ 		return -SWW_E_HALT;
+ 	}
+@@ -2150,6 +2300,7 @@
+ 			return rc;
+ 		}
+ 	} else if (x->level == SWW_F2_LEVEL) {
++		swl_gap("f2", "window 0 dumps not made", "medium");
+ 		printf("SWEET WLAN: F2 window 0 dumps not made, restore=%s\n", swl_rsname(x->restore));
+ 	}
+ 	if (x->level >= SWW_F1_LEVEL && x->restore == SWW_RS_OK) {   /* run F1 (review 0134 F1): the PCIe core group with the CA7 in reset */

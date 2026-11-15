@@ -1,0 +1,1025 @@
+sweet-ufs-irq (lowclk 2026-11-14; design: docs/research/154-ufs-completion-interrupt.md "Implementation spec", stages 0 and 1 only): UFS command completion by interrupt instead of polling, plus a read-only logging mode, both behind boot-arg sweetufsirq.
+Sources [read]: research 154 with its citations: Linux v6.6 drivers/ufs/core/ufshcd.c:6838-6877 (ufshcd_intr: read IS, W1C exactly the bits read, then service; completion = the UTRLDBR scan, :5465-5466), the gs101 devicetree (arch/arm64/boot/dts/exynos/google/gs101.dtsi ufs@14700000: GIC SPI 532, level high; INTID = SPI + 32 = 564, the convention patch 0347 proved with INTID 541), Linux include/ufs/ufshci.h (IS bit 0 UTRCS, offsets 0x20/0x24/0x4C/0x58), Fuchsia registers.h (UTRLCNR 0x64).
+sweetufsirq absent or 0 = polled exactly as before: no register access, no log line, no thread (an invalid value, including 3 = the error-bit stage that is NOT in this patch, logs a GAP and counts as 0). The boot-arg is parsed with the other ufs boot-args in sweet_ufs_init.
+sweetufsirq=2 (stage 0, read only): once, in a thread started after su.ready, under the driver lock with UTRLDBR == 0: READ UTRLDBR, UTRIACR (0x4C), UTRLCNR (0x64), IE, IS, VER and print them. In ufs_scsi, after the doorbell cleared and before the driver's own IS write: READ IS, count commands that finish with UTRCS set (is0), with any other bit set (isx), and when UTRCS is set read the OCS byte once and count how often it is still the 0x0f preset (ocs0f; research 154 U3). One row per 5 s: `SWEET UFS IRQ: ro cmds N is0 N (N/5s) isx N ocs0f N`. The polled path itself is unchanged.
+sweetufsirq=1 (stage 1, gs101 only): a kernel thread started after su.ready (so the root mount stays polled) takes the driver lock and arms, in this order: UTRLDBR must read 0 (else GAP, not armed); GIC attach of INTID 564 with the SPI DISABLED (patch 0346 sweet_spi_attach_off; rc != 0 = GAP, not armed); clear stale IS (W1C of the bits read); READ UTRIACR and log it (bit 31 = GAP, never written); the ONE NEW WRITE: IE := 0x1 (UTRCS only; the error bits are stage 2), read back (mismatch = disarm + GAP); sweet_spi_enable (failure = disarm + GAP); armed only then.
+ISR (interrupt context, no lock, no print): Linux order: read IS and IE, W1C exactly the bits read, read IS again (Linux :6862, read only, a still-set bit is only counted as isr_again), then if IS & IE has UTRCS: bump the sequence counter and thread_wakeup the waiter, return 0 (the line is dropped by the W1C, no DEFER); otherwise count a spurious entry. IS bits other than UTRCS are cleared with the rest and reported as a GAP by the next waiter (never silently discarded). Storm guard: more than 100 spurious entries (IS has no UTRCS) in one second: IE := 0, armed off, return 1 (the dispatcher masks INTID 564), the summary thread finishes the teardown with a loud GAP.
+Wait (ufs_scsi, only while armed and in thread context; every other caller keeps the old loop): seq0 is taken before the doorbell write; the doorbell write, the 5 s deadline and the timeout branch (UTRLCLR, ETIMEDOUT) are the old statements; the wait spins CMD_SPIN_NS reading UTRLDBR, then loops: assert_wait with a timeout of min(1 ms, time to the deadline), RE-READ UTRLDBR (clear = done, clear_wait, no block), else thread_block. poll_found counts a completion seen on a timeout wake with no interrupt since the command was issued. 200 consecutive commands with no interrupt at all disarm back to polling with a GAP. After the doorbell clears, while armed the blanket IS write is replaced by: read IS, NO write (the ISR is the only IS writer while armed, as in Linux; a waiter write raced the ISR and made real interrupts count as spurious, review 0354 finding 1), any other bit logged as a GAP; when not armed the driver's own IS write is unchanged. The UTRD write-back wait is unchanged.
+Summary row every 5 s while armed: `SWEET UFS IRQ: irqs N spurious N poll_found N cmds N mode irq|off:<why> ...`. Restart: sweet_clean_stop (patch 0083) calls sweet_ufs_irq_quiesce() after the filesystem sync: IE := 0, IS cleared, INTID detached (research 154 risk 7); every OTHER reset path (reboot(2), panic, sweetrestart timer, watchdog handler) goes through sweet_machine_reset_x, whose second statement (after the pets stop) calls sweet_ufs_irq_ie_off(): lock-free IE := 0 through the same judge row, only when IE holds our 0x1, no lock, no print, no detach (review finding 2). Quiesce without the driver lock after 100 ms logs one GAP line.
+Hardware access of this patch [the only NEW writes]: IE (0x24) := 0x1 once at arm time and := 0 at every disable (the value the driver already writes at take-over), IS (0x20) W1C of bits that were read set (ISR, arm, disarm; the waiter no longer writes IS while armed), IE := 0 once more at machine reset (lock-free), the GIC calls of patch 0346 for INTID 564 (attach_off, enable, detach). Reads: VER, IS, IE, UTRIACR, UTRLCNR, UTRLDBR. NO write to UTRIACR, UTRLCNR, UTMRLDBR, the vendor block or the UTRLDBR/UTRLCLR doorbell path beyond the existing statements.
+Judge: every register access of the new code goes through sui_rd/sui_wr of bsd/dev/sweet_ufs_irq.h: one allowlist (sui_rows[], offset/access/mode) plus value rules (IS: never 0 or 0xFFFFFFFF, only bits read set; IE: 0, or 0x1 only after the attach, before the enable, while IE is 0); a refused access never reaches the bus and disarms. Teardown steps are all tried and idempotent.
+Files: new bsd/dev/sweet_ufs_irq.h (pure core between SUI_CORE_BEGIN/END, host test tools/test_ufs_irq_core.py with a fake controller), bsd/dev/sweet_ufs.c (boot-arg, kernel ops, thread, the wait hook in ufs_scsi, sweet_ufs_irq_quiesce), bsd/dev/sweet_restart.c (one call). ufs_write_blocks and its bounds check are not touched. Needs patch 0346 (sweet_spi_attach_off / enable / detach) and every earlier patch that touches sweet_ufs.c (0028 ... 0341); diffed against the fully applied tree. ORDER: after 0351 (0346 for the GIC helpers, 0341 last toucher of sweet_ufs.c).
+NOT RUN ON HARDWARE (the kernel glue is built into the lowclk kernels but not host-run; no register of this patch has ever been touched on hardware). The new write path is UNREVIEWED: it needs the rule-8 Opus review (AGENTS.md rule 8) before it boots. The review fixes themselves (lock-free IE := 0 at machine reset, the ISR's IS re-read) are NOT re-reviewed. Review 0354 (docs/reviews/0354-ufs-irq-review.md) findings 1 to 4 are fixed here (ISR sole IS writer while armed, IE := 0 at machine reset, GAP texts and rate limits, IS re-read after the ISR's W1C); findings 5 (pe_fiq.c slot search, patch 0346) and 6 (return 1 counts in the global unhandled counter) are open. The ISR returns 0 (no DEFER) as research 154 s.5.2 suggests and returns 1 only on the storm / ISR-error path.
+diff --git a/bsd/dev/sweet_restart.c b/bsd/dev/sweet_restart.c
+index 7bced10..3a48096 100644
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -49,6 +49,7 @@ extern void sweet_thermal_start(void); /* bsd/dev/sweet_thermal.c (patch 0336) *
+ extern void sweet_stall_tick(int src);
+ extern void sweet_wdt_poll(int may_arm);
+ extern void sweet_wdt_stop_pets(void);   /* patch 0333: one atomic store, stops every pet/arm/timer tick for good */
++extern void sweet_ufs_irq_ie_off(void);   /* bsd/dev/sweet_ufs.c (patch 0354): lock-free IE := 0 when the UFS completion interrupt is on */
+ 
+ static uint64_t
+ sweet_pmu_write(uint64_t pa, uint64_t val)
+@@ -86,6 +87,7 @@ sweet_machine_reset_x(int to_bootloader, int test_skip_swreset)
+ 	uint64_t rc;
+ 
+ 	sweet_wdt_stop_pets();
++	sweet_ufs_irq_ie_off();         /* patch 0354: lock-free IE := 0 (UFS completion interrupt), only when it is on; no print, no lock; after the pets stop so a stall here cannot keep them alive */
+ 	if (to_bootloader) {
+ 		rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
+ 		if (rc != 0) {   /* patch 0309 (audit finding 4) */
+@@ -165,6 +167,7 @@ sweet_restart_poll(void)
+ }
+ 
+ extern int sync_internal(void);
++extern void sweet_ufs_irq_quiesce(void);   /* bsd/dev/sweet_ufs.c (patch 0354) */
+ static volatile int sweet_sync_done;
+ 
+ static void
+@@ -192,6 +195,7 @@ sweet_clean_stop(void)
+ 		}
+ 	}
+ 	printf("SWEET RESTART: sync %s after %d ms\n", sweet_sync_done ? "done" : "TIMED OUT", i * 100);
++	sweet_ufs_irq_quiesce();        /* patch 0354: IE back to 0 and the GIC handler detached before the reset; a no-op unless sweetufsirq=1 armed it */
+ }
+ 
+ static int sweet_reset_ready;       /* patch 0336: /sweet-reset node and both offsets parsed (sweet_restart_start) */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5265cc1..dbc750a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -203,6 +203,305 @@ dma_clean(uint32_t off, uint32_t len)
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/*
++ * patch 0354 (lowclk 2026-11-14): UFS command completion by interrupt, boot-arg sweetufsirq (docs/research/154). Absent or 0: nothing below runs, no register is touched, no line is
++ * printed (an invalid value logs a GAP and counts as 0). 2 = stage 0, reads only (IS/IE/UTRIACR/UTRLCNR/VER once, IS bit counts per polled command). 1 = stage 1: a kernel thread started
++ * after su.ready arms it (GIC INTID 564 = SPI 532 attached DISABLED, stale IS cleared, IE := 0x1 and read back, SPI enabled, armed last); the wait of ufs_scsi then sleeps on the
++ * interrupt with a 1 ms fallback wake. The logic (judge table, ISR, wait, counters, storm and no-interrupt auto-off) is bsd/dev/sweet_ufs_irq.h, host tested by
++ * tools/test_ufs_irq_core.py; this block is the kernel side of its ops. The write path (the block writer with its bounds check, the doorbell write, the timeout's UTRLCLR write) is not touched.
++ */
++#include "sweet_ufs_irq.h"
++#define SU_INTID 564u       /* gs101 UFS: GIC SPI 532 + 32 (research 154 s.2) */
++#define SU_ROW_NS (5ull * NSEC_PER_SEC)
++extern int sweet_spi_attach_off(uint32_t intid, int (*fn)(void *, uint32_t), void *arg, uint32_t rb[4]);   /* pexpert/arm/pe_fiq.c (patch 0346) */
++extern int sweet_spi_enable(uint32_t intid, uint32_t *en);
++extern int sweet_spi_detach(uint32_t intid);
++extern void sweet_spi_counts(uint32_t intid, uint64_t *handled, uint64_t *unhandled, uint32_t *unhandled_last);
++static struct sui sui;
++static struct sui_ops sui_kops;                 /* filled by sui_start() before anything can use it */
++static int sui_thr_evt, sui_idle_evt;           /* addresses only: the summary thread's wake event and its never-woken parking event */
++
++static int
++sui_k_rd(void *cx __unused, uint32_t off, uint32_t *v)
++{
++	*v = ufs_rd(off);
++	return 0;
++}
++
++static int
++sui_k_wr(void *cx __unused, uint32_t off, uint32_t v)
++{
++	ufs_wr(off, v);
++	__builtin_arm_dsb(0xf);
++	return 0;
++}
++
++static uint64_t
++sui_k_now(void *cx __unused)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static int
++sui_k_isr(void *arg __unused, uint32_t intid __unused)
++{
++	return sui_isr(&sui, &sui_kops, sui_k_now(NULL));
++}
++
++static int
++sui_k_attach(void *cx __unused, uint32_t rb[4])
++{
++	return sweet_spi_attach_off(SU_INTID, sui_k_isr, &su, rb);
++}
++
++static int
++sui_k_enable(void *cx __unused, uint32_t *en)
++{
++	return sweet_spi_enable(SU_INTID, en);
++}
++
++static int
++sui_k_detach(void *cx __unused)
++{
++	return sweet_spi_detach(SU_INTID);
++}
++
++static void
++sui_k_pause(void *cx __unused)
++{
++	delay(1);
++}
++
++static int
++sui_k_wait_begin(void *cx __unused, uint64_t wake_ns)
++{
++	uint64_t wake;
++
++	nanoseconds_to_absolutetime(wake_ns, &wake);
++	/* Keep the mutex: the slot and the bounce buffer are still owned (same as the ufswait sleep). */
++	return assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING;
++}
++
++static void
++sui_k_wait_cancel(void *cx __unused)
++{
++	clear_wait(current_thread(), THREAD_AWAKENED);
++}
++
++static int
++sui_k_block(void *cx __unused)
++{
++	return thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT;
++}
++
++static void
++sui_k_wake(void *cx __unused)
++{
++	thread_wakeup((event_t)&su.wait);              /* ISR safe: the Wi-Fi and Mali ISRs wake their threads the same way */
++}
++
++static void
++sui_k_kick(void *cx __unused)
++{
++	thread_wakeup((event_t)&sui_thr_evt);
++}
++
++static uint32_t
++sui_k_ocs(void *cx __unused)
++{
++	const unsigned slot = su.gs101 ? 1 : 0;
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL) + slot;
++
++	dma_sync(DMA_UTRL + slot * sizeof(*utrd), sizeof(*utrd));
++	return utrd->dw2 & 0xff;
++}
++
++static void
++sui_k_note(void *cx __unused, int code, uint32_t a, uint32_t b)
++{
++	switch (code) {
++	case SUI_N_ATTACH1:
++		printf("SWEET UFS IRQ: attach INTID %u (SPI left disabled) group %u enabled %u\n", SU_INTID, a, b);
++		break;
++	case SUI_N_ATTACH2:
++		printf("SWEET UFS IRQ: attach icfgr %#x irouter %#x\n", a, b);
++		break;
++	case SUI_N_UTRIACR:
++		printf("SWEET UFS IRQ: UTRIACR %#x (read only, never written)\n", a);
++		break;
++	case SUI_N_RO1:
++		printf("SWEET UFS IRQ: ro UTRIACR %#x UTRLCNR %#x\n", a, b);
++		break;
++	case SUI_N_RO2:
++		printf("SWEET UFS IRQ: ro IE %#x IS %#x\n", a, b);
++		break;
++	case SUI_N_RO3:
++		printf("SWEET UFS IRQ: ro VER %#x UTRLDBR %#x\n", a, b);
++		break;
++	case SUI_N_ARMED:
++		printf("SWEET UFS IRQ: ARMED INTID %u, IE %#x (UTRCS only), 1 ms fallback wake, off after >%u spurious entries/s or %u commands with no interrupt, polling kept as fallback\n",
++		    SU_INTID, a, SUI_STORM_MAX, SUI_NOIRQ_MAX);
++		break;
++	case SUI_N_QUIESCE:
++		printf("SWEET UFS IRQ: off (restart): IE 0, INTID %u detached, irqs %u\n", SU_INTID, a);
++		break;
++	case SUI_G_ARM_BUSY:
++		printf("SWEET UFS IRQ GAP: UTRLDBR %#x: a command is in flight, not armed (stage 0 reads on)\n", a);
++		break;
++	case SUI_G_ATTACH:
++		printf("SWEET UFS IRQ GAP: GIC attach of INTID %u failed rc %u (19 no GICD, 22 bad or duplicate INTID, 28 no slot): not armed, polling\n", SU_INTID, a);
++		break;
++	case SUI_G_AGGR:
++		printf("SWEET UFS IRQ GAP: UTRIACR %#x has bit 31 (interrupt aggregation) set: not written; completions may be coalesced, the 1 ms fallback wake covers it\n", a);
++		break;
++	case SUI_G_IE_RB:
++		printf("SWEET UFS IRQ GAP: IE reads back %#x after the write of 0x1: disarming, polling\n", a);
++		break;
++	case SUI_G_ENABLE:
++		printf("SWEET UFS IRQ GAP: SPI enable of INTID %u failed rc %u (ISENABLER bit %u): disarming, polling\n", SU_INTID, a, b);
++		break;
++	case SUI_G_REFUSED:
++		printf("SWEET UFS IRQ GAP: register access refused by the judge (offset %#x): disarming, polling\n", a);
++		break;
++	case SUI_G_BUS:
++		printf("SWEET UFS IRQ GAP: register access failed (offset %#x): disarming, polling\n", a);
++		break;
++	case SUI_G_ARM_ACC:
++		printf("SWEET UFS IRQ GAP: register read of offset %#x %s before anything was attached or written: not armed, polling\n", a, b ? "refused by the judge" : "failed");
++		break;
++	case SUI_G_ACCESS:
++		printf("SWEET UFS IRQ GAP: %s of offset %#x %s (place %u: 1 ack, 2 read-only per command, 3 read-only init); interrupt mode unchanged, polling carries on as before (rate limited)\n",
++		    "read", a, (b & 1u) ? "refused by the judge" : "failed", b >> 8);
++		break;
++	case SUI_G_OFF:
++		printf("SWEET UFS IRQ GAP: interrupt mode OFF (%s): IE 0, INTID %u detached, irqs %u; polling carries every command\n", sui_mode_str(&sui), SU_INTID, b);
++		break;
++	case SUI_G_OTHER_IS:
++		printf("SWEET UFS IRQ GAP: IS bits other than UTRCS seen: %#x (count %u); stage 1 enables UTRCS only, the ISR clears what it reads\n", a, b);
++		break;
++	default:
++		printf("SWEET UFS IRQ GAP: teardown step %u failed (%u): 1 IE := 0, 2 IS read/clear, 3 GIC detach\n", a, b);
++		break;
++	}
++}
++
++static void
++sui_row(void)
++{
++	static uint32_t last_is0;
++	if (sui.mode == SUI_MODE_RO) {
++		printf("SWEET UFS IRQ: ro cmds %u is0 %u (%u/5s) isx %u ocs0f %u\n", sui.ro_cmds, sui.ro_is0, sui.ro_is0 - last_is0, sui.ro_isx, sui.ro_ocs0f);
++		last_is0 = sui.ro_is0;
++		return;
++	}
++	uint64_t h, u;
++	uint32_t ul;
++	sweet_spi_counts(SU_INTID, &h, &u, &ul);
++	printf("SWEET UFS IRQ: irqs %u spurious %u poll_found %u cmds %u mode %s fast %u tmo_wakes %u isr %u refused %u noirq_run %u isr_again %u gic_handled %llu gic_unhandled %llu\n",
++	    sui.irqs, sui.spurious, sui.poll_found, sui.cmds, sui_mode_str(&sui), sui.fast, sui.tmo_wakes, sui.isr_total, sui.refused, sui.noirq_run, sui.isr_again, h, u);
++}
++
++/* Summary thread (thread context): arms (stage 1) or reads (stage 0) once under the driver lock, then one row per 5 s while there is something to report; the ISR's storm disable
++ * wakes it to finish the teardown. After the mode went off it prints the final row and parks. Started after su.ready, so the root mount stays polled. */
++static void
++sui_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	lck_mtx_lock(&sweet_ufs_lock);
++	if (sui.mode == SUI_MODE_ON) {
++		(void)sui_arm(&sui, &sui_kops);
++	} else {
++		(void)sui_ro_init(&sui, &sui_kops);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	for (;;) {
++		uint64_t dl;
++		bool live = sui.mode == SUI_MODE_RO || sui.armed;
++
++		nanoseconds_to_absolutetime(SU_ROW_NS, &dl);
++		dl += mach_absolute_time();
++		if (live && assert_wait_deadline((event_t)&sui_thr_evt, THREAD_UNINT, dl) == THREAD_WAITING) {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++		if (sui.off_pending) {
++			lck_mtx_lock(&sweet_ufs_lock);
++			sui_finish(&sui, &sui_kops);
++			lck_mtx_unlock(&sweet_ufs_lock);
++		}
++		sui_row();
++		if (sui.mode == SUI_MODE_ON && !sui.armed) {
++			break;
++		}
++	}
++	for (;;) {
++		if (assert_wait((event_t)&sui_idle_evt, THREAD_UNINT) == THREAD_WAITING) {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
++static void
++sui_start(void)
++{
++	thread_t thread;
++
++	if (sui.mode == SUI_MODE_0) {
++		return;
++	}
++	if (sui.mode == SUI_MODE_ON && !su.gs101) {
++		printf("SWEET UFS IRQ GAP: sweetufsirq=1 needs the gs101 host (INTID %u is its UFS SPI): ignored, polling\n", SU_INTID);
++		sui.mode = SUI_MODE_0;
++		return;
++	}
++	sui_kops = (struct sui_ops){
++		.ctx = NULL, .rd = sui_k_rd, .wr = sui_k_wr, .spi_attach_off = sui_k_attach, .spi_enable = sui_k_enable, .spi_detach = sui_k_detach,
++		.now = sui_k_now, .pause = sui_k_pause, .wait_begin = sui_k_wait_begin, .wait_cancel = sui_k_wait_cancel, .block = sui_k_block,
++		.wake = sui_k_wake, .kick = sui_k_kick, .ocs = sui_k_ocs, .note = sui_k_note,
++	};
++	if (kernel_thread_start(sui_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET UFS IRQ GAP: sweetufsirq=%u: could not start the thread, polling\n", sui.mode);
++		sui.mode = SUI_MODE_0;
++	}
++}
++
++/* Called by sweet_clean_stop (patch 0083 sweet_restart.c) after the filesystem sync and before the reset: IE back to 0 so a reset never starts with our enable set (research 154 risk 7).
++ * Waits up to 100 ms for the driver lock; after that it disarms WITHOUT it (the sync may have TIMED OUT with a sync-thread command still holding the lock, and a restart must not hang on
++ * it). That is safe here: the disarm only writes IE := 0 and IS (the same value rules as under the lock) and detaches the handler, nothing the command in flight depends on; a line says so. */
++void sweet_ufs_irq_quiesce(void);
++void
++sweet_ufs_irq_quiesce(void)
++{
++	bool locked = false;
++
++	if (sui.mode != SUI_MODE_ON || (!sui.armed && !sui.ie_on && !sui.spi_att)) {
++		return;
++	}
++	for (int i = 0; i < 100 && !(locked = lck_mtx_try_lock(&sweet_ufs_lock)); i++) {
++		delay(1000);
++	}
++	if (!locked) {
++		printf("SWEET UFS IRQ GAP: quiesce without the driver lock (still held after 100 ms: a command is in flight, the sync may have timed out): IE := 0 and the detach are done anyway\n");
++	}
++	sui_disarm(&sui, &sui_kops, SUI_Y_RESTART);
++	if (locked) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
++}
++
++/* Called first thing in sweet_machine_reset_x (patch 0083 sweet_restart.c, after the pets stop), on EVERY software reset path (reboot(2), panic, sweetrestart, sweetremote): lock-free IE := 0 when
++ * our enable is set (review 0354 finding 2). Reset or panic context: no lock, no wait, no print (a print could fault there, nothing is logged), no detach; one MMIO write through the same
++ * judge row as the disarm (register 0x24, value 0). Not called with the sync done: sweet_clean_stop's quiesce above already did the full teardown on the clean paths. */
++void sweet_ufs_irq_ie_off(void);
++void
++sweet_ufs_irq_ie_off(void)
++{
++	sui_ie_off(&sui, &sui_kops);
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -272,6 +571,12 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	/* patch 0354: the interrupt wait only while armed, in thread context; seq0 is taken BEFORE the doorbell write */
++	const bool irq_wait = sui.mode == SUI_MODE_ON && os_atomic_load(&sui.armed, acquire) && su.ready && ml_get_interrupts_enabled() &&
++	    !ml_at_interrupt_context() && get_preemption_level() == 0;
++	if (irq_wait) {
++		sui_begin(&sui);
++	}
+ 	ufs_wr(REG_UTRLDBR, slot_bit);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -284,7 +589,19 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
+-	while (ufs_rd(REG_UTRLDBR) & slot_bit) {
++	int irqw = SUI_W_POLL;      /* patch 0354: SUI_W_DONE = the interrupt wait finished the command, the loop below then does not run */
++	if (irq_wait) {
++		uint64_t deadline_ns;
++
++		absolutetime_to_nanoseconds(deadline, &deadline_ns);
++		irqw = sui_wait(&sui, &sui_kops, slot_bit, CMD_SPIN_NS, deadline_ns);
++		if (irqw == SUI_W_TIMEOUT) {
++			ufs_wr(REG_UTRLCLR, su.gs101 ? slot_bit : ~slot_bit);
++			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			return ETIMEDOUT;
++		}
++	}
++	while (irqw != SUI_W_DONE && (ufs_rd(REG_UTRLDBR) & slot_bit)) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			/* gs101 has an inverted UTRLCLR (write the slot mask); standard hosts want ~mask */
+@@ -304,7 +621,12 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	sui_ro_cmd(&sui, &sui_kops);            /* patch 0354, stage 0 only (returns at once otherwise): READ IS before the write below, count UTRCS set, OCS still 0x0f */
++	if (irqw == SUI_W_DONE && os_atomic_load(&sui.armed, acquire)) {
++		sui_ack(&sui, &sui_kops);       /* patch 0354: READ only, any non-UTRCS IS bit is logged; the ISR is the only IS writer while armed */
++	} else {
++		ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	}
+ 
+ 	/* gs101: the UTRD write-back can land a little after the doorbell clears */
+ 	for (int w = 0; su.gs101 && w < 100; w++) {
+@@ -738,6 +1060,15 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	{
++		/* patch 0354: absent or 0 = nothing runs; 1 = interrupt wait; 2 = read only; anything else is a GAP and counts as 0 */
++		uint32_t irqv = 0;
++		int bad = 0;
++		sui.mode = (uint8_t)sui_mode_from_arg(PE_parse_boot_argn("sweetufsirq", &irqv, sizeof(irqv)), irqv, &bad);
++		if (bad) {
++			printf("SWEET UFS IRQ GAP: sweetufsirq=%u is not 0, 1 or 2 (3 = error bits is not in this build): ignored, polling only, no interrupt register is touched\n", irqv);
++		}
++	}
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -801,6 +1132,7 @@ sweet_ufs_init(void)
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
+ 	sweet_wlan_init();            /* no-op without boot-arg sweetwlan= */
+ 	sweet_bt_init();              /* no-op (one GAP line) without the ADT node /bluetooth */
++	sui_start();                  /* patch 0354: no-op without boot-arg sweetufsirq=1|2; arms from its own thread, after su.ready */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_ufs_irq.h b/bsd/dev/sweet_ufs_irq.h
+new file mode 100644
+index 0000000..6a4f6c3
+--- /dev/null
++++ b/bsd/dev/sweet_ufs_irq.h
+@@ -0,0 +1,589 @@
++/* sweet_ufs_irq.h - patch 0354 (lowclk 2026-11-14): UFS command completion by interrupt (stage 1) and its read-only logging mode (stage 0), behind boot-arg sweetufsirq.
++ * Sources: docs/research/154-ufs-completion-interrupt.md (its "Implementation spec" is the contract); Linux v6.6 drivers/ufs/core/ufshcd.c:6838-6877 (ufshcd_intr: read IS, W1C
++ * the bits read, then service) and :5465-5466 (completion = the doorbell scan); gs101: GIC SPI 532 (arch/arm64/boot/dts/exynos/google/gs101.dtsi, ufs@14700000), INTID 564.
++ * sweetufsirq absent or 0 = nothing in this file runs (every entry point returns before any register access). 2 = read-only logging: only READS of VER, IS, IE, UTRIACR,
++ * UTRLCNR, UTRLDBR. 1 = stage 1: IE := 0x1 (UTRCS only), the ISR, the interrupt wait. Stage 2 (error bits) is NOT in this patch.
++ *
++ * The block between SUI_CORE_BEGIN and SUI_CORE_END is pure C (no kernel type, no printf, no MMIO): tools/test_ufs_irq_core.py compiles it with the host compiler and drives it
++ * with a fake controller. The kernel glue (struct sui_ops implementations, the GIC calls of patch 0346, assert_wait / thread_block, the log lines) is in sweet_ufs.c.
++ *
++ * EVERY register access of this feature goes through sui_rd() / sui_wr(): one table (sui_rows[], offset/access/mode) plus the value rules of sui_value_ok(), independent of the
++ * driver's own ufs_rd/ufs_wr. A refused access is counted and never reaches the bus. The write path of the driver (doorbell, UTRLCLR, UTRD/PRDT, ufs_write_blocks) is untouched.
++ * Not run on hardware. */
++#ifndef SWEET_UFS_IRQ_H
++#define SWEET_UFS_IRQ_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* SUI_CORE_BEGIN */
++/* Registers (offsets from the HCI base; Linux include/ufs/ufshci.h REG_* enum, research 154 s.3.1; the driver's own #defines agree for IS/IE/UTRLDBR). */
++#define SUI_REG_VER       0x08u
++#define SUI_REG_IS        0x20u
++#define SUI_REG_IE        0x24u
++#define SUI_REG_UTRIACR   0x4Cu   /* read only, logged once (research 154 s.4); never written */
++#define SUI_REG_UTRLDBR   0x58u   /* read only here: the driver's own doorbell write is not part of this file */
++#define SUI_REG_UTRLCNR   0x64u   /* read only, logged once (UFSHCI 3.0 s.5.4.6 per Fuchsia registers.h; Linux does not use it) */
++#define SUI_UTRCS         0x1u    /* IS bit 0: UTP transfer request completion; the only enabled source of stage 1 */
++#define SUI_IE_STAGE1     0x1u
++
++enum { SUI_R = 1, SUI_W = 2 };
++enum { SUI_MODE_0 = 0, SUI_MODE_ON = 1, SUI_MODE_RO = 2 };
++enum { SUI_W_DONE = 0, SUI_W_TIMEOUT = 1, SUI_W_POLL = 2 };   /* sui_wait results: done / the caller's 5 s deadline passed / fall back to the caller's own polled loop */
++enum { SUI_E_REFUSED = -2, SUI_E_BUS = -1 };
++
++/* why the mode went off (first reason wins) */
++enum { SUI_Y_NONE = 0, SUI_Y_STORM, SUI_Y_NOIRQ, SUI_Y_IE_RB, SUI_Y_ENABLE, SUI_Y_REFUSED, SUI_Y_BUS, SUI_Y_RESTART, SUI_Y_ARM_BUSY, SUI_Y_ATTACH, SUI_Y_ISRERR };
++
++/* note codes for the log (the glue turns them into lines; codes from SUI_G_FIRST on are GAP lines) */
++enum {
++	SUI_N_ATTACH1 = 1,     /* a = rb[0] (IGROUPR bit), b = rb[1] (ISENABLER bit, 0 expected) */
++	SUI_N_ATTACH2,         /* a = rb[2] (ICFGR word), b = rb[3] (IROUTER low word) */
++	SUI_N_UTRIACR,         /* a = UTRIACR */
++	SUI_N_RO1,             /* a = UTRIACR, b = UTRLCNR */
++	SUI_N_RO2,             /* a = IE, b = IS */
++	SUI_N_RO3,             /* a = VER, b = UTRLDBR */
++	SUI_N_ARMED,           /* a = IE read back */
++	SUI_N_QUIESCE,         /* the mode was turned off because the system restarts (not a failure) */
++	SUI_G_FIRST,
++	SUI_G_ARM_BUSY = SUI_G_FIRST, /* a = UTRLDBR: a command is in flight, not armed */
++	SUI_G_ATTACH,          /* a = rc of the GIC attach (19 no GICD, 22 bad or duplicate INTID, 28 no slot), not armed */
++	SUI_G_AGGR,            /* a = UTRIACR with bit 31 (aggregation enabled) set: logged, not written */
++	SUI_G_IE_RB,           /* a = IE read back (expected 1) */
++	SUI_G_ENABLE,          /* a = rc of the SPI enable, b = ISENABLER bit read back */
++	SUI_G_REFUSED,         /* a = offset, b = access: the judge refused */
++	SUI_G_BUS,             /* a = offset: a register access failed */
++	SUI_G_OFF,             /* a = SUI_Y_*, b = irqs: back to polling (loud) */
++	SUI_G_OTHER_IS,        /* a = IS bits other than UTRCS seen (acked by the ISR, not enabled), b = count so far */
++	SUI_G_TEARDOWN,        /* a = step: 1 IE := 0, 2 IS read/W1C, 3 GIC detach */
++	SUI_G_ACCESS,          /* a = offset, b = place << 8 | refused (1 = the judge refused, 0 = bus failure; place 1 ack, 2 ro per command, 3 ro once): a READ of the ack / read-only path failed; the interrupt mode is UNCHANGED (rate limited) */
++	SUI_G_ARM_ACC          /* a = offset, b = 1 refused / 0 bus failure: the very first read of the arm (UTRLDBR) failed; nothing was attached or written, not armed, polling */
++};
++
++#define SUI_STORM_MAX     100u              /* ISR entries without UTRCS in IS in a one-second window above which the mode turns itself off (spec; the number is a guess, research 154 s.5.6) */
++#define SUI_NOIRQ_MAX     200u              /* consecutive commands with no interrupt at all, then off (same number as the GPU's 200 jobs and SWI_NOIRQ_MAX, patch 0347) */
++#define SUI_FALLBACK_NS   1000000ull        /* the timed fallback wake of one wait: 1 ms (spec 5.4) */
++#define SUI_WIN_NS        1000000000ull     /* the storm window */
++#define SUI_OTHER_LOG     8u                /* GAP lines for IS bits other than UTRCS: the first 8, then every 1024th */
++
++struct sui_ops {
++	void *ctx;
++	int (*rd)(void *ctx, uint32_t off, uint32_t *v);               /* 0 = ok */
++	int (*wr)(void *ctx, uint32_t off, uint32_t v);                /* 0 = ok, store done and ordered (dsb) */
++	int (*spi_attach_off)(void *ctx, uint32_t rb[4]);              /* GIC attach, SPI left DISABLED; rb = IGROUPR/ISENABLER/ICFGR/IROUTER; 0 = ok else the helper's rc */
++	int (*spi_enable)(void *ctx, uint32_t *enabled_rb);            /* first enable; 0 = ok */
++	int (*spi_detach)(void *ctx);                                  /* 0 = ok */
++	uint64_t (*now)(void *ctx);                                    /* ns */
++	void (*pause)(void *ctx);                                      /* one spin step (delay(1)) */
++	int (*wait_begin)(void *ctx, uint64_t wake_ns);                /* assert_wait with a timeout; 1 = waiting (a block is needed), 0 = not waiting */
++	void (*wait_cancel)(void *ctx);                                /* clear_wait after wait_begin returned 1 */
++	int (*block)(void *ctx);                                       /* thread_block: 1 = woken by the timeout, 0 = woken by a wakeup */
++	void (*wake)(void *ctx);                                       /* thread_wakeup of the waiter's event (ISR safe) */
++	void (*kick)(void *ctx);                                       /* thread_wakeup of the summary thread's event (ISR safe) */
++	uint32_t (*ocs)(void *ctx);                                    /* stage 0: the OCS byte of the finished command's UTRD (after the cache sync) */
++	void (*note)(void *ctx, int code, uint32_t a, uint32_t b);
++};
++
++struct sui {
++	uint8_t mode;                   /* SUI_MODE_*, set once */
++	volatile uint8_t armed;         /* the wait may use the interrupt (set last by sui_arm, cleared first by every disable) */
++	volatile uint8_t ie_on;         /* IE holds our 0x1 and has not been written back to 0 */
++	uint8_t spi_att;                /* the GIC handler is attached and not yet detached */
++	volatile uint8_t why;           /* SUI_Y_*: first disable reason */
++	volatile uint8_t off_pending;   /* the ISR turned the mode off: a thread has to finish the teardown (IS, detach) */
++	uint8_t off_noted;
++	volatile uint32_t isr_total, isr_seq, irqs, spurious, isr_err, refused, err_is, isr_again;
++	volatile uint32_t is_union;     /* OR of every IS value read: the base of the IS write rule (only bits that were seen set may be written back) */
++	uint64_t win_start;
++	uint32_t win_n;                 /* ISR: entries without UTRCS in the current window */
++	/* thread (waiter holds the driver lock) */
++	uint32_t cmds, hits, poll_found, fast, tmo_wakes, noirq_run, mark, seq0, other_n, acc_n;
++	/* stage 0 */
++	uint32_t ro_cmds, ro_is0, ro_isx, ro_ocs0f;
++};
++
++struct sui_row { uint8_t acc, modes; uint16_t off; };
++#define SUI_MB(m) ((uint8_t)(1u << (m)))
++
++/* The allowlist: nothing outside these rows is ever accessed by this feature. Reads in both modes; the only writes are IS (W1C) and IE, only in mode ON. UTRIACR (0x4C), UTRLCNR (0x64),
++ * UTMRLDBR (0x78), UTRLDBR/UTRLCLR (0x58/0x5C writes), the vendor block: no write row. */
++static const struct sui_row sui_rows[] = {
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_VER },
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_IS },
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_IE },
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_UTRIACR },
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_UTRLDBR },
++	{ SUI_R, SUI_MB(SUI_MODE_ON) | SUI_MB(SUI_MODE_RO), SUI_REG_UTRLCNR },
++	{ SUI_W, SUI_MB(SUI_MODE_ON),                       SUI_REG_IS },
++	{ SUI_W, SUI_MB(SUI_MODE_ON),                       SUI_REG_IE },
++};
++
++/* Value rules of the two write rows. IS: W1C of bits that were read set (never a blanket 0xFFFFFFFF, never 0); the waiter does not write IS while armed (review 0354 finding 1), so there
++ * is no "exactly UTRCS" clause any more: a write of 0x1 needs a read that saw it set. IE: 0 (the existing value, always
++ * allowed) or 0x1 (UTRCS only), the latter only after the GIC attach, before the enable, while IE is still 0. */
++static int
++sui_value_ok(const struct sui *st, uint32_t off, uint32_t v)
++{
++	if (off == SUI_REG_IS) {
++		uint32_t seen = __atomic_load_n(&st->is_union, __ATOMIC_RELAXED);
++		return v != 0u && v != 0xFFFFFFFFu && (seen & v) == v;
++	}
++	if (off == SUI_REG_IE) {
++		return v == 0u || (v == SUI_IE_STAGE1 && st->spi_att && !st->ie_on && !st->armed);
++	}
++	return 0;
++}
++
++static int
++sui_judge(const struct sui *st, int acc, uint32_t off, uint32_t v)
++{
++	for (size_t i = 0; i < sizeof sui_rows / sizeof sui_rows[0]; i++) {
++		if (sui_rows[i].off == off && sui_rows[i].acc == acc && (sui_rows[i].modes & SUI_MB(st->mode))) {
++			return acc == SUI_R || sui_value_ok(st, off, v);
++		}
++	}
++	return 0;
++}
++
++static int
++sui_rd(struct sui *st, const struct sui_ops *o, uint32_t off, uint32_t *v)
++{
++	if (!sui_judge(st, SUI_R, off, 0u)) {
++		__atomic_fetch_add(&st->refused, 1u, __ATOMIC_RELAXED);
++		return SUI_E_REFUSED;
++	}
++	if (o->rd(o->ctx, off, v) != 0) {
++		return SUI_E_BUS;
++	}
++	if (off == SUI_REG_IS) {
++		__atomic_fetch_or(&st->is_union, *v, __ATOMIC_RELAXED);
++	}
++	return 0;
++}
++
++static int
++sui_wr(struct sui *st, const struct sui_ops *o, uint32_t off, uint32_t v)
++{
++	if (!sui_judge(st, SUI_W, off, v)) {
++		__atomic_fetch_add(&st->refused, 1u, __ATOMIC_RELAXED);
++		return SUI_E_REFUSED;
++	}
++	if (o->wr(o->ctx, off, v) != 0) {
++		return SUI_E_BUS;
++	}
++	if (off == SUI_REG_IE) {
++		st->ie_on = v != 0u;
++	}
++	return 0;
++}
++
++/* boot-arg value to mode: absent or 0 = 0; 1 = ON; 2 = RO; anything else (3 = stage 2 is not in this patch) = 0 and *gap = 1 */
++static int
++sui_mode_from_arg(int present, uint32_t v, int *gap)
++{
++	*gap = 0;
++	if (!present || v == 0u) {
++		return SUI_MODE_0;
++	}
++	if (v == 1u) {
++		return SUI_MODE_ON;
++	}
++	if (v == 2u) {
++		return SUI_MODE_RO;
++	}
++	*gap = 1;
++	return SUI_MODE_0;
++}
++
++/* "irq" while armed, "ro" in the read-only mode, "off:<why>" after a disable, "idle" otherwise (never armed, nothing wrong). Not a pure function of the arm state: the first reason sticks. */
++static const char *
++sui_mode_str(const struct sui *st)
++{
++	static const char *const off[] = { "off:none", "off:storm", "off:noirq", "off:ie-readback", "off:spi-enable", "off:refused", "off:bus", "off:restart", "off:busy", "off:attach", "off:isr" };
++	if (st->mode == SUI_MODE_RO) {
++		return "ro";
++	}
++	if (st->why != SUI_Y_NONE && st->why < sizeof off / sizeof off[0]) {
++		return off[st->why];
++	}
++	return st->armed ? "irq" : "idle";
++}
++
++static void
++sui_first_why(struct sui *st, unsigned y)
++{
++	uint8_t none = SUI_Y_NONE;
++	__atomic_compare_exchange_n(&st->why, &none, (uint8_t)y, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++}
++
++/* Disable, thread context, every step tried even if an earlier one failed: (a) IE := 0 (stops the source) (b) the wr op ends with the dsb (c) IS read and W1C of the bits read
++ * (d) GIC detach (e) armed = 0 (f) one GAP line. Idempotent: a step runs only while its own state flag says it is still needed. The ISR may have done (a) already (storm). */
++static void
++sui_disarm(struct sui *st, const struct sui_ops *o, unsigned why)
++{
++	uint32_t is = 0;
++	int touched = st->ie_on || st->spi_att;
++
++	__atomic_store_n(&st->armed, 0, __ATOMIC_RELEASE);
++	sui_first_why(st, why);
++	if (st->ie_on && sui_wr(st, o, SUI_REG_IE, 0u) != 0) {
++		o->note(o->ctx, SUI_G_TEARDOWN, 1u, 0u);
++	}
++	if (touched) {
++		if (sui_rd(st, o, SUI_REG_IS, &is) != 0) {
++			o->note(o->ctx, SUI_G_TEARDOWN, 2u, 0u);
++		} else if (is != 0u && sui_wr(st, o, SUI_REG_IS, is) != 0) {
++			o->note(o->ctx, SUI_G_TEARDOWN, 2u, 1u);
++		}
++	}
++	if (st->spi_att) {
++		if (o->spi_detach(o->ctx) != 0) {
++			o->note(o->ctx, SUI_G_TEARDOWN, 3u, 0u);
++		}
++		st->spi_att = 0;
++	}
++	st->off_pending = 0;
++	if (!st->off_noted) {
++		st->off_noted = 1;
++		if (st->why == SUI_Y_RESTART) {
++			o->note(o->ctx, SUI_N_QUIESCE, st->irqs, 0u);
++		} else {
++			o->note(o->ctx, SUI_G_OFF, st->why, st->irqs);
++		}
++	}
++}
++
++/* Arm (stage 1), thread context, the driver lock held. Order of research 154 s.8: (1) no command in flight (2) GIC attach with the SPI DISABLED (3) clear stale IS (4) read UTRIACR and
++ * log it (bit 31 = GAP, not written) (5) IE := 0x1 and read it back (6) SPI enable (7) armed, only now. Returns 0 armed, -1 not armed (a GAP was logged). */
++static int
++sui_arm(struct sui *st, const struct sui_ops *o)
++{
++	uint32_t v = 0, rb[4] = { 0, 0, 0, 0 }, en = 0, is = 0, foff = SUI_REG_UTRLDBR;   /* foff = the register of the access that failed (review 0354 finding 3d) */
++	int r;
++
++	if (st->mode != SUI_MODE_ON) {
++		return -1;
++	}
++	r = sui_rd(st, o, SUI_REG_UTRLDBR, &v);
++	if (r != 0) {
++		goto early_bus;
++	}
++	if (v != 0u) {
++		sui_first_why(st, SUI_Y_ARM_BUSY);
++		o->note(o->ctx, SUI_G_ARM_BUSY, v, 0u);
++		return -1;
++	}
++	r = o->spi_attach_off(o->ctx, rb);
++	if (r != 0) {
++		sui_first_why(st, SUI_Y_ATTACH);
++		o->note(o->ctx, SUI_G_ATTACH, (uint32_t)r, 0u);
++		return -1;
++	}
++	st->spi_att = 1;
++	o->note(o->ctx, SUI_N_ATTACH1, rb[0], rb[1]);
++	o->note(o->ctx, SUI_N_ATTACH2, rb[2], rb[3]);
++	foff = SUI_REG_IS;
++	if ((r = sui_rd(st, o, SUI_REG_IS, &is)) != 0) {
++		goto fail_bus;
++	}
++	if (is != 0u && (r = sui_wr(st, o, SUI_REG_IS, is)) != 0) {
++		goto fail_bus;
++	}
++	foff = SUI_REG_UTRIACR;
++	if ((r = sui_rd(st, o, SUI_REG_UTRIACR, &v)) != 0) {
++		goto fail_bus;
++	}
++	o->note(o->ctx, SUI_N_UTRIACR, v, 0u);
++	if (v & 0x80000000u) {
++		o->note(o->ctx, SUI_G_AGGR, v, 0u);
++	}
++	foff = SUI_REG_IE;
++	if ((r = sui_wr(st, o, SUI_REG_IE, SUI_IE_STAGE1)) != 0) {
++		goto fail_bus;
++	}
++	if ((r = sui_rd(st, o, SUI_REG_IE, &v)) != 0) {
++		goto fail_bus;
++	}
++	if (v != SUI_IE_STAGE1) {
++		o->note(o->ctx, SUI_G_IE_RB, v, 0u);
++		sui_disarm(st, o, SUI_Y_IE_RB);
++		return -1;
++	}
++	o->note(o->ctx, SUI_N_ARMED, v, 0u);
++	r = o->spi_enable(o->ctx, &en);
++	if (r != 0 || en != 1u) {
++		o->note(o->ctx, SUI_G_ENABLE, (uint32_t)r, en);
++		sui_disarm(st, o, SUI_Y_ENABLE);
++		return -1;
++	}
++	__atomic_store_n(&st->armed, 1, __ATOMIC_RELEASE);
++	return 0;
++fail_bus:
++	o->note(o->ctx, r == SUI_E_REFUSED ? SUI_G_REFUSED : SUI_G_BUS, foff, 0u);   /* here the arm had attached and may have written: sui_disarm undoes it, the GAP text says "disarming" */
++	sui_disarm(st, o, SUI_Y_BUS);
++	return -1;
++early_bus:
++	o->note(o->ctx, SUI_G_ARM_ACC, SUI_REG_UTRLDBR, r == SUI_E_REFUSED ? 1u : 0u);   /* nothing attached or written yet: not "disarming" */
++	sui_first_why(st, SUI_Y_BUS);
++	return -1;
++}
++
++/* The ISR (interrupt context: no lock, no print, no allocation; every register access through the judge). Linux order (ufshcd_intr, v6.6 :6845-6862): read IS, W1C exactly the bits read,
++ * read IS again (:6862, counted only), then act on them. While armed the ISR is the ONLY writer of IS (as in Linux: the completion scan never writes it; review 0354 finding 1). Returns 0 = handled (the line is dropped, no DEFER), 1 = the dispatcher masks the INTID (storm or an ISR error: IE := 0 was written here first). */
++static int sui_isr_off(struct sui *st, const struct sui_ops *o, unsigned why);
++static int
++sui_isr(struct sui *st, const struct sui_ops *o, uint64_t now)
++{
++	uint32_t is = 0, ie = 0;
++
++	if (st->mode != SUI_MODE_ON) {
++		return 1;
++	}
++	__atomic_fetch_add(&st->isr_total, 1u, __ATOMIC_RELAXED);
++	if (sui_rd(st, o, SUI_REG_IS, &is) != 0 || sui_rd(st, o, SUI_REG_IE, &ie) != 0) {
++		__atomic_fetch_add(&st->isr_err, 1u, __ATOMIC_RELAXED);
++		return sui_isr_off(st, o, SUI_Y_ISRERR);
++	}
++	if (is != 0u) {
++		uint32_t again = 0;
++
++		if (sui_wr(st, o, SUI_REG_IS, is) != 0 || sui_rd(st, o, SUI_REG_IS, &again) != 0) {
++			__atomic_fetch_add(&st->isr_err, 1u, __ATOMIC_RELAXED);
++			return sui_isr_off(st, o, SUI_Y_ISRERR);
++		}
++		/* Linux ufshcd_intr (v6.6 :6862) reads IS again after the W1C. Read only; the value is only counted (a bit still or already set again is not lost: the level line raises the next
++		 * entry, and the waiter polls the doorbell); no print here (interrupt context), the summary row shows the count. */
++		if (again != 0u) {
++			__atomic_fetch_add(&st->isr_again, 1u, __ATOMIC_RELAXED);
++		}
++	}
++	if (now - st->win_start >= SUI_WIN_NS) {
++		st->win_start = now;
++		st->win_n = 0;
++	}
++	if (is & ie & SUI_UTRCS) {
++		__atomic_fetch_add(&st->isr_seq, 1u, __ATOMIC_RELEASE);
++		__atomic_fetch_add(&st->irqs, 1u, __ATOMIC_RELAXED);
++		if (is & ~SUI_UTRCS) {
++			__atomic_fetch_or(&st->err_is, is & ~SUI_UTRCS, __ATOMIC_RELAXED);
++		}
++		o->wake(o->ctx);
++		return 0;
++	}
++	__atomic_fetch_add(&st->spurious, 1u, __ATOMIC_RELAXED);
++	if (is & ~SUI_UTRCS) {
++		__atomic_fetch_or(&st->err_is, is & ~SUI_UTRCS, __ATOMIC_RELAXED);
++	}
++	st->win_n++;
++	if (st->win_n > SUI_STORM_MAX) {
++		return sui_isr_off(st, o, SUI_Y_STORM);
++	}
++	return 0;
++}
++
++/* ISR side of a disable: IE := 0 (the existing value) and no more interrupt waits; the thread finishes the teardown (sui_finish). */
++static int
++sui_isr_off(struct sui *st, const struct sui_ops *o, unsigned why)
++{
++	__atomic_store_n(&st->armed, 0, __ATOMIC_RELEASE);
++	sui_first_why(st, why);
++	if (st->ie_on) {
++		(void)sui_wr(st, o, SUI_REG_IE, 0u);
++	}
++	st->off_pending = 1;
++	o->kick(o->ctx);
++	return 1;
++}
++
++/* Thread context, driver lock held (the summary thread takes it): finish a teardown the ISR started. */
++static void
++sui_finish(struct sui *st, const struct sui_ops *o)
++{
++	if (st->off_pending) {
++		sui_disarm(st, o, st->why);
++	}
++}
++
++/* Lock-free IE := 0 for the machine-reset path (review 0354 finding 2): every reset goes through sweet_machine_reset_x, but only sweet_clean_stop calls sui_disarm. Through the SAME judge row
++ * (IS/IE allowlist, register 0x24, value 0, nothing else); no lock, no wait, no print (reset or panic context: a print could fault or block), no detach, no GIC call. armed is cleared first so
++ * no new interrupt wait starts. Idempotent and harmless when the ISR or a thread wrote 0 already. Only while IE holds our 0x1 (ie_on is set by the arm's write and cleared by every write of 0;
++ * armed implies it). */
++static void
++sui_ie_off(struct sui *st, const struct sui_ops *o)
++{
++	if (st->mode != SUI_MODE_ON || !st->ie_on) {
++		return;
++	}
++	__atomic_store_n(&st->armed, 0, __ATOMIC_RELEASE);
++	(void)sui_wr(st, o, SUI_REG_IE, 0u);
++}
++
++/* The interrupt wait of one command, thread context, driver lock held, the doorbell already rung. seq0 is taken here, so call it right after the doorbell write: sui_begin() below must
++ * run BEFORE the doorbell write. Result: SUI_W_DONE (the slot bit is clear), SUI_W_TIMEOUT (deadline_ns passed: the caller does its own UTRLCLR + ETIMEDOUT), SUI_W_POLL (a register access
++ * failed: the mode is off, the caller's own polled loop finishes the command). */
++static void
++sui_begin(struct sui *st)
++{
++	st->seq0 = __atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE);
++}
++
++static int
++sui_wait(struct sui *st, const struct sui_ops *o, uint32_t slot_bit, uint64_t spin_ns, uint64_t deadline_ns)
++{
++	uint64_t now = o->now(o->ctx);
++	uint64_t spin_until = now + spin_ns;
++	int last_tmo = 0, blocked = 0, r;
++	uint32_t v = 0;
++
++	for (;;) {
++		r = sui_rd(st, o, SUI_REG_UTRLDBR, &v);
++		if (r != 0) {
++			goto bus;
++		}
++		if (!(v & slot_bit)) {
++			break;
++		}
++		now = o->now(o->ctx);
++		if (now > deadline_ns) {
++			st->cmds++;
++			return SUI_W_TIMEOUT;
++		}
++		if (now < spin_until) {
++			o->pause(o->ctx);
++			continue;
++		}
++		{
++			uint64_t left = deadline_ns - now;
++			uint64_t wake = now + (left < SUI_FALLBACK_NS ? left : SUI_FALLBACK_NS);
++			int waiting = o->wait_begin(o->ctx, wake);
++
++			r = sui_rd(st, o, SUI_REG_UTRLDBR, &v);      /* the doorbell is re-read AFTER the wait is asserted: a completion between the loop-top read and here is not lost */
++			if (r != 0) {
++				if (waiting) {
++					o->wait_cancel(o->ctx);
++				}
++				goto bus;
++			}
++			last_tmo = 0;
++			if (!(v & slot_bit)) {
++				if (waiting) {
++					o->wait_cancel(o->ctx);
++				}
++				break;
++			}
++			if (waiting) {
++				blocked = 1;
++				last_tmo = o->block(o->ctx);
++				if (last_tmo) {
++					st->tmo_wakes++;
++				}
++			}
++		}
++	}
++	st->cmds++;
++	if (__atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE) != st->seq0) {
++		st->hits++;
++	} else if (blocked && last_tmo) {
++		st->poll_found++;                           /* completion seen after a timeout wake, no interrupt since the command was issued */
++	} else {
++		st->fast++;
++	}
++	if (__atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE) != st->mark) {
++		st->mark = __atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE);
++		st->noirq_run = 0;
++	} else if (++st->noirq_run >= SUI_NOIRQ_MAX) {
++		sui_disarm(st, o, SUI_Y_NOIRQ);
++	}
++	return SUI_W_DONE;
++bus:
++	o->note(o->ctx, r == SUI_E_REFUSED ? SUI_G_REFUSED : SUI_G_BUS, SUI_REG_UTRLDBR, 0u);
++	sui_disarm(st, o, r == SUI_E_REFUSED ? SUI_Y_REFUSED : SUI_Y_BUS);
++	return SUI_W_POLL;
++}
++
++/* After the doorbell has cleared (the caller's dsb done), IRQ mode, replaces the blanket IS write. READ ONLY: while armed the ISR is the only writer of IS (Linux: ufshcd_intr alone,
++ * :6858; the completion scan :5465-5466 never writes it). A write here raced the ISR (the waiter on another CPU cleared UTRCS before CPU0's ISR read it, the ISR then saw IS == 0 and counted
++ * a real interrupt as spurious and as no-interrupt: review 0354 finding 1). IS bits other than UTRCS are logged as a GAP (research 154 s.5.5, rule 7), never discarded silently; the ISR
++ * clears them at its next entry (it writes back what it read), so one stuck bit may be logged by several commands (rate limited). A failed or refused read is a GAP that changes nothing. */
++static void
++sui_note_access(struct sui *st, const struct sui_ops *o, uint32_t off, int r, uint32_t place)
++{
++	st->acc_n++;
++	if (st->acc_n <= SUI_OTHER_LOG || (st->acc_n & 1023u) == 0u) {
++		o->note(o->ctx, SUI_G_ACCESS, off, (place << 8) | (r == SUI_E_REFUSED ? 1u : 0u));
++	}
++}
++
++static void
++sui_ack(struct sui *st, const struct sui_ops *o)
++{
++	uint32_t is = 0, e;
++	int r = sui_rd(st, o, SUI_REG_IS, &is);
++
++	if (r != 0) {
++		sui_note_access(st, o, SUI_REG_IS, r, 1u);
++		return;
++	}
++	e = (is & ~SUI_UTRCS) | __atomic_exchange_n(&st->err_is, 0u, __ATOMIC_RELAXED);
++	if (e != 0u) {
++		st->other_n++;
++		if (st->other_n <= SUI_OTHER_LOG || (st->other_n & 1023u) == 0u) {
++			o->note(o->ctx, SUI_G_OTHER_IS, e, st->other_n);
++		}
++	}
++}
++
++/* Stage 0 (mode RO), thread context, driver lock held, once: read UTRLDBR (must be 0), UTRIACR, UTRLCNR, IE, IS, VER and log them. Reads only. */
++static int
++sui_ro_init(struct sui *st, const struct sui_ops *o)
++{
++	uint32_t db = 0, ia = 0, cn = 0, ie = 0, is = 0, ver = 0, foff = 0;
++	int r;
++
++	if (st->mode != SUI_MODE_RO) {
++		return -1;
++	}
++	if ((r = sui_rd(st, o, (foff = SUI_REG_UTRLDBR), &db)) != 0 || (r = sui_rd(st, o, (foff = SUI_REG_UTRIACR), &ia)) != 0 || (r = sui_rd(st, o, (foff = SUI_REG_UTRLCNR), &cn)) != 0 ||
++	    (r = sui_rd(st, o, (foff = SUI_REG_IE), &ie)) != 0 || (r = sui_rd(st, o, (foff = SUI_REG_IS), &is)) != 0 || (r = sui_rd(st, o, (foff = SUI_REG_VER), &ver)) != 0) {
++		sui_note_access(st, o, foff, r, 3u);     /* once, reads only: nothing to disarm */
++		return -1;
++	}
++	if (db != 0u) {
++		o->note(o->ctx, SUI_G_ARM_BUSY, db, 0u);
++	}
++	o->note(o->ctx, SUI_N_RO1, ia, cn);
++	o->note(o->ctx, SUI_N_RO2, ie, is);
++	o->note(o->ctx, SUI_N_RO3, ver, db);
++	return 0;
++}
++
++/* Stage 0 per command (mode RO, the polled path): after the doorbell cleared and BEFORE the driver's own IS write: read IS; count the commands that finish with UTRCS set (and
++ * with any other bit), and when UTRCS is set read the OCS once: does the interrupt bit come before the UTRD write-back (research 154 U3)? Reads only. */
++static void
++sui_ro_cmd(struct sui *st, const struct sui_ops *o)
++{
++	uint32_t is = 0;
++	int r;
++
++	if (st->mode != SUI_MODE_RO) {
++		return;
++	}
++	r = sui_rd(st, o, SUI_REG_IS, &is);
++	if (r != 0) {
++		sui_note_access(st, o, SUI_REG_IS, r, 2u);      /* rate limited like the others: this runs once per command */
++		return;
++	}
++	st->ro_cmds++;
++	if (is & SUI_UTRCS) {
++		st->ro_is0++;
++		if ((o->ocs(o->ctx) & 0xffu) == 0x0fu) {
++			st->ro_ocs0f++;
++		}
++	}
++	if (is & ~SUI_UTRCS) {
++		st->ro_isx++;
++	}
++}
++/* SUI_CORE_END */
++
++#endif /* SWEET_UFS_IRQ_H */

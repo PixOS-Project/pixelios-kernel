@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,6 +10,7 @@ static int wait_ready(void)
+ 	for (i = 0; i < 100; i++) {
+ 		if (rd32(base + STATUS) & READY)
+ 			return 0;
++		printf("wait %d\n", i);
+ 		delay_us(1);
+ 	}
+ 	return -1;

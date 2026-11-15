@@ -1,0 +1,13 @@
+diff --git a/xnu/patches/0150-sweet-iokit.patch b/xnu/patches/0150-sweet-iokit.patch
+index 1111111..2222222 100644
+--- a/xnu/patches/0150-sweet-iokit.patch
++++ b/xnu/patches/0150-sweet-iokit.patch
+@@ -20,8 +20,8 @@ Subject: x
+ diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+ --- a/iokit/Kernel/IOService.cpp
+ +++ b/iokit/Kernel/IOService.cpp
+ @@ -100,3 +100,5 @@ void f(void)
+  	foo();
+-+	printf("x\n");
+++	printf("x %d\n", state == wanted);
+  	bar();

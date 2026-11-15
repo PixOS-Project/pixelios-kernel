@@ -1,0 +1,799 @@
+#!/bin/bash
+# heavy-job: one machine-wide lock + a memory gate for every heavy job (TP-042; AP-03 "one heavy job at a time" enforced, not a habit).
+#   tools/heavy-job run --class build|vm|mutant|gate|analysis --label NAME [--light] [--mem-gb N] [--wait SEC] -- CMD...   (--light: T-66a6 second slot, see tools/heavy-job-light.sh)
+#   tools/heavy-job run ... --class gate --remote-cmd STRING ...  (T-c68c: the remote host first, see ROUTE in the code; STRING = bash -c text doing the same job on the remote host; offload use `gate`). PER-USE SWITCHES (web board; tools/offload-conf.sh): a switched-off use (or the master) prints ONE `OFFLOAD OFF: use=<use> ...` / `ROUTE local` line and runs local. `run --light -- python3|bash tools/test_*` is offered to the offload host when it admits NOW (use `test`), a quick gate stays local and says why: tools/heavy-job-offload.sh.
+#   tools/heavy-job status   |   tools/heavy-job detach --label NAME [--log FILE] [--wake-hook HOOK] -- CMD...
+# detach (AP-227): starts CMD in its OWN systemd user scope (systemd-run --user --scope --collect --unit=pixos-hj-<label>-<epoch>), so it survives the
+#   end of the agent's thread (a session's cgroup is killed with it; setsid/nohup do not escape). No lock, no memory gate: CMD (usually heavy-job run,
+#   phone-lock run or check-all.sh) takes its own. Log default <main clone>/logs/heavy-job/<label>/detach.log; first line "heavy-job: detach unit=.. start=.. cmd=..",
+#   last line (when CMD ends) "heavy-job: DETACHED-END rc=N unit=U". T-e8ad: the default log is UNIQUE per unit (logs/heavy-job/<label>/detach-<unit>.log, detach.log
+#   is a symlink to the latest); an explicit --log that already has content is moved to <log>.prev-<epoch>-<pid> first, so a reader never sees an older run's RESULT line.
+#   A job that never ran its CMD does NOT end as a job end (queue position is not a failure): in the scope every `heavy-job run` waits WITHOUT expiry
+#   (HEAVY_JOB_DETACHED=<unit>; a --wait is ignored with a line; HEAVY_JOB_DETACHED_WAIT=SEC caps it), and when a heavy-job in the scope ends without ever starting a CMD
+#   (error, signal while queued) and the scope's rc != 0, the last line is "heavy-job: DETACHED-NOTRUN reason=... unit=U", rc 75, NO wake hook. `status` lists
+#   "heavy-job: <local|queue-name> unit=U state=queued|running|active pos=N" per detached unit. Bounded launch check (<= 10 s): scope active or this unit's end line rc=0 -> PASS;
+#   end line rc!=0 -> FAIL; neither -> ERROR. HEAVY_JOB_HELD/QUIET and OFFLOAD_QUEUE_HELD are cleared (a detached heavy-job run takes its own lock). Caller keeps its thread until PASS.
+#   --wake-hook HOOK (T-afd9, R4): after that end line the scope runs `tools/job-wake HOOK LABEL RC` = ONE POST to the owner's local webhook (event `job LABEL rc=N`,
+#   docs/recipes/local-webhook.md), so the owner wakes instead of polling. Its `WAKE ok:` / `WAKE FAIL: <code> hook=H job=L` line follows the end line in the log (then the
+#   end line is no longer the LAST line: wait on it with grep, not tail -1); CMD's rc is untouched. Missing hook file: WARNING at launch.
+#   No systemd-run / no user manager: RESULT: ERROR, never a plain background fallback. Test hooks HEAVY_JOB_SYSTEMD_RUN / HEAVY_JOB_SYSTEMCTL (print a WARNING).
+#   tools/heavy-job offload-host run --owner NAME --label NAME [--use USE] [--wait SEC] -- CMD...   |   offload-host status   |   offload-host wait [--wait SEC]
+#   (T-4ecb: run also takes --fallback-local or env HEAVY_JOB_FALLBACK_LOCAL=1, see below)
+# offload-host (TP-042 amendment "OFFLOAD-HOST QUEUE"): a FIFO of ONE job at a time on the second build host, shared by every agent on this host.
+#   Queue dir ${OFFLOAD_QUEUE_DIR:-$HOME/.cache/pixelios/offload-queue}; ticket NNNNNN.label "owner label pid epoch state"; the number is taken under one
+#   flock; each waiter holds a flock on its own ticket for its lifetime and blocks (flock, no sleep) on the ticket before it; a dead waiter's lock is
+#   freed by the kernel and its ticket is skipped/removed. The head runs admission: ONE ssh probe (BatchMode=yes, ConnectTimeout=3, host
+#   ${REMOTE_JOB_HOST:-$OFFLOAD_HOST from tools/offload-host.conf}, ssh = ${REMOTE_JOB_SSH:-ssh}); admit iff load1 < ${OFFLOAD_MAXLOAD1:-8} and MemAvailable > ${OFFLOAD_MINAVAIL_GB:-12} GB and
+#   no running container rj-* and no process matching ${OFFLOAD_FOREIGN_RE:-vitest}. Not admitted: one reason line,
+#   re-probe every ${OFFLOAD_REPROBE:-60} s (the only timed wait), give up after --wait (default 7200): RESULT: ERROR offload-queue (exit 2); ssh failure:
+#   RESULT: ERROR offload-host unreachable (exit 2). run exports OFFLOAD_QUEUE_HELD=<label> (nested call: no second ticket), runs CMD (no eval), keeps its rc.
+#   Log <main clone>/logs/heavy-job/offload-host/<label>.log (see "Log:" below). tools/remote-job takes the slot itself (--where auto|offload-host).
+# run: (0) local FIFO, (1) memory gate, (2) flock on $HEAVY_JOB_LOCK, (3) memory gate again right before CMD starts, (4) CMD (not via eval), its exit code kept.
+#   Local FIFO (arrival order; before it, flock woke an ARBITRARY waiter and a first-comer starved): the same ticket code as the offload-host queue, dir
+#     ${HEAVY_JOB_QUEUE_DIR:-<dirname of $HEAVY_JOB_LOCK>/heavy-queue} (an alternate HEAVY_JOB_LOCK gets its own queue,
+#     review heavy-fifo-r1 F5); ticket NNNNNN.label "owner label pid epoch state" is taken BEFORE the memory gate, then the job
+#     blocks (flock, no sleep) on the ticket before it, so a load/memory wait of the head cannot be overtaken.
+#     Head-of-line semantics (r1 F7, by design): the head of the queue waits for ITS memory/load gate and nobody behind it may start meanwhile, even a
+#     job whose own (smaller) need would pass: a class gate/build head (needs 12 GB available) delays an analysis job (needs 10 GB). The queue orders
+#     jobs, the gate admits the head. The timeout text for a ticketed holder is "RESULT: ERROR heavy-queue: waited Ns for NNNNNN.x, not our turn".
+#     Numbering: next = max(.seq, highest live ticket) + 1, .seq written atomically under the queue .lock; an empty/garbled/missing/behind .seq is repaired
+#     with a loud line "heavy-job: queue: .seq repaired to N (why)" (r1 F1), never an exit 2 and never a restart below a live ticket. Numbers past 999999
+#     are fine (numeric order, r1 F8). Taking the ticket waits at most the ONE --wait budget for the queue .lock (RESULT: ERROR heavy-queue: cannot lock).
+#     A signal (INT/TERM/HUP) during any wait removes the ticket, prints RESULT: FAIL ... aborted by SIGNAME and exits 128+signal (130/143/129; r1 F6). The flock on $HEAVY_JOB_LOCK below stays the real
+#     mutual exclusion (it also guards holders without a ticket). Prints "heavy-job: queue: waiting behind NNNNNN.label (..)" per predecessor; status lists the queue.
+#     --wait is ONE budget for queue + memory gate + lock; a job whose wait expires (or that is killed) leaves no ticket: RESULT: ERROR (exit 2) naming its position.
+#     Queue dir not creatable/lockable: RESULT: ERROR, never a fallback to the plain flock. Nested runs take no ticket.
+#   Priority admission (T-8bf1; LOCAL queue only, the offload-host queue stays plain FIFO): the head is NOT the oldest ticket but the best by (1) already admitted (state admitted/running: head-of-line,
+#     above), (2) the EFFECTIVE level eff = max(0, prio - age/HEAVY_JOB_MAXAGE) (T-f4a2: a waiter moves up ONE level per MAXAGE s, default 3600, whole seconds, integer division; it no longer jumps to the front, so a fresh P1 port gate beats a P2 job that is only 1 h old, yet every job reaches P0 after prio x MAXAGE and cannot wait forever), (3) the ticket priority P0..P4 of the ticket named in the label (`T-xxxx`/`t-xxxx` anywhere in the
+#     label, bounded by non-alphanumerics; T-87a2 fallbacks when none: a label starting with a bare 4-hex id (`a0aa-g2c`) known to the INDEX, then the cwd checkout's branch/dir naming T-xxxx, else P2 + `heavy-job: WARN prio=P2: label L names no ticket` (stdout, run.log, `status`); column 10 of the super's docs/queue/INDEX.tsv: $HEAVY_JOB_QUEUE_INDEX, else $PIXOS_SUPER/docs/queue/INDEX.tsv, else the main clone's docs/ or ../../docs/ or
+#     <tools>/super/docs/), (4) arrival number (FIFO inside a level). A label `nightly-YYYY-MM-DD` (scheduled job, no ticket) is P3 with a `prio:` note line. No ticket id in the label, an id missing from the INDEX, or an unreadable INDEX = P2 (the last two are said on a `prio:` line). The ticket
+#     line carries `prio=N`; `status` prints `prio=Pn` per holder/head/waiter and, once aged, `eff=Pm aged Ns`. The head decision is taken under the queue .lock and printed: `heavy-job: queue: admitted NNNNNN.label prio=Pn (why)`.
+#     A waiter blocks on the ticket before it in the CURRENT order and re-lists every HEAVY_JOB_REEVAL s (default 30) and at every wake-up, so a newcomer with a better priority or an aging waiter moves up.
+#   Lock: ${HEAVY_JOB_LOCK:-$HOME/.cache/pixelios/heavy-job.lock}, opened >> (a waiter never truncates), holder line "label class pid start".
+#   Memory gate: MemAvailable + ZFS ARC freeable (arc_credit; HEAVY_JOB_ARCSTATS/HEAVY_JOB_ARC_PC test overrides) >= need + reserve, need = --mem-gb or class default (build 4, gate 4, vm 2, mutant 2, analysis 2 GB; review F1: with reserve 8 build/gate need 12 GB available),
+#     reserve ${HEAVY_JOB_RESERVE_GB:-8}; and /proc/pressure/memory "some avg10" < ${HEAVY_JOB_PSI_MAX:-10} (file missing: "PSI unavailable"
+#     is printed and only memory gates). Not met: re-check every ${HEAVY_JOB_POLL:-15} s, say why each minute, give up after --wait
+#     (default 1800) with "RESULT: ERROR memory-gate ...". The same gate also needs /proc/pressure/cpu "some" avg10 < ${HEAVY_JOB_CPU_PSI_MAX:-20} (T-a8b4: load1 counts disk-blocked tasks, so it is NOT the CPU rule)
+#     and load1 < HEAVY_JOB_MAXLOAD1 (default 3 x nproc as a high guard, or 6 when CPU PSI is unreadable, said loudly; strict; load1 unreadable = refused).
+#     Every refusal names the metric (mem_avail, psi, cpu_psi, load1). Both are HOST-wide (any process, not only heavy jobs): on a busy host the ERROR means "host busy, retry later", not a defect of CMD.
+#     Nested runs (HEAVY_JOB_HELD) and the offload path (own remote load rule) skip this local gate.
+#     CPU limit file (T-ee35): the web board's limit field writes `HEAVY_JOB_CPU_PSI_MAX=N` (N whole, 5-80) to ${HEAVY_JOB_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pixelios/heavy-job.conf}
+#     (per user, never in git; template tools/heavy-job.conf.example). It is re-read on EVERY poll of the gate, so a running wait picks it up; an explicit env HEAVY_JOB_CPU_PSI_MAX wins over
+#     the file. A value outside 5-80 or not a whole number is refused loudly ("LIMIT GAP", naming value and file) and the previous limit stays. Each change is logged ("cpu_psi limit now N (source)").
+#     Test overrides: HEAVY_JOB_MEMINFO, HEAVY_JOB_PSI, HEAVY_JOB_CPU_PSI, HEAVY_JOB_LOAD (file paths).
+#     It never renices, cgroups or throttles anything: it only decides when a NEW heavy job starts.
+#   Re-entrancy: CMD gets HEAVY_JOB_HELD=<label>; a nested run (or a wired tool: check-all.sh, xnu-local-build) sees it and skips lock and
+#     memory gate with one line "heavy-job: nested in <label>, no second lock" (gate -> xnu-local-build cannot deadlock).
+#   HEAVY_JOB_QUIET=1 (set by the wired tools): every heavy-job line goes to stderr so the wrapped tool's stdout contract is unchanged, and
+#     heavy-job's own result lines are `heavy-job: RESULT ...` (never `RESULT:` at line start), so a caller that greps the wrapped tool's
+#     last `^RESULT:` line (gate-xnu-build) can never mistake heavy-job's line for it (review F3).
+# Log: <main clone>/logs/heavy-job/<label>/run.log, where <main clone> = dirname of `git rev-parse --git-common-dir`, so a worktree's logs survive
+#   its removal (AP-217); outside git (or git failing) it falls back to $PWD with a note line. The absolute path is printed one line before the RESULT
+#   line ("heavy-job: log PATH"). Last line: RESULT: PASS|FAIL label=.. class=.. rc=N elapsed=Ns | RESULT: ERROR ... run.log ends with that same RESULT line (also RESULT: ERROR once the lock is held; W34 R22), so a reader of run.log alone sees the verdict. A run refused before the lock writes nothing to run.log. Known limit: a background child that keeps stderr open can still write after the RESULT line (waiting for it would let a daemon hold the lock).
+# Exit: 0 PASS (rc 0), 1 FAIL (rc 1 or any other nonzero), 2 ERROR (lock/memory timeout, usage) or CMD rc 2; 128+N when aborted by signal N while waiting OR while CMD runs (RESULT: FAIL ... aborted by SIGNAME).
+#   A signal DURING CMD (r2 F2): CMD runs in its own session (setsid, hidden subcommand __cmd) as a background job, so the trap fires at once; heavy-job turns INT/HUP/TERM into ONE SIGTERM for CMD and its
+#   children (SIGKILL after ${HEAVY_JOB_KILL_GRACE:-10} s; whole seconds 1..3600, anything else = RESULT: ERROR before the lock; CMD sees the effective value in HEAVY_JOB_KILL_GRACE), they are reaped, the lock
+#   text is cleared and the RESULT line goes to stdout and run.log. A CMD with an INT-only cleanup (`trap cleanup INT`) never runs it: CMD gets TERM, never INT (r4 F6).
+#   A second INT/TERM/HUP while CMD is being killed is ignored (r3 F3). A SIGKILL of heavy-job itself (or of its whole group, `timeout -s KILL`) cannot be trapped: the CMD leader (which ignores TERM, so
+#   it outlives the group TERM of an abort in progress, r4 F2) has `setpriv --pdeathsig USR1`; its USR1 trap sends SIGTERM to CMD's session, SIGKILL after the same grace if CMD (or any other session
+#   member, r4 F1: a daemon-style child holding the lock) is still there, and says so in run.log. A CMD leader killed alone by a signal (rc > 128) while its session still runs: the session is
+#   terminated the same way with a WARNING in run.log and on stderr (r4 F3; a CMD that itself exits > 128 with a live session gets the same treatment). A CMD whose rc <= 128 may leave daemons: known limit.
+#   CMD starts with SIGINT/SIGQUIT at their defaults (AP-280, r3 F2).
+#   CMD has no controlling terminal (own session): `ssh -t`, `docker run -it`, `sudo` prompts and `read </dev/tty` in CMD do not work, and Ctrl-Z stops heavy-job only (r3 F6; run interactive tools outside heavy-job).
+#   CMD's first word must be a program name: a leading NAME=VALUE or -option word is refused (RESULT: ERROR usage; `env NAME=VALUE prog ...` is the way; r4 F5).
+#   Needs bash >= 5.1 (`wait -n -p`), util-linux setsid + setpriv (--pdeathsig), coreutils env (--default-signal): checked before the ticket, RESULT: ERROR if not (r3 F8). Test override HEAVY_JOB_MIN_BASH (e.g. 501).
+#   `run` executes on the machine that calls it (lab-host for check-all.sh and `remote-job --where lab-host`); the offload-host route is `offload-host run`, which has none of these preflights.
+#   `offload-host run` still defers a signal until its CMD ends.
+# CANONICAL COPY (T-d543; code in the sourced tools/heavy-job-canon.sh, T-4675: module missing = one `HEAVY GAP: canonical-copy module ... missing` line, local copy runs): run|detach|offload-host|status compare their blob (git hash-object) with the main clone's tools/heavy-job; a different blob prints `heavy-job: STALE COPY <path> blob=X -> exec <canonical> blob=Y`
+#   and re-execs it (HEAVY_JOB_REEXEC=1 = loop guard) before any ticket/unit exists; canonical missing/unreadable: `HEAVY GAP: canonical heavy-job not found (why), running <path>`. Tickets end in ` blob=X`;
+#   WAIT-CYCLE (T-70cd, tools/heavy-job-cycle.sh): lock free >= 120 s with live waiters = `WAIT-CYCLE free=Ns waiters=N edges=..`, waiters of other blobs re-queued under the same unit/number (`CYCLE-REQUEUE`).
+#   `status` prints `STALE-WAITER pid=N blob=X canonical=Y label=L ticket=T` for a live ticket of another blob (blob=unknown: none readable). Test seam: HEAVY_JOB_CANONICAL=FILE.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+out() { if [ -n "${HEAVY_JOB_QUIET:-}" ]; then echo "$@" >&2; else echo "$@"; fi; }
+# T-d543: admission is decided by ONE copy, the canonical checkout's tools/heavy-job (main clone = parent of the git common dir of this script's directory) [obs 2026-11-02: 7 waiters ran a worktree copy with the old load1<6 rule and held the FIFO head 3-4 h].
+#   A differing blob re-execs the canonical copy with ONE loud line; a missing/unreadable/unhashable one is a `HEAVY GAP:` line and the local copy runs. HEAVY_JOB_REEXEC=1 = loop guard (read once, dropped, so no CMD inherits it).
+hj_self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || hj_self=${BASH_SOURCE[0]}
+hj_reexec=${HEAVY_JOB_REEXEC:-}; unset HEAVY_JOB_REEXEC
+hj_blob_self=; hj_canon=; hj_canon_blob=; light=; hj_lmod=$(dirname "$hj_self")/heavy-job-light.sh; hj_cmod=$(dirname "$hj_self")/heavy-job-cycle.sh; hj_omod=$(dirname "$hj_self")/heavy-job-offload.sh   # module paths: T-66a6 light slot, T-70cd wait-cycle breaker, per-use offload routing
+hj_mod=$(dirname "$hj_self")/heavy-job-canon.sh   # T-4675: the canonical-copy code lives in a sourced module next to this script
+if [ -r "$hj_mod" ]; then
+	# shellcheck source=tools/heavy-job-canon.sh
+	. "$hj_mod"
+	case ${1:-} in run|detach|offload-host|status) hj_canon_resolve "$@" ;; esac
+else
+	case ${1:-} in run|detach|offload-host|status) out "HEAVY GAP: canonical-copy module $hj_mod missing, stale-copy check off, running $hj_self" ;; esac   # T-4675:gap
+fi
+# shellcheck source=tools/heavy-job-light.sh
+[ ! -r "$hj_lmod" ] || . "$hj_lmod"   # T-66a6: the --light slot lives in a sourced module
+# shellcheck source=tools/heavy-job-offload.sh
+[ ! -r "$hj_omod" ] || . "$hj_omod"   # per-use offload routing (shared load for --light host tests, quick-gate decision, per-use status) lives in a sourced module
+# shellcheck source=tools/heavy-job-cycle.sh
+[ ! -r "$hj_cmod" ] || . "$hj_cmod"   # T-70cd: the wait-cycle breaker (WAIT-CYCLE, CYCLE-REQUEUE) lives in a sourced module
+hj_tkb=${hj_blob_self:+ blob=$hj_blob_self}   # appended to every ticket line
+lock=${HEAVY_JOB_LOCK:-$HOME/.cache/pixelios/heavy-job.lock}
+case $lock in /*) ;; *) lock=$PWD/$lock ;; esac   # r2 F5: a relative lock (no slash: dirname = ".") is resolved once, so lock, queue and every printed path are absolute
+hq=${HEAVY_JOB_QUEUE_DIR:-$(dirname "$lock")/heavy-queue}; [ -z "${HEAVY_JOB_LIGHT_SLOT:-}" ] || hj_light_apply   # F5: an alternate lock gets its own queue; T-66a6: the __cmd leader of a light job checks the LIGHT lock
+arcf=${HEAVY_JOB_ARCSTATS:-/proc/spl/kstat/zfs/arcstats}; arcpc=${HEAVY_JOB_ARC_PC:-/sys/module/zfs/parameters/zfs_arc_pc_percent}
+meminfo=${HEAVY_JOB_MEMINFO:-/proc/meminfo}; psif=${HEAVY_JOB_PSI:-/proc/pressure/memory}; loadf=${HEAVY_JOB_LOAD:-/proc/loadavg}
+reserve=${HEAVY_JOB_RESERVE_GB:-8}; psimax=${HEAVY_JOB_PSI_MAX:-10}; poll=${HEAVY_JOB_POLL:-15}
+HEAVY_JOB_DEFAULT_CPU_PSI_MAX=20
+cpupsif=${HEAVY_JOB_CPU_PSI:-/proc/pressure/cpu}; cpupsimax=${HEAVY_JOB_CPU_PSI_MAX:-20}
+maxage=${HEAVY_JOB_MAXAGE:-3600}; reeval=${HEAVY_JOB_REEVAL:-30}; mypr=; pwarn=; punt=; tepoch=; tlen=0   # T-8bf1: priority admission of the local queue (validated in cmd_run before any ticket)
+hjconf=${HEAVY_JOB_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pixelios/heavy-job.conf}; cpupsi_src=default; [ -z "${HEAVY_JOB_CPU_PSI_MAX:-}" ] || cpupsi_src="env"; limit_bad=
+# T-ee35: the CPU-pressure limit may come from the board's config file; re-read on every gate poll. env wins; a bad value is refused loudly and the previous limit stays.
+limit_reload() {
+	local v line
+	[ "$cpupsi_src" != env ] || return 0
+	if [ -r "$hjconf" ]; then
+		v=; while IFS= read -r line || [ -n "$line" ]; do case $line in HEAVY_JOB_CPU_PSI_MAX=*) v=${line#*=} ;; esac; done <"$hjconf"
+		if [ -z "$v" ]; then v=$HEAVY_JOB_DEFAULT_CPU_PSI_MAX; fi
+		if [[ $v =~ ^[0-9]+$ ]] && [ "$v" -ge 5 ] && [ "$v" -le 80 ]; then
+			if [ "$v" != "$cpupsimax" ] || [ "$cpupsi_src" = default ]; then out "heavy-job: cpu_psi limit now $v (from $hjconf, was $cpupsimax from $cpupsi_src)"; cpupsimax=$v; cpupsi_src=$hjconf; fi
+		elif [ "$limit_bad" != "$v" ]; then
+			limit_bad=$v; out "heavy-job: LIMIT GAP: $hjconf: HEAVY_JOB_CPU_PSI_MAX='$v' refused (want a whole number 5-80, template tools/heavy-job.conf.example); keeping cpu_psi limit $cpupsimax ($cpupsi_src)"
+		fi
+	elif [ "$cpupsi_src" != default ]; then   # the file was removed: back to the built-in default, said once
+		out "heavy-job: cpu_psi limit back to $HEAVY_JOB_DEFAULT_CPU_PSI_MAX ($hjconf is gone, was $cpupsimax from $cpupsi_src)"; cpupsimax=$HEAVY_JOB_DEFAULT_CPU_PSI_MAX; cpupsi_src=default
+	fi
+}
+# CPU rule (T-a8b4, user 2026-11-02): /proc/pressure/cpu "some" avg10 < 20 admits. load1 counts tasks blocked on DISK too: on 2026-11-02 load1 sat at 16-18 for 86+ min with
+# cpu some avg10 ~7 and io some avg10 ~60, 47 % CPU idle, so the old load1 < 6 rule starved every gate [obs]. Measured here: 5.5-7 with that I/O wait, 28.8 after 22 s with all
+# 16 cores busy [obs 2026-11-02]; 20 sits between. The W25 case (a build admitted next to a load-41 gate, user 2026-10-28) is a CPU-saturated host: cpu PSI refuses it.
+# load1 stays only as a high guard (3 x nproc) and is logged in every decision line. No readable CPU PSI: the old load1 < 6 rule, said loudly in memgate.
+if [ -n "${HEAVY_JOB_MAXLOAD1:-}" ]; then maxload=$HEAVY_JOB_MAXLOAD1
+elif [ -r "$cpupsif" ]; then maxload=$((3 * $(nproc 2>/dev/null || echo 2)))
+else maxload=6; fi
+# logroot: the main clone (a worktree shares its .git, whose parent is the main clone), else $PWD with a note
+logroot() {
+	local g
+	if g=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$g" ]; then dirname "$g"
+	else echo "heavy-job: note: not in a git checkout, logs go under $PWD/logs" >&2; echo "$PWD"; fi
+}
+res_line() { if [ -n "${HEAVY_JOB_QUIET:-}" ]; then echo "heavy-job: RESULT $*"; else echo "RESULT: $*"; fi; }
+rlog=   # set by cmd_run once the log dir exists: every RESULT line printed after that is appended to run.log too, so run.log ends with the RESULT (W34 R22)
+# rlog_add LINE: appends to run.log on a line of its own (a wrapped command whose last output has no newline would otherwise merge into the RESULT, review F3a)
+rlog_add() { { [ ! -s "$rlog" ] || [ -z "$(tail -c1 "$rlog")" ] || echo; echo "$1"; } >>"$rlog"; }
+# T-e8ad: a detached scope sets HEAVY_JOB_NOTRUN_FILE (+ .started). A heavy-job that ends BEFORE it started a CMD (any err/serr, a signal while queued) writes the reason there;
+# the scope turns "reason file present, nobody started a CMD, rc != 0" into DETACHED-NOTRUN instead of a job end. mark_started: CMD (or the nested exec) is about to run.
+cmd_started=
+notrun_note() { [ -n "${HEAVY_JOB_NOTRUN_FILE:-}" ] && [ -z "$cmd_started" ] && echo "$*" | tr '\n\t' '  ' | cut -c1-300 >>"$HEAVY_JOB_NOTRUN_FILE" 2>/dev/null; return 0; }
+mark_started() { cmd_started=1; unset HEAVY_JOB_DETACHED HEAVY_JOB_DETACHED_WAIT   # T-9954: only the scope's own job waits without expiry; every nested CMD honours its --wait
+	[ -z "${HEAVY_JOB_NOTRUN_FILE:-}" ] || : >"$HEAVY_JOB_NOTRUN_FILE.started" 2>/dev/null; return 0; }
+err() { local l; l=$(res_line ERROR "$*"); out "$l"; [ -z "$rlog" ] || rlog_add "$l"; notrun_note "$*"; exit 2; }
+# T-e8ad: inside a detached scope (HEAVY_JOB_DETACHED=<unit>) the queue/memory/lock wait has NO expiry: a queue position is not a failure, the job keeps its ticket and
+# `status` shows it. HEAVY_JOB_DETACHED_WAIT=SEC (whole seconds) caps it; an explicit --wait is ignored, said in the log.
+detached_wait() {
+	[ -n "${HEAVY_JOB_DETACHED:-}" ] || return 0
+	local cap=${HEAVY_JOB_DETACHED_WAIT:-31536000}
+	[[ $cap =~ ^[0-9]+$ ]] || err "usage: HEAVY_JOB_DETACHED_WAIT must be whole seconds (got '$cap')"
+	[ "$wait" = "$cap" ] || out "heavy-job: detached unit $HEAVY_JOB_DETACHED: --wait $wait ignored, waiting up to ${cap}s (a queue position is not a failure)"
+	wait=$cap
+}
+# sets mem_gb (MemAvailable in GB), psi (memory PSI avg10 or "n/a"), load1, cpupsi (CPU PSI some avg10 or "n/a")
+sample() {
+	mem_gb=$(awk '/^MemAvailable:/{printf "%.1f", $2/1048576; f=1} END{if(!f) print "x"}' "$meminfo" 2>/dev/null)
+	[[ $mem_gb =~ ^[0-9.]+$ ]] || err "memory-gate: no MemAvailable in $meminfo"
+	arc_credit
+	mem_gb=$(awk -v m="$mem_gb" -v a="$arc_gb" 'BEGIN{printf "%.1f", m+a}')
+	psi=n/a
+	if [ -r "$psif" ]; then psi=$(sed -n 's/^some .*avg10=\([0-9.]*\).*/\1/p' "$psif" | head -1); [ -n "$psi" ] || psi=n/a; fi
+	load1=$(cut -d' ' -f1 "$loadf" 2>/dev/null); load1=${load1:-n/a}
+	cpupsi=n/a
+	if [ -r "$cpupsif" ]; then cpupsi=$(sed -n 's/^some .*avg10=\([0-9.]*\).*/\1/p' "$cpupsif" | head -1); [ -n "$cpupsi" ] || cpupsi=n/a; fi
+}
+# ZFS ARC is not in MemAvailable but the ARC shrinker frees it under pressure (lab-host: 8.7 GB ARC, W29 [obs 07:49]). arc_gb = what the shrinker
+# reports as freeable, same formula as arc_evictable_memory() in openzfs zfs-2.3.9 module/os/linux/zfs/arc_os.c:149-170 (zfs_arc_pc_percent=0 case):
+# clean = mru+mfu evictable data+metadata (kstat names: module/zfs/arc.c:7219-7231,7340); dirty = size - clean; dirty >= c_min ? clean : size - c_min.
+# No arcstats = no ZFS = 0. zfs_arc_pc_percent != 0 changes the floor (page-cache scaled): no credit, said loudly.
+arc_credit() {
+	arc_gb=0; arc_note=
+	[ -r "$arcf" ] || return 0
+	local pc; pc=$(cat "$arcpc" 2>/dev/null || echo x)
+	if [ "$pc" != 0 ]; then arc_note=" arc=0(zfs_arc_pc_percent=$pc unsupported)"; return 0; fi
+	arc_gb=$(awk '$1=="size"{s=$3} $1=="c_min"{m=$3} $1~/^(mru|mfu)_evictable_(data|metadata)$/{c+=$3; n++}
+		END{ if(s==""||m==""||n!=4){print "x"; exit} d=s-c; if(d<0)d=0; f=(d>=m)?c:s-m; if(f<0)f=0; printf "%.1f", f/1073741824 }' "$arcf" 2>/dev/null)
+	if ! [[ $arc_gb =~ ^[0-9.]+$ ]]; then arc_gb=0; arc_note=" arc=0(unparsable $arcf)"; return 0; fi
+	arc_note=" arc_free=${arc_gb}G"
+}
+stamp() { echo "mem_avail=${mem_gb}G${arc_note} psi=$psi load1=$load1 cpu_psi=$cpupsi"; }
+class_need() { case $1 in build|gate) echo 4 ;; vm|mutant|analysis) echo 2 ;; *) return 1 ;; esac; }
+# memgate WHEN: waits until the gate is met or the deadline passes. 0 = met.
+memgate() {
+	local when=$1 last=0 now why total
+	total=$(awk -v a="$need" -v b="$reserve" 'BEGIN{print a+b}')
+	[ -r "$psif" ] || out "heavy-job: PSI unavailable ($psif), gating on memory only"
+	[ -r "$cpupsif" ] || out "heavy-job: CPU PSI unavailable ($cpupsif), CPU rule falls back to load1 < $maxload"
+	while :; do
+		limit_reload; sample; why=
+		awk -v m="$mem_gb" -v t="$total" 'BEGIN{exit !(m+0>=t+0)}' || why="mem_avail ${mem_gb}G < need ${need}G + reserve ${reserve}G"
+		if [ "$psi" != n/a ] && ! awk -v p="$psi" -v x="$psimax" 'BEGIN{exit !(p+0<x+0)}'; then why="${why:+$why; }psi $psi >= $psimax"; fi
+		if [ "$cpupsi" != n/a ] && ! awk -v p="$cpupsi" -v x="$cpupsimax" 'BEGIN{exit !(p+0<x+0)}'; then why="${why:+$why; }cpu_psi $cpupsi >= $cpupsimax"; fi
+		if ! [[ $load1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; then why="${why:+$why; }load1 unreadable ($loadf)"; elif ! awk -v l="$load1" -v x="$maxload" 'BEGIN{exit !(l+0<x+0)}'; then why="${why:+$why; }load1 $load1 >= $maxload"; fi
+		if [ -z "$why" ]; then out "heavy-job: memory-gate ok ($when) $(stamp)"; return 0; fi
+		now=$(date +%s)
+		if [ $((now - t0)) -ge "$wait" ]; then out "heavy-job: memory-gate not met ($when): $why $(stamp)"; return 1; fi
+		if [ $((now - last)) -ge 60 ]; then out "heavy-job: waiting ($when): $why $(stamp)"; last=$now; fi
+		sleep "$poll" 9>&- & fp=$!; wait "$fp"; fp=   # background + wait: a trapped signal is not deferred for $poll s; no ticket fd for the sleep
+	done
+}
+# T-e8ad: detached units that are alive but hold no ticket (starting, or a CMD that is not a heavy-job run): "heavy-job: unit=U state=active pos=-"
+sunits() {
+	local sc=${HEAVY_JOB_SYSTEMCTL:-systemctl} u o
+	command -v "$sc" >/dev/null 2>&1 || { echo "heavy-job: units UNKNOWN ($sc not found)"; return 0; }
+	o=$("$sc" --user list-units --type=scope --state=active --plain --no-legend --no-pager 'pixos-hj-*' 2>&1) || { echo "heavy-job: units UNKNOWN ($sc list-units failed: ${o:0:100})"; return 0; }
+	while read -r u _; do
+		case $u in pixos-hj-*.scope) u=${u%.scope}; case $su in *"unit=$u "*) continue ;; esac; echo "heavy-job: unit=$u state=active pos=-" ;; esac   # a ticketed unit was listed above
+	done <<<"$o"
+}
+cmd_status() {
+	if flock -n 7 2>/dev/null; then echo "heavy-job: lock free ($lock)"; else echo "heavy-job: lock held by: $(cat "$lock" 2>/dev/null || echo unknown)"; fi
+	sq=$hq; qk=local
+	su=; if mkdir -p "$sq" 2>/dev/null; then su=$(sstate); echo "$su"; else echo "heavy-job: local queue UNAVAILABLE (cannot create $sq)"; fi
+	if declare -F hj_light_status >/dev/null; then hj_light_status; su+=${lsu:-}; else echo "heavy-job: light slot UNAVAILABLE ($hj_lmod missing)"; fi   # T-66a6
+	if declare -F hj_cycle_check >/dev/null; then hj_cycle_check; else echo "heavy-job: wait-cycle breaker UNAVAILABLE ($hj_cmod missing)"; fi   # T-70cd
+	sunits
+	sample; echo "heavy-job: $(stamp)"; echo "RESULT: PASS status"; exit 0
+}
+cmd_run() {
+	local lreq='' class='' label='' memgb='' offloadc='' rc el t1 held ld ld_rc c l why
+	wait=1800
+	while [ $# -gt 0 ]; do case $1 in
+		--class) class=${2:-}; shift 2 ;; --label) label=${2:-}; shift 2 ;; --mem-gb) memgb=${2:-}; shift 2 ;;
+		--wait) wait=${2:-}; shift 2 ;; --light) lreq=1; shift ;; --remote-cmd) offloadc=${2:-}; shift 2 ;; --) shift; break ;;
+		*) err "usage: unknown option '$1' (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" ;;
+	esac; done
+	[ $# -gt 0 ] || err "usage: no CMD after --"
+	[[ $label =~ ^[A-Za-z0-9._-]+$ ]] || err "usage: --label NAME (letters, digits, . _ -)"
+	[[ $wait =~ ^[0-9]+$ ]] || err "usage: --wait SEC"
+	detached_wait
+	# r3 F4: validated once, before any lock or ticket; killcmd/cmd_inner do arithmetic with it (a non-integer was an immediate SIGKILL or a crash; leading zero = octal)
+	export HEAVY_JOB_KILL_GRACE=${HEAVY_JOB_KILL_GRACE:-10}   # r4 F4: the one place the default 10 is written; killcmd and cmd_inner read the variable (CMD sees it too)
+	[[ $HEAVY_JOB_KILL_GRACE =~ ^[1-9][0-9]{0,3}$ ]] && [ "$HEAVY_JOB_KILL_GRACE" -le 3600 ] || err "usage: HEAVY_JOB_KILL_GRACE must be whole seconds 1..3600 (got '$HEAVY_JOB_KILL_GRACE')"
+	need=$(class_need "$class") || err "usage: --class build|vm|mutant|gate|analysis"
+	[[ $maxage =~ ^[0-9]+$ ]] || err "usage: HEAVY_JOB_MAXAGE must be whole seconds (got '$maxage')"
+	[[ $reeval =~ ^[1-9][0-9]{0,5}$ ]] || err "usage: HEAVY_JOB_REEVAL must be whole seconds >= 1 (got '$reeval')"
+	[ -z "$memgb" ] || { [[ $memgb =~ ^[0-9.]+$ ]] || err "usage: --mem-gb N"; need=$memgb; }
+	# r4 F5: `env` (in cmd_inner) would read a leading NAME=VALUE or -option as its own argument and change what CMD means (`-i` ran nothing and passed); the nested path execs CMD directly: check before both
+	case $1 in -*|*=*) err "usage: CMD must start with a program name, not '$1' (use: env NAME=VALUE prog ...)" ;; esac
+	if [ -n "${HEAVY_JOB_HELD:-}" ]; then
+		out "heavy-job: nested in $HEAVY_JOB_HELD, no second lock"
+		mark_started
+		exec "$@"
+	fi
+	! declare -F hj_route_offload >/dev/null || hj_route_offload "$@"   # use=test: a --light host test goes to the offload host when it admits NOW (exits with the rc); a quick gate stays local and says why (module)
+	if [ -n "$lreq" ]; then   # T-66a6: --light = the second slot (own lock + FIFO, same gate); refused for a mutant-marked label, never with --remote-cmd
+		[ -z "$offloadc" ] && declare -F hj_light_apply >/dev/null || err "usage: --light needs $hj_lmod and cannot be combined with --remote-cmd"
+		hj_light_apply; hj_light_refused "$label"
+	fi
+	# T-c68c: gate-class jobs are offered to the remote host FIRST (user 2026-11-01). --remote-cmd STR is the bash -c string that does the SAME job on the remote host (the caller owns it: remote-job + import);
+	#   one ssh probe; admitted (load1 < OFFLOAD_MAXLOAD1, MemAvailable > OFFLOAD_MINAVAIL_GB, no rj-/foreign) -> `heavy-job: ROUTE remote (...)` and STR runs through the remote FIFO path (offload_run: its FIFO + rc, no local queue, no local load rule);
+	#   unreachable or refused -> ONE `heavy-job: ROUTE local: remote host <reason>` line and the normal local path below. Only class gate; no --remote-cmd = today's behaviour. Never silent, the remote host never required.
+	if [ -n "$offloadc" ] && [ "$class" = gate ]; then
+		if ! { huse=gate; sprobe; }; then why="unreachable: $p_err"; [[ $p_err != "OFFLOAD OFF"* ]] || why=$p_err; elif ! sadmit; then why="refused: $sreason"; else why=; fi
+		if [ -z "$why" ]; then
+			route_line="heavy-job: ROUTE remote label=$label ($(sstamp))"; out "$route_line"; ! declare -F hj_rlog >/dev/null || hj_rlog gate remote "$route_line"
+			offload_run --owner "$(id -un 2>/dev/null || echo unknown)" --label "$label" --wait "$wait" -- bash -c "$offloadc"   # in-process: takes the remote FIFO, runs STR, keeps its rc, exits
+		fi
+		route_line="heavy-job: ROUTE local: remote host $why"; out "$route_line"; ! declare -F hj_rlog >/dev/null || hj_rlog gate local "$route_line"
+		hj_late=$offloadc   # queued locally: swait_turn re-offers it to the remote host while it waits (late_remote)
+	elif [ -n "$offloadc" ]; then out "heavy-job: ROUTE local: --remote-cmd is for class gate only (class=$class)"; fi
+	# r3 F8: tools the CMD launch and killcmd rely on, checked BEFORE the ticket and the lock (a missing setsid used to surface as rc=127 after the lock, like a missing CMD)
+	(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= ${HEAVY_JOB_MIN_BASH:-501} )) || err "bash >= 5.1 required for wait -n -p (this is $BASH_VERSION)"   # lab-host bash 5.2.37 observed 2026-10-29; offload-host not read, only matters if `run` is ever used there
+	command -v setsid >/dev/null 2>&1 || err "setsid not found (util-linux): CMD cannot be started in its own session"
+	command -v setpriv >/dev/null 2>&1 || err "setpriv not found (util-linux): CMD cannot get a parent-death signal (a SIGKILL of heavy-job would leave CMD holding the lock)"
+	setpriv --pdeathsig USR1 true >/dev/null 2>&1 || err "setpriv --pdeathsig is not supported here (util-linux too old)"   # lab-host util-linux 2.41.5 observed 2026-10-29
+	env --default-signal=INT,QUIT,TERM true >/dev/null 2>&1 || err "env --default-signal is not supported here (coreutils too old)"   # lab-host coreutils 9.7 observed 2026-10-29
+	t0=$(date +%s)   # one budget: queue + memory gate + lock
+	ld=$(logroot)/logs/heavy-job/$label; mkdir -p "$ld" "$(dirname "$lock")" || err "cannot create log or lock directory"
+	out "heavy-job: log $ld/run.log"
+	[ -z "${route_line:-}" ] || echo "$route_line" >>"$ld/run.log"
+	ssq=$sq; sqn=$qn; sqw=$qw; sqk=$qk   # the remote FIFO dir + names, kept for late_remote
+	sq=$hq; qn=heavy-queue; qw=queue; qk=local; qpos=1; owner=$(id -un 2>/dev/null || echo unknown)   # the shared FIFO code (offload-host queue section) on the local queue dir
+	settraps   # ticket removed on every exit path; sabort kills the background wait child and prints the RESULT line
+	qprio   # T-8bf1: priority of the ticket named in the label (before the ticket: it is written into it)
+	stake   # arrival order, taken BEFORE the memory gate so a load/memory wait cannot be overtaken
+	out "heavy-job: queue: ticket ${ticket##*/} owner=$owner"
+	out "heavy-job: queue: $pnote"
+	[ -z "$pwarn" ] || out "$pwarn"   # T-87a2: a job whose ticket cannot be found says so (run.log gets it once the lock is held, below)
+	swait_turn
+	memgate "before lock" || err "memory-gate mem_avail=${mem_gb}G need=${need}G psi=$psi load1=$load1 cpu_psi=$cpupsi"
+	exec 7>>"$lock"
+	if ! flock -n 7; then   # still real: guards non-ticketed holders (an older tools/heavy-job copy)
+		held=$(cat "$lock" 2>/dev/null); out "heavy-job: lock held by: ${held:-unknown}; waiting up to $((wait - ($(date +%s) - t0))) s"
+		flock -w $((wait - ($(date +%s) - t0) > 0 ? wait - ($(date +%s) - t0) : 1)) 7 9>&- & fp=$!
+		wait "$fp"; ld_rc=$?; fp=
+		[ "$ld_rc" = 0 ] || err "heavy-job lock held by: $(cat "$lock" 2>/dev/null || echo unknown) (waited ${wait}s)"
+	fi
+	printf '%s %s %s %s\n' "$label" "$class" "$$" "$(date +%FT%T)" >"$lock"
+	tkwrite running
+	rlog=$ld/run.log   # only now: a run refused at the lock must not append its ERROR to the log of the job that holds it (review F1)
+	[ -z "$pwarn" ] || echo "$pwarn" >>"$rlog"   # T-87a2: the unticketed-job WARN in run.log, but only for a run that holds the lock (a refused run writes nothing there)
+	sample   # not inside $(...): an err() in sample() must exit this shell, not a subshell (review F2)
+	out "heavy-job: lock acquired label=$label class=$class $(stamp)"
+	t0=$(date +%s)   # the memory wait after the lock gets its own budget
+	memgate "before exec" || { : >"$lock"; err "memory-gate mem_avail=${mem_gb}G need=${need}G psi=$psi load1=$load1 cpu_psi=$cpupsi"; }
+	t1=$(date +%s)
+	export HEAVY_JOB_HELD=$label
+	mark_started
+	[ -z "$light" ] || { export HEAVY_JOB_LIGHT_SLOT=1; cpu0=$(hj_cpu_children); }   # T-66a6: cmd_inner unsets it before CMD
+	launch_cmd "$ld/run.log" "$@"   # CMD in its own session, tracked in cg; rc set (offload_run launches CMD the same way)
+	el=$(( $(date +%s) - t1 ))
+	[ -z "$light" ] || hj_light_after "$cpu0"   # T-66a6: CPU cap check, HEAVY GAP + gaps=1
+	: >"$lock"   # holder text is informational; the flock itself dies with this process
+	local res=FAIL ex=1; [ "$rc" = 0 ] && { res=PASS; ex=0; }; [ "$rc" = 2 ] && ex=2
+	res=$(res_line "$res" "label=$label class=$class rc=$rc elapsed=${el}s${gaps:+ gaps=$gaps}"); out "$res"
+	rlog_add "$res" || echo "heavy-job: WARNING: cannot append the RESULT line to $rlog" >&2
+	exit $ex
+}
+# ---------------------------------------------------------------- offload-host queue
+sq=${OFFLOAD_QUEUE_DIR:-$HOME/.cache/pixelios/offload-queue}
+hj_root=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+. "$hj_root/tools/offload-conf.sh"; offload_conf_load "$hj_root"   # T-dd93: host + foreign-process regex from tools/offload-host.conf (gitignored) or the environment
+shost=${REMOTE_JOB_HOST:-${OFFLOAD_HOST:-}}; sssh=${REMOTE_JOB_SSH:-ssh}
+smax=${OFFLOAD_MAXLOAD1:-8}; smin=${OFFLOAD_MINAVAIL_GB:-12}; sre=${OFFLOAD_FOREIGN_RE:-vitest}; sreprobe=${OFFLOAD_REPROBE:-60}
+ticket=; fp=; cg=; slog=; label=; owner=; huse=; sfb=${HEAVY_JOB_FALLBACK_LOCAL:-0}; sfell=
+# the queue code below (stake/swait_turn/stickets/sstate/srelease) serves BOTH FIFOs; globals: sq dir, qn error prefix, qw wait-line prefix, qk status kind, qpos (set: error names the position)
+qn=offload-queue; qw="offload-host queue"; qk=offload-host; qpos=
+sout() { out "$@"; [ -z "$slog" ] || echo "$@" >>"$slog"; }
+sres() { local l; l=$(res_line "$@"); [ "${gaps:-0}" = 0 ] || l="$l gaps=$gaps"; sout "$l"; }   # T-4ecb: offload_run sets gaps=1 when it fell back (dynamic scope)
+gapw=$(sed -n 's/^#   tools\/heavy-job \([a-z]*\) run --owner.*/\1/p' "${BASH_SOURCE[0]}" | head -1); gapw=${gapw:-offload}; gapw=${gapw^^}   # the host word for the GAP line, read from the usage so no host literal is added here
+serr() { sres ERROR "$*"; notrun_note "$*"; exit 2; }
+srelease() { [ -z "$ticket" ] || rm -f "$ticket"; ticket=; }
+# sabort SIG: a trapped INT/TERM/HUP. Kills the background child, removes the ticket, prints a RESULT line (F6: tools end in one) and exits 128+signal.
+# killcmd [reaped]: r2 F2. SIGTERM to CMD's session, SIGKILL after $HEAVY_JOB_KILL_GRACE s; the session is gone before killcmd returns. If heavy-job is SIGKILLed meanwhile, the leader's
+# pdeathsig takes over (cmd_inner; r4 F2). "reaped" (r4 F3): the leader was already waited for, so only the session is signalled and polled.
+killcmd() {
+	local c=$cg w ks g=${HEAVY_JOB_KILL_GRACE:?} i
+	sleep "$g" 9>&- & ks=$!
+	kill -TERM -- "-$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null   # the group does not exist in the few ms before setsid ran: then the leader pid itself
+	if [ "${1:-}" = reaped ]; then w=$c; else wait -n -p w "$c" "$ks" 2>/dev/null; fi   # the session leader (our wrapper) is reaped, or the grace is over
+	if [ "${w:-}" = "$c" ]; then   # CMD itself may outlive the wrapper (it can ignore SIGTERM): poll the session until the grace is over
+		for ((i = 0; i < g * 10; i++)); do kill -0 -- "-$c" 2>/dev/null || break; sleep 0.1 9>&-; done
+	fi
+	kill -KILL "$ks" 2>/dev/null; wait "$ks" 2>/dev/null   # KILL: sabort ignores TERM, and an ignored signal is inherited by sleep
+	if kill -0 -- "-$c" 2>/dev/null; then echo "heavy-job: WARNING: CMD ignored SIGTERM for ${g} s, sending SIGKILL" >&2; kill -KILL -- "-$c" 2>/dev/null; fi
+	wait "$c" 2>/dev/null
+	cg=   # cleared last (r3 F3), not first
+}
+sabort() {
+	trap '' INT TERM HUP   # r3 F3: a second signal while aborting must not interrupt killcmd (it used to exit with CMD still alive)
+	local t=${ticket##*/} l ex=143 k=; [ "$1" != INT ] || ex=130; [ "$1" != HUP ] || ex=129
+	[ -z "$fp" ] || kill "$fp" 2>/dev/null
+	[ -z "$cg" ] || { killcmd; k=" (CMD killed)"; }
+	srelease
+	[ -n "$cg" ] || notrun_note "aborted by SIG$1 before CMD started"
+	l=$(res_line FAIL "$qn${label:+ label=$label} aborted by SIG$1${k}${t:+ (ticket $t removed)}"); sout "$l"
+	[ -z "$rlog" ] || { rlog_add "$l"; : >"$lock"; }   # local run after the lock: run.log ends with the verdict, holder text cleared (as err() does)
+	exit $ex
+}
+# launch_cmd LOG CMD...: the one way CMD is started (cmd_run and offload_run); sets rc. Caller has the locals rc and t1. HEAVY_JOB_CMD_NOLOCK=1: no heavy-job lock held (offload), the leader skips its lock wait.
+# r2 F2: CMD is a BACKGROUND job in its own session (a foreground pipeline defers the INT/TERM/HUP trap until CMD ends, leaving an orphan CMD and no RESULT line); sabort kills the session (-$cg).
+# 0<&0 keeps CMD's stdin (a bare `&` gives /dev/null); 6/8/9 closed: no ticket fd. r3 F1: pdeathsig USR1 on the leader only (a fork clears it): a SIGKILL of heavy-job runs its USR1 trap (cmd_inner).
+launch_cmd() {
+	local c l
+	setpriv --pdeathsig USR1 setsid "$BASH" "${BASH_SOURCE[0]}" __cmd "$@" 0<&0 6>&- 8>&- 9>&- & cg=$!; c=$cg; wait "$c"; rc=$?
+	if [ "$rc" -gt 128 ] && kill -0 -- "-$c" 2>/dev/null; then   # r4 F3: the leader died by a signal (or CMD exited > 128) but members of its session still run and hold the lock: say so, end them
+		l="heavy-job: WARNING: CMD leader ended with rc=$rc (signal $((rc - 128))) but its session is still running after $(( $(date +%s) - ${t1:-$(date +%s)} )) s; terminating it (SIGTERM, SIGKILL after ${HEAVY_JOB_KILL_GRACE} s)"; echo "$l" >&2; [ -z "$rlog" ] || rlog_add "$l"; killcmd reaped
+	fi; cg=
+}
+settraps() { trap srelease EXIT; trap 'sabort INT' INT; trap 'sabort TERM' TERM; trap 'sabort HUP' HUP; }
+# sprobe: one ssh. Sets p_load p_gb p_rj p_foreign; returns 1 (reason in p_err) when ssh or the answer fails.
+sprobe() {
+	local o k v kb='' seenrj=0 prc off
+	p_load=; p_gb=; p_rj=; p_foreign=; p_err=; p_to=0; rjerr=
+	[ -n "$shost" ] || { p_err="OFFLOAD GAP: no offload host configured (set OFFLOAD_HOST in tools/offload-host.conf, template tools/offload-host.conf.example)"; return 1; }
+	if off=$(offload_off_reason "$hj_root" "$huse"); then p_err="OFFLOAD OFF: use=${huse:-all} switched off by order, nothing new is routed to the offload host: $off"; return 1; fi   # T-ee35 + per-use switch (huse: set by the caller, empty = master only)
+	# the remote shell is fish: the script goes in on stdin of `bash -s`
+	o=$({ printf 're=%q\n' "$sre"; cat <<'P'
+echo "load=$(cut -d' ' -f1 /proc/loadavg)"
+echo "memkb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+dk=$HOME/.local/bin/docker; [ -x "$dk" ] || dk=$(command -v docker || { rc=$?; [ $rc = 1 ] || echo "heavy-job GAP: command -v docker failed rc=$rc" >&2; })
+if [ -z "$dk" ]; then echo "rjerr=no docker on the host"
+elif ps=$("$dk" ps --format '{{.Names}}' 2>&1); then echo "rj=$(grep '^rj-' <<<"$ps" | head -3 | tr '\n' ',')"
+else echo "rjerr=docker ps failed: $(head -c 60 <<<"$ps" | tr '\n' ' ')"; fi
+echo "foreign=$(pgrep -af -- "$re" 2>/dev/null | awk -v me="$$" -v pp="$PPID" '$1!=me && $1!=pp' | head -2 | cut -c1-80 | tr '\n' ';')"
+P
+	} 9>&- | timeout "${OFFLOAD_PROBE_TIMEOUT:-30}" "$sssh" -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$shost" bash -s 2>&1 9>&-) || {
+		prc=$?; p_err="ssh failed (rc $prc): ${o:0:80}"
+		[ "$prc" != 124 ] || { p_to=1; p_err="ssh probe timed out after ${OFFLOAD_PROBE_TIMEOUT:-30}s"; }   # r2 F4: a stalled ssh is a loud, retried probe error, never an admission
+		return 1; }
+	while IFS='=' read -r k v; do
+		case $k in load) p_load=$v ;; memkb) kb=$v ;; rj) p_rj=$v; seenrj=1 ;; rjerr) rjerr=$v ;; foreign) p_foreign=$v ;; *) ;; esac
+	done <<<"$o"
+	[ -z "$rjerr" ] || { p_err="docker check failed on offload-host: ${rjerr:0:80}"; return 1; }   # r2 F3: no answer about rj- containers is an error, never "none"
+	[ "$seenrj" = 1 ] || { p_err="probe gave no rj= answer: ${o:0:80}"; return 1; }
+	[[ $p_load =~ ^[0-9.]+$ ]] && [[ $kb =~ ^[0-9]+$ ]] || { p_err="bad probe answer: ${o:0:80}"; return 1; }
+	p_gb=$(awk -v k="$kb" 'BEGIN{printf "%.1f", k/1048576}')
+}
+# sadmit: after a good sprobe; sets sreason and returns 1 when refused.
+sadmit() {
+	local why=
+	awk -v l="$p_load" -v m="$smax" 'BEGIN{exit !(l+0<m+0)}' || why="load1 $p_load >= $smax"
+	awk -v g="$p_gb" -v m="$smin" 'BEGIN{exit !(g+0>m+0)}' || why="${why:+$why; }MemAvailable ${p_gb}G <= ${smin}G"
+	[ -z "$p_rj" ] || why="${why:+$why; }rj- container running: ${p_rj%,}"
+	[ -z "$p_foreign" ] || why="${why:+$why; }foreign heavy process: ${p_foreign%;}"
+	sreason=$why; [ -z "$why" ]
+}
+sstamp() { echo "load1=$p_load mem_avail=${p_gb}G rj=${p_rj:-none} foreign=${p_foreign:-none}"; }
+
+qposmsg() { local f n=0; [ -n "$qpos" ] || return 0; for f in $(stickets); do n=$((n + 1)); [ "$f" = "$ticket" ] && break; done; echo " (queue position $n)"; }
+
+# F8: tickets are NNNNNN.label (%06d) but the number may pass 999999: match any digits, order NUMERICALLY (a glob sorts 1000000 before 999999)
+# T-8bf1/T-f4a2: the LOCAL queue orders by (admitted first, effective level, ticket priority, number); every other queue (offload-host) is the plain numeric order.
+# effprio PRIO EP NOW: max(0, PRIO - (NOW-EP)/MAXAGE); an unreadable EP counts as age 0
+effprio() { local e=$1; [[ $2 =~ ^[0-9]+$ ]] && [ "$3" -ge "$2" ] && e=$(($1 - ($3 - $2) / maxage)); [ "$e" -ge 0 ] || e=0; echo "$e"; }
+stickets() {
+	local f b o l pid ep st rest adm eff prio now; now=$(date +%s)
+	for f in "$sq"/[0-9]*.*; do
+		b=${f##*/}; [ -e "$f" ] && [[ $b =~ ^[0-9]+\. ]] || continue
+		adm=1; eff=2; prio=2
+		if [ "$qk" = local ]; then
+			o=; l=; pid=; ep=; st=; rest=; read -r o l pid ep st rest <"$f" 2>/dev/null || true   # an empty ticket (being written, or unreadable) counts as a P2 waiter
+			case $st in admitted|running) adm=0 ;; esac
+			[[ $rest =~ prio=([0-4]) ]] && prio=${BASH_REMATCH[1]}
+			eff=$(effprio "$prio" "$ep" "$now")
+		else eff=$prio
+		fi
+		echo "$adm $eff $prio $((10#${b%%.*})) $f"
+	done | sort -k1,1n -k2,2n -k3,3n -k4,4n | cut -d' ' -f5-
+}
+
+# tkwrite STATE: rewrites our ticket in place (no truncation, padded to the longest line written so far, so a reader never sees it empty or half old/half new)
+tkwrite() {
+	local line; line=$(printf '%s %s %s %s %s%s%s%s' "$owner" "$label" "$$" "$tepoch" "$1" "${HEAVY_JOB_DETACHED:+ unit=$HEAVY_JOB_DETACHED}" "${mypr:+ prio=$mypr}${punt:+ unticketed}" "$hj_tkb")   # T-d543: + blob=X
+	[ "${#line}" -ge "$tlen" ] || line=$(printf '%-*s' "$tlen" "$line")
+	tlen=${#line}
+	printf '%s\n' "$line" 1<>"$ticket"
+}
+
+# qprio: sets mypr (0..4), pnote and pwarn. Order (T-87a2): (0) an explicit T-xxxx / t-xxxx in the label -> that ticket's priority (column 10 of the super's queue INDEX.tsv);
+# (a) a label that STARTS with a bare 4-hex id followed by `-` or its end (a0aa-g2c, t4e39-g2 with an optional leading t; `ba17j` is NOT this) when that id is in the INDEX; (b) the cwd checkout's branch, git top-level dir or cwd dir naming T-xxxx
+# (tools/T-ba17, worktree T-ba17) when that id is in the INDEX; (c) else P2 with a WARN line (pwarn: printed, appended to run.log, and shown by `status` through the `unticketed` ticket token).
+qprio() {
+	local id idx c lr p cand src top
+	mypr=2; pnote="prio=P2 (no ticket id in the label)"; pwarn=; punt=; src=; id=
+	[[ $label =~ (^|[^A-Za-z0-9])[Tt]-([0-9A-Fa-f]{4})($|[^A-Za-z0-9]) ]] && id=T-${BASH_REMATCH[2],,}
+	idx=${HEAVY_JOB_QUEUE_INDEX:-}
+	if [ -z "$idx" ]; then
+		lr=$(logroot 2>/dev/null)
+		for c in ${PIXOS_SUPER:+"$PIXOS_SUPER/docs/queue/INDEX.tsv"} "$lr/docs/queue/INDEX.tsv" "$lr/../../docs/queue/INDEX.tsv" "$hj_root/super/docs/queue/INDEX.tsv"; do
+			[ -n "$idx" ] || idx=$c   # the first candidate is the one named when none is readable
+			[ -r "$c" ] && { idx=$c; break; }
+		done
+	fi
+	if [ -z "$id" ] && [[ $label =~ ^nightly- ]]; then   # T-f4a2: the scheduled nightly job has no ticket and is not urgent: P3, said on the note line (not a WARN: it is by design)
+		mypr=3; pnote="prio: label $label is a scheduled nightly job (no ticket); P3"; return 0
+	fi
+	if [ -z "$id" ] && [ -r "$idx" ]; then
+		# (a) bare id at the start of the label (a0aa-g2c, a0aa), known to the INDEX
+		if [[ $label =~ ^[Tt]?([0-9A-Fa-f]{4})($|-) ]]; then
+			cand=T-${BASH_REMATCH[1],,}
+			[ -n "$(awk -F'\t' -v id="$cand" '$1 == id { print $1; exit }' "$idx" 2>/dev/null)" ] && { id=$cand; src="bare label id"; }
+		fi
+		# (b) the checkout this job runs from: branch tools/T-xxxx, the git top-level dir, or the cwd dir
+		if [ -z "$id" ]; then
+			top=$(git rev-parse --show-toplevel 2>/dev/null)
+			for c in "$(git symbolic-ref --short -q HEAD 2>/dev/null)" "${top##*/}" "${PWD##*/}"; do
+				[[ $c =~ (^|[^A-Za-z0-9])[Tt]-([0-9A-Fa-f]{4})($|[^A-Za-z0-9]) ]] || continue
+				cand=T-${BASH_REMATCH[2],,}
+				[ -n "$(awk -F'\t' -v id="$cand" '$1 == id { print $1; exit }' "$idx" 2>/dev/null)" ] && { id=$cand; src="checkout '$c'"; break; }
+			done
+		fi
+	fi
+	if [ -z "$id" ]; then
+		pwarn="heavy-job: WARN prio=P2: label $label names no ticket"; punt=1; return 0
+	fi
+	if [ ! -r "$idx" ]; then pnote="prio: INDEX $idx unreadable; $id treated as P2"; return 0; fi
+	p=$(awk -F'\t' -v id="$id" '$1 == id { print $10; exit }' "$idx" 2>/dev/null)
+	if [[ $p =~ ^P([0-4])$ ]]; then mypr=${BASH_REMATCH[1]}; pnote="prio=P$mypr ($id${src:+ from $src} in $idx)"
+	else pnote="prio: $id not in $idx${p:+ (priority '$p' is not P0..P4)}; P2"; fi
+}
+
+stake() {   # takes a ticket under one flock; dead tickets (nobody holds their lock) are removed first
+	local n f m=0 b s='' why='' rem frc
+	mkdir -p "$sq" || serr "$qn: cannot create $sq"
+	{ exec 8>>"$sq/.lock"; } 2>/dev/null || serr "$qn: cannot open $sq/.lock"
+	# F2: bounded like every other wait here: background flock (fd 8 is the same open file description, so the parent holds the lock), charged to the ONE --wait budget, trappable
+	rem=$((wait - ($(date +%s) - t0))); [ "$rem" -ge 0 ] || rem=0
+	# r2 F6 (equivalent mutant, no kill row): $rem == $wait unless the clock ticks between t0 and here (t0 is set just before; date has 1 s granularity); a row would need a delay hook
+	flock -w "$rem" 8 9>&- & fp=$!
+	wait "$fp"; frc=$?; fp=
+	[ "$frc" = 0 ] || serr "$qn: cannot lock $sq/.lock within ${wait}s (flock rc $frc; something holds the queue lock)"
+	# r2 F7: a dead ticket of ANOTHER user is swept only if we can open it and remove it; otherwise a loud line (liveness of an unreadable ticket cannot be told without root)
+	for f in $(stickets); do
+		if [ -e "$f" ] && [ ! -r "$f" ]; then sout "heavy-job: WARNING: $qw: ticket ${f##*/} is unreadable (another user's?), cannot tell if its owner is alive; not swept (remove by hand if dead: rm $f)"; continue; fi
+		( { exec 3<"$f"; } 2>/dev/null && flock -n 3 && { rm -f "$f"; [ ! -e "$f" ] || sout "heavy-job: WARNING: $qw: dead ticket ${f##*/} cannot be removed (directory permissions?): rm $f"; } )
+	done
+	# F1: the next number is max(.seq, highest live ticket) + 1, so a lost, empty or garbled .seq can neither stop the lane nor restart numbering below a live ticket
+	for f in $(stickets); do b=${f##*/}; b=$((10#${b%%.*})); [ "$b" -le "$m" ] || m=$b; done
+	[ ! -e "$sq/.seq" ] || s=$(cat "$sq/.seq" 2>/dev/null)
+	if [[ $s =~ ^[0-9]{1,15}$ ]]; then n=$((10#$s)); [ "$n" -ge "$m" ] || why="behind the highest live ticket $m"
+	else
+		n=0
+		if [ -e "$sq/.seq" ]; then why=empty; [ -z "$s" ] || why="garbled '${s:0:20}'"
+		elif [ "$m" != 0 ]; then why="missing while a live ticket $m exists"; fi
+	fi
+	[ "$n" -ge "$m" ] || n=$m
+	n=$((n + 1))
+	# r2 F6 (equivalent mutant, no kill row): tmp+mv vs a direct write differ only for a crash between truncate and write, which a host test cannot hit; kept for atomicity
+	{ echo "$n" >"$sq/.seq.tmp" && mv -f "$sq/.seq.tmp" "$sq/.seq"; } || serr "$qn: cannot write $sq/.seq"
+	[ -z "$why" ] || sout "heavy-job: $qw: .seq repaired to $n ($why)"
+	! declare -F hj_seq_pick >/dev/null || [ "$qk" != local ] || hj_seq_pick   # T-70cd: a re-queued waiter keeps its number (hj_seqn) and enqueue epoch (hj_ep)
+	ticket=$(printf '%s/%06d.%s' "$sq" "${hj_seqn:-$n}" "$label")
+	{ exec 9>>"$ticket" && flock -n 9; } || serr "$qn: cannot lock own ticket $ticket"
+	tepoch=${hj_ep:-$(date +%s)}; tlen=0; tkwrite waiting
+	exec 8>&-
+}
+
+# qhead (local queue): returns 0 after marking our ticket `admitted` when it is the first of the CURRENT order, decided under the queue .lock (stake holds it while it writes a ticket)
+qhead() {
+	local f first='' cnt=0 why now rem frc eff
+	{ exec 8>>"$sq/.lock"; } 2>/dev/null || serr "$qn: cannot open $sq/.lock"
+	rem=$((wait - ($(date +%s) - t0))); [ "$rem" -ge 1 ] || serr "$qn: waited ${wait}s, not our turn$(qposmsg)"
+	flock -w "$rem" 8 9>&- & fp=$!
+	wait "$fp"; frc=$?; fp=
+	[ "$frc" = 0 ] || serr "$qn: cannot lock $sq/.lock within ${wait}s (flock rc $frc; something holds the queue lock)"
+	for f in $(stickets); do cnt=$((cnt + 1)); [ -n "$first" ] || first=$f; done
+	if [ "$first" != "$ticket" ]; then exec 8>&-; return 1; fi
+	now=$(date +%s)
+	eff=$(effprio "${mypr:-2}" "$tepoch" "$now")
+	if [ "$eff" -lt "${mypr:-2}" ]; then why="aged $((now - tepoch))s: +$((${mypr:-2} - eff)) levels at HEAVY_JOB_MAXAGE ${maxage}s, prio=P${mypr:-2} eff=P$eff, best effective level of $cnt in the queue"
+	elif [ "$cnt" = 1 ]; then why="only job in the queue"
+	else why="best priority P${mypr:-2} of $cnt in the queue, FIFO inside the level"; fi
+	tkwrite admitted
+	exec 8>&-
+	sout "heavy-job: queue: admitted ${ticket##*/} prio=P${mypr:-2} ($why)"
+	return 0
+}
+
+swait_turn() {   # blocks (flock, no sleep) on the predecessor until this ticket is the head; budget $wait from $t0
+	local pred f rem frc sl
+	while :; do
+		pred=
+		for f in $(stickets); do [ "$f" = "$ticket" ] && break; pred=$f; done
+		if [ -z "$pred" ]; then
+			[ "$qk" = local ] || return 0
+			qhead && return 0   # head decision under the queue .lock; a better ticket staked meanwhile -> not first any more, re-list
+			continue
+		fi
+		if ! { exec 6<"$pred"; } 2>/dev/null; then   # F3: gone = re-list; present but unopenable = loud error, never a silent spin
+			[ -e "$pred" ] || continue
+			serr "$qn: cannot open the predecessor ticket ${pred##*/} (permissions?); not waiting on it$(qposmsg) (remove by hand if its owner is gone: rm $pred)"
+		fi
+		rem=$((wait - ($(date +%s) - t0)))
+		[ "$rem" -ge 1 ] || serr "$qn: waited ${wait}s for ${pred##*/}, not our turn$(qposmsg)"
+		sout "heavy-job: $qw: waiting behind ${pred##*/} ($(cut -d' ' -f1,2,5 "$pred" 2>/dev/null))"
+		! declare -F hj_cycle_check >/dev/null || hj_cycle_check   # T-70cd: lock free with live waiters = WAIT-CYCLE (canonical copy only)
+		sl=$rem   # 2026-11-01: a gate queued locally (remote host busy at submit) waited hours behind one local lock while the remote host went idle: re-offer it every hrep s
+		[ "$qk" != local ] || [ -z "${hj_late:-}" ] || [ "$rem" -le "$hrep" ] || sl=$hrep
+		[ "$qk" != local ] || [ "$sl" -le "$reeval" ] || sl=$reeval   # T-8bf1: re-list now and then (aging, a better-priority newcomer)
+		flock -w "$sl" 6 9>&- 8>&- & fp=$!
+		wait "$fp"; frc=$?; fp=
+		same=0; [ "$pred" -ef /proc/self/fd/6 ] && same=1; exec 6<&-   # T-a1e4: is the path still the file we locked? (asked before fd 6 is closed)
+		if [ "$frc" != 0 ] && [ "$sl" != "$rem" ]; then [ -z "${hj_late:-}" ] || late_remote; continue; fi   # slice over, not our turn yet: remote free -> late_remote exits; else wait on
+		[ "$frc" = 0 ] || serr "$qn: waited ${wait}s for ${pred##*/}, not our turn$(qposmsg)"
+		[ "$same" = 1 ] || continue; rm -f "$pred"   # T-a1e4: we got its lock = the owner is gone, but the NAME may now belong to ANOTHER ticket (a re-queued waiter restarts under its old name after the sweep removed the dead file): never rm that one (it hid a live waiter, which spun forever); re-list
+		[ ! -e "$pred" ] || serr "$qn: dead predecessor ticket ${pred##*/} cannot be removed (directory permissions?): rm $pred"   # r2 F7: else the next loop spins on it
+	done
+}
+
+hrep=${HEAVY_JOB_REMOTE_REPROBE:-120}
+late_remote() {   # a locally queued gate with --remote-cmd: the remote FIFO is empty and the remote host admits -> leave the local FIFO, run remote (offload_run exits)
+	local f n=0 c
+	for f in "$ssq"/[0-9]*.*; do [ -e "$f" ] || continue; ( flock -n 3 ) 3<"$f" 2>/dev/null && continue; n=$((n + 1)); done   # live remote tickets only
+	[ "$n" = 0 ] || return 0
+	sprobe && sadmit || return 0
+	c=$hj_late; hj_late=
+	sout "heavy-job: ROUTE remote (late) label=$label: remote host free while queued locally behind ${pred##*/} ($(sstamp))"
+	[ -z "${ld:-}" ] || echo "heavy-job: ROUTE remote (late) label=$label" >>"$ld/run.log"
+	srelease; exec 9>&-   # our local ticket is gone: the waiters behind us move up
+	sq=$ssq; qn=$sqn; qw=$sqw; qk=$sqk; qpos=
+	offload_run --owner "$owner" --label "$label" --wait "$wait" -- bash -c "$c"
+}
+
+sadmission() {
+	local rc
+	while :; do
+		if ! sprobe; then
+			[ "$sfb" != 1 ] || { sfell=$p_err; return 3; }   # T-4ecb: --fallback-local, offload host lost between the caller's probe and admission: caller runs CMD here
+			[ "$p_to" = 1 ] || serr "offload-host unreachable ($p_err)"
+			sout "heavy-job: offload-host probe error: $p_err; retrying in ${sreprobe}s"   # not admitted
+			[ $(($(date +%s) - t0 + sreprobe)) -le "$wait" ] || serr "offload-queue: probe kept failing within ${wait}s: $p_err"
+			sleep "$sreprobe" 9>&- & fp=$!; wait "$fp"; rc=$?; fp=; [ "$rc" = 0 ] || exit 143
+			continue
+		fi
+		if sadmit; then sout "heavy-job: offload-host admitted $(sstamp)"; return 0; fi
+		sout "heavy-job: offload-host not admitted: $sreason ($(sstamp))"
+		[ $(($(date +%s) - t0 + sreprobe)) -le "$wait" ] || serr "offload-queue: not admitted within ${wait}s: $sreason"
+		sleep "$sreprobe" 9>&- & fp=$!; wait "$fp"; rc=$?; fp=; [ "$rc" = 0 ] || exit 143
+	done
+}
+
+offload_run() {
+	local lbl='' rc el t1 res ex arc gaps
+	wait=7200
+	while [ $# -gt 0 ]; do case $1 in
+		--owner) owner=${2:-}; shift 2 ;; --label) lbl=${2:-}; shift 2 ;; --wait) wait=${2:-}; shift 2 ;; --fallback-local) sfb=1; shift ;; --use) huse=${2:-}; shift 2 ;; --) shift; break ;;
+		*) serr "usage: offload-host run: unknown option '$1'" ;;
+	esac; done
+	label=$lbl
+	[ $# -gt 0 ] || serr "usage: offload-host run: no CMD after --"
+	[[ $owner =~ ^[A-Za-z0-9._-]+$ ]] && [[ $label =~ ^[A-Za-z0-9._-]+$ ]] || serr "usage: offload-host run --owner NAME --label NAME (letters, digits, . _ -)"
+	[[ $wait =~ ^[0-9]+$ ]] || serr "usage: offload-host run: --wait SEC"
+	detached_wait
+	if [ -n "${OFFLOAD_QUEUE_HELD:-}" ]; then
+		out "heavy-job: offload-host queue: nested in ${OFFLOAD_QUEUE_HELD}, no second ticket"
+		mark_started
+		exec "$@"
+	fi
+	lr=$(logroot); mkdir -p "$lr/logs/heavy-job/offload-host" || serr "cannot create the log directory"
+	slog=$lr/logs/heavy-job/offload-host/$label.log
+	out "heavy-job: log $slog"
+	t0=$(date +%s)
+	settraps
+	stake
+	sout "heavy-job: offload-host queue: ticket ${ticket##*/} owner=$owner"
+	swait_turn
+	sadmission; arc=$?
+	gaps=0
+	if [ "$arc" = 3 ]; then   # T-4ecb rule 8: never silent; CMD (remote-job) goes on and does its own local run, the slot is given back
+		gaps=1; srelease
+		sout "$gapw GAP: fell back to the main host, the offload host was lost before the job started ($sfell)"
+	else printf '%s %s %s %s running%s%s\n' "$owner" "$label" "$$" "$(date +%s)" "${HEAVY_JOB_DETACHED:+ unit=$HEAVY_JOB_DETACHED}" "$hj_tkb" >"$ticket"; fi
+	export OFFLOAD_QUEUE_HELD=$label; mark_started; t1=$(date +%s)
+	export HEAVY_JOB_KILL_GRACE=${HEAVY_JOB_KILL_GRACE:-10} HEAVY_JOB_CMD_NOLOCK=1   # killcmd/__cmd read the grace; the offload slot is a ticket, not the heavy-job lock
+	[[ $HEAVY_JOB_KILL_GRACE =~ ^[1-9][0-9]{0,3}$ ]] && [ "$HEAVY_JOB_KILL_GRACE" -le 3600 ] || serr "usage: HEAVY_JOB_KILL_GRACE must be whole seconds 1..3600 (got '$HEAVY_JOB_KILL_GRACE')"
+	launch_cmd "$slog" "$@"   # own session, tracked in cg: INT/TERM/HUP -> sabort -> killcmd; SIGKILL of heavy-job -> the leader's pdeathsig
+	el=$(($(date +%s) - t1))
+	srelease
+	res=FAIL; ex=1; [ "$rc" = 0 ] && { res=PASS; ex=0; }; [ "$rc" = 2 ] && ex=2
+	sres "$res" "offload-queue label=$label owner=$owner rc=$rc elapsed=${el}s"
+	exit $ex
+}
+
+sstate() {   # holder + waiters in order; a ticket whose lock is free is stale
+	local f n=0 o l pid ep st rest un pr pp ef now holder=0
+	now=$(date +%s)
+	for f in $(stickets); do
+		if ( flock -n 3 ) 3<"$f" 2>/dev/null; then echo "heavy-job: $qk queue: ${f##*/} STALE (owner dead, removed by the next taker)"; continue; fi
+		[ -r "$f" ] || { echo "heavy-job: $qk queue: ${f##*/} UNREADABLE (another user's? remove by hand if dead: rm $f)"; continue; }   # r2 F7: never skipped silently
+		read -r o l pid ep st rest <"$f" 2>/dev/null || { echo "heavy-job: $qk queue: ${f##*/} (being written)"; continue; }   # r3 F7: stake creates the ticket empty under the queue lock, then writes it; a live holder's empty ticket is not unreadable
+		n=$((n + 1)); un=; [[ $rest =~ (unit=[^ ]+) ]] && un=${BASH_REMATCH[1]}
+		pr=; [ "$qk" != local ] || { pp=2; [[ $rest =~ prio=([0-4]) ]] && pp=${BASH_REMATCH[1]}; pr=" prio=P$pp"; ef=$(effprio "$pp" "$ep" "$now"); [ "$ef" = "$pp" ] || pr+=" eff=P$ef aged $((now - ep))s"; [[ $rest =~ (^| )unticketed( |$) ]] && pr+=" WARN: label names no ticket"; }   # T-8bf1, T-87a2, T-f4a2
+		[ -z "$hj_canon_blob" ] || hj_stale_check "$pid" "$rest" "$l" "${f##*/}"   # T-d543 (module): a live ticket of another blob than the canonical one
+		case $un in unit=*) echo "heavy-job: $qk unit=${un#unit=} state=$([ "$st" = running ] && echo running || echo queued) pos=$((n - 1))" ;; esac   # T-e8ad: tools/queue tick reads this
+		if [ "$holder" = 0 ]; then
+			holder=1
+			if [ "$st" = running ]; then echo "heavy-job: $qk holder: owner=$o label=$l pid=$pid age=$((now - ep))s$pr"
+			else echo "heavy-job: $qk head (admission): owner=$o label=$l pid=$pid age=$((now - ep))s$pr"; fi
+		else echo "heavy-job: $qk waiter #$((n - 1)): ${f##*/} owner=$o label=$l pid=$pid age=$((now - ep))s$pr"; fi
+	done
+	[ "$n" -gt 0 ] || echo "heavy-job: $qk queue empty ($sq)"
+}
+
+offload_status() {
+	mkdir -p "$sq" 2>/dev/null
+	sstate; ! declare -F hj_uses_status >/dev/null || hj_uses_status   # per-use switch state
+	sprobe || { sres ERROR "offload-host unreachable ($p_err)"; exit 2; }
+	if sadmit; then echo "heavy-job: offload-host probe: $(sstamp) -> would admit"; else echo "heavy-job: offload-host probe: $(sstamp) -> would refuse: $sreason"; fi
+	sres PASS "offload-status"; exit 0
+}
+
+offload_wait() {   # returns when the queue is empty (at once when the caller already holds the slot)
+	local f
+	wait=7200
+	while [ $# -gt 0 ]; do case $1 in --wait) wait=${2:-}; shift 2 ;; *) serr "usage: offload-host wait [--wait SEC]" ;; esac; done
+	[[ $wait =~ ^[0-9]+$ ]] || serr "usage: offload-host wait [--wait SEC]"
+	if [ -n "${OFFLOAD_QUEUE_HELD:-}" ]; then sres PASS "offload-queue holder=$OFFLOAD_QUEUE_HELD (our turn)"; exit 0; fi
+	t0=$(date +%s); mkdir -p "$sq" || serr "cannot create $sq"
+	settraps
+	while :; do
+		f=$(stickets | tail -n 1)
+		[ -n "$f" ] || { sres PASS "offload-queue empty"; exit 0; }
+		{ exec 6<"$f"; } 2>/dev/null || { [ -e "$f" ] || continue; serr "$qn: cannot open ticket ${f##*/} (permissions?); not waiting on it"; }   # r2 F1: gone = re-list, present but unopenable = loud error, never a spin
+		sout "heavy-job: offload-host queue: waiting for ${f##*/} to finish"
+		flock -w "$((wait - ($(date +%s) - t0) > 0 ? wait - ($(date +%s) - t0) : 1))" 6 & fp=$!
+		wait "$fp"; frc=$?; fp=
+		exec 6<&-
+		[ "$frc" = 0 ] || serr "offload-queue: still busy after ${wait}s"
+		rm -f "$f"
+	done
+}
+
+cmd_detach() {
+	unset HEAVY_JOB_NOTRUN_FILE HEAVY_JOB_DETACHED   # this process is the launcher, not a scope: its own errors are plain errors
+	local label='' log='' wake='' deflog='' nr='' sr=${HEAVY_JOB_SYSTEMD_RUN:-systemd-run} sc=${HEAVY_JOB_SYSTEMCTL:-systemctl} unit
+	while [ $# -gt 0 ]; do case $1 in
+		--label) label=${2:-}; shift 2 ;; --log) log=${2:-}; shift 2 ;; --wake-hook) wake=${2:-}; shift 2 ;; --) shift; break ;;
+		*) err "usage: detach: unknown option '$1' (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" ;;
+	esac; done
+	[ $# -gt 0 ] || err "usage: detach: no CMD after --"
+	[[ $label =~ ^[A-Za-z0-9._-]+$ ]] || err "usage: --label NAME (letters, digits, . _ -)"
+	# T-fb2c: no --wake-hook given: the hook `queue claim` registered for THIS thread (thread-<id>.hook, from T3CODE_THREAD_ID) is the default, so the job end wakes the same thread
+	if [ -z "$wake" ] && [ -n "${T3CODE_THREAD_ID:-}" ]; then wk_d=thread-${T3CODE_THREAD_ID//[^A-Za-z0-9._-]/-}; [ ! -f "${WAKE_SECRETS_DIR:-$HOME/.t3/scratch_sec}/$wk_d.hook" ] || wake=$wk_d; fi
+	[ -z "$wake" ] || [[ $wake =~ ^[A-Za-z0-9._-]{1,64}$ ]] || err "usage: --wake-hook HOOKLABEL (letters, digits, . _ -; the file ~/.t3/scratch_sec/HOOKLABEL.hook, docs/recipes/local-webhook.md)"
+	# T-afd9: --wake-hook HOOK: after the DETACHED-END line the scope runs tools/job-wake HOOK LABEL RC (one POST, event `job LABEL rc=N`); its WAKE ok/FAIL line goes to the log,
+	# the job's rc is not touched. A missing hook file is said now (WAKE FAIL at the end would reach nobody who is watching), not silently at the end only.
+	if [ -n "$wake" ] && [ ! -f "${WAKE_SECRETS_DIR:-$HOME/.t3/scratch_sec}/$wake.hook" ]; then out "heavy-job: WARNING: --wake-hook $wake: no hook file $wake.hook in the secrets dir yet; the end-of-job wake will print WAKE FAIL: off unless it exists by then"; fi
+	if [ -n "${HEAVY_JOB_SYSTEMD_RUN:-}${HEAVY_JOB_SYSTEMCTL:-}" ]; then out "heavy-job: WARNING systemd-run/systemctl replaced by env (host test only)"; fi
+	command -v "$sr" >/dev/null 2>&1 || err "detach: $sr not found (no systemd user scope available; refusing a plain background job)"
+	"$sc" --user show-environment >/dev/null 2>&1 || err "detach: '$sc --user show-environment' failed (no systemd user manager; refusing a plain background job)"
+	unit=pixos-hj-$label-$(date +%s)-$$   # r1 F1: + caller pid, two detaches of one label in the same second get two units
+	# T-e8ad: a log is never shared by two units (a stale RESULT / DETACHED-END of an earlier run satisfied a later waiter): default = one file per unit + detach.log -> latest;
+	# an explicit --log with content is moved aside first
+	if [ -z "$log" ]; then log=$(logroot)/logs/heavy-job/$label/detach-$unit.log; deflog=1; fi
+	mkdir -p "$(dirname "$log")" || err "detach: cannot create the log directory of $log"
+	if [ -s "$log" ]; then mv -f "$log" "$log.prev-$(date +%s)-$$" || err "detach: cannot move the old $log aside"; out "heavy-job: note: old content of $log moved to $log.prev-*"; fi
+	[ -z "$deflog" ] || ln -sfn "${log##*/}" "$(dirname "$log")/detach.log"
+	nr=$log.notrun-$unit; rm -f "$nr" "$nr.started"
+	printf 'heavy-job: detach unit=%s start=%s cmd=%s\n' "$unit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%q ' "$@")" >>"$log" || err "detach: cannot write $log"
+	# r1 F4: the scope must not inherit a held lock/queue slot, else a detached `heavy-job run` would skip its lock as "nested"
+	# T-afd9: the wake settings travel in HJ_WAKE_* and are dropped before CMD runs; the wake runs AFTER the end line, its output joins the log. T-4119/AP-280: this bare `&` ignores INT and QUIT, CMD gets its defaults back (bash cannot trap an inherited ignored signal; a detached gate failed test_adversary_matrix and test_check_all_stub)
+	env -u HEAVY_JOB_HELD -u HEAVY_JOB_QUIET -u OFFLOAD_QUEUE_HELD HEAVY_JOB_DETACHED="$unit" HEAVY_JOB_NOTRUN_FILE="$nr" HJ_WAKE_HOOK="$wake" HJ_WAKE_LABEL="$label" HJ_WAKE_TOOL="$(cd "$(dirname "$0")" && pwd)/job-wake" \
+		"$sr" --user --scope --quiet --collect --unit="$unit" -- \
+		bash -c 'wh=$HJ_WAKE_HOOK wl=$HJ_WAKE_LABEL wt=$HJ_WAKE_TOOL nr=$HEAVY_JOB_NOTRUN_FILE; unset HJ_WAKE_HOOK HJ_WAKE_LABEL HJ_WAKE_TOOL; env --default-signal=INT,QUIT "$@"; rc=$?
+			if [ "$rc" != 0 ] && [ -s "$nr" ] && [ ! -e "$nr.started" ]; then rs=$(head -1 "$nr"); rm -f "$nr" "$nr.started"; echo "heavy-job: DETACHED-NOTRUN reason=$rs unit=$0"; exit 75; fi   # T-e8ad: no CMD ever started: not a job end, no wake
+			rm -f "$nr" "$nr.started"; echo "heavy-job: DETACHED-END rc=$rc unit=$0"
+			[ -z "$wh" ] || "$wt" "$wh" "$wl" "$rc" || echo "heavy-job: WAKE FAIL above; job rc=$rc unchanged (hook=$wh)"' "$unit" "$@" >>"$log" 2>&1 </dev/null &
+	local srpid=$! end="^heavy-job: DETACHED-END rc=[0-9]* unit=$unit\$" endn="^heavy-job: DETACHED-NOTRUN reason=.* unit=$unit\$" i=0 st='' jrc
+	# r1 F3: bounded poll (20 x 0.5 s) until the scope is active or this unit's end line is there. Until the PASS line the job may still sit in the
+	# caller's cgroup (systemd-run moves itself into the scope, then execs): the caller must not end its thread before that line.
+	while [ $i -lt 20 ]; do
+		grep -q "$end" "$log" && { st=ended; break; }
+		grep -q "$endn" "$log" && { st=notrun; break; }
+		[ "$("$sc" --user is-active "$unit.scope" 2>/dev/null)" = active ] && { st=active; break; }
+		kill -0 "$srpid" 2>/dev/null || { grep -q "$end" "$log" && st=ended; grep -q "$endn" "$log" && st=notrun; break; }
+		timeout 0.5 tail -f /dev/null; i=$((i + 1))
+	done
+	case $st in
+	active) ;;
+	notrun) jrc=$(grep "$endn" "$log" | tail -1); jrc=${jrc#heavy-job: DETACHED-NOTRUN reason=}; jrc=${jrc% unit=$unit}   # reason text: no sed (it may contain any delimiter)
+		out "$(res_line FAIL "detach unit=$unit: CMD never ran: $jrc (see $log)")"; exit 1 ;;
+	ended)   # r1 F2: a CMD that already ended is judged by its own rc, not reported as a good launch
+		jrc=$(sed -n "s/^heavy-job: DETACHED-END rc=\([0-9]*\) unit=$unit\$/\1/p" "$log" | tail -1)
+		[ "$jrc" = 0 ] || { out "$(res_line FAIL "detach unit=$unit: CMD already ended with rc=$jrc during the launch check (see $log)")"; exit 1; } ;;
+	*) kill -0 "$srpid" 2>/dev/null && err "detach: unit $unit not active after 10 s and no end line (systemd-run pid $srpid still running; see $log)"
+	   wait "$srpid"; err "detach: systemd-run exited rc=$? without starting $unit (see $log)" ;;
+	esac
+	out "heavy-job: detached unit=$unit log=$log pid=$srpid end-line='heavy-job: DETACHED-END rc=N unit=$unit' waiting-line='unit=$unit $log $srpid'"   # T-e8ad: the last token pair is `tools/queue close T-id --waiting` as is
+	out "$(res_line PASS "detach unit=$unit log=$log")"; exit 0
+}
+
+# __cmd LOG CMD...: internal, run by cmd_run in its own session; CMD with stdout and stderr copied to LOG, exits with CMD's rc (r2 F2).
+# r3 F1: the pipeline is a background job so the USR1 trap (setpriv --pdeathsig: heavy-job died, even by SIGKILL) fires at once: SIGTERM to the session,
+#   SIGKILL after the grace (the group includes this leader).
+# r4 F2: the leader ignores TERM itself: sabort's group TERM used to kill it at once, and a SIGKILL of heavy-job during killcmd's grace then had no leader left to fire the pdeathsig in.
+#   bp, the tees and env inherit the ignore; bp sets it again and env gives CMD the default back, so CMD alone sees the TERM (one TERM, not two).
+# r4 F1: after the pipeline ended the leader still waits until no member of the session holds the lock (a daemon-style child that ignores TERM and has no stdout open), SIGKILL after the grace.
+# r3 F2/AP-280: the `&` subshell ignores INT/QUIT again, so CMD goes through env --default-signal (TERM too: see the pipeline line).
+cmd_inner() {
+	local log=$1 rc bp ks w g=${HEAVY_JOB_KILL_GRACE:?} pd='' nl=${HEAVY_JOB_CMD_NOLOCK:-}; shift
+	unset HEAVY_JOB_LIGHT_SLOT HEAVY_JOB_CMD_NOLOCK   # T-66a6: CMD must not see it
+	trap '' TERM
+	trap 'trap "" USR1; pd=1; echo "heavy-job: WARNING: heavy-job died (parent-death signal): SIGTERM to CMD, SIGKILL after ${g} s" >>"$log"; kill -TERM -- "-$$" 2>/dev/null' USR1
+	# bp and both tees ignore TERM (inherited), so the group TERM reaches only CMD: its cleanup output is still logged and bp is still there to wait on; env gives CMD the default TERM back.
+	{ trap '' TERM; { env --default-signal=INT,QUIT,TERM "$@"; } 2> >(tee -a "$log" >&2) | tee -a "$log"; exit "${PIPESTATUS[0]}"; } 0<&0 & bp=$!   # 0<&0: a bare `&` would give the pipeline /dev/null as stdin
+	wait "$bp"; rc=$?
+	if [ -n "$pd" ] && kill -0 "$bp" 2>/dev/null; then   # the trap interrupted wait and CMD is still ours: wait out the grace, then SIGKILL the session
+		sleep "$g" >/dev/null 2>&1 & ks=$!
+		wait -n -p w "$bp" "$ks"; rc=$?
+		if [ "${w:-}" = "$ks" ]; then echo "heavy-job: WARNING: CMD ignored SIGTERM for ${g} s after heavy-job died, sending SIGKILL" >>"$log"; kill -KILL -- "-$$"; fi
+		kill -KILL "$ks" 2>/dev/null
+	fi
+	if [ -n "$pd" ]; then   # r4 F1: the leader drops its own fd 7 first; flock then gets the lock only when every other member of the session has dropped its copy too
+		exec 7>&-
+		[ -n "$nl" ] || flock -w "$g" "$lock" true || { echo "heavy-job: WARNING: session members still hold the lock ${g} s after heavy-job died, sending SIGKILL" >>"$log"; kill -KILL -- "-$$"; }
+	fi
+	exit "$rc"
+}
+
+case ${1:-} in
+	__cmd) shift; cmd_inner "$@" ;;
+	detach) shift; cmd_detach "$@" ;;
+	offload-host) shift; case ${1:-} in run) shift; offload_run "$@" ;; status) shift; offload_status ;; wait) shift; offload_wait "$@" ;; *) err "usage: tools/heavy-job offload-host run|status|wait" ;; esac ;;
+	run) shift; cmd_run "$@" ;;
+	status) exec 7>>"$lock" 2>/dev/null || { mkdir -p "$(dirname "$lock")" && exec 7>>"$lock"; }; cmd_status ;;
+	*) err "usage: tools/heavy-job run --class build|vm|mutant|gate|analysis --label NAME [--light] [--mem-gb N] [--wait SEC] -- CMD... | status | detach --label NAME [--log FILE] [--wake-hook HOOK] -- CMD..." ;;
+esac

@@ -1,0 +1,782 @@
+SWEET Bluetooth Skywalk UART channel (patch 0286; design docs/research/bt-skywalk-uart-channel.md, sections 1-4). Stock bluetoothd opens the control "com.apple.uart.sk.bluetooth", calls setsockopt IOAOSSKYSETCHANNELSPEC (level SYSPROTO_CONTROL = 2, 0x800c5414, 12 bytes = u32 1024, 63, 63) and getsockopt IOAOSSKYGETCHANNELUUID (level 2, 0x40105412, 16 bytes), then os_channel_create(uuid, port 0) and does all H4 I/O through the channel's TX ring 0 / RX ring 2 (slot API, byte stream with the H4 type byte, packets may span slots) [bin: bluetoothd 0x100066f10..0x100067b90, read with capstone]. Until now tools/mkbtm49.py byte-patched that branch away. New bsd/dev/sweet_bt_sk.c (files entry in bsd/conf/files) serves it from the kernel: ONE persistent anonymous kernel-pipe nexus instance (default kpipe domain provider, 1 TX + 1 RX ring, 64 slots of 1024 bytes each; recipe if_utun.c utun_register_kernel_pipe_nexus / utun_enable_channel and nx_kpipe_loopback.c) created lazily at the first sk sockopt (the Skywalk core is not up at sweet_bt_init time [guess]); SETCHANNELSPEC logs the three u32 (a BT GAP line when they differ from 1024 63 63) and returns 0; GETCHANNELUUID returns the instance uuid. Provider callbacks: pre_connect fetches the packet pools (one channel at a time, a second gets EBUSY + GAP), ring_init/ring_fini keep the RX ring, connected switches the UART RX relay (sweet_bt_rx) from ctl_enqueuedata to a 64 KiB locked byte FIFO plus kern_channel_notify, pre_disconnect waits for in-flight notifiers (kern_channel_notify is never called under the FIFO lock because the kevent path takes the kq lock and then sync_rx), disconnected clears everything; sync_tx copies the slot buffers in slot order to the same sbt.ops->tx path the plain control uses (sweet_bt_sk_tx in sweet_bt.c, refused with ENOTCONN + GAP when the sk control is closed, ENXIO + GAP without a backend; a backend error is returned to bluetoothd after the remaining slots are consumed and counted as dropped, never silent); sync_rx fills slots from the FIFO (up to 1024 bytes each, kern_pbufpool_alloc_nosleep, bytes stay queued on allocation failure with a GAP). bluetoothd closes the control before it destroys the channel: the control close keeps the channel and drops unread RX bytes with a GAP. Boot-arg sweetbtsk=0 turns the channel off: the two sockopts are then not recognised and fail as before (ENOPROTOOPT + GAP) and the old "skywalk rows M12-M14" GAP line is printed; the plain control and BlueTool are unchanged. Every Skywalk call that fails is a BT GAP line with the errno and the partially built controller/provider is torn down in reverse order. No new hardware write: TX bytes take the existing UART path. Without SKYWALK/CONFIG_NEXUS_KERNEL_PIPE the file compiles to stubs that log a GAP. NOT run on hardware: unknowns are the Skywalk core on this kernel, the arena mmap into bluetoothd, kern_channel_notify from the RX thread, and whether a sandbox policy filters __channel_open (report s.4). Host test: tools/test_sweet_bt_sk.sh. Review/gap fix: once IOAOSSKYSETCHANNELSPEC succeeded on the sk control, UART RX goes to the channel FIFO (drop oldest with a BT GAP count when full) and is delivered when the channel connects; the FIFO is dropped with a GAP when the control closes first.
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index c9749f0..add576c 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -2,8 +2,9 @@
+  * Bluetooth transport, kernel side (patch 0189, BT-S3 f; docs/research/BT-S3-transport-decision.md D-1 = option (a) plain UART kctl).
+  * bluetoothd / BlueTool talk to the BCM4389 controller through a kernel control (PF_SYSTEM, SYSPROTO_CONTROL, SOCK_DGRAM) and three
+  * switch devices. This file provides those rows (conformance matrix docs/research/109-bt-conformance-matrix.md):
+- *   M17  kctl "com.apple.uart.bluetooth"      BlueTool; M10' kctl "com.apple.uart.sk.bluetooth" registered as the SAME plain control (no Skywalk,
+- *                                              rows M12-M14 are absent; bluetoothd needs the M49 byte patch to use it)
++ *   M17  kctl "com.apple.uart.bluetooth"      BlueTool; M10' kctl "com.apple.uart.sk.bluetooth" registered as the SAME plain control; since patch 0286
++ *                                              (sweet_bt_sk.c) it also answers the two Skywalk sockopts and serves a kernel-pipe channel (rows M12-M14), so bluetoothd
++ *                                              needs no M49 byte patch; with boot-arg sweetbtsk=0 it is the plain control again
+  *   M15/M16 TIOCGETA/TIOCSETA (getsockopt/setsockopt, level 2), M19 H4 bytes (send), M20 TIOCMGET (ioctl; kern_control.c hook)
+  *   M11/M21-M23 /dev/btwake, /dev/btpoweroff, /dev/btreset (open = assert, close = release; polarity is BT-S3 O4, unknown)
+  * There is NO backend yet (no gs101 HCI UART driver, no REG_ON/reset/wake GPIO wiring: nothing here is invented). Every operation that
+@@ -27,6 +28,7 @@
+ #define SBT_CTL_PLAIN   "com.apple.uart.bluetooth"       /* M17 [bin: BlueTool 0x10091b8f0] */
+ #define SBT_CTL_SK      "com.apple.uart.sk.bluetooth"    /* M10 [bin: bluetoothd 0x1006d346a] */
+ #define SBT_NCTL        2
++#define SBT_IDX_SK      1                                /* index of SBT_CTL_SK in sbt.ref[] / names[] */
+ #define SBT_NSW         3
+ #define SBT_TIOCGETA    0x40487413u                      /* M15 [bin 0x40487413]; checked against <sys/ttycom.h> below */
+ #define SBT_TIOCSETA    0x80487414u                      /* M16 [bin 0x80487414] */
+@@ -94,6 +96,11 @@ sbt_index(kern_ctl_ref ref)
+ int
+ sweet_bt_rx(const void *data, size_t len)
+ {
++	int skerr = 0;
++
++	if (sweet_bt_sk_rx(data, len, &skerr)) {         /* patch 0286: a Skywalk channel is connected, it takes every byte */
++		return skerr;
++	}
+ 	for (int i = 0; i < SBT_NCTL; i++) {
+ 		if (sbt.ref[i] != NULL && __atomic_load_n(&sbt.busy[i], __ATOMIC_ACQUIRE)) {
+ 			errno_t err = ctl_enqueuedata(sbt.ref[i], sbt.unit[i], (void *)(uintptr_t)data, len, 0);
+@@ -139,6 +146,9 @@ sbt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
+ 	SBT_TRACE("disconnect control %d", i);
+ 	if (i >= 0 && __atomic_exchange_n(&sbt.busy[i], 0, __ATOMIC_ACQ_REL)) {
+ 		sweet_bt_uart_disc();       /* patch 0285: the VSC adapter drops what only this client could use and prints its counters; before the UART is freed so a new client cannot be hit (review F3) */
++		if (i == SBT_IDX_SK) {
++			sweet_bt_sk_kctl_disconnect();                      /* patch 0286: the channel (if any) outlives the control */
++		}
+ 		__atomic_store_n(&sbt.uart_busy, 0, __ATOMIC_RELEASE);      /* only the holder frees the UART */
+ 	}
+ 	return 0;
+@@ -163,11 +173,32 @@ sbt_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
+ 	return err;
+ }
+ 
++/*
++ * Patch 0286: the Skywalk channel's TX bytes (sweet_bt_sk.c sync_tx, one slot at a time, in slot order) take the plain control's path: sbt.ops->tx. Refused with an error and a
++ * GAP when the sk control is not connected (the channel never writes the UART without the control's client claim) or when there is no backend / no tx hook.
++ */
++int
++sweet_bt_sk_tx(const void *data, size_t len)
++{
++	if (!__atomic_load_n(&sbt.busy[SBT_IDX_SK], __ATOMIC_ACQUIRE)) {
++		SBT_GAP(G_TX, "skywalk channel TX of %zu bytes with the sk control closed; dropped", len);
++		return ENOTCONN;
++	}
++	if (sbt.ops == NULL || sbt.ops->tx == NULL) {
++		SBT_GAP(G_TX, "skywalk channel TX path absent (H4 bytes not relayed)");
++		return ENXIO;
++	}
++	return sbt.ops->tx(data, len);
++}
++
+ static errno_t
+ sbt_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
+ {
+-#pragma unused(ref, unit, unitinfo)
++#pragma unused(unit, unitinfo)
+ 	SBT_TRACE("setsockopt opt %#x len %zu", (unsigned)opt, len);
++	if (sbt_index(ref) == SBT_IDX_SK && sweet_bt_sk_is_opt(opt)) {      /* patch 0286: IOAOSSKYSETCHANNELSPEC */
++		return sweet_bt_sk_setopt(opt, data, len);
++	}
+ 	if ((u_int32_t)opt != SBT_TIOCSETA) {
+ 		SBT_GAP(G_OPT, "kctl setsockopt %#x unknown (only TIOCSETA is a row); refused", (unsigned)opt);
+ 		return ENOPROTOOPT;
+@@ -186,8 +217,11 @@ sbt_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data
+ static errno_t
+ sbt_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
+ {
+-#pragma unused(ref, unit, unitinfo)
++#pragma unused(unit, unitinfo)
+ 	SBT_TRACE("getsockopt opt %#x len %zu", (unsigned)opt, *len);
++	if (sbt_index(ref) == SBT_IDX_SK && sweet_bt_sk_is_opt(opt)) {      /* patch 0286: IOAOSSKYGETCHANNELUUID */
++		return sweet_bt_sk_getopt(opt, data, len);
++	}
+ 	if ((u_int32_t)opt != SBT_TIOCGETA) {
+ 		SBT_GAP(G_OPT, "kctl getsockopt %#x unknown (only TIOCGETA is a row); refused", (unsigned)opt);
+ 		return ENOPROTOOPT;
+@@ -323,5 +357,5 @@ sweet_bt_init(void)
+ 		}
+ 	}
+ 	sweet_bt_uart_attach();   /* bsd/dev/sweet_bt_uart.c: gs101 UART16 + REG_ON/DEV_WAKE backend; boot-arg sweetbt=1 powers it, else one GAP line */
+-	printf("BT GAP: skywalk rows M12-M14 not implemented; %s is a plain control (bluetoothd needs the M49 byte patch)\n", SBT_CTL_SK);
++	sweet_bt_sk_attach();      /* bsd/dev/sweet_bt_sk.c (patch 0286): boot-arg sweetbtsk (default on), one log line */
+ }
+diff --git a/bsd/dev/sweet_bt.h b/bsd/dev/sweet_bt.h
+index 05353fa..8b9290a 100644
+--- a/bsd/dev/sweet_bt.h
++++ b/bsd/dev/sweet_bt.h
+@@ -20,4 +20,13 @@ void sweet_bt_set_ops(const struct sweet_bt_ops *ops);
+ int sweet_bt_rx(const void *data, size_t len);          /* backend -> connected control (ctl_enqueuedata); drops loudly without a client */
+ void sweet_bt_uart_disc(void);                          /* sweet_bt_uart.c (patch 0285), called when the client of either control disconnects */
+ void sweet_bt_uart_attach(void);                        /* sweet_bt_uart.c, called once from sweet_bt_init */
++
++/* Skywalk UART channel (patch 0286, sweet_bt_sk.c; design docs/research/bt-skywalk-uart-channel.md). sweet_bt.c routes the two sk sockopts and the UART RX bytes here. */
++void sweet_bt_sk_attach(void);                          /* parse boot-arg sweetbtsk (0 = off), one log line; called once from sweet_bt_init */
++int sweet_bt_sk_is_opt(int opt);                        /* 1 if `opt` is IOAOSSKYSETCHANNELSPEC / IOAOSSKYGETCHANNELUUID and the channel is on; 0 = handle as before the patch */
++int sweet_bt_sk_setopt(int opt, const void *data, size_t len);  /* errno */
++int sweet_bt_sk_getopt(int opt, void *data, size_t *len);       /* errno; *len is the buffer size in, 16 out */
++int sweet_bt_sk_rx(const void *data, size_t len, int *err);     /* 1 = a channel is connected and took the bytes (*err = 0 or ENOBUFS); 0 = no channel, caller uses ctl_enqueuedata */
++void sweet_bt_sk_kctl_disconnect(void);                 /* the sk control was closed (bluetoothd closes it before it destroys the channel) */
++int sweet_bt_sk_tx(const void *data, size_t len);       /* defined in sweet_bt.c: the channel's TX bytes into the same ops->tx path the plain control uses */
+ #endif
+diff --git a/bsd/dev/sweet_bt_sk.c b/bsd/dev/sweet_bt_sk.c
+new file mode 100644
+index 0000000..b7d569a
+--- /dev/null
++++ b/bsd/dev/sweet_bt_sk.c
+@@ -0,0 +1,649 @@
++/*
++ * Bluetooth Skywalk UART channel (patch 0286). Stock bluetoothd opens the control "com.apple.uart.sk.bluetooth", then (docs/research/bt-skywalk-uart-channel.md):
++ *   setsockopt(fd, SYSPROTO_CONTROL = 2, 0x800c5414 = IOAOSSKYSETCHANNELSPEC, 12 bytes)   [bin 0x100066f44; the 12 bytes are the u32 triple 1024, 63, 63]
++ *   getsockopt(fd, 2, 0x40105412 = IOAOSSKYGETCHANNELUUID, 16 bytes)                       [bin 0x100066f70]
++ *   os_channel_create(uuid, port 0), then ALL H4 I/O through ring TX 0 / RX 2 (slot API, byte stream, H4 type byte included, packets may span slots).
++ * Only -1 counts as failure for the two sockopts, and a failure ends the open with no fallback [bin 0x100066f48, 0x100066f74]; until now tools/mkbtm49.py
++ * byte-patched that branch away. This file serves it from the kernel with ONE persistent anonymous kernel-pipe nexus instance:
++ *   - created lazily at the first sk sockopt, not at sweet_bt_init: sweet_bt_init runs from sweet_ufs_init early in boot, and the Skywalk core must be up before
++ *     kern_nexus_* works (never exercised on hardware, report s.4 unknown 1); a lazy create also costs nothing on boots that never open the control [guess].
++ *   - recipe = if_utun.c utun_register_kernel_pipe_nexus + utun_enable_channel (default kpipe domain provider, register_provider, alloc_provider_instance)
++ *     and nx_kpipe_loopback.c (pre_connect fetches the packet pools with kern_nexus_get_pbufpool; TX/RX slot walk) [read from source: xnu-8796.141.3].
++ *   - NEXUS_ATTR_ANONYMOUS = 1, otherwise nx_kpipe_na_find answers EACCES to a client that was not bind()ed [nx_kernel_pipe.c:731-733; nx_kpipe_loopback.c:604]. Binding bluetoothd
++ *     by pid/exec-uuid is a later hardening, not done here.
++ *   - kernel slot KPIs (get_next_slot, advance_slot, slot_get_packet, attach_packet) are only legal inside a sync callback (VERIFY(sk_is_sync_protected()),
++ *     channel_kern.c:111,165): TX bytes are consumed in sync_tx, RX bytes are put into slots in sync_rx; the UART RX relay only appends to a locked FIFO and calls
++ *     kern_channel_notify (channel_kern.c:43-51), which makes the kevent re-run sync_rx (channel.c:1324-1360).
++ * Every failing Skywalk call, every refused option, every dropped byte is a `BT GAP:` line with the errno (rule 7), rate-limited (first 8, then every power of two).
++ * No hardware register is written here: TX bytes go to the same sbt.ops->tx path the plain control uses (sweet_bt.c sweet_bt_sk_tx), so there is no new store list.
++ * Boot-arg sweetbtsk=0 turns the channel off: the two sockopts are then not recognised and fail exactly as before this patch (ENOPROTOOPT + GAP).
++ * Host test: tools/test_sweet_bt_sk.sh. NOT run on hardware.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/ioctl.h>
++#include <sys/proc.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <uuid/uuid.h>
++#include "sweet_bt.h"
++#include <skywalk/os_skywalk_private.h>
++
++#define SBSK_SET_SPEC   0x800c5414u     /* IOAOSSKYSETCHANNELSPEC [bin 0x800c5414]; _IOW('T', 0x14, 12 bytes), checked below */
++#define SBSK_GET_UUID   0x40105412u     /* IOAOSSKYGETCHANNELUUID [bin 0x40105412]; _IOR('T', 0x12, 16 bytes) */
++#define SBSK_SPEC_LEN   12u
++#define SBSK_UUID_LEN   16u
++_Static_assert(SBSK_SET_SPEC == _IOW('T', 0x14, uint8_t[SBSK_SPEC_LEN]) && SBSK_GET_UUID == _IOR('T', 0x12, uint8_t[SBSK_UUID_LEN]), "BT sk ioctl numbers");
++
++/* bluetoothd's spec [bin 0x100675260]: slot buffer size, then two slot counts (order unknown, both 63) [guess]; the kernel geometry is ours (report s.1: never compared) */
++#define SBSK_SPEC_BUF   1024u
++#define SBSK_SPEC_SLOTS 63u
++#define SBSK_BUF        1024u           /* NEXUS_ATTR_SLOT_BUF_SIZE; kpipe allows 64..16384 [nx_kernel_pipe.c:59-65] */
++#define SBSK_SLOTS      64u             /* TX and RX slots per ring; kpipe allows 2..4096 [nx_kernel_pipe.c:59-65]; report s.4 step 1 */
++#define SBSK_FIFO       65536u          /* RX byte FIFO between the UART relay and the slots */
++#define SBSK_PROV_NAME  "com.apple.uart.sk.bluetooth"
++
++#if SKYWALK && CONFIG_NEXUS_KERNEL_PIPE
++
++enum { SKG_INIT, SKG_SPEC, SKG_BADLEN, SKG_TX, SKG_RXDROP, SKG_ALLOC, SKG_NOTIFY, SKG_BUSY, SKG_CONN, SKG_FLUSH, SKG_SLOT, SKG_PREDROP, SKG_N };
++enum { SKST_NONE, SKST_UP, SKST_FAILED };
++
++static LCK_GRP_DECLARE(sbsk_grp, "sweet_bt_sk");
++static LCK_MTX_DECLARE(sbsk_init_lock, &sbsk_grp);     /* serialises the one-time nexus creation (held across sleeping Skywalk calls) */
++static LCK_MTX_DECLARE(sbsk_lock, &sbsk_grp);          /* channel state + RX FIFO; never held across a Skywalk call or ops->tx */
++
++static struct {
++	bool enabled;                   /* sweetbtsk != 0 */
++	int state;                      /* ST_*; written under sbsk_init_lock only */
++	errno_t err;                    /* errno of the failed creation */
++	nexus_controller_t ncd;
++	uuid_t prov_uuid;
++	uuid_t nx_uuid;                 /* the instance uuid GETCHANNELUUID hands out */
++	/* below: under sbsk_lock */
++	kern_channel_t chan;            /* the connected channel (pre_connect .. disconnected); one at a time */
++	kern_channel_ring_t rxring;     /* set by ring_init, cleared by ring_fini */
++	kern_pbufpool_t rx_pp;
++	bool active;                    /* connected callback done: UART RX goes to the FIFO */
++	bool armed;                     /* IOAOSSKYSETCHANNELSPEC succeeded on the sk control, channel not yet connected: UART RX already goes to the FIFO (bluetoothd never reads the control's socket buffer after the spec; drop-oldest when full) */
++	int notifiers;                  /* threads inside kern_channel_notify (pre_disconnect waits for 0) */
++	size_t fhead, flen;
++	uint8_t fifo[SBSK_FIFO];
++	uint32_t gap_n[SKG_N];
++} sbsk;
++
++#define SBSK_TRACE(fmt, ...) do { \
++	static int n_; \
++	if (n_ < 32) { \
++		char pn_[20]; \
++		n_++; \
++		proc_selfname(pn_, sizeof(pn_)); \
++		printf("BT SK: %s " fmt "\n", pn_, ##__VA_ARGS__); \
++	} \
++} while (0)
++
++#define SBSK_GAP(slot, fmt, ...) do { \
++	uint32_t n_ = __atomic_add_fetch(&sbsk.gap_n[slot], 1, __ATOMIC_RELAXED); \
++	if (n_ <= 8 || (n_ & (n_ - 1)) == 0) { \
++		printf("BT GAP: " fmt " x%u\n", ##__VA_ARGS__, n_); \
++	} \
++} while (0)
++
++static void sbsk_notify_rx(void);
++
++/* ---- provider callbacks (nxprov_*_fn_t, os_nexus.h:520-700); called with the Skywalk lock dropped (nexus.c:1215-1330) ---- */
++
++static errno_t
++sbsk_pre_connect(kern_nexus_provider_t nxprov, proc_t p, kern_nexus_t nexus, nexus_port_t port, kern_channel_t channel, void **ch_ctx)
++{
++#pragma unused(nxprov, p)
++	kern_pbufpool_t tpp = NULL, rpp = NULL;
++	errno_t e;
++
++	*ch_ctx = NULL;
++	SBSK_TRACE("pre_connect port %u", (unsigned)port);
++	e = kern_nexus_get_pbufpool(nexus, &tpp, &rpp);
++	if (e != 0 || rpp == NULL) {
++		SBSK_GAP(SKG_CONN, "skywalk channel refused: kern_nexus_get_pbufpool error %d (rx pool %s)", (int)e, rpp != NULL ? "set" : "NULL");
++		return e != 0 ? e : ENXIO;
++	}
++	lck_mtx_lock(&sbsk_lock);
++	if (sbsk.chan != NULL) {
++		lck_mtx_unlock(&sbsk_lock);
++		SBSK_GAP(SKG_BUSY, "skywalk channel refused: the UART channel already has a client (one UART, one channel)");
++		return EBUSY;
++	}
++	sbsk.chan = channel;
++	sbsk.rx_pp = rpp;
++	lck_mtx_unlock(&sbsk_lock);
++	return 0;
++}
++
++static errno_t
++sbsk_ring_init(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_t channel, kern_channel_ring_t ring, boolean_t is_tx_ring, void **ring_ctx)
++{
++#pragma unused(nxprov, nexus, channel)
++	*ring_ctx = NULL;
++	if (!is_tx_ring) {
++		lck_mtx_lock(&sbsk_lock);
++		sbsk.rxring = ring;
++		lck_mtx_unlock(&sbsk_lock);
++	}
++	return 0;
++}
++
++static void
++sbsk_ring_fini(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_ring_t ring)
++{
++#pragma unused(nxprov, nexus)
++	lck_mtx_lock(&sbsk_lock);
++	if (sbsk.rxring == ring) {
++		sbsk.rxring = NULL;
++	}
++	lck_mtx_unlock(&sbsk_lock);
++}
++
++static errno_t
++sbsk_connected(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_t channel)
++{
++#pragma unused(nxprov, nexus, channel)
++	errno_t e = 0;
++	size_t kept = 0;
++
++	lck_mtx_lock(&sbsk_lock);
++	if (sbsk.rxring == NULL) {
++		e = ENXIO;
++	} else {
++		if (!sbsk.armed) {
++			sbsk.fhead = sbsk.flen = 0;     /* not armed: nothing was queued for this channel */
++		}
++		kept = sbsk.flen;               /* armed: the bytes that arrived between SETCHANNELSPEC and now are delivered */
++		sbsk.armed = false;
++		sbsk.active = true;     /* from here sweet_bt_rx feeds the FIFO instead of ctl_enqueuedata */
++	}
++	lck_mtx_unlock(&sbsk_lock);
++	if (e == 0 && kept != 0) {
++		SBSK_TRACE("connected with %zu RX bytes queued since the channel spec: delivered", kept);
++		sbsk_notify_rx();
++	}
++	if (e != 0) {
++		SBSK_GAP(SKG_CONN, "skywalk channel connect failed: the RX ring was not initialised (error %d)", (int)e);
++	} else {
++		SBSK_TRACE("connected: UART RX now goes to the channel");
++	}
++	return e;
++}
++
++/* Drop the FIFO and stop the RX relay from using the ring. Idempotent. Caller holds sbsk_lock. */
++static void
++sbsk_deactivate_locked(const char *why)
++{
++	if (sbsk.flen != 0) {
++		SBSK_GAP(SKG_FLUSH, "skywalk channel %s with %zu unread RX bytes; dropped", why, sbsk.flen);
++	}
++	sbsk.fhead = sbsk.flen = 0;
++	sbsk.active = false;
++	sbsk.armed = false;
++}
++
++static void
++sbsk_pre_disconnect(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_t channel)
++{
++#pragma unused(nxprov, nexus, channel)
++	SBSK_TRACE("pre_disconnect");
++	lck_mtx_lock(&sbsk_lock);
++	sbsk_deactivate_locked("closing");
++	while (sbsk.notifiers != 0) {   /* a notifier holds the RX ring pointer; ring_fini follows this callback */
++		(void)msleep(&sbsk.notifiers, &sbsk_lock, PWAIT, "sbsk_nfy", NULL);
++	}
++	lck_mtx_unlock(&sbsk_lock);
++}
++
++static void
++sbsk_disconnected(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_t channel)
++{
++#pragma unused(nxprov, nexus)
++	lck_mtx_lock(&sbsk_lock);
++	if (sbsk.chan == channel) {
++		sbsk_deactivate_locked("closed");
++		sbsk.chan = NULL;
++		sbsk.rx_pp = NULL;
++		sbsk.rxring = NULL;
++	}
++	lck_mtx_unlock(&sbsk_lock);
++	SBSK_TRACE("disconnected");
++}
++
++/* TX: the user wrote H4 bytes into the slot buffers (slot API: sp_len bytes at the buffer, report s.2); copy them in slot order into the plain control's TX path. */
++static errno_t
++sbsk_sync_tx(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_ring_t ring, uint32_t flags)
++{
++#pragma unused(nxprov, nexus, flags)
++	struct kern_channel_ring_stat_increment st;
++	kern_channel_slot_t slot = kern_channel_get_next_slot(ring, NULL, NULL), last = NULL;
++	errno_t err = 0;
++	size_t sent = 0, dropped = 0;
++
++	bzero(&st, sizeof(st));
++	while (slot != NULL) {
++		kern_packet_t ph = kern_channel_slot_get_packet(ring, slot);
++		kern_buflet_t buf = ph != 0 ? kern_packet_get_next_buflet(ph, NULL) : NULL;
++
++		last = slot;
++		slot = kern_channel_get_next_slot(ring, slot, NULL);
++		if (ph == 0) {
++			continue;       /* a dropped quantum carries no bytes (channel_kern.c:277-281) */
++		}
++		uint8_t *base = buf != NULL ? kern_buflet_get_data_address(buf) : NULL;
++		uint16_t len = buf != NULL ? kern_buflet_get_data_length(buf) : 0;
++
++		if (base == NULL) {
++			SBSK_GAP(SKG_SLOT, "skywalk TX slot has no buffer (buflet %s); slot skipped", buf != NULL ? "without address" : "NULL");
++			continue;
++		}
++		if (len == 0) {
++			continue;
++		}
++		if (err == 0) {
++			errno_t e = sweet_bt_sk_tx(base + kern_buflet_get_data_offset(buf), len);
++
++			if (e == 0) {
++				sent += len;
++				st.kcrsi_slots_transferred++;
++				st.kcrsi_bytes_transferred += len;
++				continue;
++			}
++			err = e;        /* the rest of this sync is dropped, loudly, but consumed so the ring does not wedge */
++		}
++		dropped += len;
++	}
++	if (last != NULL) {
++		kern_channel_advance_slot(ring, last);
++		kern_channel_increment_ring_stats(ring, &st);
++		(void)kern_channel_reclaim(ring);
++	}
++	if (err != 0) {
++		SBSK_GAP(SKG_TX, "skywalk TX to the controller failed (error %d): %zu bytes sent, %zu bytes dropped", (int)err, sent, dropped);
++	}
++	return err;     /* non-zero ends bluetoothd's os_channel_sync with an error, like a failing write() on the plain control */
++}
++
++/* Called by the UART RX relay (sweet_bt_rx) when no sync is running: append to the FIFO and wake the user ring. Returns whether the channel took the bytes. */
++static void
++sbsk_notify_rx(void)
++{
++	kern_channel_ring_t r;
++	uint32_t ne;
++
++	lck_mtx_lock(&sbsk_lock);
++	r = sbsk.active ? sbsk.rxring : NULL;
++	if (r != NULL) {
++		sbsk.notifiers++;
++	}
++	lck_mtx_unlock(&sbsk_lock);
++	if (r == NULL) {
++		return;
++	}
++	ne = kern_channel_notify(r, 0);        /* not under sbsk_lock: the kevent path holds the kq lock and then enters sync_rx, which takes sbsk_lock */
++	if (ne != 0) {
++		SBSK_GAP(SKG_NOTIFY, "skywalk RX notify failed (error %u); the bytes stay in the FIFO until the next sync", ne);
++	}
++	lck_mtx_lock(&sbsk_lock);
++	if (--sbsk.notifiers == 0) {
++		wakeup(&sbsk.notifiers);
++	}
++	lck_mtx_unlock(&sbsk_lock);
++}
++
++static errno_t
++sbsk_sync_rx(kern_nexus_provider_t nxprov, kern_nexus_t nexus, kern_channel_ring_t ring, uint32_t flags)
++{
++#pragma unused(nxprov, nexus, flags)
++	struct kern_channel_ring_stat_increment st;
++	kern_channel_slot_t slot, prev = NULL;
++	kern_pbufpool_t pp;
++
++	bzero(&st, sizeof(st));
++	(void)kern_channel_reclaim(ring);       /* user-released slots (utun and kpipe loopback do the same first) */
++	lck_mtx_lock(&sbsk_lock);
++	pp = sbsk.active ? sbsk.rx_pp : NULL;
++	lck_mtx_unlock(&sbsk_lock);
++	if (pp == NULL) {
++		return 0;
++	}
++	for (slot = kern_channel_get_next_slot(ring, NULL, NULL); slot != NULL; slot = kern_channel_get_next_slot(ring, slot, NULL)) {
++		kern_packet_t ph = 0;
++		kern_buflet_t buf;
++		uint8_t *dst;
++		size_t n, first, i;
++		errno_t e;
++
++		lck_mtx_lock(&sbsk_lock);
++		n = sbsk.flen < SBSK_BUF ? sbsk.flen : SBSK_BUF;
++		lck_mtx_unlock(&sbsk_lock);
++		if (n == 0) {
++			break;
++		}
++		e = kern_pbufpool_alloc_nosleep(pp, 1, &ph);
++		if (e != 0 || ph == 0) {
++			SBSK_GAP(SKG_ALLOC, "skywalk RX: packet allocation failed (error %d); %zu bytes wait in the FIFO", (int)e, n);
++			break;
++		}
++		buf = kern_packet_get_next_buflet(ph, NULL);
++		dst = buf != NULL ? kern_buflet_get_data_address(buf) : NULL;
++		if (dst == NULL || kern_buflet_set_data_offset(buf, 0) != 0 || kern_buflet_set_data_length(buf, (uint16_t)n) != 0) {
++			SBSK_GAP(SKG_ALLOC, "skywalk RX: packet has no usable buflet for %zu bytes (buflet %s)", n, buf != NULL ? "unusable" : "NULL");
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		lck_mtx_lock(&sbsk_lock);
++		if (n > sbsk.flen) {    /* the FIFO was dropped meanwhile (pre_disconnect) */
++			n = sbsk.flen;
++		}
++		first = SBSK_FIFO - sbsk.fhead < n ? SBSK_FIFO - sbsk.fhead : n;
++		for (i = 0; i < first; i++) {
++			dst[i] = sbsk.fifo[sbsk.fhead + i];
++		}
++		for (; i < n; i++) {
++			dst[i] = sbsk.fifo[i - first];
++		}
++		sbsk.fhead = (sbsk.fhead + n) % SBSK_FIFO;
++		sbsk.flen -= n;
++		lck_mtx_unlock(&sbsk_lock);
++		if (n == 0 || kern_buflet_set_data_length(buf, (uint16_t)n) != 0 || kern_packet_finalize(ph) != 0 ||
++		    kern_channel_slot_attach_packet(ring, slot, ph) != 0) {
++			SBSK_GAP(SKG_ALLOC, "skywalk RX: could not finalize/attach a %zu byte packet; bytes dropped", n);
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		st.kcrsi_slots_transferred++;
++		st.kcrsi_bytes_transferred += n;
++		prev = slot;
++	}
++	if (prev != NULL) {
++		kern_channel_advance_slot(ring, prev);
++		kern_channel_increment_ring_stats(ring, &st);
++	}
++	return 0;       /* never block, never an error for "no data" or "no buffer" (report s.4 step 5) */
++}
++
++/* ---- one-time nexus creation ---- */
++
++static const struct {
++	nexus_attr_type_t type;
++	uint64_t value;
++	const char *name;
++} sbsk_attrs[] = {      /* table: every attribute set at provider registration */
++	{ NEXUS_ATTR_TX_RINGS, 1, "TX_RINGS" },
++	{ NEXUS_ATTR_RX_RINGS, 1, "RX_RINGS" },
++	{ NEXUS_ATTR_TX_SLOTS, SBSK_SLOTS, "TX_SLOTS" },
++	{ NEXUS_ATTR_RX_SLOTS, SBSK_SLOTS, "RX_SLOTS" },
++	{ NEXUS_ATTR_SLOT_BUF_SIZE, SBSK_BUF, "SLOT_BUF_SIZE" },
++	{ NEXUS_ATTR_ANONYMOUS, 1, "ANONYMOUS" },
++};
++
++/* Build controller + provider + instance. On any failure everything built so far is torn down (reverse order) and the errno returned. Caller holds sbsk_init_lock. */
++static errno_t
++sbsk_create(void)
++{
++	struct kern_nexus_provider_init pi;
++	struct kern_nexus_init ni;
++	nexus_attr_t nxa = NULL;
++	uuid_t dom;
++	bool have_ctl = false, have_prov = false;
++	errno_t e;
++
++	bzero(&pi, sizeof(pi));
++	pi.nxpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION;
++	pi.nxpi_flags = NXPIF_VIRTUAL_DEVICE;
++	pi.nxpi_pre_connect = sbsk_pre_connect;
++	pi.nxpi_connected = sbsk_connected;
++	pi.nxpi_pre_disconnect = sbsk_pre_disconnect;
++	pi.nxpi_disconnected = sbsk_disconnected;
++	pi.nxpi_ring_init = sbsk_ring_init;
++	pi.nxpi_ring_fini = sbsk_ring_fini;
++	pi.nxpi_slot_init = NULL;
++	pi.nxpi_slot_fini = NULL;
++	pi.nxpi_sync_tx = sbsk_sync_tx;
++	pi.nxpi_sync_rx = sbsk_sync_rx;
++	pi.nxpi_tx_doorbell = NULL;
++	bzero(&ni, sizeof(ni));
++	ni.nxi_version = KERN_NEXUS_CURRENT_VERSION;
++	uuid_clear(dom);
++	uuid_clear(sbsk.prov_uuid);
++	uuid_clear(sbsk.nx_uuid);
++
++	if ((e = kern_nexus_controller_create(&sbsk.ncd)) != 0) {
++		printf("BT GAP: skywalk kern_nexus_controller_create failed (error %d)\n", (int)e);
++		goto fail;
++	}
++	have_ctl = true;
++	if ((e = kern_nexus_get_default_domain_provider(NEXUS_TYPE_KERNEL_PIPE, &dom)) != 0) {
++		printf("BT GAP: skywalk kern_nexus_get_default_domain_provider(KERNEL_PIPE) failed (error %d)\n", (int)e);
++		goto fail;
++	}
++	if ((e = kern_nexus_attr_create(&nxa)) != 0) {
++		printf("BT GAP: skywalk kern_nexus_attr_create failed (error %d)\n", (int)e);
++		nxa = NULL;
++		goto fail;
++	}
++	for (size_t k = 0; k < sizeof(sbsk_attrs) / sizeof(sbsk_attrs[0]); k++) {
++		if ((e = kern_nexus_attr_set(nxa, sbsk_attrs[k].type, sbsk_attrs[k].value)) != 0) {
++			printf("BT GAP: skywalk kern_nexus_attr_set(%s = %llu) failed (error %d)\n", sbsk_attrs[k].name, (unsigned long long)sbsk_attrs[k].value, (int)e);
++			goto fail;
++		}
++	}
++	if ((e = kern_nexus_controller_register_provider(sbsk.ncd, dom, (const uint8_t *)SBSK_PROV_NAME, &pi, sizeof(pi), nxa, &sbsk.prov_uuid)) != 0) {
++		printf("BT GAP: skywalk kern_nexus_controller_register_provider failed (error %d)\n", (int)e);
++		uuid_clear(sbsk.prov_uuid);
++		goto fail;
++	}
++	have_prov = true;
++	if ((e = kern_nexus_controller_alloc_provider_instance(sbsk.ncd, sbsk.prov_uuid, &sbsk, NULL, &sbsk.nx_uuid, &ni)) != 0) {
++		printf("BT GAP: skywalk kern_nexus_controller_alloc_provider_instance failed (error %d)\n", (int)e);
++		uuid_clear(sbsk.nx_uuid);
++		goto fail;
++	}
++	kern_nexus_attr_destroy(nxa);
++	return 0;
++
++fail:
++	if (nxa != NULL) {
++		kern_nexus_attr_destroy(nxa);
++	}
++	if (have_prov) {
++		(void)kern_nexus_controller_deregister_provider(sbsk.ncd, sbsk.prov_uuid);
++		uuid_clear(sbsk.prov_uuid);
++	}
++	if (have_ctl) {
++		kern_nexus_controller_destroy(sbsk.ncd);
++		sbsk.ncd = NULL;
++	}
++	return e != 0 ? e : EIO;
++}
++
++static errno_t
++sbsk_ensure(void)
++{
++	errno_t e;
++
++	lck_mtx_lock(&sbsk_init_lock);
++	if (sbsk.state == SKST_NONE) {
++		e = sbsk_create();
++		sbsk.state = e == 0 ? SKST_UP : SKST_FAILED;
++		sbsk.err = e;
++		if (e == 0) {
++			uuid_string_t s;
++
++			uuid_unparse(sbsk.nx_uuid, s);
++			printf("BT SK: kernel-pipe nexus instance %s ready (%u rings x %u slots x %u bytes, anonymous); not run on hardware\n", s, 1u, SBSK_SLOTS, SBSK_BUF);
++		}
++	}
++	e = sbsk.state == SKST_UP ? 0 : sbsk.err;
++	lck_mtx_unlock(&sbsk_init_lock);
++	if (e != 0) {
++		SBSK_GAP(SKG_INIT, "skywalk channel unavailable (nexus creation failed, error %d); the sk sockopt is refused", (int)e);
++	}
++	return e;
++}
++
++/* ---- the interface used by sweet_bt.c ---- */
++
++void
++sweet_bt_sk_attach(void)
++{
++	int v = 1;
++
++	sbsk.enabled = !(PE_parse_boot_argn("sweetbtsk", &v, sizeof(v)) && v == 0);
++	if (sbsk.enabled) {
++		printf("BT SK: skywalk channel on for %s (kernel-pipe nexus created at the first IOAOSSKYSETCHANNELSPEC; boot-arg sweetbtsk=0 turns it off)\n", "com.apple.uart.sk.bluetooth");
++	} else {
++		printf("BT GAP: skywalk rows M12-M14 off (sweetbtsk=0); com.apple.uart.sk.bluetooth is a plain control (bluetoothd needs the M49 byte patch)\n");
++	}
++}
++
++int
++sweet_bt_sk_is_opt(int opt)
++{
++	return sbsk.enabled && ((u_int32_t)opt == SBSK_SET_SPEC || (u_int32_t)opt == SBSK_GET_UUID);
++}
++
++int
++sweet_bt_sk_setopt(int opt, const void *data, size_t len)
++{
++	uint32_t spec[3];
++	errno_t e;
++
++	if ((u_int32_t)opt != SBSK_SET_SPEC) {
++		SBSK_GAP(SKG_SPEC, "skywalk setsockopt %#x is not IOAOSSKYSETCHANNELSPEC; refused", (unsigned)opt);
++		return ENOPROTOOPT;
++	}
++	if (len != SBSK_SPEC_LEN || data == NULL) {
++		SBSK_GAP(SKG_BADLEN, "IOAOSSKYSETCHANNELSPEC length %zu is not %u; refused", len, SBSK_SPEC_LEN);
++		return EINVAL;
++	}
++	memcpy(spec, data, sizeof(spec));
++	SBSK_TRACE("IOAOSSKYSETCHANNELSPEC %u %u %u", spec[0], spec[1], spec[2]);
++	if (spec[0] != SBSK_SPEC_BUF || spec[1] != SBSK_SPEC_SLOTS || spec[2] != SBSK_SPEC_SLOTS) {
++		SBSK_GAP(SKG_SPEC, "IOAOSSKYSETCHANNELSPEC %u %u %u differs from bluetoothd's 1024 63 63; accepted, the channel geometry stays %u slots of %u bytes", spec[0], spec[1], spec[2], SBSK_SLOTS, SBSK_BUF);
++	}
++	e = sbsk_ensure();
++	if (e == 0) {
++		lck_mtx_lock(&sbsk_lock);
++		if (!sbsk.active) {
++			sbsk.armed = true;      /* from here the channel owns the RX bytes (bluetoothd reads only the channel) */
++		}
++		lck_mtx_unlock(&sbsk_lock);
++	}
++	return e;
++}
++
++int
++sweet_bt_sk_getopt(int opt, void *data, size_t *len)
++{
++	if ((u_int32_t)opt != SBSK_GET_UUID) {
++		SBSK_GAP(SKG_SPEC, "skywalk getsockopt %#x is not IOAOSSKYGETCHANNELUUID; refused", (unsigned)opt);
++		return ENOPROTOOPT;
++	}
++	if (*len < SBSK_UUID_LEN || data == NULL) {      /* ctl_ctloutput passes data == NULL when the caller gave no buffer (kern_control.c:1374) */
++		SBSK_GAP(SKG_BADLEN, "IOAOSSKYGETCHANNELUUID buffer %zu%s is smaller than %u; refused", *len, data == NULL ? " (NULL)" : "", SBSK_UUID_LEN);
++		return EINVAL;
++	}
++	errno_t e = sbsk_ensure();
++
++	if (e != 0) {
++		return e;
++	}
++	memcpy(data, sbsk.nx_uuid, SBSK_UUID_LEN);
++	*len = SBSK_UUID_LEN;
++	SBSK_TRACE("IOAOSSKYGETCHANNELUUID answered");
++	return 0;
++}
++
++int
++sweet_bt_sk_rx(const void *data, size_t len, int *err)
++{
++	const uint8_t *p = data;
++	size_t n, first;
++
++	lck_mtx_lock(&sbsk_lock);
++	if (!sbsk.active) {
++		if (sbsk.armed) {       /* spec done, channel not connected yet: queue; when full the OLDEST bytes go (a reconnecting bluetoothd wants the newest) */
++			size_t drop = 0;
++
++			if (len >= SBSK_FIFO) {
++				drop = sbsk.flen + (len - SBSK_FIFO);
++				p += len - SBSK_FIFO;
++				len = SBSK_FIFO;
++				sbsk.fhead = sbsk.flen = 0;
++			} else if (sbsk.flen + len > SBSK_FIFO) {
++				drop = sbsk.flen + len - SBSK_FIFO;
++				sbsk.fhead = (sbsk.fhead + drop) % SBSK_FIFO;
++				sbsk.flen -= drop;
++			}
++			first = (sbsk.fhead + sbsk.flen) % SBSK_FIFO;
++			for (size_t i = 0; i < len; i++) {
++				sbsk.fifo[(first + i) % SBSK_FIFO] = p[i];
++			}
++			sbsk.flen += len;
++			lck_mtx_unlock(&sbsk_lock);
++			if (drop != 0) {
++				SBSK_GAP(SKG_PREDROP, "skywalk RX before the channel connected: FIFO full, %zu oldest bytes dropped (bluetoothd has not created the channel)", drop);
++			}
++			*err = 0;
++			return 1;
++		}
++		lck_mtx_unlock(&sbsk_lock);
++		return 0;
++	}
++	n = SBSK_FIFO - sbsk.flen < len ? SBSK_FIFO - sbsk.flen : len;
++	first = (sbsk.fhead + sbsk.flen) % SBSK_FIFO;
++	for (size_t i = 0; i < n; i++) {
++		sbsk.fifo[(first + i) % SBSK_FIFO] = p[i];
++	}
++	sbsk.flen += n;
++	lck_mtx_unlock(&sbsk_lock);
++	if (n != 0) {
++		sbsk_notify_rx();
++	}
++	if (n != len) {
++		SBSK_GAP(SKG_RXDROP, "skywalk RX FIFO full: %zu of %zu UART bytes dropped (bluetoothd is not reading the channel)", len - n, len);
++		*err = ENOBUFS;
++	} else {
++		*err = 0;
++	}
++	return 1;
++}
++
++void
++sweet_bt_sk_kctl_disconnect(void)
++{
++	/* bluetoothd closes the control FIRST and destroys the channel after (report s.2, close 0x100067520): the channel stays up; unread RX bytes are dropped loudly */
++	SBSK_TRACE("control closed; channel %s", sbsk.active ? "still open" : "not open");
++	lck_mtx_lock(&sbsk_lock);
++	if ((sbsk.active || sbsk.armed) && sbsk.flen != 0) {
++		SBSK_GAP(SKG_FLUSH, "skywalk control closed with %zu unread RX bytes; dropped", sbsk.flen);
++		sbsk.fhead = sbsk.flen = 0;
++	}
++	if (!sbsk.active) {
++		sbsk.armed = false;     /* the control closed before the channel connected: the RX bytes go back to the controls */
++	}
++	lck_mtx_unlock(&sbsk_lock);
++}
++
++#else /* !(SKYWALK && CONFIG_NEXUS_KERNEL_PIPE) */
++
++/* Kernel built without the kernel-pipe nexus: the interface stays, every sk path says so. */
++void
++sweet_bt_sk_attach(void)
++{
++	printf("BT GAP: skywalk rows M12-M14 not built in (SKYWALK/CONFIG_NEXUS_KERNEL_PIPE off); com.apple.uart.sk.bluetooth is a plain control (bluetoothd needs the M49 byte patch)\n");
++}
++
++int sweet_bt_sk_is_opt(int opt) { (void)opt; return 0; }
++int sweet_bt_sk_setopt(int opt, const void *data, size_t len) { (void)opt; (void)data; (void)len; return ENOPROTOOPT; }
++int sweet_bt_sk_getopt(int opt, void *data, size_t *len) { (void)opt; (void)data; (void)len; return ENOPROTOOPT; }
++int sweet_bt_sk_rx(const void *data, size_t len, int *err) { (void)data; (void)len; (void)err; return 0; }
++void sweet_bt_sk_kctl_disconnect(void) { }
++
++#endif
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a9c1054..da03927 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -132,2 +132,3 @@ bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/sweet_wlan.c			standard
++bsd/dev/sweet_bt_sk.c		standard
+ bsd/dev/sweet_bt.c			standard

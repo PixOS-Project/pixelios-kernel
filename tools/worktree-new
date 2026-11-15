@@ -1,0 +1,89 @@
+#!/bin/bash
+# worktree-new: create a git worktree from trunk AND link the gitignored inputs a run/gate needs, so a new worktree cannot build a
+# /product-less ADT (AP-144: gpu-gate10 had no research/ link, mkadt only warned, 3 runs + a re-flash lost) or miss .env (AP-78).
+#   tools/worktree-new BRANCH [--dir DIR] [--base REF] [--repo DIR] [--link-logs]
+#   BRANCH       new branch (git worktree add -b BRANCH DIR BASE; an existing branch or DIR is refused, nothing is changed)
+#   --dir DIR    default ${WORKTREE_ROOT:-~/.t3/worktrees}/<last component of BRANCH>
+#   --base REF   default trunk (AGENTS.md "Branches")
+#   --repo DIR   any checkout of the repo (default: the one holding this tool); links point at its MAIN clone (parent of the git common dir)
+#   tools/worktree-new --link-only DIR [--repo DIR]   link the inputs below into an EXISTING worktree DIR, only where the path does not exist yet
+#                (an existing file/dir/link is never replaced; each skipped one is printed as 'SKIPPED'); RESULT: PASS|FAIL worktree-new link-only ...
+#   tools/worktree-new install-hook [--repo DIR]      write the common hooks dir's post-checkout hook: a raw `git worktree add` then runs the MAIN
+#                clone's `tools/worktree-new --link-only` on the new worktree (AP-144); refuses a post-checkout hook that is not ours
+#   --link-logs  symlink logs/ to the main clone's; default is a real logs/ dir in the worktree, as the existing run worktrees have it
+#                (tools/runs --all-worktrees scans every worktree's logs/ without resolving links, tools/runs:33-60, so a linked logs/ counts runs twice)
+# Links: research -> <main>/research (required: <worktree>/research/ipsw-x/d22ap.adt must resolve, the condition of run-preflight `adt`),
+#        .env -> <main>/.env (when the main clone has one; else a WARNING: tools/envfile.py would find none either),
+#        (tools/third_party is NOT linked: the AOSP tools are tracked in git since T-93e6, a plain `git worktree add` has them.)
+# Last line: RESULT: PASS worktree-new DIR ... | RESULT: FAIL worktree-new DIR <what is missing> (the worktree exists, the gap is named)
+#            | RESULT: ERROR worktree-new ... (nothing created). Exit 0 / 1 / 2. Host only; no phone, no network.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd) || exit 2
+err() { echo "RESULT: ERROR worktree-new: $*"; exit 2; }
+branch=""; dir=""; base=trunk; repo=$(dirname "$here"); linklogs=0; mode=new; lodir=""
+while [ $# -gt 0 ]; do case $1 in
+	--link-only) mode="link"; lodir=${2:-}; shift 2 || shift ;; install-hook) mode=hook; shift ;;
+	--dir) dir=${2:-}; shift 2 ;; --base) base=${2:-}; shift 2 ;; --repo) repo=${2:-}; shift 2 ;; --link-logs) linklogs=1; shift ;;
+	-*) err "unknown option '$1' (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" ;;
+	*) [ -z "$branch" ] || err "one BRANCH only (got '$branch' and '$1')"; branch=$1; shift ;; esac; done
+[ "$mode" != new ] || [ -n "$branch" ] || err "usage: tools/worktree-new BRANCH [--dir DIR] [--base REF] [--repo DIR] [--link-logs]"
+[ "$mode" != new ] || git -C "$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || err "'$branch' is not a valid branch name"
+cd "$repo" 2>/dev/null || err "--repo '$repo' is not a directory"
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || err "$repo is not a git checkout"
+main=$(dirname "$common")
+mkl() {   # mkl SRC REL: link $dir/REL -> SRC unless REL already exists (never replaced); returns 0 = linked, 1 = skipped (printed loudly)
+	if [ -e "$dir/$2" ] || [ -L "$dir/$2" ]; then echo "worktree-new: SKIPPED $dir/$2 exists, not replaced (link target would be $1)"; skipped+=("$2"); return 1; fi
+	mkdir -p "$(dirname "$dir/$2")" && ln -s "$1" "$dir/$2"
+}
+link_inputs() {   # uses $main $dir; sets miss warn links skipped
+	miss=(); warn=0; links=(); skipped=()
+	if [ -e "$main/research" ]; then mkl "$main/research" research && links+=(research); else miss+=("research (the main clone $main has none)"); fi
+	if [ -f "$main/.env" ]; then mkl "$main/.env" .env && links+=(.env)
+	else echo "worktree-new: WARNING $main/.env is missing: camera runs need CAM_HOST (tools/envfile.py finds no .env either)"; warn=1; fi
+}
+if [ "$mode" = hook ]; then
+	hooks=$(git rev-parse --path-format=absolute --git-path hooks) || err "cannot find the hooks dir of $repo"
+	hf=$hooks/post-checkout; mark="# worktree-new autolink hook (AP-144)"
+	if [ -e "$hf" ] || [ -L "$hf" ]; then grep -qF "$mark" "$hf" 2>/dev/null || { echo "RESULT: FAIL worktree-new install-hook $hf exists and is not ours; merge by hand (call: tools/worktree-new --link-only \"\$(git rev-parse --show-toplevel)\")"; exit 1; }; fi
+	mkdir -p "$hooks" && cat >"$hf" <<HOOK || err "cannot write $hf"
+#!/bin/bash
+$mark: runs on a NEW worktree checkout only (old HEAD all zeros, flag 1); never fails the checkout
+[ "\$1" = 0000000000000000000000000000000000000000 ] && [ "\$3" = 1 ] || exit 0
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+top=\$(git rev-parse --show-toplevel 2>/dev/null) || { echo "WORKTREE-AUTOLINK GAP: git rev-parse --show-toplevel failed (rc=\$?): research/.env links not made" >&2; exit 0; }
+common=\$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "WORKTREE-AUTOLINK GAP: git rev-parse --git-common-dir failed (rc=\$?): research/.env links not made" >&2; exit 0; }
+main=\$(dirname "\$common")
+[ "\$top" != "\$main" ] || exit 0
+if [ ! -x "\$main/tools/worktree-new" ]; then echo "WORKTREE-AUTOLINK FAIL: \$main/tools/worktree-new missing: \$top has no research/.env links (AP-144)" >&2; exit 0; fi
+out=\$("\$main/tools/worktree-new" --link-only "\$top" 2>&1); rc=\$?
+echo "\$out" >&2
+[ \$rc -eq 0 ] || echo "WORKTREE-AUTOLINK FAIL: rc=\$rc for \$top, fix: \$main/tools/worktree-new --link-only \$top (AP-144)" >&2
+exit 0
+HOOK
+	chmod +x "$hf" && echo "RESULT: PASS worktree-new install-hook $hf"; exit 0
+fi
+if [ "$mode" = link ]; then
+	[ -n "$lodir" ] && [ -d "$lodir" ] || err "--link-only needs an existing worktree DIR (got '$lodir')"
+	dir=$(cd "$lodir" && git rev-parse --show-toplevel 2>/dev/null) || err "$lodir is not a git worktree"
+	[ "$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)" = "$common" ] || err "$dir belongs to another repo than $repo"
+	link_inputs
+	[ -f "$dir/research/ipsw-x/d22ap.adt" ] || [ ${#miss[@]} -gt 0 ] || miss+=("research/ipsw-x/d22ap.adt does not resolve through $dir/research")
+	sum="links=$(IFS=,; echo "${links[*]:-none}") skipped=$(IFS=,; echo "${skipped[*]:-none}") warnings=$warn"
+	if [ ${#miss[@]} -gt 0 ]; then echo "RESULT: FAIL worktree-new link-only $dir missing: ${miss[*]} ($sum)"; exit 1; fi
+	echo "RESULT: PASS worktree-new link-only $dir $sum"; exit 0
+fi
+git rev-parse --verify -q "$base^{commit}" >/dev/null || err "base '$base' is not a commit"
+! git rev-parse --verify -q "refs/heads/$branch" >/dev/null || err "branch '$branch' already exists (use git worktree add DIR $branch, then link by hand)"
+[ -n "$dir" ] || dir=${WORKTREE_ROOT:-$HOME/.t3/worktrees}/${branch##*/}
+[ ! -e "$dir" ] && [ ! -L "$dir" ] || err "$dir already exists"
+out=$(git worktree add -q -b "$branch" "$dir" "$base" 2>&1) || err "git worktree add failed: $(tail -n 2 <<<"$out" | tr '\n' ' ')"
+dir=$(cd "$dir" && pwd)
+link_inputs
+if [ "$linklogs" = 1 ]; then mkdir -p "$main/logs" && ln -s "$main/logs" "$dir/logs" && links+=(logs); logs=linked; else mkdir -p "$dir/logs"; logs=dir; fi
+# the same condition as tools/run-preflight c_adt and tools/mkadt.py:46 (tools/../research/ipsw-x/d22ap.adt)
+[ -f "$dir/research/ipsw-x/d22ap.adt" ] || [ ${#miss[@]} -gt 0 ] || miss+=("research/ipsw-x/d22ap.adt does not resolve through $dir/research")
+sum="branch=$branch base=$base@$(git rev-parse --short "$base") links=$(IFS=,; echo "${links[*]:-none}") logs=$logs warnings=$warn"
+if [ ${#miss[@]} -gt 0 ]; then echo "RESULT: FAIL worktree-new $dir missing: ${miss[*]} ($sum; mkadt would drop /product, AP-144)"; exit 1; fi
+echo "RESULT: PASS worktree-new $dir $sum"

@@ -49,6 +49,7 @@ static uint32_t dme_op(uint32_t op, uint32_t attr, uint32_t sel, uint32_t *val)
 	volatile uint32_t *hci = (volatile uint32_t *)HCI;
 	uint64_t t0 = now_ticks(), lim = counter_freq() / 2;	/* 500 ms */
 
+	/* bounded: now_ticks() - t0 > lim (500 ms) returns 0xFFFF below */
 	while (!(hci[0x30 / 4] & 0x8)) {			/* HCS.UCRDY */
 		if (now_ticks() - t0 > lim)
 			return 0xFFFF;
@@ -60,6 +61,7 @@ static uint32_t dme_op(uint32_t op, uint32_t attr, uint32_t sel, uint32_t *val)
 	__asm__ volatile("dsb sy" ::: "memory");
 	hci[0x90 / 4] = op;					/* DME_GET */
 	t0 = now_ticks();
+	/* bounded: now_ticks() - t0 > lim (500 ms) returns 0xFFFF below */
 	while (!(hci[0x20 / 4] & 0x400)) {
 		if (now_ticks() - t0 > lim)
 			return 0xFFFF;

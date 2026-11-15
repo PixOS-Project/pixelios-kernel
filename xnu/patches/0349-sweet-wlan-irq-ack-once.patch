@@ -1,0 +1,258 @@
+sweet-wlan-irq-ack-once (lowclk 2026-11-14, fix plan 0349 after boot B10b; revised after review 0349): one 0xC30 ack per interrupt entry, Linux-style, and a stuck rule that cannot fire under steady traffic. Changes bsd/dev/sweet_wlan_irq.h (the pure core created by patch 0347) and, for one GAP text and two comments, bsd/dev/sweet_wlan.c.
+Observation [obs: hardware, boot B10b, job c17e, run resident-213410-b2, 2026-11-13]: with sweetwifiirq=1 the doorbell armed and took 9138 interrupts in 157 s (0 spurious, 0 storm, 4 missed); then swi_ack_loop printed `SWEET WLAN IRQ GAP: 0xC30 not zero after ack and drain (a=0x1 b=0)`, the mode turned itself off as off:c30stuck and the 5 ms poll carried the data path.
+Cause [read: 0347 swi_ack_loop]: the loop re-read 0xC30 after each ack + drain and called it stuck after SWI_ACK_TRIES (8) rounds with a bit still set. Bit 0 of 0xC30 is BRCMF_PCIE_64_MB_INT_D2H0_DB0, an ordinary D2H ring doorbell that the dongle re-raises while traffic flows, so 8 non-zero reads in a row happen under steady load without any fault [read: Linux v6.6 drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c, rev-64 mailbox block].
+Linux brcmf_pcie_isr_thread (pcie.c:939-963 v6.6) reads MAILBOXINT once, writes the same bits back (W1C), handles them and re-enables the interrupt; it does not loop until zero and has no stuck verdict, a doorbell still pending re-fires the level line [read: pcie.c v6.6].
+What changed: (1) doorbell mode, per interrupt entry: swi_pre reads 0xC30 once and W1Cs exactly the bits read (as in 0347), the glue drains the rings once, swi_post no longer runs the ack loop (swi_ack_loop is gone from the thread path); ORDER stays ack, drain, unmask. A failed or refused 0xC30 read or W1C of an entry is reported by swi_post (GAP read/write/refused text of 0347) and turns the mode off as c30. An all-ones 0xC30 read (0xFFFFFFFF, dead link) is not acked and turns the mode off at the first entry (review F3).
+(2) new stuck rule: c30stuck only when 0xC30 is non-zero at entry on SWI_C30_RUN_MAX (64) consecutive interrupt entries AND every one of those entries' drains found no ring work; an entry whose drain found work, ANY pass that drained work (review F2: the poll drains first, the interrupt pass then finds the doorbell bit with nothing left), or a zero read resets the counter. GAP text key unchanged ("0xC30 not zero after ack and drain"), args a = last 0xC30 value, b = the consecutive count.
+(3) review F1: before the unmask swi_post reads 0xC30 once more (the read row 0347 already has). Non-zero = a bit set between the entry's read and its W1C is still asserted, which an edge-latched ELBI bit 14 would never signal again: no unmask, pend is set, the next pass is a new entry (ack, drain, this check). Bounded by the c30 run (no-work entries) and the thread pass rate; the line stays masked meanwhile, the poll carries the data. A failed read or all-ones here turns the mode off as c30. Counter rechecks counts the postponed unmasks.
+(4) review F1: "doorbell silent" auto-off: SWI_SILENT_MAX (200) poll passes that found ring work with no interrupt pass while irqs did not rise since the last pass (an interrupt resets the run), then GAP "doorbell silent: poll finds work, no interrupt" (a = passes, b = irqs) and mode off:silent. Row added to the GAP table of sw_irq_note in sweet_wlan.c. The noirq rule (irqs == 0 ever) is unchanged and fires first at the same count.
+(5) swi_ack_loop stays for ARM only (step 2, while 0xC34 = 0 and the SPI is disabled, so it cannot spin an interrupt), unchanged: 8 rounds. The stale "re-read loop" comments in sweet_wlan_irq.h and the three in sweet_wlan.c are reworded.
+Known and left (review F5, pre-existing in 0347): entries with no work that alternate 0xC30 non-zero / zero trip neither the empty rule nor the c30 rule; only the storm guard (5000 ISR entries/s) bounds them.
+What did not change: storm 5000/s, noirq after 200 poll-found-work passes, spurious 3, empty-interrupt run 64, elbistuck, the gate and its closes, teardown order, the judge rows and value rules, the arm order, the keep-thread glue and the log lines other than the new GAP row. New struct swi fields: c30_run, p_aerr, silent_run, silent_seen, rechecks.
+No new register access: reads and writes stay exactly 0xC30 read + W1C of the bits read (judge rows of 0347), the ring drain and the ELBI/0xC34 accesses of 0347; no new offset, no new access kind, no new value. The one added 0xC30 read (before the unmask) uses the existing read row; the doorbell-mode thread path still has fewer 0xC30 accesses than 0347's loop (one read + one W1C + one read per entry instead of a loop of them).
+Host test: tools/test_wlan_irq_core.py applies this patch on top of the 0347 core (same chaining as shim/build.sh for 0124 + 0174) and checks: a steady stream of non-zero 0xC30 with work never disables; 63 non-zero + no-work entries then work resets; 64 disables as c30stuck with the GAP; one entry = one 0xC30 read + one W1C (+ the pre-unmask read); the poll-drains-first sequence (review R3) never disables; a bit set between the read and the W1C postpones the unmask and the silent doorbell ends in the GAP and off:silent (R4); all-ones read; a failing W1C driven through the ops fake; mutants of the new rules are killed.
+Review: the 0347 write path was reviewed (docs/reviews/0346-wifi-irq-review.md); this patch adds no write and removes accesses; its own review is docs/reviews/0349-wifi-irq-ack-once-review.md (findings F1-F6 fixed here, F5 left). NOT RUN, NOT BUILT, NOT ON HARDWARE: the glue was not compiled with 0349. ORDER: after 0347.
+diff --git a/bsd/dev/sweet_wlan_irq.h b/bsd/dev/sweet_wlan_irq.h
+--- a/bsd/dev/sweet_wlan_irq.h
++++ b/bsd/dev/sweet_wlan_irq.h
+@@ -32,7 +32,7 @@ enum { SWI_ISR_DONE = 0, SWI_ISR_MASK = 1, SWI_ISR_DEFER = 2 };  /* handler retu
+ enum { SWI_E_REFUSED = -100, SWI_E_IO = -101 };
+ 
+ /* why the doorbell mode is off (st->why); 0 = not off */
+-enum { SWI_Y_NONE = 0, SWI_Y_GATE, SWI_Y_ARM, SWI_Y_STORM, SWI_Y_NOIRQ, SWI_Y_C30, SWI_Y_SPUR, SWI_Y_ISR, SWI_Y_LINK, SWI_Y_END, SWI_Y_UNMASK, SWI_Y_REFUSED, SWI_Y_EMPTY };
++enum { SWI_Y_NONE = 0, SWI_Y_GATE, SWI_Y_ARM, SWI_Y_STORM, SWI_Y_NOIRQ, SWI_Y_C30, SWI_Y_SPUR, SWI_Y_ISR, SWI_Y_LINK, SWI_Y_END, SWI_Y_UNMASK, SWI_Y_REFUSED, SWI_Y_EMPTY, SWI_Y_SILENT };
+ 
+ /* notes to the glue (it prints them; every GAP-class code is a loud line + swl_gap): code, a, b */
+ enum {
+@@ -42,7 +42,7 @@ enum {
+ 	SWI_G_RD,              /* read failed (a = step) */
+ 	SWI_G_WR,              /* write failed (a = step) */
+ 	SWI_G_REFUSED,         /* the swi judge refused (a = space, b = offset) */
+-	SWI_G_C30STUCK,        /* 0xC30 not zero after the ack/drain loop (a = last value) */
++	SWI_G_C30STUCK,        /* arm: 0xC30 not zero after SWI_ACK_TRIES ack/drain rounds (a = last value, b = 0); patch 0349, doorbell mode: 0xC30 non-zero at SWI_C30_RUN_MAX interrupt entries in a row whose drains all found no ring work (a = last value, b = the count) */
+ 	SWI_G_ELBISTUCK,       /* IRQ0 bit 14 still set after its W1C (a = value read) */
+ 	SWI_G_ENOTHER,         /* IRQ0_EN has bits other than 14 set (a = value): not armed */
+ 	SWI_G_ATTACH,          /* GIC attach rc (a = rc, b = enable read-back) */
+@@ -56,13 +56,16 @@ enum {
+ 	SWI_G_TEARDOWN,        /* a teardown step failed (a = step: 1 ELBI read, 2 ELBI write, 3 detach, 4 restore 0xC34) */
+ 	SWI_G_EMPTY,           /* SWI_EMPTY_MAX interrupts in a row whose thread pass found 0xC30 == 0 and no ring work: a stuck line (a = run, b = irqs so far) */
+ 	SWI_G_GATECLOSE,       /* thread gate closed after arming (engine stopped / DS / dead bus / link): no BAR0 access, no unmask, SPI left masked (a = closes so far) */
+-	SWI_G_GATEOPEN         /* thread gate open again (a = closes so far) */
++	SWI_G_GATEOPEN,        /* thread gate open again (a = closes so far) */
++	SWI_G_SILENT           /* patch 0349: SWI_SILENT_MAX poll passes found ring work while no interrupt came in (irqs did not rise): the doorbell is dead (a = passes, b = irqs so far) */
+ };
+ 
+-#define SWI_ACK_TRIES   8u      /* ack/drain rounds per pass before 0xC30 is called stuck [decision] */
++#define SWI_ACK_TRIES   8u      /* ARM ONLY (patch 0349): ack/drain rounds before 0xC30 is called stuck while the line is still masked (0xC34 = 0, SPI off) [decision] */
+ #define SWI_STORM_MAX   5000u   /* ISR entries in a one-second window above which the mode turns itself off [guess: the busy poll runs at most every 100 us = 10000 passes/s, one interrupt per pass; half of it] */
+ #define SWI_NOIRQ_MAX   200u    /* poll passes that found ring work while NO interrupt ever fired, then off (task order; same number as the GPU's "200 jobs without a JOB interrupt", patch 0272) */
+ #define SWI_SPUR_MAX    3u      /* ISR entries without IRQ0 bit 14 in a row [decision] */
++#define SWI_C30_RUN_MAX 64u     /* patch 0349: interrupt entries in a row with 0xC30 non-zero at entry AND a drain that found no ring work, then c30stuck [decision; 64 = the SWI_EMPTY_MAX run length, a line that keeps asserting with nothing to do for 64 entries is not a busy ring] */
++#define SWI_SILENT_MAX  200u    /* patch 0349: poll passes that found ring work while irqs did not rise since the last pass, in a row (any interrupt resets), then off with a GAP: the doorbell went silent while the mode still says doorbell (review 0349 F1; the number is the SWI_NOIRQ_MAX style, 200) */
+ #define SWI_EMPTY_MAX   64u     /* interrupts in a row whose thread pass finds 0xC30 == 0 and no ring work, then off BEFORE the unmask (review 0346 F1; the value is a decision, 64 x 250 us = 16 ms of spin at most) */
+ 
+ struct swi_ops {
+@@ -95,6 +98,8 @@ struct swi {
+ 	uint32_t seen, seen_spur, spur_run, p_pend, p_defer;
+ 	uint32_t missed, storm, work_events, ack_writes, unmasks, loops, extra_items, ro_n, ro_skip;
+ 	uint32_t win_ms, win_isr;
++	uint32_t silent_run, silent_seen, rechecks;   /* patch 0349: SWI_SILENT_MAX run, the irqs value of the last pass, unmasks postponed because 0xC30 was non-zero again */
++	uint32_t c30_run, p_aerr;                   /* patch 0349: c30_run = consecutive entries with 0xC30 != 0 at entry and no ring work (SWI_C30_RUN_MAX); p_aerr = SWI_G_* code of a failed/refused 0xC30 access in swi_pre this pass (0 = none) */
+ 	uint32_t p_c30, empty_run, gate_closes;     /* p_c30: the 0xC30 value swi_pre read this pass (0xFFFFFFFF = not read); empty_run: see SWI_EMPTY_MAX */
+ 	uint8_t gate_closed, owe_unmask;            /* gate closed at the last thread pass; an unmask the closed gate postponed */
+ };
+@@ -318,7 +323,8 @@ swi_disable(struct swi *st, const struct swi_ops *o, int why, int code, uint32_t
+ 	swi_teardown(st, o, 1);
+ }
+ 
+-/* ack/drain loop (study-check W1): read 0xC30, W1C exactly the bits read, drain the rings, re-read, until zero. Returns 0 = zero reached, -1 = stuck/failed (caller disables), -2 = the gate closed after a drain (no more BAR0 access). *extra += drained items */
++/* ARM ONLY since patch 0349 (study-check W1): read 0xC30, W1C exactly the bits read, drain the rings, re-read, until zero. Runs while the line is still masked (0xC34 = 0, SPI disabled), so the loop cannot spin an interrupt. Returns 0 = zero reached, -1 = stuck/failed (caller disables), -2 = the gate closed after a drain (no more BAR0 access). *extra += drained items.
++ * The doorbell-mode thread path does NOT use it: one read + one W1C per interrupt entry (swi_pre), one drain, the unmask (swi_post), like Linux brcmf_pcie_isr_thread (pcie.c:939-963 v6.6). */
+ static int
+ swi_ack_loop(struct swi *st, const struct swi_ops *o, uint32_t *extra)
+ {
+@@ -487,9 +493,11 @@ static int
+ swi_pre(struct swi *st, const struct swi_ops *o)
+ {
+ 	uint32_t c = 0, sp;
++	int r;
+ 
+ 	st->p_pend = 0;
+ 	st->p_defer = 0;
++	st->p_aerr = 0;
+ 	st->p_c30 = 0xFFFFFFFFu;
+ 	if (!st->on) {
+ 		return 0;
+@@ -511,24 +519,33 @@ swi_pre(struct swi *st, const struct swi_ops *o)
+ 	if (st->p_pend) {
+ 		st->p_defer = 1;
+ 		st->spur_run = 0;
+-		if (swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &c) == 0) {
++		st->p_aerr = 0;
++		r = swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &c);
++		if (r == 0 && c == 0xFFFFFFFFu) {       /* all ones = dead link / surprise removal (DHD treats it as link down): no ack, off at the first entry (review 0349 F3; 0347 got there through the judge refusing the W1C) */
++			st->p_aerr = SWI_G_RD;
++		} else if (r == 0) {
+ 			st->p_c30 = c;
++		} else {
++			st->p_aerr = r == SWI_E_REFUSED ? SWI_G_REFUSED : SWI_G_RD;
+ 		}
+ 		if (st->p_c30 != 0xFFFFFFFFu && c != 0u) {
+-			if (swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_INT, &c) == 0) {      /* the bits just read, before any ring is touched */
++			r = swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_INT, &c);      /* the bits just read (once per entry, patch 0349), before any ring is touched */
++			if (r == 0) {
+ 				st->ack_writes++;
++			} else {
++				st->p_aerr = r == SWI_E_REFUSED ? SWI_G_REFUSED : SWI_G_WR;
+ 			}
+ 		}
+ 	}
+ 	return (int)(st->p_pend | st->p_defer);
+ }
+ 
+-/* ---- thread, after the first drain (got = items it found): missed/auto-disable bookkeeping, the re-read loop, then the unmask. Returns extra items drained. */
++/* ---- thread, after the first drain (got = items it found): missed/auto-disable bookkeeping, the stuck and silent rules, one 0xC30 read, then the unmask (patch 0349: no ack loop here). Always returns 0 (items are only drained by the glue's own drain). */
+ static uint32_t
+ swi_post(struct swi *st, const struct swi_ops *o, uint32_t got)
+ {
+-	uint32_t ex = 0, now = st->isr_total, aw0;
+-	int fired, r;
++	uint32_t now = st->isr_total;
++	int fired;
+ 
+ 	if (!st->on) {
+ 		return 0;
+@@ -566,42 +583,76 @@ swi_post(struct swi *st, const struct swi_ops *o, uint32_t got)
+ 		swi_disable(st, o, SWI_Y_NOIRQ, SWI_G_NOIRQ, st->work_events);
+ 		return 0;
+ 	}
+-	aw0 = st->ack_writes;
+-	if (st->p_pend || got != 0u) {
+-		r = swi_ack_loop(st, o, &ex);
+-		if (r == -2) {                          /* the gate closed during the loop: no unmask, owed for when it opens */
+-			if (st->p_defer) {
+-				st->owe_unmask = 1;
+-			}
+-			return ex;
+-		}
+-		if (r != 0) {
++	/* patch 0349 (review F1): the doorbell went silent: work found by the poll alone, irqs not rising, SWI_SILENT_MAX passes in a row (an interrupt resets the run; passes without work do not count) */
++	if (st->irqs != st->silent_seen) {
++		st->silent_seen = st->irqs;
++		st->silent_run = 0;
++	} else if (got != 0u && !st->p_pend) {
++		st->silent_run++;
++	}
++	if (st->silent_run >= SWI_SILENT_MAX) {
++		swi_gap(o, SWI_G_SILENT, st->silent_run, st->irqs);
++		swi_disable(st, o, SWI_Y_SILENT, 0, 0u);
++		return 0;
++	}
++	/* patch 0349: ONE ack per interrupt entry (done in swi_pre, before the drain), one drain (the glue's, before this call), no re-read, no loop: a doorbell still pending re-fires the level line after the unmask (Linux brcmf_pcie_isr_thread, pcie.c:939-963 v6.6).
++	 * c30stuck only when 0xC30 was non-zero at SWI_C30_RUN_MAX entries in a row and every one of those drains found no ring work (a busy ring resets the run, a zero read resets it) */
++	if (got != 0u) {                            /* review 0349 F2: a pass that drained work is not an idle entry, whichever pass carried the interrupt (poll pass first, interrupt pass finds the bit with nothing left) */
++		st->c30_run = 0;
++	}
++	if (st->p_pend) {
++		if (st->p_aerr != 0u) {                 /* the entry's 0xC30 read or W1C failed or was refused */
++			swi_gap(o, (int)st->p_aerr, SWI_SP_BAR0, SWI_MBX_INT);
+ 			swi_disable(st, o, SWI_Y_C30, 0, 0u);
+-			return ex;
++			return 0;
++		}
++		if (st->p_c30 != 0u && got == 0u) {
++			st->c30_run++;
++			if (st->c30_run >= SWI_C30_RUN_MAX) {
++				swi_gap(o, SWI_G_C30STUCK, st->p_c30, st->c30_run);
++				swi_disable(st, o, SWI_Y_C30, 0, 0u);
++				return 0;
++			}
++		} else {
++			st->c30_run = 0;
+ 		}
+ 	}
+-	/* F1 (review 0346): an interrupt whose pass finds 0xC30 == 0 (pre and loop) and no ring work is "empty"; SWI_EMPTY_MAX in a row = a line that stays asserted: off BEFORE the unmask so it cannot spin the thread */
+-	if (st->p_pend && st->p_c30 == 0u && got == 0u && ex == 0u && st->ack_writes == aw0) {
++	/* F1 (review 0346): an interrupt whose pass finds 0xC30 == 0 and no ring work is "empty"; SWI_EMPTY_MAX in a row = a line that stays asserted: off BEFORE the unmask so it cannot spin the thread */
++	if (st->p_pend && st->p_c30 == 0u && got == 0u) {
+ 		st->empty_run++;
+-	} else if (st->p_pend || got != 0u || ex != 0u) {
++	} else if (st->p_pend || got != 0u) {
+ 		st->empty_run = 0;
+ 	}
+ 	if (st->empty_run >= SWI_EMPTY_MAX) {
+ 		swi_gap(o, SWI_G_EMPTY, st->empty_run, st->irqs);
+ 		swi_disable(st, o, SWI_Y_EMPTY, 0, 0u);
+-		return ex;
++		return 0;
+ 	}
+-	st->extra_items += ex;
+ 	if (st->p_defer) {                          /* the line was masked by the ISR (deferred or entry without bit 14): re-enable it, last */
+-		int r = o->spi_unmask(o->ctx);
++		uint32_t c = 0;
++		int r = swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &c);
++
++		/* review 0349 F1: one 0xC30 read before the unmask (the 0xC30 read row of 0347, no new access). A bit set between the entry's read and its W1C is still asserted: if the ELBI bit 14 is an edge latch the unmask would
++		 * never see it again. Non-zero = no unmask, the next pass is a new entry (pend set: ack, drain, this check again); the run of such entries with no work is bounded by SWI_C30_RUN_MAX, entries with work are real traffic. */
++		if (r != 0 || c == 0xFFFFFFFFu) {
++			swi_gap(o, r == SWI_E_REFUSED ? SWI_G_REFUSED : SWI_G_RD, SWI_SP_BAR0, SWI_MBX_INT);
++			swi_disable(st, o, SWI_Y_C30, 0, 0u);
++			return 0;
++		}
++		if (c != 0u) {
++			__atomic_store_n(&st->pend, 1u, __ATOMIC_RELEASE);
++			st->rechecks++;
++			return 0;
++		}
++		r = o->spi_unmask(o->ctx);
+ 
+ 		if (r != 0) {
+ 			swi_disable(st, o, SWI_Y_UNMASK, SWI_G_UNMASK, (uint32_t)r);
+-			return ex;
++			return 0;
+ 		}
+ 		st->unmasks++;
+ 	}
+-	return ex;
++	return 0;
+ }
+ 
+ /* ---- once per pass: the storm window (ISR entries per second). now_ms = any monotonic millisecond clock */
+@@ -662,7 +713,7 @@ swi_ro_sample(struct swi *st, const struct swi_ops *o, struct swi_ro *r)
+ static const char *
+ swi_mode_str(const struct swi *st)
+ {
+-	static const char *const why[] = { "", "off:gate", "off:arm", "off:storm", "off:noirq", "off:c30stuck", "off:spurious", "off:isr", "off:link", "off:end", "off:unmask", "off:refused", "off:emptyirq" };
++	static const char *const why[] = { "", "off:gate", "off:arm", "off:storm", "off:noirq", "off:c30stuck", "off:spurious", "off:isr", "off:link", "off:end", "off:unmask", "off:refused", "off:emptyirq", "off:silent" };
+ 
+ 	if (st->mode == SWI_MODE_RO) {
+ 		return "ro";
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2631,6 +2631,7 @@ sw_irq_note(void *cx __unused, int code, uint32_t a, uint32_t b)
+ 		{ SWI_G_EMPTY, "empty interrupts in a row (0xC30 0, no work): stuck line" },
+ 		{ SWI_G_GATECLOSE, "thread gate closed: no BAR0 access, SPI left masked" },
+ 		{ SWI_G_GATEOPEN, "thread gate open again, doorbell resumes" },
++		{ SWI_G_SILENT, "doorbell silent: poll finds work, no interrupt" },   /* patch 0349 */
+ 	};
+ 	unsigned i;
+ 
+@@ -2721,7 +2722,7 @@ sw_irq_pre(struct swi_ro *ro, uint64_t *t_ro)
+ 	return r == -1 ? 2 : 1;
+ }
+ 
+-/* keep thread, lock held, after the first drain (got items): mode 1 = the re-read loop, the unmask, the counters, the storm window; mode 2 = print the sample. Returns extra items drained */
++/* keep thread, lock held, after the first drain (got items): mode 1 = the stuck and silent rules, one 0xC30 read, the unmask, the counters, the storm window (patch 0349: no ack loop); mode 2 = print the sample. Returns 0 in mode 1 */
+ static uint32_t
+ sw_irq_post(uint32_t got, int ro_have, const struct swi_ro *ro)
+ {
+@@ -2962,7 +2963,7 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		got = en0_live_poll(e, b);
+ 		if (irq_on_pass) {
+-			got += sw_irq_post(got, irq_ro_have, &irq_ro);  /* patch 0347: re-read loop, unmask, counters, storm window / the ro line */
++			got += sw_irq_post(got, irq_ro_have, &irq_ro);  /* patch 0347/0349: stuck + silent rules, 0xC30 re-check, unmask, counters, storm window / the ro line */
+ 		}
+ 		items += got;
+ 		busy = got != 0u || e->tx_blocked != 0u;

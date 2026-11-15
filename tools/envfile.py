@@ -6,6 +6,8 @@ Order: $PIXOS_ENV_FILE, the worktree's own <root>/.env, else <git-common-dir>/..
   tools/envfile.py path                 print the resolved path (RESULT: ERROR, exit 2 when none)
   tools/envfile.py require KEY...       exit 2 with `RESULT: ERROR ...` unless each KEY is non-empty in the process env or the file
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,7 +23,7 @@ def find(root=ROOT):
     try:
         out = subprocess.run(["git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"],
                              capture_output=True, text=True, timeout=10, check=True).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):   # lint-silent: expected git absent or not a repo: no main .env to fall back to, the caller then reports the missing config
         return None
     main = os.path.join(os.path.dirname(out), ".env")
     return main if os.path.isfile(main) else None

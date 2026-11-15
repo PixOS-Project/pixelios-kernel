@@ -1,0 +1,838 @@
+SWEET Bluetooth: VSC adapter for Apple multi-advertising (patch 0285, sprint-bt bt-proper 2026-11-10), default ON, boot-arg sweetbtvsc=0 turns it off with a log line. Spec docs/research/bt-vsc-adapter-spec.md. bluetoothd runs this phone on the BCM_4357 platform profile [bin docs/research/bt-platform-chipset-select.md s.1-3], which advertises only through Apple's vendor commands 0xfd48..0xfd4e (Create, Remove, SetParams, SetAdvData, SetScanRsp, Enable, UpdateAddress, layouts in that note s.6); the Pixel BCM4389 answers 0xfd48 with 0x01 [obs bt-bw2], so bluetoothd never advertises. The kernel UART driver is the controller as bluetoothd sees it: after the verified patchram download it reads the controller's own Broadcom multi-advertising capability (0xfd53, read-only, max_adv_inst >= 5 needed), then answers Create locally (ids 1..max-1) and translates the other six commands to the controller's 0xfd54 sub-ops 01-05 [src AOSP ble_advertiser_hci_interface.cc, docs/research/sprint-bt-fd48-firmware.md s.2a], rewriting the chip's replies to the Apple opcode. Set-Param tx_power is -7 dBm (AOSP default TX_POWER_MEDIUM, cited in the code). The ONLY controller commands it sends are 0xfd53 (once) and 0xfd54 sub-ops 01-05; no register or GPIO access is added. Both streams are framed into whole H4 packets (tx: commands held until complete, other packets forwarded as they arrive; rx: whole packets, local answers only between packets); a non-H4 byte, a length beyond the 2048-byte buffer or a uart rx error inside a packet stops the adapter for the boot (loud, pass-through). It refuses to start (BT GAP) if a diagnostic rewrite knob (sweetbtrw200b, sweetbtrw200c, sweetbtnopadv, sweetbtnopcf, sweetbtpubscan) is on, and every refusal, stray 0xfd54 reply and framing loss is a BT GAP row; BT VSC rows (first 16 in full, then powers of two) never print an address or payload byte; counters print when bluetoothd disconnects (new hook sweet_bt_uart_disc from sbt_disconnect in sweet_bt.c). Applies after 0277. Host test: tools/test_sweet_bt_vsc.sh. Not run on hardware. New hardware-write path (controller commands), unreviewed. Review fixes (docs/reviews/bt-proper-0285-review.md): Remove (0xfd49) of an instance that is not enabled is answered 00 locally with no chip command (as AOSP); sbu_vsc_cmd re-checks the adapter is on under the lock; the framing-loss rows print a stream offset, never a stream byte; sweet_bt_uart_disc runs before uart_busy is released.
+
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 0ce125a..c9749f0 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -138,6 +138,7 @@ sbt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
+ 
+ 	SBT_TRACE("disconnect control %d", i);
+ 	if (i >= 0 && __atomic_exchange_n(&sbt.busy[i], 0, __ATOMIC_ACQ_REL)) {
++		sweet_bt_uart_disc();       /* patch 0285: the VSC adapter drops what only this client could use and prints its counters; before the UART is freed so a new client cannot be hit (review F3) */
+ 		__atomic_store_n(&sbt.uart_busy, 0, __ATOMIC_RELEASE);      /* only the holder frees the UART */
+ 	}
+ 	return 0;
+diff --git a/bsd/dev/sweet_bt.h b/bsd/dev/sweet_bt.h
+index 0013903..05353fa 100644
+--- a/bsd/dev/sweet_bt.h
++++ b/bsd/dev/sweet_bt.h
+@@ -18,5 +18,6 @@ struct sweet_bt_ops {
+ 
+ void sweet_bt_set_ops(const struct sweet_bt_ops *ops);
+ int sweet_bt_rx(const void *data, size_t len);          /* backend -> connected control (ctl_enqueuedata); drops loudly without a client */
++void sweet_bt_uart_disc(void);                          /* sweet_bt_uart.c (patch 0285), called when the client of either control disconnects */
+ void sweet_bt_uart_attach(void);                        /* sweet_bt_uart.c, called once from sweet_bt_init */
+ #endif
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index 7684d00..a5147ff 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1766,6 +1766,735 @@ sbu_romread_patched(void)
+ 		sbu_rom_row("patchhead", 0x1a0400, b, n);
+ }
+ 
++/*
++ * patch 0285 (sprint-bt, bt-proper 2026-11-10): BT VSC adapter, default ON, boot-arg sweetbtvsc=0 turns it off (logged). Spec: docs/research/bt-vsc-adapter-spec.md.
++ * Why [bin docs/research/bt-platform-chipset-select.md s.1-3, s.6]: bluetoothd runs this phone on the BCM_4357 profile, which drives LE advertising only through Apple's vendor
++ * commands 0xfd48..0xfd4e (Create 0xfd48, Remove 0xfd49, SetParams 0xfd4a, SetAdvData 0xfd4b, SetScanRsp 0xfd4c, Enable 0xfd4d, UpdateAddress 0xfd4e); the Pixel firmware answers 0xfd48
++ * with 0x01 [obs bt-bw2]. This code is the controller as bluetoothd sees it: it answers Create locally (the controller's instances are chosen by the host) and translates the rest onto
++ * the controller's own Broadcom multi-advertising command 0xfd54 [src AOSP android12-release system/bt/stack/btm/ble_advertiser_hci_interface.cc, docs/research/sprint-bt-fd48-firmware.md
++ * s.2a]. Every other command, event and data packet passes byte for byte.
++ *
++ * The ONLY controller commands this code ever sends: 0xfd53 (LE Get Vendor Capabilities, read-only, once after the verified patchram download, sbu_vsc_attach) and 0xfd54 with sub-op
++ * 01..05 (set params, adv data, scan rsp, random address, enable) for an instance id the host created here. No register or GPIO access is added; bytes go out through sbu_tx.
++ *
++ * Framing: the tx stream is split into H4 packets (01 cmd hdr 4, 02 ACL 5, 03 SCO 4, 05 ISO 5; Core v5.4 Vol 4 Part A s.2): only a complete command with an opcode of the table is acted on,
++ * a command is held until complete, every other packet is forwarded as it arrives. The rx stream is split into complete packets (04 event hdr 3 etc., buffer SBU_VSC_RXMAX) and each is delivered
++ * with sweet_bt_rx; local answers wait for a packet boundary. A byte that is no H4 type, or a length beyond the buffer, stops the adapter for the rest of the boot (loud, pass-through).
++ * The diagnostic rewrite knobs (rw200b, rw200c, nopadv, nopcf, pubscan) are refused at bring-up: they parse the same streams.
++ */
++#define SBU_VSC_NID     32u             /* instance ids 1..31 at most; the live limit is min(max_adv_inst, 32) from 0xfd53 */
++#define SBU_VSC_MINCAP  5u              /* bluetoothd creates N = 4 instances [bin bt-platform-chipset-select.md s.6e]; ids 1..max-1, id 0 never used (AOSP keeps 0 for its default instance [src, shape only]) */
++#define SBU_VSC_RXMAX   2048u
++#define SBU_VSC_TXMAX   (4u + 255u)
++#define SBU_VSC_PEND    8u              /* pending translations (bluetoothd has one command in flight; 8 is slack) */
++#define SBU_VSC_ANS     8u              /* queued local answers */
++/*
++ * Set-Param tx_power field (int8, dBm) = -7. AOSP: the advertiser passes the caller's tx_power straight into sub-op 01 (btm_ble_multi_adv.cc:692,704 -> ble_advertiser_hci_interface.cc:121,155
++ * INT8_TO_STREAM(pp, tx_power)); the caller's default is AdvertisingSetParameters.TX_POWER_MEDIUM = -7 (frameworks/base core/java/android/bluetooth/le/AdvertisingSetParameters.java:76 constant,
++ * :255 builder default mTxPowerLevel = TX_POWER_MEDIUM; the same file's levels are -21/-15/-7/1, javadoc names them TX power levels, unit dBm per Core v5.4 Vol 4 Part E s.7.8.6 Tx_Power_Level).
++ */
++#define SBU_VSC_TXPWR   0xf9u
++
++struct sbu_vsc_inst {
++	bool used, params_set, enabled;
++	uint8_t atype, addr[6];         /* own address type + address, LSB first as on the wire (Create / UpdateAddress carry it that way; 0xfd54 sub 01 / 04 want the same order [src AOSP BDADDR_TO_STREAM]) */
++	uint8_t prm[7];                 /* last successful SetParams: min16 max16 type chmap filter */
++};
++struct sbu_vsc_pend {
++	uint16_t aop;                   /* the Apple opcode the chip's 0xfd54 reply is rewritten to */
++	uint8_t sub, id, en, prm[7];
++	bool orphan;                    /* the client disconnected: the reply is consumed, not delivered */
++};
++
++static bool sbu_vsc_on;                         /* the adapter is active (set by sbu_vsc_attach, cleared by sbu_vsc_stop) */
++static bool sbu_vsc_ok;                         /* bring-up succeeded once this boot: the summary row is printed */
++static unsigned sbu_vsc_max;                    /* ids 1..sbu_vsc_max-1 */
++static struct sbu_vsc_inst sbu_vsc_in[SBU_VSC_NID];
++static struct sbu_vsc_pend sbu_vsc_pq[SBU_VSC_PEND];
++static unsigned sbu_vsc_ph, sbu_vsc_pn;         /* FIFO head index, entries */
++static struct { uint8_t n, b[8]; } sbu_vsc_aq[SBU_VSC_ANS];
++static unsigned sbu_vsc_ah, sbu_vsc_an;
++static uint32_t sbu_vsc_lk;                     /* spin flag: tx context (kctl send) and the rx thread share the state above; sections are a few instructions and never call the UART */
++static uint8_t sbu_vsc_txb[SBU_VSC_TXMAX];      /* the command being assembled */
++static unsigned sbu_vsc_toff, sbu_vsc_thlen, sbu_vsc_tneed;      /* offset in the current H4 packet, its header length (type byte included), its total length (0 until the header is complete) */
++static uint8_t sbu_vsc_ttype;
++static uint8_t sbu_vsc_rxb[SBU_VSC_RXMAX];
++static unsigned sbu_vsc_rxn, sbu_vsc_rneed;
++static unsigned sbu_vsc_logn;
++static unsigned sbu_vsc_ncreate, sbu_vsc_nremove, sbu_vsc_nxlate, sbu_vsc_nok, sbu_vsc_nfail, sbu_vsc_nlocal, sbu_vsc_nrefuse, sbu_vsc_nstray, sbu_vsc_norphan;
++
++static void
++sbu_vsc_lock(void)
++{
++	while (__atomic_exchange_n(&sbu_vsc_lk, 1, __ATOMIC_ACQUIRE)) {
++	}
++}
++
++static void
++sbu_vsc_unlock(void)
++{
++	__atomic_store_n(&sbu_vsc_lk, 0, __ATOMIC_RELEASE);
++}
++
++/* rule 7 volume control: the first 16 rows in full, then every power of two; never an address or a payload byte */
++#define SBU_VSC_LOG(fmt, ...) do { \
++	unsigned n_ = __atomic_add_fetch(&sbu_vsc_logn, 1, __ATOMIC_RELAXED); \
++	if (n_ <= 16 || (n_ & (n_ - 1)) == 0) { \
++		printf("BT VSC: " fmt " (row %u)\n", ##__VA_ARGS__, n_); \
++	} \
++} while (0)
++
++static void
++sbu_vsc_summary(const char *when)
++{
++	printf("BT VSC: summary (%s): create %u remove %u translated %u (chip ok %u, chip refused %u) local answers %u refused %u stray 0xfd54 replies %u orphan replies %u\n", when,
++	    sbu_vsc_ncreate, sbu_vsc_nremove, sbu_vsc_nxlate, sbu_vsc_nok, sbu_vsc_nfail, sbu_vsc_nlocal, sbu_vsc_nrefuse, sbu_vsc_nstray, sbu_vsc_norphan);
++}
++
++/* the adapter stops for the rest of the boot (pass-through from then on); held tx bytes and a partial rx packet are flushed by the paths that own them */
++static void
++sbu_vsc_stop(const char *why)
++{
++	unsigned lost;
++	bool was;
++
++	sbu_vsc_lock();
++	was = sbu_vsc_on;
++	sbu_vsc_on = false;
++	lost = sbu_vsc_pn;
++	sbu_vsc_pn = 0;
++	sbu_vsc_unlock();
++	if (was) {
++		SBU_GAP(SG_OTHER, "sweetbtvsc: adapter OFF for the rest of the boot: %s (%u pending translations dropped); every command and event passes unchanged from now on", why, lost);
++		sbu_vsc_summary("stopped");
++	}
++}
++
++/* queue a Command Complete for bluetoothd (lock held): 04 0e <plen> 01 <opc lo> <opc hi> <status> [id]; Num_HCI_Command_Packets = 1 */
++static void
++sbu_vsc_ans(unsigned op, uint8_t st, int id)
++{
++	uint8_t *b;
++
++	if (sbu_vsc_an >= SBU_VSC_ANS) {
++		SBU_GAP(SG_OTHER, "sweetbtvsc: local answer queue full (%u): the answer to 0x%04x is lost, bluetoothd will wait", SBU_VSC_ANS, op);
++		return;
++	}
++	b = sbu_vsc_aq[(sbu_vsc_ah + sbu_vsc_an++) % SBU_VSC_ANS].b;
++	b[0] = 0x04;
++	b[1] = 0x0e;
++	b[2] = id >= 0 ? 5 : 4;
++	b[3] = 0x01;
++	b[4] = (uint8_t)(op & 0xff);
++	b[5] = (uint8_t)(op >> 8);
++	b[6] = st;
++	if (id >= 0) {
++		b[7] = (uint8_t)id;
++	}
++	sbu_vsc_aq[(sbu_vsc_ah + sbu_vsc_an - 1) % SBU_VSC_ANS].n = (uint8_t)(3 + b[2]);
++	sbu_vsc_nlocal++;
++}
++
++/* a refusal is a local error status plus a BT GAP row with the reason (every call site has its own counter via SBU_GAP) */
++#define SBU_VSC_REFUSE(op, st, id, fmt, ...) do { \
++	sbu_vsc_ans(op, st, id); \
++	sbu_vsc_nrefuse++; \
++	SBU_GAP(SG_OTHER, "sweetbtvsc: 0x%04x refused with local status 0x%02x: " fmt, (unsigned)(op), (unsigned)(st), ##__VA_ARGS__); \
++} while (0)
++
++#define SBU_VSC_VALID(id) ((id) >= 1u && (id) < sbu_vsc_max && sbu_vsc_in[(id)].used)
++
++/* the 0xfd54 sub-op 01 packet (H4 command, 28 bytes incl. the 4-byte header) from stored params; layout [src AOSP ble_advertiser_hci_interface.cc:127-155, BTM_BLE_MULTI_ADV_SET_PARAM_LEN 24:38]:
++ * [01][min16][max16][adv type][own addr type][own addr6][peer addr type][peer addr6][channel map][filter policy][inst id][tx power]; no peer address (bluetoothd never sends one) */
++static void
++sbu_vsc_setparam(uint8_t *o, unsigned id, const uint8_t *prm, uint8_t atype, const uint8_t *addr)
++{
++	uint8_t *s = o + 4;
++
++	o[0] = 0x01;
++	o[1] = 0x54;
++	o[2] = 0xfd;
++	o[3] = 24;
++	memset(s, 0, 24);
++	s[0] = 0x01;
++	memcpy(s + 1, prm, 4);          /* min, max: 0.625 ms units on both sides [bin s.6a; src AOSP passes adv_int_min/max unchanged] */
++	s[5] = prm[4];                  /* Apple type 0/2/3 = legacy ADV_IND / SCAN_IND / NONCONN_IND = the 0xfd54 type byte [bin s.6a table; src AOSP :135-140] */
++	s[6] = atype;
++	memcpy(s + 7, addr, 6);
++	s[13] = 0;                      /* peer address type + address stay zero */
++	s[20] = prm[5];                 /* channel map */
++	s[21] = prm[6];                 /* filter policy */
++	s[22] = (uint8_t)id;
++	s[23] = SBU_VSC_TXPWR;
++}
++
++enum { SBU_VSC_PASS, SBU_VSC_DONE, SBU_VSC_SEND };
++
++/*
++ * One complete command packet c (01 hdr). Returns SBU_VSC_PASS (send it unchanged), SBU_VSC_DONE (answered locally, nothing goes to the chip) or SBU_VSC_SEND (send sub[0..*subn), a whole
++ * H4 0xfd54 command, instead and wait for its reply, which sbu_vsc_pkt rewrites). Apple layouts [bin bt-platform-chipset-select.md s.6a-6d]; Broadcom layouts [src AOSP
++ * ble_advertiser_hci_interface.cc, s.2a of sprint-bt-fd48-firmware.md]: sub 02 write adv data :166-181 [02][len][data31][id], 03 scan rsp :193-210 same, 04 random address :217-223
++ * [04][addr6][id], 05 enable :245-251 [05][en][id]; sub 01 is built by sbu_vsc_setparam.
++ */
++static int
++sbu_vsc_cmd(const uint8_t *c, uint8_t *sub, unsigned *subn)
++{
++	static const uint8_t want[7] = { 7, 1, 8, 33, 33, 7, 8 };      /* plen of 0xfd48..0xfd4e */
++	unsigned op = (unsigned)c[1] | ((unsigned)c[2] << 8), plen = c[3], id = 0;
++	const uint8_t *q = c + 4;
++	struct sbu_vsc_pend pe;
++	struct sbu_vsc_inst *in;
++	int res = SBU_VSC_DONE;
++
++	if (op == 0x0c03) {                     /* HCI Reset: the chip clears its advertising instances too [Core v5.4 Vol 4 Part E s.7.3.2 resets all controller state; bluetoothd resets first at every start] */
++		sbu_vsc_lock();
++		memset(sbu_vsc_in, 0, sizeof(sbu_vsc_in));
++		if (sbu_vsc_pn != 0) {
++			SBU_GAP(SG_OTHER, "sweetbtvsc: HCI Reset with %u translated 0xfd54 commands unanswered: dropped; a late reply passes unchanged", sbu_vsc_pn);
++		}
++		sbu_vsc_pn = 0;
++		sbu_vsc_unlock();
++		SBU_VSC_LOG("HCI Reset seen: all instance state freed");
++		return SBU_VSC_PASS;
++	}
++	if (op < 0xfd48 || op > 0xfd4e) {
++		return SBU_VSC_PASS;
++	}
++	memset(&pe, 0, sizeof(pe));
++	pe.aop = (uint16_t)op;
++	sbu_vsc_lock();
++	if (!sbu_vsc_on) {                      /* the rx thread stopped the adapter after the caller's check: send nothing, let bluetoothd's bytes pass (review F2) */
++		res = SBU_VSC_PASS;
++		goto out;
++	}
++	if (plen != want[op - 0xfd48]) {
++		SBU_VSC_REFUSE(op, 0x12, -1, "plen %u (need %u)", plen, (unsigned)want[op - 0xfd48]);
++		goto out;
++	}
++	if (op == 0xfd48) {                     /* Create(addr_type, addr6) -> id: allocated here, the controller has no such command */
++		for (id = 1; id < sbu_vsc_max && sbu_vsc_in[id].used; id++) {
++		}
++		if (id >= sbu_vsc_max) {
++			SBU_VSC_REFUSE(op, 0x07, 0xff, "no free instance id (1..%u all used)", sbu_vsc_max - 1);
++			goto out;
++		}
++		in = &sbu_vsc_in[id];
++		memset(in, 0, sizeof(*in));
++		in->used = true;
++		in->atype = q[0];
++		memcpy(in->addr, q + 1, 6);
++		sbu_vsc_ans(op, 0x00, (int)id);
++		sbu_vsc_ncreate++;
++		SBU_VSC_LOG("0xfd48 Create -> local id %u", id);
++		goto out;
++	}
++	id = q[0];
++	if (!SBU_VSC_VALID(id)) {
++		SBU_VSC_REFUSE(op, 0x12, -1, "unknown instance id %u", id);
++		goto out;
++	}
++	in = &sbu_vsc_in[id];
++	pe.id = (uint8_t)id;
++	*subn = 0;
++	switch (op) {
++	case 0xfd49:                            /* Remove(id): no true remove on the chip, disable (sub 05, enable 0), free the id when the chip says 00; an instance that is not enabled is freed here and answered 00 with no chip command, as AOSP does (btm_ble_multi_adv.cc:864-867, ble_advertiser_hci_interface.cc:283-286) */
++		if (!in->enabled) {
++			memset(in, 0, sizeof(*in));
++			sbu_vsc_nremove++;
++			sbu_vsc_ans(op, 0x00, -1);
++			SBU_VSC_LOG("0xfd49 Remove id %u: not enabled, freed locally (no chip command)", id);
++			goto out;
++		}
++		sub[4] = 0x05;
++		sub[5] = 0x00;
++		sub[6] = (uint8_t)id;
++		pe.sub = 0x05;
++		*subn = 7;
++		break;
++	case 0xfd4a: {                          /* SetParams(id, min16, max16, type, chmap, filter) */
++		unsigned mn = (unsigned)q[1] | ((unsigned)q[2] << 8), mx = (unsigned)q[3] | ((unsigned)q[4] << 8);
++
++		if (q[5] == 1) {
++			SBU_VSC_REFUSE(op, 0x12, -1, "directed advertising type 1 needs a peer address that bluetoothd never sends [bin s.6a]");
++			goto out;
++		}
++		if (mn < 0x20 || mn > 0x4000 || mx < 0x20 || mx > 0x4000 || q[5] > 3 || q[6] == 0 || q[6] > 7 || q[7] > 3) {      /* [bin s.6a table: interval 0x20..0x4000, type 0..3, chmap 1..7, filter 0..3] */
++			SBU_VSC_REFUSE(op, 0x12, -1, "parameters out of range (min %#x max %#x type %u chmap %u filter %u)", mn, mx, q[5], q[6], q[7]);
++			goto out;
++		}
++		memcpy(pe.prm, q + 1, 7);
++		sbu_vsc_setparam(sub, id, pe.prm, in->atype, in->addr);
++		pe.sub = 0x01;
++		*subn = 28;
++		break;
++	}
++	case 0xfd4b:                            /* SetAdvData(id, len, data31) -> sub 02 [02][len][data31][id] */
++	case 0xfd4c:                            /* SetScanRsp: same, sub 03 */
++		if (q[1] > 31) {
++			SBU_VSC_REFUSE(op, 0x12, -1, "data length %u > 31", q[1]);
++			goto out;
++		}
++		pe.sub = op == 0xfd4b ? 0x02 : 0x03;
++		sub[4] = pe.sub;
++		sub[5] = q[1];
++		memcpy(sub + 6, q + 2, 31);
++		sub[37] = (uint8_t)id;
++		*subn = 38;
++		break;
++	case 0xfd4d:                            /* Enable(id, en, u32, u8) -> sub 05 [05][en][id] */
++		if (q[1] > 1) {
++			SBU_VSC_REFUSE(op, 0x12, -1, "enable value %u", q[1]);
++			goto out;
++		}
++		if (q[2] != 0 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) {
++			SBU_VSC_REFUSE(op, 0x11, -1, "duration/max-events fields are not zero; the 3-byte 0xfd54 enable has no such field [bin s.6b: bluetoothd always sends 0]");
++			goto out;
++		}
++		pe.sub = 0x05;
++		pe.en = q[1];
++		sub[4] = 0x05;
++		sub[5] = q[1];
++		sub[6] = (uint8_t)id;
++		*subn = 7;
++		break;
++	default: {                              /* 0xfd4e UpdateAddress(id, type, addr6) */
++		bool same = in->atype == q[1];
++
++		if (in->enabled) {
++			SBU_VSC_REFUSE(op, 0x0c, -1, "instance %u is enabled; bluetoothd disables first [bin s.6d]", id);
++			goto out;
++		}
++		in->atype = q[1];
++		memcpy(in->addr, q + 2, 6);
++		if (!in->params_set) {          /* the address goes out with the first SetParams */
++			sbu_vsc_ans(op, 0x00, -1);
++			SBU_VSC_LOG("0xfd4e UpdateAddress id %u stored (no params yet)", id);
++			goto out;
++		}
++		if (same) {
++			sub[4] = 0x04;
++			memcpy(sub + 5, in->addr, 6);
++			sub[11] = (uint8_t)id;
++			pe.sub = 0x04;
++			*subn = 12;
++		} else {                        /* the address type is not in sub 04: re-send the stored params with the new type + address */
++			sbu_vsc_setparam(sub, id, in->prm, in->atype, in->addr);
++			pe.sub = 0x01;
++			*subn = 28;
++		}
++		break;
++	}
++	}
++	if (sbu_vsc_pn >= SBU_VSC_PEND) {
++		SBU_VSC_REFUSE(op, 0x07, -1, "pending translation queue full (%u)", SBU_VSC_PEND);
++		goto out;
++	}
++	sub[0] = 0x01;
++	sub[1] = 0x54;
++	sub[2] = 0xfd;
++	sub[3] = (uint8_t)(*subn - 4);
++	sbu_vsc_pq[(sbu_vsc_ph + sbu_vsc_pn++) % SBU_VSC_PEND] = pe;
++	sbu_vsc_nxlate++;
++	if (op == 0xfd49) {
++		sbu_vsc_nremove++;
++	}
++	SBU_VSC_LOG("0x%04x id %u -> 0xfd54 sub 0x%02x sent", op, id, pe.sub);
++	res = SBU_VSC_SEND;
++out:
++	sbu_vsc_unlock();
++	return res;
++}
++
++/* the chip refused to take the translated command bytes: forget its pending entry */
++static void
++sbu_vsc_unpush(void)
++{
++	sbu_vsc_lock();
++	if (sbu_vsc_pn != 0) {
++		sbu_vsc_pn--;
++		sbu_vsc_nxlate--;
++	}
++	sbu_vsc_unlock();
++}
++
++/*
++ * tx: bluetoothd -> chip. Used by sbu_tx_kctl while the adapter is on or a command is held. Whole packets, split across writes in any way. Bytes of a command are held until the packet is
++ * complete (sbu_vsc_txb); every other packet is forwarded as it arrives (consecutive forwarded bytes go out in one sbu_tx), in order.
++ */
++#define SBU_VSC_TXHELD  (sbu_vsc_ttype == 0x01 && sbu_vsc_toff != 0)
++
++static int
++sbu_vsc_tx(const void *data, size_t len)
++{
++	const uint8_t *p = data;
++	size_t s = 0, e = 0;            /* the run p[s..e) is forwarded unchanged and not yet sent */
++	int rc = 0;
++
++	if (!sbu_vsc_on) {              /* stopped: held command bytes first (they were never sent), then the rest raw */
++		if (SBU_VSC_TXHELD) {
++			unsigned m = sbu_vsc_toff;
++
++			sbu_vsc_toff = 0;
++			SBU_GAP(SG_OTHER, "sweetbtvsc: adapter off: %u held command bytes are sent unchanged", m);
++			rc = sbu_tx(sbu_vsc_txb, m);
++		}
++		sbu_vsc_toff = 0;
++		return rc != 0 ? rc : sbu_tx(data, len);
++	}
++	for (size_t i = 0; i < len; i++) {
++		uint8_t b = p[i];
++		bool hold;
++
++		if (sbu_vsc_toff == 0) {
++			unsigned hl = b == 0x01 ? 4u : b == 0x02 ? 5u : b == 0x03 ? 4u : b == 0x05 ? 5u : 0u;     /* type + cmd opcode2 plen1 | ACL handle2 len2 | SCO handle2 len1 | ISO handle2 len2 */
++
++			if (hl == 0) {
++				char why[48];
++
++				if (e > s) {
++					rc = sbu_tx(p + s, e - s);
++				}
++				snprintf(why, sizeof(why), "tx framing lost at offset %u", (unsigned)i);
++				sbu_vsc_stop(why);
++				return rc != 0 ? rc : sbu_tx(p + i, len - i);
++			}
++			sbu_vsc_ttype = b;
++			sbu_vsc_thlen = hl;
++			sbu_vsc_tneed = 0;
++		}
++		hold = sbu_vsc_ttype == 0x01;
++		if (hold || sbu_vsc_toff < sbu_vsc_thlen) {
++			sbu_vsc_txb[sbu_vsc_toff] = b;
++		}
++		sbu_vsc_toff++;
++		if (sbu_vsc_toff == sbu_vsc_thlen) {
++			unsigned pl = sbu_vsc_ttype == 0x01 || sbu_vsc_ttype == 0x03 ? sbu_vsc_txb[3] :
++			    sbu_vsc_ttype == 0x02 ? (unsigned)(sbu_vsc_txb[3] | (sbu_vsc_txb[4] << 8)) : (unsigned)((sbu_vsc_txb[3] | (sbu_vsc_txb[4] << 8)) & 0x3fff);
++
++			sbu_vsc_tneed = sbu_vsc_thlen + pl;
++		}
++		if (hold) {
++			if (e > s) {            /* what was forwarded before this command goes first */
++				rc = sbu_tx(p + s, e - s);
++			}
++			s = e = i + 1;
++		} else {
++			if (e == s) {
++				s = i;
++			}
++			e = i + 1;
++		}
++		if (rc == 0 && sbu_vsc_tneed != 0 && sbu_vsc_toff == sbu_vsc_tneed) {
++			unsigned need = sbu_vsc_tneed;
++
++			sbu_vsc_toff = 0;
++			sbu_vsc_tneed = 0;
++			if (hold) {
++				uint8_t sub[44];
++				unsigned sn = 0;
++				int a = sbu_vsc_cmd(sbu_vsc_txb, sub, &sn);
++
++				if (a == SBU_VSC_PASS) {
++					rc = sbu_tx(sbu_vsc_txb, need);
++				} else if (a == SBU_VSC_SEND) {
++					rc = sbu_tx(sub, sn);
++					if (rc != 0) {
++						sbu_vsc_unpush();
++					}
++				}
++			}
++		}
++		if (rc != 0) {
++			char why[48];
++
++			snprintf(why, sizeof(why), "tx error %d", rc);
++			sbu_vsc_toff = 0;
++			sbu_vsc_stop(why);
++			return rc;
++		}
++	}
++	if (e > s) {
++		rc = sbu_tx(p + s, e - s);
++		if (rc != 0) {
++			char why[48];
++
++			snprintf(why, sizeof(why), "tx error %d", rc);
++			sbu_vsc_toff = 0;
++			sbu_vsc_stop(why);
++		}
++	}
++	return rc;
++}
++
++/* one complete packet from the chip to bluetoothd (rx thread): replies to the translated 0xfd54 commands are rewritten to the Apple opcode, everything else is delivered unchanged */
++static void
++sbu_vsc_pkt(uint8_t *p, size_t n)
++{
++	bool cc = n >= 7 && p[0] == 0x04 && p[1] == 0x0e && p[2] >= 4 && (p[4] | (p[5] << 8)) == 0xfd54;
++	bool cs = n == 7 && p[0] == 0x04 && p[1] == 0x0f && p[2] == 4 && (p[5] | (p[6] << 8)) == 0xfd54;
++	struct sbu_vsc_pend pe;
++	uint8_t st, o[7];
++
++	if (!cc && !cs) {
++		(void)sweet_bt_rx(p, n);
++		return;
++	}
++	st = cc ? p[6] : p[3];
++	sbu_vsc_lock();
++	if (sbu_vsc_pn == 0) {
++		sbu_vsc_nstray++;
++		sbu_vsc_unlock();
++		SBU_GAP(SG_OTHER, "sweetbtvsc: 0xfd54 reply (status 0x%02x) with no pending translation (bluetoothd never sends 0xfd54 itself [bin s.5]): delivered unchanged", st);
++		(void)sweet_bt_rx(p, n);
++		return;
++	}
++	pe = sbu_vsc_pq[sbu_vsc_ph];
++	if (cc || st != 0) {            /* a Command Status with status 0 only acknowledges; the Command Complete that ends the command is expected after it [guess: the Core-spec pattern, no vendor capture of 0xfd54] */
++		sbu_vsc_ph = (sbu_vsc_ph + 1) % SBU_VSC_PEND;
++		sbu_vsc_pn--;
++		if (st == 0) {
++			struct sbu_vsc_inst *in = &sbu_vsc_in[pe.id % SBU_VSC_NID];
++
++			sbu_vsc_nok++;
++			if (pe.aop == 0xfd49) {
++				memset(in, 0, sizeof(*in));
++			} else if (pe.aop == 0xfd4a) {
++				memcpy(in->prm, pe.prm, 7);
++				in->params_set = true;
++			} else if (pe.aop == 0xfd4d) {
++				in->enabled = pe.en != 0;
++			}
++		} else {
++			sbu_vsc_nfail++;
++		}
++	}
++	if (pe.orphan) {
++		sbu_vsc_norphan++;
++	}
++	sbu_vsc_unlock();
++	if (cc && (p[2] < 5 || p[7] != pe.sub)) {
++		SBU_GAP(SG_OTHER, "sweetbtvsc: 0xfd54 reply plen %u does not echo sub-op 0x%02x (AOSP ble_advertiser_hci_interface.cc:60-68: status, sub-op); rewritten anyway", p[2], pe.sub);
++	}
++	SBU_VSC_LOG("0x%04x id %u <- 0xfd54 sub 0x%02x chip status 0x%02x%s", pe.aop, pe.id, pe.sub, st, pe.orphan ? " (client gone: not delivered)" : "");
++	if (pe.orphan) {
++		return;
++	}
++	o[0] = 0x04;
++	if (cc) {                       /* 04 0e 04 <ncmd from the chip> <Apple opcode> <chip status> */
++		o[1] = 0x0e;
++		o[2] = 4;
++		o[3] = p[3];
++		o[4] = (uint8_t)(pe.aop & 0xff);
++		o[5] = (uint8_t)(pe.aop >> 8);
++		o[6] = st;
++	} else {                        /* 04 0f 04 <status> <ncmd> <Apple opcode> */
++		o[1] = 0x0f;
++		o[2] = 4;
++		o[3] = st;
++		o[4] = p[4];
++		o[5] = (uint8_t)(pe.aop & 0xff);
++		o[6] = (uint8_t)(pe.aop >> 8);
++	}
++	sbu_trace("rx-vsc", o, sizeof(o));
++	(void)sweet_bt_rx(o, sizeof(o));
++}
++
++/* rx: chip -> bluetoothd. b[0..n) are bytes of the chip's stream; whole packets are delivered one by one, a partial one waits in sbu_vsc_rxb. */
++static void
++sbu_vsc_rx(const uint8_t *b, size_t n)
++{
++	if (!sbu_vsc_on) {              /* stopped: the partial packet first, then the rest raw */
++		if (sbu_vsc_rxn != 0) {
++			(void)sweet_bt_rx(sbu_vsc_rxb, sbu_vsc_rxn);
++			sbu_vsc_rxn = 0;
++		}
++		(void)sweet_bt_rx(b, n);
++		return;
++	}
++	for (size_t i = 0; i < n; i++) {
++		unsigned hl;
++
++		sbu_vsc_rxb[sbu_vsc_rxn++] = b[i];
++		if (sbu_vsc_rxn == 1) {
++			uint8_t t = sbu_vsc_rxb[0];
++
++			hl = t == 0x04 ? 3u : t == 0x02 ? 5u : t == 0x03 ? 4u : t == 0x05 ? 5u : 0u;
++			sbu_vsc_rneed = 0;
++			if (hl == 0) {
++				char why[48];
++
++				snprintf(why, sizeof(why), "rx framing lost at offset %u", (unsigned)i);
++				sbu_vsc_stop(why);
++				sbu_vsc_rxn = 0;
++				(void)sweet_bt_rx(b + i, n - i);
++				return;
++			}
++		}
++		hl = sbu_vsc_rxb[0] == 0x04 ? 3u : sbu_vsc_rxb[0] == 0x03 ? 4u : 5u;
++		if (sbu_vsc_rxn == hl) {
++			uint8_t t = sbu_vsc_rxb[0];
++			unsigned pl = t == 0x04 ? sbu_vsc_rxb[2] : t == 0x03 ? sbu_vsc_rxb[3] : t == 0x02 ? (unsigned)(sbu_vsc_rxb[3] | (sbu_vsc_rxb[4] << 8)) :
++			    (unsigned)((sbu_vsc_rxb[3] | (sbu_vsc_rxb[4] << 8)) & 0x3fff);
++
++			sbu_vsc_rneed = hl + pl;
++			if (sbu_vsc_rneed > SBU_VSC_RXMAX) {
++				char why[64];
++				unsigned have = sbu_vsc_rxn;
++
++				snprintf(why, sizeof(why), "rx packet type %#x length %u exceeds %u: framing lost", t, sbu_vsc_rneed, SBU_VSC_RXMAX);
++				sbu_vsc_stop(why);
++				sbu_vsc_rxn = 0;
++				(void)sweet_bt_rx(sbu_vsc_rxb, have);
++				(void)sweet_bt_rx(b + i + 1, n - i - 1);
++				return;
++			}
++		}
++		if (sbu_vsc_rneed != 0 && sbu_vsc_rxn == sbu_vsc_rneed) {
++			unsigned m = sbu_vsc_rxn;
++
++			sbu_vsc_rxn = 0;
++			sbu_vsc_rneed = 0;
++			sbu_vsc_pkt(sbu_vsc_rxb, m);
++		}
++	}
++}
++
++/* local answers (rx thread, once per poll): only at a packet boundary, never inside a chip packet */
++static void
++sbu_vsc_flush_ans(void)
++{
++	for (;;) {
++		uint8_t b[8], k;
++
++		if (sbu_vsc_rxn != 0 || __atomic_load_n(&sbu_vsc_an, __ATOMIC_RELAXED) == 0) {
++			return;
++		}
++		sbu_vsc_lock();
++		if (sbu_vsc_an == 0) {
++			sbu_vsc_unlock();
++			return;
++		}
++		k = sbu_vsc_aq[sbu_vsc_ah].n;
++		memcpy(b, sbu_vsc_aq[sbu_vsc_ah].b, sizeof(b));
++		sbu_vsc_ah = (sbu_vsc_ah + 1) % SBU_VSC_ANS;
++		sbu_vsc_an--;
++		sbu_vsc_unlock();
++		sbu_trace("rx-vsc", b, k);
++		(void)sweet_bt_rx(b, k);
++	}
++}
++
++/* rx error while the framer has a partial packet: the framing is no longer known */
++static void
++sbu_vsc_rxerr(void)
++{
++	if (sbu_vsc_on && sbu_vsc_rxn != 0) {
++		sbu_vsc_stop("uart rx error inside a packet: bytes may be lost");
++		(void)sweet_bt_rx(sbu_vsc_rxb, sbu_vsc_rxn);
++		sbu_vsc_rxn = 0;
++	}
++}
++
++/* the client (bluetoothd) disconnected (sweet_bt.c sbt_disconnect): drop what only it could use, keep the chip's instance state (the next HCI Reset frees it), print the counters */
++void sweet_bt_uart_disc(void);
++
++void
++sweet_bt_uart_disc(void)
++{
++	unsigned held = 0, ans, pend;
++
++	if (!sbu_vsc_ok) {
++		return;
++	}
++	if (SBU_VSC_TXHELD) {
++		held = sbu_vsc_toff;
++	}
++	sbu_vsc_toff = 0;
++	sbu_vsc_lock();
++	ans = sbu_vsc_an;
++	sbu_vsc_an = 0;
++	pend = sbu_vsc_pn;
++	for (unsigned k = 0; k < sbu_vsc_pn; k++) {
++		sbu_vsc_pq[(sbu_vsc_ph + k) % SBU_VSC_PEND].orphan = true;
++	}
++	sbu_vsc_unlock();
++	if (held != 0 || ans != 0 || pend != 0) {
++		SBU_GAP(SG_OTHER, "sweetbtvsc: bluetoothd disconnected with %u held command bytes dropped, %u undelivered local answers dropped, %u translated commands unanswered (their replies are consumed)", held, ans, pend);
++	}
++	sbu_vsc_summary("bluetoothd disconnected");
++}
++
++/* why the adapter is not running although the knob does not turn it off: a default-on feature never goes silent (rule 7) */
++static void
++sbu_vsc_unused(const char *why)
++{
++	int v = 1;
++
++	if (PE_parse_boot_argn("sweetbtvsc", &v, sizeof(v)) && v == 0) {
++		printf("BT VSC: sweetbtvsc=0: adapter off by boot-arg (%s)\n", why);
++		return;
++	}
++	printf("BT GAP: sweetbtvsc adapter not started: %s; bluetoothd's Apple multi-adv commands 0xfd48..0xfd4e go to the chip unchanged\n", why);
++}
++
++/*
++ * Bring-up (R1), after the verified patchram download, same place and style as sbu_lefeat (the rx thread is not running yet, sbu_cmd owns the FIFO): LE Get Vendor Capabilities 0xfd53
++ * (read-only): Command Complete status 00, the byte after the status is max_adv_inst [src AOSP btm_ble_gap.cc:542; docs/research/sprint-bt-fd48-firmware.md s.2a, the stock Android capture
++ * reports 16 [obs]]. The adapter turns on only when max_adv_inst >= SBU_VSC_MINCAP.
++ */
++static void
++sbu_vsc_attach(void)
++{
++	static const struct { const char *name; int maxv; } knobs[] = {     /* the diagnostic rewrites that parse the same streams; on at 1 (pubscan 1 or 2) */
++		{ "sweetbtrw200b", 1 }, { "sweetbtrw200c", 1 }, { "sweetbtnopadv", 1 }, { "sweetbtnopcf", 1 }, { "sweetbtpubscan", 2 },
++	};
++	static const uint8_t none[1] = { 0 };
++	uint8_t rp[SBU_PM_SUPP], st = 0xff;
++	size_t rpn = 0;
++	int v = 1, e;
++
++	memset(sbu_vsc_in, 0, sizeof(sbu_vsc_in));
++	if (PE_parse_boot_argn("sweetbtvsc", &v, sizeof(v)) && v != 1) {
++		if (v == 0) {
++			printf("BT VSC: sweetbtvsc=0: adapter off by boot-arg; bluetoothd's 0xfd48..0xfd4e go to the chip unchanged (the controller answers 0xfd48 with 0x01 [obs bt-bw2])\n");
++			return;
++		}
++		printf("BT GAP: sweetbtvsc=%d ignored: only 0 (off) and 1 (on, the default) exist; the adapter stays on\n", v);
++	}
++	for (unsigned k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
++		int kv = 0;
++
++		if (PE_parse_boot_argn(knobs[k].name, &kv, sizeof(kv)) && kv >= 1 && kv <= knobs[k].maxv) {
++			printf("BT GAP: sweetbtvsc adapter refuses to start: diagnostic knob %s=%d rewrites the same HCI streams; unset it or set sweetbtvsc=0\n", knobs[k].name, kv);
++			return;
++		}
++	}
++	if ((e = sbu_cmd(0xfd53, none, 0, &st, rp, sizeof(rp), &rpn)) != 0) {
++		printf("BT GAP: sweetbtvsc: 0xfd53 (LE Get Vendor Capabilities) got no Command Complete (error %d): adapter OFF; 0xfd48 goes to the chip unchanged\n", e);
++		return;
++	}
++	if (st != 0) {
++		printf("BT GAP: sweetbtvsc: 0xfd53 status 0x%02x (%s): adapter OFF; 0xfd48 goes to the chip unchanged\n", st, sbu_pstatus(st));
++		return;
++	}
++	if (rpn < 1) {
++		printf("BT GAP: sweetbtvsc: 0xfd53 reply has %zu return bytes after the status (need max_adv_inst): adapter OFF; 0xfd48 goes to the chip unchanged\n", rpn);
++		return;
++	}
++	printf("BT VSC: caps max_adv_inst=%u\n", rp[0]);
++	if (rp[0] < SBU_VSC_MINCAP) {
++		printf("BT GAP: sweetbtvsc: max_adv_inst=%u < %u (bluetoothd creates 4 instances, ids 1..max-1): adapter OFF; 0xfd48 goes to the chip unchanged\n", rp[0], SBU_VSC_MINCAP);
++		return;
++	}
++	sbu_vsc_max = rp[0] < SBU_VSC_NID ? rp[0] : SBU_VSC_NID;
++	if (sbu_vsc_max != rp[0]) {
++		printf("BT VSC: max_adv_inst=%u clamped to %u instance ids (0..%u)\n", rp[0], sbu_vsc_max, sbu_vsc_max - 1);
++	}
++	sbu_vsc_ph = sbu_vsc_pn = sbu_vsc_ah = sbu_vsc_an = 0;
++	sbu_vsc_on = sbu_vsc_ok = true;
++	printf("BT VSC: adapter ON: Apple multi-adv 0xfd48..0xfd4e are answered/translated to 0xfd54 (instance ids 1..%u), everything else passes unchanged; sweetbtvsc=0 turns it off\n", sbu_vsc_max - 1);
++}
++
+ /* attach side of the knob (review T-60ed F7: a function the host test can call). 0 = go on to bluetoothd (patched, refused or ROM restored), else the backend must not start. */
+ static int
+ sbu_patchram_attach(const struct sbu_cand *cand)
+@@ -1789,15 +2518,18 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ 				printf("BT GAP: sweetbtlefeat=1 FAILED (error %d); bluetoothd meets the patched controller with its own LE feature set\n", le);
+ 			}
+ 		}
++		sbu_vsc_attach();       /* patch 0285 */
+ 		return 0;
+ 	}
+ 	if (e == SBU_PR_REFUSED) {
+ 		printf("BT GAP: sweetbtpatchram=1 had no effect (refused, nothing sent); bluetoothd meets the unpatched ROM\n");
+ 		sbu_lefeat_unused("patchram refused");
++		sbu_vsc_unused("patchram refused");      /* patch 0285 */
+ 		return 0;
+ 	}
+ 	printf("BT GAP: sweetbtpatchram=1 FAILED (error %d): power-cycling the controller back to the unpatched ROM for bluetoothd\n", e);
+ 	sbu_lefeat_unused("patchram failed");
++	sbu_vsc_unused("patchram failed");      /* patch 0285 */
+ 	(void)sbu_power_off();
+ 	e = sbu_probe_one(cand);
+ 	if (e != 0) {
+@@ -2251,6 +2983,7 @@ sbu_rx_poll(void)
+ 			sbu_rw_off = 0;
+ 			SBU_GAP(SG_RXERR, "sweetbtrw200b: framing reset after rx error");
+ 		}
++		sbu_vsc_rxerr();        /* patch 0285 */
+ 	}
+ 	/* a FIFO that is completely full may read as count 0 (the full state is a separate UFSTAT bit [guess, not cited]), so RXDR counts as data too */
+ 	while (n < sizeof(buf) && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
+@@ -2259,11 +2992,16 @@ sbu_rx_poll(void)
+ 	if (n != 0) {
+ 		sbu.rx_bytes += (uint32_t)n;
+ 		sbu_trace("rx", buf, n);       /* the trace shows the chip's real bytes, before any sweetbtrw200b rewrite */
+-		if (sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on || (sbu_nopcf_rx && !sbu_rw_lost)) {
+-			sbu_rw200b(buf, n);
++		if (sbu_vsc_on || sbu_vsc_rxn != 0) {      /* patch 0285: packet framer + Apple multi-adv reply rewrite; the rewrite knobs are off while it is on */
++			sbu_vsc_rx(buf, n);
++		} else {
++			if (sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on || (sbu_nopcf_rx && !sbu_rw_lost)) {
++				sbu_rw200b(buf, n);
++			}
++			(void)sweet_bt_rx(buf, n);
+ 		}
+-		(void)sweet_bt_rx(buf, n);
+ 	}
++	sbu_vsc_flush_ans();    /* patch 0285 */
+ 	if (sbu_nopcf_rx) {
+ 		sbu_pcf_deliver(n);
+ 	}
+@@ -2532,6 +3270,9 @@ sbu_tx_kctl(const void *data, size_t len)
+ 	const uint8_t *p = data;
+ 	int e = 0;
+ 
++	if (sbu_vsc_on || SBU_VSC_TXHELD) {      /* patch 0285: the VSC adapter owns the tx stream (its knob conflicts with the two below are refused at bring-up) */
++		return sbu_vsc_tx(data, len);
++	}
+ 	if (!sbu_pubscan_on && !sbu_nopcf_on) {
+ 		return sbu_tx(data, len);
+ 	}
+@@ -2805,6 +3546,7 @@ sweet_bt_uart_attach(void)
+ 				}
+ 				if (v != 1) {
+ 					sbu_lefeat_unused("sweetbtpatchram=1 is not set");      /* patch 0274 */
++					sbu_vsc_unused("sweetbtpatchram=1 is not set (the adapter runs only after a verified patchram download)");      /* patch 0285 */
+ 				}
+ 			}
+ 			{       /* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness (LE scan 100% duty + classic Inquiry) on the controller bluetoothd will meet; before the rx thread */
+@@ -2828,6 +3570,7 @@ sweet_bt_uart_attach(void)
+ 			printf("BT GAP: sweetbtpatchram=1 ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
+ 		}
+ 		sbu_rfwit_unused("the baud probe did not settle the clock");
++		sbu_vsc_unused("the baud probe did not settle the clock");      /* patch 0285 */
+ 	}
+ 	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
+ 		int v = 0;

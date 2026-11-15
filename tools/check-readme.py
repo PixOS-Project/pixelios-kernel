@@ -10,6 +10,8 @@ Report: `file:line rule message` per finding, last line `RESULT: PASS|FAIL|ERROR
 A README whose first 3 lines contain `<!-- readme-gate: archive -->` is skipped.
 Known file: ROOT/tools/check-readme.known, one TAB-separated entry per line: file, rule, message, date, reason.
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import fnmatch, os, re, subprocess, sys, tempfile
 
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -17,7 +19,7 @@ DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 LEAKS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY"), "private key"),
     (re.compile(r"/home/[a-z][\w-]*/"), "local path"),
-    (re.compile(r"(?<!\d)\d{15}(?!\d)"), "15-digit number (IMEI?)"),
+    (re.compile(r"(?<![0-9A-Za-z])\d{15}(?![0-9A-Za-z])"), "15-digit number (IMEI?)"),
     (re.compile(r"(?i)\bserial(?:no| number)?\s*[:=]\s*[A-Z0-9]{8,}\b"), "device serial"),
     (re.compile(r"pixelios-artifacts"), "private artifacts name"),
     (re.compile(r"(?<![\w.+/-])(?!git@)[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b(?![\w/-])"), "e-mail address"),
@@ -67,8 +69,10 @@ def generated(root):
             ln = ln.strip()
             if ln and not ln.startswith("#"):
                 g.add(ln)
-    except OSError:
+    except FileNotFoundError:   # the file exists only in a generated public clone: absent = no generated names   # lint-silent: expected upstream-files.txt exists only in a generated public clone
         pass
+    except OSError as _err:
+        print(f"check-readme GAP: OSError ignored in generated(): {_err}", file=sys.stderr)
     d = os.path.join(root, "upstream-patches")
     for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
         if n.endswith(".patch") and "__" in n:
@@ -213,7 +217,7 @@ def known_entries(root):
             if ln.strip() and not ln.startswith("#"):
                 f = ln.rstrip("\n").split("\t")
                 ents.append((n, f) if len(f) == 5 and all(f) and DATE.fullmatch(f[3]) else (n, None))
-    except OSError:
+    except OSError:   # lint-silent: expected the table file is absent: no entries
         pass
     return ents
 

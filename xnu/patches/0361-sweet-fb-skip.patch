@@ -1,0 +1,237 @@
+sweet-fb-skip (lowclk 2026-11-14, group A item A5-3; research docs/research/160-kernel-cpu-users-lskdd-boot-reads.md s.1.1 and U2; tracker L-25): AppleCLCD::present skips the CPU panel copy when nothing it reads has changed since the last copy. NO HARDWARE ACCESS: the panel memory is written by the same memcpy as before, only less often; no register, no firmware command.
+Why [obs from research 160]: the panel copy is the "thread call kernel-high #1" thread, 64-66 s of CPU per boot (37 presents/s x 1.7-2.3 ms); the row says "empty presents counted" but not how many are unchanged (U2).
+Unchanged-since-last-copy signal [read from source, not pixels]: (1) the swap record is byte-identical except the swap id (get32(rec, 0x50), the "swap %u" of the existing log); (2) the seed of every layer surface is the same (SweetSurface state page +0xc, bumped by sweet_surface_seed_out on every write-unlock, SweetSurface.cpp trapUnlock; read by the new sweet_surface_seed_peek); (3) the Mali submitted seqno is the same (sweet_mali_seq_peek, patch 0186; every job has its seqno at submit, also parked ones, patch 0227). (2) covers CPU writers that lock/unlock the IOSurface, (3) covers GPU writers. Not covered: a CPU writer that writes the mapped surface without a lock (the IOSurface API requires the lock) [guess: none on this root]; hence the refresh below.
+Always copied [read from source]: the first frame; the present after any power change (RequestPowerChange) or QR hold (fForceCopy, atomic exchange); while the kernel console is not muted (it draws into the panel memory, sweet_console_muted); Mali not up or dead (no GPU signal); the present after a copy that ran while the GPU was busy or during which a job was submitted (that copy may have shown half a frame); every 150th unchanged present in a row (bounded staleness, counted as "refresh"). There is no mode change or brightness path in this driver (geometry is set once in start(); GetGammaTable/brightness are absent), so no event beyond those exists to force a copy.
+Boot-arg sweetfb_skip: 0 = off, today's behaviour (no decision, no counting); 1 = skip (default); 2 = count only (decide, log, always copy: the "count first" step); other values = GAP row and 1.
+Log (rule 7): one row at the first present naming the mode; every 10 s of presents `SWEET FB: panel skip (10 s, mode M): presents N copied C skipped S would-skip W; why first/forced/console/nosig/gpubusy/rec/seed/gpu/refresh (sums since boot); unchanged U skipped T`; the existing sweetfb_copytime row gets `unchanged U skipped T` appended.
+Host test: tools/test_sweetfb_skip.py compiles the added pure function sweet_fb_skip_why from this patch text and checks every reason and priority, that only the swap id is ignored, each of the 4 layer seeds, the seqno and the refresh bound, then text checks of the hooks (force events, loop gate, record after copy, GAP, count-only) with a mutant per check. Not run on hardware.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,64 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++
++/*
++ * Patch 0361 (lowclk A5-3, research 160 s.1.1 / U2): skip the panel copy when nothing the copy reads has changed since the last copy. A present() is queued by
++ * swap() (fDirty); CoreAnimation can swap again with the same layers and no new pixels. What the copy reads is the layers' surface memory, written by (a) the
++ * GPU: every Mali job has a seqno at submit (sweet_mali_seq_peek, patch 0186/0227; in-order completion watermark, patch 0240) and (b) CPU clients between an
++ * IOSurface lock and a write-unlock, which bumps the surface seed (state page +0xc, SweetSurface.cpp sweet_surface_seed_out). Unchanged since the last copy =
++ * the swap record is the same except the swap id (get32(rec, 0x50)), every layer surface has the same seed, and no Mali job was submitted. Never compared: pixels.
++ * Always copied: the first frame; after any power change or QR hold (fForceCopy); while the kernel console is not muted (it draws into the panel memory); when
++ * Mali is not up (no GPU signal); when the last copy ran while the GPU was busy (a copy that may have seen half a frame is repeated once); and every
++ * SWEET_FB_SKIP_REFRESH-th unchanged present (bounded staleness if a writer ever skips both counters; counted as "refresh"). Boot-arg sweetfb_skip: 0 = off
++ * (today's behaviour), 1 = skip (default), 2 = count only (decide and log, always copy).
++ */
++#define SWEET_FB_SWAPID_OFF             0x50
++#define SWEET_FB_SKIP_REFRESH           150
++enum sweet_fb_skip_why { SFB_W_SKIP = 0, SFB_W_FIRST, SFB_W_FORCED, SFB_W_CONSOLE, SFB_W_NOSIG, SFB_W_GPUBUSY, SFB_W_REC, SFB_W_SEED, SFB_W_GPU, SFB_W_REFRESH, SFB_W_N };
++struct sweet_fb_last {
++	bool      valid;                /* a copy was made and recorded */
++	bool      clean;                /* the GPU was idle before and after that copy (no job submitted during it) */
++	uint32_t  unchanged_run;        /* consecutive unchanged presents since that copy */
++	uint64_t  seq;                  /* Mali submitted seqno before that copy */
++	uint32_t  seed[SWEET_FB_LAYERS];/* surface seed per layer before that copy (0 = layer not in the mask) */
++	uint8_t   rec[SWEET_FB_SWAP_REC_SIZE];
++};
++
++/* pure: why this present must copy, or SFB_W_SKIP if the panel already shows it. force = fForceCopy consumed by the caller. */
++static int
++sweet_fb_skip_why(const struct sweet_fb_last *l, const uint8_t *rec, const uint32_t *seed, bool force, bool console_muted, bool gpu_known, uint64_t seq_now)
++{
++	if (!l->valid) {
++		return SFB_W_FIRST;
++	}
++	if (force) {
++		return SFB_W_FORCED;
++	}
++	if (!console_muted) {
++		return SFB_W_CONSOLE;
++	}
++	if (!gpu_known) {
++		return SFB_W_NOSIG;
++	}
++	if (!l->clean) {
++		return SFB_W_GPUBUSY;
++	}
++	if (memcmp(rec, l->rec, SWEET_FB_SWAPID_OFF) != 0 ||
++	    memcmp(rec + SWEET_FB_SWAPID_OFF + 4, l->rec + SWEET_FB_SWAPID_OFF + 4, SWEET_FB_SWAP_REC_SIZE - SWEET_FB_SWAPID_OFF - 4) != 0) {
++		return SFB_W_REC;
++	}
++	if (memcmp(seed, l->seed, sizeof(l->seed)) != 0) {
++		return SFB_W_SEED;
++	}
++	if (seq_now != l->seq) {
++		return SFB_W_GPU;
++	}
++	if (l->unchanged_run >= SWEET_FB_SKIP_REFRESH) {
++		return SFB_W_REFRESH;
++	}
++	return SFB_W_SKIP;
++}
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /* patch 0289: selector 28 returns a float in the low 32 bits (research 133 D: GetDotPitch scalar = float bits); mm per dot at 458 ppi =
+  * 25.4 / 458 = 0.05546 = 0x3d632878 [computed]. Selector 29 (GetDisplayArea, two floats, mm [guess: unit by analogy]) for the presented
+@@ -156,6 +214,8 @@ public:
+ 	uint64_t      fSwapSeq;       /* patch 0343: last submitted Mali seqno at the latest swap (0 = none / Mali not up); fLock */
+ 	uint64_t      fLastPresentCount;      /* patch 0343: vsync count of the last panel copy */
+ 	uint32_t      fGateTicks;     /* patch 0343: flush ticks the pending swap was held back by the present gate; fLock */
++	volatile bool fForceCopy;     /* patch 0361: a panel event (power change, QR hold) happened: the next present() copies; atomic exchange */
++	struct sweet_fb_last fLast;   /* patch 0361: what the last panel copy saw; only present() (the vsync thread) touches it */
+ 
+ 	bool needsVsync(void);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -317,6 +377,8 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	fForceCopy = false;   /* patch 0361 */
++	memset(&fLast, 0, sizeof(fLast));
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -483,6 +545,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (sweet_qr_hold) {
+ 		/* the QR log owns the panel: no present(), no fade (vsync notifications keep flowing) */
++		__atomic_store_n(&fb->fForceCopy, true, __ATOMIC_RELEASE);   /* patch 0361: the QR log wrote the panel: the next present() copies */
+ 		IOLockUnlock(fb->fLock);
+ 		sweet_fb_rearm(sender, now);
+ 		return;
+@@ -1193,7 +1256,71 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++	/* patch 0361: unchanged since the last copy? (see the comment at sweet_fb_skip_why) */
++	static int skip_mode = -1;      /* sweetfb_skip: 0 off, 1 skip (default), 2 count only */
++	static uint32_t sk_why[SFB_W_N], sk_win_n, sk_win_copied, sk_win_skipped, sk_win_would;
++	static uint64_t sk_t0_ns, sk_total_unchanged, sk_total_skipped;
++	bool skip = false, sk_decided = false;
++	uint32_t sk_seed[SWEET_FB_LAYERS] = { 0 };
++	uint64_t sk_sq = 0, sk_dn = 0;
++	bool sk_gpu = false;
++	if (skip_mode < 0) {
++		int v = 1;
++		skip_mode = 1;
++		if (PE_parse_boot_argn("sweetfb_skip", &v, sizeof(v))) {
++			if (v == 0 || v == 1 || v == 2) {
++				skip_mode = v;
++			} else {
++				IOLog("SWEET FB: GAP sweetfb_skip=%d is not 0, 1 or 2: using 1 (skip unchanged presents)\n", v);
++			}
++		}
++		IOLog("SWEET FB: sweetfb_skip %s\n", skip_mode == 0 ? "0: off, every present copies" : skip_mode == 1 ? "1: a present whose swap record, surface seeds and Mali seqno are unchanged since the last copy is skipped" : "2: count only, every present still copies");
++	}
++	if (skip_mode != 0) {
++		bool force = __atomic_exchange_n(&fForceCopy, false, __ATOMIC_ACQ_REL);
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			uint32_t lid = get32(rec, 0x54 + 4 * layer);
++			if ((mask & (1u << layer)) && lid != 0) {
++				SweetSurface *ls = sweet_surface_copy(lid);
++				sk_seed[layer] = ls != NULL ? sweet_surface_seed_peek(ls) : 0xffffffffu;
++				OSSafeReleaseNULL(ls);
++			}
++		}
++		sk_gpu = sweet_mali_seq_peek(&sk_sq, &sk_dn) == 0;
++		int why = sweet_fb_skip_why(&fLast, rec, sk_seed, force, sweet_console_muted != 0, sk_gpu, sk_sq);
++		sk_decided = true;
++		sk_why[why]++;
++		skip = why == SFB_W_SKIP;
++		if (skip) {
++			sk_total_unchanged++;
++			fLast.unchanged_run++;
++			if (skip_mode == 1) {
++				sk_total_skipped++;
++				sk_win_skipped++;
++			} else {
++				sk_win_would++;
++				skip = false;
++			}
++		}
++		sk_win_n++;
++		if (!skip) {
++			sk_win_copied++;
++		}
++		uint64_t sk_now;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &sk_now);
++		if (sk_t0_ns == 0) {
++			sk_t0_ns = sk_now;
++		}
++		if (sk_now - sk_t0_ns >= 10000000000ull) {
++			IOLog("SWEET FB: panel skip (10 s, mode %d): presents %u copied %u skipped %u would-skip %u; why first %u forced %u console %u nosig %u gpubusy %u rec %u seed %u gpu %u refresh %u (sums since boot); unchanged %llu skipped %llu\n",
++			    skip_mode, sk_win_n, sk_win_copied, sk_win_skipped, sk_win_would, sk_why[SFB_W_FIRST], sk_why[SFB_W_FORCED], sk_why[SFB_W_CONSOLE], sk_why[SFB_W_NOSIG], sk_why[SFB_W_GPUBUSY],
++			    sk_why[SFB_W_REC], sk_why[SFB_W_SEED], sk_why[SFB_W_GPU], sk_why[SFB_W_REFRESH], sk_total_unchanged, sk_total_skipped);
++			sk_win_n = sk_win_copied = sk_win_skipped = sk_win_would = 0;
++			sk_t0_ns = sk_now;
++		}
++	}
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !skip; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+ 		const uint8_t *b = rec + 0xc4 + 16 * layer;
+@@ -1311,6 +1438,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (sk_decided && !skip) {      /* patch 0361: remember what this copy saw; clean = the GPU was idle before it and no job was submitted during it */
++		uint64_t sq2 = 0, dn2 = 0;
++		bool g2 = sweet_mali_seq_peek(&sq2, &dn2) == 0;
++		fLast.valid = true;
++		fLast.clean = sk_gpu && g2 && sk_sq == sk_dn && sq2 == sk_sq;
++		fLast.unchanged_run = 0;
++		fLast.seq = sk_sq;
++		memcpy(fLast.seed, sk_seed, sizeof(fLast.seed));
++		memcpy(fLast.rec, rec, SWEET_FB_SWAP_REC_SIZE);
++	}
+ 	if (ct_on) {
+ 		static uint32_t ct_n;
+ 		static uint64_t ct_sum_ns, ct_max_ns, ct_total;
+@@ -1322,8 +1459,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		ct_total++;
+ 		if (++ct_n >= 40) {
+-			IOLog("SWEET FB: panel copy (whole present(), incl. 64x64 diag, empty presents counted): %u presents (total %llu) avg %u us max %u us\n", ct_n, ct_total,
+-			    (uint32_t)(ct_sum_ns / ct_n / 1000), (uint32_t)(ct_max_ns / 1000));
++			IOLog("SWEET FB: panel copy (whole present(), incl. 64x64 diag, empty presents counted): %u presents (total %llu) avg %u us max %u us unchanged %llu skipped %llu\n", ct_n, ct_total,
++			    (uint32_t)(ct_sum_ns / ct_n / 1000), (uint32_t)(ct_max_ns / 1000), sk_total_unchanged, sk_total_skipped);
+ 			ct_n = 0;
+ 			ct_sum_ns = ct_max_ns = 0;
+ 		}
+@@ -1525,6 +1662,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				__atomic_store_n(&fFB->fForceCopy, true, __ATOMIC_RELEASE);   /* patch 0361: power change: copy, never skip */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -138,6 +138,13 @@ sweet_surface_seed(SweetSurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++/* patch 0361: the surface seed (bumped by every write-unlock), read for the panel-copy skip decision */
++uint32_t
++sweet_surface_seed_peek(SweetSurface *s)
++{
++	return __atomic_load_n(sweet_surface_seed(s), __ATOMIC_ACQUIRE);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -59,6 +59,9 @@ public:
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
++/* patch 0361: current seed (state page +0xc) of a surface. */
++uint32_t sweet_surface_seed_peek(SweetSurface *s);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller

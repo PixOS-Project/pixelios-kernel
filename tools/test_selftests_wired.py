@@ -32,7 +32,7 @@ def read_tree(d=TOOLS):
         if p.is_file() and not p.name.endswith((".pyc", ".rules", ".txt", ".known")):
             try:
                 tools[p.name] = p.read_text()
-            except UnicodeDecodeError:
+            except UnicodeDecodeError:   # lint-silent: expected a non-UTF-8 file in tools/ is not a script text to scan
                 continue
     tests = {n: t for n, t in tools.items() if n.startswith("test_") and n != pathlib.Path(__file__).name}   # not this file: it names every tool
     return tools, tools["check-all.sh"], tests

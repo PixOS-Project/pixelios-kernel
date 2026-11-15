@@ -1,0 +1,59 @@
+SWEET USB live log back-pressure (patch 0267, sprint-gpu 2026-11-08, no register write, no new USB/DMA programming): the USB Ethernet TX path keeps one frame in flight and a 32-frame queue that ud_if_output empties silently when full (returns 0); the live-log thread sent a whole 100 ms of console ring in one burst and lost most of it under load (run gputest-nav25: 34.8k of 165k SWEET KDBG lines arrived). Now ud_log_drain sends only while >= 4 queue slots are free, the thread sleeps 2 ms instead of 100 ms while bytes are pending, and every frame ud_if_output drops on a full queue is counted and reported as a 'SWEET GAP: usb tx queue full, N frames dropped by ud_if_output (total T)' datagram.
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -710,2 +710,6 @@
+ 
++/* patch 0267 (sprint-gpu 2026-11-08): frames ud_if_output threw away on a full TX queue (it returns 0, the socket never knows);
++ * reported by the live-log thread as a SWEET GAP datagram (rule 8). */
++static uint64_t ud_txq_drops;
++
+ static errno_t
+@@ -715,2 +719,5 @@
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
++		if (ud.configured) {
++			ud_txq_drops++;
++		}
+ 		lck_mtx_unlock(ud.lock);
+@@ -1175,2 +1182,17 @@
+ 
++/* patch 0267: free TX queue slots (UD_TXQ - queued); the live log sends only while >= UD_LOG_ROOM slots are free */
++#define UD_LOG_ROOM 4
++static uint64_t ud_log_drops_said;        /* drops already reported by ud_log_thread */
++static char ud_log_dmsg[160];
++static uint32_t
++ud_txq_room(void)
++{
++	uint32_t r;
++
++	lck_mtx_lock(ud.lock);
++	r = UD_TXQ - ud.txq_count;
++	lck_mtx_unlock(ud.lock);
++	return r;
++}
++
+ static void
+@@ -1182,3 +1204,6 @@
+ 
+-	while ((n = sweet_log_copy(pos, chunk, chunk_max)) > 0) {
++	/* patch 0267: back-pressure. The USB TX path has ONE frame in flight and a 32-frame queue that drops silently when full
++	 * (ud_if_output); a 100 ms burst of the console ring overran it (nav25: 21% of the KDBG lines arrived). Stop while the queue
++	 * is nearly full; the thread comes back in 2 ms while bytes are pending (ud_log_thread). */
++	while (ud_txq_room() >= UD_LOG_ROOM && (n = sweet_log_copy(pos, chunk, chunk_max)) > 0) {
+ 		g->skipped += *pos - n - before;
+@@ -1304,3 +1329,4 @@
+ 	for (;;) {
+-		ud_sleep_ms(100);
++		/* patch 0267: 2 ms while console bytes are pending (back-pressure from ud_log_drain), else 100 ms as before */
++		ud_sleep_ms((so != NULL && sweet_log_position() > pos) ? 2 : 100);
+ 		if (!ud.configured) {
+@@ -1308,2 +1334,10 @@
+ 		}
++		if (so != NULL && ud_txq_drops != ud_log_drops_said && ud_txq_room() >= UD_LOG_ROOM) {
++			uint64_t d = ud_txq_drops;
++			int len = snprintf(ud_log_dmsg, sizeof(ud_log_dmsg), "\nSWEET GAP: usb tx queue full, %llu frames dropped by ud_if_output (total %llu)\n",
++			    (unsigned long long)(d - ud_log_drops_said), (unsigned long long)d);
++			if (ud_log_note(so, &to, ud_log_dmsg, len, sizeof(ud_log_dmsg)) == 0) {
++				ud_log_drops_said = d;
++			}
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {

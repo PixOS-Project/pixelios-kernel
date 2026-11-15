@@ -1,0 +1,21 @@
+{
+ "build_variants": 12,
+ "legacy_mutant_tables": [
+  "test_audit_memo_selfmutants.py:BOOT_MUTANTS",
+  "test_audit_memo_selfmutants.py:LOCK_MUTANTS",
+  "test_audit_memo_selfmutants.py:POOL_MUTANTS",
+  "test_audit_memo_selfmutants.py:WIRING_MUTANTS",
+  "test_lint_mutant_needles.py:D4B_MUTANTS",
+  "test_lint_mutant_needles.py:G2FIX_MUTANTS",
+  "test_lint_mutant_needles.py:G2HOST_MUTANTS",
+  "test_lint_mutant_needles.py:G2L_MUTANTS",
+  "test_lint_mutant_needles.py:G2VA_MUTANTS",
+  "test_lint_mutant_needles.py:G2_MUTANTS",
+  "test_lint_mutant_needles.py:GLUE_MUTANTS",
+  "test_lint_mutant_needles.py:X_MUTANTS",
+  "test_lint_mutant_needles.py:Y_MUTANTS",
+  "test_wlan_mutant_pool.py:POOL_MUTANTS",
+  "test_wlan_mutants_cache.py:GATE_WIRING_MUTANTS",
+  "test_wlan_wr_mutants.py:GLUE_MUTANTS"
+ ]
+}

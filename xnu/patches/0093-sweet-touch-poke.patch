@@ -14,7 +14,7 @@ index 443109a..d008586 100644
 + *                        maps (PMU/alive banks are not in the node, so not allowed). CMU_PERIC1 and CMU_TOP are read-only
 + *                        except the words the ADT names: usi mux, bus mux, both auto regs, ipclk/pclk/rstnsync gates, QCH, DIV
 + *                        (PERIC1; OPTION is never writable) and mux/div/gate (TOP). Max 32 ops, 240 characters (the whole
-+ *                        boot-args line is 607 characters; tools/mkpayload.py now refuses longer ones; put this arg last).
++ *                        boot-args line is 1023 characters (patch 0176); tools/mkpayload.py refuses longer ones; put this arg last).
 + *                        A bad script prints one "SWEET TOUCH: poke: rejected ..." line and runs nothing. `w` does not read
 + *                        before writing and, inside SPI11, does not read back either (RX_DATA pops on read).
 + *                        Example: --args "sweettouchclk=3 sweettouchpoke=r:10c00000;m:1e080000=1=1;d:1000;r:1e080000;"
@@ -177,7 +177,7 @@ index 0000000..e1dd63d
 +#include <stdint.h>
 +
 +#define POKE_MAX_OPS      32u
-+#define POKE_MAX_LEN      240u       /* script characters; boot-args total is 607 (BOOT_LINE_LENGTH 608) */
++#define POKE_MAX_LEN      240u       /* script characters; boot-args total is 1023 (BOOT_LINE_LENGTH 1024, patch 0176) */
 +#define POKE_MAX_DELAY_US 1000000u
 +#define POKE_MAX_RANGES   16u
 +#define POKE_MAX_WINDOWS  16u

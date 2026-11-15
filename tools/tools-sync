@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """tools-sync: keep the phone-path tools identical in every agent worktree (TP-021). Python 3 stdlib only, no prompts.
 
-  tools/tools-sync status [--ref common-tools]           per file: same | differs | missing | not-in-ref
-  tools/tools-sync pull   [--ref common-tools] [--force] [--prune]  copy the differing files from the ref (git checkout REF -- FILE); you commit them
+  tools/tools-sync status [--ref trunk]           per file: same | differs | missing | not-in-ref
+  tools/tools-sync pull   [--ref trunk] [--force] [--prune]  copy the differing files from the ref (git checkout REF -- FILE); you commit them
 
 A manifest line ending in "/" is a whole directory (today xnu/patches/): every file of it at the ref, plus files that exist only here (state only-here: upstream them to the ref
 first; `pull --prune` deletes them, never together with uncommitted work unless --force). One shared patch directory means one numbering and one stack for every agent.
 
-The file list is tools/common-files.txt AS OF THE REF. The source of truth is the branch `common-tools`: change a common file there (its own worktree),
+The file list is tools/common-files.txt AS OF THE REF. The source of truth is the branch `trunk` (the old branch `common-tools` is gone): land a common file change on trunk first,
 then every other worktree runs `tools/tools-sync pull` at a task boundary. `pull` skips a file with uncommitted local changes and refuses while the
 phone lock is held by anyone (changing tools under a live run is AP-18); --force overrides both.
 Last line: RESULT: PASS|FAIL|ERROR ...   Exit 0 in sync / pulled, 1 drift (status) or blocked (pull), 2 error.
@@ -85,7 +85,7 @@ def dirty(path):
 def main():
     p = argparse.ArgumentParser(prog="tools-sync")
     p.add_argument("op", choices=("status", "pull"))
-    p.add_argument("--ref", default="common-tools")
+    p.add_argument("--ref", default="trunk")
     p.add_argument("--force", action="store_true")
     p.add_argument("--prune", action="store_true", help="delete files that exist only here (directory entries)")
     a = p.parse_args()

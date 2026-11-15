@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""devd-stage: build, sign and pack the devd overlay (TP-027, research 111 sections 2, 4, 6; review gemini-devd-r1 F4).
+
+  tools/devd-stage [--src tools/devd.c] [--out-dir DIR] [--launchd-base FILE] [--key-copy FILE]
+
+Builds the CURRENT tools/devd.c for iOS (clang -target arm64-apple-ios16.0 + theos ld64 + `ldid -Cadhoc -S` under the final
+name `devd`), checks the result (rc 0, arm64 Mach-O, minos <= 16.0, ad-hoc signature with Identifier=devd, no PAC/LDAPUR
+instructions), writes a fresh 32-byte key, stages the tree and packs it with tools/mkdevoverlay.py:
+
+  DIR/tree/usr/local/bin/devd                  0755  signed binary
+  DIR/tree/private/var/dev/devd.key            0600  hex key + newline (new key on every call; never printed)
+  DIR/tree/System/Library/xpc/launchd.plist    0644  only with --launchd-base: the base plist + the job org.pixelios.devd
+  DIR/devd-overlay.bin                               packed SWEETDEV archive (mkdevoverlay --owner 0:0); tools/xrun --overlay wants DIR/tree
+
+The key is also copied to <kernel clone>/logs/devd/devd.key (logs/ is gitignored) for tools/devsh. --launchd-base is a plist
+taken from the FLASHED image (the tool never fetches one): the overlay replaces the whole cache file, so a fresh IPSW copy would drop the
+project's tweaks (research 111 4.3). Without it the plist is not staged: SWEET GAP line, binary-only overlay (hot reload when devd runs).
+Env (defaults from research 111 section 2): DEVD_SDK, DEVD_THEOS_BIN (dir with ld, ldid, vtool, llvm-objdump), DEVD_CLANG.
+Nothing here touches the phone. Last line RESULT: PASS|FAIL|ERROR ...; exit 0/1/2.
+"""
+import argparse, hashlib, importlib.util, os, plistlib, re, shutil, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser('~')
+DEFAULT_SDK = os.path.join(HOME, 'pixelios-artifacts/localbuild/theos/sdks/iPhoneOS16.5.sdk')
+DEFAULT_THEOS_BIN = os.path.join(HOME, 'pixelios-artifacts/localbuild/theos/toolchain/linux/iphone/bin')
+DEFAULT_OUT = os.path.join(HOME, 'pixelios-artifacts/devd-stage')
+JOB_LABEL = 'org.pixelios.devd'
+# Key shape: the combined cache is {'LaunchDaemons': {<plist PATH>: <job dict>}}, a bare label is ignored by launchd
+# (pixelios-userland tools/patch-launchd-plist.py:27 iterates plist['LaunchDaemons'].values(); tools/sweet-root-tweaks.py:355-373
+# edit_plist/tweak_launchd use pl['LaunchDaemons'] and write FMT_BINARY at :343-345; research 111 4.1-4.2).
+JOB_KEY = '/System/Library/LaunchDaemons/%s.plist' % JOB_LABEL
+# instructions that LOCAL-BUILD.md:82-94 says clang 19 emits for apple-m1 and that trap on Cortex cores (research 111 section 2)
+BAD_INSN = re.compile(r'xpaci|ldapur|stlur|pac|autia|retaa')
+
+
+class Fail(Exception):
+    """An acceptance check or the pack step failed (RESULT: FAIL, exit 1)."""
+
+
+class Err(Exception):
+    """Missing input or tool (RESULT: ERROR, exit 2)."""
+
+
+def toolchain():
+    t = os.environ.get('DEVD_THEOS_BIN', DEFAULT_THEOS_BIN)
+    return {'sdk': os.environ.get('DEVD_SDK', DEFAULT_SDK), 'bin': t, 'clang': os.environ.get('DEVD_CLANG', 'clang'),
+            'ld': os.path.join(t, 'ld'), 'ldid': os.path.join(t, 'ldid'), 'vtool': os.path.join(t, 'vtool'),
+            'objdump': os.path.join(t, 'llvm-objdump')}
+
+
+def toolchain_missing(tc=None):
+    """Empty string if everything the build needs exists, else a one-line reason."""
+    tc = tc or toolchain()
+    miss = [n + ' ' + tc[n] for n in ('ld', 'ldid', 'vtool', 'objdump') if not os.access(tc[n], os.X_OK)]
+    if not os.path.isdir(tc['sdk']):
+        miss.append('sdk ' + tc['sdk'])
+    if not shutil.which(tc['clang']) and not os.access(tc['clang'], os.X_OK):
+        miss.append('clang ' + tc['clang'])
+    if not shutil.which('file'):
+        miss.append('file (the command)')
+    return ('missing: ' + '; '.join(miss)) if miss else ''
+
+
+def run(cmd, what):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise Fail('%s failed rc %d: %s' % (what, p.returncode, (p.stderr or p.stdout).strip()[-600:]))
+    return p
+
+
+def build(src, work, tc=None):
+    """Build + sign src under the final name devd; every acceptance check must pass. Returns (path, [info lines])."""
+    tc = tc or toolchain()
+    why = toolchain_missing(tc)
+    if why:
+        raise Err('devd-stage: cannot build, ' + why)
+    if not os.path.isfile(src):
+        raise Err('devd-stage: no source ' + src)
+    raw, final = os.path.join(work, 'raw'), os.path.join(work, 'final')
+    for d in (raw, final):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d)
+    out = os.path.join(final, 'devd')   # the code-directory Identifier is taken from the file name (research 111 section 2)
+    p = run([tc['clang'], '-target', 'arm64-apple-ios16.0', '-isysroot', tc['sdk'], '-O2', '-Wall', '-Wextra',
+             '--ld-path=' + tc['ld'], '-o', os.path.join(raw, 'devd'), src], 'clang')
+    info = []
+    if p.stderr.strip():
+        info.append('SWEET GAP: devd-stage: clang printed %d warning line(s); first: %s' % (len(p.stderr.strip().splitlines()),
+                                                                                         p.stderr.strip().splitlines()[0][:160]))
+    shutil.copyfile(os.path.join(raw, 'devd'), out)
+    os.chmod(out, 0o755)
+    run([tc['ldid'], '-Cadhoc', '-S', out], 'ldid -Cadhoc -S')
+    desc = run(['file', '-b', out], 'file').stdout
+    if 'Mach-O 64-bit arm64' not in desc:
+        raise Fail('acceptance: file says "%s", want Mach-O 64-bit arm64' % desc.strip())
+    vt = run([tc['vtool'], '-show-build', out], 'vtool').stdout
+    m = re.search(r'^\s*minos\s+(\d+)(?:\.(\d+))?', vt, re.M)
+    if not m:
+        raise Fail('acceptance: vtool shows no minos')
+    minos = (int(m.group(1)), int(m.group(2) or 0))
+    if minos > (16, 0):
+        raise Fail('acceptance: minos %d.%d > 16.0' % minos)
+    lh = run([tc['ldid'], '-h', out], 'ldid -h').stdout
+    if not re.search(r'flags=0x[0-9a-f]+\(adhoc\)', lh):
+        raise Fail('acceptance: ldid -h shows no adhoc flag')
+    if not re.search(r'^Identifier=devd$', lh, re.M):
+        raise Fail('acceptance: ldid -h Identifier is not devd')
+    dis = run([tc['objdump'], '-d', out], 'llvm-objdump').stdout
+    bad = [l.strip() for l in dis.splitlines() if '\t' in l and BAD_INSN.search(l.split('\t')[1])]   # mnemonic field only
+    if bad:
+        raise Fail('acceptance: %d PAC/LDAPUR-class instruction(s), first: %s' % (len(bad), bad[0][:100]))
+    data = open(out, 'rb').read()
+    info.append('build: %s %d bytes sha256 %s minos %d.%d adhoc Identifier=devd, 0 PAC-class instructions'
+                % (out, len(data), hashlib.sha256(data).hexdigest(), minos[0], minos[1]))
+    return out, info
+
+
+def kernel_root():
+    """The kernel clone root (parent of the common git dir), also from a worktree."""
+    p = subprocess.run(['git', '-C', HERE, 'rev-parse', '--path-format=absolute', '--git-common-dir'], capture_output=True, text=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise Err('devd-stage: cannot resolve the kernel clone (git rev-parse --git-common-dir): ' + p.stderr.strip()[:200])
+    return os.path.dirname(p.stdout.strip())
+
+
+def write_secret(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)   # an existing file keeps its old mode through O_CREAT
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+def make_key(tree, key_copy):
+    """New 32-byte key, hex + newline, to the tree and to key_copy (both 0600). Returns nothing: the key is never returned or printed."""
+    text = os.urandom(32).hex() + '\n'
+    write_secret(os.path.join(tree, 'private/var/dev/devd.key'), text)
+    write_secret(key_copy, text)
+
+
+def add_job(plist):
+    """Add the devd job to a combined launchd cache dict in place; refuses a cache that already has it."""
+    jobs = plist.get('LaunchDaemons')
+    if not isinstance(jobs, dict):
+        raise Err('devd-stage: --launchd-base has no LaunchDaemons dict (not a combined launchd cache)')
+    if JOB_KEY in jobs or any(isinstance(j, dict) and j.get('Label') == JOB_LABEL for j in jobs.values()):
+        raise Err('devd-stage: --launchd-base already has %s (take the base from the flashed image, not from a staged overlay)' % JOB_LABEL)
+    # no KeepAlive (a failing gate/bind would respawn every ThrottleInterval) and no _PanicOnCrash (research 111 4.2)
+    jobs[JOB_KEY] = {'Label': JOB_LABEL, 'Program': '/usr/local/bin/devd', 'ProgramArguments': ['devd'],
+                     'UserName': 'root', 'RunAtLoad': True}
+
+
+def stage_plist(base, tree):
+    with open(base, 'rb') as f:
+        pl = plistlib.load(f)
+    add_job(pl)
+    dst = os.path.join(tree, 'System/Library/xpc/launchd.plist')
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, 'wb') as f:
+        f.write(plistlib.dumps(pl, fmt=plistlib.FMT_BINARY))   # binary like the cache itself (sweet-root-tweaks.py:343-345)
+    os.chmod(dst, 0o644)
+    return len(pl['LaunchDaemons'])
+
+
+def load_mkdevoverlay():
+    spec = importlib.util.spec_from_file_location('mkdevoverlay', os.path.join(HERE, 'mkdevoverlay.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def pack(tree, out_bin):
+    p = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'mkdevoverlay.py'), tree, out_bin, '--owner', '0:0'],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise Fail('mkdevoverlay rc %d: %s' % (p.returncode, (p.stdout + p.stderr).strip()[-500:]))
+    os.chmod(out_bin, 0o600)   # review devd-r1 F10: the archive holds the devd key; a host umask of 0002 left it 0664
+    ents = load_mkdevoverlay().parse(open(out_bin, 'rb').read())
+    bad = [e[0] for e in ents if not e[5]]
+    if bad:
+        raise Fail('mkdevoverlay output fails its own crc check: ' + ', '.join(bad))
+    return ents, p.stdout.strip()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--src', default=os.path.join(HERE, 'devd.c'))
+    ap.add_argument('--out-dir', default=os.environ.get('DEVD_STAGE_OUT', DEFAULT_OUT))
+    ap.add_argument('--launchd-base', help='plist from the flashed image to add the boot job to (never fetched)')
+    ap.add_argument('--key-copy', help='second copy of the key (default <kernel clone>/logs/devd/devd.key)')
+    a = ap.parse_args(argv)
+    try:
+        out_dir = os.path.abspath(a.out_dir)
+        if a.launchd_base and not os.path.isfile(a.launchd_base):
+            raise Err('devd-stage: --launchd-base %s is not a file' % a.launchd_base)
+        key_copy = a.key_copy or os.path.join(kernel_root(), 'logs/devd/devd.key')
+        os.makedirs(out_dir, exist_ok=True)
+        binary, info = build(a.src, os.path.join(out_dir, 'build'))
+        for l in info:
+            print(l)
+        tree = os.path.join(out_dir, 'tree')
+        shutil.rmtree(tree, ignore_errors=True)   # our own subdirectory, rebuilt on every call
+        dst = os.path.join(tree, 'usr/local/bin/devd')
+        os.makedirs(os.path.dirname(dst))
+        shutil.copyfile(binary, dst)
+        os.chmod(dst, 0o755)
+        make_key(tree, key_copy)
+        print('key: new 32-byte key in the tree (0600) and %s (0600); not printed' % key_copy)
+        if a.launchd_base:
+            n = stage_plist(a.launchd_base, tree)
+            print('launchd: job %s added to %s (%d jobs now)' % (JOB_KEY, a.launchd_base, n))
+        else:
+            print('SWEET GAP: devd-stage: no launchd base given, boot job NOT staged')
+        out_bin = os.path.join(out_dir, 'devd-overlay.bin')
+        ents, msg = pack(tree, out_bin)
+        print(msg)
+        print('overlay: %s' % out_bin)
+        print('tree: %s   (tools/xrun --overlay takes this directory and packs it itself, tools/build-xnu-image.sh:61)' % tree)
+        print('RESULT: PASS devd-stage files=%d launchd=%s overlay=%s' % (len(ents), 'staged' if a.launchd_base else 'NOT-staged', out_bin))
+        return 0
+    except Fail as e:
+        print('RESULT: FAIL ' + str(e))
+        return 1
+    except (Err, OSError, plistlib.InvalidFileException, ValueError) as e:
+        print('RESULT: ERROR ' + str(e))
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

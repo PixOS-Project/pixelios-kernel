@@ -54,7 +54,8 @@
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
 
-extern char _head[], _end[];
+/* Linker-script symbols: _head = start.S:4 label (ENTRY, shim.ld:1), _end = shim.ld:19. The names are fixed by start.S/shim.ld/build.sh, so no rename. */
+extern char _head[], _end[]; // NOLINT(bugprone-reserved-identifier)
 
 /* 1 L2 + up to 2 L3 tables, plus slack to align to 16K at runtime */
 static uint64_t pt_pool[4 * NENT] __attribute__((aligned(4096)));

@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 37f7faf..a6c9800 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -99,12 +99,14 @@ extern int sweet_gpu_power_on(volatile uint32_t *g);
+ #define MEMATTR_LO        0x888D8F88u        /* observed */
+ #define MEMATTR_HI        0x00004C8Du        /* observed */
+ #define JS_CONFIG_VAL     0x00083B00u        /* observed; ponytail: kbase would use 0x85300 (flush reduction), research 31 s.2 advises keeping the proven value */
++#define JS_CONFIG_END_CLEAN 0x00081B00u      /* patch 0210 (T-061a): END_FLUSH b13:12 = 1 (clean only) as kbase on CLEAN_ONLY_SAFE GPUs [src jm_hw.c:174-179]; everything else as JS_CONFIG_VAL */
+ #define IDVS_GROUP        (0xFu << 16)       /* JM_CONFIG, kbase pm_driver.c:3995-4047 */
+ #define SC_VAR_ALGORITHM  (1u << 29)         /* SHADER_CONFIG, erratum TTRX_2968_TTRX_3162, pm_driver.c:4058 */
+ #define COHERENCY_NONE    31u                /* kbase default for a DT without system-coherency, core_linux.c:5320 */
+ #define JOB_TIMEOUT_US    3000000u           /* ponytail: kbase hard-stops at ~5 s of soft-stop ticks (research 31 s.2); 3 s is our choice */
+ #define STOP_GRACE_US     500000u
+ 
++static uint32_t sm_js_config = JS_CONFIG_VAL;   /* JSn_CONFIG_NEXT written for every job; boot-arg sweetmalicfg picks another allowed value (patch 0210) */
+ static int sm_reset(void);
+ static LCK_GRP_DECLARE(sm_grp, "sweet_mali");
+ static LCK_MTX_DECLARE(sm_lock, &sm_grp);
+@@ -825,7 +827,7 @@ sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali
+ 	wr(R_JS_BASE(slot) + JS_HEAD_NEXT + 4, (uint32_t)(jc >> 32));
+ 	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT, SHADERS);
+ 	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT + 4, 0);
+-	wr(R_JS_BASE(slot) + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr(R_JS_BASE(slot) + JS_CONFIG_NEXT, sm_js_config);
+ 	sm.busy = 1;
+ 	wr(R_JS_BASE(slot) + JS_COMMAND_NEXT, JS_CMD_START);
+ 	if (tmon) {
+@@ -1091,10 +1093,15 @@ sm_gic_probe(void)
+ void
+ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ {
+-	static int started, gic_done;
+-	uint32_t mode = 0;
++	static int started, gic_done, cfg_gap;
++	uint32_t mode = 0, cfg_ignored = 0;
++	int have_cfg = PE_parse_boot_argn("sweetmalicfg", &cfg_ignored, sizeof(cfg_ignored));
+ 
+ 	if (!PE_parse_boot_argn("sweetmali", &mode, sizeof(mode))) {
++		if (have_cfg && !cfg_gap) {
++			cfg_gap = 1;
++			printf("SWEET GAP: mali sweetmalicfg=%#x ignored: boot-arg sweetmali is not set\n", cfg_ignored);
++		}
+ 		return;
+ 	}
+ 	if ((mode & 0x40u) && !gic_done) {
+@@ -1102,9 +1109,28 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ 		sm_gic_probe();       /* read-only; 0x40 alone is a pure read run, before any Mali interrupt mask is touched */
+ 	}
+ 	if (started || (mode & 3u) == 0 || (mode & 3u) == 3) {
++		if (have_cfg && !started && !cfg_gap) {
++			cfg_gap = 1;
++			printf("SWEET GAP: mali sweetmalicfg=%#x ignored: sweetmali=%#x does not start the service (needs 1 or 2 in bits 1:0)\n", cfg_ignored, mode);
++		}
+ 		return;       /* sweetmali = 1 (service) or 2 (service + selftest), | 0x10 skips the kbase config writes */
+ 	}
+ 	started = 1;
++	{
++		uint32_t cfg = 0;
++		const char *src = "default";
++		if (PE_parse_boot_argn("sweetmalicfg", &cfg, sizeof(cfg))) {
++			if (cfg == JS_CONFIG_VAL || cfg == JS_CONFIG_END_CLEAN) {
++				sm_js_config = cfg;
++				src = "boot-arg sweetmalicfg";
++			} else {
++				printf("SWEET GAP: mali sweetmalicfg=%#x is not an allowed JS_CONFIG value (%#x, %#x), keeping %#x\n", cfg, JS_CONFIG_VAL, JS_CONFIG_END_CLEAN, JS_CONFIG_VAL);
++				src = "default (sweetmalicfg rejected)";
++			}
++		}
++		printf("SWEET MALI: JS_CONFIG_NEXT=%#x start_flush=%u end_flush=%u chain_flag=%u flush_reduction=%u source=%s\n", sm_js_config, (sm_js_config >> 8) & 3u,
++		    (sm_js_config >> 12) & 3u, (sm_js_config >> 11) & 1u, (sm_js_config >> 14) & 1u, src);
++	}
+ 	sm_selftest_reset = (mode & 0x20u) != 0;      /* sweetmali=0x22: selftest + an explicit GPU reset and one more job */
+ 	int bad = sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0);
+ 	sweet_mmio_log_summary(SWEET_MMIO_GPU, "bringup");   /* after sm_hw_config_and_power() and AS0 enable (patch 0170) */

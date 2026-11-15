@@ -1,0 +1,10 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,7 +10,6 @@ void wait_for_flag(void)
+ {
+ 	while (!flag) {
+-		printf("w");
+ 	}
+ }
+

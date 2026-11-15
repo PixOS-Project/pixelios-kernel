@@ -24,6 +24,10 @@ returns it to a locked, stock state.
   (lost on a power cycle, the phone is restored by Power+VolDown) and the dev loop needs them: touch rails,
   Wi-Fi power, display. Rules: read first, write only registers/values cited from Linux or ABL sources, keep every
   write behind the audited allowlist, bound every wait.)
+- Flash any partition other than `userdata` without the maintainer's explicit go-ahead for that partition. Such a go-ahead
+  (maintainer rule, 2026-10-28) covers only a partition that cannot brick the phone, lose unique data or trip anti-rollback,
+  after a recovery path was exercised on this phone and written down in the run plan. `bootloader_*`/`abl`, `modem`, `persist`,
+  `efs`, the GPT, relocking and an older bootloader are never covered unless the maintainer names them.
 - `fastboot flashing lock` while anything non-stock is flashed. Relocking with a custom image
   can leave the phone unbootable with flashing disabled. Relock only right after `flash-all.sh`.
 - Flash a factory image older than the one on the phone. The 6a has bootloader anti-rollback;
@@ -39,6 +43,10 @@ returns it to a locked, stock state.
   does this (`ufs_write_blocks` bounds check); keep it and add the LUN check for gs101.
 - **Temporary boot only**: `fastboot boot` writes nothing to the phone. Phases 0–1 never write
   storage at all.
+- **Hardware register writes** in the shim (Wi-Fi PCIe bring-up, GPU power) and in the XNU Wi-Fi driver are table-driven,
+  checked against their own allowlist, and probes undo what they changed in an always-run teardown; the hand-over modes
+  that leave state on for XNU on purpose (`--wlan-hold`, `--gpu-handover`) are documented in `shim/build.sh`. Each such writer
+  gets an independent review before it runs (read from source: `shim/wlanlink.c`, `tools/test-bluejay-boot.py`, `docs/reviews/`).
 
 ## Restore procedure
 

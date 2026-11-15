@@ -1,0 +1,79 @@
+SWEET CHG SOC (patch 0307, ALL-ON goal, user 2026-11-11 "can't you literally read the battery percentage?"): the SWEET CHG P3 rows (patch 0287) and the 30 s SWEET CHG MON rows (patch 0298) also read the fuel gauge's RepSOC (0x36 register 0x06, 2 bytes low first, LSB 1/256 %) and print 'soc=NN.NN %' after vcell; the MON rows also read the gauge Temp (0x08, signed 1/256 C, battery thermistor; src BMS 6702fca8 max_m5.c:1593, max_m5_reg.h:219, max1720x_battery.c:526-530) and print 'temp=NN.N C' (a heat signal: an all-on boot reset with no log at max clocks, resident-184344-b1), so the host battery floor uses the gauge's charge state instead of the loaded VCell (session 20261111T182314Z parked a 72.48 % phone at a loaded 3676 mV). Same chip, same transfer and conversion as the phase-2 RepSOC read of i2c_g_fg (patch 0284, research charger-max77759-gs101.md note 2 from BMS max1720x_battery.h / max_m5_reg.h). The fuel-gauge read allowlist (patch 0284, i2c_rd_slave_ok) gains Temp 0x08 for the MON read (without it the compiler proved the MON row unreachable: kernel allon-k4 had no SWEET CHG MON string and every row would have failed). READS ONLY: no new chip or controller register written. Needs patch 0298.
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -341,7 +341,7 @@
+ 	switch (slave) {
+ 	case 0x66: return n == 1 && (reg == 0x00 || reg == 0x01 || reg == 0x60);                   /* PMIC: ID, REVISION, DeviceID block */
+ 	case 0x25: return n == 1 && (reg <= 0x05 || reg == 0x87);                                  /* TCPC: VID/PID/BCD_DEV, VENDOR_BC_STATUS1 */
+-	case 0x36: return n == 2 && (reg == 0x21 || reg == 0x09 || reg == 0x0a || reg == 0x06);    /* FG: DEVNAME, VCell, Current, RepSOC */
++	case 0x36: return n == 2 && (reg == 0x21 || reg == 0x09 || reg == 0x0a || reg == 0x06 || reg == 0x08);    /* FG: DEVNAME, VCell, Current, RepSOC, Temp (patch 0307: read only; BMS max_m5_reg.h:219 MAX_M5_TEMP 0x8) */
+ 	case 0x69: return n == 1 && reg >= 0xb0 && reg <= 0xcc;                                    /* charger */
+ 	default: return 0;
+ 	}
+@@ -813,24 +813,26 @@
+ static void
+ p3_sample(uint32_t t_s)
+ {
+-	uint8_t cu[2], vc[2], c9 = 0, io = 0;
++	uint8_t cu[2], vc[2], sc[2], c9 = 0, io = 0;
+ 	int32_t cs;
+-	uint32_t v;
++	uint32_t v, so;
+ 	int ct;
+ 
+ 	if (!i2c_gate(0)) {
+ 		p3_done("gate");
+ 		return;
+ 	}
+-	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0 || chg_i2c_read(0x69, 0xc2, 1, &c9) != 0 || chg_i2c_read(0x69, 0xb4, 1, &io) != 0) {
++	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0 || chg_i2c_read(0x36, 0x06, 2, sc) != 0 || chg_i2c_read(0x69, 0xc2, 1, &c9) != 0 ||
++	    chg_i2c_read(0x69, 0xb4, 1, &io) != 0) {
+ 		p3_done("sample read failed");
+ 		return;
+ 	}
+ 	cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
+ 	v = vc[0] | ((uint32_t)vc[1] << 8);
++	so = sc[0] | ((uint32_t)sc[1] << 8);   /* patch 0307: RepSOC 1/256 % */
+ 	/* same conversions as the P2 row: Current 312.5 uA/LSB (sign as read, the Android driver negates it), VCell 78.125 uV/LSB [note 2] */
+-	i2c_log("SWEET CHG P3: t=%us current=%d uA vcell=%u mV cnfg09=0x%x ilim=%u mA int_ok=0x%x aicl_ok=%u\n", t_s, (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u), c9,
+-	    chg_icl_ma(c9 & 0x7fu), io, io >> 7);
++	i2c_log("SWEET CHG P3: t=%us current=%d uA vcell=%u mV soc=%u.%02u %% cnfg09=0x%x ilim=%u mA int_ok=0x%x aicl_ok=%u\n", t_s, (int)((cs * 3125) / 10),
++	    (uint32_t)(((uint64_t)v * 78125u) / 1000000u), so >> 8, ((so & 0xffu) * 100u) >> 8, c9, chg_icl_ma(c9 & 0x7fu), io, io >> 7);
+ 	p3_samples++;
+ 	ct = p3_chgtyp_ok();
+ 	(void)i2c_wr(I_INTEN, 0);
+@@ -850,11 +852,17 @@
+ static void
+ mon_row(uint32_t t_s)
+ {
+-	uint8_t cu[2], vc[2];
+-	int32_t cs;
+-	uint32_t v;
+-
+-	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0) {
++	uint8_t cu[2], vc[2], sc[2], tc[2];
++	int32_t cs, td;
++	uint32_t v, so;
++
++	/* patch 0307 (ALL-ON, user 2026-11-11 "can't you literally read the battery percentage?"): RepSOC (0x06, LSB 1/256 %) too, the register i2c_g_fg already
++	 * reads once in phase 2 (same chip, same 2-byte read and conversion [note 2]), so the host floor uses the gauge's charge state, not the loaded VCell (a
++	 * 72.48 % phone parked at a loaded 3676 mV, resident-182314-b1). Also Temp (0x08, signed, LSB 1/256 C; battery thermistor) [src BMS 6702fca8 max_m5.c:1593
++	 * MAX17X0X_TAG_temp = MAX_M5_TEMP, max_m5_reg.h:219 0x8, max1720x_battery.c:526-530 s16 x 10 / 256 = deci-C]: an all-on boot reset with no log at max clocks
++	 * (resident-184344-b1), so the rows carry a heat signal. Reads only. */
++	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0 || chg_i2c_read(0x36, 0x06, 2, sc) != 0 ||
++	    chg_i2c_read(0x36, 0x08, 2, tc) != 0) {
+ 		(void)i2c_wr(I_INTEN, 0);
+ 		i2c_log("SWEET CHG GAP: MON fuel-gauge read failed at t=%us: bus stopped, no more battery rows this boot\n", t_s);
+ 		return;
+@@ -862,7 +870,10 @@
+ 	(void)i2c_wr(I_INTEN, 0);
+ 	cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
+ 	v = vc[0] | ((uint32_t)vc[1] << 8);
+-	i2c_log("SWEET CHG MON: t=%us current=%d uA vcell=%u mV\n", t_s, (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u));
++	so = sc[0] | ((uint32_t)sc[1] << 8);
++	td = ((int32_t)(int16_t)(tc[0] | ((uint32_t)tc[1] << 8)) * 10) / 256;   /* deci-C */
++	i2c_log("SWEET CHG MON: t=%us current=%d uA vcell=%u mV soc=%u.%02u %% temp=%s%d.%d C\n", t_s, (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u),
++	    so >> 8, ((so & 0xffu) * 100u) >> 8, td < 0 ? "-" : "", (int)((td < 0 ? -td : td) / 10), (int)((td < 0 ? -td : td) % 10));
+ }
+ 
+ static void

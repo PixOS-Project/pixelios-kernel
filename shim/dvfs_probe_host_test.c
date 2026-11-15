@@ -46,16 +46,22 @@ static int find(const char *needle, unsigned from)
 	return -1;
 }
 
+struct touch_dvfs_res res;
+#if DP_WRITE
+static char tokbuf[TOUCH_DVFS_TOK_MAX];
+#endif
+
 int main(void)
 {
 	int a, b, c;
 
 	acpm_cfg_init(&cfg);
+	touch_dvfs_res_init(&res);
 	setup(ESZ);
-	assert(touch_probe_dvfs(0) == ACPM_OK);			/* describe: reads only, channel 1 */
+	assert(touch_probe_dvfs(0, &res) == ACPM_OK);			/* describe: reads only, channel 1 */
 	assert(find("ACPM cfg ch=1 ", 0) >= 0 && find("ACPM descriptor validated; queues empty", 0) >= 0 && nw == 0);
 	assert(find("ACPM q len=5 elem=16 words=4 bytes=16", 0) >= 0);
-	assert(touch_probe_dvfs(1) == ACPM_OK);
+	assert(touch_probe_dvfs(1, &res) == ACPM_OK);
 	a = find("DVFS CL0 rate=1197000 kHz", 0);
 	b = find("DVFS CL1 rate=1197000 kHz", 0);
 	c = find("DVFS CL2 rate=1106000 kHz", 0);
@@ -63,10 +69,15 @@ int main(void)
 	assert(find("dvfs read: 3/3 domains ok", 0) >= 0 && nreq == 0 && nget == 3 && nbell == 3);
 	assert(find("DVFS get CL0 seq=1 req=00010002 00000000 00000001", 0) >= 0);
 	assert(find("DVFS get CL2 rep=00030000 0010e050 00000001 00000000", 0) >= 0);	/* 1106000 = 0x10e050; word 0 = seq << 16 as on the phone */
+#if DP_WRITE
+	/* L-28 / xnu patch 0367: after step 1 only, the tokens show the ask, the readings before, nothing after, and rc 4 (the request step not reached) */
+	assert(!strcmp(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf)), " sweetdvfsk0=1803000 sweetdvfsk1=0 sweetdvfsk2=1826000 sweetdvfsb0=1197000 sweetdvfsb1=1197000 sweetdvfsb2=1106000"
+					    " sweetdvfsa0=0 sweetdvfsa1=0 sweetdvfsa2=0 sweetdvfsrc=4"));
+#endif
 	nout = 0;
 	setup(ESZ);
 #if DP_WRITE
-	assert(touch_probe_dvfs(2) == ACPM_OK);
+	assert(touch_probe_dvfs(2, &res) == ACPM_OK);
 	for (unsigned k = 0; getenv("DP_DUMP") && k < nout; k++)
 		fprintf(stderr, "%s\n", out[k]);
 	a = find("DVFS request CL0 seq=2 req=00020002 001b82f8 00000000", 0);	/* 1803000 = 0x1b82f8 */
@@ -77,29 +88,55 @@ int main(void)
 	assert(find("DVFS CL1 readback rate=1197000 kHz (asked 0)", c) >= 0);
 	assert(find("DVFS CL2 readback rate=1826000 kHz (asked 1826000)", c) >= 0);
 	assert(find("dvfs set: ok 2/2 read back", 0) >= 0 && stray == 0);
+	/* the same numbers as the screen lines: asked, before (step 1), read back (CL1 asked 0 is read back too), rc 0 */
+	assert(!strcmp(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf)), " sweetdvfsk0=1803000 sweetdvfsk1=0 sweetdvfsk2=1826000 sweetdvfsb0=1197000 sweetdvfsb1=1197000 sweetdvfsb2=1106000"
+					    " sweetdvfsa0=1803000 sweetdvfsa1=1197000 sweetdvfsa2=1826000 sweetdvfsrc=0"));
+	assert(strlen(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf))) < TOUCH_DVFS_TOK_MAX);
 	only_channel_writes();
 	/* the first request fails (APM never takes it): the second cluster is NOT touched, the read-back still prints */
 	nout = 0;
 	setup(ESZ);
 	never_at = 2;
-	assert(touch_probe_dvfs(2) != ACPM_OK);
+	assert(touch_probe_dvfs(2, &res) != ACPM_OK);
 	assert(find("DVFS request CL2 ", 0) < 0 && find("DVFS readback CL0 err=5", 0) >= 0 && find("dvfs set: UNVERIFIED 0/2 read back (differ 0, unread 2)", 0) >= 0);	/* the read-back is refused: the request is still queued (queue not empty) */
 	assert(find("the request stays queued", 0) >= 0 && nreq == 0);
+	assert(strstr(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf)), " sweetdvfsa0=0 sweetdvfsa1=0 sweetdvfsa2=0 sweetdvfsrc=3"));	/* read-back refused: unverified, not a made-up rate */
 	/* review H1: the firmware answers the requests but keeps the rates: the RESULT must say MISMATCH (it used to say ok) */
 	nout = 0;
 	setup(ESZ);
 	ignore_req = 1;
-	assert(touch_probe_dvfs(2) != ACPM_OK);
+	assert(touch_probe_dvfs(2, &res) != ACPM_OK);
 	assert(find("DVFS CL0 readback rate=1197000 kHz (asked 1803000)", 0) >= 0 && find("dvfs set: MISMATCH 0/2 read back (differ 2, unread 0)", 0) >= 0);
 	assert(find("dvfs set: ok", 0) < 0);
+	assert(strstr(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf)), " sweetdvfsa0=1197000 sweetdvfsa1=1197000 sweetdvfsa2=1106000 sweetdvfsrc=2"));	/* MISMATCH on the screen = rc 2 in the log */
 	/* a slow reply (6 ms) is waited for: ok */
 	nout = 0;
 	setup(ESZ);
 	delay_ticks = 150000;
 	delay_from = 2;
-	assert(touch_probe_dvfs(2) == ACPM_OK && find("dvfs set: ok 2/2 read back", 0) >= 0);
+	assert(touch_probe_dvfs(2, &res) == ACPM_OK && find("dvfs set: ok 2/2 read back", 0) >= 0);
+	assert(strstr(touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf)), " sweetdvfsrc=0"));
+	/* the loader's append (touch_dvfs_append): after the existing text, never truncated; no room = nothing appended; no tokens = reported */
+	{
+		char line[400], keep[400];
+		const char *tok = touch_dvfs_tokens(&res, tokbuf, sizeof(tokbuf));
+		unsigned len = (unsigned)strlen(tok), cap;
+
+		memset(line, 0, sizeof(line));
+		strcpy(line, "debug=0xc cpus=5 sweetmifrc=0");
+		cap = (unsigned)strlen(line) + len + 1;			/* exactly fits: text + tokens + NUL */
+		assert(touch_dvfs_append(line, cap, tok) == 0 && !strncmp(line, "debug=0xc cpus=5 sweetmifrc=0 sweetdvfsk0=", 42) && !strcmp(line + 29, tok));
+		memset(line, 0, sizeof(line));
+		strcpy(line, "debug=0xc cpus=5 sweetmifrc=0");
+		strcpy(keep, line);
+		assert(touch_dvfs_append(line, cap - 1, tok) == 1 && !strcmp(line, keep));	/* one byte short: no room, line untouched */
+		assert(touch_dvfs_append(line, 4, tok) == 1 && !strcmp(line, keep));
+		assert(touch_dvfs_append(line, cap, 0) == 2 && !strcmp(line, keep));
+		line[0] = 0;
+		assert(touch_dvfs_append(line, sizeof(line), tok) == 0 && !strcmp(line, tok));
+	}
 #else
-	assert(touch_probe_dvfs(2) == ACPM_E_UNSURE && find("dvfs set: not in this image", 0) >= 0 && nw == 0 && nbell == 0);
+	assert(touch_probe_dvfs(2, &res) == ACPM_E_UNSURE && find("dvfs set: not in this image", 0) >= 0 && nw == 0 && nbell == 0);
 #endif
 	printf("PASS dvfs_probe_host_test DP_WRITE=%d\n", DP_WRITE);
 	return 0;

@@ -1,0 +1,11 @@
+diff --git a/shim/wlansmc.c b/shim/wlansmc.c
+--- a/shim/wlansmc.c
++++ b/shim/wlansmc.c
+@@ -55,6 +55,7 @@ __attribute__((noipa)) static int smc_priv_read(uint64_t pa, struct smc_res *r)
+ 			 :
+ 			 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+ 	r->a0 = x0;
++	ramlog_line("smc read");
+ 	r->a1 = x1;
+ 	r->a2 = x2;
+ 	r->a3 = x3;

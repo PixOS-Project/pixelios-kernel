@@ -1,0 +1,133 @@
+sweet-el2-report (SPEC-EL2-PROXY-PROBE 3.4 (b) design items 2-6, decision W24 option (b)): with boot-arg sweetel2=1 one kernel thread asks the shim's resident EL2 for its counters with `hvc #0x5345` (x0 = 0x53454C3200000001) at start and every 60 s and prints
+`SWEET EL2: vm=V gaps=G traps=T bound=B up=<ms>` (x0 = 0x53454C32000000AA is the answer, x1 = HCR_EL2.VM, x2 = gaps, x3 = traps, x4 = bound). Why: under the shim's B2 build (`--el2-trap --boot-xnu`, stage 2 kept on across the jump) a stage-2 map
+hole clears VM and retries natively, and the shim printer never runs again once XNU owns the CPU, so without this call a silent stage-2 drop would read as "XNU runs with stage 2 on" (rule 8). First line: `SWEET EL2: bootflags 0x<16 hex>`. Checks, each loud: boot_args.bootFlags bit 62 missing ->
+`SWEET GAP: el2 report: sweetel2=1 but the shim reports no resident EL2` (no hvc: without a resident EL2 the hvc would reach the shim's EL1 vectors, SPEC 1.2); ml_get_cpu_count() != 1 (checked once, osfmk/arm64/machine_routines.c:954-1016,:1184-1187) ->
+`SWEET GAP: el2 report: N cpus, needs cpus=1` (patch 0063 rewrites the EL2 registers on secondaries); no answer -> `SWEET GAP: el2 report: no answer x0=<hex>` and the thread stops. Default (sweetel2 absent or 0): one PE_parse_boot_argn read, no thread, no
+hvc executed. New bsd/dev/sweet_el2.c + bsd/conf/files entry; started from sweet_ufs_init next to sweet_cpustat_start (bsd/dev/sweet_ufs.c, inside its ARM64_BOARD_CONFIG_SWEET block). PE_state.bootArgs is a kernel VA (osfmk/arm/arm_init.c:357-358
+BootArgs = &const_boot_args; pexpert/arm/pe_init.c:403) and carries bootFlags (pexpert/pexpert/arm64/boot.h:77). Guarded by ARM64_BOARD_CONFIG_SWEET. Not compiled locally, not run on hardware.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c69e7f5..8d3eb47 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_cpustat.c			standard
++bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_usbroot.c		standard
+diff --git a/bsd/dev/sweet_el2.c b/bsd/dev/sweet_el2.c
+new file mode 100644
+index 0000000..c526aa5
+--- /dev/null
++++ b/bsd/dev/sweet_el2.c
+@@ -0,0 +1,87 @@
++/*
++ * SWEET EL2 report (patch 0180, docs/specs/SPEC-EL2-PROXY-PROBE.md 3.4 (b) design items 2-6): asks the shim's resident EL2 (build.sh --el2-trap --boot-xnu, stage 2 kept on across the jump)
++ * for its counters, so a silent stage-2 drop under XNU shows up in the log (rule 8).
++ *
++ * Always first with sweetel2=1: "SWEET EL2: bootflags 0x<16 hex>" (the shim's handshake, which its own pre-jump lines cannot show in the run log).
++ * If sweet_ufs_init returns before it starts this thread (no UFS root path, init error) no "SWEET EL2:" line appears at all; the B2 run plan REQUIRES `--expect 'SWEET EL2: vm=1 ...'` (spec 3.4 (b) design item 6), so that case is a FAIL, not a silent PASS.
++ * Boot-arg sweetel2 (default 0): with 0 nothing runs and no hvc is reachable (one PE_parse_boot_argn read only). With 1 one kernel thread:
++ *   - boot_args.bootFlags bit 62 (set by the shim only with a resident EL2 and stage 2 on) missing: "SWEET GAP: el2 report: sweetel2=1 but the shim reports no resident EL2" once, no hvc, exit;
++ *   - ml_get_cpu_count() != 1 (the shim's patch-0063 secondary path rewrites HCR_EL2/VTTBR_EL2/VBAR_EL2, so the run needs cpus=1), checked once before the first hvc: "SWEET GAP: el2 report: N cpus, needs cpus=1", no hvc, exit;
++ *   - else `hvc #0x5345` with x0 = 0x53454C3200000001 at start and every 60 s, printing
++ *       SWEET EL2: vm=V gaps=G traps=T bound=B up=<ms>
++ *     x0 = 0x53454C32000000AA is the answer; x1 = HCR_EL2.VM, x2 = gaps, x3 = traps, x4 = bound. No answer: "SWEET GAP: el2 report: no answer x0=<hex>" and the thread stops.
++ * The call is only answered by the shim's EL2 (shim/el2h.c el2_handle); EL2 changes nothing but x0-x4. Not compiled locally, not run on hardware.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
++
++extern int hz;
++extern unsigned int ml_get_cpu_count(void);   /* osfmk/arm/machine_routines.h:277 */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++void sweet_el2_start(void);
++
++#define SEL2_FN         0x53454C3200000001ULL   /* "SEL2" + function 1 (REPORT) */
++#define SEL2_ANS        0x53454C32000000AAULL   /* "SEL2" + answered */
++#define SEL2_BOOTFLAG   (1ULL << 62)            /* kBootFlagsSweetEL2 in shim/payload.h; XNU defines only bit 0 (pexpert/arm64/boot.h:54) */
++#define SEL2_PERIOD_S   60
++
++static void
++sel2_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	boot_args *ba = (boot_args *)PE_state.bootArgs;   /* a kernel VA: arm_init.c:357-358 points it at const_boot_args */
++
++	/* review el2-b2-report-r1 F4: the shim's own lines (EL2 IMG, S2 ON) are printed before the jump and the USB log starts only after loader_boot returns (shim/shim.c usb_gadget_start), so they never reach the run log; XNU prints the handshake itself, in every sweetel2=1 case, before the gates */
++	printf("SWEET EL2: bootflags 0x%016llx\n", (ba != NULL && ba->Revision >= kBootArgsRevision2) ? (unsigned long long)ba->bootFlags : 0ULL);
++	if (ba == NULL || ba->Revision < kBootArgsRevision2 || !(ba->bootFlags & SEL2_BOOTFLAG)) {
++		printf("SWEET GAP: el2 report: sweetel2=1 but the shim reports no resident EL2\n");
++		return;
++	}
++	/* review r1 F1: the secondary CPUs run XNU's EL2 vectors (patch 0063 start.s:290-322), an hvc there would hang with no line. ml_get_cpu_count() is topology_info.num_cpus, capped by the cpus= boot-arg when the topology is built
++	 * (osfmk/arm64/machine_routines.c:954-1016, :1184-1187, dk-jetsam), i.e. fixed before any CPU starts, so one check before the first hvc is race-free (processor_avail_count in the loop was not). */
++	if (ml_get_cpu_count() != 1) {
++		printf("SWEET GAP: el2 report: %u cpus, needs cpus=1\n", (unsigned)ml_get_cpu_count());
++		return;
++	}
++	for (;;) {
++		register uint64_t x0 __asm__("x0") = SEL2_FN;
++		register uint64_t x1 __asm__("x1") = 0;
++		register uint64_t x2 __asm__("x2") = 0;
++		register uint64_t x3 __asm__("x3") = 0;
++		register uint64_t x4 __asm__("x4") = 0;
++		__asm__ volatile ("hvc #0x5345" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4) : : "memory");
++		if (x0 != SEL2_ANS) {
++			printf("SWEET GAP: el2 report: no answer x0=0x%llx\n", x0);
++			return;
++		}
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("SWEET EL2: vm=%llu gaps=%llu traps=%llu bound=%llu up=%llu\n", x1, x2, x3, x4, ns / NSEC_PER_MSEC);
++		(void)tsleep(&chan, PZERO, "sweetel2", SEL2_PERIOD_S * hz);
++	}
++}
++
++void
++sweet_el2_start(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetel2", &on, sizeof(on));
++	if (on == 0) {
++		return;
++	}
++	if (kernel_thread_start(sel2_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GAP: el2 report: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 14c5a1c..6f05187 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_cpustat_start(void);
++extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+ /* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+ uint64_t sweet_ufs_stat[6];
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+@@ -735,6 +736,7 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	sweet_cpustat_start();
++	sweet_el2_start();
+ 	sweet_keys_gs101_start();
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */

@@ -1,0 +1,653 @@
+SWEET CHG P3 (patch 0287, charger phase 3): boot-arg sweetchgicl=900 (default OFF, needs sweetchgi2c=1) raises the charger input limit CNFG_09 CHGIN_ILIM from 500 mA to 875 mA (code 0x22), because chg-p2 showed charging at the 500 mA SDP limit is below the iOS load (net discharge); sweetchgicl=500 puts it back (0x13). THE ONLY CHIP WRITES OF THE SERIES (HW-WRITE, for the Opus reviewer; review docs/reviews/chg-0287-review.md F1-F8 fixed here). One I2C write of two bytes to the charger 0x69: [0xC2, (old & 0x80) | 0x22] (setter 0x04 + (875000-125000)/25000, getter 100 + (0x22-3) x 25; note 3 CNFG_09; BMS max77759_charger.c:1445-1499). No CNFG_06 unlock (driver writes CNFG_09 without it, BMS :319-368; CNFG_06 is 0x0C = unlocked on this phone, logged in the preflight row). Read back; a mismatch restores the old value once, logs a GAP and stops all transfers. F1: with this boot-arg only, sweet_usb.c sends bMaxPower 112 (896 mA) in the SuperSpeed configuration descriptor instead of 62 (Android declares 896 mA before it draws 900: GS composite.c:493-511, 952-967; usb_psy.c:31-38, 254-259); sweet_usb_ss_configured() requires the byte actually sent and a SuperSpeed configuration; the flag is cleared at disconnect, bus reset and gadget restart. F2: the samples and a watcher for the rest of the boot restore the old CNFG_09 (once) when the SuperSpeed link or TCPC CHGTYP is lost. Preconditions (GAP and no write otherwise): phase 2 finished with 0 errors and identity checks passed; phase-1 gate + controller idle; the accessor; TCPC CHGTYP SDP/CDP; CNFG_00 MODE 4 or 5; CNFG_09 NO_AUTOIBUS = 1 and ILIM code 4..0x21. Then FG Current/VCell every 30 s for 5 minutes (`SWEET CHG P3: t=..`). i2c_msg gains the write-with-STOP form (len 2) used only by i2c_cnfg09_write. Phase 2 logs a GAP when ILIM is above 500 mA at boot. Never written: CNFG_00/02/04/06/12/18, any bit-3 mode, any other chip. Applies after 0284. Host test: tools/test_chg_icl.py.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -13,6 +13,9 @@
+  * bring-up and not allowed here). Before every group of transfers sweet_chg_gate_still_open() (patch 0284 hunk in sweet_chg.c) re-reads the phase-1
+  * gate state and must find it identical to the open pattern, and the controller must still look like phase 1 saw it (checked here).
+  *
++ * PHASE 3 (patch 0287, boot-arg sweetchgicl=900, default OFF, same file at the end): the ONLY chip write in this series: CNFG_09 (charger 0x69, reg 0xC2) CHGIN_ILIM
++ * 500 mA -> 900 mA, with read-back and one restore. See the section "phase 3" below for every precondition and its source.
++ *
+  * Tags: [note X] = note section X (it carries the downstream i2c-exynos5.c line numbers); [obs] observed on hardware; [guess] not backed by a source.
+  * Portable C: tools/test_chg_i2c.py compiles this file on the host (SWEET_CHG_I2C_HOST) with a fake HSI2C12 + chip model.
+  */
+@@ -180,7 +183,8 @@ i2c_dump(const char *what, uint32_t slave, uint32_t reg)
+ }
+ 
+ /*
+- * One auto-mode message [note 5.4]. rd=0: message 1 (write `len` = 1 byte, the register address, no STOP); rd=1: message 2 (read len bytes, STOP).
++ * One auto-mode message [note 5.4]. rd=0: write `len` bytes txb[0..len-1] (phase 2: len 1 = the register address, stop 0 = message 1; phase 3 only: len 2 =
++ * register address + value, stop 1 = a complete chip register write); rd=1: message 2 (read len bytes, STOP).
+  * Write sequence (the table the reviewer gets), each line with its note citation:
+  *   1 TIMEOUT   RMW   clear TIMEOUT_EN (bit 31)                                  [5.4 step 1; 5.1 0x48]
+  *   2 FIFO_CTL  :=    RXFIFO_EN | TXFIFO_EN | (trig << 4) | (trig << 16), trig = min(len, 8)   [5.4 step 1, step 7; 5.1 0x04]
+@@ -188,15 +192,15 @@ i2c_dump(const char *what, uint32_t slave, uint32_t reg)
+  *   4 ADDR      RMW   clear [19:10] and [9:0], set (slave & 0x7f) << 10, [31:24] := 0x7   [5.4 step 3; 5.1 0x70]
+  *   5 CTL       RMW   clear RXCHON|TXCHON, then set TXCHON (msg 1) or RXCHON (msg 2)      [5.4 step 2, step 7; 5.1 0x00]
+  *   6 INT_ENABLE :=   TRANSFER_DONE | bits 8-11                                  [5.4 step 4, 5.5; 5.1 0x20]
+- *   7 AUTO_CONF :=    len (msg 1) | READ_WRITE | STOP | len (msg 2)              [5.4 step 5, step 8; 5.1 0x44]
++ *   7 AUTO_CONF :=    len | (READ_WRITE if read) | (STOP if stop)                 [5.4 step 5, step 8; 5.1 0x44]
+  *   8 AUTO_CONF :=    (value of 7) | MASTER_RUN (bit 31)                         [5.4 step 5, step 8]
+- *   9 TX_DATA   :=    register address (msg 1 only, after 8)                     [5.4 step 6; 5.1 0x34]
++ *   9 TX_DATA   :=    txb[0..len-1] (write messages only, after 8)               [5.4 step 6; 5.1 0x34]
+  *  10 INT_STATUS :=   value read when done (write-1-to-clear)                    [5.4 step 6 / step 9]
+  * Poll: msg 1 INT_STATUS.TRANSFER_DONE and FIFO_STATUS.TX_EMPTY; msg 2 FIFO_STATUS.RX_EMPTY == 0 then RX_DATA (len times), then TRANSFER_DONE;
+  * INT_STATUS bits 8-11 = error. Timeout I2C_TIMEOUT_US. Returns 0 or -1 (GAP printed, i2c_dead set).
+  */
+ static int
+-i2c_msg(uint32_t slave, uint32_t reg, int rd, uint32_t len, uint8_t *out)
++i2c_msg(uint32_t slave, uint32_t reg, int rd, int stop, uint32_t len, const uint8_t *txb, uint8_t *out)
+ {
+ 	uint32_t v, trig = len > 8u ? 8u : len, got = 0, autov, st = 0, fs = 0;
+ 	uint64_t t0;
+@@ -226,14 +230,16 @@ i2c_msg(uint32_t slave, uint32_t reg, int rd, uint32_t len, uint8_t *out)
+ 	if (i2c_wr(I_INTEN, INT_DONE | INT_ERR_MASK) != 0) {                                                                    /* 6 */
+ 		goto fail;
+ 	}
+-	autov = (rd ? (AUTO_RW | AUTO_STOP) : 0u) | (len & 0xffffu);
++	autov = (rd ? AUTO_RW : 0u) | ((rd || stop) ? AUTO_STOP : 0u) | (len & 0xffffu);
+ 	if (i2c_wr(I_AUTO, autov) != 0 || i2c_wr(I_AUTO, autov | AUTO_RUN) != 0) {                                              /* 7, 8 */
+ 		goto fail;
+ 	}
+ 	t0 = i2c_now_us();
+ 	if (!rd) {
+-		if (i2c_wr(I_TXD, reg & 0xffu) != 0) {                                                                              /* 9 */
+-			goto fail;
++		for (got = 0; got < len; got++) {
++			if (i2c_wr(I_TXD, txb[got]) != 0) {                                                                         /* 9 */
++				goto fail;
++			}
+ 		}
+ 		for (;;) {
+ 			if (i2c_rd(I_INTST, &st) != 0 || i2c_rd(I_FIFOST, &fs) != 0) {
+@@ -251,7 +257,13 @@ i2c_msg(uint32_t slave, uint32_t reg, int rd, uint32_t len, uint8_t *out)
+ 				goto fail;
+ 			}
+ 		}
+-		return i2c_wr(I_INTST, st);                                                                                         /* 10 */
++		if (i2c_wr(I_INTST, st) != 0) {                                                                                     /* 10 */
++			goto fail;
++		}
++		if (!stop) {
++			return 0;
++		}
++		goto idle;
+ 	}
+ 	while (got < len) {
+ 		if (i2c_rd(I_INTST, &st) != 0 || i2c_rd(I_FIFOST, &fs) != 0) {
+@@ -296,6 +308,7 @@ i2c_msg(uint32_t slave, uint32_t reg, int rd, uint32_t len, uint8_t *out)
+ 	if (i2c_wr(I_INTST, st) != 0) {                                                                                         /* 10 */
+ 		goto fail;
+ 	}
++idle:
+ 	t0 = i2c_now_us();              /* F2: wait for MASTER_BUSY (TRANS_STATUS bit 17) to clear after the STOP, as ML does (ML:821, helper ML:623-640) */
+ 	for (;;) {
+ 		if (i2c_rd(I_TRANS, &st) != 0) {
+@@ -338,6 +351,8 @@ i2c_target_ok(uint32_t slave, uint32_t reg, uint32_t n)
+ static int
+ chg_i2c_read(uint32_t slave, uint32_t reg, uint32_t n, uint8_t *out)
+ {
++	uint8_t rb;
++
+ 	if (i2c_dead) {
+ 		return -1;
+ 	}
+@@ -346,7 +361,8 @@ chg_i2c_read(uint32_t slave, uint32_t reg, uint32_t n, uint8_t *out)
+ 		return -1;
+ 	}
+ 	i2c_xfers++;
+-	if (i2c_msg(slave, reg, 0, 1, NULL) != 0 || i2c_msg(slave, reg, 1, n, out) != 0) {
++	rb = (uint8_t)(reg & 0xffu);
++	if (i2c_msg(slave, reg, 0, 0, 1, &rb, NULL) != 0 || i2c_msg(slave, reg, 1, 1, n, NULL, out) != 0) {
+ 		i2c_errors++;
+ 		i2c_dead = 1;
+ 		return -1;
+@@ -523,6 +539,9 @@ i2c_g_chg(int hi)
+ 	i2c_log("SWEET CHG P2: chg CNFG_09[0xc2]=0x%x NO_AUTOIBUS=%u CHGIN_ILIM=%u (~%u mA) | CNFG_12[0xc5]=0x%x CHG_EN=%u WCINSEL=%u CHGINSEL=%u VCHGIN_REG=%u | CNFG_18[0xcb]=0x%x WDTEN=%u\n",
+ 	    C(0xc2), C(0xc2) >> 7, C(0xc2) & 0x7fu, chg_icl_ma(C(0xc2) & 0x7fu), C(0xc5), C(0xc5) >> 7, (C(0xc5) >> 6) & 1u, (C(0xc5) >> 5) & 1u, (C(0xc5) >> 3) & 3u,
+ 	    C(0xcb), C(0xcb) & 1u);
++	if ((C(0xc2) & 0x7fu) > 0x13u) {      /* review chg-0287 F3: 0x13 = 500 mA is what a stock boot shows (obs 0x93); more means an earlier run or the bootloader raised it */
++		i2c_log("SWEET CHG GAP: P2 CNFG_09 ILIM code 0x%x (%u mA) is above the 500 mA of a stock boot; sweetchgicl=500 puts it back\n", C(0xc2) & 0x7fu, chg_icl_ma(C(0xc2) & 0x7fu));
++	}
+ 	/* three rows, each well under 200 characters: the kernel printf of this port cuts a row at about 290 characters (chg-p2: "INT_OK[0xb4]=0x" ended the line) */
+ 	i2c_log("SWEET CHG P2: chg DETAILS_00[0xb5]=0x%x CHGIN_DTLS=%u WCIN_DTLS=%u SPSN_DTLS=%u TREG=%u (meanings unknown, note 3)\n",
+ 	    C(0xb5), (C(0xb5) >> 5) & 3u, (C(0xb5) >> 3) & 3u, (C(0xb5) >> 1) & 3u, C(0xb5) & 1u);
+@@ -533,11 +552,390 @@ i2c_g_chg(int hi)
+ #undef C
+ }
+ 
++static int i2c_icl_arg(uint32_t *v);
++static uint64_t i2c_now_ms(void);
++static int i2c_gate(int first);
++
++/* ==================================================================================================================================================
++ * phase 3 (patch 0287): raise CHGIN_ILIM 500 mA -> 875 mA (boot-arg sweetchgicl=900) and put it back (sweetchgicl=500). Default OFF. THE ONLY CHIP WRITES OF THE SERIES.
++ *
++ * Why: chg-p2 showed the input limit (CNFG_09 ILIM code 19 = 500 mA, SDP) is below the iOS load: net discharge [obs chg-p2: charging fast-CC, FG current -98 mA].
++ * Android allows up to 900 mA when a USB 3 link is configured AND the configuration declared 896 mA (GS composite.c:493-511, 952-967 -> usb_psy.c:31-38, 254-259
++ * SDP_SS_CONFIG_UA 900000; note 4). So the gadget's SuperSpeed configuration descriptor is raised to bMaxPower 112 = 896 mA with this boot-arg only (sweet_usb.c, same
++ * patch; review chg-0287 F1) and the code written is 0x22 = 875 mA, inside the declared 896 mA.
++ *
++ * What is written: ONE I2C write of two bytes to the charger (slave 0x69): [0xC2 = CHG_CNFG_09, (old & 0x80) | 0x22]. 0x22 = setter 0x04 + (875000 - 125000) / 25000,
++ * getter 100 + (0x22 - 3) x 25 = 875 mA [note 3, CNFG_09; BMS max77759_charger.c:1445-1473, 1475-1499]. NO_AUTOIBUS (bit 7) is kept and REQUIRED to be 1, as Android always
++ * writes it with the limit (BMS :1463-1468; review F4). The driver writes CNFG_09 without a CNFG_06 CHGPROT unlock (BMS :319-368 unlocks only around CNFG_12); on this phone
++ * CNFG_06 reads 0x0C (unlocked by ABL) [obs chg-p2 raw dump], so the claim is not exercised here and no unlock/relock write exists (review F5).
++ * Writes that can follow: the restore of the old value (once; after a read-back mismatch, or when the SuperSpeed link or CHGTYP is lost later in the boot, review F2), or with
++ * sweetchgicl=500 the step 0x22 -> 0x13 (500 mA, setter 0x04 + 15; review F3). Never written: CNFG_00/02/04/06/12/18, any OTG/boost mode (bit 3), any other chip. The writer
++ * (i2c_cnfg09_write) checks all of this itself and the host test proves it byte by byte.
++ *
++ * Preconditions of the raise, each a GAP line when it fails (nothing is written): phase 2 finished with 0 errors and passed identity (i2c_p2_ok); the phase-1 gate and
++ * the controller idle checks (i2c_gate); sweet_usb_ss_configured() (SuperSpeed + a configuration descriptor that declared >= 896 mA actually sent); TCPC CHGTYP SDP (1) or CDP (2)
++ * [note 4]; CNFG_00 MODE 4 or 5 [note 3]; CNFG_09 NO_AUTOIBUS = 1 and ILIM code 4..0x21. Then every 30 s: FG Current and VCell (+ CNFG_09, INT_OK), 10 times, and a watcher for
++ * the rest of the boot restores the old value if the SuperSpeed link or CHGTYP goes away. Host suspend is not detected (DEVTEN has no suspend event): the limit stays (GAP at start).
++ * ================================================================================================================================================== */
++#define ICL_ARG_UP      900u            /* sweetchgicl=900: raise */
++#define ICL_ARG_DOWN    500u            /* sweetchgicl=500: put it back */
++#define ICL_CODE        0x22u           /* 875 mA */
++#define ICL500_CODE     0x13u           /* 500 mA: 0x04 + (500000 - 125000) / 25000 [note 3 setter] */
++#define ICL_REG         0xc2u
++#define P3_SAMPLE_MS    30000u
++#define P3_SAMPLES      10u
++
++extern uint32_t sweet_usb_ss_configured(void);          /* bsd/dev/sweet_usb.c (patch 0287): DSTS.CONNECTSPD when the gadget is configured at SuperSpeed, else 0 */
++
++static int i2c_p2_ok, p3_stage, p3_nwrites, p3_orig_valid, p3_mode;
++static uint8_t p3_orig, p3_intended;
++static uint32_t p3_samples;
++static uint64_t p3_t0_ms, p3_next_ms, p3_w0_ms;
++
++/*
++ * The only chip write. cur = the CNFG_09 value just read (or, for the restore, the value we wrote); val = what to write. Allowed, nothing else:
++ *  (a) mode 900, the first write: val == (cur & 0x80) | 0x22, cur has NO_AUTOIBUS and an ILIM code in 4..0x21;
++ *  (b) after (a), the restore of the original value, once;
++ *  (c) mode 500, the first write: cur's ILIM code is exactly 0x22 and val == (cur & 0x80) | 0x13.
++ */
++static int
++i2c_cnfg09_write(uint8_t cur, uint8_t val)
++{
++	uint8_t b[2];
++	uint32_t code = cur & 0x7fu;
++	int first = p3_mode == ICL_ARG_UP && p3_nwrites == 0 && (cur & 0x80u) != 0 && val == (uint8_t)((cur & 0x80u) | ICL_CODE) && code >= 4u && code < ICL_CODE;
++	int restore = p3_mode == ICL_ARG_UP && p3_nwrites == 1 && p3_orig_valid && val == p3_orig && cur == p3_intended;
++	int down = p3_mode == ICL_ARG_DOWN && p3_nwrites == 0 && code == ICL_CODE && val == (uint8_t)((cur & 0x80u) | ICL500_CODE);
++
++	if (i2c_dead) {
++		return -1;
++	}
++	if (!first && !restore && !down) {
++		i2c_log("SWEET CHG GAP: P3 chip write 0x%x <- 0x%x refused (cur 0x%x, writes so far %d, mode %d): only the 875 mA step, one restore, or (mode 500) the step to 500 mA\n", ICL_REG,
++		    val, cur, p3_nwrites, p3_mode);
++		return -1;
++	}
++	if (first) {
++		p3_orig = cur;
++		p3_intended = val;
++		p3_orig_valid = 1;
++	}
++	b[0] = (uint8_t)ICL_REG;
++	b[1] = val;
++	p3_nwrites++;
++	i2c_xfers++;
++	if (i2c_msg(0x69, ICL_REG, 0, 1, 2, b, NULL) != 0) {
++		i2c_errors++;
++		i2c_dead = 1;
++		return -1;
++	}
++	return 0;
++}
++
++static void
++p3_done(const char *why)
++{
++	if (i2c_nwr != 0) {
++		(void)i2c_wr(I_INTEN, 0);
++	}
++	i2c_log("SWEET CHG P3: done (%s) chip_writes=%d samples=%u xfers=%u errors=%u\n", why, p3_nwrites, p3_samples, i2c_xfers, i2c_errors);
++	p3_stage = 9;
++}
++
++static int
++p3_refuse(const char *why)
++{
++	i2c_log("SWEET CHG GAP: P3 refused, CNFG_09 not written: %s\n", why);
++	p3_done("refused");
++	return 0;
++}
++
++/* Write val to CNFG_09 (via the guarded writer), read it back, log before/after. Returns 1 when the read-back equals val. */
++static int
++p3_write_verify(uint8_t cur, uint8_t val, uint8_t *readback)
++{
++	if (i2c_cnfg09_write(cur, val) != 0) {
++		return -1;
++	}
++	if (chg_i2c_read(0x69, 0xc2, 1, readback) != 0) {
++		return -2;
++	}
++	return *readback == val;
++}
++
++/* Reads, then (if everything holds) the one write + read-back + restore. Returns 1 when the 875 mA step is in place and the sampling may start. */
++static int
++p3_step(void)
++{
++	uint8_t bc = 0, c0 = 0, c6 = 0, c9 = 0, r9 = 0, r9b = 0;
++	uint32_t spd = sweet_usb_ss_configured();
++	int v;
++
++	if (spd == 0) {
++		return p3_refuse("the USB gadget is not a configured SuperSpeed link that declared 896 mA (speed unknown, high speed, or the 62 descriptor): 875 mA is the USB 3 value");
++	}
++	if (!i2c_gate(0)) {
++		return p3_refuse("phase-1 gate / controller idle check failed (see the GAP above)");
++	}
++	if (chg_i2c_read(0x25, 0x87, 1, &bc) != 0 || chg_i2c_read(0x69, 0xb9, 1, &c0) != 0 || chg_i2c_read(0x69, 0xbf, 1, &c6) != 0 || chg_i2c_read(0x69, 0xc2, 1, &c9) != 0) {
++		return p3_refuse("pre-read of BC_STATUS1 / CNFG_00 / CNFG_06 / CNFG_09 failed");
++	}
++	i2c_log("SWEET CHG P3: preflight usb_speed=%u BC_STATUS1=0x%x CHGTYP=%u CNFG_00=0x%x MODE=0x%x CNFG_06=0x%x CHGPROT=%u CNFG_09=0x%x ILIM=%u mA\n", spd, bc, bc & 3u, c0, c0 & 0xfu, c6,
++	    (c6 >> 2) & 3u, c9, chg_icl_ma(c9 & 0x7fu));
++	if ((bc & 3u) != 1u && (bc & 3u) != 2u) {
++		return p3_refuse("TCPC CHGTYP is not SDP (1) or CDP (2)");
++	}
++	if ((c0 & 0xfu) != 4u && (c0 & 0xfu) != 5u) {
++		return p3_refuse("CNFG_00 MODE is not 4 or 5");
++	}
++	if ((c9 & 0x80u) == 0) {
++		return p3_refuse("CNFG_09 NO_AUTOIBUS is 0: Android always programs it as 1 with a limit, that combination is not written");
++	}
++	if ((c9 & 0x7fu) < 4u) {
++		return p3_refuse("CNFG_09 ILIM code below 4 (input suspended or 100 mA): not touched");
++	}
++	if ((c9 & 0x7fu) >= ICL_CODE) {
++		return p3_refuse("CNFG_09 ILIM is already 875 mA or more");
++	}
++	v = p3_write_verify(c9, (uint8_t)((c9 & 0x80u) | ICL_CODE), &r9);
++	if (v == -1) {
++		i2c_log("SWEET CHG GAP: P3 CNFG_09 write failed (CNFG_09 state unknown, bus stopped, no restore possible)\n");
++		p3_done("write failed");
++		return 0;
++	}
++	if (v == -2) {
++		i2c_log("SWEET CHG GAP: P3 read-back of CNFG_09 failed (CNFG_09 state unknown, bus stopped, no restore possible)\n");
++		p3_done("read-back failed");
++		return 0;
++	}
++	i2c_log("SWEET CHG P3: CNFG_09 before=0x%x (%u mA) wrote=0x%x read back=0x%x (%u mA)\n", c9, chg_icl_ma(c9 & 0x7fu), p3_intended, r9, chg_icl_ma(r9 & 0x7fu));
++	if (v == 0) {
++		int w = i2c_cnfg09_write(p3_intended, p3_orig);      /* cur = the value we intended to write; the chip's actual value (r9) is what the mismatch is about */
++
++		if (w == 0) {
++			(void)chg_i2c_read(0x69, 0xc2, 1, &r9b);
++		}
++		i2c_log("SWEET CHG GAP: P3 CNFG_09 read-back 0x%x != written 0x%x: restore of 0x%x %s, read back after restore 0x%x; all further transfers stopped\n", r9, p3_intended,
++		    p3_orig, w == 0 ? "sent once" : "FAILED", r9b);
++		i2c_dead = 1;
++		p3_done("mismatch");
++		return 0;
++	}
++	i2c_log("SWEET CHG GAP: P3 host suspend is not detected (the gadget enables no suspend event): the input limit stays at 875 mA while a host sleeps\n");
++	return 1;
++}
++
++/* sweetchgicl=500: put 875 mA back to 500 mA (review F3). Needs phase 2 OK and the phase-1 gate, not the link or CHGTYP (lowering is always safe). */
++static void
++p3_step500(void)
++{
++	uint8_t c9 = 0, r9 = 0;
++	int v;
++
++	if (!i2c_gate(0)) {
++		(void)p3_refuse("phase-1 gate / controller idle check failed (see the GAP above)");
++		return;
++	}
++	if (chg_i2c_read(0x69, 0xc2, 1, &c9) != 0) {
++		(void)p3_refuse("pre-read of CNFG_09 failed");
++		return;
++	}
++	if ((c9 & 0x7fu) != ICL_CODE) {
++		i2c_log("SWEET CHG P3: CNFG_09=0x%x (%u mA) is not the 875 mA step: nothing to put back\n", c9, chg_icl_ma(c9 & 0x7fu));
++		p3_done("nothing to restore");
++		return;
++	}
++	v = p3_write_verify(c9, (uint8_t)((c9 & 0x80u) | ICL500_CODE), &r9);
++	if (v < 0) {
++		i2c_log("SWEET CHG GAP: P3 CNFG_09 %s failed (state unknown, bus stopped)\n", v == -1 ? "write" : "read-back");
++		p3_done("500 mA step failed");
++		return;
++	}
++	i2c_log("SWEET CHG P3: CNFG_09 before=0x%x (%u mA) wrote=0x%x read back=0x%x (%u mA)\n", c9, chg_icl_ma(c9 & 0x7fu), (c9 & 0x80u) | ICL500_CODE, r9, chg_icl_ma(r9 & 0x7fu));
++	if (v == 0) {
++		i2c_log("SWEET CHG GAP: P3 CNFG_09 read-back 0x%x != written 0x%x, nothing more is written; all further transfers stopped\n", r9, (c9 & 0x80u) | ICL500_CODE);
++		i2c_dead = 1;
++		p3_done("500 mA mismatch");
++		return;
++	}
++	(void)i2c_wr(I_INTEN, 0);
++	p3_done("put back to 500 mA");
++}
++
++/* The link or the charger source we relied on is gone: put the original value back, once, if CNFG_09 is still what we wrote (review F2). */
++static void
++p3_lost(const char *what)
++{
++	uint8_t c9 = 0, r9 = 0;
++
++	i2c_log("SWEET CHG GAP: P3 %s lost: putting CNFG_09 back to the original value 0x%x\n", what, p3_orig);
++	if (i2c_dead) {
++		i2c_log("SWEET CHG GAP: P3 bus stopped earlier, CNFG_09 stays at the 875 mA step\n");
++		p3_done("link lost, no restore");
++		return;
++	}
++	if (!i2c_gate(0)) {
++		i2c_log("SWEET CHG GAP: P3 gate lost too, CNFG_09 stays at the 875 mA step\n");
++		p3_done("link lost, no restore");
++		return;
++	}
++	if (chg_i2c_read(0x69, 0xc2, 1, &c9) != 0) {
++		i2c_log("SWEET CHG GAP: P3 read of CNFG_09 failed, CNFG_09 state unknown\n");
++		p3_done("link lost, no restore");
++		return;
++	}
++	if (c9 != p3_intended) {
++		i2c_log("SWEET CHG GAP: P3 CNFG_09 is 0x%x, not the 0x%x we wrote: not touched\n", c9, p3_intended);
++		p3_done("link lost, changed by someone else");
++		return;
++	}
++	if (i2c_cnfg09_write(p3_intended, p3_orig) == 0 && chg_i2c_read(0x69, 0xc2, 1, &r9) == 0) {
++		i2c_log("SWEET CHG P3: CNFG_09 before=0x%x wrote=0x%x (the original) read back=0x%x%s\n", c9, p3_orig, r9, r9 == p3_orig ? "" : " MISMATCH, no further write");
++	} else {
++		i2c_log("SWEET CHG GAP: P3 restore of CNFG_09 failed, state unknown\n");
++	}
++	(void)i2c_wr(I_INTEN, 0);
++	p3_done("link lost, restored");
++}
++
++/* CHGTYP still SDP/CDP? (one read) */
++static int
++p3_chgtyp_ok(void)
++{
++	uint8_t bc = 0;
++
++	if (chg_i2c_read(0x25, 0x87, 1, &bc) != 0) {
++		return -1;
++	}
++	return (bc & 3u) == 1u || (bc & 3u) == 2u;
++}
++
++static void
++p3_sample(uint32_t t_s)
++{
++	uint8_t cu[2], vc[2], c9 = 0, io = 0;
++	int32_t cs;
++	uint32_t v;
++	int ct;
++
++	if (!i2c_gate(0)) {
++		p3_done("gate");
++		return;
++	}
++	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0 || chg_i2c_read(0x69, 0xc2, 1, &c9) != 0 || chg_i2c_read(0x69, 0xb4, 1, &io) != 0) {
++		p3_done("sample read failed");
++		return;
++	}
++	cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
++	v = vc[0] | ((uint32_t)vc[1] << 8);
++	/* same conversions as the P2 row: Current 312.5 uA/LSB (sign as read, the Android driver negates it), VCell 78.125 uV/LSB [note 2] */
++	i2c_log("SWEET CHG P3: t=%us current=%d uA vcell=%u mV cnfg09=0x%x ilim=%u mA int_ok=0x%x aicl_ok=%u\n", t_s, (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u), c9,
++	    chg_icl_ma(c9 & 0x7fu), io, io >> 7);
++	p3_samples++;
++	ct = p3_chgtyp_ok();
++	(void)i2c_wr(I_INTEN, 0);
++	if (ct == 0) {
++		p3_lost("TCPC CHGTYP (source no longer SDP/CDP)");
++	} else if (ct < 0) {
++		p3_done("chgtyp read failed");
++	}
++}
++
++static void
++i2c_p3_tick(int log_pending)
++{
++	uint32_t arg = 0;
++
++	if (p3_stage >= 9) {
++		return;
++	}
++	if (p3_stage == 0) {
++		p3_stage = 8;
++		if (!i2c_icl_arg(&arg)) {
++			i2c_log("SWEET CHG P3: off (default; sweetchgicl=900 raises CNFG_09 CHGIN_ILIM to 875 mA, sweetchgicl=500 puts it back: the only chip writes; need sweetchgi2c=1)\n");
++			p3_stage = 9;
++			return;
++		}
++		if (arg != ICL_ARG_UP && arg != ICL_ARG_DOWN) {
++			i2c_log("SWEET CHG GAP: P3 sweetchgicl=%u is not supported (only 900 or 500), nothing done\n", arg);
++			p3_stage = 9;
++			return;
++		}
++		if (!i2c_p2_ok) {
++			i2c_log("SWEET CHG GAP: P3 refused: phase 2 did not finish with 0 errors and passed identity checks (sweetchgi2c=1 needed), CNFG_09 not written\n");
++			p3_stage = 9;
++			return;
++		}
++		p3_mode = (int)arg;
++		i2c_log("SWEET CHG P3: start (patch 0287, sweetchgicl=%u)\n", arg);
++		p3_stage = 1;
++		p3_w0_ms = i2c_now_ms();
++		return;
++	}
++	if (p3_stage == 1) {
++		uint8_t cu[2], vc[2];
++
++		if (log_pending && i2c_now_ms() - p3_w0_ms < I2C_FORCE_MS) {
++			return;                 /* the start/preflight rows leave the log first, at most I2C_FORCE_MS */
++		}
++		p3_stage = 7;
++		if (p3_mode == (int)ICL_ARG_DOWN) {
++			p3_step500();
++			return;
++		}
++		if (chg_i2c_read(0x36, 0x0a, 2, cu) == 0 && chg_i2c_read(0x36, 0x09, 2, vc) == 0) {
++			int32_t cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
++			uint32_t v = vc[0] | ((uint32_t)vc[1] << 8);
++
++			i2c_log("SWEET CHG P3: t=-0s current=%d uA vcell=%u mV (before the write)\n", (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u));
++		}
++		if (!p3_step()) {
++			return;
++		}
++		(void)i2c_wr(I_INTEN, 0);
++		p3_t0_ms = i2c_now_ms();
++		p3_next_ms = p3_t0_ms + P3_SAMPLE_MS;
++		p3_stage = 2;
++		return;
++	}
++	/* stages 2 (10 samples) and 3 (watcher for the rest of the boot): the SuperSpeed flag is checked every tick (no bus traffic), the I2C checks every 30 s */
++	if (!sweet_usb_ss_configured()) {
++		p3_lost("USB SuperSpeed link / 896 mA configuration");
++		return;
++	}
++	if (i2c_now_ms() >= p3_next_ms) {
++		if (p3_stage == 2) {
++			p3_sample((uint32_t)((p3_next_ms - p3_t0_ms) / 1000u));
++			if (p3_stage == 9) {
++				return;
++			}
++			if (p3_samples >= P3_SAMPLES) {
++				i2c_log("SWEET CHG P3: samples done (chip_writes=%d samples=%u xfers=%u errors=%u); the watcher keeps checking the link and CHGTYP every 30 s\n", p3_nwrites, p3_samples,
++				    i2c_xfers, i2c_errors);
++				p3_stage = 3;
++			}
++		} else if (p3_stage == 3) {
++			int ct = i2c_gate(0) ? p3_chgtyp_ok() : -2;
++
++			(void)i2c_wr(I_INTEN, 0);
++			if (ct == 0) {
++				p3_lost("TCPC CHGTYP (source no longer SDP/CDP)");
++				return;
++			}
++			if (ct < 0) {
++				i2c_log("SWEET CHG GAP: P3 watcher cannot check CHGTYP (%s): CNFG_09 stays at the 875 mA step\n", ct == -2 ? "gate lost" : "read failed");
++				p3_done("watcher stopped");
++				return;
++			}
++		}
++		p3_next_ms += P3_SAMPLE_MS;
++	}
++}
++
+ #ifdef SWEET_CHG_I2C_HOST
+ /* the harness (tools/chg_i2c_host_test.c) defines i2c_hw_rd32/i2c_hw_wr32/i2c_now_us/i2c_load/i2c_arg_on AFTER including this file */
+ static int i2c_load(void);
+ static int i2c_arg_on(void);
+-static uint64_t i2c_now_ms(void);
+ #else
+ static volatile uint32_t *i2c_va;
+ 
+@@ -550,6 +948,14 @@ i2c_arg_on(void)
+ 	return PE_parse_boot_argn("sweetchgi2c", &v, sizeof(v)) && v == 1;
+ }
+ 
++/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++static int
++i2c_icl_arg(uint32_t *v)
++{
++	*v = 0;
++	return PE_parse_boot_argn("sweetchgicl", v, sizeof(*v));
++}
++
+ static uint64_t
+ i2c_now_us(void)
+ {
+@@ -620,6 +1026,7 @@ void
+ sweet_chg_i2c_tick(int log_pending)
+ {
+ 	if (i2c_group >= 9) {
++		i2c_p3_tick(log_pending);       /* patch 0287: default off */
+ 		return;
+ 	}
+ 	if (i2c_group == 0) {
+@@ -662,6 +1069,7 @@ sweet_chg_i2c_tick(int log_pending)
+ 	}
+ 	i2c_t_ms = i2c_now_ms();
+ 	if (i2c_dead || i2c_group == 5) {
++		i2c_p2_ok = !i2c_dead && i2c_errors == 0;
+ 		i2c_finish();
+ 		return;
+ 	}
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -296,6 +296,10 @@ static struct {
+ 	uint32_t    speed;          /* DSTS.CONNECTSPD at the last ConnectDone */
+ 	uint32_t    ep0_mps;        /* 64 (HS/FS) or 512 (SS), set at ConnectDone */
+ 	uint64_t    ss_deadline;    /* mach absolute time: RUN at SuperSpeed + UD_SS_WAIT_MS */
++	/* patch 0287 (charger phase 3): the 896 mA / SuperSpeed power state the charger input limit relies on. Written by ud_thread (ud_event, ud_configure, ud_restart), read by
++	 * ud_log_thread through sweet_usb_ss_configured() with atomic loads. */
++	bool        ss_power_ok;    /* configured at SuperSpeed AFTER a config descriptor with bMaxPower >= 112 (896 mA) was sent; cleared at disconnect, bus reset, restart */
++	uint8_t     ss_bmax_sent;   /* bMaxPower byte of the SuperSpeed configuration descriptor last sent to the host (0 = none since the last reset) */
+ } ud;
+ 
+ /* PixOS patch 0242 (T-9d99): state read by sweet_usb_panic_send() on the panicking CPU (below ud_log_thread) */
+@@ -503,6 +507,29 @@ ud_notify_connected(void)
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
++/* BEGIN 0287 power */
++/*
++ * Patch 0287 (review chg-0287 F1): the SuperSpeed configuration descriptor (patch 0173) declares bMaxPower 62 = 496 mA. With the boot-arg sweetchgicl=900 the charger input
++ * limit is raised to 875 mA (CNFG_09 code 0x22), so the descriptor sent to the host must declare at least that: 112 x 8 mA = 896 mA, the cap of Android's encode_bMaxPower
++ * (GS drivers/usb/gadget/composite.c:493-511; composite.c:952-967 draws the same MaxPower). Only with that boot-arg: a default boot sends the unchanged 62, so enumeration for
++ * everyone else is as before. The high-speed descriptor stays at 500 mA.
++ */
++#define UD_SS_BMAXPOWER_DEFAULT 62u
++#define UD_SS_BMAXPOWER_ICL     112u
++static uint8_t
++ud_ss_power_byte(void)
++{
++	static int icl900 = -1;
++	uint32_t v = 0;
++
++	if (icl900 < 0) {
++		/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++		icl900 = (PE_parse_boot_argn("sweetchgicl", &v, sizeof(v)) && v == 900) ? 1 : 0;
++	}
++	return icl900 ? (uint8_t)UD_SS_BMAXPOWER_ICL : (uint8_t)UD_SS_BMAXPOWER_DEFAULT;
++}
++/* END 0287 power */
++
+ /* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+ static void
+ ud_configure(void)
+@@ -527,6 +554,8 @@ ud_configure(void)
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud.bulk_mps = bulk;
++	/* patch 0287: the 896 mA claim holds only for a SuperSpeed configuration whose descriptor really declared it */
++	__atomic_store_n(&ud.ss_power_ok, ud.ss_mode && ud.speed >= DSTS_SPEED_SS && (uint32_t)ud.ss_bmax_sent * 8u >= 896u, __ATOMIC_RELEASE);
+ 	ud_rx_arm();
+ 	printf("SWEET USB: ECM endpoints configured\n");
+ 	if (ud.ss_mode) {
+@@ -565,6 +594,8 @@ ud_setup(void)
+ 		case 2:
+ 			if (ss) {
+ 				memcpy(data, ud_ss_cfg_desc, sizeof(ud_ss_cfg_desc)); n = sizeof(ud_ss_cfg_desc);
++				data[8] = ud_ss_power_byte();   /* patch 0287: bMaxPower 62 (default) or 112 (sweetchgicl=900) */
++				__atomic_store_n(&ud.ss_bmax_sent, data[8], __ATOMIC_RELEASE);
+ 			} else {
+ 				memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc);
+ 			}
+@@ -1016,6 +1047,8 @@ ud_event(uint32_t ev)
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
++			__atomic_store_n(&ud.ss_power_ok, false, __ATOMIC_RELEASE);       /* patch 0287 */
++			__atomic_store_n(&ud.ss_bmax_sent, 0, __ATOMIC_RELEASE);
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t dsts = dwc_rd(DSTS), speed = dsts & 7;
+ 			/* ep0 max packet: 64 at high/full speed, 512 at SuperSpeed (gadget.c:4095-4143), modify action */
+@@ -1048,6 +1081,8 @@ ud_event(uint32_t ev)
+ 			}
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			__atomic_store_n(&ud.ss_power_ok, false, __ATOMIC_RELEASE);       /* patch 0287 */
++			__atomic_store_n(&ud.ss_bmax_sent, 0, __ATOMIC_RELEASE);
+ 			if (ud.ss_mode) {
+ 				uint32_t dsts = dwc_rd(DSTS);
+ 				printf("SWEET USB3: disconnect at speed %u, DSTS 0x%08x link state %u\n",
+@@ -1296,6 +1331,24 @@ extern void sweet_wdt_poll(int may_arm);       /* bsd/dev/sweet_wdt.c */
+ extern void sweet_stall_tick(int src);         /* bsd/dev/sweet_stall.c (patch 0279) */
+ extern void sweet_chg_tick(int log_pending); /* bsd/dev/sweet_chg.c (patch 0283): read-only charger-bus witness, one shot */
+ 
++/* BEGIN 0287 accessor */
++/*
++ * Patch 0287 (charger phase 3): is the gadget configured at SuperSpeed (USB 3) with the power the charger limit relies on? Returns DSTS.CONNECTSPD (4 = SuperSpeed, 5 = SuperSpeed+)
++ * only if ALL hold: ud.configured, ud.ss_power_ok (set in ud_configure after a SuperSpeed ConnectDone and a configuration descriptor that really declared bMaxPower >= 112 = 896 mA;
++ * cleared at disconnect, bus reset and gadget restart), the bMaxPower byte actually sent x 8 mA >= 896, and ud.speed >= SuperSpeed. Else 0. Read-only. Called from ud_log_thread
++ * (sweet_chg_i2c.c); the fields are written by ud_thread (ud_event, ud_configure) and ud_restart, so every field is read with an atomic load (no lock, no torn or hoisted read).
++ */
++uint32_t
++sweet_usb_ss_configured(void)
++{
++	bool ok = __atomic_load_n(&ud.ss_power_ok, __ATOMIC_ACQUIRE) && __atomic_load_n(&ud.configured, __ATOMIC_ACQUIRE);
++	uint32_t sp = __atomic_load_n(&ud.speed, __ATOMIC_ACQUIRE);
++	uint32_t bm = __atomic_load_n(&ud.ss_bmax_sent, __ATOMIC_ACQUIRE);
++
++	return (ok && sp >= DSTS_SPEED_SS && bm * 8u >= 896u) ? sp : 0;
++}
++/* END 0287 accessor */
++
+ static void
+ ud_log_round(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, struct ud_log_arp *a,
+     char *chunk, uint32_t chunk_max)
+@@ -1889,6 +1942,8 @@ ud_restart(uint32_t devspd)
+ 	/* review usb3-ss-r2 F1: stop every TX kick (ud_if_output, sweet_usb_raw_tx, ud_log_thread) before the stop */
+ 	lck_mtx_lock(ud.lock);
+ 	ud.configured = false;
++	__atomic_store_n(&ud.ss_power_ok, false, __ATOMIC_RELEASE);               /* patch 0287 */
++	__atomic_store_n(&ud.ss_bmax_sent, 0, __ATOMIC_RELEASE);
+ 	ud.data_alt = 0;
+ 	if (ud.tx_busy) {
+ 		printf("USB3 GAP: restart drops the TX transfer in flight\n");

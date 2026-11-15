@@ -11,7 +11,7 @@ class T(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.d)
         self.r = os.path.join(self.d, "repo")
         os.makedirs(os.path.join(self.r, "tools"))
-        for f in ("tools-sync", "phone-lock"):
+        for f in ("tools-sync", "phone-lock", "simseams.py", "phone_lock_end.py", "phone_lock_root.py"):  # phone-lock imports simseams and phone_lock_end (it is in tools/common-files.txt too)
             shutil.copy(os.path.join(TOOLS, f), os.path.join(self.r, "tools", f))
         self.env = dict(os.environ, PHONE_LOCK_DIR=os.path.join(self.d, "lock"), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
@@ -19,9 +19,9 @@ class T(unittest.TestCase):
         self.w("tools/common-files.txt", "# c\ntools/a\ntools/b\n")
         self.w("tools/a", "A1\n"); self.w("tools/b", "B1\n")
         self.git("add", "-A"); self.git("commit", "-qm", "base")
-        self.git("branch", "common-tools")
-        # common-tools moves on: a changes
-        self.git("checkout", "-q", "common-tools"); self.w("tools/a", "A2\n"); self.git("commit", "-qam", "a2"); self.git("checkout", "-q", "main")
+        self.git("branch", "trunk")
+        # trunk moves on: a changes
+        self.git("checkout", "-q", "trunk"); self.w("tools/a", "A2\n"); self.git("commit", "-qam", "a2"); self.git("checkout", "-q", "main")
 
     def git(self, *a):
         return subprocess.run(["git", "-C", self.r, *a], env=self.env, capture_output=True, text=True, check=True)
@@ -66,7 +66,7 @@ class T(unittest.TestCase):
         os.makedirs(os.path.join(self.r, "patches"))
         self.w("patches/0001-a.patch", "a\n"); self.w("tools/common-files.txt", "tools/a\ntools/b\npatches/\n")
         self.git("add", "-A"); self.git("commit", "-qm", "dir")
-        self.git("checkout", "-q", "common-tools"); self.git("checkout", "-q", "main", "--", "tools/common-files.txt", "patches")
+        self.git("checkout", "-q", "trunk"); self.git("checkout", "-q", "main", "--", "tools/common-files.txt", "patches")
         self.w("patches/0002-b.patch", "b\n"); self.git("add", "-A"); self.git("commit", "-qm", "common patches"); self.git("checkout", "-q", "main")
         self.w("patches/0002-mine.patch", "x\n")  # untracked local extra with the same number
         x = self.ts("status")
@@ -121,6 +121,24 @@ class T(unittest.TestCase):
         self.assertEqual(self.ts("pull").returncode, 0)
         self.assertTrue(os.path.exists(os.path.join(self.r, "tools/b")))
         self.assertEqual(self.ts("status", "--ref", "nope").returncode, 2)
+
+
+class CommonFilesClosure(unittest.TestCase):
+    def test_python_imports_of_shared_files_are_shared(self):
+        """A shared python tool that imports a sibling module needs that module in tools/common-files.txt too (phone-lock + simseams broke the gate once)."""
+        import re
+        shared = {l.strip() for l in open(os.path.join(TOOLS, "common-files.txt")) if l.strip() and not l.startswith("#")}
+        missing = []
+        for rel in sorted(shared):
+            path = os.path.join(os.path.dirname(TOOLS), rel)
+            if not os.path.isfile(path): continue
+            head = open(path, errors="replace").read(200)
+            if not (rel.endswith(".py") or "python" in head.split("\n", 1)[0]): continue
+            for m in re.finditer(r"^\s*(?:import|from)\s+([A-Za-z_]\w*)", open(path, errors="replace").read(), re.M):
+                sib = "tools/%s.py" % m.group(1)
+                if os.path.isfile(os.path.join(os.path.dirname(TOOLS), sib)) and sib not in shared:
+                    missing.append("%s imports %s (not in tools/common-files.txt)" % (rel, sib))
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

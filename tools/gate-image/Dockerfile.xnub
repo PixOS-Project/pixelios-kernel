@@ -1,0 +1,11 @@
+# PixOS XNU-build image pixos-xnub:trixie-20261111 (20w, W35 R22 lane jam): the gate image plus the host tools tools/xnu-local-build's prerequisite check wants
+# (m4 autoconf automake rsync, tools/xnu-local-build:62; the pre-built deps/hostroot come from the staged toolchain, nothing is built from them here).
+# Lets remote-job gate-pre build HEAD's xnu/patches INSIDE the offload-host slot (no lab-host heavy-job lock). Versions = lab-host apt candidates [obs apt-cache policy 2026-10-29].
+# Build context on offload-host: $OFFLOAD_ROOT/work/xnub-image-20261111 (this file). `docker build -t pixos-xnub:trixie-20261111 -f Dockerfile.xnub .`
+# 2026-11-11: rebuilt FROM pixos-gate:trixie-20261111 (which already has these four tools; the RUN below is then a no-op kept as the explicit pin list).
+FROM localhost/pixos-gate:trixie-20261111
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+ m4=1.4.19-8 autoconf=2.72-3.1 automake=1:1.17-4 rsync=3.5.0+ds1-0+deb13u1 \
+ && rm -rf /var/lib/apt/lists/*
+USER 1000

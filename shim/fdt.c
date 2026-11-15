@@ -4,6 +4,7 @@
  */
 #include "fdt.h"
 #include "console.h"
+#include "shim_assert.h"
 
 #define FDT_MAGIC	0xd00dfeed
 #define FDT_BEGIN_NODE	1
@@ -25,6 +26,7 @@ static uint32_t be32(uintptr_t a)
 
 static int streq(const char *a, const char *b)
 {
+	/* bounded: ends at the first NUL or mismatch, so by the shorter string */
 	while (*a && *a == *b)
 		a++, b++;
 	return *a == *b;
@@ -32,8 +34,10 @@ static int streq(const char *a, const char *b)
 
 static int has_text(const char *text, const char *needle)
 {
+	/* bounded: text is a node name; the node walk (fdt_walk) checked its NUL lies before fdt_end */
 	while (*text) {
 		const char *a = text, *b = needle;
+		/* bounded: ends at the first NUL or mismatch, so by the shorter string */
 		while (*a && *b && *a == *b)
 			a++, b++;
 		if (!*b)
@@ -63,6 +67,7 @@ static int has_text_n(const char *text, uint32_t len, const char *needle)
 static int name_is_memory(const char *name)
 {
 	const char *m = "memory";
+	/* bounded: ends at the end of the literal "memory" or the first mismatch */
 	while (*m && *name == *m)
 		m++, name++;
 	return *m == 0 && (*name == 0 || *name == '@');
@@ -131,7 +136,7 @@ static int fdt_read_reg_entry(const struct fdt_walk_state *st, uintptr_t val, ui
 	if (ac == 0 || ac > 2 || sc == 0 || sc > 2)
 		return 0;
 	*base = read_cells(val + off, ac);
-	*size = read_cells(val + off + ac * 4, sc);
+	*size = read_cells(val + off + (uintptr_t)ac * 4, sc);
 	return 1;
 }
 
@@ -165,6 +170,7 @@ static int fdt_walk(uintptr_t fdt, const struct fdt_ops *ops, void *ctx)
 	for (int i = 0; i < MAX_DEPTH; i++)
 		st.names[i] = 0;
 
+	/* bounded: p advances 4 per token and the walk returns once p + 4 > fdt_end */
 	for (;;) {
 		if (p + 4 > fdt_end)
 			return 0;
@@ -244,6 +250,23 @@ static int fdt_walk(uintptr_t fdt, const struct fdt_ops *ops, void *ctx)
 		}
 	}
 }
+
+/* ALL-ON T-06: a malformed tree (walk rc 0) must not read as "absent".
+ * fdt_probe_report says so too, but a --boot-xnu handover leaves for XNU in
+ * loader_boot() (shim.c) before it runs, while fdt_framebuffer (shim.c),
+ * fdt_chosen_u64 (loader.c), fdt_ramoops (pstore.c) and fdt_memory_contains
+ * (mmu.c) all run earlier. Every walk below goes through this (the macro),
+ * named by its caller; the rc is returned unchanged. */
+static int32_t fdt_walk_gap(uintptr_t fdt, const struct fdt_ops *ops, void *ctx, const char *who)
+{
+	SHIM_ASSERT(ops != 0);
+	SHIM_ASSERT(who != 0);
+	int32_t rc = fdt_walk(fdt, ops, ctx);
+	if (rc == 0)
+		con_str("FDT GAP: malformed or truncated tree, read as not found by", who);
+	return rc;
+}
+#define fdt_walk(fdt, ops, ctx) fdt_walk_gap((fdt), (ops), (ctx), __func__)
 
 struct chosen_ctx {
 	const char *prop;
@@ -398,6 +421,7 @@ static int collect_memreserve(uintptr_t fdt, struct fdt_memmap *mm)
 	uintptr_t p = fdt + be32(fdt + 16);
 	if (p <= fdt || (p & 7))
 		return 0;
+	/* bounded: p advances 16 per entry and the loop returns once p + 16 > end */
 	for (;;) {
 		if (p + 16 > end)
 			return 0;	/* no (0,0) terminator before the blob ends */
@@ -534,6 +558,7 @@ int fdt_framebuffer(uintptr_t fdt, struct fdt_video *video)
 
 static int name_starts_with(const char *name, const char *prefix)
 {
+	/* bounded: ends at the end of prefix (a literal) or the first mismatch */
 	while (*prefix && *name == *prefix)
 		name++, prefix++;
 	return *prefix == 0;

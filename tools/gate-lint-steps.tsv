@@ -1,0 +1,19 @@
+# gate-lint-steps.tsv: the ONE table of the gate's seconds-long lint steps (AP-278, R42). Read by tools/gate-lint-first; tools/test_gate_lint_first.py checks every row
+# against tools/check-all.sh. Columns (TAB): name, gate, command.
+#   gate = step           -> check-all.sh has `step B <name> <command>` with exactly this command (the test compares them);
+#   gate = inside:validate -> not a step of its own: tools/validate-repo.py runs it (the test greps validate-repo.py for the command).
+#   command = [needs FILE] CMD...: with `needs FILE` the step is SKIPped (printed) when FILE is not in the checkout, as check-all.sh `needs` does.
+# A row whose tool is not in tools/ yet (branch not merged) may lack its check-all.sh line; the test requires the line as soon as the tool file exists.
+inputs	step	needs tools/gate-inputs bash tools/gate-inputs
+validate	step	python3 tools/validate-repo.py
+mutant-needles	step	needs tools/lint-mutant-needles python3 tools/lint-mutant-needles
+boot-markers	step	needs tools/lint-boot-markers python3 tools/lint-boot-markers
+lint-silent	step	needs tools/lint-silent python3 tools/lint-silent
+consumed	step	needs tools/lint-consumed python3 tools/lint-consumed
+rules	step	python3 tools/check-rules.py --strict
+phone-converge	step	tools/lint-phone-converge
+census	inside:validate	python3 tools/tool-census --check
+lint-c-style	inside:validate	python3 tools/lint-c --style
+lint-size	inside:validate	python3 tools/lint-size --check
+public-split	step	needs tools/make-public-tree.py python3 tools/make-public-tree.py --check
+public-guard	step	needs tools/public-push-guard python3 tools/public-push-guard gate HEAD

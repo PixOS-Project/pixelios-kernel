@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""abl-dmesg: read the bootloader (ABL) log ring of the Pixel 6a with `fastboot oem dmesg` (TP-044). Python 3 stdlib only.
+
+  tools/abl-dmesg [--out DIR] [--label LABEL] [--dry-run]
+
+Spec: docs/tool-proposals/TP-044-abl-dmesg.md. Facts: super docs/research/ABL-oem-dmesg.md (handler 0x3b488 read-only, argc must be 0,
+ring sent as TEXT chunks of <= 252 B then OKAY, locked bootloader -> `FAILoem command (dmesg) is not allowed when locked`).
+Caller: super docs/runplans/ba6-btaudio.md:36-38 (post-run step, PR-1), run as `tools/phone-lock run --owner method -- tools/abl-dmesg --label X`.
+
+Refusals (exit 2, RESULT: ERROR, no oem command sent): the caller does not hold the phone lock (`tools/phone-lock check`, like tools/fboot.sh:13-14);
+`fastboot devices` does not list exactly one device; `fastboot -s SERIAL getvar product` is not bluejay. Every later call carries -s SERIAL.
+The only fastboot verbs this tool can run are ALLOWED below (checked in fb(), raises -> RESULT: ERROR, also under python -O): devices, getvar product, oem dmesg. It never reboots/flashes/erases.
+
+How fastboot prints the reply (read from AOSP system/core tag platform-tools-34.0.5, the version installed at /usr/bin/fastboot):
+fastboot/fastboot_driver.cpp RawCommand (lines ~488-505): a reply starting `INFO` calls info_(rest) and `TEXT` calls text_(rest), the 4-letter
+prefix is removed, `OKAY`/`FAIL` end it. fastboot/fastboot.cpp:223-229: InfoMessage prints "(bootloader) %s\\n" and TextMessage prints "%s" (NO
+newline added) both to STDERR; Epilog (fastboot.cpp:~213) then prints "OKAY [%7.3fs]\\n", main prints "Finished. Total time: %.3fs\\n"; on FAIL it
+prints "FAILED (remote: '<msg>')" and "fastboot: error: Command failed". So the joined ring = stderr with that trailing OKAY/Finished block cut off,
+chunk boundaries preserved exactly (nothing is inserted between chunks). No prefix has to be stripped from TEXT. [read from source]
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import argparse, os, re, signal, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PHONE_LOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phone-lock")  # always the sibling, no env override (review F5)
+TIMEOUT = 30.0  # seconds; ABL_DMESG_TIMEOUT overrides it (parsed in main, bad value = RESULT: ERROR)
+OEM_DMESG = ("oem", "dmesg")  # the one command this tool sends
+ALLOWED = {("devices",), ("getvar", "product"), OEM_DMESG}
+KEYS = ("Reboot mode:", "RST_STAT", "Reboot Info:", "fastboot enter reason")
+TAIL = re.compile(r"OKAY \[ *[0-9.]+s\]\n(Finished\. Total time: [0-9.]+s\n?)?\Z")
+
+
+def result(code, msg):
+    print("RESULT: %s" % " ".join(msg.split()))  # always one line, always the last stdout line (review F3)
+    return code
+
+
+def fb(serial, *verb):
+    """Run one allowlisted fastboot verb (with -s SERIAL unless it is `devices`). Returns (rc, stdout, stderr) or None on timeout."""
+    if tuple(verb) not in ALLOWED:  # explicit check, not assert: survives python -O (review F6)
+        raise RuntimeError("fastboot verb not allowed: %r" % (verb,))
+    argv = ["fastboot"] + ([] if verb == ("devices",) else ["-s", serial]) + list(verb)
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        return None
+    return p.returncode, out, err
+
+
+def main(argv):
+    try:
+        return run(argv)
+    except Exception as e:  # rule 8: never a traceback without a RESULT line (review F1)
+        return result(2, "ERROR unexpected %s: %s" % (type(e).__name__, e))
+
+
+def run(argv):
+    global TIMEOUT
+    ap = argparse.ArgumentParser(prog="abl-dmesg", description="read the ABL log ring with fastboot oem dmesg (TP-044)")
+    ap.add_argument("--out", default=os.path.join(ROOT, "logs", "abl-dmesg"))
+    ap.add_argument("--label", default="run")
+    ap.add_argument("--dry-run", action="store_true")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit:
+        return result(2, "ERROR usage: tools/abl-dmesg [--out DIR] [--label LABEL] [--dry-run]")
+    if os.environ.get("ABL_DMESG_TIMEOUT"):
+        try:
+            TIMEOUT = float(os.environ["ABL_DMESG_TIMEOUT"])
+        except ValueError:
+            return result(2, "ERROR bad ABL_DMESG_TIMEOUT=%r" % os.environ["ABL_DMESG_TIMEOUT"])
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", a.label):
+        return result(2, "ERROR bad --label (use [A-Za-z0-9._-])")
+    try:
+        lk = subprocess.run([PHONE_LOCK, "check"], capture_output=True, text=True, timeout=20).returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return result(2, "ERROR phone-lock check could not run: %s" % e)
+    if lk != 0:
+        return result(2, "ERROR phone lock not held by the caller (run under tools/phone-lock run), no command sent")
+    r = fb("", "devices")
+    if r is None or r[0] != 0:
+        return result(2, "ERROR fastboot devices failed, no command sent")
+    devs = [l.split()[0] for l in r[1].splitlines() if l.strip()]
+    if len(devs) != 1:
+        return result(2, "ERROR fastboot devices lists %d devices (need exactly 1), no command sent" % len(devs))
+    ser = devs[0]
+    r = fb(ser, "getvar", "product")
+    if r is None:
+        return result(2, "ERROR getvar product timed out after %gs, no command sent" % TIMEOUT)
+    m = re.search(r"^product:\s*(\S+)", r[2] + r[1], re.M)
+    if not m or m.group(1) != "bluejay":
+        return result(2, "ERROR not bluejay/fastboot (product=%s), no command sent" % (m.group(1) if m else "unknown"))
+    if a.dry_run:
+        print("dry-run: would send: fastboot -s <serial> %s" % " ".join(OEM_DMESG))
+        return result(0, "PASS dry-run checks ok, oem dmesg not sent")
+    r = fb(ser, *OEM_DMESG)
+    if r is None:
+        return result(1, "FAIL timeout after %gs" % TIMEOUT)
+    rc, _, err = r
+    if rc != 0:  # only a non-zero rc is a device FAIL; ring text with these words and rc 0 is data (review F2)
+        if "not allowed when locked" in err:
+            return result(1, "FAIL locked (bootloader is locked; oem dmesg refused)")
+        return result(1, "FAIL fastboot rc=%d: %s" % (rc, " ".join(err.replace(ser, "<redacted>").split())[-200:]))
+    text, nsub = TAIL.subn("", err, count=1)
+    text = text.replace(ser, "<redacted>")
+    warn = 0
+    if not nsub:
+        warn = 1
+        print("WARN no `OKAY [..s]` tail found in fastboot output: the file may contain fastboot's footer (different fastboot format?)")
+    if not text.strip():
+        return result(1, "FAIL empty output")
+    path = os.path.join(a.out, "%s-%s.txt" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), a.label))
+    try:
+        os.makedirs(a.out, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError as e:
+        return result(2, "ERROR cannot write %s: %s" % (path, e))
+    for l in text.splitlines():
+        if any(k in l for k in KEYS):
+            print(l)
+    mode = re.search(r"Reboot mode:\s*(0x[0-9a-fA-F]+)", text)
+    rst = re.search(r"RST_STAT:?\s*(0x[0-9a-fA-F]+)", text)
+    mode, rst = (mode.group(1) if mode else "unknown"), (rst.group(1) if rst else "unknown")
+    fields = "bytes=%d reboot_mode=%s rst_stat=%s file=%s warn=%d" % (len(text.encode()), mode, rst, path, warn)
+    if "unknown" in (mode, rst):
+        return result(1, "PARTIAL " + fields)
+    return result(0, "PASS " + fields)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

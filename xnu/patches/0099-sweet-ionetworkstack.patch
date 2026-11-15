@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -134,6 +134,47 @@
+@@ -134,6 +134,53 @@
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
@@ -39,16 +39,22 @@
 +}
 +
 +IOReturn
-+IONetworkStackUserClient::externalMethod(uint32_t selector __unused, IOExternalMethodArguments *args __unused,
++IONetworkStackUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args __unused,
 +    IOExternalMethodDispatch *dispatch __unused, OSObject *target __unused, void *reference __unused)
 +{
++	/* T-07 (silent-failure audit): the stub refuses every call; say so (first 8 calls, then one line per 1000) */
++	static uint32_t calls;
++	calls++;
++	if (calls <= 8 || calls % 1000 == 0) {
++		IOLog("SWEET GAP: IONetworkStack user client selector %u refused (kIOReturnUnsupported, stub of patch 0099), call %u\n", selector, calls);
++	}
 +	return kIOReturnUnsupported;
 +}
 +
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
  
-@@ -223,6 +264,12 @@
+@@ -223,6 +270,12 @@
  		}
  	}
  

@@ -1,0 +1,195 @@
+SWEET WLAN run F2 (patch 0135, docs/research/53-wd4-msgbuf-ring-plan.md s5.2), boot-arg sweetwlan=9 = level 8 (patch 0134, unchanged: same log, reads and stores) + more READ-ONLY dumps of the halted firmware's RAM through BAR2 window 0. No new store, no new mapping, no cfg 0x84 store, no new read row.
+Why: on hardware (run F1, wlan-runF1-0134, observed) the console (0x3b19d8), the mailbox data words (0x3ed8b4, 0x3ed8b8) and rings_info_ptr (0x3ed578) are below 0x400000, so swl_f1_span_ok refused them in the tail window (review 0134 F3).
+What: swl_f2() runs in W17 after the CA7 re-halt and the cfg 0x84 := 0 restore row (restore ended ok), before the PCIe core group: mailbox data (2 words), ring_info (19), the 5 ring_mem entries (80 B), the console (hnd_cons_t, up to 4 KiB, same 128 lines x 120 chars caps), each pointer through swl_f1_span_ok with window 0. Guard: cfg 0x84 reads 0 and the RAM word at 0x200000 still equals word 0 of the pinned image (the shared word is in the tail window and cannot be re-read without a store); both printed. Stops (all-ones block of 2+ words, failed read or precondition) happen with nothing armed.
+Glue: level 9 accepted, named "F2"; rev gate (level >= 7) unchanged. HW-WRITE path: unreviewed (read-only additions to a reviewed path).
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index d9c3b88..22336da 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -16,6 +16,8 @@
+  * values that let the CPU run only at level 7, each once, in order) and the PCIe core rev gate for level 7. docs/research/43c-run-e-release.md.
+  * Patch 0134 (run F1, sweetwlan=8 = run E + read-only dumps of the running firmware before the re-halt, docs/research/53-wd4-msgbuf-ring-plan.md s5.2): the glue only accepts level 8 and names the run; the reads are the
+  * header's (sw3_rd serves them from the pages already mapped), no store, no new mapping. The sw3_ca7_ok limit (>= 7) holds at level 8 unchanged.
++ * Patch 0135 (run F2, sweetwlan=9 = level 8 + more read-only dumps, in BAR2 window 0, after the re-halt and the cfg 0x84 restore): the glue only accepts level 9 and names the run; the PCIe core rev gate (level >= 7) and the
++ * sw3_ca7_ok limit (>= 7) hold at level 9 unchanged; no store, no new mapping (sw3_rd serves BAR2 offsets below 4 MiB).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -347,7 +349,7 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	x.nv_src_crc = sw_nv.crc;
+ 	x.nv = sw_nvbuf;
+ 	x.nv_cap = sizeof sw_nvbuf;
+-	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 7 ? "F1" : level > 6 ? "E" : level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
++	printf("SWEET WLAN: stage 3 level %d starts (chip WRITES, run %s, docs/research/43)\n", level, level > 8 ? "F2" : level > 7 ? "F1" : level > 6 ? "E" : level > 5 ? "D" : level > 4 ? "C" : level > 3 ? "B" : "A");
+ 	(void)swl_stage3(&x);
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+@@ -373,7 +375,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 8 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 9 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		printf("SWEET WLAN: sweetwlan=%u without a usable /sweet-wlan node, not touched\n", level);
+diff --git a/bsd/dev/sweet_wlan_wr.h b/bsd/dev/sweet_wlan_wr.h
+index 23e74cb..9d565bb 100644
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -137,6 +137,16 @@ _Static_assert(SWW_FW_LEN == SWW_IMG_MAX, "the pinned firmware is the largest ac
+ #define SWW_F1_ELBI     0x40u
+ #define SWW_F1_CFG      0x80u
+ 
++/* Run F2 (patch 0135; boot-arg sweetwlan=9 = level 8 unchanged + more READ-ONLY dumps). On hardware (wlan-runF1-0134) the console (0x3b19d8), the mailbox data words (0x3ed8b4, 0x3ed8b8) and rings_info_ptr (0x3ed578) lie BELOW 0x400000, so
++ * swl_f1_span_ok() refused them in the tail window (review 0134 F3). After the restore of W17 the BAR2 window (cfg 0x84) is back at 0 and the CA7 is in reset: swl_f2() reads those pointers through window 0. No constant is new: the layout
++ * constants are the F1 ones above (SWW_SH_*, SWW_RI_WORDS, SWW_RM_*, SWW_CON_*), the reads are the run 2 rows of swl_rt[] (BAR2 window 0, SWW_RAM_BASE..SWW_TCM_BYTES - 4) and the cfg 0x84 read row. */
++#define SWW_F2_LEVEL    (SWW_LEVEL0 + 7)        /* sweetwlan=9 */
++#define SWW_F2_LOW      0x01u                   /* x->f2 bits: the window 0 guard held / what was dumped */
++#define SWW_F2_MB       0x02u
++#define SWW_F2_RI       0x04u
++#define SWW_F2_RM       0x08u
++#define SWW_F2_CON      0x10u
++
+ enum { SWW_CFG = 1, SWW_ATU, SWW_BAR0, SWW_BAR2, SWW_ELBI, SWW_ISO };
+ 
+ /* phase flags (what the steps proved), required by swl_wt[].need */
+@@ -368,6 +378,8 @@ struct swl_wx {
+ 	int halted;                                     /* run E: the CA7 is in reset again, proven by the read-back of the re-halt (swl_restore) */
+ 	int ca_ok;                                      /* run E (review 0133 F3): the CA7 RESET_CTL := 1 of swl_restore was stored and read back */
+ 	uint32_t f1;                                    /* run F1 (patch 0134): SWW_F1_* bits of the dumps that were made (0 below level 8) */
++	uint32_t f2;                                    /* run F2 (patch 0135): SWW_F2_* bits of the window 0 dumps that were made (0 below level 9) */
++	uint32_t f2p[4];                                /* run F2: the pointers the firmware handed over in the shared structure, read by F1 in the tail window: h2d mailbox, d2h mailbox, rings_info, console (0 = not read) */
+ };
+ 
+ static inline const char *
+@@ -1835,6 +1847,7 @@ swl_f1(struct swl_wx *x, uint32_t sh, uint32_t sw, uint32_t fl)
+ 
+ 	x->row = 17;
+ 	x->f1 = 0;
++	x->f2p[0] = x->f2p[1] = x->f2p[2] = x->f2p[3] = 0;
+ 	if ((fl & (SWW_SH_ASSERT | SWW_SH_TRAP)) != 0) {
+ 		printf("SWEET WLAN: F1 firmware flags %#x report assert/trap\n", fl);
+ 		return swl_stop(x, SWW_E_FWFAIL);
+@@ -1853,6 +1866,10 @@ swl_f1(struct swl_wx *x, uint32_t sh, uint32_t sw, uint32_t fl)
+ 		printf("SWEET WLAN: F1 shared structure %#x, %u of %u words\n", sh, n, SWW_SH_WORDS);
+ 		swl_f1_dump("shared", sd, n);
+ 		x->f1 |= SWW_F1_SH;
++		x->f2p[0] = sd[SWW_SH_H2D_MB];          /* for swl_f2 (words past the n read are 0) */
++		x->f2p[1] = sd[SWW_SH_D2H_MB];
++		x->f2p[2] = sd[SWW_SH_RINGINFO];
++		x->f2p[3] = sd[SWW_SH_CONSOLE];
+ 	} else {
+ 		printf("SWEET WLAN: F1 shared structure %#x is not a readable range, not read\n", sh);
+ 	}
+@@ -1909,6 +1926,92 @@ swl_f1(struct swl_wx *x, uint32_t sh, uint32_t sw, uint32_t fl)
+ 	return 0;
+ }
+ 
++/* Run F2 (patch 0135): the dumps F1 had to refuse because the pointer is below 0x400000, read through BAR2 window 0 AFTER the re-halt and the cfg 0x84 restore of W17. Read only: no store, no mapping, only rows of swl_rt[]. The pointers are
++ * the ones F1 read from the shared structure (x->f2p), each goes through swl_f1_span_ok() with window 0 ([SWW_RAM_BASE, 4 MiB) and the RAM end, aligned, no wrap) before one word is read; one outside the window is reported and skipped (the ones
++ * above 4 MiB were dumped by F1). The guard first: cfg 0x84 reads 0 and the RAM word at SWW_RAM_BASE still equals word 0 of the pinned image (W10 copied it there; the shared word at ram_end - 4 cannot be re-read, it is in the tail
++ * window and selecting that window is a store); both are printed; a mismatch skips the dumps (0). The F1 helpers print the lines with the prefix "F1": every line between "F2 low window" and "F2 done" belongs to F2. Every stop (all-ones
++ * block of 2+ words, a failed read or precondition) happens with nothing armed. 0 = done or skipped, negative = stopped. */
++static inline int
++swl_f2(struct swl_wx *x)
++{
++	uint32_t c84 = 0xFFFFFFFFu, w0 = 0xFFFFFFFFu, want, mb[2] = { 0 }, ri[SWW_RI_WORDS] = { 0 }, rm[SWW_RM_WORDS] = { 0 }, f1k, i;
++	int rc, ok0, ok1;
++
++	x->row = 17;
++	x->f2 = 0;
++	if (x->level < SWW_F2_LEVEL) {
++		return swl_stop(x, SWW_E_LEVEL);
++	}
++	if (swl_wpre(x)) {
++		return swl_stop(x, SWW_E_PRE);
++	}
++	SWW_RD(x, SWW_CFG, 0, SWW_CFG_WIN2, c84);
++	if (c84 != 0) {
++		printf("SWEET WLAN: F2 low window: cfg 0x84 is %#x, not 0, not read\n", c84);
++		return 0;
++	}
++	SWW_RD(x, SWW_BAR2, 0, SWW_RAM_BASE, w0);
++	want = x->img != NULL && x->img_len >= 4u ? swl_img_word(x, 0) : 0xFFFFFFFFu;
++	printf("SWEET WLAN: F2 low window: cfg 0x84 %#x, [%#x] %#x, image word 0 %#x\n", c84, SWW_RAM_BASE, w0, want);
++	if (w0 == 0xFFFFFFFFu && want != 0xFFFFFFFFu) {
++		return swl_stop(x, SWW_E_DEAD);
++	}
++	if (w0 != want || want == 0xFFFFFFFFu) {
++		printf("SWEET WLAN: F2 the RAM changed while the CA7 ran, not read\n");
++		return 0;
++	}
++	x->f2 |= SWW_F2_LOW;
++	ok0 = swl_f1_block(x, 0, x->f2p[0], 1, &mb[0]);
++	ok1 = ok0 != 0 ? ok0 : swl_f1_block(x, 0, x->f2p[1], 1, &mb[1]);
++	if (ok0 < 0 || ok1 < 0) {
++		return ok0 < 0 ? ok0 : ok1;
++	}
++	if (ok0 == 0 && ok1 == 0) {
++		printf("SWEET WLAN: F2 mailbox data: host to dongle [%#x] = %#x, dongle to host [%#x] = %#x\n", x->f2p[0], mb[0], x->f2p[1], mb[1]);
++		x->f2 |= SWW_F2_MB;
++	} else {
++		printf("SWEET WLAN: F2 mailbox data pointers %#x %#x are not readable words in window 0, not read\n", x->f2p[0], x->f2p[1]);
++	}
++	rc = swl_f1_block(x, 0, x->f2p[2], SWW_RI_WORDS, ri);
++	if (rc < 0) {
++		return rc;
++	}
++	if (rc == 0) {
++		printf("SWEET WLAN: F2 ring_info %#x\n", x->f2p[2]);
++		swl_f1_dump("lo ring_info", ri, SWW_RI_WORDS);
++		x->f2 |= SWW_F2_RI;
++		rc = swl_f1_block(x, 0, ri[0], SWW_RM_WORDS, rm);
++		if (rc < 0) {
++			return rc;
++		}
++		if (rc == 0) {
++			for (i = 0; i < SWW_RM_N; i++) {
++				printf("SWEET WLAN: F2 ring_mem %u: idx %u type %u max_item %u len_items %u base %08x%08x\n", i, rm[4u * i] & 0xFFFFu, (rm[4u * i] >> 16) & 0xFFu, rm[4u * i + 1u] & 0xFFFFu, rm[4u * i + 1u] >> 16, rm[4u * i + 3u], rm[4u * i + 2u]);
++			}
++			x->f2 |= SWW_F2_RM;
++		} else {
++			printf("SWEET WLAN: F2 ringmem_ptr %#x is not a readable range in window 0, not read\n", ri[0]);
++		}
++	} else {
++		printf("SWEET WLAN: F2 rings_info_ptr %#x is not a readable range in window 0, not read\n", x->f2p[2]);
++	}
++	if (swl_wpre(x)) {
++		return swl_stop(x, SWW_E_PRE);
++	}
++	f1k = x->f1;                            /* swl_f1_console sets SWW_F1_CON: keep F1's mask apart */
++	x->f1 = 0;
++	rc = swl_f1_console(x, 0, x->f2p[3]);
++	if (x->f1 & SWW_F1_CON) {
++		x->f2 |= SWW_F2_CON;
++	}
++	x->f1 = f1k;
++	if (rc < 0) {
++		return rc;
++	}
++	printf("SWEET WLAN: F2 done mask %#x\n", x->f2);
++	return 0;
++}
++
+ /* W17: the CA7 ran for the first time. Poll the shared-area word (ram_end - 4, the token until the firmware replaces it) 100 times, 50 ms apart (OpenBSD if_bwfm_pci.c:866-883; DHD
+  * dhd_pcie.c:13637-13705: loop while the word is 0 or the token, all-ones is the link-down error): every change is printed. A shared address must be 4-aligned and inside [SWW_RAM_BASE, ram_end - 4); its first word
+  * is read (the version byte is printed, a version outside 5..7 only logged). A timeout prints the last word and the CA7 wrapper state and stops. Whatever happens the run ends with the stop action
+@@ -1979,6 +2082,16 @@ swl_w17(struct swl_wx *x)
+ 		printf("SWEET WLAN: W17 STOP: %s (code %d), restore=%s\n", swl_ename(SWW_E_HALT), SWW_E_HALT, swl_rsname(x->restore));
+ 		return -SWW_E_HALT;
+ 	}
++	if (x->level >= SWW_F2_LEVEL && x->restore == SWW_RS_OK) {   /* run F2: window 0 is certain (the CA7 is in reset and the cfg 0x84 restore row held); before the PCIe core group: its window selects are stores, the dumps are what this run is for */
++		int rs = x->restore, rc = swl_f2(x);
++
++		if (rc) {
++			x->restore = rs;        /* as below: the stop found nothing armed */
++			return rc;
++		}
++	} else if (x->level >= SWW_F2_LEVEL) {
++		printf("SWEET WLAN: F2 window 0 dumps not made, restore=%s\n", swl_rsname(x->restore));
++	}
+ 	if (x->level >= SWW_F1_LEVEL && x->restore == SWW_RS_OK) {   /* run F1 (review 0134 F1): the PCIe core group with the CA7 in reset */
+ 		int rs = x->restore, rc = swl_f1_pcie(x);
+ 

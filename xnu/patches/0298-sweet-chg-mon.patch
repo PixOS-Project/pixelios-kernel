@@ -1,0 +1,45 @@
+SWEET CHG MON (patch 0298, resident iOS session, user 2026-11-11): after the 10 phase-3 samples the 30 s CNFG_09 watcher (patch 0287, stage 3) also logs one battery row per tick for the rest of the boot, `SWEET CHG MON: t=..s current=.. uA vcell=.. mV`, so tools/resident can apply its battery floor and "falling" rule while the phone stays in iOS. READS ONLY: the same two MAX77759 fuel-gauge registers (0x36: 0x0a Current, 0x09 VCell) and conversions as p3_sample, after the watcher checked the phase-1 gate; no new chip or controller register (the transfer path is chg_i2c_read, as in 0284/0287). A failed read logs `SWEET CHG GAP: MON fuel-gauge read failed`; like every failed read since 0284 it stops the bus, so the next watcher tick ends phase 3 with its own GAP (the host sees no more rows = no battery data). Active only where 0287 stage 3 runs (sweetchgi2c=1 sweetchgicl=900, the xrun default). Applies after 0287. Host test: tools/test_chg_mon.py.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+index c4bd4c2..94e5c0a 100644
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -841,6 +841,30 @@ p3_sample(uint32_t t_s)
+ 	}
+ }
+ 
++/*
++ * Patch 0298 (resident iOS session, user 2026-11-11): one battery row per watcher tick (30 s) for the whole boot, so the host can apply the
++ * battery floor and the "falling" rule (tools/resident). Reads only, the same two fuel-gauge registers and conversions as p3_sample
++ * (0x36: 0x0a Current, 0x09 VCell); the phase-1 gate was checked by the caller. A failed read stops the bus (chg_i2c_read sets i2c_dead), so
++ * the next watcher tick ends phase 3 with its own GAP; this row logs the GAP that names the fuel gauge.
++ */
++static void
++mon_row(uint32_t t_s)
++{
++	uint8_t cu[2], vc[2];
++	int32_t cs;
++	uint32_t v;
++
++	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0) {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_log("SWEET CHG GAP: MON fuel-gauge read failed at t=%us: bus stopped, no more battery rows this boot\n", t_s);
++		return;
++	}
++	(void)i2c_wr(I_INTEN, 0);
++	cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
++	v = vc[0] | ((uint32_t)vc[1] << 8);
++	i2c_log("SWEET CHG MON: t=%us current=%d uA vcell=%u mV\n", t_s, (int)((cs * 3125) / 10), (uint32_t)(((uint64_t)v * 78125u) / 1000000u));
++}
++
+ static void
+ i2c_p3_tick(int log_pending)
+ {
+@@ -927,6 +951,7 @@ i2c_p3_tick(int log_pending)
+ 				p3_done("watcher stopped");
+ 				return;
+ 			}
++			mon_row((uint32_t)((p3_next_ms - p3_t0_ms) / 1000u));
+ 		}
+ 		p3_next_ms += P3_SAMPLE_MS;
+ 	}

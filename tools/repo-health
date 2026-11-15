@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""repo-health: audit the shared kernel repo and its hooks for the corruption classes seen on 2026-11-02; called by tools/gate-request before every gate (R30).
+
+  tools/repo-health [--repo DIR]   run every check on the kernel clone that DIR belongs to (default: this checkout), one line each, last line RESULT: PASS|FAIL repo-health ...
+  tools/repo-health --repair-index [--repo DIR]   safe repair of the `index` check only (refuses unless the staged diff is provably a stale index, see repair_index)
+  tools/repo-health --self-test    builds scratch repos and breaks each invariant in turn (each must be caught), then a clean one (must pass)
+
+Checks (each names the do-instead; none changes anything):
+  bare        core.bare must be false on the main clone (a test fixture under a leaked GIT_DIR once set it true: every git command then failed "must be run in a work tree")
+  user        no fixture user.name / user.email in the repo config (fixtures wrote t / t@t); a local *@users.noreply.github.com email is allowed (T-536a public-identity stopgap)
+  hooks       core.hooksPath is <common git dir>/pixos-hooks (not a linked worktree's private dir) and every tracked tools/hooks/* equals its installed copy
+  fixtures    no local branch whose every commit beyond trunk is authored by `t`, and no worktree at a test-fixture path under /tmp (kernel-hooks-test.*, tmp*) (leftovers of fixtures that ran against the real repo)
+  stray-root  no tracked root-level file with a 1-2 letter name and no extension on trunk (a fixture committed `f`)
+  trunk-authors  none of the last 30 trunk commits is authored by `t`
+  index       the main checkout's index matches HEAD (a stale index makes a plain `git commit` there commit phantom reversions of other threads' merged work)
+Git environment of the caller (GIT_DIR, GIT_INDEX_FILE ...) is scrubbed first: a hook exports it and it overrides -C.
+Exit 0 PASS / 1 FAIL / 2 usage. Last line: RESULT: PASS|FAIL repo-health checks=N failed=K"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+# keep equal to PHONE_TOOLS in tools/agent-guard (tools/test_repo_health.py compares them)
+PHONE_TOOL_PATHS = {"tools/" + n for n in ("probe-run", "xrun", "fboot.sh", "plock.sh", "phone-lock", "phone", "fflash-userdata.sh", "fboot-android", "golden-pull")}
+
+
+def git(cwd, *a):
+    r = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, env=CLEAN_ENV, timeout=60)
+    return r.returncode, r.stdout.strip()
+
+
+def common_dir(start):
+    rc, out = git(start, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return out if rc == 0 else ""
+
+
+def main_clone(start):
+    c = common_dir(start)
+    return os.path.dirname(c) if c.endswith("/.git") else c
+
+
+def checks(start):
+    """-> [(name, ok, detail)]"""
+    out = []
+    c = common_dir(start)
+    if not c:
+        return [("repo", False, "not inside a git repository: %s" % start)]
+    main = main_clone(start)
+    rc, bare = git(main, "config", "--get", "core.bare")
+    out.append(("bare", bare != "true", "core.bare=true on %s. Do instead: git config core.bare false (then find the process that set it)" % main if bare == "true" else "core.bare=%s" % (bare or "unset")))
+    rc, users = git(main, "config", "--local", "--get-regexp", r"^user\.(name|email)$")
+    # T-03ff: the public-identity stopgap (T-536a) sets a local noreply user.email on purpose; a fixture identity (t, t@t, any non-noreply email) is still a FAIL
+    badu = [l for l in users.splitlines() if not (l.startswith("user.email ") and l.split(None, 1)[1].endswith("@users.noreply.github.com")) and not (l.startswith("user.name ") and l.split(None, 1)[1].strip() not in ("t", ""))]
+    out.append(("user", not badu, "local user config present (%s). Do instead: git config --unset-all user.name; git config --unset-all user.email (a local *@users.noreply.github.com email is allowed, T-536a)" % "; ".join(badu) if badu else "no local fixture user config"))
+    rc, hp = git(main, "config", "--get", "core.hooksPath")
+    want = os.path.join(c, "pixos-hooks")
+    bad = []
+    if hp and os.path.realpath(hp) != os.path.realpath(want):
+        bad.append("core.hooksPath=%s, want %s" % (hp, want))
+    tracked = os.path.join(main, "tools", "hooks")
+    if hp and os.path.isdir(tracked) and os.path.isdir(hp):
+        for name in sorted(os.listdir(tracked)):
+            a, b = os.path.join(tracked, name), os.path.join(hp, name)
+            if os.path.isfile(a) and not (os.path.isfile(b) and open(a, "rb").read() == open(b, "rb").read()):
+                bad.append("installed hook %s differs from tools/hooks/%s" % (name, name))
+    out.append(("hooks", not bad, "; ".join(bad) + ". Do instead: run tools/install-hooks from the main clone with a clean environment" if bad else "hooksPath=%s, copies match" % (hp or "unset")))
+    rc, branches = git(main, "for-each-ref", "--format=%(refname:short) %(authorname)", "refs/heads")
+    fx = []
+    for l in branches.splitlines():   # a branch is a fixture leftover only when EVERY commit it has beyond trunk is by `t` (an old real branch with a `t` tip commit is not)
+        name = l.split()[0]
+        if l.rsplit(" ", 1)[-1] != "t" or name == "trunk":
+            continue
+        if set(git(main, "log", "trunk.." + name, "--format=%an")[1].splitlines()) == {"t"}:
+            fx.append(name)
+    rc, wts = git(main, "worktree", "list", "--porcelain")
+    tmpwt = [l[len("worktree "):] for l in wts.splitlines() if re.match(r"worktree /tmp/(kernel-hooks-test\.|tmp[a-z0-9_]{6,}/)", l)][1 if wts.startswith("worktree /tmp/tmp") else 0:]   # the first entry is the main worktree itself
+    out.append(("fixtures", not fx and not tmpwt, "fixture leftovers: branches %s, /tmp worktrees %s. Do instead: git worktree prune; git branch -D <branch> after checking the commits are all authored by t" % (fx, tmpwt) if (fx or tmpwt) else "no fixture branches or /tmp worktrees"))
+    rc, root = git(main, "ls-tree", "--name-only", "trunk")
+    stray = [n for n in root.splitlines() if re.fullmatch(r"[A-Za-z0-9_-]{1,2}", n)]
+    out.append(("stray-root", not stray, "tracked root file(s) %s on trunk look like a fixture leftover. Do instead: remove them in a tool-lane worktree and merge" % stray if stray else "no stray root files"))
+    rc, authors = git(main, "log", "trunk", "-30", "--format=%an")
+    tn = authors.splitlines().count("t")
+    out.append(("trunk-authors", tn == 0, "%d of the last 30 trunk commits are authored by `t` (a test fixture committed into the real repo). Do instead: inspect git log trunk --author=t and revert in a worktree" % tn if tn else "no fixture-authored trunk commits"))
+    rc, cached = git(main, "diff", "--cached", "--name-only")
+    br = git(main, "symbolic-ref", "-q", "--short", "HEAD")[1]
+    stale = bool(cached) and br == "trunk"
+    out.append(("index", not stale, "the main checkout's index differs from HEAD (%d staged path(s), e.g. %s): a stale index. Do instead: never `git commit` there without -- PATHS; if its tree equals an ancestor of trunk, `git reset --hard HEAD`" % (len(cached.splitlines()), cached.splitlines()[0]) if stale else "main checkout index matches HEAD"))
+    return out
+
+
+def repair_index(start):
+    """-> (done, message). Only when it is provably safe: branch trunk, no unstaged change, the index tree equals the tree of an ancestor of HEAD (so the staged diff is only a stale index, no unique work), phone lock free (or held but no staged path is a phone tool: T-0210)."""
+    main = main_clone(start)
+    if git(main, "symbolic-ref", "-q", "--short", "HEAD")[1] != "trunk":
+        return False, "not on trunk: refusing"
+    if not git(main, "diff", "--cached", "--name-only")[1]:
+        return False, "index already matches HEAD: nothing to do"
+    if git(main, "diff", "--name-only")[1]:
+        return False, "unstaged changes exist (possible unique work): refusing"
+    tree = git(main, "write-tree")[1]
+    if tree not in git(main, "log", "-300", "--format=%T")[1].split():
+        return False, "the index tree equals no recent ancestor of HEAD (possible unique staged work): refusing"
+    lock = os.path.join(main, "tools", "phone-lock")
+    if os.path.exists(lock) and subprocess.run([sys.executable, lock, "status"], capture_output=True, env=CLEAN_ENV).returncode != 0:
+        # T-0210: a held lock only protects the phone tools (agent-guard E8b, AP-18). The reset rewrites exactly the paths that differ between the index tree and HEAD,
+        # so when none of them is a phone tool nothing a run reads changes: repair anyway (else gate-request is refused for the length of every run)
+        hit = [n for n in git(main, "diff", "--cached", "--name-only")[1].splitlines() if n in PHONE_TOOL_PATHS]
+        if hit:
+            return False, "phone lock is held and the stale index touches phone tool(s) %s: not writing into the shared clone now" % hit
+    rc, out = git(main, "reset", "-q", "--hard", "HEAD")
+    return rc == 0, "index reset to HEAD (it equalled an ancestor tree: only a stale index)" if rc == 0 else "git reset failed: " + out
+
+
+def report(results):
+    for name, ok, detail in results:
+        print("%s %-13s %s" % ("ok  " if ok else "FAIL", name, detail))
+    failed = sum(1 for _, ok, _ in results if not ok)
+    print("RESULT: %s repo-health checks=%d failed=%d" % ("FAIL" if failed else "PASS", len(results), failed))
+    return 1 if failed else 0
+
+
+def self_test():
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        def g(*a): return git(d, "-c", "user.name=real", "-c", "user.email=r@r", *a)
+        def commit(msg, author="real"):
+            subprocess.run(["git", "-C", d, "-c", "user.name=" + author, "-c", "user.email=a@a", "commit", "-q", "--allow-empty", "-m", msg], env=CLEAN_ENV, check=True, capture_output=True)
+        g("init", "-q", "-b", "trunk")
+        commit("base")
+        def names(): return sorted(n for n, good, _ in checks(d) if not good)
+        def expect(label, want):
+            nonlocal ok
+            got = names()
+            if got != want:
+                ok = False
+                print("FAIL self-test %s: expected %s got %s" % (label, want, got))
+        expect("clean repo passes", [])
+        g("config", "core.bare", "true"); expect("bare caught", ["bare"]); g("config", "core.bare", "false")
+        g("config", "user.name", "t"); expect("user caught", ["user"]); g("config", "--unset-all", "user.name")
+        g("config", "user.email", "1+x@users.noreply.github.com"); expect("noreply email allowed", []); g("config", "user.email", "t@t"); expect("fixture email caught", ["user"]); g("config", "--unset-all", "user.email")
+        hooks = os.path.join(d, ".git", "pixos-hooks"); os.makedirs(hooks)
+        g("config", "core.hooksPath", os.path.join(d, ".git", "worktrees", "x", "pixos-hooks")); expect("hooksPath in a worktree dir caught", ["hooks"])
+        g("config", "core.hooksPath", hooks); expect("hooksPath right passes", [])
+        os.makedirs(os.path.join(d, "tools", "hooks")); open(os.path.join(d, "tools", "hooks", "pre-commit"), "w").write("new\n")
+        expect("installed hook missing/different caught", ["hooks"])
+        open(os.path.join(hooks, "pre-commit"), "w").write("new\n"); expect("matching copy passes", ["index"] if False else [])
+        g("checkout", "-q", "-b", "fx"); commit("m", "t"); g("checkout", "-q", "trunk"); expect("fixture branch + t author caught", ["fixtures"])
+        g("branch", "-D", "fx")
+        open(os.path.join(d, "f"), "w").write("x\n"); g("add", "f"); commit("add f"); expect("stray root file + staged-then-committed passes only the stray check", ["stray-root"])
+        g("rm", "-q", "-f", "f"); commit("rm f")
+        open(os.path.join(d, "tools", "x"), "w").write("y\n"); g("add", "tools/x"); expect("stale/staged index caught", ["index"])
+        done, msg = repair_index(d)
+        if done:   # an index with unique staged work must be refused
+            ok = False; print("FAIL self-test repair_index must refuse unique staged work: %s" % msg)
+        g("reset", "-q", "--hard", "HEAD"); expect("after reset passes", [])
+        commit("ancestor"); open(os.path.join(d, "tools", "y"), "w").write("z\n"); g("add", "tools/y"); commit("adds y"); g("branch", "keep")
+        g("read-tree", "HEAD~1")   # a stale index: HEAD moved on (adds y) but the index is the ancestor tree
+        os.remove(os.path.join(d, "tools", "y")) if os.path.exists(os.path.join(d, "tools", "y")) else None
+        done, msg = repair_index(d)
+        if not done or names():
+            ok = False; print("FAIL self-test repair_index must fix a pure stale index: %s %s" % (msg, names()))
+        # T-0210: a held phone lock blocks the repair only when the stale index touches a phone tool
+        open(os.path.join(d, "tools", "phone-lock"), "w").write("import sys\nsys.exit(1)\n")   # untracked fake: `status` says held
+        g("read-tree", "HEAD~1"); os.remove(os.path.join(d, "tools", "y"))
+        done, msg = repair_index(d)
+        if not done or names():
+            ok = False; print("FAIL self-test repair_index must fix a stale index (no phone tool) while the lock is held: %s %s" % (msg, names()))
+        commit("phone tool"); open(os.path.join(d, "tools", "xrun"), "w").write("v1\n"); g("add", "tools/xrun"); commit("adds xrun")
+        g("read-tree", "HEAD~1"); os.remove(os.path.join(d, "tools", "xrun"))
+        done, msg = repair_index(d)
+        if done or names() != ["index"]:
+            ok = False; print("FAIL self-test repair_index must refuse a stale index touching a phone tool while the lock is held: %s %s" % (msg, names()))
+        os.remove(os.path.join(d, "tools", "phone-lock")); done, msg = repair_index(d)
+        if not done or names():
+            ok = False; print("FAIL self-test repair_index must fix the phone-tool stale index once the lock is free: %s %s" % (msg, names()))
+        commit("trunk by t", "t"); expect("t-authored trunk commit caught", ["trunk-authors"])
+    print("RESULT: %s repo-health self-test" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    if "--repair-index" in argv:
+        done, msg = repair_index(argv[argv.index("--repo") + 1] if "--repo" in argv else HERE)
+        print("repo-health: repair-index: %s" % msg)
+        print("RESULT: %s repo-health repair-index" % ("PASS" if done else "FAIL"))
+        return 0 if done else 1
+    start = HERE
+    if "--repo" in argv:
+        i = argv.index("--repo")
+        if i + 1 >= len(argv):
+            print("RESULT: FAIL repo-health usage: --repo DIR"); return 2
+        start = argv[i + 1]
+    elif [a for a in argv if a.startswith("-")]:
+        print(__doc__.splitlines()[0]); print("RESULT: FAIL repo-health usage"); return 2
+    return report(checks(start))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

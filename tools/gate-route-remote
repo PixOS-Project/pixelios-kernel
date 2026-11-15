@@ -1,0 +1,25 @@
+#!/bin/bash
+# gate-route-remote TOP: a quick gate that would run FULL (tools/gate_select.py said FULL), done on the offload host instead (tools/heavy-job-offload.sh hj_quick_offer; heavy-job runs this in the offload slot).
+# remote-job --where auto gate-pre on the committed HEAD of TOP + tools/gate-import-remote: shim/out/gate.result, gate.stamp, the registry entry and the GATE line are what a local full gate leaves.
+# Outcomes: PASS imported = exit 0. A gate that ran and FAILed (its gate.log ends in GATE FAIL) = the verdict: gate.result says so, exit 1, never re-run elsewhere.
+# Infra failure, or a refused import: the offload host is never a dependency, so the gate runs here (GATE_NO_ROUTE keeps it from being offered again), with one OFFLOAD GAP line. That run still holds the offload slot until it ends.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+[ $# = 1 ] && [ -d "$1" ] || { echo "RESULT: ERROR gate-route-remote: usage: tools/gate-route-remote TOP"; exit 2; }
+top=$1; here=$(cd "$(dirname "$0")" && pwd); out=$top/logs/remote-jobs/gate-pre/out
+cd "$top" || { echo "RESULT: ERROR gate-route-remote: cannot cd $top"; exit 2; }
+local_gate() { echo "OFFLOAD GAP: $1, running the gate here"; unset HEAVY_JOB_HELD OFFLOAD_QUEUE_HELD; GATE_NO_ROUTE="$1" exec tools/check-all.sh --quick; }
+rm -rf "$out"; rm -f shim/out/gate.progress   # no result of an earlier run may be read as this one's
+REMOTE_JOB_REPO=$top "$here/remote-job" --where auto gate-pre; rc=$?
+if [ "$rc" = 0 ]; then
+	"$here/gate-import-remote" "$out" "$top" || local_gate "gate-pre passed but its import was refused (see above)"
+	exit 0
+fi
+gl=$(grep -a -E '^GATE (PASS|FAIL) ' "$out/gate.log" 2>/dev/null | tail -n 1)
+case $gl in
+	'GATE FAIL '*)
+		mkdir -p shim/out && printf '%s %s\n' "$gl" "$(date +%s)" >shim/out/gate.result
+		echo "$gl"; echo "RESULT: FAIL gate-route-remote where=offload-host rc=$rc (full log: $out/gate.log)"; exit 1 ;;
+	*) local_gate "remote-job gate-pre rc=$rc with no GATE FAIL line (infra)" ;;
+esac

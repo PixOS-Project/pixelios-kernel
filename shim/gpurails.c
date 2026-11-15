@@ -103,8 +103,9 @@ static const char *rname(unsigned k)
 	case 6: return "B8S_OUT2";
 	case 7: return "L1S_CTRL1";
 	case 8: return "L1S_CTRL2";
+	case 9: return "LDO_CTRL1";
+	default: return "REG?";	/* ACPM_S11_NREG is 10 (soc.json): a longer list needs a name here, show it instead of mislabelling it */
 	}
-	return "LDO_CTRL1";
 }
 
 static const char *mname(uint32_t mode)
@@ -113,8 +114,9 @@ static const char *mname(uint32_t mode)
 	case 0: return "off";
 	case 1: return "SUSPEND,DT default";
 	case 2: return "on-PWREN_MIF";
+	case 3: return "on-normal";
+	default: return "mode?";	/* the callers mask the field to 2 bits (0..3): unreachable, but never mislabel */
 	}
-	return "on-normal";
 }
 
 /* "RAIL decode <rail> mode=<m>(<name>) enabled=<0|1> uV=<n>" */
@@ -135,7 +137,9 @@ static void decode(const char *rail, uint32_t mode, uint32_t uv)
 	emit(line, p);
 }
 
-int gpu_rails(void)
+/* b2s_uv / b8s_uv (NULL = not wanted): set to the decoded OUT1 voltage of BUCK2S / BUCK8S only when
+ * all ten registers were read (return 0); T-a214 review F1 */
+int gpu_rails_uv(uint32_t *b2s_uv, uint32_t *b8s_uv)
 {
 	struct acpm_cfg c;
 	struct acpm_trace t;
@@ -144,6 +148,9 @@ int gpu_rails(void)
 	uint32_t v[ACPM_S11_NREG];
 	unsigned k, got = 0;
 	int e = ACPM_OK;
+	/* style-allow: func-len one linear read sequence (gates, ten reads, decode), byte-pinned */
+	/* style-allow: sized-types int is the acpm_* status type and this module's API (0 = ok) */
+	/* style-allow: assert audited read-only object: every refusal is handled and logged */
 
 	acpm_cfg_init(&c);
 	say_kv("cfg speedy", "ch", ACPM_S11_SPEEDY, "pmic_addr", ACPM_S11_PMIC_ADDR);
@@ -203,6 +210,10 @@ int gpu_rails(void)
 	if (got == ACPM_S11_NREG) {
 		decode("BUCK2S(VDD_G3D shaders) ", (v[1] >> 6) & 3u, ACPM_S11_BUCK_MIN_UV + ACPM_S11_BUCK_STEP_UV * v[2]);
 		decode("BUCK8S(VDD_G3D_L2) ", (v[4] >> 6) & 3u, ACPM_S11_BUCK_MIN_UV + ACPM_S11_BUCK_STEP_UV * v[5]);
+		if (b2s_uv)
+			*b2s_uv = ACPM_S11_BUCK_MIN_UV + ACPM_S11_BUCK_STEP_UV * v[2];
+		if (b8s_uv)
+			*b8s_uv = ACPM_S11_BUCK_MIN_UV + ACPM_S11_BUCK_STEP_UV * v[5];
 		decode("LDO1S(VDD_G3D_M) ", (v[9] >> 4) & 3u, ACPM_S11_LDO1_MIN_UV + ACPM_S11_LDO1_STEP_UV * (v[7] & ACPM_S11_LDO1_VSEL_MASK));
 		say("decode note: ", "mode 1 is the DT default of CPU rails too; OUT1 live = guess");
 	}
@@ -210,12 +221,30 @@ int gpu_rails(void)
 	return got == ACPM_S11_NREG ? 0 : 1;
 }
 
+int gpu_rails(void)
+{
+	/* style-allow: sized-types int is this module's status type (0 = ok), as in gpu_rails_uv */
+	/* style-allow: assert audited object (read-only): a wrapper, the callee logs every refusal */
+	return gpu_rails_uv(0, 0);
+}
+
 #else	/* not gs101 / config unknown (null value): refuse, zero ACPM traffic */
+
+int gpu_rails_uv(uint32_t *b2s_uv, uint32_t *b8s_uv)
+{
+	/* style-allow: sized-types int is this module's status type (0 = ok), as in gpu_rails_uv */
+	/* style-allow: assert audited object (read-only): the refusal below is logged */
+	(void)b2s_uv;
+	(void)b8s_uv;
+	con_str("GPU", "RAIL refused: soc.json acpm.s2mpg11 has a null/unknown value, no ACPM request sent");
+	return 1;
+}
 
 int gpu_rails(void)
 {
-	con_str("GPU", "RAIL refused: soc.json acpm.s2mpg11 has a null/unknown value, no ACPM request sent");
-	return 1;
+	/* style-allow: sized-types int is this module's status type (0 = ok), as in gpu_rails_uv */
+	/* style-allow: assert audited object (read-only): a wrapper, the callee logs every refusal */
+	return gpu_rails_uv(0, 0);
 }
 
 #endif

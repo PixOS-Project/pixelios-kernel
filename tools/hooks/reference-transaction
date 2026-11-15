@@ -1,0 +1,28 @@
+#!/bin/sh
+# PixOS kernel repo reference-transaction (user 2026-11-10): trunk moves only to a commit with a FORMAL gate PASS.
+# Why: ungated merges broke trunk in 6 places (23 Wi-Fi mutant needles, stale tests, ...) and tools/fflash-userdata.sh then refused every flash
+# for ~7 h (sprint-bt bt-bw1). The flash check stays; this moves the same check to the moment trunk changes, so trunk is always flashable.
+# Checks: for an update of refs/heads/trunk to commit C (state "prepared"), ${GATE_PASS_DIR:-~/.cache/pixelios/gate-pass}/C must exist
+# (tools/check-all.sh writes it only for a clean full PASS; a quick gate never does).
+# Do instead: on your branch, `git merge trunk`, run `tools/gate --formal` (GATE PASS <head>), then fast-forward trunk to that head
+# (`git -C <trunk checkout> merge --ff-only <branch>`). A merge commit made on trunk itself has no gate yet: make it on the branch.
+# Escape (printed, one command): PIXOS_UNGATED_TRUNK="reason" git ...    Ref deletes and other refs pass unchanged.
+[ "$1" = prepared ] || exit 0
+gp=${GATE_PASS_DIR:-$HOME/.cache/pixelios/gate-pass}
+rc=0
+while read -r _old new ref; do
+	[ "$ref" = refs/heads/trunk ] || continue
+	case $new in 0000000000000000000000000000000000000000) continue ;; esac
+	c=$(git rev-parse --verify -q "$new^{commit}" 2>/dev/null) || c=$new
+	[ -f "$gp/$c" ] && continue
+	if [ -n "${PIXOS_UNGATED_TRUNK:-}" ]; then
+		echo "reference-transaction: NOTE trunk -> ${c%"${c#????????}"} WITHOUT a formal gate PASS: PIXOS_UNGATED_TRUNK=\"$PIXOS_UNGATED_TRUNK\"" >&2
+		continue
+	fi
+	echo "reference-transaction: REFUSED trunk -> ${c%"${c#????????}"}: no formal GATE PASS for this commit ($gp/$c missing)." >&2
+	echo "  why: an ungated trunk blocks every userdata flash (tools/fflash-userdata.sh needs a formal PASS on the head)." >&2
+	echo "  do instead: merge trunk into your branch, tools/gate --formal there, then git merge --ff-only <branch> on trunk." >&2
+	echo "  escape: PIXOS_UNGATED_TRUNK=\"reason\" git ..." >&2
+	rc=1
+done
+exit $rc

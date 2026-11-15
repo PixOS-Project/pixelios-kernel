@@ -1,0 +1,8 @@
+diff --git a/shim/x b/docs/y.c b/shim/x b/docs/y.c
+index 1..2 100644
+--- a/shim/x b/docs/y.c
++++ b/shim/x b/docs/y.c
+@@ -1,3 +1,4 @@
+ {
++	write32(a, 1);
+ }

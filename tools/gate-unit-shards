@@ -1,0 +1,163 @@
+#!/bin/bash
+# Run the gate's unit tests as parallel per-file shards: same tests as
+#   python3 -m unittest discover -s tools -p "test_*.py"
+# but one `discover -p FILE` process per tests file, N at a time (GATE_UNIT_SHARDS, default 4), biggest file first.
+# Dynamic shards (PLAN-GATE-2X K4b, cold gate): N is a pool of job slots (tokens in a FIFO, no xargs -P). When the file GATE_LANES_A_DONE (default
+# shim/out/gate/.lanes-a-done; tools/check-all.sh touches it when lane A ends, lane B usually outlives A) appears, the slots grow to min(GATE_UNIT_SHARDS_MAX=8, nproc-2-GATE_MUT_JOBS) (K5: the
+# cap is GLOBAL for the pool workers: lane C's mutant pool is still at its base size GATE_MUT_JOBS while the shards grow, so its jobs are subtracted; unset = 0).
+# A GATE_UNIT_SHARDS the user set explicitly never grows (check-all.sh says so with GATE_UNIT_SHARDS_SRC=env|derived; without it a set GATE_UNIT_SHARDS is explicit).
+# One line: `unit shards 4->8 at +NNs` or `unit shards stayed 4 (reason)`. At the end every token must be back in the FIFO (TOKEN MISMATCH = FAIL).
+# Order (K4c): by RECORDED DURATION, not byte size (the slow tests are tiny wrappers: test_heavy_job.py was 500 B and 193 s): tools/gate-unit-durations.tsv (`seconds<TAB>file`,
+# env GATE_UNIT_DURATIONS), longest first; files NOT in the table first (unknown = maybe slow), then by size. The run writes shim/out/gate/unit-durations.new.tsv (env GATE_UNIT_DURATIONS_NEW)
+# from its own logs, never the committed table; refresh the table by copying that file. Line: `gate: unit order: durations from TABLE (N known, M unknown)`.
+# Every shard has a memory cap (ulimit -v, except files that build with -fsanitize: ASan cannot run under it; GATE_UNIT_MEM_KB, default 6 GiB; the wlan mutant test once reached 6.7 GB RSS, HANDOFF.md:248).
+# test_wlan_wr_mutants.py is NOT run here: check-all.sh runs it as its own step `wlan-mutants` (lane C from t=0, 5400 s; research 68 D4).
+# Rule 8: a table row that is malformed/duplicated, an unwritable .new.tsv and a *_SRC value other than env|derived print a named line and count in `gaps=N` on RESULT; a file whose run time is
+# off the table by more than 2x and 10 s prints `DURATION DRIFT file old->new` (and `drift=N` on RESULT). Neither fails the run.
+# Every skipped test prints a "SKIPPED TEST FILE: test (id) ... skipped 'reason'" line (rule 8, W40 2026-10-30).
+# No test is skipped and no timeout is changed (the caller's timeout covers the whole run). Any shard failing, or a shard
+# whose "Ran N tests" line is missing, fails the run. Last line: RESULT: PASS|FAIL ... (exit 0/1, 2 usage).
+# Run from the repository root. Logs: $GATE_UNIT_OUT (default shim/out/gate/unit-shards/NAME.log).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+cd "$(dirname "$0")/.." || exit 2
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX   # a caller inside a git hook exports these: `git -C scratch ...` in a test then hits the REAL repo (2026-11-02: stray commit, core.bare=true, fixture branches)
+dir=${GATE_UNIT_DIR:-tools}  # test dir; override only for the self-check (tools/test_gate_unit_shards.py)
+selected=; [ "${1:-}" = --selected ] && { selected=1; shift; }   # --selected: honour GATE_UNIT_ONLY (S4); only check-all.sh --quick passes it
+[ $# -eq 0 ] || { echo "usage: tools/gate-unit-shards [--selected] (env GATE_UNIT_SHARDS, GATE_UNIT_SHARDS_MAX, GATE_LANES_A_DONE, GATE_UNIT_DIR, GATE_UNIT_MEM_KB, GATE_UNIT_OUT, GATE_UNIT_ONLY with --selected)"; exit 2; }
+n=${GATE_UNIT_SHARDS:-4}; mem=${GATE_UNIT_MEM_KB:-6291456}; out=${GATE_UNIT_OUT:-shim/out/gate/unit-shards}; smax=${GATE_UNIT_SHARDS_MAX:-8}
+lanes_a=${GATE_LANES_A_DONE:-shim/out/gate/.lanes-a-done}
+case $n$mem$smax in ''|*[!0-9]*) echo "RESULT: ERROR GATE_UNIT_SHARDS, GATE_UNIT_SHARDS_MAX and GATE_UNIT_MEM_KB must be positive integers"; exit 2 ;; esac
+[ "$n" -gt 0 ] && [ "$mem" -gt 0 ] && [ "$smax" -gt 0 ] || { echo "RESULT: ERROR GATE_UNIT_SHARDS, GATE_UNIT_SHARDS_MAX and GATE_UNIT_MEM_KB must be positive"; exit 2; }
+# growth: only a derived/default shard count may grow, never above min(smax, nproc-2-GATE_MUT_JOBS) (K5, global: the mutant pool's base size is subtracted)
+np=$(nproc 2>/dev/null) || np=; case $np in ''|*[!0-9]*) echo "RESULT: ERROR cannot determine the CPU count (nproc=$np)"; exit 2 ;; esac
+mj=${GATE_MUT_JOBS:-0}; case $mj in ''|*[!0-9]*) echo "RESULT: ERROR GATE_MUT_JOBS must be a non-negative integer (lane C's base pool counts against the shard cap), got '$mj'"; exit 2 ;; esac
+[ "$n" -le 1024 ] && [ "$smax" -le 1024 ] || { echo "RESULT: ERROR GATE_UNIT_SHARDS and GATE_UNIT_SHARDS_MAX must be <= 1024 (the token FIFO is a pipe)"; exit 2; }
+gaps=0
+case ${GATE_UNIT_SHARDS_SRC:-env} in env|derived) ;; *) echo "GAP: GATE_UNIT_SHARDS_SRC='$GATE_UNIT_SHARDS_SRC' is neither env nor derived: treated as derived"; gaps=$((gaps + 1)) ;; esac
+cap=$((np - 2 - mj)); [ "$cap" -ge 1 ] || cap=1; [ "$cap" -le "$smax" ] || cap=$smax
+echo "gate: unit shard cap $cap = min(GATE_UNIT_SHARDS_MAX=$smax, nproc $np - 2 - lane C mutant jobs $mj)"
+if [ "${GATE_UNIT_SHARDS_SRC:-}" = env ] || { [ -z "${GATE_UNIT_SHARDS_SRC:-}" ] && [ -n "${GATE_UNIT_SHARDS:-}" ]; }; then maxslots=$n; why="GATE_UNIT_SHARDS set explicitly, no growth"
+elif [ "$cap" -le "$n" ]; then maxslots=$n; why="already at the cpu cap min($smax,nproc-2-$mj)=$cap"
+else maxslots=$cap; why="lane A was still running ($lanes_a not seen)"; fi
+rm -rf "$out"; mkdir -p "$out" || exit 2
+allow=${GATE_UNIT_SKIP_ALLOW:-tools/unit-skip-allow.txt}  # `file::Class.test | text | reason` per line (environment skips only); override only for the self-check (T-ebec)
+excl=test_wlan_wr_mutants.py  # fixed: no env override, a full PASS must never skip a test file (review C5)
+tbl=${GATE_UNIT_DURATIONS:-tools/gate-unit-durations.tsv}; newtsv=${GATE_UNIT_DURATIONS_NEW:-shim/out/gate/unit-durations.new.tsv}
+ranked=$(for f in "$dir"/test_*.py; do [ -e "$f" ] && [ "${f##*/}" != "$excl" ] && stat -c '%s %n' "$f"; done |
+	awk -v tbl="$tbl" 'BEGIN { while ((getline l < tbl) > 0) if (l ~ /^[0-9.]+\t/) { split(l, a, "\t"); d[a[2]] = a[1] } }
+		{ size = $1; path = substr($0, length($1) + 2); n = split(path, q, "/"); b = q[n]
+		  if (b in d) printf "1\t%s\t%s\t%s\n", d[b], size, path; else printf "0\t0\t%s\t%s\n", size, path }' |
+	sort -t "$(printf '\t')" -k1,1n -k2,2gr -k3,3nr)   # unknown (0) first, then known by seconds descending, ties by size descending
+files=$(cut -f4 <<<"$ranked"); nknown=$(grep -c '^1' <<<"$ranked"); nunknown=$(grep -c '^0' <<<"$ranked")
+[ -z "${GATE_UNIT_EXCLUDE+x}" ] || { echo "RESULT: ERROR GATE_UNIT_EXCLUDE is no longer supported"; exit 2; }
+[ -n "$files" ] || { echo "RESULT: FAIL no test_*.py in $dir"; exit 1; }
+if [ -r "$tbl" ]; then
+	tab=$(printf '\t')
+	while IFS= read -r l; do echo "TABLE ROW IGNORED (malformed, file runs as unknown) $tbl:${l%%:*}: ${l#*:}"; gaps=$((gaps + 1)); done < <(grep -n -v -E "^[0-9]+(\.[0-9]+)?${tab}[A-Za-z0-9_]+\.py\$|^#|^[[:space:]]*\$" "$tbl")
+	while IFS= read -r l; do echo "TABLE ROW DUPLICATE $tbl: $l has more than one row (the last wins)"; gaps=$((gaps + 1)); done < <(grep -v -E '^#|^[[:space:]]*$' "$tbl" | cut -f2 | sort | uniq -d)
+fi
+if [ -r "$tbl" ]; then echo "gate: unit order: durations from $tbl ($nknown known, $nunknown unknown)"; else echo "gate: unit order: $tbl MISSING, size order ($nunknown unknown)"; fi
+# `--selected` + GATE_UNIT_ONLY=FILE (quick gate only, tools/unit_select.py via check-all.sh): run just the test files named in FILE (basenames, one per line).
+# Empty variable = all. Without --selected an inherited GATE_UNIT_ONLY is ignored LOUDLY (a stray export must not shrink a run; review gate-cold-s4-r1 F1/F7).
+# FILE must be a regular file with at least one name; every non-blank line must be test_NAME.py and a test file run by this step (rule 8); duplicates run once.
+only=
+if [ -n "$selected" ]; then only=${GATE_UNIT_ONLY:-}
+elif [ -n "${GATE_UNIT_ONLY:-}" ]; then echo "gate-unit-shards: ignoring inherited GATE_UNIT_ONLY=$GATE_UNIT_ONLY (pass --selected; only check-all.sh --quick does): running ALL test files"; fi
+nall=$(printf '%s\n' "$files" | grep -c .)
+if [ -n "$only" ]; then
+	[ -f "$only" ] && [ -s "$only" ] || { echo "RESULT: ERROR GATE_UNIT_ONLY=$only is missing, empty or not a regular file"; exit 2; }
+	allf=$files; nsel=0; declare -A seen=()
+	while IFS= read -r b || [ -n "$b" ]; do
+		[[ $b =~ ^[[:space:]]*$ ]] && continue
+		[[ $b =~ ^test_[A-Za-z0-9_]+\.py$ ]] || { echo "RESULT: ERROR GATE_UNIT_ONLY line '$b' is not a test_NAME.py basename"; exit 2; }
+		[ -z "${seen[$b]:-}" ] || continue
+		seen[$b]=1
+		printf '%s\n' "$allf" | grep -qFx -- "$dir/$b" || { echo "RESULT: ERROR GATE_UNIT_ONLY names $b: not a test file run by this step"; exit 2; }
+		nsel=$((nsel+1))
+	done <"$only"
+	[ "$nsel" -gt 0 ] || { echo "RESULT: ERROR GATE_UNIT_ONLY=$only names no test file (blank lines only)"; exit 2; }
+	files=$(while IFS= read -r f; do [ -n "${seen[${f##*/}]:-}" ] && echo "$f"; done <<<"$allf")   # keep the recorded-duration order of the full list
+	echo "gate: unit shards: ran $nsel of $nall test files (GATE_UNIT_ONLY=$only)"
+fi
+# job slots = tokens in a FIFO (fd 9, read-write so it never blocks); a shard takes a token to start and puts it back when it ends
+mkfifo "$out/.tokens" && exec 9<>"$out/.tokens" || { echo "RESULT: ERROR cannot create the token FIFO in $out"; exit 2; }
+printf '%*s' "$n" '' | tr ' ' x >&9
+slots=$n; grown=0; t0=$SECONDS
+# T-209d: NO timed read on the slot path. A `read -t` that times out can drop the byte it was just reading (bash's alarm longjmp), which lost one token under load
+# ("TOKEN MISMATCH: 8 job slots, 7 tokens back"). The slot wait is a plain blocking read; growth is a background watcher that adds the extra tokens when the lanes-done
+# file appears, stops when told ($out/.stop) and is waited for before the accounting, so $out/.grown tells whether the tokens were added.
+if [ "$maxslots" -gt "$n" ]; then
+	(
+		until [ -e "$lanes_a" ] || [ -e "$out/.stop" ]; do sleep 0.5; done
+		[ ! -e "$out/.stop" ] || exit 0
+		printf '%*s' "$((maxslots - n))" '' | tr ' ' x >&9; : >"$out/.grown"
+		echo "unit shards $n->$maxslots at +$((SECONDS - t0))s"
+	) &
+	watcher=$!
+fi
+while IFS= read -r f <&3; do
+	read -r -n1 -u 9 _   # wait for a free slot (blocking, see above)
+	(
+		b=$(basename "$f"); grep -q fsanitize "$dir/$b" || ulimit -v "$mem"   # ASan reserves ~14 TB of virtual shadow: a -v cap makes it abort (qrl2, devoverlay_kernel)
+		python3 -m unittest discover -v -s "$dir" -p "$b" >"$out/$b.log" 2>&1 </dev/null; echo $? >"$out/$b.rc"
+		printf x >&9
+	) &
+done 3<<<"$files"
+: >"$out/.stop"; [ -z "${watcher:-}" ] || wait "$watcher"
+wait
+[ ! -e "$out/.grown" ] || { grown=1; slots=$maxslots; }
+[ "$grown" = 1 ] || echo "unit shards stayed $n ($why)"
+# token accounting: every slot is back. All shards are waited for, so every token is already in the FIFO: read exactly $slots of them with a generous timeout (a missing
+# token costs one 10 s wait, never a false mismatch), then one short probe for an EXTRA token.
+got=0; while [ "$got" -lt "$slots" ] && read -r -t 10 -n1 -u 9 _; do got=$((got + 1)); done
+if [ "$got" = "$slots" ] && read -r -t 0.2 -n1 -u 9 _; then got=$((got + 1)); fi
+exec 9>&-; rm -f "$out/.tokens"
+total=0; bad=0; nf=0; skipped=0; envsk=0; durs=$(mktemp) || exit 2
+for f in $files; do
+	b=$(basename "$f"); nf=$((nf+1)); rc=$(cat "$out/$b.rc" 2>/dev/null || echo missing)
+	c=$(sed -n 's/^Ran \([0-9]*\) tests\? in.*/\1/p' "$out/$b.log" | tail -1)
+	if [ "$rc" != 0 ] || [ -z "$c" ]; then bad=$((bad+1)); echo "SHARD FAIL $b rc=$rc (log $out/$b.log)"; tail -n 15 "$out/$b.log"; fi
+	# T-9fb9: a test that prints to stderr before it skips (test_devd_stage "SKIP: ...") splits "name (id) ... " from "skipped 'why'" over two lines; join them first, or the skip is neither named nor checked against the pins
+	sklog=$(awk '{ if (match($0, /\([A-Za-z0-9_.]+\) \.\.\. /)) hdr = substr($0, 1, RSTART + RLENGTH - 1)
+		if ($0 ~ / \.\.\. (skipped .*|expected failure)$/) { print; hdr = "" } else if ($0 ~ /^(skipped .*|expected failure)$/ && hdr != "") { print hdr $0; hdr = "" } }' "$out/$b.log")
+	grep -E " \.\.\. skipped " <<<"$sklog" | sed "s/^/SKIPPED TEST $b: /"   # rule 8: a skip names its test id and reason, never just a count
+	# a skip or an expected failure is a hidden hole: it FAILS the step unless `file::Class.test | text | reason` is pinned in $allow (environment skips only: no gcc/clang/shellcheck/opencv/capstone/root on that host; T-ebec)
+	while IFS= read -r line; do
+		if [[ $line =~ \(([A-Za-z0-9_.]+)\)\ \.\.\.\ (skipped\ .*|expected\ failure)$ ]]; then id=${BASH_REMATCH[1]}; why=${BASH_REMATCH[2]}
+		else bad=$((bad+1)); echo "SKIP NOT ALLOWED $b: cannot read the test id of '$line'"; continue; fi
+		case $id in "${b%.py}".*) t=${id#"${b%.py}".} ;; *) t=$id ;; esac   # file::Class.test (a module-level skip keeps its whole unittest id)
+		# awk exit: 0 = pinned, 3 = pinned and the reason starts with "environment" (T-9fb9: the host lacks a tool; check-all.sh may still register the PASS), 1 = not pinned
+		awk -F'|' -v k="$b::$t" -v s="$why" 'function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+				{ r = $0; sub(/^[^|]*\|[^|]*\|/, "", r); r = trim(r) }
+				trim($1) == k && NF >= 3 && trim($2) != "" && index(s, trim($2)) > 0 && length(r) >= 10 { f = 1; if (r ~ /^environment/) e = 1 } END { exit f ? (e ? 3 : 0) : 1 }' "$allow" 2>/dev/null; arc=$?
+		case $arc in
+		0) ;;
+		3) envsk=$((envsk+1)) ;;
+		*) bad=$((bad+1)); echo "SKIP NOT ALLOWED $b::$t ($why): a skip or expected failure hides a hole; fix it, or (environment skip only) pin '$b::$t | text of the skip reason | reason' in $allow" ;;
+		esac
+	done < <(grep -E " \.\.\. (skipped .*|expected failure)$" <<<"$sklog")
+	sec=$(sed -n 's/^Ran [0-9]* tests\? in \([0-9.]*\)s.*/\1/p' "$out/$b.log" | tail -1); [ -z "$sec" ] || printf '%s\t%s\n' "$sec" "$b" >>"$durs"
+	total=$((total+${c:-0})); sk=$(grep -Eo 'skipped=[0-9]+' "$out/$b.log" | tail -1); sk=${sk#skipped=}; skipped=$((skipped+${sk:-0}))
+done
+if mkdir -p "$(dirname "$newtsv")" && { echo "# gate-unit-shards durations of the last run (seconds<TAB>file); copy over tools/gate-unit-durations.tsv to refresh the order${only:+; PARTIAL run ($nf of $nall files, GATE_UNIT_ONLY): do NOT copy over the table}"; sort -t "$(printf '\t')" -k1,1gr "$durs"; } >"$newtsv"; then :
+else echo "GAP: DURATIONS NOT WRITTEN: cannot write $newtsv (the next run orders by the committed table only)"; gaps=$((gaps + 1)); fi
+drift=0
+if [ -r "$tbl" ]; then   # a table row off by more than 2x and 10 s is stale: the order the next run uses is wrong for that file (review gate-cold-k14 r1 F6)
+	while IFS= read -r l; do echo "$l"; drift=$((drift + 1)); done < <(awk -F'\t' -v tbl="$tbl" 'NR == FNR { if ($0 ~ /^[0-9.]+\t/) old[$2] = $1; next }
+		($2 in old) { o = old[$2] + 0; w = $1 + 0; d = w > o ? w - o : o - w; if (d > 10 && (w > 2 * o || w < o / 2)) printf "DURATION DRIFT %s: table %s s -> now %s s (refresh %s from the new table)\n", $2, old[$2], $1, tbl }' "$tbl" "$durs")
+fi
+rm -f "$durs"
+# count check: the shards must run exactly as many tests as one unsharded discover collects (collect only, no run), minus the excluded file
+if [ -n "$only" ]; then   # same subset: the tests of exactly the selected files
+	mapfile -t nm < <(printf '%s\n' "$files" | xargs -r -n1 basename)
+	want=$(python3 -c 'import sys,unittest; l=unittest.TestLoader(); print(sum(l.discover(sys.argv[1], p).countTestCases() for p in sys.argv[2:]))' "$dir" "${nm[@]}") || want=error
+else
+	want=$(python3 -c 'import sys,unittest; l=unittest.TestLoader(); print(l.discover(sys.argv[1], "test_*.py").countTestCases()-l.discover(sys.argv[1], sys.argv[2]).countTestCases())' "$dir" "$excl") || want=error
+fi
+if [ "$got" != "$slots" ]; then bad=$((bad+1)); echo "TOKEN MISMATCH: $slots job slots at the end, $got tokens back in the FIFO"; fi
+if [ "$want" != "$total" ]; then bad=$((bad+1)); echo "COUNT MISMATCH: unsharded discover collects $want tests, shards ran $total"; fi
+[ "$envsk" -le "$skipped" ] || envsk=$skipped
+echo "unit skips: environment=$envsk other=$((skipped-envsk)) (environment = pinned in $allow with a reason starting 'environment'; check-all.sh registers a PASS only when other=0)"
+if [ "$bad" = 0 ]; then echo "count check: sharded $total == unsharded $want; token check: $got == $slots slots"; echo "RESULT: PASS $total tests in $nf files, $n shards, skipped=$skipped${only:+ partial=$nf/$nall} drift=$drift gaps=$gaps"; exit 0; fi
+echo "RESULT: FAIL $bad of $nf files failed ($total tests ran)"; exit 1

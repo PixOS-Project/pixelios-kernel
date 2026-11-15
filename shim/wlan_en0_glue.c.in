@@ -1,0 +1,130 @@
+/*
+ * sweet_wlan_en0.c - XNU glue of the Wi-Fi `en0` ifnet (patch 0199, T-4d29; SPEC-WIFI Part E EN0 block, rows EN1-EN12). The logic is the host-tested
+ * bsd/dev/sweet_wlan_en0.h; this file only supplies what the kernel provides (KPI headers, if_xflags, the boot-arg, the SIOCAIFADDR socket) and the
+ * bus of the not-yet-wired msgbuf transport (DP15): every exec() refuses, so a transmit is a counted drop with a GAP line, never a silent success.
+ * Not compiled against XNU here (CI builds the tree), not run on hardware, and NOT CALLED by anything yet: sweet_wlan_en0_init() is for T-4505.
+ */
+#include <sys/types.h>
+#include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/kpi_mbuf.h>
+#include <sys/kpi_socket.h>
+#include <sys/sockio.h>
+#include <sys/kern_event.h>
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_media.h>
+#include <net/if_types.h>
+#include <net/ethernet.h>
+#include <net/if_ether.h>
+#include <net/ether_if_module.h>
+#include <net/kpi_interface.h>
+#include <net/kpi_protocol.h>
+#include <net/net_kev.h>
+#include <net/bpf.h>
+#include <netinet/in.h>
+#include <pexpert/pexpert.h>
+
+#define SWDP_LOG(s) printf("%s\n", (s))
+#define SWDP_GAP(s) printf("%s\n", (s))
+#define EN0_XFLAGS(ifp) ((ifp)->if_xflags)
+#define EN0_XF_NOAUTO IFXF_NX_NOAUTO
+#define EN0_EFLAGS(ifp) ifnet_eflags(ifp)
+#define EN0_EF_ENQUEUE_MULTI IFEF_ENQUEUE_MULTI
+#include "sweet_wlan_data.h"
+#include "sweet_wlan_data_plan.h"
+#include "sweet_wlan_en0.h"
+
+static struct en0 sw_en0;
+
+int sweet_wlan_a80211_radio_attach(ifnet_t ifp);      /* patch 0201 (T-431f): the Apple80211 handler and the radio backend behind it */
+
+static int
+sw_en0_exec(void *ctx __unused, const struct swdp_store *s __unused, uint32_t n __unused)
+{
+	return -1;                                                /* DP15: the transport is not wired, nothing was written */
+}
+
+static uint32_t
+sw_en0_wr(void *ctx __unused, uint32_t ring_id __unused)
+{
+	return 0;
+}
+
+static const uint8_t *
+sw_en0_item(void *ctx __unused, uint32_t ring_id __unused, uint32_t idx __unused)
+{
+	return NULL;
+}
+
+static const uint8_t *
+sw_en0_rxbuf(void *ctx __unused, uint32_t slot __unused)
+{
+	return NULL;
+}
+
+/* EN9 apply hook: plumb IPv4 and SIOCAIFADDR on a kernel socket (the 0073 pattern). The values come from en0_boot_cfg(), never from this file. */
+static int
+sw_en0_apply(ifnet_t ifp, const struct en0_cfg *c)
+{
+	struct ifaliasreq ifra;
+	struct sockaddr_in *a;
+	socket_t so = NULL;
+	uint32_t ip = ((uint32_t)c->ip[0] << 24) | ((uint32_t)c->ip[1] << 16) | ((uint32_t)c->ip[2] << 8) | c->ip[3];
+	uint32_t mask = ((uint32_t)c->mask[0] << 24) | ((uint32_t)c->mask[1] << 16) | ((uint32_t)c->mask[2] << 8) | c->mask[3];
+	errno_t err = proto_plumb(PF_INET, ifp);
+
+	if (err == 0) {
+		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+	}
+	if (err != 0) {
+		return (int)err;
+	}
+	bzero(&ifra, sizeof(ifra));
+	snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s%u", ifnet_name(ifp), ifnet_unit(ifp));
+	a = (struct sockaddr_in *)&ifra.ifra_addr;
+	a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(ip);
+	a = (struct sockaddr_in *)&ifra.ifra_mask;
+	a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(mask);
+	a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+	a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(ip | ~mask);
+	err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+	sock_close(so);
+	return (int)err;
+}
+
+/* Creates en0 with the MAC the join code read (NULL = refused with a GAP, never a default). The static address comes from boot-arg pixos_en0_ip. */
+int
+sweet_wlan_en0_init(const uint8_t *mac)
+{
+	static char bootarg[64];
+	int rc;
+
+	memset(&sw_en0, 0, sizeof(sw_en0));
+	sw_en0.bus.exec = sw_en0_exec;
+	sw_en0.bus.d2h_wr = sw_en0_wr;
+	sw_en0.bus.d2h_item = sw_en0_item;
+	sw_en0.bus.rxbuf = sw_en0_rxbuf;
+	sw_en0.apply = sw_en0_apply;
+	if (PE_parse_boot_argn(EN0_BOOTARG, bootarg, sizeof(bootarg))) {
+		sw_en0.bootarg = bootarg;
+	}
+	rc = en0_attach(&sw_en0, mac);
+	if (rc == 0 && sweet_wlan_a80211_radio_attach(sw_en0.ifp) != 0) {
+		printf("WIFI GAP: en0 is up without the Apple80211 radio (see the attach line above)\n");
+	}
+	return rc;
+}
+
+/* The poll period belongs to the caller (a kernel thread of T-4505); link events come from the join code. */
+uint32_t
+sweet_wlan_en0_poll(void)
+{
+	return en0_poll(&sw_en0);
+}
+
+void
+sweet_wlan_en0_link(int up)
+{
+	en0_set_link(&sw_en0, up ? 1u : 0u);
+}

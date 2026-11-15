@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""tools/public-push-guard: content guard for pushes to PUBLIC remotes (user order R66, 2026-10-31).
+
+  git pre-push hook:   public-push-guard REMOTE URL   (stdin: `<local ref> <local sha> <remote ref> <remote sha>` lines)
+  tools/public-push-guard install-hook      write .git/hooks/pre-push in the common git dir (fails closed when this tool is missing)
+  tools/public-push-guard report [REF] [--remote NAME] [--list] [--tip-only]
+                                            dry run: scan REF (default HEAD) as if pushed to a public remote; counts per rule, top 15 files;
+                                            --tip-only scans only the blobs and paths of REF's tree (the gate step: history is not the gate's business)
+  tools/public-push-guard gate [REF] [--write-baseline]
+                                            gate step `public-guard` (T-6070): tip tree of REF (default HEAD) against the ratchet tools/public-push-guard-baseline.tsv
+                                            (rule<TAB>file<TAB>count, never a value). More findings than the baseline for a rule+file, or any finding of rule e,
+                                            or a baseline entry above the actual count = FAIL. Pre-existing findings stay loud (PUBLIC GAP, rule 8) until relocated.
+  tools/public-push-guard staged            pre-commit (T-6070, public by default): scan the ADDED lines and new paths of the staged diff, whatever the remote
+  tools/public-push-guard msg FILE           commit-msg (T-6070): scan the commit message in FILE (comment lines skipped) and the current branch name
+  tools/public-push-guard identity           (T-536a) refuse when this clone's author/committer e-mail (`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`) is not a GitHub noreply address
+                                            (`staged` runs the same check; pre-push and `report` check the e-mails of every pushed commit; `gate` those of BASE..REF, BASE default trunk)
+Rules: tools/public-push-guard.rules (reason per rule). Rule e = every non-empty value (>= 6 chars) of the gitignored .env of the
+clone and of the super folder, read at runtime, compared as substrings, NEVER printed, hashed or written.
+Public remote = url matches a public-url rule, or any substring listed (one per line) in the gitignored tools/public-push-guard.urls.
+Scanned: added lines of every pushed commit + every blob and path of the pushed tip tree. No bypass flag or env var.
+Exit: 0 pass/skip, 1 findings, 2 usage/internal error. Last line is RESULT: ...
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import collections, os, re, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RULES = os.path.join(HERE, "public-push-guard.rules")
+URLS = os.path.join(HERE, "public-push-guard.urls")
+IDENTITIES = os.path.join(HERE, "public-push-guard.identities")   # gitignored extra allowed e-mails (rule 4: never tracked)
+BASELINE = os.path.join(HERE, "public-push-guard-baseline.tsv")
+BASELINE_REL = "tools/public-push-guard-baseline.tsv"
+ZERO = "0" * 40
+MIN_SECRET = 6
+LIST_CAP = 200
+
+HOOK = """#!/bin/sh
+# installed by tools/public-push-guard install-hook (R66): content guard for pushes to public remotes.
+# Uses this worktree's tools/public-push-guard, else the copy recorded at install time. Fails CLOSED only for a PUBLIC url
+# (same patterns as the PUB rules in public-push-guard.rules, plus the lines of the optional gitignored public-push-guard.urls).
+FB='@FALLBACK@'
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+T=$TOP/tools/public-push-guard
+[ -n "$TOP" ] && [ -f "$T" ] || T=$FB
+if [ -f "$T" ] && command -v python3 >/dev/null 2>&1; then exec python3 "$T" "$@"; fi
+URL=$2
+LC=$(printf '%s' "$URL" | tr 'A-Z' 'a-z')
+PUB=0
+case "$LC" in *github.com:pixos-project/*|*github.com/pixos-project/*|*pixos-project/*) PUB=1;; esac
+CD=$(git rev-parse --git-common-dir 2>/dev/null)
+for U in "$TOP/tools/public-push-guard.urls" "$(dirname "$FB")/public-push-guard.urls" "$CD/../tools/public-push-guard.urls"; do
+  [ -f "$U" ] && while IFS= read -r L; do [ -n "$L" ] && case "$URL" in *"$L"*) PUB=1;; esac; done < "$U"
+done
+if [ $PUB = 0 ]; then
+  echo "public-push-guard: tool missing, private remote $URL allowed" >&2
+  exit 0
+fi
+echo "RESULT: FAIL public-push-guard missing (${T:-not inside a work tree}; recorded copy $FB) or python3 missing: push to public remote refused, merge trunk into this branch or fix the hook" >&2
+exit 1
+"""
+
+HOOK_PC = """#!/bin/sh
+# installed by tools/public-push-guard install-hook (T-536a): refuses a commit whose author/committer e-mail is not a GitHub noreply address (R66).
+# Uses this worktree's tools/public-push-guard, else the copy recorded at install time. A missing tool is a loud note, not a block (the pre-push hook still guards the push).
+FB='@FALLBACK@'
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+T=$TOP/tools/public-push-guard
+[ -n "$TOP" ] && [ -f "$T" ] || T=$FB
+if [ -f "$T" ] && command -v python3 >/dev/null 2>&1; then python3 "$T" identity >&2; rc=$?; [ $rc = 1 ] && exit 1; [ $rc = 0 ] || echo "public-push-guard: internal error, commit identity NOT checked" >&2; exit 0; fi
+echo "public-push-guard: tool missing ($T) or python3 missing, commit identity NOT checked" >&2
+exit 0
+"""
+
+
+def git(*a, cwd=None, raw=False):
+    r = subprocess.run(("git",) + a, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode:
+        raise RuntimeError("git %s: %s" % (" ".join(a[:3]), r.stderr.decode("utf-8", "replace").strip()))
+    return r.stdout if raw else r.stdout.decode("utf-8", "replace")
+
+
+def load_rules():
+    out = []
+    for n, ln in enumerate(open(RULES, encoding="utf-8"), 1):
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        f = ln.rstrip("\n").split("\t")
+        if len(f) != 4 or f[1] not in ("line", "path", "public-url", "identity"):
+            raise ValueError("%s:%d: want ID<TAB>line|path|public-url|identity<TAB>REGEX<TAB>REASON" % (RULES, n))
+        out.append((f[0], f[1], re.compile(f[2], re.I if f[1] in ("public-url", "identity") else 0), f[3]))
+    return out
+
+
+def is_public(url, rules):
+    if any(k == "public-url" and rx.search(url) for _, k, rx, _ in rules):
+        return True
+    if os.path.exists(URLS):
+        return any(u.strip() and u.strip() in url for u in open(URLS, encoding="utf-8"))
+    return False
+
+
+def env_secrets(top):
+    """(values, n_skipped_short, files): values of the clone .env and the super .env. Never printed."""
+    vals, short, files = {}, 0, []
+    clone = os.path.dirname(os.path.abspath(git("rev-parse", "--git-common-dir", cwd=top).strip() if os.path.isabs(git("rev-parse", "--git-common-dir", cwd=top).strip()) else os.path.join(top, git("rev-parse", "--git-common-dir", cwd=top).strip())))
+    seen = set()
+    for p in (os.path.join(top, ".env"), os.path.join(clone, ".env"), os.path.join(clone, "..", "..", ".env"), os.path.join(top, "..", "..", ".env")):
+        if not os.path.isfile(p) or os.path.realpath(p) in seen:
+            continue   # a worktree reads its own .env and the main clone's (worktrees do not carry the gitignored file)
+        seen.add(os.path.realpath(p))
+        files.append(os.path.basename(os.path.dirname(os.path.realpath(p))))
+        for ln in open(p, encoding="utf-8", errors="replace"):
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            k = re.sub(r"^export\s+", "", k.strip())
+            v = v.strip().strip("'\"")
+            if not v:
+                continue
+            if k.endswith("_SECURITY"):
+                continue   # T-2952: a security MODE name (wpa2-psk), a protocol identifier the code must spell, not a credential; the PSK/SSID/IP keys stay secrets
+            if len(v) < MIN_SECRET:
+                short += 1
+                continue
+            vals[v] = k
+    return vals, short, files
+
+
+class Scan:
+    def __init__(self, rules, secrets):
+        self.line_rules = [r for r in rules if r[1] == "line"]
+        self.path_rules = [r for r in rules if r[1] == "path"]
+        self.id_rules = [r for r in rules if r[1] == "identity"]
+        self.secrets = secrets
+        self.found = collections.OrderedDict()   # (rule, file, line) -> where
+
+    def add(self, rule, f, ln, where):
+        self.found.setdefault((rule, f, ln), where)
+
+    def path(self, f, where):
+        for rid, _, rx, _ in self.path_rules:
+            if rx.search(f):
+                self.add(rid, f, 0, where)
+
+    def text(self, f, ln, s, where):
+        if f != BASELINE_REL:   # the ratchet lists file PATHS that still hold findings (no values): its line rules would count the names it lists; rule e still applies
+            for rid, _, rx, _ in self.line_rules:
+                if rx.search(s):
+                    self.add(rid, f, ln, where)
+        for v, k in self.secrets.items():
+            if v in s:
+                self.add("e-env-secret(%s)" % k, f, ln, where)
+
+
+def mask_email(e):
+    """first char of the local part + *** + the domain: the full personal address is never printed"""
+    loc, at, dom = e.partition("@")
+    return (loc[:1] + "***" + at + dom) if at else (e[:1] + "***")
+
+
+def email_ok(sc, e):
+    """allowed = matches an identity rule (noreply) or a line of the gitignored identities file (full e-mail, or an @domain suffix)"""
+    e = e.strip().lower()
+    if any(rx.search(e) for _, _, rx, _ in sc.id_rules):
+        return True
+    if os.path.exists(IDENTITIES):
+        for ln in open(IDENTITIES, encoding="utf-8"):
+            ln = ln.strip().lower()
+            if ln and not ln.startswith("#") and (e == ln or (ln.startswith("@") and e.endswith(ln))):
+                return True
+    return False
+
+
+def check_identity(sc, label, e, where):
+    if not sc.id_rules:
+        raise ValueError("%s has no identity rule (g-identity): the identity check cannot run" % RULES)
+    if not email_ok(sc, e):
+        sc.add(sc.id_rules[0][0], "%s e-mail %s" % (label, mask_email(e)), 0, where)
+
+
+def scan_identities(sc, top, revs):
+    """author + committer e-mail of every commit (merges included) in the rev args"""
+    out = git("log", "--format=%h%x09%ae%x09%ce", "--no-color", *revs, cwd=top)
+    for ln in out.splitlines():
+        h, ae, ce = (ln.split("\t") + ["", "", ""])[:3]
+        check_identity(sc, "commit %s author" % h, ae, "history")
+        if ce != ae:
+            check_identity(sc, "commit %s committer" % h, ce, "history")
+
+
+def ident_email(top, var):
+    """e-mail of `git var GIT_AUTHOR_IDENT` / GIT_COMMITTER_IDENT ('Name <mail> ts tz'); None when git has no identity (git commit itself fails then)"""
+    r = subprocess.run(["git", "var", var], cwd=top, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    m = re.search(r"<([^>]*)>", r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else None
+    return m.group(1) if m else None
+
+
+def has_public_remote(top, rules):
+    """True when any remote url of this repo is public (public-url rules / the gitignored urls file). The private super repo, which shares the pre-commit guard, has none."""
+    r = subprocess.run(["git", "remote", "-v"], cwd=top, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return any(is_public(ln.split()[1], rules) for ln in r.stdout.decode("utf-8", "replace").splitlines() if len(ln.split()) >= 2)
+
+
+def scan_ident_vars(sc, top, rules=None):
+    if rules is not None and not has_public_remote(top, rules):
+        print("public-push-guard: NOTE no public remote in this repo: commit identity not checked (it is checked in every clone that has one)", file=sys.stderr)
+        return
+    for who, var in (("author", "GIT_AUTHOR_IDENT"), ("committer", "GIT_COMMITTER_IDENT")):
+        e = ident_email(top, var)
+        if e is None:
+            print("public-push-guard: NOTE git has no %s identity here (git commit will refuse by itself); identity NOT checked" % who, file=sys.stderr)
+        else:
+            check_identity(sc, "this clone's %s" % who, e, "git config")
+
+
+def scan_range(sc, top, revs):
+    """added lines of every non-merge commit in the rev args"""
+    out = git("log", "--no-merges", "--format=@@C%h", "-p", "-U0", "--no-color", "--no-renames", "--no-ext-diff", *revs, cwd=top, raw=True)
+    cur = f = None
+    ln = 0
+    for raw in out.split(b"\n"):
+        s = raw.decode("utf-8", "replace")
+        if s.startswith("@@C"):
+            cur, f = "commit " + s[3:], None
+        elif s.startswith("+++ "):
+            f = s[6:] if s.startswith("+++ b/") else None
+            if f:
+                sc.path(f, cur)
+        elif s.startswith("@@ "):
+            m = re.match(r"@@ -\S+ \+(\d+)", s)
+            ln = int(m.group(1)) if m else 0
+        elif s.startswith("+") and f:
+            sc.text(f, ln, s[1:], cur)
+            ln += 1
+
+
+def scan_tree(sc, top, tip):
+    ents = git("ls-tree", "-r", "-z", tip, cwd=top, raw=True).split(b"\0")
+    blobs = []
+    for e in ents:
+        if not e:
+            continue
+        meta, _, name = e.partition(b"\t")
+        mode, typ, sha = meta.decode().split()
+        f = name.decode("utf-8", "replace")
+        sc.path(f, "tip tree")
+        if typ == "blob":
+            blobs.append((sha, f))
+    p = subprocess.Popen(["git", "cat-file", "--batch"], cwd=top, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    for sha, f in blobs:
+        p.stdin.write(sha.encode() + b"\n")
+        p.stdin.flush()
+        hdr = p.stdout.readline().split()
+        n = int(hdr[2])
+        data = p.stdout.read(n)
+        p.stdout.read(1)
+        for i, s in enumerate(data.decode("utf-8", "replace").split("\n"), 1):
+            sc.text(f, i, s, "tip tree")
+    p.stdin.close()
+    p.wait()
+
+
+def identity_help():
+    print("  do instead: git config --local user.email <id>+<login>@users.noreply.github.com && git config --local user.name <login>   (this clone only; the global git config stays untouched)")
+    print("              commits already made: `git commit --amend --reset-author` (the last one) or T-b2d1 (publish branches); other allowed addresses go in the gitignored tools/public-push-guard.identities")
+
+
+def summary(sc, rules, top, verbose):
+    reasons = {r[0]: r[3] for r in rules}
+    per = collections.Counter(k[0] for k in sc.found)
+    files = collections.Counter(k[1] for k in sc.found)
+    if verbose or len(sc.found) <= LIST_CAP:
+        for (rid, f, ln), where in sc.found.items():
+            print("  %s %s%s (%s)" % (rid, f, ":%d" % ln if ln else "", where))
+    else:
+        print("  (%d findings, first %d listed; `report --list` lists all)" % (len(sc.found), LIST_CAP))
+        for (rid, f, ln), where in list(sc.found.items())[:LIST_CAP]:
+            print("  %s %s%s (%s)" % (rid, f, ":%d" % ln if ln else "", where))
+    for rid, n in sorted(per.items()):
+        print("rule %s: %d finding(s) - %s" % (rid, n, reasons.get(rid.split("(")[0], "value of a gitignored .env file (not shown)")))
+    if "g-identity" in per:
+        identity_help()
+    return per, files
+
+
+def range_args(local, remote_sha, remote_name):
+    if remote_sha and remote_sha != ZERO:
+        try:
+            git("cat-file", "-e", remote_sha + "^{commit}")
+            return [local, "--not", remote_sha]
+        except RuntimeError:   # lint-silent: expected the remote sha is not in the local object store: fall back to --remotes right below
+            pass
+    return [local, "--not", "--remotes=" + remote_name]
+
+
+def staged_added(top, base):
+    """(file, line no, text) of every added line, and the set of touched paths, of `git diff --cached BASE`"""
+    out = git("diff", "--cached", "-p", "-U0", "--no-color", "--no-renames", "--no-ext-diff", "--diff-filter=ACMR", base, cwd=top, raw=True)
+    f = None
+    ln = 0
+    lines, paths = [], set()
+    for raw in out.split(b"\n"):
+        s = raw.decode("utf-8", "replace")
+        if s.startswith("+++ "):
+            f = s[6:] if s.startswith("+++ b/") else None
+            if f:
+                paths.add(f)
+        elif s.startswith("@@ "):
+            m = re.match(r"@@ -\S+ \+(\d+)", s)
+            ln = int(m.group(1)) if m else 0
+        elif s.startswith("+") and f:
+            lines.append((f, ln, s[1:]))
+            ln += 1
+    return lines, paths
+
+
+def scan_staged(sc, top):
+    """added lines + new paths of the staged diff (T-6070). During a merge (T-9305, MERGE_HEAD present) the diff against HEAD also holds everything the other
+    parent brings, which is already on that parent: like a combined diff, only content new to BOTH parents counts (a line or path added against HEAD AND against MERGE_HEAD)."""
+    lines, paths = staged_added(top, "HEAD")
+    try:
+        mh = git("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=top).strip()
+    except RuntimeError:   # lint-silent: expected no MERGE_HEAD (not a merge commit) is the normal case: mh stays empty
+        mh = ""
+    if mh:
+        olines, opaths = staged_added(top, mh)
+        have = set((f, s) for f, _, s in olines)
+        lines = [t for t in lines if (t[0], t[2]) in have]
+        paths &= opaths
+    for f in sorted(paths):
+        sc.path(f, "staged")
+    for f, ln, s in lines:
+        sc.text(f, ln, s, "staged")
+
+
+def staged(argv):
+    """pre-commit: no remote involved, so no skip: every commit must be public-safe"""
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    secrets, short, files = env_secrets(top)
+    sc = Scan(rules, secrets)
+    scan_staged(sc, top)
+    scan_ident_vars(sc, top, rules)
+    return finish("staged", sc, rules, top, "staged diff", files, short)
+
+
+def identity(argv):
+    """standalone: this clone's author/committer e-mail (install-hook runs it, so does the tracked pre-commit via `staged`)"""
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    sc = Scan(rules, {})
+    scan_ident_vars(sc, top, rules)
+    return finish("identity", sc, rules, top, "this clone's git identity", [], 0)
+
+
+def msg(argv):
+    """commit-msg: the message text and the branch name (both end up in a public history)"""
+    if len(argv) != 1:
+        print("RESULT: ERROR public-push-guard usage: msg FILE")
+        return 2
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    secrets, short, files = env_secrets(top)
+    sc = Scan(rules, secrets)
+    for n, ln in enumerate(open(argv[0], encoding="utf-8", errors="replace").read().split("\n"), 1):
+        if not ln.startswith("#"):
+            sc.text("COMMIT_MSG", n, ln, "commit message")
+    r = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], cwd=top, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode == 0:
+        sc.text("BRANCH_NAME", 0, r.stdout.decode("utf-8", "replace").strip(), "branch name")
+    return finish("msg", sc, rules, top, "commit message", files, short)
+
+
+def finish(mode, sc, rules, top, what, files, short):
+    if sc.found:
+        per, fl = summary(sc, rules, top, False)
+        print("RESULT: FAIL public-push-guard %s %d finding(s) in %s (public by default, T-6070: use a gitignored local config or .env and commit a *.example; rules: tools/public-push-guard.rules; values are never printed)" % (mode, len(sc.found), what))
+        return 1
+    print("RESULT: PASS public-push-guard %s no findings (.env files read: %s; %d secret value(s) loaded)" % (mode, ",".join(files) or "none", len(sc.secrets)))
+    return 0
+
+
+def load_baseline():
+    out = {}
+    if os.path.exists(BASELINE):
+        for n, ln in enumerate(open(BASELINE, encoding="utf-8"), 1):
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            f = ln.rstrip("\n").split("\t")
+            if len(f) != 3 or not f[2].isdigit():
+                raise ValueError("%s:%d: want RULE<TAB>FILE<TAB>COUNT" % (BASELINE, n))
+            out[(f[0], f[1])] = int(f[2])
+    return out
+
+
+def gate(argv):
+    """gate step: tip tree only, ratcheted against the baseline of findings that exist today (T-dd93 relocates them, the baseline only shrinks)"""
+    argv = list(argv)
+    base_ref = "trunk"
+    if "--base" in argv:
+        i = argv.index("--base")
+        if i + 1 >= len(argv):
+            print("RESULT: ERROR public-push-guard usage: gate [REF] [--base BASE] [--write-baseline]")
+            return 2
+        base_ref = argv[i + 1]
+        del argv[i:i + 2]
+    write = "--write-baseline" in argv
+    refs = [a for a in argv if not a.startswith("--")]
+    ref = refs[0] if refs else "HEAD"
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    sc = run_scan([(ref, [ref])], rules, top, True)
+    cur = collections.Counter((k[0], k[1]) for k in sc.found)
+    if write:
+        keep = {k: n for k, n in cur.items() if not k[0].startswith("e-")}
+        with open(BASELINE, "w", encoding="utf-8") as f:
+            f.write("# tools/public-push-guard-baseline.tsv (T-6070): findings of the tip tree that exist today, RULE<TAB>FILE<TAB>COUNT, no values. Written by `public-push-guard gate --write-baseline`.\n")
+            f.write("# The gate step public-guard fails on any finding above this list and on any entry above the actual count: the list only shrinks. Rule e (.env values) is never listed. Relocation: T-dd93.\n")
+            for (r, fl), n in sorted(keep.items()):
+                f.write("%s\t%s\t%d\n" % (r, fl, n))
+        print("RESULT: PASS public-push-guard gate baseline written: %d entr(y/ies), %d finding(s); %d rule-e finding(s) not listed" % (len(keep), sum(keep.values()), sum(n for k, n in cur.items() if k[0].startswith("e-"))))
+        return 0
+    gaps = 0
+    try:   # T-536a: identities of the commits this branch adds on top of BASE (old history is T-b2d1's business)
+        git("rev-parse", "--verify", "-q", base_ref + "^{commit}", cwd=top)
+        scan_identities(sc, top, [ref, "--not", base_ref])
+    except RuntimeError:   # lint-silent: expected an unresolvable base is reported loudly right below (PUBLIC GAP, gaps=1), not swallowed
+        gaps += 1
+        print("PUBLIC GAP: gate base '%s' does not resolve in this repo, commit identities of %s NOT checked (pass --base REF or create the ref)" % (base_ref, ref))
+    cur = collections.Counter((k[0], k[1]) for k in sc.found)
+    base = load_baseline()
+    new, stale = [], []
+    for k, n in cur.items():
+        if k[0].startswith("e-") or n > base.get(k, 0):
+            new.append(k)
+    for k, n in base.items():
+        if cur.get(k, 0) < n:
+            stale.append((k, n, cur.get(k, 0)))
+    for k in new:
+        for (rid, f, ln), where in sc.found.items():
+            if (rid, f) == k:
+                print("  NEW %s %s%s (%s)" % (rid, f, ":%d" % ln if ln else "", where))
+    for (r, f), n, c in stale:
+        print("  STALE %s %s baseline %d > actual %d (a finding was removed: lower the baseline)" % (r, f, n, c))
+    if any(k[0] == "g-identity" for k in new):
+        identity_help()
+    held = sum(min(n, base.get(k, 0)) for k, n in cur.items() if not k[0].startswith("e-")) + gaps
+    if held - gaps:
+        print("PUBLIC GAP: %d finding(s) in %d file(s) remain in the baseline (tools/public-push-guard-baseline.tsv), to be relocated by T-dd93" % (held - gaps, len({k[1] for k in cur if not k[0].startswith("e-") and k in base})))
+    if new or stale:
+        print("RESULT: FAIL public-push-guard gate %s: %d new finding group(s), %d stale baseline entr(y/ies). Fix: remove the value (gitignored .env or local config + a *.example); after removing baselined findings run `tools/public-push-guard gate --write-baseline`" % (ref, len(new), len(stale)))
+        return 1
+    print("RESULT: PASS public-push-guard gate %s: no finding above the baseline (gaps=%d)" % (ref, held))
+    return 0
+
+
+def run_scan(tips, rules, top, tip_only=False):
+    secrets, short, files = env_secrets(top)
+    print("public-push-guard: .env files read: %s; %d secret value(s) loaded, %d too short (< %d chars) skipped" % (",".join(files) or "none", len(secrets), short, MIN_SECRET))
+    sc = Scan(rules, secrets)
+    for local, revs in tips:
+        if not tip_only:
+            scan_range(sc, top, revs)
+            scan_identities(sc, top, revs)
+        scan_tree(sc, top, local)
+    return sc
+
+
+def hook(argv):
+    if len(argv) < 2:
+        print("RESULT: ERROR public-push-guard usage: REMOTE URL (stdin ref lines) | install-hook | report")
+        return 2
+    name, url = argv[0], argv[1]
+    rules = load_rules()
+    if not is_public(url, rules):
+        print("RESULT: PASS public-push-guard skip (private remote)")
+        return 0
+    top = git("rev-parse", "--show-toplevel").strip()
+    tips = []
+    for ln in sys.stdin.read().splitlines():
+        p = ln.split()
+        if len(p) != 4 or p[1] == ZERO:
+            continue   # deletion or junk: nothing to scan
+        tips.append((p[1], range_args(p[1], p[3], name)))
+    sc = run_scan(tips, rules, top)
+    if sc.found:
+        per, files = summary(sc, rules, top, False)
+        print("RESULT: FAIL public-push-guard %d finding(s) in %d file(s) on a push to a public remote (fix the content; rules: tools/public-push-guard.rules)" % (len(sc.found), len(files)))
+        return 1
+    print("RESULT: PASS public-push-guard %d ref(s) scanned, no findings" % len(tips))
+    return 0
+
+
+def report(argv):
+    ref, remote, verbose, tip_only, i = "HEAD", "origin", False, False, 0
+    while i < len(argv):
+        if argv[i] == "--remote":
+            remote, i = argv[i + 1], i + 1
+        elif argv[i] == "--list":
+            verbose = True
+        elif argv[i] == "--tip-only":
+            tip_only = True
+        else:
+            ref = argv[i]
+        i += 1
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    sc = run_scan([(ref, [ref, "--not", "--remotes=" + remote])], rules, top, tip_only)
+    per, files = summary(sc, rules, top, verbose)
+    print("top 15 files:")
+    for f, n in files.most_common(15):
+        print("  %5d %s" % (n, f))
+    print("RESULT: %s public-push-guard report %s: %d finding(s), %d file(s)" % ("FAIL" if sc.found else "PASS", ref, len(sc.found), len(files)))
+    return 1 if sc.found else 0
+
+
+def install_hook():
+    rules = load_rules()
+    top = git("rev-parse", "--show-toplevel").strip()
+    sc = Scan(rules, {})
+    scan_ident_vars(sc, top)   # T-536a: do not install a guard into a clone that would commit with a personal e-mail
+    if sc.found:
+        summary(sc, rules, top, False)
+        print("RESULT: ERROR public-push-guard install-hook: this clone's git identity is not a GitHub noreply address; fix it first (do instead above), then re-run install-hook")
+        return 2
+    common = git("rev-parse", "--git-common-dir").strip()
+    common = os.path.abspath(common)
+    path = os.path.join(common, "hooks", "pre-push")
+    if os.path.exists(path) and "public-push-guard" not in open(path).read():
+        print("RESULT: ERROR %s exists and is not ours; add `python3 .../public-push-guard \"$@\"` to it by hand" % path)
+        return 2
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(HOOK.replace("@FALLBACK@", os.path.realpath(__file__).replace("'", "")))
+    os.chmod(path, 0o755)
+    hp = subprocess.run(["git", "config", "--get", "core.hooksPath"], stdout=subprocess.PIPE).stdout.decode().strip()
+    if hp:
+        print("NOTE: core.hooksPath=%s is set: git ignores %s/hooks; the tracked tools/hooks (pre-commit, pre-push) installed by tools/install-hooks do the work there" % (hp, common))
+    else:
+        pc = os.path.join(common, "hooks", "pre-commit")
+        if os.path.exists(pc) and "public-push-guard" not in open(pc).read():
+            print("RESULT: ERROR %s exists and is not ours; add `python3 .../public-push-guard identity` to it by hand (pre-push is installed: %s)" % (pc, path))
+            return 2
+        with open(pc, "w") as f:
+            f.write(HOOK_PC.replace("@FALLBACK@", os.path.realpath(__file__).replace("'", "")))
+        os.chmod(pc, 0o755)
+        print("installed %s (commit identity check)" % pc)
+    print("RESULT: PASS installed %s" % path)
+    return 0
+
+
+def main(argv):
+    try:
+        if argv and argv[0] == "install-hook":
+            return install_hook()
+        if argv and argv[0] == "report":
+            return report(argv[1:])
+        if argv and argv[0] == "gate":
+            return gate(argv[1:])
+        if argv and argv[0] == "staged":
+            return staged(argv[1:])
+        if argv and argv[0] == "msg":
+            return msg(argv[1:])
+        if argv and argv[0] == "identity":
+            return identity(argv[1:])
+        return hook(argv)
+    except (RuntimeError, ValueError, OSError) as e:
+        print("RESULT: ERROR public-push-guard %s" % e)
+        return 1 if len(argv) >= 2 and argv[0] not in ("report", "install-hook", "staged", "msg", "gate", "identity") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

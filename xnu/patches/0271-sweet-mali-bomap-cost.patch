@@ -1,0 +1,135 @@
+SWEET Mali BO map cost witness (patch 0271, sprint-gpu 2026-11-09; log only, no register or memory write outside the patch's own statics): times sweet_mali_map, sweet_mali_unmap and the whole user-client surface import (prepare + page walk + map) and prints, in seconds that had any, 'SWEET PERF: bomap map n N pages16k P us U max_us M unmap n N us U max_us M import n N pages16k P us U max_us M'. Why [obs nav38 settings-open r1]: the first frame with Preferences content took 36.5 ms to submit its 76 jobs (later frames 8-9 ms); a new full-screen surface import does a CPU clean+invalidate and 4 PTE writes per 16 KB page plus a page-table clean and an AS flush: is that the cost?
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index d2ba136..0c37f40 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -21,6 +21,8 @@ extern processor_t thread_bind(processor_t);
+ extern void thread_terminate_self(void);
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
++#include <os/atomic_private.h>   /* patch 0271 */
++static uint64_t sm_bom_n[3], sm_bom_us[3], sm_bom_max[3], sm_bom_pg[3];   /* patch 0271: BO map / unmap / import counters (sweet_mali_perf_bo) */
+ #include <mach/host_info.h>
+ #include <mach/task_info.h>
+ #include <sys/proc.h>
+@@ -850,6 +852,21 @@ sm_perf_tick(void)
+ 		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d cpus %d %d %d %d %d %d %d %d\n", jobs, busy / 1000, mx, sw / 1000, pct,
+ 		    cpct[0], cpct[1], cpct[2], cpct[3], cpct[4], cpct[5], cpct[6], cpct[7]);
+ 	}
++	{
++		/* patch 0271: BO map / unmap / surface import cost this second */
++		uint64_t bn[3], bu[3], bm[3], bp[3];
++		for (int k = 0; k < 3; k++) {
++			bn[k] = os_atomic_xchg(&sm_bom_n[k], 0, relaxed);
++			bu[k] = os_atomic_xchg(&sm_bom_us[k], 0, relaxed);
++			bp[k] = os_atomic_xchg(&sm_bom_pg[k], 0, relaxed);
++			bm[k] = sm_bom_max[k];
++			sm_bom_max[k] = 0;
++		}
++		if (bn[0] || bn[1] || bn[2]) {
++			printf("SWEET PERF: bomap map n %llu pages16k %llu us %llu max_us %llu unmap n %llu us %llu max_us %llu import n %llu pages16k %llu us %llu max_us %llu\n",
++			    bn[0], bp[0], bu[0], bm[0], bn[1], bu[1], bm[1], bn[2], bp[2], bu[2], bm[2]);
++		}
++	}
+ 	if (jobs > 0) {
+ 		printf("SWEET PERF: jobhist jobs %llu lt100 %llu lt250 %llu lt500 %llu lt1000 %llu lt2000 %llu lt4000 %llu ge4000 %llu\n", jobs, hist[0], hist[1], hist[2], hist[3],
+ 		    hist[4], hist[5], hist[6]);
+@@ -1130,10 +1147,45 @@ sweet_mali_query(struct sweet_mali_info *o)
+ 	return 0;
+ }
+ 
++/* patch 0271 (sprint-gpu 2026-11-09, log only): BO map / unmap / surface-import cost per second, `SWEET PERF: bomap ...` from sm_perf_tick.
++ * kind 0 = sweet_mali_map, 1 = sweet_mali_unmap, 2 = a whole surface import in the user client (prepare + page walk + map). Lock-free counters (log only). */
++void sweet_mali_perf_bo(int kind, uint64_t us, uint64_t pages16k);
++void
++sweet_mali_perf_bo(int kind, uint64_t us, uint64_t pages16k)
++{
++	if (kind < 0 || kind > 2) {
++		return;
++	}
++	os_atomic_inc(&sm_bom_n[kind], relaxed);
++	os_atomic_add(&sm_bom_us[kind], us, relaxed);
++	os_atomic_add(&sm_bom_pg[kind], pages16k, relaxed);
++	if (us > sm_bom_max[kind]) {
++		sm_bom_max[kind] = us;
++	}
++}
++
++static uint64_t
++sm_bom_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
+ /* Map n 16 KB physical pages (given by PA) into the GPU VA window; flags: SWEET_MALI_EXEC. Returns 0 and *va. The caller keeps the pages wired.
+  * Contract (review H2): ENOMEM/EINVAL = nothing is mapped. EIO/ENXIO = the mapping may still exist in the GPU, the caller must NOT free the pages (leak them). */
++static int sweet_mali_map_inner(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_out);
+ int
+ sweet_mali_map(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_out)
++{
++	uint64_t t0 = sm_bom_now_us();   /* patch 0271 */
++	int e = sweet_mali_map_inner(pa16k, n, flags, va_out);
++	sweet_mali_perf_bo(0, sm_bom_now_us() - t0, n);
++	return e;
++}
++
++static int
++sweet_mali_map_inner(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_out)
+ {
+ 	int e = 0;
+ 	uint64_t va;
+@@ -1189,8 +1241,18 @@ sweet_mali_map(const uint64_t *pa16k, uint32_t n, uint32_t flags, uint64_t *va_o
+ 
+ /* Contract (review H1/H2): the caller may only unmap a range it mapped (0105 tracks that per client). 0 = unmapped and flushed. Any other return (EINVAL: nothing changed;
+  * EIO/ENXIO: the GPU may STILL reach the pages) means the caller must NOT free or reuse the memory. */
++static int sweet_mali_unmap_inner(uint64_t va, uint32_t n);
+ int
+ sweet_mali_unmap(uint64_t va, uint32_t n)
++{
++	uint64_t t0 = sm_bom_now_us();   /* patch 0271 */
++	int e = sweet_mali_unmap_inner(va, n);
++	sweet_mali_perf_bo(1, sm_bom_now_us() - t0, n);
++	return e;
++}
++
++static int
++sweet_mali_unmap_inner(uint64_t va, uint32_t n)
+ {
+ 	int e;
+ 
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index f16aa05..13e1803 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -306,6 +306,8 @@ SweetMaliUserClient::boNew(uint64_t size, uint32_t flags, uint64_t *handle, uint
+ 	return kIOReturnSuccess;
+ }
+ 
++extern "C" void sweet_mali_perf_bo(int kind, uint64_t us, uint64_t pages16k);   /* patch 0271, bsd/dev/sweet_mali.c */
++
+ IOReturn
+ SweetMaliUserClient::importSurface(uint32_t id, IOExternalMethodArguments *args)
+ {
+@@ -319,6 +321,8 @@ SweetMaliUserClient::importSurface(uint32_t id, IOExternalMethodArguments *args)
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
++	uint64_t imp_t0;   /* patch 0271 */
++	absolutetime_to_nanoseconds(mach_absolute_time(), &imp_t0);
+ 	uint64_t len = s->memory->getLength();
+ 	if (len == 0 || (len & (page_size - 1)) || len > SWEET_MALI_MAX_BO_BYTES) {
+ 		s->release();
+@@ -340,6 +344,11 @@ SweetMaliUserClient::importSurface(uint32_t id, IOExternalMethodArguments *args)
+ 		s->release();
+ 		return ret;
+ 	}
++	{
++		uint64_t imp_t1;   /* patch 0271: whole import (prepare + page walk + GPU map) */
++		absolutetime_to_nanoseconds(mach_absolute_time(), &imp_t1);
++		sweet_mali_perf_bo(2, (imp_t1 - imp_t0) / 1000, len / page_size);
++	}
+ 	args->scalarOutput[0] = handle;
+ 	args->scalarOutput[1] = va;
+ 	args->scalarOutput[2] = len;

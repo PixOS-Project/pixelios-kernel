@@ -16,8 +16,10 @@ Rules:
 5. Anti-spam: a new file needs the same manual step done 2+ times with a measured cost (first occurrence = a line in the super repo `docs/ANTIPATTERNS.md`).
    At most 3 open (`proposed`) proposals; a 4th must supersede or replace one.
 6. Expiry: a `proposed` entry with no decision after 14 days becomes `rejected (stale)` at housekeeping; revive it only with a new reason.
-7. Housekeeping (driver, at each handoff): `tools/tool-proposals prune` (TP-017) lists stale proposals and `done` tools unused for 30 days;
+7. Housekeeping (driver, at each handoff): `tools/tool-proposals prune` (TP-017) lists stale proposals, `tools/tool-census` (TP-043) the unused tools;
    deletions need the user's approval.
+8. Used or replaced (user, 2026-10-28): a proposal's `## checked` names its **Caller:** (a tools/ caller, gate step, run plan, skill or
+   documented command) or the tool it **Replaces:**. A replaced or unused tool is deprecated through `tools/tools-status.tsv` (TP-043).
 
 Status values: proposed, approved, building, done, rejected, superseded.
 
@@ -41,14 +43,14 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-014 | tools/lint-c | done (amended) |
 | TP-015 | tools/probe-run-timeout | done (amended) |
 | TP-016 | tools/phone-lock | done |
-| TP-017 | tools/tool-proposals prune | done |
+| TP-017 | tools/tool-proposals prune | done (amended) |
 | TP-018 | tools/phone | proposed |
 | TP-019 | tools/check-site | done |
 | TP-020 | tools/phone-lock | done (amended) |
 | TP-021 | tools/tools-sync | done |
 | TP-022 | tools/patch-numbers | done (amended) |
 | TP-023 | tools/runs | done |
-| TP-024 | tools/run-preflight | done |
+| TP-024 | tools/run-preflight | done (amended) |
 | TP-025 | tools/fflash-userdata.sh --sparse | approved (amended) |
 | TP-026 | QEMU runner --smoke (runner removed in standalone T2) | rejected (amended) |
 | TP-027 | tools/devsh + org.pixelios.devd | approved (amended) |
@@ -58,3 +60,25 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-031 | tools/phone-battery | proposed (amended) |
 | TP-032 | tools/phone-postmortem | proposed |
 | TP-033 | tools/artifacts-prune | proposed |
+| TP-034 | tools/phone-lock run --snapshot | proposed |
+| TP-035 | tools/fboot-android + tools/golden-pull | done (amended) |
+| TP-036 | tools/trace-diff | done |
+| TP-037 | tools/golden-unattended-image + tools/fboot-android --unattended + tools/golden-pull ui | building (amended) |
+| TP-038 | tools/xrun-adt-guard | building (amended) |
+| TP-039 | tools/gate-xnu-build | building (amended) |
+| TP-040 | tools/run-preflight (check cmdline) | building (amended) |
+| TP-041 | tools/probe-run | proposed (amended) |
+| TP-042 | tools/heavy-job | building (amended) |
+| TP-043 | tools/tool-census | building (amended) |
+| TP-044 | tools/abl-dmesg | building |
+| TP-045 | tools/xrun | building (amended) |
+| TP-046 | tools/agent-guard | proposed (amended) |
+| TP-047 | tools/unit-hermetic | proposed |
+| TP-048 | tools/remote-job | proposed (amended) |
+| TP-049 | tools/ota-extract | building (amended) |
+| TP-050 | tools/remote-job | proposed (amended) |
+| TP-051 | tools/xrun-secret-scan | proposed |
+| TP-052 | tools/gate-lint-first | building |
+| TP-053 | tools/gate | proposed |
+| TP-054 | tools/install-hooks | proposed |
+| TP-055 | tools/offload-sync | approved (amended) |

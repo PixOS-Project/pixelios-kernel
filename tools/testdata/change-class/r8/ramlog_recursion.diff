@@ -1,0 +1,11 @@
+diff --git a/shim/ramlog.c b/shim/ramlog.c
+--- a/shim/ramlog.c
++++ b/shim/ramlog.c
+@@ -45,6 +45,7 @@ static void drop_oldest_line(void)
+ void ramlog_line(const char *line)
+ {
+ 	unsigned len = 0;
++	ramlog_line("append");
+ 	while (line[len] && len < RAMLOG_LINE_MAX - 1)
+ 		len++;
+ 	while (ramlog_used + len + 1 > RAMLOG_SIZE)

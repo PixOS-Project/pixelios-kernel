@@ -1,0 +1,93 @@
+#!/bin/sh
+# PixOS kernel repo commit-msg (TP-054, E11; same trailer rule as the super repo's tools/hooks/commit-msg, R9/R11, AP-293).
+# 1. every commit, merges included, ends with a `PixOS-Worker: <role|label>` trailer. Escape: PIXOS_ALLOW_NO_TRAILER=1 (human commits only).
+# 2. the trailer must belong to the committing thread (T3CODE_THREAD_ID -> role through the super registry docs/ROLES.tsv):
+#    - trailer == a role name: must be THE thread's role;
+#    - trailer == another registered role name: denied;
+#    - trailer == a numeric worker label (20ad, 21y): must start with the number of a role named NAME-NN (infra-20 -> 20.., fix-21 -> 21..)
+#      [convention read from the ROLES.tsv header comments, there is no label table: TP-054 open question];
+#    - anything else (W42, review-b4d11fed, a role without a numeric suffix): not decidable, printed as a loud "NOT checked" line.
+#    No T3CODE_THREAD_ID (a human), or a thread not in the registry, or no registry: the role check is skipped with a printed line.
+#    Escape for the role check only: PIXOS_TRAILER_ROLE_OVERRIDE="reason".
+# Registry: PIXOS_ROLES_FILE (tests) else docs/ROLES.tsv of the super repo = two levels above the MAIN kernel checkout (pixos-project/pixelios-kernel).
+# 0. public by default (T-6070, RULES R7): the message and the branch name go through tools/public-push-guard msg FILE; runs before every escape below, no bypass.
+PGTOP=$(git rev-parse --show-toplevel 2>/dev/null) || PGTOP=
+if [ -n "$PGTOP" ] && [ -f "$PGTOP/tools/public-push-guard" ] && command -v python3 >/dev/null 2>&1; then
+	python3 "$PGTOP/tools/public-push-guard" msg "$1" >&2
+	pgrc=$?
+	[ $pgrc = 1 ] && exit 1
+	[ $pgrc = 0 ] || echo "public-push-guard: internal error (rc=$pgrc), commit message NOT checked for public-by-default" >&2
+else
+	echo "public-push-guard: tools/public-push-guard or python3 is missing, commit message NOT checked for public-by-default" >&2
+fi
+[ "${PIXOS_ALLOW_NO_TRAILER:-}" = 1 ] && { echo "commit-msg: NOTE PIXOS_ALLOW_NO_TRAILER=1, trailer and role checks skipped" >&2; exit 0; }
+# every PixOS-Worker trailer is checked (not just the last), lower-cased once (FIX-21 is fix-21: a case spoof must not skip the role checks) (review kernel-hooks-r1 F7)
+trailers=$(git interpret-trailers --parse "$1" | sed -n 's/^PixOS-Worker:[[:space:]]*//p' | sed 's/[[:space:]]*$//' | tr 'A-Z' 'a-z')
+if [ -z "$trailers" ]; then
+	{
+		echo "commit-msg: no 'PixOS-Worker: <role>' trailer (AP-293, R9/R11)."
+		echo "  do instead: git commit --trailer \"PixOS-Worker: <role>\" -- <paths>   (merge: -m \"Merge ...\" -m \"PixOS-Worker: <role>\")"
+		echo "  escape: PIXOS_ALLOW_NO_TRAILER=1 git commit ...   (human commits only)"
+	} >&2
+	exit 1
+fi
+note() { echo "commit-msg: NOTE trailer role check skipped: $*" >&2; exit 0; }
+tid=${T3CODE_THREAD_ID:-}
+[ -n "$tid" ] || note "no T3CODE_THREAD_ID (a human commit)"
+reg=${PIXOS_ROLES_FILE:-}
+if [ -z "$reg" ]; then
+	common=$(git rev-parse --git-common-dir 2>/dev/null) || common=
+	case "$common" in /*) ;; *) common=$(pwd)/$common ;; esac
+	reg=$(cd "$common/.." 2>/dev/null && pwd)/../../docs/ROLES.tsv
+fi
+[ -r "$reg" ] || note "registry $reg not readable"
+canon() { printf '%s' "$1" | tr 'A-Z' 'a-z' | sed 's/^mcp://; s/^launch://'; }
+want=$(canon "$tid")
+# role of the thread = the role of ANY registry row (current or retired) with that id
+role=$(awk -F'\t' -v w="$want" '
+	/^#/ || $1 == "role" || NF < 7 { next }
+	{ id = tolower($2); sub(/^mcp:/, "", id); sub(/^launch:/, "", id); if (id == w) { print $1; exit } }' "$reg")
+[ -n "$role" ] || note "thread $tid is not in $reg"
+check_one() {
+	if [ -n "${PIXOS_TRAILER_ROLE_OVERRIDE:-}" ]; then
+		echo "commit-msg: NOTE trailer '$trailer' vs thread role '$role' allowed by PIXOS_TRAILER_ROLE_OVERRIDE=\"$PIXOS_TRAILER_ROLE_OVERRIDE\"" >&2
+		exit 0
+	fi
+	deny() {
+		{
+			echo "commit-msg: DENIED, trailer 'PixOS-Worker: $trailer' does not belong to this thread (role $role): $1"
+			echo "  do instead: use the role name ($role) or one of its worker labels as the trailer: git commit --trailer \"PixOS-Worker: $role\" -- <paths>"
+			echo "  escape (one commit, with a reason): PIXOS_TRAILER_ROLE_OVERRIDE=\"why\" git commit ..."
+		} >&2
+		exit 1
+	}
+	[ "$trailer" = "$role" ] && exit 0
+	if awk -F'\t' -v t="$trailer" '/^#/ || $1 == "role" || NF < 7 { next } $1 == t { found = 1 } END { exit !found }' "$reg"; then
+		deny "'$trailer' is another registered role"
+	fi
+	case "$trailer" in
+	[0-9]*[a-z]*)
+		num=${trailer%%[a-z]*}
+		rnum=${role##*-}
+		case "$role" in
+		*-[0-9]*)
+			case "$num" in
+			"$rnum") exit 0 ;;
+			esac
+			deny "label '$trailer' starts with $num but role $role is $rnum-series"
+			;;
+		esac
+		note "label '$trailer': role '$role' has no numeric suffix, label NOT checked (TP-054 open question)"
+		;;
+	esac
+	echo "commit-msg: NOTE trailer '$trailer' is neither a registered role nor a numeric label: NOT checked against role '$role' (TP-054 open question)" >&2
+	exit 0
+}
+rc=0
+set -f
+IFS='
+'
+for trailer in $trailers; do
+	( check_one ) || rc=1
+done
+exit $rc

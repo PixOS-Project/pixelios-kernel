@@ -1,0 +1,12 @@
+diff --git a/xnu/patches/0205-sweet-log.patch b/xnu/patches/0205-sweet-log.patch
+index 0000000..1111111 100644
+--- a/xnu/patches/0205-sweet-log.patch
++++ b/xnu/patches/0205-sweet-log.patch
+@@ -8,6 +8,7 @@ From: x
+ @@ -2,2 +2,3 @@ void f(void)
+  {
+ +	printf("x"); //
++\ No newline at end of file
+  	write32(a, 1);
+  }
+ --

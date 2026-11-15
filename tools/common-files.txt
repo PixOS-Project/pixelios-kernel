@@ -1,5 +1,7 @@
-# Files shared by every agent worktree (TP-021). Source of truth: branch common-tools. Edit them there, then `tools/tools-sync pull` elsewhere.
+# Files shared by every agent worktree (TP-021). Source of truth: branch trunk. Edit them there (via a branch merged to trunk), then `tools/tools-sync pull` elsewhere.
 tools/phone-lock
+tools/phone_lock_end.py
+tools/phone_lock_root.py
 tools/plock.sh
 tools/phone
 tools/phone-state
@@ -8,10 +10,26 @@ tools/fboot.sh
 tools/fflash-userdata.sh
 tools/hang-recover
 tools/probe-run
-tools/run-probe.sh
 tools/xrun
+tools/overlay_std.py
+tools/live-cut
+tools/hot
+tools/hot_shared.py
+tools/pixps.c
+tools/hfs_read.py
+tools/mkdevoverlay.py
 tools/envfile.py
 tools/xrun_report.py
+tools/xrun_early.py
+tools/crash_summary.py
+tools/ucrash_summary.py
+tools/cam_bracket.py
+tools/panic_capture.py
+tools/simseams.py
+tools/xrun_secret_scan.py
+tools/safety-check
+tools/safety_lib.py
+tools/qrmerge.py
 tools/usb-log.py
 tools/usbnet-log.py
 tools/phone-guard
@@ -19,6 +37,14 @@ tools/pstore-pull.py
 tools/tools-sync
 tools/common-files.txt
 tools/test_phone_lock.py
+tools/test_phone_lock_end.py
+tools/test_safety_check.py
+tools/test_safety_mutants.py
+tools/test_safety_xrun.py
+tools/test_overlay_std.py
+tools/test_live_cut.py
+tools/test_hot.py
+tools/test_hot_shared.py
 tools/test_phone_sm.py
 tools/test_phone_guard.py
 tools/test_usb_log.py
@@ -30,3 +56,7 @@ tools/test_patch_numbers.py
 tools/patch-guard
 tools/test_patch_guard.py
 tools/check-all.sh
+# R38 phone-converge gate step (check-all.sh runs it): the lint, its allowlist and its test must exist in every worktree that runs the shared gate
+tools/lint-phone-converge
+tools/phone-converge-allow.txt
+tools/test_lint_phone_converge.py

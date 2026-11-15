@@ -1,0 +1,14 @@
+#!/bin/bash
+# PixOS kernel repo post-checkout (T-e23b, AP-144): a NEW worktree (old HEAD all zeros, flag 1) gets the gitignored inputs (research/, .env) linked by the MAIN
+# clone's tools/worktree-new --link-only, so a raw `git worktree add` can gate (gate step `inputs`) without hand copying. Never fails the checkout; a failure is a loud stderr line.
+[ "$1" = 0000000000000000000000000000000000000000 ] && [ "$3" = 1 ] || exit 0
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "WORKTREE-AUTOLINK GAP: git rev-parse --show-toplevel failed (rc=$?): research/.env links not made" >&2; exit 0; }
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "WORKTREE-AUTOLINK GAP: git rev-parse --git-common-dir failed (rc=$?): research/.env links not made" >&2; exit 0; }
+main=$(dirname "$common")
+[ "$top" != "$main" ] || exit 0
+if [ ! -x "$main/tools/worktree-new" ]; then echo "WORKTREE-AUTOLINK FAIL: $main/tools/worktree-new missing: $top has no research/.env links (AP-144)" >&2; exit 0; fi
+out=$("$main/tools/worktree-new" --link-only "$top" 2>&1); rc=$?
+echo "$out" >&2
+[ $rc -eq 0 ] || echo "WORKTREE-AUTOLINK FAIL: rc=$rc for $top, fix: $main/tools/worktree-new --link-only $top (AP-144)" >&2
+exit 0

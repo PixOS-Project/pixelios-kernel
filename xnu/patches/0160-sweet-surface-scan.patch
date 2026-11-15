@@ -1,0 +1,128 @@
+SWEET surface scan (patch 0160, boot-arg sweetsurfscan=SEC, default off; G-11 icons): every SEC seconds (80 rounds, only changes logged) log how much of every small surface (<= 1200x1200, single plane, <= 4 MiB) holds data (sampled nonzero 32-bit words) to see whether CoreAnimation's 180x180 icon render targets are ever written. Counts client lock / write-unlock traps per surface id and the last locker process (0160c); read-only (kernel mapping of an IOBufferMemoryDescriptor); no hardware access.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -40,6 +40,8 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -186,6 +188,84 @@
+ 	return s;
+ }
+ 
++/* Patch 0160 (G-11 icons): boot-arg sweetsurfscan=SEC logs, every SEC seconds (12 rounds, first after SEC), how much of every small surface (<= 1200x1200,
++ * single plane, <= 4 MiB: CoreAnimation's 180x180 icon render targets, masks, blur buffers) holds data: a sampled count of nonzero 32-bit words. It tells
++ * whether the GPU (or anyone) ever wrote the icon surfaces: empty = nothing rendered into them, filled = they are composited wrongly. Read-only. */
++static thread_call_t sweet_surf_scan_tc;
++static uint32_t      sweet_surf_scan_secs, sweet_surf_scan_round, sweet_surf_scan_started;
++static uint32_t      sweet_surf_scan_last[SWEET_SURFACE_MAX_ID];
++static uint32_t      sweet_surf_scan_lastlk[SWEET_SURFACE_MAX_ID];   /* locks + write-unlocks at the last logged line */
++/* patch 0160c: per surface id, how many times a client locked it, write-unlocked it (kIOSurfaceLockReadOnly clear), and who last locked it */
++static uint32_t      sweet_surf_locks[SWEET_SURFACE_MAX_ID], sweet_surf_wunlocks[SWEET_SURFACE_MAX_ID];
++static char          sweet_surf_locker[SWEET_SURFACE_MAX_ID][12];   /* last sampled nonzero count + 1 per surface id (0 = never seen): only changes are logged */
++
++static void
++sweet_surf_scan_fire(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	uint32_t round = ++sweet_surf_scan_round, logged = 0, skipped = 0;
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL) {
++			sweet_surf_scan_last[id] = 0;   /* a reused id must be logged again (review 0160b) */
++			continue;
++		}
++		if (s->width <= 1200 && s->height <= 1200 && s->planeCount == 0 && s->allocSize != 0 && s->allocSize <= (4u << 20)) {
++			uintptr_t va = s->kernelAddress();
++			if (va != 0) {
++				const uint32_t *w = (const uint32_t *)va;
++				uint32_t nwords = s->allocSize / 4, nz = 0, n = 0;
++				for (uint32_t i = 0; i < nwords; i += 7) {
++					n++;
++					if (w[i] != 0) {
++						nz++;
++					}
++				}
++				uint32_t lk = sweet_surf_locks[id] + sweet_surf_wunlocks[id];
++				if (sweet_surf_scan_last[id] != nz + 1 || sweet_surf_scan_lastlk[id] != lk) {   /* first sight or changed: a timeline of when each surface gets written (0160b) */
++					if (++logged > 96) {   /* bound the log lines per round (review 0160 7b); not updated, so it is logged next round */
++						skipped++;
++					} else {
++						sweet_surf_scan_last[id] = nz + 1;
++						sweet_surf_scan_lastlk[id] = lk;
++						IOLog("SWEET SURF scan %u: id %u %ux%u fmt 0x%x bpr %u sampled nonzero %u of %u locks %u wunlocks %u last locker %s\n", round, id, s->width, s->height,
++						    s->pixelFormat, s->bytesPerRow, nz, n, sweet_surf_locks[id], sweet_surf_wunlocks[id], sweet_surf_locker[id][0] ? sweet_surf_locker[id] : "-");
++					}
++				}
++			}
++		}
++		s->release();
++	}
++	if (skipped != 0) {
++		IOLog("SWEET SURF scan %u: %u more surfaces not logged\n", round, skipped);
++	}
++	if (round < 80 && sweet_surf_scan_tc != NULL) {
++		uint64_t dl;
++		clock_interval_to_deadline(sweet_surf_scan_secs, NSEC_PER_SEC, &dl);
++		thread_call_enter_delayed(sweet_surf_scan_tc, dl);
++	}
++}
++
++static void
++sweet_surf_scan_start(void)
++{
++	uint32_t secs = 0;
++	if (!OSCompareAndSwap(0, 1, &sweet_surf_scan_started)) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweetsurfscan", &secs, sizeof(secs)) && secs != 0) {
++		sweet_surf_scan_secs = secs > 3600 ? 3600 : secs;
++		sweet_surf_scan_tc = thread_call_allocate(sweet_surf_scan_fire, NULL);
++		if (sweet_surf_scan_tc != NULL) {
++			uint64_t dl;
++			clock_interval_to_deadline(sweet_surf_scan_secs, NSEC_PER_SEC, &dl);
++			thread_call_enter_delayed(sweet_surf_scan_tc, dl);
++			IOLog("SWEET SURF: surface scan every %u s\n", sweet_surf_scan_secs);
++		}
++	}
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+@@ -196,6 +276,7 @@
+ 			IOLockFree(lock);
+ 		}
+ 	}
++	sweet_surf_scan_start();
+ }
+ 
+ static SweetSurface *
+@@ -850,6 +931,11 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	uint32_t lid = (uint32_t)(uintptr_t)id;
++	if (lid < SWEET_SURFACE_MAX_ID) {   /* patch 0160c: lock accounting for the scan */
++		sweet_surf_locks[lid]++;
++		proc_selfname(sweet_surf_locker[lid], sizeof(sweet_surf_locker[lid]));
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -863,6 +949,10 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	uint32_t uid = (uint32_t)(uintptr_t)id;
++	if (uid < SWEET_SURFACE_MAX_ID && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		sweet_surf_wunlocks[uid]++;
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();

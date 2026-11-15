@@ -38,6 +38,7 @@ static void udelay(uint32_t us)
 static int poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
 {
 	uint64_t end = now() + (uint64_t)timeout_us * counter_freq() / 1000000;
+	/* bounded: now() > end (timeout_us) returns -1 below */
 	while ((rd(a) & mask) != want)
 		if (now() > end)
 			return -1;

@@ -1,0 +1,99 @@
+sweet-wlan-rxpool (lowclk 2026-11-14, tracker L-13, research 156 sections 4-7): the Wi-Fi rx buffer pool is sized like Linux brcmfmac (max_rxbufpost from the firmware's shared RAM) and refilled in batches, one doorbell per batch.
+Observed (hardware, tracker L-13): under a 140-180 Mbit/s TCP download the AP deauths us; every bench boot shows rx starvation counters (`rx starved polls`, `fewest empty rx buffers`), and the drop boots show firmware-tossed tx (status 3) just before the DOWN [obs docs/ALL-ON-TRACKER.md L-13].
+Cause [read, not yet proven to be THE cause]: the pool was 16 buffers (SWDP_NSLOT), reposted one per rx completion with a doorbell each; 16 x 1514 B at 180 Mbit/s is about 1 ms of air time (research 156 s.4 item 1 [calc]). Linux posts max_rxbufpost (u16 at shared RAM +34, 0 -> 255) and refills in
+batches of up to 32 when 32 below it, one write-index update + doorbell per batch [Linux v6.6 brcmfmac pcie.c:223,246,1644-1647, msgbuf.c:58,974-975,987-1006; Pixel bcmdhd bcmpcie.h:373-374 max_host_rxbufs, dhd_msgbuf.c:5705-5724].
+Changed: (1) sweet_wlan_g2.h swg_e reads the u16 at shared +0x22 once, read-only (swg_rd16, the word at +0x20 the engine already reads around), a failed read or all ones is a GAP and the pool stays 16. (2) swl25_env picks the pool (swdp_rx_pick, host-tested): boot-arg sweetwlanrxpost=N (16..255) overrides, else the firmware value
+(0 -> 255, > 255 -> 255, < 16 -> 16), cut to the ring (depth - 1) and to the rx buffers the DATA block holds; one log line with firmware value, ring-1 depth, block capacity, ceiling and chosen count, and a GAP line for every adjustment. sweetwlanrxpost=16 = today's pool. Absent boot-arg = the new behaviour.
+(3) sweet_wlan.c sweet_wlan_data_blk allocates the DATA block once for 255 rx buffers (or the boot-arg count) with the same allocator and checks (contig, S2MPU granule), GAP + the old 16-buffer block when that is refused. (4) wlan_en0.h refills the pool after the completions of a poll pass
+(swdp_rx_refill_n: at least min(32, pool/4) buffers free, 1 for a pool of 16, at most 32 per batch, never past the ring end, never more than the ring has free) as ONE plan [ITEM x n, WRIDX, DB]: audited by swdp_audit (consecutive slots, one index = last slot + 1, no duplicate request id, only ring 1 may carry several items),
+executed by swg_dp_exec (item words concatenated in a file-scope buffer), judged by the L25 whitelist (sweet_wlan_l25_wl.h: ring-1 item within 32 slots of the write index, index step 1..32 inside the ring, every published item re-read, lap count on the wrap; rx buffer cap rx_n from the glue's own block length).
+(5) a 10 s line `en0 rx pool`: posted now of pool, fewest posted at a refill, most posted, batches, most buffers in one batch, buffers posted by batches, refills due but not done; the old `rx starved polls` / `fewest empty rx buffers` counters stay.
+Also regenerated from shim/ (host-tested sources): 0174 (g2.h, g2d.h), 0199 (data.h, data_plan.h, en0.h), 0206 (l25.h, l25_wl.h, l25_glue.h), 0268 (en0_bus.h hunk). This patch carries the sweet_wlan.c part.
+Host tests: shim/wlan_{data,en0,dp15,en0_live,l25_wl,glue_l25,g2}_host_test.c (the live soak runs the real audit, executor and judge with pools of 16, 48, 64, 72 and 255: at 255, 227 ring-1 doorbells for 7000 rx frames instead of 7000), tools/test_wlan_rxpool_mutants.py (93 mutants, all killed).
+Not changed: no register, address, doorbell register or firmware command is new: the stores are the existing kinds (ring-1 item words, H2D write index slot, doorbell 0 with the ring-1 word); what is new is the SHAPE (several items before one index + doorbell) in the audit, the executor and the judge. NEW WRITE SHAPE, NOT YET REVIEWED (rule 8: the
+driver decides on the review). The tx path, ring 0, flow ring, D2H consumes and the 16 rx posts of L25 are unchanged. No hardware run yet. ORDER: after 0356 (touches no wlan file; applies on the trunk stack too).
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -1160,16 +1160,20 @@
+ 	return 0;
+ }
+ 
+-/* T-d84f (W-JOIN L25, docs/research/130-wlan-l25-glue-dma-and-wiring.md s.3 C): the DATA block (flow ring, 16 tx and 16 rx buffers, SWL25_DATA_MIN bytes), allocated like the G1 block: kmem_alloc_contig (KMA_DATA|KMA_ZERO|KMA_PERMANENT),
++/* T-d84f (W-JOIN L25, docs/research/130-wlan-l25-glue-dma-and-wiring.md s.3 C): the DATA block (flow ring, 16 tx and the rx buffers), allocated like the G1 block: kmem_alloc_contig (KMA_DATA|KMA_ZERO|KMA_PERMANENT),
+  * both end pages looked up, swd_contig (physically contiguous), then the S2MPU granule guard (the probe wlan-runH1b saw S2MPU off only in the 1 GiB granule 0x22, host RAM 0x8_8000_0000 up to 0x8_C000_0000; a block above it is NOT covered, refused and its PA logged)
+  * and a cache flush of the zeroed block. swd_audit_all audits the G1 plan and does not apply here; the DATA ranges are audited by swdp_env_ok when L25 starts (swl25_env), and the alias window / overlap with the G1 block by swl25g_data at arm time.
+- * 0 = ok (outputs set), -1 = refused (one GAP line, outputs untouched). */
++ * Patch 0357: the block holds `nrx` rx buffers (SWL25_RX_OFF + nrx * 2048 bytes). The rx pool the engine posts is chosen later from the firmware's max_rxbufpost (swdp_rx_pick), which is not known at this time, so the
++ * block is allocated for the most the pool may be: SWDP_RX_MAX (255) buffers, or the boot-arg sweetwlanrxpost value (clamped 16..255) when it is set. A refused attempt (no contiguous memory, not contiguous, above the
++ * S2MPU granule) is a GAP and the next try is the old 16-buffer block (SWL25_DATA_MIN); the refused block stays allocated (KMA_PERMANENT cannot be freed, as for every failure path of this function).
++ * 0 = ok (outputs set; *len_out = the bytes the layout uses), -1 = refused (one GAP line, outputs untouched). */
+ #define SW_G2_S2MPU_END   0x8C0000000ull
+ static int
+-sweet_wlan_data_blk(uint64_t *pa_out, vm_offset_t *va_out, uint32_t *len_out)
++sweet_wlan_data_blk_try(uint32_t nrx, uint64_t *pa_out, vm_offset_t *va_out, uint32_t *len_out)
+ {
+ 	vm_offset_t va = 0;
+-	vm_size_t sz = round_page(SWL25_DATA_MIN);
++	const uint32_t want = SWL25_RX_OFF + nrx * SWL25_BUF_SZ;
++	vm_size_t sz = round_page(want);
+ 	ppnum_t pn, pl;
+ 	uint64_t pa;
+ 
+@@ -1197,13 +1201,32 @@
+ 		return -1;
+ 	}
+ 	flush_dcache64((addr64_t)pa, (unsigned)sz, TRUE);
+-	printf("SWEET WLAN: DATA block pa=0x%llx len=%u (%lu allocated)\n", (unsigned long long)pa, (unsigned)SWL25_DATA_MIN, (unsigned long)sz);
++	printf("SWEET WLAN: DATA block pa=0x%llx len=%u (%lu allocated, %u rx buffers)\n", (unsigned long long)pa, (unsigned)want, (unsigned long)sz, (unsigned)nrx);
+ 	*pa_out = pa;
+ 	*va_out = va;
+-	*len_out = (uint32_t)SWL25_DATA_MIN;
++	*len_out = want;
+ 	return 0;
+ }
+ 
++static int
++sweet_wlan_data_blk(uint64_t *pa_out, vm_offset_t *va_out, uint32_t *len_out)
++{
++	uint32_t nrx = SWDP_RX_MAX, arg = 0;
++
++	if (PE_parse_boot_argn("sweetwlanrxpost", &arg, sizeof arg)) {       /* patch 0357: the boot-arg sizes the block too (swl25_env logs and clamps the pool itself) */
++		nrx = arg < SWDP_NSLOT ? SWDP_NSLOT : arg > SWDP_RX_MAX ? SWDP_RX_MAX : arg;
++	}
++	if (sweet_wlan_data_blk_try(nrx, pa_out, va_out, len_out) == 0) {
++		return 0;
++	}
++	if (nrx > SWDP_NSLOT) {
++		swl_gap("l25", "DATA block for the large rx pool refused, falling back to 16 rx buffers", "high");
++		printf("WIFI GAP: DATA block for %u rx buffers refused (see the line above): falling back to the 16-buffer block, the rx pool stays 16\n", (unsigned)nrx);
++		return sweet_wlan_data_blk_try(SWDP_NSLOT, pa_out, va_out, len_out);
++	}
++	return -1;
++}
++
+ /* ---- patch 0174, run G2 (sweetwlan=12): the glue side. G2's own values, independent of sweet_wlan_g2.h's (R107 #5): the header computes its words, this list is computed again here from the
+  * glue's own reads of the shared structure and ring_info, its own copy of the G1 plan and the constants below; sw3_wr takes a G2 store only when it is an entry of this list. */
+ #define SW_G2_FLAGS2_OLD 0x40943041u    /* shared +0x50 as the firmware left it, R89 s.1 [obs] F3 */
+@@ -3066,6 +3089,9 @@
+ 			printf("SWEET WLAN: en0 poll time (last window, ms): pass %llu link %llu (%llu checks) judge %llu cache %llu; longest pass %llu us, longest gap after a busy pass %llu us, rx starved polls %u, fewest empty rx buffers %u\n",
+ 			    ns_[0] / 1000000ull, ns_[1] / 1000000ull, swp_n_link - l_nlink, ns_[2] / 1000000ull, ns_[3] / 1000000ull, ns_[4] / 1000ull, d_ / 1000ull, e->rx_starve,
+ 			    e->rx_avail_min > 0u ? e->rx_avail_min - 1u : 0u);
++			printf("SWEET WLAN: en0 rx pool (last window): posted now %u of %u, fewest posted at a refill %u, most posted %u, refill batches %u, most buffers in one batch %u, buffers posted by batches %u, refills due but not done %u\n",
++			    e->rxb.inflight, swdp_env_rxn(&e->env), e->rx_posted_min > 0u ? e->rx_posted_min - 1u : 0u, e->rx_posted_peak, e->rx_batches, e->rx_batch_max, e->rx_batch_bufs, e->rx_refill_fail);
++			e->rx_posted_min = 0u; e->rx_posted_peak = 0u; e->rx_batches = 0u; e->rx_batch_max = 0u; e->rx_batch_bufs = 0u;
+ 			pass_max = gap_max = 0;
+ 			e->rx_avail_min = 0;
+ 			l_pass = t_pass; l_link = swp_t_link; l_judge = swp_t_judge; l_cache = swp_t_cache; l_nlink = swp_n_link;
+@@ -3185,6 +3211,12 @@
+ 		sw_gx.d4b = h->d4b;
+ 		sw_gx.jc = h->jc;           /* T-4a7f: the same table the list's L24 entries were built from (NULL until the credentials reader sets it) */
+ 		sw_gx.njc = h->njc;
++		{       /* patch 0357: boot-arg sweetwlanrxpost (present with any value) for swl25_env's pool choice */
++			uint32_t rxarg = 0;
++
++			sw_gx.in.rxarg_set = PE_parse_boot_argn("sweetwlanrxpost", &rxarg, sizeof rxarg) ? 1u : 0u;
++			sw_gx.in.rxarg = rxarg;
++		}
+ 		if (PE_parse_boot_argn("sweetwlankeep", &keep, sizeof keep) && keep == 1u) {        /* patch 0268: keep the dongle running after a finished L26 (see sw_keep_arm) */
+ 			if (h->d4b >= 13) {
+ 				sw_gx.keep = 1;

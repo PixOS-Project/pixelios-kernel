@@ -49,6 +49,19 @@ class T(unittest.TestCase):
         self.files(3, 5)   # and with every number in the range really present
         self.assertTrue(self.run_check([3, 4, 5])[0])
 
+    def test_long_prose_header_before_the_diff_is_accepted(self):
+        # patch 0173 opens with ~3 KB of description; the check used to read only the first 2048 bytes and FAILED the gate (integ20ab2)
+        with open(os.path.join(self.d, "0001-sweet-long.patch"), "w") as fh:
+            fh.write("prose line\n" * 400 + DIFF)
+        self.assertTrue(self.run_check([])[0])
+
+    def test_no_diff_line_anywhere_fails(self):
+        with open(os.path.join(self.d, "0001-sweet-prose.patch"), "w") as fh:
+            fh.write("only prose, mentions diff and --- inline\n" * 100)
+        ok, _, findings = self.run_check([])
+        self.assertFalse(ok)
+        self.assertIn("no diff header", findings[0])
+
     def test_held_regex_matches_reservations_and_files(self):
         self.assertTrue(vr.HELD_RE.match("0132  (not committed anywhere)   RESERVED by wifi-reserved (?)"))
         self.assertTrue(vr.HELD_RE.match("0130  0130-sweet-wlan-image-copy.patch [4 refs]   RESERVED by wifi (x)"))

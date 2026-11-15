@@ -1,0 +1,139 @@
+SWEET nav16 (patch 0260, T-b34d, G-10b-nav; input injection + log only, no register or store to hardware): (1) the nav unlock check (patch 0254/0255) accepts the unlock only when Preferences was exec'd inside the unlock window or >= 20 DISTINCT frames (SWEET FPS distinct) followed the swipe, not by raw swaps >= 30: nav15 accepted 164 swaps of a lock-screen/boot-logo animation (distinct 0) with 0 wake taps and reps 0-1 ran on a locked phone; a failed check sends the wake tap (540,70) and the swipe again, cap 3, SWEET GAP on the cap; without sweetfps the swap check stays with a GAP line. (2) `SWEET NAV: display-state about-pre|about-post ...` lines (swaps, distinct, vsync callbacks, ms since the last AppleCLCD::swap, Preferences exec count) around the About tap, the H3 witness (is the panel still presenting when About is dead with the gate satisfied).
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3817cf2..4b75e44 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -514,6 +514,13 @@ extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: read by the nav sessio
+ uint64_t sweet_fb_swap_count;
+ extern "C" uint64_t sweet_fb_distinct_count;   /* patch 0258: distinct frames (SWEET FPS `distinct`, the 32x32 hash) since boot, read by the nav session of SweetHID.cpp; counts only with boot-arg sweetfps */
+ uint64_t sweet_fb_distinct_count;
++static uint64_t sweet_fb_last_swap_abs;   /* patch 0260: mach_absolute_time of the last AppleCLCD::swap, for the nav display-state line */
++extern "C" void
++sweet_fb_display_state(uint64_t *vsync, uint64_t *last_swap_abs)   /* patch 0260 (T-b34d): read-only snapshot for the nav session's `SWEET NAV: display-state` line */
++{
++	*vsync = sweet_fb_vsync_count_mirror;
++	*last_swap_abs = sweet_fb_last_swap_abs;
++}
+ 
+ /*
+  * DPU register dump (patch 0165, boot-arg sweetdpudump=MASK, default 0 = off; docs/research/79, research 78 item "DPU read-only dump").
+@@ -726,6 +733,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	sweet_fb_last_swap_abs = mach_absolute_time();   /* patch 0260 */
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index e356e90..db29f1c 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -395,6 +395,7 @@ public:
+ 	uint64_t fNavAboutDs0;   /* patch 0258: distinct-frame count at the first about-open tap */
+ 	uint64_t fNavGenSw0;   /* patch 0258: swap count at the General tap */
+ 	uint64_t fNavGateT0, fNavGateCnt, fNavGateFlatT;   /* patch 0258: about-open gate: start (0 = idle), last seen swap count, time that count last changed (ns) */
++	uint64_t fNavDs0;   /* patch 0260: distinct-frame count at the start of this unlock attempt */
+ 	UInt32 fNavHomeSt, fNavPref0;   /* patch 0255: 1-3 = the app-home swipe after a Preferences launch inside the unlock window is running, 4 = done; Preferences exec count at the first unlock attempt */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+@@ -445,8 +446,27 @@ uint64_t sweet_touch_down_ns;
+ extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: swaps presented so far, written by AppleCLCD::swap */
+ extern "C" uint64_t sweet_fb_distinct_count;   /* patch 0258: distinct frames so far (SWEET FPS `distinct`), written by AppleCLCD::swap when sweetfps is on */
+ extern "C" bool sweet_fb_distinct_live(void);   /* patch 0258 */
++extern "C" void sweet_fb_display_state(uint64_t *vsync, uint64_t *last_swap_abs);   /* patch 0260 */
+ extern "C" uint32_t sweet_exec_pref_count;   /* patch 0255: execs of "Preferences" so far, counted in bsd/kern/kern_exec.c */
+ 
++/*
++ * Patch 0260 (T-b34d, G-10b-nav): display-state line, the H3 witness of T-18b3 ("a dead About with a satisfied gate: is the panel still presenting?"). One line of read-only
++ * counters on the SWEET NAV clock: swaps and distinct frames since boot, the vsync callback count, the ms since the last AppleCLCD::swap (a blank or frozen display shows a growing
++ * `last_swap_ago_ms` with `vsync` still counting, a stopped vsync shows both flat), the Preferences exec count. No hardware access.
++ */
++static void
++sweetNavDisplayState(const char *tag, UInt32 rep, UInt32 taps)
++{
++	uint64_t vs = 0, lsa = 0, nowabs = mach_absolute_time(), ago_ns = 0, nowns;
++	sweet_fb_display_state(&vs, &lsa);
++	absolutetime_to_nanoseconds(nowabs, &nowns);
++	if (lsa != 0 && nowabs >= lsa) {
++		absolutetime_to_nanoseconds(nowabs - lsa, &ago_ns);
++	}
++	IOLog("SWEET NAV: display-state %s rep %u taps %u now %llu swaps %llu distinct %llu vsync %llu last_swap_ago_ms %llu%s pref_exec %u\n", tag, rep, taps, nowns,
++	    sweet_fb_swap_count, sweet_fb_distinct_count, vs, ago_ns / 1000000, lsa == 0 ? " (no swap yet)" : "", (unsigned)sweet_exec_pref_count);
++}
++
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
+@@ -627,6 +647,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	fNavAboutTaps = 0;
+ 	fNavAboutSw0 = 0;
+ 	fNavAboutDs0 = fNavGenSw0 = 0;
++	fNavDs0 = 0;
+ 	fNavGateT0 = fNavGateCnt = fNavGateFlatT = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNav = NULL;
+@@ -743,6 +764,7 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		self->fNavGateT0 = 0;
+ 		self->fNavAboutSw0 = sweet_fb_swap_count;   /* patch 0256: swaps before the first About tap */
+ 		self->fNavAboutDs0 = sweet_fb_distinct_count;   /* patch 0258 */
++		sweetNavDisplayState("about-pre", self->fNavRep, self->fNavAboutTaps);   /* patch 0260: the state of the display right before the first About tap */
+ 		if (!sweet_fb_distinct_live()) {
+ 			IOLog("SWEET GAP: NAV about-open: SWEET FPS distinct is not live (boot-arg sweetfps off), the verify counts swaps\n");
+ 		}
+@@ -761,6 +783,7 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+ 	if (st == 0 && i == 0) {
+ 		self->fNavSw0 = sweet_fb_swap_count;   /* patch 0254: swaps before this unlock attempt */
++		self->fNavDs0 = sweet_fb_distinct_count;   /* patch 0260 */
+ 		if (self->fNavWakeTaps == 0) {
+ 			self->fNavPref0 = sweet_exec_pref_count;   /* patch 0255 */
+ 		}
+@@ -801,10 +824,18 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * presented fewer than 30 swaps the session sends a wake tap (540,70 = the status bar, a tap there is harmless on the lock and the home screen; 100 ms), waits 2 s and swipes again, at most 3 times, then goes on with a GAP line. Logs every
+ 		 * decision; the action markers of the first attempt stay the only ones. Input injection only.
+ 		 */
+-		uint64_t d = sweet_fb_swap_count - self->fNavSw0;
+-		if (d < 30 && self->fNavWakeTaps < 3) {
++		/*
++		 * Patch 0260 (T-b34d, G-10b-nav): the unlock is accepted only by Preferences having been exec'd inside the window, or by >= 20 DISTINCT frames (SWEET FPS `distinct`) after the
++		 * swipe, not by raw swaps >= 30. nav15 [obs docs/reviews/T-18b3-proof.md boot 2]: the window held 164 swaps (SWEET FPS 61 swaps/s, distinct 0 at +1.9 s) of the lock-screen/boot-logo
++		 * animation, was accepted with 0 wake taps, and reps 0-1 ran on a locked phone. Same class as the About verify of patch 0258. Not accepted: the wake tap and the swipe again
++		 * (cap 3, as patch 0254), then a GAP line. Without sweetfps (distinct not live) the swap count of patch 0254 stays the check, with its own GAP line.
++		 */
++		uint64_t d = sweet_fb_swap_count - self->fNavSw0, dd = sweet_fb_distinct_count - self->fNavDs0;
++		bool dlive = sweet_fb_distinct_live(), prefExec = sweet_exec_pref_count != self->fNavPref0;
++		bool unlocked = prefExec || (dlive ? dd >= 20 : d >= 30);
++		if (!unlocked && self->fNavWakeTaps < 3) {
+ 			self->fNavWakeTaps++;
+-			IOLog("SWEET NAV: unlock retry %u: %llu swaps in the unlock window (< 30), wake tap at 540,70 then the swipe again\n", self->fNavWakeTaps, d);
++			IOLog("SWEET NAV: unlock retry %u: %llu distinct (%llu swaps) in the unlock window (< 20 distinct, Preferences not exec'd), wake tap at 540,70 then the swipe again\n", self->fNavWakeTaps, dd, d);
+ 			self->touch(0, true, 540, 70);
+ 			self->fNavWakeSt = 1;
+ 			self->fNavStep = 0;
+@@ -825,10 +856,13 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 			sender->setTimeoutMS(100);
+ 			return;
+ 		}
+-		IOLog("SWEET NAV: unlock window %llu swaps, wake taps %u, preferences exec count %u -> %u, home swipe %u\n", d, self->fNavWakeTaps,
+-		    (unsigned)self->fNavPref0, (unsigned)sweet_exec_pref_count, (unsigned)self->fNavHomeSt);
+-		if (d < 30) {
+-			IOLog("SWEET GAP: NAV unlock: %llu swaps after %u wake taps, going on (rep 0 unlock / home-page rows will be no-anim)\n", d, self->fNavWakeTaps);
++		IOLog("SWEET NAV: unlock window %llu swaps, %llu distinct, wake taps %u, preferences exec count %u -> %u, home swipe %u, %s\n", d, dd, self->fNavWakeTaps,
++		    (unsigned)self->fNavPref0, (unsigned)sweet_exec_pref_count, (unsigned)self->fNavHomeSt, unlocked ? "accepted" : "NOT accepted");
++		if (!dlive) {
++			IOLog("SWEET GAP: NAV unlock: SWEET FPS distinct is not live (boot-arg sweetfps off), the unlock check counts swaps\n");
++		}
++		if (!unlocked) {
++			IOLog("SWEET GAP: NAV unlock: %llu distinct (%llu swaps) after %u wake taps, going on (rep 0 unlock / home-page rows will be no-anim)\n", dd, d, self->fNavWakeTaps);
+ 		}
+ 	}
+ 	if (aboutAct) {
+@@ -844,6 +878,7 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		uint64_t sw = sweet_fb_swap_count - self->fNavAboutSw0, ds = sweet_fb_distinct_count - self->fNavAboutDs0;
+ 		bool dlive = sweet_fb_distinct_live();
+ 		uint64_t ad = dlive ? ds : sw;
++		sweetNavDisplayState("about-post", self->fNavRep, self->fNavAboutTaps);   /* patch 0260: at the end of the tap's settle window, before the retry decision */
+ 		if (ad < 20 && self->fNavAboutTaps < 2) {
+ 			self->fNavAboutTaps++;
+ 			IOLog("SWEET NAV: about-open retry %u: %llu distinct (%llu swaps) since the first About tap (< 20 distinct), tap again at 500,%d\n", self->fNavAboutTaps, ds, sw, self->fNavAboutTaps == 2 ? 400 : 370);

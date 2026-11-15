@@ -1,0 +1,10 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,4 +1,7 @@
+ {
++	printf("%d",
++#define write32 trace32
++	    a);
+ 	write32(a, 1);
+ }

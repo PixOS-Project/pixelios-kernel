@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""safety-check: enforce docs/SAFETY-CHECKLIST.md (super repo, RULES H9, user 2026-11-12) on every phone run. Host only; stdlib.
+
+  tools/safety-check pre --kernel K --bootline LINE [--build-out F] [--image IMG] [--usbnet 0|1] [--action ram-boot|flash-userdata]
+                         [--writes PART]... [--patches DIR]... [--profile NAME] [--tree DIR] [--state DIR]
+      BEFORE the phone lock: S2 (cooled, last known), S3 (temp source in kernel + boot line), S4 (last known soc/vcell), S5 (early watchdog),
+      S6 (USB log on), S7 (boot line fits this kernel + shim; the build refused nothing), S8 (reversible writes only), S9 (rule-8 marks reviewed).
+      One `SAFETY PASS pre <id>: ...` or `SAFETY FAIL <id>: <why>` line per item, then `RESULT: PASS|FAIL safety-check pre ...`. Exit 0 = all pass.
+      With --image IMG a pass writes IMG.safety (image sha256): tools/fboot.sh --expect xnu refuses an image without it.
+  tools/safety-check fastboot [--state DIR]
+      UNDER the lock, phone in fastboot, right before `fastboot boot`: S8 product == bluejay (nothing else is asked of another phone), S4
+      battery-voltage >= 3500 mV, S2 storage-temperature < 38 C (the only temperature fastboot reports on bluejay, UFS sensor [obs resident
+      2026-11-12 21:10Z]) and the S2/S4 state rules again (a queued run waited). Exit 0 = boot may start.
+  tools/safety-check monitor --log USBNET_LOG [--stop FILE] [--until FILE] [--t-boot EPOCH] [--sysfs DIR] [--state DIR]
+      ALONGSIDE the boot (start right after `fastboot boot`): follows the tools/usbnet-log.py file ("<epoch>\\t<line>"). S1 temp >= 45.0 C;
+      S3 no temp= row for > 60 s (480 s before the first row: GAP, patch 0307 prints temp= only from ~330 s after the charger start); S4 soc
+      < 10 % or vcell < 3500 mV (a kernel with patch 0334 prints temp= in the P3 rows: then 60 s from the first USB log line; median of 3; and the boot's first soc >= 15 % after a low park); S6 no USB log within 180 s of the boot, a
+      silence > 60 s, or a phone that left the bus and is not back as 18d1 within 180 s. A fail prints `SAFETY FAIL ...`, writes FILE (default
+      DIR/stop) with the reason, marks the state, exits 1. Exit 0: --until FILE appeared or the phone came back as 18d1 (reset) = normal end,
+      written to FILE.done (so a caller can tell a monitor that ended from one that died).
+  tools/safety-check notify --line TEXT [--thread ID] [--state DIR]
+      HUMAN-NEEDED alert: one line in DIR/human-needed.log and `t3 thread send` to --thread / $T3CODE_THREAD_ID (tools/phone_lock_end.py notify,
+      the phone-lock end-notice path); `NOTIFY ok|FAIL|none` line. The receiving thread pushes the user (PushNotification).
+  tools/safety-check stamp-check IMG      exit 0 when IMG.safety names IMG's sha256 (tools/fboot.sh)
+  tools/safety-check status [--state DIR] the shared state (last temp/soc/vcell, hot/low, parked since)
+
+CALL CONTRACT (tools/xrun does all of it for every boot it makes; tools/resident boots through tools/xrun, so a resident boot is covered):
+  1. pre before the lock; a FAIL refuses the run (never inside a hold). 2. fastboot after to-fastboot, under the lock. 3. monitor from
+  `fastboot boot` until the boot ends; its stop file ends the boot: park in fastboot (software reset, tools/phone goto fastboot). 4. an S6 stop
+  or a park that fails: notify at once, mark the run HUMAN-NEEDED. 5. every caller uses the SAME --state DIR (default
+  $ARTIFACTS/safety = ~/pixelios-artifacts/safety): the next boot's S2/S4 read what the last boot left. A resident job between boots may read
+  `status`; it never boots without pre. Thresholds are the checklist's; there is no override flag for S1-S6 (raise a limit only with the user).
+SIM SEAM: SAFETY_TBOOT_BACKDATE=S (monitor: the boot started S s earlier; sandbox only, tools/simseams.py require). SAFETY_FASTBOOT=PATH (the
+  fastboot binary of the fastboot mode; sandbox only). Exit: 0 PASS, 1 FAIL, 2 usage/error.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import argparse, hashlib, json, os, re, signal, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import safety_lib as L  # noqa: E402
+import simseams  # noqa: E402
+
+
+def out(line):
+    print(line, flush=True)
+
+
+def argval(bootline, key):
+    """The last KEY=value of the boot line (XNU keeps the last), or None."""
+    v = None
+    for t in bootline.split():
+        if t.startswith(key + "="):
+            v = t[len(key) + 1:]
+    return v
+
+
+def pint(v):
+    m = re.match(r"\d+", v or "")
+    return int(m.group(0)) if m else 0
+
+
+# ---- S2 / S4 state rules (pre and fastboot) ------------------------------------------------------------------
+s2_state = L.s2_state   # one S2 rule, in tools/safety_lib.py: tools/resident asks the same function before it boots (tracker L-17)
+
+
+def s4_state(st, now):
+    park = L.last_park(st)
+    parked = None if park is None else now - park
+    soc, mv = st.get("soc"), st.get("vcell")
+    low = st.get("low") or (soc is not None and soc < L.SOC_FLOOR) or (mv is not None and mv < L.VCELL_MIN)
+    have = "last soc %s, vcell %s" % ("%.2f %%" % soc if soc is not None else "unknown", "%d mV" % mv if mv is not None else "unknown")
+    if low:
+        why = (st.get("low") and st.get("low_why")) or have   # same stale-cause rule as S2 (L-21)
+        if parked is not None and parked >= L.COOL_PARK_S:
+            return True, "low at the last reading (%s), parked %d s >= %d s: admitted on the fastboot battery-voltage (>= %d mV) and the boot's first soc (>= %.1f %%)" % (
+                why, parked, L.COOL_PARK_S, L.VCELL_MIN, L.SOC_FLOOR), True
+        return False, "%s below soc %.1f %% / vcell %d mV; parked %s < %d s" % (why, L.SOC_FLOOR, L.VCELL_MIN, "%d s" % parked if parked is not None else "unknown", L.COOL_PARK_S), False
+    if soc is None and mv is None:
+        return True, "no soc/vcell reading known: the fastboot battery-voltage and the live rows decide", True
+    return True, have + " (floors soc %.1f %%, vcell %d mV)" % (L.SOC_FLOOR, L.VCELL_MIN), False
+
+
+# ---- pre -------------------------------------------------------------------------------------------------------
+def pre_items(a, now):
+    """[(id, ok, text)] of every pre item; plus the defer flags for the monitor."""
+    items, st = [], L.load_state(a.state)
+    ok2, t2, d2 = s2_state(st, now)
+    items.append(("S2", ok2, t2))
+    try:
+        kb = L.kernel_bytes(a.kernel)
+    except OSError as e:
+        return [("S7", False, "kernel %s unreadable: %s" % (a.kernel, e))], False, False, False
+    bl = a.bootline or ""
+    chg = argval(bl, "sweetchgi2c") == "1" and pint(argval(bl, "sweetchgicl")) > 0
+    if L.TEMP_FMT not in kb:
+        items.append(("S3", False, "kernel %s has no battery temp row (xnu patch 0307 'temp=' format string): the boot would run blind" % os.path.basename(a.kernel)))
+    elif not chg:
+        items.append(("S3", False, "boot line lacks sweetchgi2c=1 + sweetchgicl=N (the charger stage that prints the temp rows; --no-chg turns it off)"))
+    else:
+        items.append(("S3", True, "temp source present (patch 0307 rows, sweetchgi2c=1 sweetchgicl=%s); %s" % (argval(bl, "sweetchgicl"),
+                      "P3 rows carry temp (patch 0334): first row due within %d s of the first USB log line" % L.TEMP_GAP_S if L.P3_TEMP_FMT in kb else
+                      "GAP: no temp in the P3 rows (kernel without patch 0334): blind until the first MON row, limit %d s from the boot" % L.TEMP_FIRST_S)))
+    ok4, t4, d4 = s4_state(st, now)
+    items.append(("S4", ok4, t4))
+    early, wdt = L.WDT_EARLY.encode() in kb, pint(argval(bl, "sweetwdt"))
+    if early and wdt > 0:
+        items.append(("S5", True, "kernel arms the watchdog without USB (patch 0333 string), sweetwdt=%d" % wdt))
+    else:
+        miss = "kernel lacks the early-arm string '%s'" % L.WDT_EARLY if not early else "boot line has no sweetwdt=N > 0 (--no-wdt)"
+        on = L.trunk_has(a.tree, L.WDT_EARLY)
+        if on is True:
+            items.append(("S5", False, miss + "; the early watchdog (patch 0333) is on trunk: rebuild the kernel from trunk"))
+        else:
+            items.append(("S5", True, "WARN %s; %s: S6 (alive-or-notify) is the backstop" % (
+                miss, "the early watchdog is not on trunk yet" if on is False else "GAP: git could not tell whether trunk has it")))
+    items.append(("S6", a.usbnet == "1", "USB log on (sweetusb=2): the monitor can see the boot" if a.usbnet == "1" else
+                  "the boot has no USB log (--no-usbnet): alive, temp and battery cannot be watched"))
+    items.append(s7(a, kb, bl))
+    items.append(s8(a))
+    items.append(s9(a))
+    return items, d2, d4, L.P3_TEMP_FMT in kb
+
+
+def s7(a, kb, bl):
+    lim, shim = L.kernel_bootline_len(kb), L.mkpayload_len(a.tree)
+    if not bl:
+        return ("S7", False, "no boot line given (--bootline)")
+    if lim is None:
+        return ("S7", False, "kernel lacks the SWEET_BOOT_LINE_LENGTH tag (xnu patch 0176): mkpayload refuses it")
+    if shim is not None and shim != lim:
+        return ("S7", False, "kernel boot line field %d B != tools/mkpayload.py BOOT_LINE_LENGTH %d B (mkpayload refuses the pair)" % (lim, shim))
+    n = len(bl.encode())
+    if n > lim - 1:
+        return ("S7", False, "boot line %d B > limit %d B of this kernel" % (n, lim - 1))
+    if a.build_out:
+        try:
+            bo = open(a.build_out, errors="replace").read()
+        except OSError as e:
+            return ("S7", False, "build output %s unreadable: %s" % (a.build_out, e))
+        ref = [x for x in bo.splitlines() if x.startswith("REFUSED") or x.startswith("mkpayload:")]
+        if ref:
+            return ("S7", False, "the build refused: " + ref[0][:200])
+        if not re.search(r"^boot-args: ", bo, re.M):
+            return ("S7", False, "the build output has no boot-args: line (the image was not built)")
+    return ("S7", True, "boot line %d B <= %d B (kernel tag %d%s%s)" % (n, lim - 1, lim, ", build ok" if a.build_out else "",
+                                                                  "; GAP: no BOOT_LINE_LENGTH in this tree's tools/mkpayload.py, kernel tag alone judged" if shim is None else ""))
+
+
+GUARDS = (("tools/fboot.sh", '[ "$prod" = bluejay ]'), ("tools/fboot.sh", "tools/phone-lock check"), ("tools/to-fastboot.sh", "bluejay"))
+
+
+def s8(a):
+    bad = [w for w in a.writes if w != "userdata"]
+    if bad:
+        return ("S8", False, "the run writes %s: only userdata may be written (AGENTS rule 1)" % ", ".join(bad))
+    if a.action == "flash-userdata" and not os.path.exists(os.path.join(a.tree, "tools", "fflash-userdata.sh")):
+        return ("S8", False, "userdata flash without tools/fflash-userdata.sh in %s" % a.tree)
+    for f, needle in GUARDS:
+        try:
+            if needle not in open(os.path.join(a.tree, f)).read():
+                return ("S8", False, "%s lost its guard '%s' (bluejay/lock check)" % (f, needle))
+        except OSError as e:
+            return ("S8", False, "%s unreadable: %s" % (f, e))
+    what = "RAM boot (fastboot boot), no partition write" if a.action == "ram-boot" and not a.writes else "userdata only, via tools/fflash-userdata.sh"
+    return ("S8", True, what + "; bluejay + lock checked by tools/fboot.sh / to-fastboot.sh under the lock and by `safety-check fastboot`")
+
+
+def s9(a):
+    try:
+        items = L.marked_items(a.tree, [os.path.join(a.tree, "xnu", "patches")] + a.patches)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+        return ("S9", False, "cannot list the rule-8 marks: %s" % e)
+    if not items:
+        return ("S9", True, "no [NEW ... UNREVIEWED] mark in the tree's history or patch headers")
+    rdir = L.reviews_dir(a.tree)
+    if not rdir or not os.path.isdir(rdir):
+        return ("S9", False, "%d rule-8 mark(s) and no reviews dir (%s; set PIXOS_REVIEWS_DIR)" % (len(items), rdir))
+    open_ = []
+    for what, keys in items:
+        f, v = L.review_verdict(rdir, keys)
+        if not L.is_safe_verdict(v):
+            open_.append("%s (%s)" % (what, "review %s says %r" % (f, v) if f else "no review names it"))
+    if open_:
+        return ("S9", False, "unreviewed new hardware write: " + "; ".join(open_[:3]) + (" +%d more" % (len(open_) - 3) if len(open_) > 3 else ""))
+    return ("S9", True, "%d rule-8 mark(s), each with a SAFE review in %s" % (len(items), os.path.basename(os.path.dirname(rdir)) + "/reviews"))
+
+
+def cmd_pre(a):
+    now = time.time()
+    if a.bootline_file:
+        a.bootline = open(a.bootline_file).read().strip()
+    items, d2, d4, p3 = pre_items(a, now)
+    for i, ok, txt in items:
+        out("SAFETY %s %s: %s" % ("PASS pre" if ok else "FAIL", i, txt))
+    bad = [i for i, ok, _ in items if not ok]
+    if bad:
+        out("RESULT: FAIL safety-check pre %s failed=%s" % (a.profile or os.path.basename(a.kernel), ",".join(bad)))
+        return 1
+    L.update_state(a.state, defer_s2=d2, defer_s4=d4, p3_temp=p3)
+    if a.image:
+        h = hashlib.sha256(open(a.image, "rb").read()).hexdigest()
+        with open(a.image + ".safety", "w") as f:
+            json.dump({"sha256": h, "at": now, "items": [i for i, _, _ in items]}, f)
+    out("RESULT: PASS safety-check pre %s items=%d" % (a.profile or os.path.basename(a.kernel), len(items)))
+    return 0
+
+
+# ---- fastboot ----------------------------------------------------------------------------------------------------
+def getvar(fb, var):
+    try:
+        r = subprocess.run([fb, "getvar", var], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    m = re.search(r"^%s:\s*(\S+)" % re.escape(var), r.stdout + r.stderr, re.M)
+    return (m.group(1) if m else None), (r.stdout + r.stderr).strip()[:120]
+
+
+def cmd_fastboot(a):
+    fb = os.environ.get("SAFETY_FASTBOOT") or "fastboot"
+    if os.environ.get("SAFETY_FASTBOOT"):
+        simseams.warn("SAFETY_FASTBOOT")
+        simseams.require_sandbox(["SAFETY_FASTBOOT"])
+    now, res = time.time(), []
+    prod, raw = getvar(fb, "product")
+    if prod != "bluejay":
+        out("SAFETY FAIL S8: fastboot product is %r, not bluejay (%s): nothing else is asked" % (prod, raw))
+        out("RESULT: FAIL safety-check fastboot failed=S8")
+        return 1
+    res.append(("S8", True, "product bluejay"))
+    st = L.load_state(a.state)
+    v, raw = getvar(fb, "battery-voltage")
+    mv = pint(v) if v else None
+    ok4, t4, _ = s4_state(st, now)
+    if mv is not None and mv < L.VCELL_MIN:
+        res.append(("S4", False, "fastboot battery-voltage %d mV < %d mV" % (mv, L.VCELL_MIN)))
+    elif mv is None:
+        res.append(("S4", ok4, "GAP: fastboot battery-voltage unreadable (%s); state: %s" % (raw, t4)))
+    else:
+        res.append(("S4", True, "fastboot battery-voltage %d mV >= %d mV" % (mv, L.VCELL_MIN)))
+    v, raw = getvar(fb, "storage-temperature")
+    try:
+        sc = float(v) if v is not None else None
+    except ValueError:   # lint-silent: expected a non-numeric value = unreadable, printed as the GAP of the S2 line below
+        sc = None
+    ok2, t2, _ = s2_state(st, now)
+    if sc is not None and sc >= L.COOL_C:
+        res.append(("S2", False, "fastboot storage-temperature %.0f C >= %.1f C (still cooling in fastboot)" % (sc, L.COOL_C)))
+    elif sc is not None:
+        res.append(("S2", True, "fastboot storage-temperature %.0f C < %.1f C (the newest reading; state: %s)" % (sc, L.COOL_C, t2)))
+    else:
+        res.append(("S2", ok2, "GAP: fastboot storage-temperature unreadable (%s); state: %s" % (raw, t2)))
+    L.update_state(a.state, fb_at=now, fb_vcell=mv, fb_storage_c=sc)
+    for i, ok, txt in res:
+        out("SAFETY %s %s: %s" % ("PASS fastboot" if ok else "FAIL", i, txt))
+    bad = [i for i, ok, _ in res if not ok]
+    out("RESULT: %s safety-check fastboot%s" % ("FAIL" if bad else "PASS", " failed=" + ",".join(bad) if bad else ""))
+    return 1 if bad else 0
+
+
+# ---- monitor -------------------------------------------------------------------------------------------------------
+def usb_ids(sysfs):
+    ids = set()
+    try:
+        for n in os.listdir(sysfs):
+            try:
+                ids.add(open(os.path.join(sysfs, n, "idVendor")).read().strip())
+            except OSError:   # lint-silent: expected a sysfs entry without idVendor (interface/hub nodes)
+                continue
+    except OSError:   # lint-silent: expected no sysfs (container): the gadget is never "seen", so the silence rules stay on
+        pass
+    return ids
+
+
+def cmd_monitor(a):
+    stop = a.stop or os.path.join(a.state, "stop")
+    t_boot = float(a.t_boot) if a.t_boot else time.time()
+    back = os.environ.get("SAFETY_TBOOT_BACKDATE")
+    if back:
+        simseams.warn("SAFETY_TBOOT_BACKDATE")
+        simseams.require_sandbox(["SAFETY_TBOOT_BACKDATE"])
+        t_boot -= float(back)
+    sysfs = a.sysfs or simseams.sysfs_usb()
+    for p in (stop, stop + ".done"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:   # lint-silent: expected no stale stop file, the normal case
+            pass
+    st = L.update_state(a.state, boot_at=t_boot, end_at=None, end_why=None)
+    m = L.Monitor(t_boot, defer_s2=bool(st.get("defer_s2")), defer_s4=bool(st.get("defer_s4")), p3_temp=bool(st.get("p3_temp")))
+    term = []
+    signal.signal(signal.SIGTERM, lambda *_: term.append(1))
+    out("SAFETY MONITOR: start log=%s t_boot=%.0f defer_s2=%s defer_s4=%s p3_temp=%s state=%s" % (a.log, t_boot, m.defer_s2, m.defer_s4, m.p3_temp, a.state))
+    pos, buf, cleared = 0, b"", False
+    while True:
+        now = time.time()
+        try:
+            with open(a.log, "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos += len(chunk)
+        except FileNotFoundError:   # lint-silent: expected the listener has not created the log yet; S6 counts the silence
+            chunk = b""
+        buf += chunk
+        *lines, buf = buf.split(b"\n")
+        batt = False
+        for ln in lines:
+            ep, tab, text = ln.decode("latin-1").partition("\t")
+            try:
+                ep = float(ep)
+            except ValueError:   # lint-silent: expected a line without the listener's epoch stamp is no datagram (blank/partial line)
+                continue
+            r = m.feed(ep, text)
+            batt = batt or r is not None
+        if batt:
+            kv = {"batt_at": now}
+            if m.last_temp is not None:
+                kv.update(temp_c=m.last_temp, temp_at=m.last_temp_at)
+            if m.socs:
+                kv["soc"] = L.median3(m.socs)
+            if m.vcells:
+                kv["vcell"] = int(L.median3(m.vcells))
+            if not cleared and m.first_temp is not None and m.first_temp < L.COOL_C and (not m.defer_s4 or (m.socs and m.socs[0] >= L.SOC_FLOOR)):
+                kv.update(hot=False, low=False, defer_s2=False, defer_s4=False)
+                cleared = True
+            L.update_state(a.state, **kv)
+        ids = usb_ids(sysfs)
+        m.usb(now, "1209" in ids, "18d1" in ids)
+        why = m.check(now)
+        if why:
+            with open(stop, "w") as f:
+                f.write(why + "\n")
+            L.record_fail(a.state, why, now)
+            out(why)
+            return 1
+        if m.reset_done or term or (a.until and os.path.exists(a.until)):
+            how = "phone back on the bus as 18d1 (reset)" if m.reset_done else "terminated" if term else "until-file"
+            L.update_state(a.state, end_at=now, end_why="normal end: " + how)
+            end = "SAFETY MONITOR END: %s; last temp %s soc %s vcell %s" % (how, m.last_temp, L.median3(m.socs), L.median3(m.vcells))
+            with open(stop + ".done", "w") as f:   # a normal end: waitusb must not read the exited monitor as a dead one (rule 7 check)
+                f.write(end + "\n")
+            out(end)
+            return 0
+        simseams.poll(1.0)
+
+
+# ---- notify / stamp / status -----------------------------------------------------------------------------------------
+def cmd_notify(a):
+    import phone_lock_end
+    now = time.time()
+    L.human_needed(a.state, a.line, now)
+    tid = a.thread or os.environ.get("T3CODE_THREAD_ID")
+    if not tid:
+        out("NOTIFY none: no --thread and no T3CODE_THREAD_ID (logged in %s/human-needed.log only)" % a.state)
+        return 0
+    rc = phone_lock_end.notify("thread:" + tid, "SAFETY HUMAN-NEEDED: " + a.line[:300])
+    out("NOTIFY %s thread=%s" % ("ok" if rc == 0 else "FAIL rc=%s" % rc, tid))
+    return 0
+
+
+def cmd_stamp_check(a):
+    try:
+        s = json.load(open(a.image + ".safety"))
+    except (OSError, ValueError) as e:
+        out("SAFETY FAIL stamp: %s.safety missing/unreadable (%s): run tools/safety-check pre --image IMG first" % (a.image, e))
+        return 1
+    h = hashlib.sha256(open(a.image, "rb").read()).hexdigest()
+    if s.get("sha256") != h:
+        out("SAFETY FAIL stamp: %s changed since its safety-check pre (sha %s != %s)" % (a.image, h[:12], str(s.get("sha256"))[:12]))
+        return 1
+    out("SAFETY PASS stamp: pre passed for this image %d s ago" % (time.time() - float(s.get("at", 0))))
+    return 0
+
+
+def cmd_status(a):
+    st = L.load_state(a.state)
+    park = L.last_park(st)
+    out(json.dumps(dict(st, parked_since=park, now=time.time()), sort_keys=True))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="safety-check", add_help=False)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("pre")
+    p.add_argument("--kernel", required=True)
+    p.add_argument("--bootline")
+    p.add_argument("--bootline-file")
+    p.add_argument("--build-out")
+    p.add_argument("--image")
+    p.add_argument("--usbnet", choices=("0", "1"), default="1")
+    p.add_argument("--action", choices=("ram-boot", "flash-userdata"), default="ram-boot")
+    p.add_argument("--writes", action="append", default=[])
+    p.add_argument("--patches", action="append", default=[])
+    p.add_argument("--profile")
+    p.add_argument("--tree", default=os.path.dirname(HERE))
+    p = sub.add_parser("fastboot")
+    p = sub.add_parser("monitor")
+    p.add_argument("--log", required=True)
+    p.add_argument("--stop")
+    p.add_argument("--until")
+    p.add_argument("--t-boot")
+    p.add_argument("--sysfs")
+    p = sub.add_parser("notify")
+    p.add_argument("--line", required=True)
+    p.add_argument("--thread")
+    p = sub.add_parser("stamp-check")
+    p.add_argument("image")
+    sub.add_parser("status")
+    for s in sub.choices.values():
+        s.add_argument("--state", default=L.default_state_dir())
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit:
+        return 2
+    if not a.cmd:
+        print(__doc__)
+        return 2
+    return {"pre": cmd_pre, "fastboot": cmd_fastboot, "monitor": cmd_monitor, "notify": cmd_notify, "stamp-check": cmd_stamp_check,
+            "status": cmd_status}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

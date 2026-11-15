@@ -5,23 +5,30 @@
 # Exit 0 PASS / 1 FAIL / 2 ERROR. Serials are never printed. Non-bluejay devices are reported, never touched beyond the id query.
 # Other tools only assume vendor 18d1. fastboot is queried only when the usb id says fastboot (18d1:d001 / 18d1:4ee0),
 # because a bare `fastboot getvar` against a phone in recovery hangs 120 s.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 TMO=${PS_TMO:-8}; [ "$TMO" -le 8 ] || TMO=8
 t() { timeout -k 1 "$TMO" "$@"; }
 
 probe() { # sets state, prod, note; returns 0 ok, 2 probe error (timeout)
 	state=absent prod=unknown note=""
-	local usb out s st rc=0 other=0 info dev boot p
+	local usb out s st rc=0 other=0 pend=0 info dev boot p
 	usb=$(t lsusb 2>/dev/null) || { rc=$?; [ "$rc" -lt 124 ] || { note="lsusb timed out"; return 2; }; usb=""; }
 	echo "$usb" | grep -qi 'ID 18d1:' || { note="no Google USB device"; return 0; }
 	rc=0; out=$(t adb devices 2>/dev/null) || rc=$?
 	[ "$rc" -lt 124 ] || { note="adb devices timed out"; return 2; }
 	while read -r s st; do
 		[ -n "$s" ] && [ -n "$st" ] || continue
-		case "$st" in device|recovery|sideload|rescue) ;; *) other=1; continue ;; esac
+		# 2026-11-11 (resident parks 15:27Z/17:01Z): right after a reset adb lists the phone in a transient state (offline/connecting/...) before
+		# recovery; that is not another device, it is not verified yet (pend): the caller re-observes without sending anything
+		case "$st" in device|recovery|sideload|rescue) ;; *) pend=1; continue ;; esac
 		rc=0; info=$(t adb -s "$s" shell 'getprop ro.product.device; getprop sys.boot_completed' 2>/dev/null) || rc=$?
 		[ "$rc" -lt 124 ] || { note="adb getprop timed out"; return 2; }
 		info=$(echo "$info" | tr -d '\r')
 		dev=$(echo "$info" | sed -n 1p); boot=$(echo "$info" | sed -n 2p)
+		# 2026-11-09 (gputest-cache1 park): right after a reset the phone lists in recovery before adbd answers getprop; an EMPTY product is
+		# not another device, it is not verified yet: probe error (the caller retries), as the fastboot path below does for an empty getvar
+		[ -n "$dev" ] || { state=unknown; note="adb $st: getprop gave no product yet (adbd starting?)"; return 2; }
 		[ "$dev" = bluejay ] || { other=1; continue; }
 		prod=bluejay
 		case "$st" in device) if [ "$boot" = 1 ]; then state=android; else state=booting; fi ;; *) state=recovery ;; esac
@@ -37,6 +44,8 @@ probe() { # sets state, prod, note; returns 0 ok, 2 probe error (timeout)
 			return 0
 		fi
 	fi
+	# a Google USB device that neither adb nor fastboot identified (yet): only a product READ as something else is another device
+	if [ $other = 0 ]; then state=unknown; note="Google USB device not identified yet ($([ $pend = 1 ] && echo "adb lists it in a transient state" || echo "adb/fastboot list nothing")): not verified"; return 2; fi
 	state=other; note="OTHER-DEVICE (not touched)"
 	return 0
 }
@@ -82,7 +91,7 @@ esac
 S
 	cat >"$d/fastboot" <<'S'
 #!/bin/bash
-case "$1" in devices) printf 'SECRET123\tfastboot\n' ;; getvar) echo "product: ${ST_DEV:-bluejay}" >&2 ;; esac
+case "$1" in devices) [ -n "$ST_FB_NONE" ] || printf 'SECRET123\tfastboot\n' ;; getvar) echo "product: ${ST_DEV:-bluejay}" >&2 ;; esac
 S
 	chmod +x "$d"/*
 	chk() { # name expected_rc expected_state env...
@@ -99,6 +108,9 @@ S
 	chk other-adb     1 other    ST_USB=18d1:4ee2 ST_ADB=device ST_DEV=sweet
 	chk other-fb      1 other    ST_USB=18d1:4ee0 ST_DEV=sweet
 	chk hang          2 absent   ST_USB=18d1:4ee2 ST_HANG=1
+	chk reset-offline 2 unknown  ST_USB=18d1:d001 ST_ADB=offline ST_FB_NONE=1
+	chk reset-nolist  2 unknown  ST_USB=18d1:d001 ST_FB_NONE=1
+	chk other-offline 1 other    ST_USB=18d1:4ee2 ST_ADB=device ST_DEV=sweet ST_FB_NONE=1
 	CHK_ARGS="--expect fastboot" chk expect-mismatch 1 android ST_USB=18d1:4ee2 ST_ADB=device
 	CHK_ARGS="--expect none" chk expect-none 0 absent ST_USB=
 	[ $fail = 0 ] && echo "self-test PASS" || echo "self-test FAIL"; return $fail

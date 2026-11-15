@@ -4,7 +4,7 @@
 #   tools/xnu-local-build [--stack DIR] [--label NAME] [--jobs N] [--timeout SEC] [--fresh] [--deps-only] [--make-args STR]
 #                         [--compare KERNEL]
 #   --stack DIR      directory holding the *.sh stagers and *.patch files (default: <repo>/xnu/patches)
-#   --label NAME     work tree name under $LOCALBUILD/work (default: main). A changed stack is synced into the same tree, so only the
+#   --label NAME     work tree name under $LOCALBUILD/work (default: main; [A-Za-z0-9][A-Za-z0-9._-]*, else exit 2). A changed stack is synced into the same tree, so only the
 #                    files whose patched content changed are rebuilt; a different label is a separate tree.
 #   --jobs N         make -jN (default 4, capped at 4: the dev machine runs out of memory)
 #   --make-args STR  extra arguments for the final make (debugging, e.g. "-d" or "-n")
@@ -12,17 +12,31 @@
 #   --fresh          delete the work dir first (cold build)
 #   --deps-only      only fetch/build the host toolchain and dependencies, no kernel
 #   --compare KERNEL a CI kernel to compare with (default none): size, sha256, external and SWEET symbol sets, section sizes
-# Output kernel: $LOCALBUILD/out/kernel.development.sweet (also left in the work tree under fakeroot/System/Library/Kernels).
+# Where it builds (R26): on offload-host, via tools/xnu-remote-build (this tool calls it first); on this host only as its loud fallback (`XNU REMOTE FALLBACK:` line), or with
+#   XNU_BUILD_WHERE=local, XNUB_IN_SLOT=1 (inside the offload-host container), or for --deps-only/--compare/--make-args/--timeout (`XNU REMOTE SKIP:`). Every build is recorded in
+#   $LOCALBUILD/built-on.tsv (date, sha256, label, offload-host|lab-host-fallback|lab-host-local, reason). The lab-host path waits HEAVY_JOB_WAIT (default 10800 s) for the heavy-job lock.
+# Output kernel: $LOCALBUILD/out/<label>/kernel.development.sweet (also left in the work tree under fakeroot/System/Library/Kernels).
 # Everything big lives in $LOCALBUILD (default ~/pixelios-artifacts/localbuild), never in git or /tmp. No sudo: flex and
 # bison, if missing, are unpacked from the Debian .deb files into $LOCALBUILD/hostroot (apt-get download + dpkg -x).
-# Method (ideas from hackios-xnu-kernel/xnu-deps, own code): stock clang as a Mach-O cross compiler (-target
+# Method (own code, written from the build errors; the host-compat header carries one comment per error): stock clang as a Mach-O cross compiler (-target
 # arm64-apple-macos14.0), theos cctools (ld64, libtool, nm, otool, strip), MacOSX14.0.sdk, a fake xcrun, mig/unifdef/csh built
 # from source, Apple's closed iig replaced by pre-generated DriverKit headers from the SDK plus generated stubs.
 # Progress: ~/pixelios-artifacts/scratch/xnu-local-build.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -euo pipefail
 ARGS=("$@"); SELF=$(readlink -f "$0"); cd "$(dirname "$SELF")/.."
 ROOT=$PWD
-A=${ARTIFACTS:-$HOME/pixelios-artifacts}
+# R26: every build goes through tools/xnu-remote-build FIRST: it builds on offload-host (the pixos-xnub container, its own queue) and only falls back here, loudly, when offload-host is unavailable
+# before the build starts. Not dispatched: XLB_INNER (the timeout re-exec below), XNUB_IN_SLOT=1 (we ARE the build inside the offload-host container: no recursion), XNU_BUILD_WHERE=local; the
+# dispatcher itself sends --deps-only/--compare/--make-args/--timeout back here with an `XNU REMOTE SKIP:` line. It exec's us again with XNU_BUILD_WHERE=local and XNU_LEDGER_WHERE/REASON set.
+if [ -z "${XLB_INNER:-}" ] && [ "${XNUB_IN_SLOT:-}" != 1 ] && [ "${XNU_BUILD_WHERE:-auto}" != local ]; then exec "$ROOT/tools/xnu-remote-build" "${ARGS[@]}"; fi
+# TP-042: one heavy job per machine (class build); R26: the default wait is 10800 s (was 1800), the lab-host FIFO queue is being merged and a fallback build must outlive a gate in front of it. HEAVY_JOB_HELD set = already inside tools/heavy-job (e.g. the gate), so no second lock; XLB_INNER = the timeout re-exec below.
+if [ -z "${XLB_INNER:-}" ]; then
+	if [ -n "${HEAVY_JOB_HELD:-}" ]; then echo "heavy-job: nested in $HEAVY_JOB_HELD, no second lock" >&2
+	else HEAVY_JOB_QUIET=1 exec "$ROOT/tools/heavy-job" run --class build --label "xnu-local-build" --wait "${HEAVY_JOB_WAIT:-10800}" -- bash "$SELF" "${ARGS[@]}"; fi
+fi
+A=$(realpath -m -- "${ARTIFACTS:-$HOME/pixelios-artifacts}")   # absolute: stage_tree cd's into the work tree before $A/git-mirror is used (review xnub-mirror-r1 F5)
 LB=${LOCALBUILD:-$A/localbuild}
 TAG=xnu-8796.141.3
 stack=$ROOT/xnu/patches; label=""; makeargs=""; jobs=4; tmo=3600; fresh=0; depsonly=0; compare=""
@@ -30,11 +44,21 @@ while [ $# -gt 0 ]; do case "$1" in
 	--stack) stack=$(cd "$2" && pwd); shift 2 ;; --label) label=$2; shift 2 ;;
 	--jobs) jobs=$2; shift 2 ;; --make-args) makeargs=$2; shift 2 ;; --timeout) tmo=$2; shift 2 ;; --fresh) fresh=1; shift ;;
 	--deps-only) depsonly=1; shift ;; --compare) compare=$2; shift 2 ;;
-	*) echo "unknown option $1 (see the header of tools/xnu-local-build)" >&2; exit 2 ;; esac; done
+	*) echo "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
 [ "$jobs" -le 4 ] 2>/dev/null || jobs=4
-mkdir -p "$A/scratch" "$LB"; LOG=$A/scratch/xnu-local-build.log; : >"$LOG"
+[ -z "$label" ] || [[ $label =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "RESULT: ERROR --label must be one path component [A-Za-z0-9._-]: $label"; exit 2; }
+# rule 8: a mkdir failure is a RESULT: ERROR line, not a bare set -e exit 1 (a container with a read-only $HOME hit it before the lock check, trunk c2f57b5)
+mkdir -p "$LB" || { echo "RESULT: ERROR cannot create LOCALBUILD $LB"; exit 2; }
+# one XNU build per host (review dev-speed-gaps-r1 F1, one heavy job): every caller (gate-xnu-build, gate-pre, by hand) shares $LB/out and the log
+if [ -z "${XLB_INNER:-}" ]; then
+	exec 8>>"$LB/.build-lock"
+	flock -n 8 || { echo "xnu-local-build: another build holds $LB/.build-lock; waiting up to ${tmo}s" >&2; flock -w "$tmo" 8 || { echo "RESULT: ERROR another xnu-local-build held $LB/.build-lock for ${tmo}s"; exit 2; }; }
+fi
+mkdir -p "$A/scratch" || { echo "RESULT: ERROR cannot create $A/scratch (set ARTIFACTS)"; exit 2; }   # after the lock: a refused second build writes nothing
+LOG=$A/scratch/xnu-local-build.log; : >"$LOG"
 START=$(date +%s)
-finish() { local res=$1; shift; { echo "RESULT: $res $1"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
+# XNU_RESULT_EXTRA (set by tools/xnu-remote-build go_local: where= fallback= head= dirty= stack= DIRTY) rides on the RESULT line so a lab-host fallback / dirty tree shows there (review xnu-remote-build-r1 F4/F7)
+finish() { local res=$1; shift; { echo "RESULT: $res $1${XNU_RESULT_EXTRA:+ $XNU_RESULT_EXTRA}"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
 say() { echo "[$(( $(date +%s) - START ))s] $*" | tee -a "$LOG" >&2; }
 # the whole run is bounded
 if [ -z "${XLB_INNER:-}" ]; then
@@ -315,59 +339,44 @@ template <class T, decltype(sizeof(0)) N> struct __xlb_sum<T[N]> : __xlb_sum<T> 
 #endif
 EOF
 hdr "$HI/hostcompat.h" <<'EOF'
-/* force-included in the kernel build's host tools (SETUP/*): what BSD libc has and glibc lacks */
-#include <errno.h>
-#include <fcntl.h>
-#include <libgen.h>
+/* force-included in the kernel build's host tools (SETUP/*). Written from the compiler errors of a build without it; one comment per item names the error it answers. */
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
-#include <byteswap.h>
-extern char *program_invocation_short_name;
-static inline const char *getprogname(void) { return program_invocation_short_name; }
-#ifndef __unused
-#define __unused __attribute__((unused))
-#endif
-#ifndef __dead2
-#define __dead2 __attribute__((noreturn))
-#endif
-#ifndef __printflike
-#define __printflike(a, b) __attribute__((format(printf, a, b)))
-#endif
-/* kextsymboltool seeks in its output, which the export check points at /dev/null: BSD lseek returns the offset there, Linux 0 */
-static inline off_t xlb_lseek(int fd, off_t off, int whence) {
-	off_t r = (lseek)(fd, off, whence); struct stat st;
-	return (r != off && whence == SEEK_SET && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) ? off : r;
-}
-#define lseek xlb_lseek
-#define OSSwapInt16(x) bswap_16(x)
-#define OSSwapInt32(x) bswap_32(x)
-#define OSSwapInt64(x) bswap_64(x)
+/* kextsymboltool.c:59: "unknown type name 'vm_offset_t'" / 'vm_size_t' */
 typedef uintptr_t vm_offset_t;
 typedef uintptr_t vm_size_t;
+/* kextsymboltool.c:307: "use of undeclared identifier 'boolean_t'" */
 typedef int boolean_t;
+/* kextsymboltool.c:433: "use of undeclared identifier 'TRUE'" */
 #ifndef TRUE
 #define TRUE 1
 #define FALSE 0
 #endif
-/* BSD setmode/getmode: the build only uses absolute octal modes */
-static inline void *setmode(const char *s) { char *e; long v = strtol(s, &e, 8); if (*e || v < 0) return NULL; mode_t *m = malloc(sizeof *m); *m = (mode_t)v; return m; }
+/* setsegname.c:201 and 4 more lines: "call to undeclared function 'OSSwapInt32'" */
+#define OSSwapInt32(x) __builtin_bswap32(x)
+/* kextsymboltool.c:100 (seekFile): "couldn't write output: Success" from check_all_exports, which writes to /dev/null (config/Makefile:127).
+   BSD lseek on /dev/null returns the requested offset, Linux returns 0; answer the requested offset for character devices. */
+#include <unistd.h>
+static inline off_t xlb_lseek(int fd, off_t off, int whence) {
+	struct stat st;
+	off_t r = lseek(fd, off, whence);
+	return (whence == SEEK_SET && r != off && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) ? off : r;
+}
+#define lseek xlb_lseek
+/* installfile.c:148, replacecontents.c:147: "call to undeclared function 'getprogname'" (glibc spells it program_invocation_short_name) */
+extern char *program_invocation_short_name;
+static inline const char *getprogname(void) { return program_invocation_short_name; }
+/* installfile.c:63,68: "call to undeclared function 'setmode'" / 'getmode'. The build passes only absolute octal modes (-m 0444/0644/0755 in makedefs), so parse just those. */
+static inline void *setmode(const char *s) {
+	char *e; long v = strtol(s, &e, 8);
+	if (*s == 0 || *e || v < 0 || v > 07777) return NULL;
+	mode_t *m = malloc(sizeof *m); if (m) *m = (mode_t)v; return m;
+}
 static inline mode_t getmode(const void *set, mode_t omode) { (void)omode; return *(const mode_t *)set; }
-#ifndef O_EXLOCK
-#define O_EXLOCK 0
-#endif
-#ifndef O_SHLOCK
-#define O_SHLOCK 0
-#endif
-#ifndef O_SYMLINK
-#define O_SYMLINK 0
-#endif
 EOF
 hdr "$HI/libc.h" <<'EOT'
 #pragma once
@@ -510,9 +519,17 @@ DXB_SHA=663906528d1cd5ea8fde7de6f16de73db9511549   # same pin as .github/workflo
 fetchsha "$LB/dxb" https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
 shopt -s nullglob
 stagers=("$stack"/*.sh); ours=("$stack"/*.patch)
+[ ${#stagers[@]} -le 1 ] || mapfile -t stagers < <(printf '%s\n' "${stagers[@]}" | LC_ALL=C sort)   # locale-independent stager order: it feeds stackhash and the stager run order (container C.UTF-8 vs host en_US gave different orders)
+[ ${#ours[@]} -le 1 ] || mapfile -t ours < <(printf '%s\n' "${ours[@]}" | LC_ALL=C sort)
 [ ${#ours[@]} -gt 0 ] || finish ERROR "no *.patch in $stack"
-stackhash=$( (cat "${stagers[@]}" "${ours[@]}"; cat "$LB/dxb/patches/"*.patch) | sha256sum | cut -c1-12)
+stackhash=$( (cat "${stagers[@]}" "${ours[@]}"; printf '%s\0' "$LB"/dxb/patches/*.patch | LC_ALL=C sort -z | xargs -0 cat) | sha256sum | cut -c1-12)
 [ -n "$label" ] || label=main   # one rolling work tree: a changed stack is synced into it, so only the changed files rebuild
+# prune old work trees first (SSD filled twice, 2026-11-07/11): tools/xnu-lb-prune.sh; the offload container keeps its own prune (xnub_prune), never a build failure
+if [ "${XNUB_IN_SLOT:-}" = 1 ]; then echo "XNU LOCAL: work-tree prune skipped in the offload slot (xnub_prune owns it)" >&2
+else
+	# shellcheck source=tools/xnu-lb-prune.sh
+	. "$ROOT/tools/xnu-lb-prune.sh"; lbp_prune "$LB/work" "$LB" "$label" 2>&1 | tee -a "$LOG" >&2 || true
+fi
 W=$LB/work/$label
 [ "$fresh" = 0 ] || rm -rf -- "$W"
 X=$W/xnu; FR=$W/fakeroot; OBJ=$W/build/xnu.obj; SYM=$W/build/xnu.sym
@@ -520,7 +537,23 @@ MACOS_VERSION=13.5; RCDK=22.6.0; KDKROOT=$LB/no-kdk   # the closed KDK libs are 
 # a new version of this script (its generators and flags) invalidates every object: start the work tree over
 toolhash=$(sha256sum "$SELF" | cut -c1-8)
 [ "$(cat "$W/.toolhash" 2>/dev/null)" = "$toolhash" ] || rm -rf -- "$W"
-mkdir -p "$W"; echo "$toolhash" >"$W/.toolhash"
+# tree identity (wlan-wui-f, 2026-11-08): XNU's config bakes the absolute source path into every generated Makefile (SOURCE_DIR) and
+# every .d file, so a work tree copied or moved here from another label keeps compiling THAT tree's sources while the stack is synced
+# into this one. A tree is used only at the path it was made for (.treepath, and the bsd Makefile's SOURCE_DIR); otherwise it starts over.
+treepath=$(realpath -m -- "$W")
+if [ -d "$W" ]; then
+	tp=$(cat "$W/.treepath" 2>/dev/null) || tp=""; sd=""
+	for mkf in "$OBJ"/*/bsd/*/Makefile; do [ -f "$mkf" ] && { sd=$(sed -n 's/^SOURCE_DIR=//p' "$mkf" | head -n 1); break; }; done
+	why=""
+	[ -z "$tp" ] || [ "$tp" = "$treepath" ] || why="made for $tp"
+	[ -z "$sd" ] || [ "$sd" = "$X" ] || why="${why:+$why, }its Makefiles compile $sd"
+	[ -n "$tp" ] || [ ! -d "$OBJ" ] || [ -n "$sd" ] || why="no .treepath and no generated bsd Makefile to check"
+	if [ -n "$why" ]; then
+		if [ "${XLB_TEST_NO_TREE_RESET:-}" = 1 ]; then say "xnu-local-build GAP: XLB_TEST_NO_TREE_RESET=1 (regression test only): NOT resetting foreign work tree $W ($why)"
+		else say "XNU TREE RESET: work tree $W is not this label's own ($why): copied or moved from another label; starting it over (cold build)"; rm -rf -- "$W"; fi
+	fi
+fi
+mkdir -p "$W"; echo "$toolhash" >"$W/.toolhash"; echo "$treepath" >"$W/.treepath"
 
 # stage_tree DIR: a pristine copy plus everything CI's build.sh does to it, plus ours (patches() in blacktop's build.sh)
 stage_tree() {
@@ -535,8 +568,15 @@ stage_tree() {
 	sed -i 's|^\(INCFLAGS_SDK[[:space:]]*=\) -I$(SDKROOT)/usr/local/include/\(kernel\)\{0,1\}|\1 -I$(FAKEROOT_DIR)/usr/local/include/kernel|' makedefs/MakeInc.def
 	sed -i 's|export MIG := $(shell $(XCRUN) -sdk $(SDKROOT) -find mig)|export MIG := $(shell find $(FAKEROOT_DIR) -name "mig")|g' makedefs/MakeInc.cmd
 	sed -i 's|export MIGCOM := $(shell $(XCRUN) -sdk $(SDKROOT) -find migcom)|export MIGCOM := $(shell find $(FAKEROOT_DIR) -name "migcom")|g' makedefs/MakeInc.cmd
+	# the stagers git-fetch pinned commits from GitHub/bearssl.org: serve them from local mirrors (tools/xnu-src-mirror; the network is needed only to seed)
+	local menv merr mnames mn
+	merr=$(mktemp); "$ROOT/tools/xnu-src-mirror" seed --stack "$stack" --dir "$A/git-mirror" >>"$LOG" 2>&1 || true
+	menv=$("$ROOT/tools/xnu-src-mirror" env --stack "$stack" --dir "$A/git-mirror" 2>"$merr") || menv=""
+	cat "$merr" >>"$LOG"; mnames=$(sed -n 's/^xnu-src-mirror: NOT mirrored: \([^ ]*\) .*/\1/p' "$merr" | tr '\n' ' '); mn=$(sed -n 's/^RESULT: PASS mirrored=\([0-9]*\) of \([0-9]*\) .*/\1 of \2/p' "$merr"); rm -f "$merr"
+	say "xnu-src-mirror: ${mn:-0 of ?} sources from the local mirror"
+	[ -z "$mnames" ] && [ -n "$mn" ] || say "xnu-local-build: mirror incomplete (${mnames:-xnu-src-mirror env failed, see $LOG}), stagers need the network"
 	for s in "${stagers[@]}"; do
-		env PATH="$HB:$PATH" MACHINE_CONFIG=SWEET MACOS_VERSION=$MACOS_VERSION KDKROOT=$KDKROOT bash "$s" >>"$LOG" 2>&1 || finish ERROR "stager $(basename "$s") failed (network?)" "$(tail -n 5 "$LOG" | cut -c1-200)"
+		( eval "$menv"; env PATH="$HB:$PATH" MACHINE_CONFIG=SWEET MACOS_VERSION=$MACOS_VERSION KDKROOT=$KDKROOT bash "$s" ) >>"$LOG" 2>&1 || finish ERROR "stager $(basename "$s") failed (network?)" "$(tail -n 5 "$LOG" | cut -c1-200)"
 	done
 	# CI copies ours next to blacktop's top-level patches and applies the lot, skipping any that does not git-apply --check
 	mapfile -t allp < <(for p in "${ours[@]}" "$LB"/dxb/patches/*.patch; do echo "$p"; done | awk -F/ '{print $NF"\t"$0}' | LC_ALL=C sort | cut -f2)
@@ -558,7 +598,8 @@ elif [ "$(cat "$W/.stackhash" 2>/dev/null)" != "$stackhash" ]; then
 	# the stack changed: stage a second copy and sync only the files that differ, so make rebuilds just those
 	say "stack changed ($(cat "$W/.stackhash" 2>/dev/null) -> $stackhash): syncing the differing files into $X"
 	stage_tree "$W/xnu.new"
-	changed=$(rsync -rlpc --delete --exclude=/.git --out-format='%n' "$W/xnu.new/" "$X/" | grep -v '/$' || true)
+	changed=$(rsync -rlpc --delete --exclude=/.git --out-format='%n' "$W/xnu.new/" "$X/") || finish FAIL "syncing the changed stack files into $X failed (rsync rc=$?)" "work tree: $W"
+	changed=$(grep -v '/$' <<<"$changed" || { rc=$?; [ $rc = 1 ] || echo "xnu-local-build GAP: grep -v failed rc=$rc" >&2; })
 	rm -rf -- "$W/xnu.new"
 	say "$(printf '%s\n' "$changed" | grep -c . || true) files changed"
 	if printf '%s\n' "$changed" | grep -q -E '\.(h|defs|exports|iig|sh|py|json|plist|xcconfig)$|Makefile|\.template$|^config/'; then rm -f "$FR/.xnu_headers_installed"; fi
@@ -608,19 +649,37 @@ EOT
 fi
 KERN=$FR/System/Library/Kernels/kernel.development.sweet
 rm -f "$KERN"   # never report a kernel left over from an earlier build
-BT=$(date +%s)
+BT=$(date +%s); : >"$W/.make-stamp"   # the guard: an object newer than this stamp was compiled by this make
 say "make install (DEVELOPMENT ARM64 SWEET) -j$jobs -k"
 set +e
-# shellcheck disable=SC2086
+# shellcheck disable=SC2086  # $makeargs is the user's --make-args word list, split on purpose
 nice "${MK[@]}" install -j"$jobs" -k TARGET_CONFIGS="DEVELOPMENT ARM64 SWEET" $makeargs >"$W/build.log" 2>&1
 mrc=$?; set -e
 BWALL=$(( $(date +%s) - BT ))
 say "make exit $mrc after ${BWALL}s"
-errs=$(grep -c -E 'error:|\*\*\* \[' "$W/build.log" || true)
+errs=$(grep -c -E 'error:|\*\*\* \[' "$W/build.log" || { rc=$?; [ $rc = 1 ] || echo "xnu-local-build GAP: grep failed rc=$rc" >&2; })
+if ! [ -f "$KERN" ] || [ $mrc -ne 0 ]; then   # the guard records what this failed make compiled, so the next (fixed) incremental build can prove those objects (no verdict here)
+	CFG=$(dirname "$(find "$OBJ" -maxdepth 2 -name kernel.development.sweet.unstripped -print -quit 2>/dev/null)" 2>/dev/null); [ -d "$CFG" ] && [ "$CFG" != . ] || CFG=$(find "$OBJ" -mindepth 1 -maxdepth 1 -type d -name '*_ARM64_*' -print -quit 2>/dev/null)
+	[ -z "$CFG" ] || say "$(python3 -I "$ROOT/tools/xnu-build-guard.py" --cfg "$CFG" --tree "$W" --stamp "$W/.make-stamp" --manifest "$W/.guard-manifest.json" --kernel "$CFG/kernel.development.sweet.unstripped" \
+		--installed "$KERN" --root "$LB" --root "$SDK" --root /usr/lib/llvm-19 --root /usr/include --record-only 2>&1 | grep -m1 '^XNU BUILD GUARD' || echo 'XNU BUILD GUARD: record-only gave no line')"
+fi
 [ -f "$KERN" ] && [ $mrc -eq 0 ] || finish FAIL "build failed ($errs error lines, make exit $mrc, ${BWALL}s)" "$(grep -m8 -E 'error:|\*\*\* \[|undefined' "$W/build.log" | cut -c1-220)" "build log: $W/build.log"
+# stale-object guard (every build): each linked object is either compiled by this make or proven, by the content hash of every source it
+# was compiled from, unchanged since the last verified build of this tree; no dependency in another work tree; kernel relinked after them.
+# A FAIL removes this label's out/ kernel so no run picks up the stale one.
+CFG=$(dirname "$(find "$OBJ" -maxdepth 2 -name kernel.development.sweet.unstripped -print -quit)")
+gout=$(python3 -I "$ROOT/tools/xnu-build-guard.py" --cfg "$CFG" --tree "$W" --stamp "$W/.make-stamp" --manifest "$W/.guard-manifest.json" \
+	--kernel "$CFG/kernel.development.sweet.unstripped" --installed "$KERN" --root "$LB" --root "$SDK" --root /usr/lib/llvm-19 --root /usr/include 2>&1) && grc=0 || grc=$?
+say "$(grep -m1 '^XNU BUILD GUARD' <<<"$gout" || echo "XNU BUILD GUARD: no verdict (rc $grc)")"
+if [ $grc -ne 0 ]; then
+	rm -f "$LB/out/$label/kernel.development.sweet"
+	finish FAIL "stale-object guard: $(sed -n 's/^RESULT: [A-Z]* //p' <<<"$gout" | tail -n 1 | cut -c1-300)" "$(grep '^  ' <<<"$gout" | head -n 12)" "no kernel copied to $LB/out/$label (old copy removed); rerun with --fresh, or fix the tree"
+fi
 sha=$(sha256sum "$KERN" | cut -d' ' -f1)
-mkdir -p "$LB/out"; cp -f "$KERN" "$LB/out/kernel.development.sweet"
-rep=("kernel: $LB/out/kernel.development.sweet" "sha256: $sha" "size: $(stat -c %s "$KERN") bytes" "build wall: ${BWALL}s ($( [ -f "$W/.cold" ] && echo cold || echo incremental)), total run $(( $(date +%s) - START ))s, -j$jobs" "patches: $(cat "$W/patches.txt")" "make exit $mrc, $errs error lines (CI uses make -k too; see $W/build.log)")
+# per-label copy: one shared out/ file let a second label's build overwrite the kernel a run was about to use (21c, 2026-10-28)
+mkdir -p "$LB/out/$label"; cp -f "$KERN" "$LB/out/$label/kernel.development.sweet"
+rm -f "$LB/out/kernel.development.sweet"   # the old shared copy is stale by definition (review localbuild-per-label-r1 F1)
+rep=("kernel: $LB/out/$label/kernel.development.sweet" "sha256: $sha" "size: $(stat -c %s "$KERN") bytes" "build wall: ${BWALL}s ($( [ -f "$W/.cold" ] && echo cold || echo incremental)), total run $(( $(date +%s) - START ))s, -j$jobs" "patches: $(cat "$W/patches.txt")" "make exit $mrc, $errs error lines (CI uses make -k too; see $W/build.log)")
 rm -f "$W/.cold"
 if [ -n "$compare" ]; then
 	[ -f "$compare" ] || finish ERROR "--compare kernel not found: $compare"
@@ -643,9 +702,14 @@ if [ -n "$compare" ]; then
 		"section size differences ($(wc -l <"$W/sect.diff") of $(wc -l <"$W/sect.ci")): $W/sect.diff")
 	od=$(command -v llvm-objdump-19 || command -v llvm-objdump || echo /usr/lib/llvm-19/bin/llvm-objdump)
 	if [ -x "$od" ]; then
-		insn_ci=$("$od" -d "$compare" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || true)
-		insn_loc=$("$od" -d "$KERN" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || true)
+		insn_ci=$("$od" -d "$compare" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || { rc=$?; [ $rc = 1 ] || echo "xnu-local-build GAP: grep failed rc=$rc" >&2; })
+		insn_loc=$("$od" -d "$KERN" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || { rc=$?; [ $rc = 1 ] || echo "xnu-local-build GAP: grep failed rc=$rc" >&2; })
 		rep+=("unsupported v8.3+/PAC/LRCPC2/SHA3 insns: $insn_ci CI vs $insn_loc local")
 	fi
+fi
+# R26 ledger (tools/xnu-remote-build): where this kernel was built; not written inside the offload-host container (the dispatcher records offload-host builds on the lab-host side)
+if [ "${XNUB_IN_SLOT:-}" != 1 ]; then
+	"$ROOT/tools/xnu-remote-build" ledger-add --dir "$LB" --sha "$sha" --label "$label" --where "${XNU_LEDGER_WHERE:-lab-host-local}" --reason "${XNU_LEDGER_REASON:-}" >>"$LOG" 2>&1 \
+		|| say "WARNING: built-on ledger entry not written ($LB/built-on.tsv): tools/xrun will print 'XNU BUILD: unknown'"
 fi
 finish PASS "kernel.development.sweet built locally in ${BWALL}s" "${rep[@]}"

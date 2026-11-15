@@ -19,6 +19,8 @@
 #define RT_RCPT_INTERFACE 0x01u
 
 /* Standard bRequest codes handled here. */
+#define STD_CLEAR_FEATURE	0x01u
+#define STD_SET_FEATURE		0x03u
 #define STD_GET_STATUS		0x00u
 #define STD_SET_ADDRESS		0x05u
 #define STD_GET_DESCRIPTOR	0x06u
@@ -26,6 +28,9 @@
 #define STD_SET_CONFIGURATION	0x09u
 #define STD_GET_INTERFACE	0x0Au
 #define STD_SET_INTERFACE	0x0Bu
+#define STD_SET_SEL		0x30u	/* 48: USB 3 ch9.h, as patch 0173 */
+#define STD_SET_ISOCH_DELAY	0x31u	/* 49 */
+#define DT_BOS			0x0Fu
 
 /* ---- descriptors ---- */
 
@@ -180,6 +185,58 @@ _Static_assert((uint8_t)(USBPROTO_STRING2_DESC_LEN - 2) / 2u ==
 _Static_assert((uint8_t)(USBPROTO_STRING3_DESC_LEN - 2) / 2u ==
 	       4u, "string 3 length");
 
+#ifdef USB_GADGET_SS
+/* ---- SuperSpeed descriptor set (build flag USB_GADGET_SS) ----
+ * Same layout and citations as xnu/patches/0173-sweet-usb3-ss.patch
+ * (ud_ss_*_desc, its comment block: Linux v6.12 ch9.h:253-265, :693-702,
+ * :850-858, :899-916, :922-939; composite.c:540-547, :771-802, :1833-1836;
+ * f_ecm.c:273-338). bcdUSB 0x0320 + bMaxPacketSize0 9 (2^9 = 512); bulk
+ * 1024 with bMaxBurst 0; bMaxPower in 8 mA units, 500 mA -> 62;
+ * interrupt companion wBytesPerInterval = the interrupt wMaxPacketSize (8).
+ * Deviations from composite.c, on purpose (as 0173): U1/U2 exit latency 0
+ * and USB 2.0 extension bmAttributes 0 (no LPM claim).
+ * UNCITED: the interrupt ep bInterval stays 16 (the HS value). */
+const uint8_t usbproto_ss_device_desc[USBPROTO_DEVICE_DESC_LEN] = {
+	0x12, 0x01, 0x20, 0x03,	/* bLength, DEVICE, bcdUSB 3.20 */
+	0x02, 0x00, 0x00,	/* CDC, subclass, protocol */
+	0x09,			/* bMaxPacketSize0: 2^9 = 512 */
+	0x09, 0x12, 0x01, 0x00,	/* VID 0x1209 PID 0x0001 */
+	0x00, 0x01,		/* bcdDevice 1.00 */
+	0x01, 0x02, 0x03,	/* strings */
+	0x01,			/* bNumConfigurations */
+};
+
+const uint8_t usbproto_ss_config_desc[USBPROTO_SS_CONFIG_DESC_LEN] = {
+	0x09, 0x02, 0x55, 0x00, 0x02, 0x01, 0x00, 0x80,
+	0x3E,			/* bMaxPower 62 x 8 mA = 496 mA */
+	/* Interface 0: communications, identical to the HS set */
+	0x09, 0x04, 0x00, 0x00, 0x01, 0x02, 0x02, 0x01, 0x00,
+	0x05, 0x24, 0x00, 0x10, 0x01,
+	0x05, 0x24, 0x01, 0x00, 0x01,
+	0x04, 0x24, 0x02, 0x02,
+	0x05, 0x24, 0x06, 0x00, 0x01,
+	/* Interrupt IN 0x83, 8 bytes, bInterval 16 + companion */
+	0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x10,
+	0x06, 0x30, 0x00, 0x00, 0x08, 0x00,	/* burst 0, wBytesPerInterval 8 */
+	/* Interface 1: data */
+	0x09, 0x04, 0x01, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x00,
+	0x07, 0x05, 0x01, 0x02, 0x00, 0x04, 0x00,	/* bulk OUT 0x01, 1024 */
+	0x06, 0x30, 0x00, 0x00, 0x00, 0x00,		/* burst 0, no streams */
+	0x07, 0x05, 0x81, 0x02, 0x00, 0x04, 0x00,	/* bulk IN 0x81, 1024 */
+	0x06, 0x30, 0x00, 0x00, 0x00, 0x00,
+};
+
+const uint8_t usbproto_ss_bos_desc[USBPROTO_SS_BOS_DESC_LEN] = {
+	0x05, 0x0F, 0x16, 0x00, 0x02,			/* BOS, 22 bytes, 2 caps */
+	0x07, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00,	/* USB 2.0 ext, no LPM */
+	0x0A, 0x10, 0x03, 0x00, 0x0F, 0x00, 0x01,	/* SS: speeds 0x000f, func 1 */
+	0x00, 0x00, 0x00,				/* U1/U2 exit latency 0 */
+};
+
+_Static_assert(USBPROTO_SS_CONFIG_DESC_LEN == 9u + 9u + 19u + 7u + 6u + 9u + 13u + 13u,
+	       "SS wTotalLength math");
+#endif
+
 /* ---- ep0 request handling ---- */
 
 /* One-byte IN stages need storage the *data pointer can outlive the
@@ -215,8 +272,42 @@ static uint16_t min_len(uint16_t desc_len, uint16_t wLength)
 }
 
 static int get_descriptor(uint8_t type, uint8_t index, uint16_t wLength,
-			  const uint8_t **data, uint16_t *len)
+			  const uint8_t **data, uint16_t *len, uint8_t ss)
 {
+#ifndef USB_GADGET_SS
+	(void)ss;	/* HS-only build: the HS set is always served */
+#else
+	if (ss) {
+		/* SuperSpeed (only after a SS ConnectDone). Qualifier and
+		 * other-speed: STALL (Linux composite.c, as 0173); BOS and
+		 * the SS device/config set are served; strings unchanged. */
+		switch (type) {
+		case USBPROTO_DT_DEVICE:
+			if (index != 0)
+				return USBPROTO_STALL;
+			*data = usbproto_ss_device_desc;
+			*len = min_len(USBPROTO_DEVICE_DESC_LEN, wLength);
+			return USBPROTO_OK_DATA_IN;
+		case USBPROTO_DT_CONFIGURATION:
+			if (index != 0)
+				return USBPROTO_STALL;
+			*data = usbproto_ss_config_desc;
+			*len = min_len(USBPROTO_SS_CONFIG_DESC_LEN, wLength);
+			return USBPROTO_OK_DATA_IN;
+		case DT_BOS:
+			if (index != 0)
+				return USBPROTO_STALL;
+			*data = usbproto_ss_bos_desc;
+			*len = min_len(USBPROTO_SS_BOS_DESC_LEN, wLength);
+			return USBPROTO_OK_DATA_IN;
+		case USBPROTO_DT_DEVICE_QUALIFIER:
+		case USBPROTO_DT_OTHER_SPEED_CONFIG:
+			return USBPROTO_STALL;
+		default:
+			break;	/* strings and the rest: as at HS */
+		}
+	}
+#endif
 	switch (type) {
 	case USBPROTO_DT_DEVICE:
 		*data = usbproto_device_desc;
@@ -275,7 +366,7 @@ int usbproto_setup(const uint8_t setup[8], struct usbproto *st,
 	case RT_IN | RT_STANDARD | RT_RCPT_DEVICE:	/* 0x80 */
 		if (bRequest == STD_GET_DESCRIPTOR)
 			return get_descriptor((uint8_t)(wValue >> 8), value_lo,
-					      wLength, data, len);
+					      wLength, data, len, st->ss);
 		if (bRequest == STD_GET_STATUS) {
 			*data = two_zeros;
 			*len = min_len(2, wLength);
@@ -290,6 +381,23 @@ int usbproto_setup(const uint8_t setup[8], struct usbproto *st,
 		return USBPROTO_STALL;
 
 	case RT_STANDARD | RT_RCPT_DEVICE:	/* 0x00, OUT */
+#ifdef USB_GADGET_SS
+		if (st->ss) {
+			/* USB 3 standard requests (as 0173): SET_SEL takes 6
+			 * data bytes that are discarded; SET_ISOCH_DELAY is
+			 * acked; U1/U2_ENABLE (feature 48/49) stall. */
+			if (bRequest == STD_SET_SEL && wValue == 0u &&
+			    wIndex == 0u && wLength == 6u)
+				return USBPROTO_OK_SET_SEL;
+			if (bRequest == STD_SET_ISOCH_DELAY && wIndex == 0u &&
+			    wLength == 0u)
+				return USBPROTO_OK_ISOCH_DELAY;
+			if ((bRequest == STD_SET_FEATURE ||
+			     bRequest == STD_CLEAR_FEATURE) &&
+			    (wValue == 48u || wValue == 49u))
+				return USBPROTO_STALL;
+		}
+#endif
 		if (bRequest == STD_SET_ADDRESS) {
 			if (wValue > 127u || wIndex != 0u || wLength != 0u)
 				return USBPROTO_STALL;

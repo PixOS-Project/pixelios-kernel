@@ -1,0 +1,201 @@
+SWEET boot profile (patch 0121, docs/PLAN-BOOT-SPEED.md M3): sweet_cpustat.c prints per-process CPU and the UFS counters (ios, cmds, KiB, busy, lock wait, longest command) every sweetcpustat=N s (default 60, 0 = off) and logs when migrationpluginwrapper/datamigrator start and exit (5 s resolution). Read-only diagnostics; counters are kept by sweet_ufs_strategy under its lock.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6d06e3f..ccc0307 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,2 +114,3 @@ bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/b/bsd/dev/sweet_cpustat.c b/bsd/dev/sweet_cpustat.c
+new file mode 100644
+index 0000000..9265888
+--- /dev/null
++++ b/bsd/dev/sweet_cpustat.c
+@@ -0,0 +1,147 @@
++/*
++ * SWEET boot profile (docs/PLAN-BOOT-SPEED.md M3): what is the first-boot data migration bound on?
++ *
++ * Boot-arg sweetcpustat=N (seconds, default 60, 0 = off). Every N seconds one kernel thread prints
++ *   CPUSTAT --- up <ms> ms | ufs ios <n> cmds <n> KiB <n> busy <ms> lockwait <ms> maxcmd <us> (cumulative since boot)
++ *   CPUSTAT p <pid> <name> user <ms> sys <ms>        (cumulative CPU of every process with >= 100 ms)
++ * and every 5 s it checks the processes named in boot-arg sweetcpuwatch (default
++ * "com.apple.migrationpluginwrapper,com.apple.datamigrator") and prints
++ *   CPUSTAT watch <name> live <n> at <ms> ms           (only when the count of live processes with that name changes)
++ * so the end of the migration is logged to 5 s. Deltas between two samples are computed on the host.
++ * UFS counters are kept by sweet_ufs_strategy (sweet_ufs.c) under its lock; reads here are unlocked (diagnostic only).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/task_info.h>
++#include <pexpert/pexpert.h>
++
++extern task_t proc_task(proc_t);
++extern int hz;
++extern uint64_t sweet_ufs_stat[6];     /* ios, cmds, bytes, busy abs, lockwait abs, max cmd abs (sweet_ufs.c) */
++extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++void sweet_cpustat_start(void);
++
++#define CS_WATCH_MAX 4
++#define CS_MAX_LINES 200
++
++static char cs_watch_names[CS_WATCH_MAX][2 * MAXCOMLEN + 1];
++static int cs_watch_n;
++static int cs_watch_live[CS_WATCH_MAX], cs_watch_seen[CS_WATCH_MAX];
++static bool cs_full;
++static int cs_lines;
++static uint64_t cs_tot_user, cs_tot_sys, cs_tot_n;
++
++static uint64_t
++cs_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static uint64_t
++cs_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static int
++cs_proc(proc_t p, __unused void *arg)
++{
++	const char *name = proc_best_name(p);     /* p_name, 32 chars; proc_name() would give the 16-char p_comm */
++	int pid = proc_pid(p);
++	for (int i = 0; i < cs_watch_n; i++) {
++		if (strncmp(name, cs_watch_names[i], sizeof(cs_watch_names[i])) == 0) {
++			cs_watch_seen[i]++;
++		}
++	}
++	if (cs_full) {
++		task_t task = proc_task(p);
++		task_absolutetime_info_data_t ti;
++		mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
++		if (task != TASK_NULL && task_info(task, TASK_ABSOLUTETIME_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS) {
++			uint64_t u = cs_ms(ti.total_user), s = cs_ms(ti.total_system);
++			cs_tot_user += u;
++			cs_tot_sys += s;
++			cs_tot_n++;
++			if (u + s >= 100 && cs_lines < CS_MAX_LINES) {
++				printf("CPUSTAT p %d %s user %llu sys %llu\n", pid, name, u, s);
++				cs_lines++;
++			}
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++cs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	char watch[128] = "com.apple.migrationpluginwrapper,com.apple.datamigrator";
++	uint32_t period = 60;
++	int tick = 0;
++
++	(void)PE_parse_boot_argn("sweetcpustat", &period, sizeof(period));
++	if (period == 0) {
++		return;
++	}
++	if (period > 3600) {
++		period = 3600;
++	}
++	(void)PE_parse_boot_argn("sweetcpuwatch", watch, sizeof(watch));
++	for (char *t = watch; *t && cs_watch_n < CS_WATCH_MAX;) {
++		char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl > 0 && tl < sizeof(cs_watch_names[0])) {
++			strlcpy(cs_watch_names[cs_watch_n], t, tl + 1);
++			cs_watch_n++;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	(void)tsleep(&chan, PZERO, "sweetcpu", 20 * hz);
++	for (;; tick++) {
++		uint32_t every = (period + 4) / 5;
++		cs_full = (tick % every) == 0;
++		cs_lines = 0;
++		cs_tot_user = cs_tot_sys = cs_tot_n = 0;
++		bzero(cs_watch_seen, sizeof(cs_watch_seen));
++		uint64_t now = cs_ms(mach_absolute_time());
++		if (cs_full) {
++			printf("CPUSTAT --- up %llu ms | ufs ios %llu cmds %llu KiB %llu busy %llu ms lockwait %llu ms maxcmd %llu us\n",
++			    now, sweet_ufs_stat[0], sweet_ufs_stat[1], sweet_ufs_stat[2] >> 10,
++			    cs_ms(sweet_ufs_stat[3]), cs_ms(sweet_ufs_stat[4]), cs_us(sweet_ufs_stat[5]));
++		}
++		proc_iterate(PROC_ALLPROCLIST, cs_proc, NULL, NULL, NULL);
++		if (cs_full) {
++			printf("CPUSTAT total procs %llu user %llu ms sys %llu ms (all processes; kernel_task included, idle not)\n", cs_tot_n, cs_tot_user, cs_tot_sys);
++		}
++		for (int i = 0; i < cs_watch_n; i++) {
++			if (cs_watch_seen[i] != cs_watch_live[i]) {
++				printf("CPUSTAT watch %s live %d at %llu ms\n", cs_watch_names[i], cs_watch_seen[i], now);
++				cs_watch_live[i] = cs_watch_seen[i];
++			}
++		}
++		(void)tsleep(&chan, PZERO, "sweetcpu", 5 * hz);
++	}
++}
++
++void
++sweet_cpustat_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(cs_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a01f288..2ee08ac 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,2 +53,5 @@ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_cpustat_start(void);
++/* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
++uint64_t sweet_ufs_stat[6];
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+@@ -456,3 +459,8 @@ sweet_ufs_strategy(buf_t bp)
+ 
++	uint64_t t_enter = mach_absolute_time();
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	uint64_t t_lock = mach_absolute_time();
++	sweet_ufs_stat[0]++;
++	sweet_ufs_stat[2] += count;
++	sweet_ufs_stat[4] += t_lock - t_enter;
+ 	for (uint32_t done = 0; done < count;) {
+@@ -464,2 +472,4 @@ sweet_ufs_strategy(buf_t bp)
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		uint64_t t_cmd = mach_absolute_time();
++		sweet_ufs_stat[1]++;
+ 		if (rd) {
+@@ -479,2 +489,5 @@ sweet_ufs_strategy(buf_t bp)
+ 		}
++		if (mach_absolute_time() - t_cmd > sweet_ufs_stat[5]) {
++			sweet_ufs_stat[5] = mach_absolute_time() - t_cmd;
++		}
+ 		if (error) {
+@@ -485,2 +498,3 @@ sweet_ufs_strategy(buf_t bp)
+ 	}
++	sweet_ufs_stat[3] += mach_absolute_time() - t_lock;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+@@ -702,2 +716,3 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
++	sweet_cpustat_start();
+ 	sweet_keys_gs101_start();

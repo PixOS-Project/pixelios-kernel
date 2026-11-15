@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""new-tool: create a tool the way every registry expects it, in ONE command (R29/R30; the hand-synced registries caused most gate failures of 2026-11-02).
+
+  tools/new-tool NAME --purpose "one line what it does" [--ext py|sh|none] [--evidence "ticket/user date; test file"]
+Creates tools/NAME (executable skeleton with a docstring and --self-test), tools/test_NAME.py (runs the self-test), appends the tools/tools-lifecycle.tsv row, and
+regenerates tools/TOOLS.md with tools/tool-census --write (needs the super repo). Then it prints the checks to run: tools/affected-tests, tools/gate-lint-first.
+Refuses an existing name, an unsafe name, or a missing --purpose. The tool must still get a CALLER (a gate step, runplan, skill or another tool) or the census reports NOCALLER:
+say where in --purpose or add the call. Last line: RESULT: PASS|FAIL new-tool NAME.
+  tools/new-tool --check-staged   pre-commit: a staged NEW tool needs its tools-lifecycle.tsv row, and every staged added/changed executable
+                                  tools/NAME (sh/python shebang) must answer -h/--help before it runs (T-7dff:help handler or argparse);
+                                  the denial prints the exact lines to paste. Escape: PIXOS_NO_HELP_HANDLER="why"."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import datetime, os, re, subprocess, sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKEL = '''#!/usr/bin/env python3
+"""%(name)s: %(purpose)s
+
+  tools/%(name)s --self-test    inline checks (also run by tools/test_%(tid)s.py)
+Last line: RESULT: PASS|FAIL %(name)s ..."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import sys
+
+
+def self_test():
+    ok = True   # replace with real fixtures and mutants of this tool
+    print("RESULT: %%s %(name)s self-test" %% ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    print("RESULT: FAIL %(name)s not implemented")   # no silent stub (rule 8)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+TEST = '''#!/usr/bin/env python3
+"""tools/%(name)s: its self-test must pass."""
+import os, subprocess, sys, unittest
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+
+
+class T(unittest.TestCase):
+    def test_self_test(self):
+        r = subprocess.run([sys.executable, os.path.join(TOOLS, "%(name)s"), "--self-test"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+
+def candidate(path):
+    """True for a NEW file that the census counts as a tool: tools/NAME (.py .sh or no extension), not a test, not data/docs, not third_party."""
+    m = re.fullmatch(r"tools/([^/]+)", path)
+    if not m or m.group(1).startswith("test_"):
+        return False
+    n = m.group(1)
+    return n.endswith((".py", ".sh")) or "." not in n
+
+
+def check_staged():
+    """pre-commit: a staged NEW tool without its tools-lifecycle.tsv row was made by hand. -> rc 1 with the do-instead; 0 otherwise."""
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    out = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-status", "--diff-filter=A"], capture_output=True, text=True).stdout
+    new = [l.split("\t", 1)[1] for l in out.splitlines() if "\t" in l and candidate(l.split("\t", 1)[1])]
+    rows = subprocess.run(["git", "-C", root, "show", ":tools/tools-lifecycle.tsv"], capture_output=True, text=True).stdout
+    bad = [p for p in new if not re.search(r"^[^\t]*\t%s\t" % re.escape(os.path.basename(p)), rows, re.M)]
+    for p in bad:
+        print("new-tool: DENIED %s is a new tool with no tools/tools-lifecycle.tsv row (it was made by hand, so TOOLS.md, the census and its test are not registered). "
+              "Instead: `tools/new-tool NAME --purpose \"what it does and who calls it\"` (add `--ext py` for a module), then fill in the skeleton. Escape: none (R30)." % p, file=sys.stderr)
+    print("RESULT: %s new-tool check-staged new=%d unregistered=%d" % ("FAIL" if bad else "PASS", len(new), len(bad)))
+    return 1 if bad else 0
+
+
+HELP_MARK = "T-7dff:help"
+HELP_SH = """# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \\{0,1\\}//p}' "$0"; exit 0;; esac"""
+HELP_PY = """if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\\n" + (__doc__ or "").strip()); raise SystemExit(0)"""
+
+
+def help_ok(text):
+    """a -h/--help that answers before the tool runs: the T-7dff:help handler, or (python) argparse parsing of argv"""
+    if HELP_MARK in text:
+        return True
+    first = text.split("\n", 1)[0]
+    return "python" in first and "argparse" in text and re.search(r"\bparse(_known)?_args\(", text) is not None
+
+
+def check_help_staged(root):
+    """pre-commit (2026-11-10: 49 tools RAN on a --help probe, one leaked a loop at 25 % CPU; 8 more arrived in one merge): a staged added or
+    changed EXECUTABLE tools/NAME with a sh/bash/python shebang must answer -h/--help before it does anything. -> list of denied paths."""
+    raw = subprocess.run(["git", "-C", root, "diff", "--cached", "--raw", "--no-renames", "--diff-filter=AM"], capture_output=True, text=True).stdout
+    bad = []
+    for l in raw.splitlines():
+        meta, _, path = l.partition("\t")
+        f = meta.split()
+        if len(f) < 5 or f[1] != "100755" or not re.fullmatch(r"tools/[^/]+", path):
+            continue
+        text = subprocess.run(["git", "-C", root, "show", ":" + path], capture_output=True, text=True, errors="replace").stdout
+        first = text.split("\n", 1)[0]
+        if not first.startswith("#!") or not re.search(r"python|\b(ba)?sh\b", first):
+            continue
+        if not help_ok(text):
+            bad.append((path, "py" if "python" in first else "sh"))
+    return bad
+
+
+def main(argv):
+    if argv[:1] == ["--check-staged"]:
+        rc = check_staged()
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+        bad = check_help_staged(root)
+        esc = os.environ.get("PIXOS_NO_HELP_HANDLER", "").strip()
+        for p, kind in bad:
+            print("new-tool: %s %s is executable but has no -h/--help that answers before it runs: an agent's --help probe would RUN it "
+                  "(2026-11-10: a probed fcap-pull.sh leaked a loop at 25 %% CPU). Instead: put these lines right after the header comment/docstring "
+                  "(the usage text is that header):\n%s\nEscape: PIXOS_NO_HELP_HANDLER=\"why\" git commit ..."
+                  % ("NOTE (escaped: %s)" % esc if esc else "DENIED", p, HELP_SH if kind == "sh" else HELP_PY), file=sys.stderr)
+        print("RESULT: %s new-tool help-staged denied=%d%s" % ("FAIL" if bad and not esc else "PASS", 0 if esc else len(bad), " escaped=%d" % len(bad) if esc and bad else ""))
+        return 1 if rc or (bad and not esc) else 0
+    if not argv or argv[0].startswith("-"):
+        print(__doc__.splitlines()[0]); print("RESULT: FAIL new-tool usage"); return 2
+    name = argv[0]
+    opt = lambda f: argv[argv.index(f) + 1] if f in argv and argv.index(f) + 1 < len(argv) else ""
+    purpose, evidence = opt("--purpose"), opt("--evidence")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{2,40}", name):
+        print("RESULT: FAIL new-tool: name must match [a-z][a-z0-9_-]{2,40}"); return 2
+    if len(purpose) < 15:
+        print("RESULT: FAIL new-tool: --purpose needs >= 15 chars (what it does and who calls it)"); return 2
+    ext = opt("--ext")
+    if ext not in ("", "py", "sh"):
+        print("RESULT: FAIL new-tool: --ext is py, sh or empty"); return 2
+    fname = name + ("." + ext if ext else "")
+    path = os.path.join(HERE, fname)
+    if os.path.exists(path) or os.path.exists(path + ".py"):
+        print("RESULT: FAIL new-tool: tools/%s exists" % name); return 2
+    tid = name.replace("-", "_")
+    with open(path, "w") as f:
+        f.write(SKEL % {"name": name, "purpose": purpose, "tid": tid})
+    os.chmod(path, 0o755)
+    with open(os.path.join(HERE, "test_%s.py" % tid), "w") as f:
+        f.write(TEST % {"name": name})
+    ev = evidence or "tools/test_%s.py" % tid
+    with open(os.path.join(HERE, "tools-lifecycle.tsv"), "a") as f:
+        f.write("%s\t%s\t-\tactive\t%s\t%s\n" % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"), fname, purpose.replace("\t", " "), ev))
+    r = subprocess.run([sys.executable, os.path.join(HERE, "tool-census"), "--write"], capture_output=True, text=True)
+    print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "tool-census --write printed nothing")
+    print("next: give it a caller, then run tools/affected-tests and tools/gate-lint-first; tests: tools/test_%s.py" % tid)
+    print("RESULT: PASS new-tool %s" % name)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

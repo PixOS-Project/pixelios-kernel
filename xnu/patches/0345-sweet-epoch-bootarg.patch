@@ -1,0 +1,141 @@
+sweet-epoch-bootarg (lowclk 2026-11-13, docs/research/47-iortc-wait.md option a1): the platform clock reads boot-arg sweetepoch=<unix seconds, decimal> + sleepless uptime, so the
+calendar is the host's date instead of 1970 + uptime [obs: patch 0123 only publishes IORTC, getGMTTimeOfDay is the IOPlatformExpert default and returns 0; TLS validation and some daemons
+see 1970]. Overrides SweetPlatformExpert::getGMTTimeOfDay / setGMTTimeOfDay (iokit/Kernel/arm/SweetPlatformExpert.cpp). Why there [read xnu-8796.141.3]: clock_initialize_calendar
+(osfmk/kern/clock.c:1052, called by IOKitInitializeTime from bsd_init before launchd) reads PEGetUTCTimeOfDay -> IOPlatformExpert::getUTCTimeOfDay -> getGMTTimeOfDay
+(iokit/Kernel/IOPlatformExpert.cpp:493-498, 1361-1372) and derives clock_calend/boottime from it, so every later clock_get_calendar_microtime / gettimeofday reader sees the epoch;
+settimeofday goes clock_set_calendar_microtime -> PESetUTCTimeOfDay -> setGMTTimeOfDay (clock.c:826), which stores base = secs - uptime, so userland can still set the time (the clock is not pinned).
+The boot-arg is parsed once, on the first call (the calendar init), as a plain decimal string (PE_parse_boot_arg_str): hex/octal/negative/junk are refused. Range 1704067200 <= v < 4102444800 (2024..2100).
+Log: success `SWEET TIME: calendar set from sweetepoch=<v> (host clock at boot image build; drift = boot delay)`; absent `SWEET GAP: no sweetepoch boot-arg (calendar stays at 1970 + uptime)`;
+bad value `SWEET GAP: sweetepoch=<v> out of range, calendar stays at 1970 + uptime` (or `is not a decimal number`) and getGMTTimeOfDay keeps returning 0 as before.
+Patch 0123's line `SWEET RTC: published IORTC resource, no time source (calendar 1970 + uptime)` is unchanged and is printed from start() before this; with a valid boot-arg the SWEET TIME line that follows supersedes it.
+Not handled: sleep/wake (clock_get_system_microtime excludes sleep; the port does not sleep, research 47 s1). Host test: tools/test_epoch_core.py (compiles the SWEET_EPOCH_CORE block of this patch). No hardware access. ORDER: after 0123, 0200.
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,8 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <libkern/OSAtomic.h>
+ 
+ extern "C" void sweet_restart_start(void);   /* bsd/dev/sweet_restart.c */
+ extern "C" void sweet_wlan_registry_publish(void);   /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
+@@ -21,10 +23,118 @@
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;   /* patch 0345 */
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Patch 0345 (lowclk 2026-11-13; research 47 option a1; pure software, no register, bus or firmware access).
++ * Defect [obs]: no time source, the calendar is 1970 + uptime (getGMTTimeOfDay is the IOPlatformExpert default and returns 0, patch 0123 only publishes IORTC).
++ * Fix: boot-arg sweetepoch=<unix seconds, decimal> (tools/xrun adds the host clock) is the platform clock's reading at boot: getGMTTimeOfDay = base + sleepless uptime.
++ * The first reader is clock_initialize_calendar (IOKitInitializeTime, bsd_init, before launchd) [read osfmk/kern/clock.c:1052]: it computes
++ * utc_offset = secs - sys, so every later clock_get_calendar_microtime / gettimeofday returns sweetepoch + time since boot.
++ * setGMTTimeOfDay (settimeofday, clock.c:826 -> PESetUTCTimeOfDay) stores base = secs - uptime, so userland can still set the time and the platform clock follows.
++ * Accepted range 1704067200 <= value < 4102444800 (2024..2100), decimal digits only; anything else = SWEET GAP and the old behaviour (returns 0).
++ * Drift = boot delay between the host reading and XNU entry. Sleep is not handled (the port does not sleep): clock_get_system_microtime excludes sleep, like HackiOS' scheme.
++ */
++/* SWEET_EPOCH_CORE_BEGIN (host test tools/test_epoch_core.py compiles this block with a C compiler) */
++#define SWEET_EPOCH_MIN 1704067200LL
++#define SWEET_EPOCH_MAX 4102444800LL
++/* returns 0 ok (*out set), 1 not a plain decimal number, 2 out of range */
++static int
++sweet_epoch_parse(const char *s, long long *out)
++{
++	long long v = 0;
++	int n = 0;
++
++	if (s == NULL) {
++		return 1;
++	}
++	for (; *s >= '0' && *s <= '9'; s++) {
++		if (++n > 12) {
++			return 2;
++		}
++		v = v * 10 + (*s - '0');
++	}
++	if (n == 0 || *s != '\0') {
++		return 1;
++	}
++	if (v < SWEET_EPOCH_MIN || v >= SWEET_EPOCH_MAX) {
++		return 2;
++	}
++	*out = v;
++	return 0;
++}
++/* wall clock = base + sleepless uptime seconds; a set stores secs - uptime */
++static long long
++sweet_epoch_get(long long base, long long uptime_s)
++{
++	return base + uptime_s;
++}
++static long long
++sweet_epoch_set_base(long long secs, long long uptime_s)
++{
++	return secs - uptime_s;
++}
++/* SWEET_EPOCH_CORE_END */
++
++static volatile int64_t sweet_time_base;       /* valid when sweet_time_valid != 0 */
++static volatile UInt32  sweet_time_valid;
++static volatile UInt32  sweet_time_parsed;
++
++static void
++sweet_time_init_once(void)
++{
++	char buf[24];
++	long long v = 0;
++	int rc;
++
++	if (!OSCompareAndSwap(0, 1, &sweet_time_parsed)) {
++		return;
++	}
++	buf[0] = '\0';
++	if (!PE_parse_boot_arg_str("sweetepoch", buf, (int)sizeof(buf))) {
++		IOLog("SWEET GAP: no sweetepoch boot-arg (calendar stays at 1970 + uptime)\n");
++		return;
++	}
++	rc = sweet_epoch_parse(buf, &v);
++	if (rc != 0) {
++		IOLog("SWEET GAP: sweetepoch=%s %s, calendar stays at 1970 + uptime\n", buf, rc == 1 ? "is not a decimal number" : "out of range");
++		return;
++	}
++	sweet_time_base = v;
++	sweet_time_valid = 1;
++	IOLog("SWEET TIME: calendar set from sweetepoch=%lld (host clock at boot image build; drift = boot delay)\n", v);
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	clock_sec_t s = 0;
++	clock_usec_t us = 0;
++
++	sweet_time_init_once();
++	if (!sweet_time_valid) {
++		return 0;
++	}
++	clock_get_system_microtime(&s, &us);
++	return (long)sweet_epoch_get(sweet_time_base, (long long)s);
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	clock_sec_t s = 0;
++	clock_usec_t us = 0;
++
++	sweet_time_init_once();
++	clock_get_system_microtime(&s, &us);
++	sweet_time_base = sweet_epoch_set_base((long long)secs, (long long)s);
++	sweet_time_valid = 1;
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {

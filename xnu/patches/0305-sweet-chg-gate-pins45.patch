@@ -1,0 +1,18 @@
+SWEET CHG: patch 0305 (demo 2026-11-11), the P2 gate recheck of patch 0284 compares only the charger's SCL/SDA pins 4/5 of the gpp23 pad bank in CON and PUD too (DAT was already masked, review chg-0284 F1). gpp23 (0x10C40060) is the touch SPI11 pad bank (pins 0-3); with touch on by default (xrun, 2026-11-11) the touch driver sets pins 0-3 (observed resident-152843-b1: CON 0x220000 -> 0x221222) and the whole-word compare logged 'P2 gate recheck' and stopped every battery row after +60 s. Compare-mask change only: no register, bus or firmware write added; every other gate word is still compared whole. Applies after 0284.
+
+diff --git a/bsd/dev/sweet_chg.c b/bsd/dev/sweet_chg.c
+index e0cc326..f9ccc5b 100644
+--- a/bsd/dev/sweet_chg.c
++++ b/bsd/dev/sweet_chg.c
+@@ -493,7 +493,10 @@ sweet_chg_gate_still_open(void)
+ 	chg_snap_read(&n, CHG_R_SW, CHG_R_SW);
+ 	chg_snap_read(&n, CHG_R_PCON, CHG_R_PPUD);     /* review chg-0284 F1: the gpp23 pads too (DAT: only pins 4/5 = SCL/SDA, pins 0-3 belong to SPI11 and may move) */
+ 	for (r = CHG_R_MUX; r <= CHG_R_PPUD; r++) {
+-		uint32_t m = r == CHG_R_PDAT ? 0x30u : 0xffffffffu;
++		/* patch 0305: gpp23 is shared with the touch SPI11 pads (pins 0-3, soc.json gpp23_bank 0x10C40060 = touch clk/mosi/miso/cs bank); compare only the
++		 * SCL/SDA pins 4/5: DAT bits 4-5, CON and PUD 4 bits per pin = bits 16-23 (phase 1 decodes pin4 as >> 16). Observed resident-152843-b1: touch moved
++		 * CON 0x220000 -> 0x221222 (pins 0-3 only), the whole-word compare stopped every battery row. */
++		uint32_t m = r == CHG_R_PDAT ? 0x30u : (r == CHG_R_PCON || r == CHG_R_PPUD) ? 0x00ff0000u : 0xffffffffu;
+ 
+ 		if (!n.ok[r] || (n.w[r] & m) != (chg_s.w[r] & m)) {
+ 			chg_log("SWEET CHG GAP: P2 gate recheck: %s[0x%x] now 0x%x (read=%d), phase 1 saw 0x%x (mask 0x%x)\n", chg_words[r].name, chg_off[r], n.w[r], n.ok[r], chg_s.w[r], m);

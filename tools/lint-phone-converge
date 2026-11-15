@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""lint-phone-converge: no hand-rolled phone readiness checks in a tools/ run path (R38, AP-291; gate step phone-converge).
+
+  tools/lint-phone-converge [--root DIR]   scan DIR/tools (default: this clone), print findings, last line RESULT: PASS|FAIL|ERROR
+  tools/lint-phone-converge --self-test    fixture tree + mutants (also run by tools/test_lint_phone_converge.py); no device, no network
+
+A run path = a top-level file of tools/ that is executable, *.sh, *.py or starts with `#!`, is not a test_* file or a data file, and has a non-comment line that
+takes the phone lock or boots/flashes (phone-lock, plock.sh, plock_take, fboot.sh, fboot-android, fastboot boot|flash, phone goto,
+fflash-userdata). Such a file must not contain, on a non-comment line, `phone-state`, `adb get-state` or `fastboot devices`: the run tool
+converges the phone (`tools/phone goto STATE`), it does not check first. Exemptions only in tools/phone-converge-allow.txt: one
+`path<whitespace>hits=N<whitespace>reason` per line (`#` lines and blank lines ignored; path relative to the clone root; reason >= 10 chars).
+N pins the number of hit lines in the file: a file that grows OR shrinks away from N is a finding (ALLOW-GREW / ALLOW-SHRUNK), so a NEW hand check
+in an allowlisted file fails (review phone-converge-r38-r1 F1: the pre-fix tools/probe-run must not pass). An entry for a missing file, with no
+pin or reason, or that no longer covers any hit (STALE) is a finding too, so the list cannot rot (rule 8). Hits are the literal forms (`phone-state`,
+`adb get-state|devices`, `fastboot devices`), the python list forms (["adb","get-state"]) and a variable checker call (`$PS --expect fastboot|recovery|android`).
+Known gap: other indirection (a computed command name) is not seen. test_* files are
+never scanned (they build the fakes that answer these commands). Exit 0 PASS / 1 FAIL / 2 ERROR."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ALLOW = "phone-converge-allow.txt"
+HIT = re.compile(r"(?<![\w-])phone-state(?![\w-])|\badb(?: +-s +\S+)? +(?:get-state|devices)\b|\bfastboot(?: +-s +\S+)? +devices\b"
+                 r"|[\"']adb[\"'],\s*[\"'](?:get-state|devices)[\"']|[\"']fastboot[\"'],\s*[\"']devices[\"']"
+                 r"|\$\{?\w+\}?[\"']?\s+--expect\s+(?:fastboot|recovery|android)\b")
+RUN = re.compile(r"phone-lock|plock\.sh|plock_take|fboot\.sh|fboot-android|fastboot +(?:boot|flash)\b|phone +goto|fflash-userdata")
+DATA = (".md", ".tsv", ".txt", ".json", ".known", ".expected", ".rules", ".pyc", ".patch", ".c", ".h")
+MIN_REASON = 10
+
+
+def code_lines(text):
+    """(lineno, line) of the lines that are not shell/python comments (a docstring line still counts: allowlist it with a reason)."""
+    return [(i, l) for i, l in enumerate(text.splitlines(), 1) if not l.lstrip().startswith("#")]
+
+
+def run_paths(tools):
+    for n in sorted(os.listdir(tools)):
+        p = os.path.join(tools, n)
+        if not os.path.isfile(p) or n.startswith("test_") or n.endswith(DATA) or n == ALLOW:
+            continue
+        try:
+            text = open(p, encoding="utf-8").read()
+        except (UnicodeDecodeError, OSError):   # lint-silent: expected an unreadable or non-UTF-8 file in tools/ is not a script to scan
+            continue
+        if not (os.access(p, os.X_OK) or n.endswith((".sh", ".py")) or text.startswith("#!")):
+            continue
+        lines = code_lines(text)
+        if any(RUN.search(l) for _, l in lines):
+            yield n, lines
+
+
+def read_allow(tools, findings):
+    allow, p = {}, os.path.join(tools, ALLOW)
+    if not os.path.isfile(p):
+        findings.append("MISSING-ALLOWLIST tools/%s (create it, even if empty)" % ALLOW)
+        return allow
+    for i, raw in enumerate(open(p, encoding="utf-8"), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split(None, 2)
+        path = parts[0]
+        pin = re.fullmatch(r"hits=(\d+)", parts[1]) if len(parts) > 1 else None
+        if not pin:
+            findings.append("ALLOW-NO-PIN %s:%d `%s` needs `hits=N` (the number of hit lines) after the path" % (ALLOW, i, path))
+        reason = parts[2].strip() if pin and len(parts) > 2 else ""
+        if len(reason) < MIN_REASON:
+            findings.append("ALLOW-NO-REASON %s:%d `%s` needs a reason of >= %d chars" % (ALLOW, i, path, MIN_REASON))
+        if path in allow:
+            findings.append("ALLOW-DUPLICATE %s:%d `%s`" % (ALLOW, i, path))
+        allow[path] = (i, int(pin.group(1)) if pin else None)
+    return allow
+
+
+def scan(root):
+    """-> (findings, files scanned, hits seen incl. allowlisted)."""
+    tools = os.path.join(root, "tools")
+    findings, nfiles, nhits = [], 0, 0
+    allow = read_allow(tools, findings)
+    used = set()
+    for n, lines in run_paths(tools):
+        nfiles += 1
+        rel = "tools/" + n
+        hits = [(i, l.strip()[:100]) for i, l in lines if HIT.search(l)]
+        nhits += len(hits)
+        if rel in allow:
+            i, pinned = allow[rel]
+            if hits:
+                used.add(rel)
+                if pinned is not None and pinned != len(hits):
+                    findings.append("%s %s has %d hit(s), allowlisted %d (%s:%d): a new readiness check in an allowlisted file? lines %s; the run tool converges "
+                                    "(tools/phone goto STATE); if the change is intended, review it and update the pin"
+                                    % ("ALLOW-GREW" if len(hits) > pinned else "ALLOW-SHRUNK", rel, len(hits), pinned, ALLOW, i, ",".join(str(h[0]) for h in hits)))
+            continue
+        for i, l in hits:
+            findings.append("READINESS-CHECK %s:%d `%s`: the run tool converges (tools/phone goto STATE), or list the file with a reason in tools/%s" % (rel, i, l, ALLOW))
+    for rel, (i, _) in sorted(allow.items()):
+        if not os.path.isfile(os.path.join(root, rel)):
+            findings.append("ALLOW-MISSING-FILE %s:%d `%s` does not exist" % (ALLOW, i, rel))
+        elif rel not in used:
+            findings.append("ALLOW-STALE %s:%d `%s` is a run path with no readiness hit (or not a run path any more): remove the entry" % (ALLOW, i, rel))
+    return findings, nfiles, nhits
+
+
+def report(root):
+    try:
+        findings, nfiles, nhits = scan(root)
+    except OSError as e:
+        print("RESULT: ERROR %s" % e)
+        return 2
+    for f in findings:
+        print(f)
+    print("RESULT: %s run_paths=%d hits=%d findings=%d" % ("FAIL" if findings else "PASS", nfiles, nhits, len(findings)))
+    return 1 if findings else 0
+
+
+def self_test():
+    tmp = tempfile.mkdtemp(prefix="lint-phone-converge-")
+    fails = []
+    try:
+        def tree(name, files, allow):
+            root = os.path.join(tmp, name)
+            os.makedirs(os.path.join(root, "tools"))
+            for n, (body, mode) in files.items():
+                p = os.path.join(root, "tools", n)
+                open(p, "w").write(body)
+                os.chmod(p, mode)
+            open(os.path.join(root, "tools", ALLOW), "w").write(allow)
+            return root
+
+        def rc_out(root):
+            import contextlib
+            import io
+            b = io.StringIO()
+            with contextlib.redirect_stdout(b):
+                rc = report(root)
+            return rc, b.getvalue()
+
+        def expect(label, root, want_rc, needle=""):
+            rc, out = rc_out(root)
+            if rc != want_rc or needle not in out:
+                fails.append("%s: rc=%d (want %d) needle %r in %r" % (label, rc, want_rc, needle, out))
+
+        X = 0o755
+        good = {"run1": ("#!/bin/bash\n# phone-state in a comment is fine, adb get-state too\ntools/phone goto fastboot\ntools/phone-lock check\n", X)}
+        expect("clean run path", tree("clean", good, "# nothing\n"), 0)
+        # mutants of the run path: each added line must be caught
+        for label, line in (("phone-state", "tools/phone-state --expect fastboot"), ("adb get-state", "timeout 5 adb -s S get-state"),
+                            ("fastboot devices", "fastboot devices | grep -q ."), ("$here/phone-state", 'ps=$("$here/phone-state")'),
+                            ("adb devices", "adb devices | grep -q device"), ("adb -s devices", "adb -s S devices"),
+                            ("py list adb get-state", 'subprocess.run(["adb", "get-state"])'), ("py list adb devices", "subprocess.run(['adb','devices'])"),
+                            ("py list fastboot devices", 'subprocess.run(["fastboot", "devices"])'),
+                            ("var checker fastboot", '$PS --expect fastboot --wait 1'), ("var checker braces", '"${PS}" --expect recovery')):
+            body = good["run1"][0] + line + "\n"
+            expect("mutant " + label, tree("m-" + re.sub(r"\W", "_", label), {"run1": (body, X)}, ""), 1, "READINESS-CHECK tools/run1:5")
+        # not a run path: no lock/boot word -> a helper may use phone-state (e.g. a diagnostic with no phone use)
+        expect("non-run-path ignored", tree("nonrun", {"helper": ("#!/bin/bash\ntools/phone-state\n", X)}, ""), 0)
+        # tests and data and non-executable files are never scanned
+        expect("test_* ignored", tree("test", {"test_x.sh": ("tools/phone-lock\ntools/phone-state\n", X)}, ""), 0)
+        expect("non-exec non-.sh ignored", tree("nonexec", {"notes": ("tools/phone-lock\ntools/phone-state\n", 0o644)}, ""), 0)
+        expect(".sh counts even if not executable", tree("shnx", {"a.sh": ("tools/phone-lock\ntools/phone-state\n", 0o644)}, ""), 1, "tools/a.sh:2")
+        # review r1 F2: a non-executable .py and a non-executable file with a shebang are run paths too
+        expect(".py counts even if not executable", tree("pynx", {"a.py": ("import subprocess\nsubprocess.run(['tools/phone-lock','check'])\nsubprocess.run(['fastboot', 'devices'])\n", 0o644)}, ""), 1, "tools/a.py:3")
+        expect("shebang counts even if not executable", tree("shebang", {"b": ("#!/bin/sh\ntools/phone-lock check\nadb devices\n", 0o644)}, ""), 1, "tools/b:3")
+        # allowlist: a covered hit passes; missing pin / reason / file / stale / duplicate / list are findings; the pin must match (review r1 F1)
+        bad = {"run1": ("tools/phone-lock check\ntools/phone-state\n", X)}
+        expect("allowlisted hit", tree("al", bad, "tools/run1  hits=1  post-run diagnostic, not a gate\n"), 0)
+        expect("allowlist without pin", tree("alnp", bad, "tools/run1  post-run diagnostic, not a gate\n"), 1, "ALLOW-NO-PIN")
+        expect("allowlist without reason", tree("alnr", bad, "tools/run1  hits=1\n"), 1, "ALLOW-NO-REASON")
+        expect("allowlist short reason", tree("alsr", bad, "tools/run1  hits=1  x\n"), 1, "ALLOW-NO-REASON")
+        expect("allowlist missing file", tree("almf", good, "tools/gone  hits=1  was removed long ago\n"), 1, "ALLOW-MISSING-FILE")
+        expect("allowlist stale", tree("alst", good, "tools/run1  hits=1  nothing left to allow here\n"), 1, "ALLOW-STALE")
+        expect("allowlist duplicate", tree("aldup", bad, "tools/run1  hits=1  first reason text\ntools/run1  hits=1  second reason text\n"), 1, "ALLOW-DUPLICATE")
+        # the pre-fix probe-run shape: an allowlisted file that GROWS a hit (a new pre-check next to the allowed one) fails; so does one that shrinks
+        grown = {"run1": (bad["run1"][0] + '$PS --expect fastboot --wait 5 || tools/phone-state --expect recovery\n', X)}
+        expect("allowlisted file grew a pre-check", tree("algrew", grown, "tools/run1  hits=1  post-run diagnostic, not a gate\n"), 1, "ALLOW-GREW tools/run1 has 2 hit(s), allowlisted 1")
+        expect("allowlisted file shrank", tree("alshr", bad, "tools/run1  hits=3  post-run diagnostic, not a gate\n"), 1, "ALLOW-SHRUNK")
+        root = tree("noallow", good, "")
+        os.remove(os.path.join(root, "tools", ALLOW))
+        expect("allowlist file missing", root, 1, "MISSING-ALLOWLIST")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for f in fails:
+        print("FAIL", f)
+    print("RESULT: %s self-test failures=%d" % ("FAIL" if fails else "PASS", len(fails)))
+    return 1 if fails else 0
+
+
+def main(argv):
+    if argv[:1] == ["--self-test"]:
+        return self_test()
+    root = os.path.dirname(HERE)
+    if argv[:1] == ["--root"] and len(argv) == 2:
+        root = argv[1]
+    elif argv:
+        print("usage: lint-phone-converge [--root DIR | --self-test]", file=sys.stderr)
+        return 2
+    return report(root)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

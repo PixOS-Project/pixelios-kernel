@@ -5,6 +5,8 @@
 # recovery/android seen while --expect fastboot: runs tools/phone goto fastboot (bounded 45 s), then keeps checking.
 # Prints one line per state change ("+12s recovery"). Last line: RESULT: PASS state=fastboot after Ns | FAIL still absent after Ns
 # (FAIL adds the button instruction). Exit 0 PASS / 1 FAIL / 2 ERROR (bad args, non-bluejay device). Software only: no relay/reset.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 here=$(dirname "$(readlink -f "$0")")
 POLL=${HR_POLL:-3}
 

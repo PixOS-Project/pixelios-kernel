@@ -1,0 +1,87 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -25,6 +25,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
+ #include <kern/startup.h>
++#include <IOKit/IOBSD.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+@@ -435,6 +436,66 @@
+ 	{ PRIV_NET_PRIVILEGED_NETWORK_STATISTICS, "symptomsd" },
+ };
+ 
++/*
++ * Skywalk privileges: granted iff the current process holds the matching
++ * boolean-true entitlement. The map is the one the open-source skywalk code
++ * itself uses to name the missing entitlement (bsd/skywalk/core/skywalk.c,
++ * sk_priv_chk); the privilege numbers are bsd/sys/priv.h 12000-12011. The
++ * entitlement query is the KPI bsd/vfs/vfs_syscalls.c and
++ * bsd/miscfs/nullfs/null_vfsops.c use (IOCurrentTaskHasEntitlement,
++ * <IOKit/IOBSD.h>). No name-keyed entry: the entitlement is the key.
++ */
++static const struct {
++	int         priv;
++	const char *entitlement;
++} sweet_priv_sk_grants[] = {
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
++	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
++	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
++	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
++	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
++};
++
++static struct {
++	int  priv;
++	char name[20];
++} sweet_priv_sk_logged[SWEET_PRIV_LOG_MAX];
++static int sweet_priv_sk_logged_count;
++
++/* 0 = granted by entitlement, else not a Skywalk privilege or entitlement absent. */
++static int
++sweet_sandbox_priv_skywalk(int priv, const char *name)
++{
++	for (size_t g = 0; g < sizeof(sweet_priv_sk_grants) / sizeof(sweet_priv_sk_grants[0]); g++) {
++		if (sweet_priv_sk_grants[g].priv != priv) {
++			continue;
++		}
++		if (!IOCurrentTaskHasEntitlement(sweet_priv_sk_grants[g].entitlement)) {
++			return EPERM;
++		}
++		bool seen = false;
++		for (int i = 0; i < sweet_priv_sk_logged_count; i++) {
++			if (sweet_priv_sk_logged[i].priv == priv &&
++			    strncmp(sweet_priv_sk_logged[i].name, name, sizeof(sweet_priv_sk_logged[i].name)) == 0) {
++				seen = true;
++				break;
++			}
++		}
++		if (!seen && sweet_priv_sk_logged_count < SWEET_PRIV_LOG_MAX) {
++			sweet_priv_sk_logged[sweet_priv_sk_logged_count].priv = priv;
++			strlcpy(sweet_priv_sk_logged[sweet_priv_sk_logged_count].name, name,
++			    sizeof(sweet_priv_sk_logged[0].name));
++			sweet_priv_sk_logged_count++;
++			printf("SWEET Sandbox: %s privilege %d granted by entitlement %s\n", name, priv,
++			    sweet_priv_sk_grants[g].entitlement);
++		}
++		return 0;
++	}
++	return EPERM;
++}
++
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ {
+@@ -443,6 +504,9 @@
+ 	}
+ 	char name[20] = "";
+ 	proc_selfname(name, sizeof(name));
++	if (sweet_sandbox_priv_skywalk(priv, name) == 0) {
++		return 0;
++	}
+ 	for (size_t g = 0; g < sizeof(sweet_priv_net_grants) / sizeof(sweet_priv_net_grants[0]); g++) {
+ 		if (sweet_priv_net_grants[g].priv == priv &&
+ 		    strncmp(sweet_priv_net_grants[g].name, name, sizeof(name)) == 0) {

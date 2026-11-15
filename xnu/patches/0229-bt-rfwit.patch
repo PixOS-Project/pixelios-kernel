@@ -1,0 +1,243 @@
+SWEET Bluetooth: boot-arg sweetbtrfwit=1 (patch 0229, ticket T-b0b4, W-BTSCAN): RF witness after the patchram step, before the rx thread and bluetoothd. W1 LE passive scan at 100% duty (0x200b interval = window = 0x01e0, public, accept all; bluetoothd's 0x0c01/0x2001 masks) for 20 s, W2 classic Inquiry 0x0401 (GIAC, 10.24 s, unlimited) waited 13 s for Inquiry Result / Inquiry Complete. Core v5.4 Vol 4 Part E s.7.1.1, s.7.8.10-11, s.7.7.1/2/33/38/65.2; standard commands only, volatile state, no reset after. bt-up12 [obs 20261107T102916Z-bt-up12]: build 203 scanned 287.7 s at 10% duty and sent no event. Every event counted, first 16 printed without addresses (rule 4); stray bytes, rx errors, a missing Inquiry Complete and an unused knob are BT GAP rows. Default behaviour unchanged.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1590,6 +1590,195 @@
+ }
+ 
+ /*
++ * patch 0229 (T-b0b4, W-BTSCAN), boot-arg sweetbtrfwit=1: RF witness. bt-up12 [obs 20261107T102916Z-bt-up12]: the patched controller (build 203) accepted
++ * bluetoothd's passive scan (0x200b interval 0x01e0 window 0x0030 = 10% duty) and 0x200c ON with status 00 and then sent no byte for 287.7 s; a host log cannot
++ * tell "the radio does not receive" from "nothing is on air". This runs once after the patchram step, BEFORE the rx thread and bluetoothd (the backend owns the
++ * RX FIFO and the command flow, as in the 0216 probe), with standard Core v5.4 Vol 4 Part E commands only (volatile controller state, no flash, no vendor command):
++ *  W1 LE passive scan at 100% duty: 0x0c01 Set Event Mask and 0x2001 LE Set Event Mask with bluetoothd's own bytes (bt-up12 trace), 0x200b passive,
++ *     interval = window = 0x01e0 (s.7.8.10 allows window == interval), public own address, filter 0x00; 0x200c ON (no duplicate filter); listen
++ *     SBU_RFW_LE_MS; 0x200c OFF. A passive scan transmits nothing (s.7.8.10 LE_Scan_Type 0x00).
++ *  W2 classic Inquiry 0x0401 (s.7.1.1): GIAC LAP 0x9e8b33, Inquiry_Length 0x08 (8 x 1.28 s = 10.24 s), Num_Responses 0 (unlimited). Command Status, one
++ *     Inquiry Result (0x02/0x22/0x2f, s.7.7.2/33/38) per answering discoverable BR/EDR device, Inquiry Complete (0x01, s.7.7.1) at the end. Inquiry Complete is
++ *     controller-originated with no device in range (it proves the async event path); a result or an LE report proves reception. During inquiry the radio
++ *     sends ID packets, as any phone's Bluetooth device search does.
++ * No reset afterwards: scan is off, inquiry has ended, the event masks are bluetoothd's own values and bluetoothd sends its own 0x200b. Every event is counted;
++ * the first SBU_RFW_SHOW events print one row each WITHOUT addresses (rule 4). Stray bytes and rx error flags are GAPs. Events that arrive while sbu_cmd waits
++ * for a Command Complete are its `BT PROBE: skipped event` rows (not in the counts below).
++ */
++#define SBU_RFW_LE_MS   20000u
++#define SBU_RFW_INQ_MS  13000u
++#define SBU_RFW_SHOW    16u
++#define SBU_RFW_NORSSI  (-1000)
++
++struct sbu_rfw {
++	unsigned ev, adv_ev, adv_reports, le_other, inq_res, inq_cmpl, other, stray, rxerr, shown;
++	int inq_status;         /* -1 = no Inquiry Complete */
++	int rssi_max;           /* SBU_RFW_NORSSI = no RSSI seen */
++};
++
++static void
++sbu_rfw_event(const char *what, unsigned t, const uint8_t *b, size_t tot, struct sbu_rfw *w)
++{
++	uint8_t code = b[1], plen = b[2];
++	int rssi = SBU_RFW_NORSSI;
++
++	w->ev++;
++	if (code == 0x3e && plen >= 2) {
++		if (b[3] == 0x02) {     /* LE Advertising Report (s.7.7.65.2): sub, num, then per report evtype addrtype addr6 len data rssi */
++			w->adv_ev++;
++			w->adv_reports += b[4];
++			if (b[4] == 1 && plen >= 12) {
++				rssi = (int8_t)b[tot - 1];
++			}
++		} else {
++			w->le_other++;
++		}
++	} else if ((code == 0x02 || code == 0x22) && plen >= 1) {     /* Inquiry Result / with RSSI (s.7.7.2, s.7.7.33: num addr6 psrm res cod3 clkoff2 rssi = 15 for one) */
++		w->inq_res += b[3];
++		if (code == 0x22 && b[3] == 1 && plen >= 15) {
++			rssi = (int8_t)b[tot - 1];
++		}
++	} else if (code == 0x2f && plen >= 15) {      /* Extended Inquiry Result (s.7.7.38): one response, RSSI at parameter offset 14 */
++		w->inq_res++;
++		rssi = (int8_t)b[3 + 14];
++	} else if (code == 0x01 && plen >= 1) {       /* Inquiry Complete (s.7.7.1) */
++		w->inq_cmpl++;
++		w->inq_status = b[3];
++	} else {
++		w->other++;
++	}
++	if (rssi != SBU_RFW_NORSSI && (w->rssi_max == SBU_RFW_NORSSI || rssi > w->rssi_max)) {
++		w->rssi_max = rssi;
++	}
++	if (w->shown < SBU_RFW_SHOW) {
++		w->shown++;
++		if (rssi != SBU_RFW_NORSSI) {
++			printf("BT RFWIT: %s t=%u ms event %#04x plen %u sub %#04x rssi %d dBm (address not logged)\n", what, t, code, plen, plen >= 1 ? b[3] : 0, rssi);
++		} else {
++			printf("BT RFWIT: %s t=%u ms event %#04x plen %u p0 %#04x\n", what, t, code, plen, plen >= 1 ? b[3] : 0);
++		}
++	}
++}
++
++/* polls the RX FIFO for ms milliseconds (1 ms steps) and counts H4 events; stop_on_cmpl ends the wait at Inquiry Complete */
++static void
++sbu_rfw_listen(const char *what, unsigned ms, bool stop_on_cmpl, struct sbu_rfw *w)
++{
++	uint8_t buf[280];
++	size_t n = 0, tot = 0;
++
++	for (unsigned t = 0; t <= ms; t++) {
++		uint32_t err = sbu_rd(SBU_UART + U_UERSTAT);
++
++		if (err != 0) {
++			w->rxerr++;
++			sbu.rx_err++;
++			SBU_GAP(SG_RXERR, "uart16 rx error flags %#x during the RF witness (%s)", err, what);
++		}
++		while (n < sizeof(buf) && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++			buf[n++] = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++			sbu.rx_bytes++;
++		}
++		while (n > 0) {
++			if (buf[0] != 0x04) {      /* not an event indicator: drop the byte, loudly */
++				w->stray++;
++				SBU_GAP(SG_OTHER, "sweetbtrfwit: dropped stray rx byte %#x during %s", buf[0], what);
++				memmove(buf, buf + 1, --n);
++				continue;
++			}
++			if (n < 3 || n < (tot = 3u + buf[2])) {
++				break;
++			}
++			sbu_rfw_event(what, t, buf, tot, w);
++			memmove(buf, buf + tot, n - tot);
++			n -= tot;
++		}
++		if (stop_on_cmpl && w->inq_cmpl != 0) {
++			break;
++		}
++		if (t < ms) {
++			sbu.hw.msleep(1);
++		}
++	}
++	if (n != 0) {
++		SBU_GAP(SG_OTHER, "sweetbtrfwit: %zu rx bytes of an unfinished event left after %s (first %02x): dropped", n, what, buf[0]);
++	}
++}
++
++/* one command; prints its status row; 0 = status 0x00 */
++static int
++sbu_rfw_cmd(const char *step, uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *rp, size_t rpmax, size_t *rpn)
++{
++	static const uint8_t none[1] = { 0 };
++	uint8_t st = 0xff;
++	int e = sbu_cmd(op, par != NULL ? par : none, plen, &st, rp, rpmax, rpn);
++
++	if (e != 0) {
++		SBU_GAP(SG_OTHER, "sweetbtrfwit step %s op=0x%04x: no answer (error %d); witness stopped", step, op, e);
++		return e;
++	}
++	printf("BT RFWIT: step %s op=0x%04x status=0x%02x (%s)\n", step, op, st, sbu_pstatus(st));
++	if (st != 0) {
++		SBU_GAP(SG_OTHER, "sweetbtrfwit step %s op=0x%04x: status %#04x; witness stopped", step, op, st);
++		return EIO;
++	}
++	return 0;
++}
++
++static void
++sbu_rfwit(void)
++{
++	static const uint8_t evm[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f };      /* bluetoothd's 0x0c01 bytes [obs bt-up12]: bit 61 LE Meta, bits 0-1 Inquiry Complete/Result */
++	static const uint8_t levm[8] = { 0x7f, 0xfa, 0x86, 0x3f, 0x07, 0x00, 0x00, 0x00 };     /* bluetoothd's 0x2001 bytes [obs bt-up12]: bit 1 LE Advertising Report */
++	static const uint8_t scanp[7] = { 0x00, 0xe0, 0x01, 0xe0, 0x01, 0x00, 0x00 };          /* passive, interval 0x01e0, window 0x01e0, public, accept all */
++	static const uint8_t on[2] = { 0x01, 0x00 }, off[2] = { 0x00, 0x00 };
++	static const uint8_t inq[5] = { 0x33, 0x8b, 0x9e, 0x08, 0x00 };                       /* GIAC 0x9e8b33 LSB first, 10.24 s, unlimited responses */
++	struct sbu_rfw le = { .inq_status = -1, .rssi_max = SBU_RFW_NORSSI }, iq = { .inq_status = -1, .rssi_max = SBU_RFW_NORSSI };
++	uint8_t rp[SBU_PM_SUPP];
++	size_t rpn = 0;
++	unsigned build = 0;
++	int e, inq_ok = 0;
++
++	printf("BT RFWIT: start (sweetbtrfwit=1, patch 0229): W1 LE passive scan window=interval=0x01e0 for %u ms, W2 Inquiry GIAC 10.24 s (wait %u ms)\n", SBU_RFW_LE_MS, SBU_RFW_INQ_MS);
++	if (sbu_rfw_cmd("chip-id", 0xfc79, NULL, 0, rp, sizeof(rp), &rpn) == 0 && rpn >= 6) {
++		build = (unsigned)(rp[4] | (rp[5] << 8));
++	}
++	printf("BT RFWIT: controller firmware build %u (%s)\n", build, build == 0 ? "ROM or unknown" : "patched");
++	if ((e = sbu_rfw_cmd("event-mask", 0x0c01, evm, sizeof(evm), rp, sizeof(rp), &rpn)) == 0 &&
++	    (e = sbu_rfw_cmd("le-event-mask", 0x2001, levm, sizeof(levm), rp, sizeof(rp), &rpn)) == 0 &&
++	    (e = sbu_rfw_cmd("le-scan-params-100pct", 0x200b, scanp, sizeof(scanp), rp, sizeof(rp), &rpn)) == 0 &&
++	    (e = sbu_rfw_cmd("le-scan-on", 0x200c, on, sizeof(on), rp, sizeof(rp), &rpn)) == 0) {
++		sbu_rfw_listen("le-scan", SBU_RFW_LE_MS, false, &le);
++		(void)sbu_rfw_cmd("le-scan-off", 0x200c, off, sizeof(off), rp, sizeof(rp), &rpn);
++	}
++	printf("BT RFWIT: W1 LE scan 100%% duty %u ms: events=%u adv_report_events=%u adv_reports=%u le_other=%u other=%u stray=%u rxerr=%u rssi_max=%d%s\n", SBU_RFW_LE_MS,
++	    le.ev, le.adv_ev, le.adv_reports, le.le_other, le.other, le.stray, le.rxerr, le.rssi_max == SBU_RFW_NORSSI ? 0 : le.rssi_max, le.rssi_max == SBU_RFW_NORSSI ? " (none)" : "");
++	if (sbu_rfw_cmd("inquiry", 0x0401, inq, sizeof(inq), rp, sizeof(rp), &rpn) == 0) {        /* sbu_cmd matches the Command Status (0x0f) */
++		inq_ok = 1;
++		sbu_rfw_listen("inquiry", SBU_RFW_INQ_MS, true, &iq);
++		if (iq.inq_cmpl == 0) {
++			SBU_GAP(SG_OTHER, "sweetbtrfwit: no Inquiry Complete within %u ms of an accepted 0x0401 (spec length 10.24 s): the controller sent no async event", SBU_RFW_INQ_MS);
++			(void)sbu_rfw_cmd("inquiry-cancel", 0x0402, NULL, 0, rp, sizeof(rp), &rpn);
++		}
++	}
++	printf("BT RFWIT: W2 inquiry accepted=%d: events=%u results=%u complete=%u complete_status=%d other=%u stray=%u rxerr=%u rssi_max=%d%s\n", inq_ok,
++	    iq.ev, iq.inq_res, iq.inq_cmpl, iq.inq_status, iq.other, iq.stray, iq.rxerr, iq.rssi_max == SBU_RFW_NORSSI ? 0 : iq.rssi_max, iq.rssi_max == SBU_RFW_NORSSI ? " (none)" : "");
++	printf("BT RFWIT: done build=%u controller_events=%u adv_reports=%u inquiry_results=%u inquiry_complete=%u rf_witness=%s async_witness=%s\n", build,
++	    le.ev + iq.ev, le.adv_reports, iq.inq_res, iq.inq_cmpl, le.adv_reports + iq.inq_res != 0 ? "yes" : "no", le.ev + iq.ev != 0 ? "yes" : "no");
++}
++
++/* rule 8: the knob never goes silent when attach returns before it */
++static void
++sbu_rfwit_unused(const char *why)
++{
++	int v = 0;
++
++	if (PE_parse_boot_argn("sweetbtrfwit", &v, sizeof(v)) && v == 1) {
++		printf("BT GAP: sweetbtrfwit=1 ignored: %s\n", why);
++	}
++}
++
++/*
+  * patch 0217, boot-arg sweetbtrw200b=1 (diagnostic knob, not a fix): the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b
+  * is rewritten from 0x0c (Command Disallowed) to 0x00. bt-up4/5 [obs]: bluetoothd exits right after that status [read from source: scan completion 0x1005798d4]. The rewrite scores
+  * alive_s and names bluetoothd's next exit cause; it is NOT a controller state change (no register store, the chip still refused the command). Each rewrite prints a `BT GAP:` row.
+@@ -1994,6 +2183,7 @@
+ 			if (e != 0) {
+ 				printf("BT GAP: uart16 baud probe: no candidate clock got an answer to HCI Reset (error %d); backend not started, controller powered off\n", e);
+ 				sbu_patchram_unused("no candidate clock answered HCI Reset");
++				sbu_rfwit_unused("no candidate clock answered HCI Reset");
+ 				return;
+ 			}
+ 			settled = true;
+@@ -2029,6 +2219,7 @@
+ 					if (e != 0) {
+ 						printf("BT GAP: backend not started after the LE matrix power-cycle; controller powered off\n");
+ 						sbu_patchram_unused("the controller did not answer after the 0216/0217 probe power-cycle");
++						sbu_rfwit_unused("the controller did not answer after the 0216/0217 probe power-cycle");
+ 						return;
+ 					}
+ 				}
+@@ -2037,9 +2228,17 @@
+ 				int v = 0;
+ 
+ 				if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1 && sbu_patchram_attach(&use[win]) != 0) {
++					sbu_rfwit_unused("the backend did not start after the patchram step");
+ 					return;
+ 				}
+ 			}
++			{       /* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness (LE scan 100% duty + classic Inquiry) on the controller bluetoothd will meet; before the rx thread */
++				int v = 0;
++
++				if (PE_parse_boot_argn("sweetbtrfwit", &v, sizeof(v)) && v == 1) {
++					sbu_rfwit();
++				}
++			}
+ 		}
+ 	}
+ 	if (!settled) {
+@@ -2052,6 +2251,7 @@
+ 		if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1) {
+ 			printf("BT GAP: sweetbtpatchram=1 ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
+ 		}
++		sbu_rfwit_unused("the baud probe did not settle the clock");
+ 	}
+ 	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
+ 		int v = 0;

@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+"""tool-census: inventory of tools/, caller graph, status table, deprecation check (TP-043, extends TP-017).
+
+  tools/tool-census [--write] [--check] [--json]
+
+Default: print a summary and the findings. --write regenerates tools/TOOLS.md. --check is the gate step (same report; the
+exit code is what counts). --json prints the data as JSON.
+Status table: tools/tools-status.tsv (header + `tool<TAB>status<TAB>replaced_by<TAB>reason<TAB>evidence<TAB>since`), status
+active|deprecated|replaced|allowlisted. A deprecated tool prints `DEPRECATED: use X (tools/tools-status.tsv)` in its first 15 lines.
+replaced_by `none` (with the reason column) documents a deprecation that has no replacement; an empty replaced_by WARNs NO-REPLACED-BY (R5).
+Lifecycle log (user 2026-10-28): tools/tools-lifecycle.tsv (`date<TAB>tool<TAB>old<TAB>new<TAB>reason<TAB>evidence`), one row per
+status change, oldest first; old `-` = new tool (promotion), new `removed` = file deleted. Every row needs a reason and evidence; deprecated/replaced also need
+evidence that names a run label, AP-NNN, docs/reviews/ file or TP-NNN. Every tool's newest log row must match its current status.
+Callers (word-bounded literal match of the file name or its stem; test_* files count only through a Python import, see below): other tools/*, tools/check-all.sh (gate),
+super docs/runplans (runplan), .claude/skills (skill), .claude/agents (agent), super docs/WORKFLOW.md + AGENTS.md (workflow),
+kernel docs/*.md (doc), tools/test_*.py (test, 2026-10-29), .claude/settings.json hooks.<event>[*].hooks[*].command (hook, 2026-10-29).
+test: only a Python import statement counts (`import M`, `import M as`, `from M import`; M = tool stem; not text, comments or docstrings), never for the
+tool's OWN test (tests_of). A test with an own tool is a tool->tool edge from that tool (counts only if that tool is reached); a test with no own
+tool is a root edge, because the full gate runs every tools/test_*.py (--quick may skip it; a dead `if False: import m` still counts) (tools/check-all.sh:165 step B unit = tools/gate-unit-shards:18, which runs
+every tools/test_*.py but test_wlan_wr_mutants.py; that one is check-all.sh:172 step C wlan-mutants). hook: json.load of the super and kernel
+.claude/settings.json (if present); only the command strings under hooks count (permissions/allow and every other key do not); a word-bounded tool
+name in a command is a root edge; unparsable JSON is a loud WARN HOOK-SETTINGS-UNPARSABLE naming the file (tail hook_bad=N), never a crash. Only-doc tools are DOC-ONLY (warning). Last use: logs/runs/*/xrun.log of the kernel clone and every
+worktree, or the newest file in logs/<tool>/.
+A caller of kind `tool` counts only on a non-comment line (no `#` lines, no docstring lines) and only if that caller is itself reachable
+from a root (gate, runplan, skill, agent, workflow) through tool->tool edges; unreached tools that only mention each other are NOCALLER
+(or DOC-ONLY when a docs/*.md names them). NOCALLER is exempt only for a status row `allowlisted` with a reason, or `deprecated`/`replaced` with a reason (its removal is forced by STALE-DEPRECATED after one cycle).
+Last line: RESULT: PASS|FAIL|ERROR tools=N active=A deprecated=D allowlisted=L nocaller=K doc_only=M exempt=E [super_new=N (...)] [super_stale=N (...)] [super=missing|snapshot] ; exit 0/1/2.
+Super snapshot: tools/super-callers.tsv (`tool<TAB>kind<TAB>where`, sorted) holds every caller edge found in the super repo. `--write` regenerates it
+(and TOOLS.md) and needs super (without: exit 2, nothing written); `--check` with super and a snapshot analyses with the SNAPSHOT edges
+(hermetic: the same verdict as the container, a super doc edit cannot flip it) and compares them with the live super edges: live-only edge = warning
+SUPER-CALLERS-NEW (run --write; the count is super_new=N in the RESULT tail, which the gate shows); snapshot-only edge (super removed a mention, or a hand-faked row) = warning SUPER-CALLERS-STALE, counted as super_stale=N in the
+RESULT tail (the verdict depends on the commit only, W26 2026-10-29, AP-200); with TOOL_CENSUS_STRICT_SUPER=1 it is a FAIL finding instead, so a
+faked edge cannot hide a NOCALLER: its caller is the watcher's full tick audit (super docs/HANDOFF.md STANDING ORDERS). Super without a
+snapshot file: live edges, SUPER-CALLERS-STALE (file missing). Without super the
+snapshot rows are the super-side callers (NOTE line, tail super=snapshot); a malformed row is a BAD-SNAPSHOT-ROW finding. No super, no snapshot: unchanged (FAIL, super=missing).
+Dates are UTC (today = the UTC date unless TOOL_CENSUS_TODAY); status `since` and lifecycle `date` columns are UTC dates.
+Env (tests): TOOL_CENSUS_KERNEL, TOOL_CENSUS_SUPER (roots), TOOL_CENSUS_CYCLE_DAYS (default 14), TOOL_CENSUS_TODAY (YYYY-MM-DD).
+No network, no device; read-only except --write (tools/TOOLS.md).
+"""
+import ast, datetime, glob, json, os, re, subprocess, sys; sys.argv[1:2] in (["-h"], ["--help"]) and (print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + __doc__.strip()), sys.exit(0))   # T-7dff:help: -h/--help before any side effect (R29: this file may not grow)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+KERNEL = os.path.abspath(os.environ.get("TOOL_CENSUS_KERNEL") or os.path.dirname(HERE))
+TOOLS = os.path.join(KERNEL, "tools")
+STATUS_FILE = os.path.join(TOOLS, "tools-status.tsv")
+LIFE_FILE = os.path.join(TOOLS, "tools-lifecycle.tsv")
+EVIDENCE_RE = re.compile(r"AP-\d{3}|docs/reviews/\S+|TP-\d{3}|\b[\w.-]+-\d{8}T\d{6}Z\b|\brun label \S+")
+OUT_FILE = os.path.join(TOOLS, "TOOLS.md")
+DATA_EXT = (".md", ".tsv", ".json", ".txt", ".known", ".expected", ".rules")
+STATUSES = ("active", "deprecated", "replaced", "allowlisted")
+TP_FIRST_CHECKED = 42
+MAX_BYTES = 2_000_000
+MIN_REASON = 10
+ROOT_KINDS = ("gate", "runplan", "skill", "agent", "workflow", "hook")   # "test" is a root only for a test without an own tool (see reachable)
+# subdirectories of tools/ that are support code/data of a tool, not tools: check_rules = package of check-rules.py, testdata = test
+# fixtures, gate-image = the gate container recipe (Dockerfile, requirements.txt, verlist.sh; caller tools/remote-job), sim = simulation-framework support code (fakephone.py, imported by test_phone_sm.py; PLAN-SIM), third_party/__pycache__ = vendored/generated, sweet-mali-host = host test harness of bsd/dev/sweet_mali.c (run.sh, T-06ad). Any other directory is an UNTRACKED-DIR finding (rea is inventoried as a tool).
+KNOWN_DIRS = ("check_rules", "gate-image", "sim", "hooks", "testdata", "third_party", "__pycache__", "sweet-mali-host")
+SKIPPED, NOTES, UNTRACKED, HOOKBAD, TESTBAD = [], [], [], [], []
+
+
+def today():
+    t = os.environ.get("TOOL_CENSUS_TODAY")
+    return datetime.date.fromisoformat(t) if t else datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def git_branch():
+    """full ref of HEAD in the kernel clone ('' when not a git work tree or detached)"""
+    try:
+        r = subprocess.run(["git", "-C", KERNEL, "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):   # lint-silent: expected git absent or not a work tree: the documented empty answer
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def git_worktrees():
+    try:
+        r = subprocess.run(["git", "-C", KERNEL, "worktree", "list", "--porcelain"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):   # lint-silent: expected a failed `git worktree list` is reported as a NOTE right below
+        r = None
+    if r is None or r.returncode != 0:
+        n = "NOTE: `git worktree list` failed: worktree run logs and the super-repo fallback are skipped"
+        if n not in NOTES:
+            NOTES.append(n)
+        return []
+    return [l[9:] for l in r.stdout.splitlines() if l.startswith("worktree ")]
+
+
+def find_super(notes):
+    env = os.environ.get("TOOL_CENSUS_SUPER")
+    cands = [env] if env else [os.path.join(KERNEL, "..", "..")]
+    if not env:  # a worktree: the main clone (first `git worktree list` entry) sits at <super>/pixos-project/<clone>
+        wt = git_worktrees()
+        if wt:
+            cands.append(os.path.join(wt[0], "..", ".."))
+    for c in cands:
+        c = os.path.abspath(c)
+        if os.path.isfile(os.path.join(c, "AGENTS.md")):
+            return c
+    notes.append("NOTE: no super repo (no AGENTS.md at %s): super sources (runplans, WORKFLOW, super skills/agents/AGENTS.md) skipped"
+                 % (cands[0],))
+    return None
+
+
+def skip(why, path):
+    if (why + ": " + path) not in SKIPPED:
+        SKIPPED.append(why + ": " + path)
+
+
+def read(path):
+    try:
+        if os.path.getsize(path) > MAX_BYTES:
+            skip("too large", path)
+            return None
+        with open(path, "rb") as f:
+            b = f.read()
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError):  # an optional file that is simply absent is not a skipped file
+            skip("unreadable (%s)" % e.strerror, path)
+        return None
+    if b"\0" in b[:4096]:
+        skip("binary (NUL byte)", path)
+        return None
+    return b.decode("utf-8", "replace")
+
+
+def tracked_files():
+    """-> set of KERNEL-relative paths git tracks, or None when KERNEL is not a git checkout (a gate container gets the tracked tree only, no .git)"""
+    try:
+        r = subprocess.run(["git", "-C", KERNEL, "ls-files", "-z"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):   # lint-silent: expected git absent or not a checkout (a gate container has no .git): the documented None
+        return None
+    if r.returncode != 0:
+        return None
+    return set(x for x in r.stdout.split("\0") if x)
+
+
+_IGNORED = []
+
+
+def is_tracked(path):
+    """T-b0e1: False for a git-ignored/excluded PATH (.gitignore or .git/info/exclude: a private local config is not a tool, and a gate snapshot has none); True otherwise and outside a git checkout"""
+    if not _IGNORED:
+        try:
+            r = subprocess.run(["git", "-C", KERNEL, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"], capture_output=True, text=True, timeout=30)
+            _IGNORED.append(set(x.rstrip("/") for x in r.stdout.split("\0") if x) if r.returncode == 0 else set())
+        except (OSError, subprocess.SubprocessError):
+            _IGNORED.append(set())
+    return os.path.relpath(path, KERNEL) not in _IGNORED[0]
+
+
+def krglob(sub, tracked):
+    """rglob under KERNEL; in a git checkout only tracked files count, so a host render equals the container's (ignored .claude/ files are not inputs)"""
+    out = rglob(KERNEL, sub)
+    if tracked is None:
+        return out
+    keep = [p for p in out if os.path.relpath(p, KERNEL) in tracked]
+    if len(keep) != len(out):
+        n = "NOTE: %d untracked file(s) under %s ignored (only git-tracked kernel content is a caller source)" % (len(out) - len(keep), sub)
+        if n not in NOTES:
+            NOTES.append(n)
+    return keep
+
+
+def kernel_hook_source(src, tracked):
+    """kernel hook callers from git-tracked content only: .claude/settings.json when tracked (or when there is no git), else the tracked template tools/claude-settings.json"""
+    own = os.path.join(KERNEL, ".claude", "settings.json")
+    if os.path.isfile(own) and (tracked is None or ".claude/settings.json" in tracked):
+        hook_source(src, KERNEL, "")
+        return
+    if os.path.isfile(own):
+        NOTES.append("NOTE: kernel .claude/settings.json is untracked: ignored; hook callers come from the tracked template tools/claude-settings.json")
+    tpl = os.path.join(TOOLS, "claude-settings.json")
+    if os.path.isfile(tpl) and (tracked is None or "tools/claude-settings.json" in tracked):
+        hook_source(src, KERNEL, "", path=tpl, disp="tools/claude-settings.json")
+    elif os.path.isfile(own):
+        NOTES.append("NOTE: tools/claude-settings.json is missing or untracked: no kernel hook callers counted")
+
+
+def rglob(root, sub):
+    out = []
+    for d, _, fs in os.walk(os.path.join(root, sub)):
+        out += [os.path.join(d, f) for f in fs]
+    return sorted(out)
+
+
+def list_tools():
+    """-> (tools, data, tests): names relative to tools/."""
+    tools, data, tests = [], [], []
+    del UNTRACKED[:]
+    for n in sorted(os.listdir(TOOLS)):
+        p = os.path.join(TOOLS, n)
+        if not is_tracked(p):
+            continue   # T-b0e1: a git-excluded local file (private config) is not a tool; a gate snapshot has none
+        if os.path.isdir(p):
+            if n == "rea":
+                tools.append(n)
+            elif n not in KNOWN_DIRS:
+                UNTRACKED.append(n)
+            continue
+        if n.startswith("test_"):
+            tests.append(n)
+        elif n == os.path.basename(OUT_FILE):
+            continue  # the generated output is not part of its own inventory (a first --write would change the next render)
+        elif n.endswith(DATA_EXT):
+            data.append(n)
+        else:
+            tools.append(n)
+    return tools, data, tests
+
+
+def stem(n):
+    return re.sub(r"\.(py|sh)$", "", n)
+
+
+def tests_of(tool, tests):
+    s = stem(tool)
+    keys = {s, s.replace("-", "_")}
+    return [t for t in tests if re.sub(r"\.[^.]+$", "", t[5:]) in keys]
+
+
+def strip_comments(text, disp):
+    """blank (keep the line count) comment lines and, in python files, docstring lines"""
+    py = disp.endswith(".py") or "python" in (text.split("\n", 1)[0] if text.startswith("#!") else "")
+    out, doc = [], None
+    for l in text.split("\n"):
+        st = l.strip()
+        if py and doc:
+            if doc in st:
+                doc = None
+            out.append("")
+            continue
+        if py:
+            m = re.match(r"[rRbBuU]{0,2}(\"\"\"|\'\'\')", st)
+            if m:
+                if m.group(1) not in st[m.end():]:
+                    doc = m.group(1)
+                out.append("")
+                continue
+        out.append("" if st.startswith("#") else l)
+    return "\n".join(out)
+
+
+def sources(super_):
+    """-> list of (kind, relpath-for-display, text)."""
+    src = []
+
+    def add(kind, path, disp):
+        t = read(path)
+        if t is not None:
+            src.append((kind, disp, strip_comments(t, disp) if kind == "tool" else t))
+    for n in sorted(os.listdir(TOOLS)):
+        p = os.path.join(TOOLS, n)
+        if is_tracked(p) and os.path.isfile(p) and not n.startswith("test_") and not n.endswith(DATA_EXT):
+            add("gate" if n == "check-all.sh" else "tool", p, "tools/" + n)
+    for p in sorted(glob.glob(os.path.join(KERNEL, "docs", "*.md"))):
+        add("doc", p, "docs/" + os.path.basename(p))
+    tracked = tracked_files()
+    for p in krglob(".claude/skills", tracked):
+        add("skill", p, os.path.relpath(p, KERNEL))
+    for p in krglob(".claude/agents", tracked):
+        add("agent", p, os.path.relpath(p, KERNEL))
+    add("workflow", os.path.join(KERNEL, "AGENTS.md"), "AGENTS.md")
+    for n in sorted(os.listdir(TOOLS)):
+        p = os.path.join(TOOLS, n)
+        if n.startswith("test_") and n.endswith(".py") and os.path.isfile(p):
+            t = read(p)
+            if t is not None:
+                src.append(("test", "tools/" + n, import_text(t, "tools/" + n)))
+    kernel_hook_source(src, tracked)
+    # T-e23b: the tracked git hooks (tools/hooks/*) are root callers, by their non-comment lines only (a mention in a comment is no call)
+    for p in krglob("tools/hooks", tracked):
+        t = read(p)
+        if t is not None:
+            code = "\n".join(l for l in t.split("\n") if not l.lstrip().startswith("#"))
+            src.append(("hook", os.path.relpath(p, KERNEL), code))
+    return src
+
+
+def import_text(text, disp="?"):
+    """test file -> text holding only `import M` at the line of each import statement (M = top module; line numbers kept)"""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as e:
+        TESTBAD.append("TEST-UNPARSABLE %s: %s: %s (its imports are NOT counted)" % (disp, type(e).__name__, e))
+        return ""
+    lines = [""] * (text.count("\n") + 1)
+    for nd in ast.walk(tree):
+        mods = [a.name for a in nd.names] if isinstance(nd, ast.Import) else \
+            [nd.module] if isinstance(nd, ast.ImportFrom) and nd.module and not nd.level else []
+        for m in mods:
+            lines[nd.lineno - 1] += " import " + m.split(".")[0] + ";"
+    return "\n".join(lines)
+
+
+def hook_source(src, root, prefix, path=None, disp=None):
+    """add one ("hook", disp, text) source per .claude/settings.json: the hooks.<event>[*].hooks[*].command strings, nothing else"""
+    p = path or os.path.join(root, ".claude", "settings.json")
+    t = read(p)
+    if t is None:
+        return
+    disp = disp or prefix + ".claude/settings.json"
+    try:
+        hooks = json.loads(t).get("hooks", {})   # no "hooks" key = no hook edges, no warning
+        events = list(hooks.items())
+    except (ValueError, AttributeError, TypeError) as e:
+        HOOKBAD.append("HOOK-SETTINGS-UNPARSABLE %s: %s: %s (hook callers of that file are NOT counted)" % (disp, type(e).__name__, e))
+        return
+    cmds = []
+    for name, ev in events:   # per event: one malformed entry is a loud WARN naming it, the other commands still count
+        try:
+            part = []
+            for grp in ev:
+                for h in grp.get("hooks", []):
+                    if isinstance(h.get("command"), str):
+                        part.append(h["command"])
+            cmds += part
+        except (TypeError, AttributeError) as e:
+            HOOKBAD.append("HOOK-SETTINGS-UNPARSABLE %s event %s: %s: %s (that event's commands are NOT counted)" % (disp, name, type(e).__name__, e))
+    src.append(("hook", disp, "\n".join(cmds)))
+
+
+def super_sources(super_):
+    """-> list of (kind, display, text) of the super repo callers (runplans, skills, agents, WORKFLOW.md, AGENTS.md)"""
+    src = []
+
+    def add(kind, path, disp):
+        t = read(path)
+        if t is not None:
+            src.append((kind, disp, t))
+    for p in sorted(glob.glob(os.path.join(super_, "docs", "runplans", "*.md"))):
+        add("runplan", p, "super:docs/runplans/" + os.path.basename(p))
+    for p in rglob(super_, ".claude/skills"):
+        add("skill", p, "super:" + os.path.relpath(p, super_))
+    for p in rglob(super_, ".claude/agents"):
+        add("agent", p, "super:" + os.path.relpath(p, super_))
+    add("workflow", os.path.join(super_, "docs", "WORKFLOW.md"), "super:docs/WORKFLOW.md")
+    add("workflow", os.path.join(super_, "AGENTS.md"), "super:AGENTS.md")
+    hook_source(src, super_, "super:")
+    return src
+
+
+SNAP_FILE = os.path.join(TOOLS, "super-callers.tsv")
+SNAP_HDR = ("# tool-census snapshot of the caller edges found in the super repo (generated by `tools/tool-census --write` where super exists; "
+            "used when it does not): tool<TAB>kind<TAB>where, sorted. Do not edit by hand.\n")
+
+
+def snap_text(edges):
+    return SNAP_HDR + "".join("%s\t%s\t%s\n" % e for e in edges)
+
+
+def snap_load(tools):
+    """-> (edges, findings) from the committed snapshot; (None, []) when the file does not exist"""
+    t = read(SNAP_FILE)
+    if t is None:
+        return None, []
+    edges, errs = [], []
+    for i, l in enumerate(t.splitlines(), 1):
+        if not l.strip() or l.startswith("#"):
+            continue
+        f = l.split("\t")
+        if len(f) != 3 or not all(x.strip() for x in f):
+            errs.append("BAD-SNAPSHOT-ROW tools/super-callers.tsv:%d wants 3 non-empty columns tool<TAB>kind<TAB>where, got %d" % (i, len(f)))
+        elif f[1] not in ROOT_KINDS:
+            errs.append("BAD-SNAPSHOT-ROW tools/super-callers.tsv:%d %s: unknown kind %r" % (i, f[0], f[1]))
+        elif f[0] not in tools:
+            errs.append("BAD-SNAPSHOT-ROW tools/super-callers.tsv:%d %r is not a tool in tools/" % (i, f[0]))
+        else:
+            edges.append(tuple(f))
+    return sorted(edges), errs
+
+
+def callers_of(tool, src):
+    names = {tool, stem(tool)}
+    rx = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)))
+    out = []
+    for kind, disp, text in src:
+        if not any(n in text for n in names) or disp == "tools/" + tool or (kind == "test" and tests_of(tool, [os.path.basename(disp)])):   # substring test first: the regex runs only on texts that can match (~40x faster)
+            continue
+        m = rx.search(text)
+        if m:
+            out.append((kind, "%s:%d" % (disp, text.count("\n", 0, m.start()) + 1), disp))
+    return out
+
+
+def run_dirs():
+    roots = [KERNEL] + [w for w in git_worktrees() if os.path.isdir(w)]
+    seen, dirs = set(), []
+    for r in roots:
+        for d in glob.glob(os.path.join(r, "logs", "runs", "*", "")):
+            rp = os.path.realpath(d)
+            if rp not in seen:
+                seen.add(rp)
+                dirs.append(d.rstrip("/"))
+    return roots, dirs
+
+
+def last_use(tools, roots, dirs):
+    """tool -> 'YYYY-MM-DD' of the newest run (xrun.log mentions it) or newest file in logs/<tool>/, else '-'."""
+    logs = []
+    for d in dirs:
+        m = re.match(r"(\d{4})(\d{2})(\d{2})T", os.path.basename(d))
+        t = read(os.path.join(d, "xrun.log"))
+        if m and t:
+            logs.append(("%s-%s-%s" % m.groups(), t))
+    res = {}
+    for tool in tools:
+        rx = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(re.escape(n) for n in {tool, stem(tool)}))
+        best = ""
+        for day, t in logs:
+            if day > best and (tool in t or stem(tool) in t) and rx.search(t):
+                best = day
+        for r in roots:
+            ld = os.path.join(r, "logs", stem(tool))
+            if os.path.isdir(ld):
+                for p in rglob(r, os.path.join("logs", stem(tool))):
+                    try:
+                        day = datetime.date.fromtimestamp(os.path.getmtime(p)).isoformat()
+                    except OSError:   # lint-silent: expected a log that vanished between listing and stat is skipped
+                        continue
+                    best = max(best, day)
+        res[tool] = best or "-"
+    return res
+
+
+def check_evidence(ev, where, super_, errs, warns):
+    """every AP-NNN / TP-NNN / docs/reviews/F named in evidence must exist; run labels: shape only. No super repo: WARN."""
+    ap_text = read(os.path.join(super_, "docs", "ANTIPATTERNS.md")) if super_ else None
+    for ap in sorted(set(re.findall(r"AP-\d{3}", ev))):
+        if ap_text is None:
+            warns.append("EVIDENCE-UNCHECKED %s: %s not checked (no super docs/ANTIPATTERNS.md)" % (where, ap))
+        elif not re.search(r"%s(?!\d)" % ap, ap_text):
+            errs.append("EVIDENCE-UNRESOLVED %s: %s is not in the super docs/ANTIPATTERNS.md" % (where, ap))
+    for tp in sorted(set(re.findall(r"TP-\d{3}", ev))):
+        if not glob.glob(os.path.join(KERNEL, "docs", "tool-proposals", tp + "-*.md")):
+            errs.append("EVIDENCE-UNRESOLVED %s: no docs/tool-proposals/%s-*.md" % (where, tp))
+    for f in sorted(set(x.rstrip(".,;:)") for x in re.findall(r"docs/reviews/\S+", ev))):
+        if not any(os.path.isfile(os.path.join(r, f)) for r in (KERNEL, super_) if r):
+            if super_:
+                errs.append("EVIDENCE-UNRESOLVED %s: %s exists in neither the kernel nor the super repo" % (where, f))
+            else:
+                warns.append("EVIDENCE-UNCHECKED %s: %s not found in the kernel and no super repo" % (where, f))
+
+
+def load_status(day, super_, warns):
+    rows, errs = {}, []
+    t = read(STATUS_FILE)
+    if t is None:
+        return rows, ["no readable tools/tools-status.tsv"]
+    lines = t.splitlines()
+    for i, l in enumerate(lines[1:], 2):
+        if not l.strip() or l.startswith("#"):
+            continue
+        f = l.split("\t")
+        f += [""] * (6 - len(f))
+        tool, status, by, reason, evidence, since = [x.strip() for x in f[:6]]
+        if tool in rows:
+            errs.append("BAD-STATUS-ROW tools/tools-status.tsv:%d duplicate row for %s" % (i, tool))
+        if status not in STATUSES:
+            errs.append("BAD-STATUS-ROW tools/tools-status.tsv:%d %s: unknown status %r" % (i, tool, status))
+        try:
+            if datetime.date.fromisoformat(since) > day:
+                errs.append("BAD-STATUS-ROW tools/tools-status.tsv:%d %s: since %s is in the future (today %s)" % (i, tool, since, day))
+        except ValueError:
+            errs.append("BAD-STATUS-ROW tools/tools-status.tsv:%d %s: since %r is not YYYY-MM-DD" % (i, tool, since))
+        check_evidence(evidence, "tools/tools-status.tsv:%d %s" % (i, tool), super_, errs, warns)
+        if status in ("deprecated", "replaced") and len(reason) < MIN_REASON:
+            errs.append("DEPRECATE-NO-REASON tools/tools-status.tsv:%d %s: reason shorter than %d chars" % (i, tool, MIN_REASON))
+        rows[tool] = dict(status=status, replaced_by=by, reason=reason, evidence=evidence, since=since)
+    return rows, errs
+
+
+def load_lifecycle(day, super_, warns):
+    """-> (tool -> list of row dicts, oldest first; findings)"""
+    log, errs = {}, []
+    t = read(LIFE_FILE)
+    if t is None:
+        return log, ["LIFECYCLE-MISSING no readable tools/tools-lifecycle.tsv"]
+    for i, l in enumerate(t.splitlines()[1:], 2):
+        if not l.strip() or l.startswith("#"):
+            continue
+        f = [x.strip() for x in l.split("\t")]
+        f += [""] * (6 - len(f))
+        date, tool, old, new, reason, evidence = f[:6]
+        where = "tools/tools-lifecycle.tsv:%d %s" % (i, tool)
+        try:
+            if datetime.date.fromisoformat(date) > day:
+                errs.append("BAD-LIFECYCLE-ROW %s: date %s is in the future (today %s)" % (where, date, day))
+        except ValueError:
+            errs.append("BAD-LIFECYCLE-ROW %s: date %r is not YYYY-MM-DD" % (where, date))
+        check_evidence(evidence, where, super_, errs, warns)
+        if old == new:
+            errs.append("LIFECYCLE-NOOP %s: old == new (%s), not a status change" % (where, new))
+        if new in ("deprecated", "replaced", "removed") and len(reason) < MIN_REASON:
+            errs.append("LIFECYCLE-NO-REASON %s: reason shorter than %d chars" % (where, MIN_REASON))
+        if new not in STATUSES + ("removed",) or (old != "-" and old not in STATUSES):
+            errs.append("BAD-LIFECYCLE-ROW %s: status change %r -> %r" % (where, old, new))
+        if not reason or not evidence:
+            errs.append("LIFECYCLE-NO-REASON %s: %s -> %s needs a reason and evidence (user 2026-10-28)" % (where, old, new))
+        elif new in ("deprecated", "replaced", "removed") and not EVIDENCE_RE.search(evidence):
+            errs.append("LIFECYCLE-WEAK-EVIDENCE %s: %s needs evidence naming a run label, AP-NNN, docs/reviews/ or TP-NNN"
+                        % (where, new))
+        prev = log.get(tool)
+        if prev and prev[-1]["new"] != old:
+            errs.append("LIFECYCLE-GAP %s: old %r but the previous row says %r" % (where, old, prev[-1]["new"]))
+        if prev and date < prev[-1]["date"]:
+            errs.append("LIFECYCLE-ORDER %s: date %s is before the previous row's %s (oldest first)" % (where, date, prev[-1]["date"]))
+        log.setdefault(tool, []).append(dict(date=date, old=old, new=new, reason=reason, evidence=evidence))
+    return log, errs
+
+
+def tp_info():
+    """-> (tool path -> TP id, findings)"""
+    by_tool, finds = {}, []
+    for p in sorted(glob.glob(os.path.join(KERNEL, "docs", "tool-proposals", "TP-*.md"))):
+        t = read(p)
+        if t is None:
+            continue
+        name = os.path.basename(p)
+        m = re.match(r"---\n(.*?)\n---\n(.*)", t, re.S)
+        if not m:
+            continue
+        fm = dict(re.findall(r'^(\w+):\s*"?(.*?)"?\s*$', m.group(1), re.M))
+        mt = re.match(r"tools/([\w./-]+)", fm.get("tool", ""))
+        if mt and fm.get("status") not in ("rejected", "superseded"):
+            by_tool.setdefault(mt.group(1), fm.get("id", name[:6]))
+        # TP-037..041 predate the rule (it landed with TP-043): grandfathered by number only (a date can be backdated)
+        if int(name[3:6]) >= TP_FIRST_CHECKED:
+            sec = re.search(r"^## checked\n(.*?)(?=^## |\Z)", m.group(2), re.M | re.S)
+            body = sec.group(1) if sec else ""
+            if not re.search(r"\*\*(?:Caller|Replaces):\*\*[ \t]*\S", body):
+                finds.append("TP-NO-CALLER-OR-REPLACES docs/tool-proposals/%s: `## checked` needs a non-empty **Caller:** or **Replaces:** "
+                             "(TP number >= %d)" % (name, TP_FIRST_CHECKED))
+    return by_tool, finds
+
+
+def header_words(path):
+    t = read(path) or ""
+    return set(re.findall(r"[a-z]{4,}", "\n".join(t.splitlines()[:30]).lower()))
+
+
+def duplicates(tools):
+    out = []
+    ws = {t: header_words(os.path.join(TOOLS, t)) for t in tools if not os.path.isdir(os.path.join(TOOLS, t))}
+    names = sorted(ws)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if len(ws[a]) >= 8 and len(ws[b]) >= 8:
+                j = len(ws[a] & ws[b]) / len(ws[a] | ws[b])
+                if j >= 0.6:
+                    out.append((a, b, "same usage words, %d%%" % round(j * 100)))
+                    continue
+            if base(a) == base(b) or base(a) == stem(b) or base(b) == stem(a):
+                out.append((a, b, "names differ only by suffix/version"))
+    return out
+
+
+def base(n):
+    return re.sub(r"[-_.]?(v?\d+|old|new)$", "", stem(n))
+
+
+def reachable(tools, cs3, tests):
+    """-> set of tools reachable from a root (gate/runplan/skill/agent/workflow source, or the gate tool itself) via tool->tool edges"""
+    own = {}   # test file name -> its own tool
+    for t in tools:
+        for tf in tests_of(t, tests):
+            own[tf] = t
+    reached = {t for t in tools if any(c[0] in ROOT_KINDS or (c[0] == "test" and os.path.basename(c[2]) not in own) for c in cs3[t])} \
+        | ({"check-all.sh"} & set(tools))
+    changed = True
+    while changed:
+        changed = False
+        for t in tools:
+            if t not in reached and any((c[0] == "tool" and c[2][6:] in reached) or
+                                        (c[0] == "test" and own.get(os.path.basename(c[2])) in reached) for c in cs3[t]):
+                reached.add(t)
+                changed = True
+    return reached
+
+
+def analyse(write=False):
+    notes = NOTES
+    del NOTES[:], SKIPPED[:]
+    super_ = find_super(notes)
+    tools, data, tests = list_tools()
+    day = today()
+    del HOOKBAD[:], TESTBAD[:]
+    src = sources(super_)
+    warns = []
+    edges, snap_state, live, serrs = [], "super" if super_ else "missing", None, []
+    if super_:
+        ss = super_sources(super_)
+        # file only, no line number (review r2 F3): a line shift in a super doc must not make the snapshot or TOOLS.md stale
+        live = edges = sorted({(t, c[0], c[2]) for t in tools for c in callers_of(t, ss)})
+    snap, serrs = snap_load(set(tools))
+    if super_ and snap is not None and not write:
+        edges = snap   # hermetic verdict: same edges as the container (no super); live ones are only compared in main()
+    elif not super_:
+        if snap is not None:
+            snap_state = "snapshot"
+            notes.append("NOTE: no super repo: super-side callers from tools/super-callers.tsv (%d edges, checked against super by the local gate)"
+                         % len(snap))
+        edges = snap or []
+    by_edge = {}
+    for t, k, w in edges:
+        by_edge.setdefault(t, []).append((k, w, re.sub(r":\d+$", "", w)))
+    rows, finds = load_status(day, super_, warns)
+    life, lfinds = load_lifecycle(day, super_, warns)
+    finds += lfinds
+    finds += ["UNTRACKED-DIR tools/%s/ is a directory that is neither a tool nor in the known list (rea, %s): inventory it or list it"
+              % (d, ", ".join(KNOWN_DIRS)) for d in UNTRACKED]
+    roots, dirs = run_dirs()
+    lu = last_use(tools, roots, dirs)
+    tpmap, tpfinds = tp_info()
+    finds += tpfinds
+    if snap_state == "snapshot" or (super_ and snap is not None and not write):
+        finds += serrs
+    cycle = int(os.environ.get("TOOL_CENSUS_CYCLE_DAYS", "14"))
+    info = {}
+    cs3 = {t: callers_of(t, src) + by_edge.get(t, []) for t in tools}
+    reached = reachable(tools, cs3, tests)
+    for t in tools:
+        cs = [c[:2] for c in cs3[t]]
+        row = rows.get(t)
+        status = row["status"] if row else "active"
+        info[t] = dict(callers=cs, kinds=sorted({c[0] for c in cs}), nondoc=len([c for c in cs if c[0] != "doc"]), status=status, row=row,
+                       last_use=lu[t], tp=tpmap.get(t, "-"), tests=tests_of(t, tests))
+        if t not in reached:
+            doc = [c for c in cs if c[0] == "doc"]
+            unreached = [c[1] for c in cs3[t] if c[0] == "tool"]
+            if doc:
+                info[t]["flag"] = "DOC-ONLY"
+                warns.append("DOC-ONLY tools/%s (only docs/*.md and unreached tools mention it: %s)" % (t, ", ".join(c[1] for c in (doc + [(0, u) for u in unreached])[:3])))
+            else:
+                info[t]["flag"] = "NOCALLER"
+                if not (row and row["status"] in ("allowlisted", "deprecated", "replaced") and row["reason"]):   # deprecated/replaced: one cycle then STALE-DEPRECATED
+                    finds.append("NOCALLER tools/%s (no caller reachable from the gate/runplans/skills/agents/workflow%s; only an `allowlisted`, `deprecated` or `replaced` "
+                                 "row with a reason in tools/tools-status.tsv exempts it)"
+                                 % (t, "; mentioned only by unreached tools: " + ", ".join(unreached[:3]) if unreached else ""))
+    for t, r in rows.items():
+        if t not in info:
+            finds.append("STATUS-ROW-NO-TOOL tools/%s has a row in tools/tools-status.tsv but no such tool" % t)
+            continue
+        if r["status"] == "allowlisted" and not r["reason"]:
+            finds.append("ALLOWLIST-NO-REASON tools/%s is allowlisted with an empty reason" % t)
+        if r["status"] in ("deprecated", "replaced"):
+            try:
+                age = (day - datetime.date.fromisoformat(r["since"])).days
+            except ValueError:
+                age = 0
+                finds.append("BAD-SINCE-DATE tools/%s since %r in tools/tools-status.tsv is not an ISO date: its staleness cannot be judged" % (t, r["since"]))
+            if age > cycle:
+                finds.append("STALE-DEPRECATED tools/%s since %s (%d days > %d) still present" % (t, r["since"], age, cycle))
+            p = os.path.join(TOOLS, t)
+            head = (read(p) or "") if os.path.isfile(p) else ""
+            if not any(re.search(r"DEPRECATED: use", l) for l in head.splitlines()[:15]):
+                finds.append("NO-DEPRECATED-LINE tools/%s is %s but has no `DEPRECATED: use` in its first 15 lines" % (t, r["status"]))
+        if r["status"] in ("deprecated", "replaced") and not (r["reason"] and EVIDENCE_RE.search(r["evidence"])):
+            finds.append("DEPRECATE-NO-REASON tools/%s is %s without a reason + evidence (run label, AP-NNN, docs/reviews/, TP-NNN) "
+                         "in tools/tools-status.tsv" % (t, r["status"]))
+        if r["status"] == "replaced" and r["replaced_by"] in ("", "none"):
+            finds.append("REPLACED-NO-TOOL tools/%s is replaced but names no replacing tool (use status deprecated + replaced_by none)" % t)
+        if r["status"] in ("deprecated", "replaced") and not r["replaced_by"]:   # `none` = documented no replacement (reason + evidence are mandatory above)
+            warns.append("NO-REPLACED-BY tools/%s is %s but names no replacement (name one, or write `none` in replaced_by; the reason says why)" % (t, r["status"]))
+    if not any(f.startswith("LIFECYCLE-MISSING") for f in lfinds):
+        for t, i in info.items():
+            last = life.get(t, [{}])[-1].get("new")
+            if last is None:
+                finds.append("LIFECYCLE-NO-ENTRY tools/%s has no row in tools/tools-lifecycle.tsv (promotion needs a reason + evidence)" % t)
+            elif last != i["status"]:
+                finds.append("LIFECYCLE-MISMATCH tools/%s is %s but its last tools/tools-lifecycle.tsv row says %s" % (t, i["status"], last))
+            elif i["row"] and i["row"]["since"] != life[t][-1]["date"]:
+                finds.append("LIFECYCLE-MISMATCH-DATE tools/%s status since %s but its newest tools/tools-lifecycle.tsv row is dated %s"
+                             % (t, i["row"]["since"], life[t][-1]["date"]))
+        for t in sorted(set(life) - set(info)):
+            if life[t][-1]["new"] != "removed":
+                finds.append("LIFECYCLE-GONE tools/%s is gone but its last tools/tools-lifecycle.tsv row is %s (add a `removed` row)"
+                             % (t, life[t][-1]["new"]))
+        cites = {}
+        for t, rs in life.items():
+            for r in rs:
+                if r["new"] in ("deprecated", "replaced"):
+                    for ap in set(re.findall(r"AP-\d{3}", r["reason"] + " " + r["evidence"])):
+                        cites.setdefault(ap, set()).add(t)
+        for ap, ts in sorted(cites.items()):
+            if len(ts) >= 2:
+                warns.append("LIFECYCLE-REPEAT %s cited by %d deprecations (%s): repeated mistake, check docs/ANTIPATTERNS.md"
+                             % (ap, len(ts), ", ".join(sorted(ts))))
+    warns += HOOKBAD + TESTBAD
+    dups = duplicates(tools)
+    for a, b, why in dups:
+        warns.append("DUPLICATE? tools/%s ~ tools/%s (%s)" % (a, b, why))
+    st = [i["status"] for i in info.values()]
+    # T-584b decision A (2026-10-31): nocaller/doc_only count only UNEXEMPTED flags; a flagged tool whose status row is allowlisted/deprecated/replaced
+    # with a reason is counted in exempt=N instead (deprecating a dead tool lowers the counters; STALE-DEPRECATED still forces its removal)
+    def _exempt(i):
+        r = i.get("row")
+        return bool(r and r["status"] in ("allowlisted", "deprecated", "replaced") and r["reason"])
+    nocaller = sum(1 for i in info.values() if i.get("flag") == "NOCALLER" and not _exempt(i))
+    doc_only = sum(1 for i in info.values() if i.get("flag") == "DOC-ONLY" and not _exempt(i))
+    exempt = sum(1 for i in info.values() if i.get("flag") in ("NOCALLER", "DOC-ONLY") and _exempt(i))
+    active = sum(1 for i in info.values() if i["status"] == "active" and i.get("flag") != "NOCALLER")
+    counts = dict(tools=len(tools), active=active, deprecated=st.count("deprecated"), allowlisted=st.count("allowlisted"),
+                  nocaller=nocaller, doc_only=doc_only, exempt=exempt)
+    if SKIPPED:
+        notes.append("NOTE: skipped %d files (unreadable, binary or > %d bytes), first 3: %s" % (len(SKIPPED), MAX_BYTES, "; ".join(SKIPPED[:3])))
+    return dict(info=info, data=data, tests=tests, finds=finds, warns=warns, notes=notes, dups=dups, counts=counts,
+                super=super_, snap=snap_state, edges=edges, live=live, snap_edges=snap, day=day.isoformat())
+
+
+def render(a):
+    info, c = a["info"], a["counts"]
+    L = ["<!-- GENERATED FILE: do not edit; tools/tool-census --write -->", "# tools/ inventory", "",
+         "%d tools: %d active, %d deprecated, %d allowlisted, %d with no caller, %d doc-only (%d more flagged but exempt). Status table: `tools/tools-status.tsv`; "
+         "rules: docs/tool-proposals/TP-043-tool-census.md." % (c["tools"], c["active"], c["deprecated"], c["allowlisted"], c["nocaller"], c["doc_only"], c["exempt"]),
+         "", "| tool | status | callers (kinds; file, max 3 + count) | doc refs | last run use | TP | note |",
+         "|---|---|---|---|---|---|---|"]
+    for t in sorted(info):
+        i = info[t]
+        nd = [x for x in i["callers"] if x[0] != "doc"]
+        ds = [x for x in i["callers"] if x[0] == "doc"]
+        stt = i["status"]
+        if i["row"] and i["row"]["replaced_by"]:
+            stt += " (no replacement)" if i["row"]["replaced_by"] == "none" else " (by %s)" % i["row"]["replaced_by"]
+        # file only, no :line (W26 ask 2026-10-29: a line shift in a caller file made TOOLS.md stale after merges; the snapshot dropped lines in r2 F3)
+        cal = ", ".join("%s `%s`" % (k, re.sub(r":\d+$", "", d)) for k, d in nd[:3]) + (" (+%d)" % (len(nd) - 3) if len(nd) > 3 else "") if nd else "-"
+        note = i.get("flag", "")
+        if i["tests"]:
+            note = (note + " tests: " + ", ".join(i["tests"])).strip()
+        if i["row"] and i["row"]["reason"]:
+            note = (note + " " + i["row"]["reason"]).strip()
+        L.append("| `%s` | %s | %s | %d | %s | %s | %s |" % (t, stt, cal.replace("|", "/"), len(ds), i["last_use"], i["tp"], note.replace("|", "/")))
+
+    def section(title, items, empty="none"):
+        L.extend(["", "## " + title, ""] + (items or [empty]))
+    section("Deprecated", ["- `%s` (%s since %s): %s %s" % (t, i["status"], i["row"]["since"], "(no replacement)" if i["row"]["replaced_by"] == "none" else i["row"]["replaced_by"], i["row"]["reason"])
+                           for t, i in sorted(info.items()) if i["status"] in ("deprecated", "replaced")])
+    section("Allowlisted (backlog)", ["- `%s` since %s: %s" % (t, i["row"]["since"], i["row"]["reason"])
+                                      for t, i in sorted(info.items()) if i["status"] == "allowlisted"])
+    section("Duplicate hints", ["- `%s` ~ `%s` (%s)" % d for d in a["dups"]])
+    section("Data files", ["- `%s`" % d for d in a["data"]])
+    return "\n".join(L) + "\n"
+
+
+def mask_last_use(text):
+    """TOOLS.md table rows with the time-dependent `last run use` cell (5th) blanked, for the staleness compare"""
+    return re.sub(r"^(\|(?:[^|\n]*\|){4})[^|\n]*\|", r"\1*|", text, flags=re.M)
+
+
+def main(argv):
+    flags = set(argv)
+    if flags - {"--write", "--check", "--json"}:
+        sys.stderr.write(__doc__)
+        return 2
+    try:
+        a = analyse("--write" in flags)
+        if "--write" in flags and HOOKBAD:   # never regenerate the snapshot from a partial hook view (review r5-lifecycle-r1 F1)
+            for w in HOOKBAD:
+                print(w, file=sys.stderr)
+            print("RESULT: ERROR --write refused: HOOK-SETTINGS-UNPARSABLE (fix the settings.json; nothing written)")
+            return 2
+        if "--write" in flags and not a["super"]:
+            print("tool-census --write needs the super repo (the caller snapshot is regenerated from it); nothing written", file=sys.stderr)
+            print("RESULT: ERROR --write without super")
+            return 2
+        if "--write" in flags and read(SNAP_FILE) != snap_text(a["edges"]):
+            with open(SNAP_FILE, "w") as f:   # before the render: the Data files list of TOOLS.md names it
+                f.write(snap_text(a["edges"]))
+            a = analyse(True)
+        text = render(a)
+        c = a["counts"]
+        if "--check" in flags and "--write" not in flags:
+            if not a["super"]: print("NOTE: TOOLS.md staleness not checked here: a render needs the super repo and the installed git hooks, which a gate snapshot (git archive) lacks (the local gate with super checks it; observed 2026-11-02: trunk itself rendered +2 edges / 1 doc-only differently in a snapshot)")
+            elif (cur := read(OUT_FILE)) is None or mask_last_use(cur) != mask_last_use(text):
+                a["finds"].append("TOOLS-MD-STALE tools/TOOLS.md differs from a fresh render (run tools/tool-census --write and commit it)")
+        if "--check" in flags and "--write" not in flags and a["super"]:
+            if a["snap_edges"] is None:
+                a["finds"].append("SUPER-CALLERS-STALE tools/super-callers.tsv is missing (run tools/tool-census --write)")
+            else:
+                sn, lv = set(a["snap_edges"]), set(a["live"])
+                # W26 decision 2026-10-29: the verdict depends on the commit only, so a super-side removal is a loud counted WARN (AP-200);
+                # TOOL_CENSUS_STRICT_SUPER=1 (the watcher's full audit) makes it a FAIL, which also catches a hand-faked snapshot edge
+                strict = os.environ.get("TOOL_CENSUS_STRICT_SUPER") == "1"
+                for e in sorted(sn - lv):
+                    (a["finds"] if strict else a["warns"]).append(
+                        "SUPER-CALLERS-STALE %s %s %s (in tools/super-callers.tsv, not in super; run tools/tool-census --write)" % e)
+                for e in sorted(lv - sn):
+                    a["warns"].append("SUPER-CALLERS-NEW %s %s %s (in super, not in tools/super-callers.tsv; run tools/tool-census --write; "
+                                      "the gate verdict uses the snapshot)" % e)
+        res = "FAIL" if a["finds"] else "PASS"
+        tail = "RESULT: %s tools=%d active=%d deprecated=%d allowlisted=%d nocaller=%d doc_only=%d exempt=%d" % (
+            res, c["tools"], c["active"], c["deprecated"], c["allowlisted"], c["nocaller"], c["doc_only"], c["exempt"])
+        nnew = sum(1 for w in a["warns"] if w.startswith("SUPER-CALLERS-NEW "))
+        if nnew:   # loud in the RESULT tail: validate-repo / the gate show only this last line when the step passes
+            tail += " super_new=%d (super gained callers not in tools/super-callers.tsv: run tools/tool-census --write)" % nnew
+        nstale = sum(1 for w in a["warns"] if w.startswith("SUPER-CALLERS-STALE "))
+        if nstale:
+            tail += " super_stale=%d (super lost callers still in tools/super-callers.tsv: run tools/tool-census --write)" % nstale
+        ntb = sum(1 for w in a["warns"] if w.startswith("TEST-UNPARSABLE "))
+        if ntb:
+            tail += " test_bad=%d (unparsable tools/test_*.py: its imports are not counted)" % ntb
+        nbad = sum(1 for w in a["warns"] if w.startswith("HOOK-SETTINGS-UNPARSABLE "))
+        if nbad:
+            tail += " hook_bad=%d (unparsable .claude/settings.json: its hook callers are not counted)" % nbad
+        if not a["super"]:
+            tail += " super=" + a["snap"]
+        if "--write" in flags:
+            with open(OUT_FILE, "w") as f:
+                f.write(text)
+        if "--json" in flags:
+            j = dict(counts=c, findings=a["finds"], warnings=a["warns"], notes=a["notes"], result=res,
+                     tools={t: dict(status=i["status"], flag=i.get("flag", ""), callers=i["callers"], last_use=i["last_use"], tp=i["tp"])
+                            for t, i in a["info"].items()})
+            print(json.dumps(j, indent=1, sort_keys=True))
+            return 1 if a["finds"] else 0
+        for n in a["notes"]:
+            print(n)
+        if "--write" in flags:
+            print("wrote tools/TOOLS.md")
+            if git_branch() == "refs/heads/trunk":   # the hook tools/hooks/pre-commit denies a non-merge commit on trunk (TP-054, review kernel-hooks-r1 F1): print the exact escape
+                print('NOTE on trunk: commit the generated files with: PIXOS_TRUNK_DIRECT="census-write after BRANCH merge" git commit --trailer "PixOS-Worker: ROLE" -- '
+                      'tools/TOOLS.md tools/tools-status.tsv tools/super-callers.tsv')
+        elif "--check" not in flags:
+            cur = read(OUT_FILE)
+            print("tools/TOOLS.md %s" % ("is up to date" if cur == text else
+                                         "differs from the census (run tools/tool-census --write)"))
+        for w in a["warns"]:
+            print("WARN " + w)
+        for f in a["finds"]:
+            print(f)
+        print(tail)
+        return 1 if a["finds"] else 0
+    except Exception as e:  # any bug is an ERROR (exit 2), never a traceback that looks like a FAIL (exit 1)
+        print("tool-census: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        print("RESULT: ERROR")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

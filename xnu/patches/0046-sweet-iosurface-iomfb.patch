@@ -116,7 +116,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,881 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -552,14 +552,23 @@
 +static void
 +sweet_surf_log_once(const char *what, uint32_t n)
 +{
-+	uint32_t bit = (what[0] == 't' ? 48 : 0) + n;
-+	if (bit >= 64 || (sweet_surf_logged & (1ULL << bit))) {
++	/* T-07 (silent-failure audit): one mask per kind (a shared mask aliased selector 48+ onto trap 0+); a key past 63 is not dropped
++	 * silently any more: it logs, the first 8 times and then every 1000th time */
++	static uint64_t sweet_surf_logged_trap;
++	static uint32_t sweet_surf_big;
++	uint64_t *mask = what[0] == 't' ? &sweet_surf_logged_trap : &sweet_surf_logged;
++	if (n >= 64) {
++		if (++sweet_surf_big > 8 && sweet_surf_big % 1000 != 0) {
++			return;
++		}
++	} else if (*mask & (1ULL << n)) {
 +		return;
++	} else {
++		*mask |= 1ULL << n;
 +	}
-+	sweet_surf_logged |= 1ULL << bit;
 +	char name[32];
 +	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
++	IOLog("SWEET SURF GAP: %s unhandled %s %u (logged once per key)\n", name, what, n);
 +}
 +
 +bool

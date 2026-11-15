@@ -1,0 +1,60 @@
+# Review bt-vnd-debugfs-r1: golden-pull bt-vnd-on + bt-debugfs-mount (branch tools/bt-dt-symlink, fd78c52 + cbdb1d6)
+
+Reviewer: Sonnet 5.5, adversarial, read-only. Files: tools/golden-pull (header 49-53, case-arg 114, helpers 172-188, arms 526-569), tools/test_golden_capture.sh 677-726.
+Method: read from source; ran dry-run and extra-arg on a COPY [observed]; built a trimmed harness (/tmp/20t/mut/base/tools/trim.sh = test lines 1-53, 117, 617-620, 677-726; 49 ok rows, RESULT PASS [observed]) and ran 52 mutants of a copy of golden-pull through it (/tmp/20t/mut/run.sh, outputs /tmp/20t/mut/out_*.txt). The full test was not run (as ordered). No phone, no edits in the worktree.
+`shellcheck -S warning` on both files: no findings, sc=0 [observed].
+
+## Verdict: SAFE WITH CONDITIONS (all findings F1-F7 fixed in 881c01d + the test-row commit; host test PASS 20t-tgc3)
+Production code: no defect that writes more than allowed or hides a failure [read from source + observed]. The conditions are test-strength gaps (F1-F4): the host rows would let several real regressions of the safety property through. Doc fixes F6/F7.
+
+## Hard facts checked
+- (a) bt-vnd-on: golden-pull:560 holds exactly two `setprop` (persist.bluetooth.vendor.btsnoop, persist.bluetooth.disable.accelerate.bt.on), the rest is echo/getprop/[ ]; toggles via bt_tog_script (186-187) only `cmd bluetooth_manager disable|enable|wait-for-state`. No file, mount, rm, dd, flash, reboot, pm clear, bt_config. OK.
+- (b) bt-debugfs-mount: golden-pull:565 mounts only inside the `[ -e /sys/kernel/debug/gpio ]` else-branch; everything else reads (grep, getenforce, id -Z, ls -ldZ, dmesg|tail|grep, cat). The mount error is kept (`2>&1` + `mount-rc=$?`, file bt-debugfs-mount.txt); mounted=ok / pinctrl=ok are the BT() markers (183) that decide GAP/FAIL; the INFO count (569) goes to stderr and `info=$((info + bn))`, printed on the RESULT line (681). Verified with the local-tree rows (test 706-726) and mutants. OK.
+- (c) No BD address/serial/MAC/IMEI in any script output path: pins/pinmux/tty/mounts/getenforce/avc lines carry none; all bt/ files pass through bt_mask (175, 182). Dry-run: 3 + 2 "would run" lines, no adb, no out dir created [observed]. Extra arg: `RESULT: ERROR bt-vnd-on takes no arguments`, rc 2, same for bt-debugfs-mount [observed]. bt_guard (176) runs on b_set/b_off/b_on and b_m/b_p before the first BT() (562, 567). Nuance: in a non-dry run the identity adb calls (143-145: get-serialno, getprop ro.product.device) happen before any arm, as for every bt-* action; "guard before any adb call" holds only for sent scripts.
+- (d) rule 8: no `|| true`; the only `2>/dev/null` is 569 (grep -c on a file BT() just wrote; a missing file already raised the marker GAP at 183 with grep's own error on stderr). `grep -c` exit 1 on 0 matches is harmless (no `set -e`, `${bn:-0}`). Unquoted expansions: none. BT() pipeline uses pipefail (97), a timeout or su denial is a GAP plus a missing-marker GAP. OK.
+- (f) Tags: prop names tagged `[... = guess]` at line 51; vnd log path tagged `[guess]` at 55 and 535. Untagged claims: see F7.
+
+## Findings
+
+### F1 MED test_golden_capture.sh:678-689 (+ fake adb line 41): the script logic of bt-vnd-on and of the toggle is never executed
+The fake adb prints a marker for every `echo X=ok` found in the script text (`grep -o 'echo [a-z_]*=ok'`, line 41), so the `&&` chain and the read-back conditions are invisible. Mutants of golden-pull that the whole bt-vnd-on block does NOT catch [observed, all RESULT PASS trim]:
+ - `... = true ] && [ "$(getprop persist.bluetooth.disable...` -> `= false` (readback accepts the wrong value)
+ - drop the first read-back `[ "$(getprop persist.bluetooth.vendor.btsnoop)" = true ]`; drop the second
+ - `setprop vendor.btsnoop true && setprop ...accelerate` -> `true ; setprop ...` (a failed setprop no longer stops the chain)
+ - `echo vnd=ok` made unconditional (`...; echo vnd=ok`) is only caught indirectly; the chain-break ones are not
+ - `&& echo state_off=ok` -> `; echo state_off=ok` in bt_tog_script (shared with bt-snoop-on, same hole)
+Fix: add local-execution rows like the existing `dbsub` ones. Extract `b_set` with the same `sed -n "s/^[[:space:]]*b_set='\(.*\)'\$/\1/p"` (note bt-snoop-on also has a b_set at 527: take the second one, or give the vnd one its own name `b_vnd`), run it with a PATH dir holding fake `setprop` (logs to a file, `exit 1` when FAKE_SETPROP_FAIL) and `getprop` (returns the logged value, or `false` when FAKE_GET_FALSE) and assert: both props true -> `vnd=ok`; getprop returns false for either -> no `vnd=ok`; first setprop fails -> second setprop NOT called and no marker. Same for `bt_tog_script off|on` with a fake `cmd` that fails on wait-for-state (no state_* marker).
+
+### F2 MED test_golden_capture.sh:681-682: "nothing else written" only counts the string `setprop`
+The rows grep `setprop [A-Za-z0-9._]*` and the forbidden-word list; writes by other means pass. Surviving mutants of the b_set script [observed]: `&& touch /data/local/tmp/zz`, `&& settings put global foo 1`, `&& echo 1 > /data/local/tmp/zz`, `&& svc bluetooth disable`, `&& echo state_off=ok` -> `;`. (`resetprop`, `$SP persist.zz 1` were caught, but only by the setprop-count side effect.) Likewise for the debugfs scripts: an extra `mount -o remount,rw / ;` in the failure branch survives (the mount mock log is only counted in the MOUNT_OK case, line 716), `echo 1 > "$d/$f"` in b_p survives, `echo x > "$f"` in the tty loop survives.
+Fix (exact allowlist, same style as the provision-skip row at 620ish): add `grep -qxF '<literal b_set text>; echo __GP_RC=$?' "$LOG"` for the bt-vnd-on set script, and the same for b_off/b_on; for b_m and b_p add exact-text rows (or `sha256` of the extracted script text compared with a literal) so any added command makes the row red. Additionally in the local-tree harness make `dbsub` run with a PATH where every command not in an allowlist (grep, cat, ls, echo, tail, sed, [, mount, getenforce, id, dmesg, true) is a stub that logs and exits 1, and assert the log is empty; assert `wc -l mount.log` is exactly 1 in the failing-mount case too.
+
+### F3 MED test_golden_capture.sh:685,694: removal or narrowing of bt_guard in the new arms is not detected
+Mutants [observed, PASS trim]: delete `bt_guard "$b_set" "$b_off" "$b_on"` (golden-pull:562); `bt_guard "$b_set"` only; delete `bt_guard "$b_m" "$b_p"` (567); `bt_guard "$b_m"` only. The existing guard mutants (test 650-653) target bt-static and the guard body; the "no forbidden word" rows only check the shipped text, which has none today.
+Fix: for each new arm add the bt-static style mutant row: `sed` inject `rm -f x;` into b_set (and into b_p, and into b_off via bt_tog_script is shared) in `$w/mut/golden-pull`, run `gbm bt-vnd-on` / `gbm bt-debugfs-mount`, expect rc 1, `REFUSED: bt-vnd-on script holds a forbidden word`, and `grep -c 'rm -f x' "$LOG"` = 0.
+
+### F4 LOW test_golden_capture.sh:697,723: INFO counting and tty counter are only weakly pinned
+Surviving mutants [observed]: `[ "${bn:-0}" -gt 0 ]` -> `-gt 1` (a single INFO line is lost); `info=$((info + bn))` -> `info=$((info + 2))` (constant, equals the one tested value 2); `t=$((t+1));` deleted from b_p (the "INFO: no readable /proc/tty/driver/* file" line is then printed even when a tty file is readable; row 723 does not assert its absence). Also timeout values (60/90) are untestable with the fake, which is acceptable.
+Fix: make the fake emit N INFO lines from FAKE_BT_PININFO=N (loop) and add rows for N=1 (info=1) and N=3 (info=3); in row 723 add `! grep -q '^INFO: no readable' <<<"$po"` (expect rc 1) for the case where the tty file exists.
+
+### F5 LOW golden-pull:565: mount outcome semantics (rule 8, mislabel, stacking)
+ 1. If `mount` returns non-zero but `/sys/kernel/debug/gpio` exists afterwards, the script prints the error and `mount-rc=N` but also `mounted=ok`: PASS with a swallowed non-zero rc. Unlikely, but rule 8 says every failed step shows. Fix: `mount ... 2>&1; mrc=$?; echo "mount-rc=$mrc"` and gate the marker `[ $mrc -eq 0 ]` on the attempted-mount path (keep `already-present` path as is), or print `mount_rc_nonzero` and omit the marker.
+ 2. If the mount succeeds (rc 0) but there is no `gpio` file (kernel without gpiolib debugfs [guess]), the file says `mount_failed: /sys/kernel/debug/gpio missing` while mount-rc=0: misleading but the evidence is in the file. Fix: label `gpio_missing_after_mount rc=$mrc`.
+ 3. If debugfs is already mounted but `gpio` is absent, the script mounts a second (stacked) debugfs. The inventory arm (golden-pull:624) uses `mountpoint -q /sys/kernel/debug || mount ...` for the same purpose. Fix: `if mountpoint -q /sys/kernel/debug; then echo debugfs=mountpoint-present; else mount ...; fi` then keep the gpio check as the success test (whether toybox on BP31 has `mountpoint` is [guess]; line 624 already depends on it, so a failure there would show in that arm).
+
+### F6 LOW golden-pull:50-54: header insertion splits the bt-snoop-on comment
+Lines 51-52 (new) were inserted between line 50 (bt-snoop-on) and its continuation line 53 (`#   [research 107 Q1/Q3, read from source]; one file per step (bt-snoop-set/-off/-on.txt), a failed wait = GAP ...`), so the continuation now reads as part of bt-debugfs-mount [read from the diff of fd78c52]. Line 50 also still says "the ONLY write besides the BT toggle", which is false now (bt-vnd-on writes two props, bt-debugfs-mount mounts).
+Fix: move lines 51-52 to after line 53 (before `# bt-toggle`), and change line 50 to "the persist write of this action" (or "... besides the bt-vnd-on props and the debugfs mount").
+
+### F7 LOW golden-pull:51-52: untagged claims (AGENTS rule 5)
+ - line 52 "the bt-debug on|off action works unchanged after this": a "works" claim with no device result; write "[guess: untested on the phone] ... should work".
+ - line 51 "userdata, wiped by the inj9 restore": tag `[read from source: persist.* props live in /data/property; restore = HANDOFF 21m 'inj9 restored by golden-bt-cold C11']` or `[guess]`.
+ - line 52 "runtime mount, no persistent write": tag `[read from source: mount(2) is kernel RAM state; line 69 says the same for inventory]`; that the Magisk su shell mounts in the namespace other processes see is [guess] (Magisk namespace mode).
+ - success criterion `/sys/kernel/debug/gpio` exists: file name from the existing bt-debug arm (555), [guess] on BP31 until the run.
+No new "works" claim found in the arms or the test names.
+
+## Mutants run (52; killed = test rows go red)
+Not caught (survived): third-setprop caught; NOT caught: readback `= false`, readback 1 dropped, readback 2 dropped, `;` chain break in b_set, `touch`, `settings put`, `> file`, `svc bluetooth disable`, state_off `;` chain break, bt_guard removed (vnd), bt_guard only b_set (vnd), bt_guard removed (debugfs), bt_guard only b_m, extra `mount -o remount,rw /` in the failure branch, `mounted=ok` unconditional after a failing `grep debugfs /proc/mounts`, `echo 1 > "$d/$f"` in b_p, `echo x > "$f"` in the tty loop, `-gt 1` on the INFO test, `info+2` constant, `t=$((t+1))` removed. Caught: third setprop, wrong value of either setprop (true->false, after anchoring), wrong prop name, no off/on toggle BT call, mount without the gpio test, mount always, remount flag, mount-rc dropped, mount error text dropped, getenforce dropped, avc grep dropped, pinctrl marker unconditional, INFO count +1, INFO count dropped, INFO stderr line dropped, pinmux-pins skipped, tty INFO line dropped, pinctrl INFO line dropped, pinctrl dir counter removed, `-d` test removed, marker line broken, forbidden word injected into b_set (11 rows).
+
+## Antipattern candidate (for the driver; I did not edit the repo)
+A host-test fake that derives its "success" output from the script text (`echo X=ok` -> prints X=ok) cannot test the script logic it feeds; every chain/readback/guard mutation passes. New AP: "fake adb that echoes markers from the script under test"; instead run the real script text locally with stubbed commands (as `dbsub` does) for any logic that matters.

@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""g11d-oracle: T0 host oracle for goal G-11d (App Library tile backdrop/blur missing). Host only, read-only, never touches the phone.
+
+  python3 -I tools/g11d-oracle [--json] RUNDIR_OR_LABEL...
+
+Tells 'blur shader missing' from 'capture FBO empty/partial' from the EXISTING SWEETGL logs of a run. A label resolves to
+logs/runs/<label> (env RUNS_ROOT: <RUNS_ROOT>/logs/runs). Reads RUNDIR/merged.log, fallback RUNDIR/usbnet.log. Lines may carry a host
+timestamp and/or a "|backboardd| " prefix (skipped by search). Line formats (read from userland/tools/sweetgl-eagl/gli_table.c and
+observed in logs/runs/20261029T125945Z-gputest113g-capv7, ...162816Z-gputest113h-capv8, ...090131Z-gputest113f-capvp):
+  SWEETGL: BDROP census t+1080s blur S/T/O 3277/4086/3446 fbfetch ...            (the LAST one counts; blur_present = S+T+O > 0)
+  SWEETGL: PIXELS grid r4 fbo 33 vp 1082x1226 cells 60/64 map ..++####|...(8 rows) a5 0     ('.' empty '+' partial '#' full)
+  SWEETGL: PIXELS grid r1 fbo 3 vp 1082x1226 written 0                           (grid unreadable -> class nogrid)
+  SWEETGL: PIXELS unbind S fbo 33 vp 1082x1226 nonzero 16 of 16 maxa 0xff sum 0x265f written 1 round 4 quad 16/16/16/16
+  SWEETGL: PIXELS capdraws r4 fbo 33 draws 5 kinds b:0 f:2 c:0 l:0 r:0 o:3 verts 66 progs 7..23 blendlast 0 since-bind
+  SWEETGL: PIXELS capvp r4 fbo 33 first vp 0,0,1082,1226 mode 0x4 count 6 last vp 0,0,1082,1226 mode 0x4 count 48
+Rows are joined on (round, fbo); a later row with the same key replaces an earlier one. Capture FBOs = rows whose vp is
+CAP_W_MIN..CAP_W_MAX wide and >= CAP_H_MIN high. Classes: full / quadrant / sparse / empty / nogrid (see classify()).
+capv8 join (plan-g114b-r1 F2): `SWEETGL: PIXELS capv8 fbo F vp WxH draw N <tag> ...` lines carry no round and FBO names are reused, so
+they are parsed in file order into BLOCKS (consecutive lines of one fbo; a new block starts when another fbo's line intervenes, when
+the draw number goes down, or when a `prog` header repeats a draw number). A capture sample (round R, fbo F) takes the LAST block of
+fbo F that ends BEFORE its `unbind S fbo F ... round R` line (fallback: its grid line); it is joined only if the block vp equals the
+sample vp and its number of distinct draws equals the capdraws draws count, else join=unmatched. Per joined sample, for every draw
+whose header has `count 48`: min/max x,y of the printed vertices v0..v3, max x/W and max y/H, ortho_ok (vertex_matrix scale ==
+2/W, 2/H), tex units, and hint positions-quadrant (both <= 0.55) / positions-full (both >= 0.9) / positions-other.
+Bind level (batch 10b): the userland prints ONE line `SWEETGL: PIXELS capv8 skip fbo F vp WxH reason keycap binds N` (or `reason keytable
+binds 0`) for every bind skipped by the per-key cap, and `capv8 skip cap 400` when those lines run out, and `capv8 cap` when the block budget
+is spent. With any skip line the join is BIND level: the sample takes the last capv8 EVENT (block or skip line) of its fbo before the unbind
+line; a skip line last (or after the block) -> unmatched (bind skipped by key cap); a `capv8 cap` line between the block and the sample ->
+unmatched (budget exhausted after the block: a later bind of the name left no line). Without skip lines the old key-level join is kept and
+`join level: key (no skip lines in the log)` is printed (plan-g114c-r1 F1: key level can join a block of an EARLIER bind of a recycled name).
+DECIDE (batch 10b, new capv8 tags; formats fixed by the userland batch, not yet observed on hardware):
+  ... draw N s u0 21 512x256 if 0x8058, u1 13 256x256 if 0x8058     (sampled units: name, level-0 WxH or `?`, internal format)
+  ... draw N z idx i0,i1,i2,i3 l0 x,y,z,w l1 .. l3                   (attrib 0 of the LAST 4 indices; `z - reason` = unreadable)
+  ... draw N t a2 f0 s,t f1 .. f3 | l0 s,t .. l3 s,t                 (texcoords of the first 4 / last 4 indices; `t a2 - reason`; also a3)
+Per matched quadrant sample one `DECIDE:` line and a `DECIDE-SUMMARY:`. Reading of the table (guess where the brief is vague): the main
+draw is the first count-48 draw, the quad draw the first count-6 draw. Position extent = span of the 8 vertices (v0..v3 + z l0..l3) as
+a fraction of the FBO: via the ortho vertex_matrix to clip space ((max-min)*scale/2, scale = m[0] / m.4[1]) when the u line has it, else
+(max-min)/W. Texcoord extent = max-min of the 8 a2 values, s and t. Source ratio = u0 w/W, h/H. Order: O5 (same signature as a matched
+full-class sample: per draw count, prog, source sizes, extents, tex ranges) -> O1 (main or quad draw extent <= 0.55 in x or y) -> O2 (all
+extents >= 0.9, a2 range <= 0.55 in s or t) -> O3 (tex >= 0.9, u0 ratio <= 0.55) -> O4 (u0 ratio >= 0.9) ; values between 0.55 and 0.9 or
+missing lines -> undecided (reason named). Runs with no s/z/t line: `DECIDE: n/a (no s/z/t lines)`.
+No capv8 lines at all: `JOIN: n/a (no capv8 lines)`. Otherwise `JOIN: matched n of m samples`.
+Last line: RESULT: PASS g11d-oracle runs=N verdict=<short>   exit 0
+          RESULT: FAIL g11d-oracle ... (a run has no capture-FBO rows or no census line)   exit 1
+          RESULT: ERROR ... (bad arguments / missing dir or log)                       exit 2
+"""
+import argparse, json, os, re, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+# Capture FBO viewport bounds. Observed capture FBOs in gputest113f/g/h: 1082x1226, 1077x1226, 1045x1226, 1077x1203; the other
+# FBOs in the same runs are 1127x149 (status-bar strip). Not derived from a spec: a guess-free heuristic, change here only.
+CAP_W_MIN, CAP_W_MAX, CAP_H_MIN = 1000, 1200, 1000
+# Upper height bound (plan-g114b-r1 F3): excludes the 1127x2438 screen-like FBO that research 115 wrongly counted as `full`
+# (also 1125x2436). Matches the instrumentation window h<=1300 (gli_table.c:2690, read from source by the reviewer).
+CAP_H_MAX = 1300
+POS_QUAD_MAX = 0.55   # hint: positions-quadrant if the vertex extent (max x / W, max y / H) is <= this
+POS_FULL_MIN = 0.90   # hint: positions-full if both are >= this
+ORTHO_TOL = 0.02      # relative tolerance for vertex_matrix scale vs 2/W, 2/H
+FULL_CELLS = 56      # of 64; observed full tiles 60/64 and 64/64
+QUAD_MIN_CELLS = 8   # observed quadrant maps have 12 or 16 cells in the top-left 4x4 block
+CLASSES = ("full", "quadrant", "sparse", "empty", "nogrid")
+
+CENSUS = re.compile(r"SWEETGL: BDROP census t\+(\d+)s blur S/T/O (\d+)/(\d+)/(\d+)")
+GRID = re.compile(r"SWEETGL: PIXELS grid r(\d+) fbo (\d+) vp (\d+)x(\d+) (?:cells (\d+)/64 map ([.+#]{8}(?:\|[.+#]{8}){7}) a5 \d+|written (\d+))\s*$")
+UNBIND = re.compile(r"SWEETGL: PIXELS unbind \w fbo (\d+) vp (\d+)x(\d+) nonzero (\d+) of (\d+) maxa \S+ sum \S+ written (\d+) round (\d+) quad \S+\s*$")
+CAPDRAWS = re.compile(r"SWEETGL: PIXELS capdraws r(\d+) fbo (\d+) draws (\d+) kinds (b:\d+ f:\d+ c:\d+ l:\d+ r:\d+ o:\d+) verts (\d+) progs \S+ blendlast \S+ since-bind\s*$")
+CAPVP = re.compile(r"SWEETGL: PIXELS capvp r(\d+) fbo (\d+) first vp (\d+),(\d+),(\d+),(\d+) mode \S+ count (\d+) last vp (\d+),(\d+),(\d+),(\d+) mode \S+ count (\d+)\s*$")
+SKIP = re.compile(r"SWEETGL: PIXELS capv8 skip fbo (\d+) vp (\d+)x(\d+) reason (keycap|keytable) binds (\d+)")
+CAPV8 = re.compile(r"SWEETGL: PIXELS capv8 fbo (\d+) vp (\d+)x(\d+) draw (\d+) (\S+)(?: (.*))?$")
+VERT = re.compile(r"\bv([0-3]) (-?[\d.eE+-]+),(-?[\d.eE+-]+),(-?[\d.eE+-]+),(-?[\d.eE+-]+)")
+UNI = re.compile(r"\b(vertex_matrix(?:\.\d+)?)=(-?[\d.eE+-]+),(-?[\d.eE+-]+),(-?[\d.eE+-]+),(-?[\d.eE+-]+)")
+SRC = re.compile(r"\bu(\d+) (\d+) (\d+x\d+|\?) if (0x[0-9a-fA-F]+)")
+NUM = r"(-?[\d.eE+-]+)"
+ZV = re.compile(r"\bl([0-3]) " + ",".join([NUM] * 4) + r"(?=\s|$)")
+TV = re.compile(r"\b([fl])([0-3]) " + ",".join([NUM] * 2) + r"(?=\s|$)")
+KINDS = ("SWEETGL: PIXELS grid r", "SWEETGL: PIXELS capdraws r", "SWEETGL: PIXELS capvp r")
+
+
+class Bad(Exception):
+    pass
+
+
+def resolve(arg):
+    if os.path.isdir(arg):
+        return arg
+    base = os.environ.get("RUNS_ROOT") or REPO
+    d = os.path.join(base, "logs", "runs", arg)
+    if os.path.isdir(d):
+        return d
+    raise Bad("no such run dir or label: %s" % arg)
+
+
+def is_cap(w, h):
+    return CAP_W_MIN <= w <= CAP_W_MAX and CAP_H_MIN <= h <= CAP_H_MAX
+
+
+def classify(cells, rows, unbind_nonzero):
+    """cells: int or None; rows: 8 map strings or None; unbind_nonzero: int or None (no grid row -> unbind decides)."""
+    if cells is None or rows is None:
+        return "empty" if unbind_nonzero == 0 else "nogrid"
+    if cells == 0:
+        return "empty"
+    if cells >= FULL_CELLS:
+        return "full"
+    outside = any(ch != "." for r, row in enumerate(rows) for c, ch in enumerate(row) if r >= 4 or c >= 4)
+    if cells >= QUAD_MIN_CELLS and not outside:
+        return "quadrant"
+    return "sparse"
+
+
+def ortho_check(d, w, h):
+    """'yes'/'no' if vertex_matrix scale (m[0] first comp, m.4 second comp) equals 2/W, 2/H; 'n/a' if the u line lacks it."""
+    a, b = d["uni"].get("vertex_matrix"), d["uni"].get("vertex_matrix.4")
+    if not a or not b:
+        return "n/a"
+    ok = abs(a[0] - 2.0 / w) <= ORTHO_TOL * 2.0 / w and abs(b[1] - 2.0 / h) <= ORTHO_TOL * 2.0 / h
+    return "yes" if ok else "no"
+
+
+def hint_of(fx, fy):
+    if fx <= POS_QUAD_MAX and fy <= POS_QUAD_MAX:
+        return "positions-quadrant"
+    if fx >= POS_FULL_MIN and fy >= POS_FULL_MIN:
+        return "positions-full"
+    return "positions-other"
+
+
+def join_sample(s, blocks, ev=None):
+    """Join one capture sample to its capv8 block (see module doc). Returns a dict with status matched/unmatched."""
+    if not blocks:
+        return {"status": "n/a"}
+    if s["_pos"] is None:
+        return {"status": "unmatched", "reason": "no line position"}
+    blk = None
+    for b in reversed(blocks):
+        if b["fbo"] == int(s["fbo"]) and b["end"] < s["_pos"]:
+            blk = b
+            break
+    ev = ev or {"bind": False, "skips": [], "cap": None}
+    if ev["bind"]:
+        sk = [x for x in ev["skips"] if x[1] == int(s["fbo"]) and x[0] < s["_pos"]]
+        if sk and (blk is None or sk[-1][0] > blk["end"]):
+            return {"status": "unmatched", "reason": "bind skipped by key cap (%s)" % sk[-1][2]}
+        if blk is not None and ev["cap"] is not None and blk["end"] < ev["cap"] < s["_pos"]:
+            return {"status": "unmatched", "reason": "budget exhausted after the block"}
+    if blk is None:
+        return {"status": "unmatched", "reason": "no capv8 block for fbo %d before the sample" % s["fbo"]}
+    w, h = (int(x) for x in s["vp"].split("x"))
+    if blk["vp"] != (w, h):
+        return {"status": "unmatched", "reason": "vp mismatch block %dx%d sample %dx%d" % (blk["vp"] + (w, h))}
+    if s["draws"] is None or len(blk["draws"]) != s["draws"]:
+        return {"status": "unmatched", "reason": "draws %d in block vs %s in capdraws" % (len(blk["draws"]), s["draws"])}
+    dl = []
+    for dn in sorted(blk["draws"]):
+        d = blk["draws"][dn]
+        if d["count"] != 48:
+            continue
+        e = {"draw": dn, "tex": d["tex"], "idx": d["idx"], "ortho_ok": ortho_check(d, w, h)}
+        vs = list(d["verts"].values())
+        if vs:
+            xs, ys = [v[0] for v in vs], [v[1] for v in vs]
+            e.update(x_min=min(xs), x_max=max(xs), y_min=min(ys), y_max=max(ys), fx=max(xs) / w, fy=max(ys) / h)
+            e["hint"] = hint_of(e["fx"], e["fy"])
+        else:
+            e["hint"] = "positions-n/a"
+        dl.append(e)
+    return {"status": "matched", "count48": dl, "info": {dn: draw_info(blk["draws"][dn], w, h) for dn in sorted(blk["draws"])}}
+
+
+LOW, HIGH = 0.55, 0.90
+OUTCOMES = ("O1", "O2", "O3", "O4", "O5")
+NAMES = {"O1": "geometry-quadrant", "O2": "texcoord-quadrant", "O3": "source-small", "O4": "source-content", "O5": "same-as-full"}
+
+
+def draw_info(d, w, h):
+    """per-draw facts for DECIDE: count, prog, pos extent fractions (8 vertices), a2/a3 texcoord ranges, u0/u1 size"""
+    info = {"count": d["count"], "prog": d["prog"], "pos": None, "pos_missing": None, "tex": {}, "src": {}}
+    a, b = d["uni"].get("vertex_matrix"), d["uni"].get("vertex_matrix.4")
+    sx = abs(a[0]) / 2 if a and a[0] else 1.0 / w
+    sy = abs(b[1]) / 2 if b and b[1] else 1.0 / h
+    pts = list(d["verts"].values())
+    z = d["z"]
+    if z is None:
+        info["pos_missing"] = "z"
+    elif isinstance(z, str):
+        info["pos_missing"] = "z (%s)" % z
+    elif not pts:
+        info["pos_missing"] = "v"
+    else:
+        pts = pts + list(z.values())
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        info["pos"] = ((max(xs) - min(xs)) * sx, (max(ys) - min(ys)) * sy)
+    for k, tv in d["t"].items():
+        if isinstance(tv, str):
+            info["tex"][k] = tv
+        else:
+            ss, tt = [v[0] for v in tv.values()], [v[1] for v in tv.values()]
+            info["tex"][k] = (max(ss) - min(ss), max(tt) - min(tt))
+    for u, (sz, fmt) in (d["src"] or {}).items():
+        info["src"][u] = None if sz is None else (sz[0] / w, sz[1] / h)
+    return info
+
+
+def signature(j):
+    """order-independent-free signature of a joined sample's draws (rounded to 0.01)"""
+    r2 = lambda t: None if t is None or isinstance(t, str) else tuple(round(x, 2) for x in t)
+    return tuple((dn, i["count"], i["prog"], r2(i["pos"]), tuple(sorted((k, r2(v)) for k, v in i["tex"].items())),
+                  tuple(sorted((k, r2(v)) for k, v in i["src"].items()))) for dn, i in sorted(j["info"].items()))
+
+
+def decide(s, fulls):
+    """-> (outcome or 'undecided', text)"""
+    j = s["join"]
+    info = j["info"]
+    main = next((i for dn, i in sorted(info.items()) if i["count"] == 48), None)
+    quad = next((i for dn, i in sorted(info.items()) if i["count"] == 6), None)
+    if main is None:
+        return "undecided", "missing: no count-48 draw"
+    sig = signature(j)
+    if any(sig == f for f in fulls):
+        return "O5", "draws identical to a matched full-class FBO"
+    miss = []
+    if main["pos"] is None:
+        miss.append("main draw %s" % main["pos_missing"])
+    if quad is not None and quad["pos"] is None:
+        miss.append("quad draw %s" % quad["pos_missing"])
+    t2 = main["tex"].get(2)
+    if t2 is None or isinstance(t2, str):
+        miss.append("t a2 (%s)" % (t2 or "no line"))
+    u0 = main["src"].get(0)
+    if 0 not in main["src"]:
+        miss.append("s u0 (no line)")
+    elif u0 is None:
+        miss.append("s u0 (size ?)")
+    ps = [i["pos"] for i in (quad, main) if i is not None and i["pos"] is not None]
+    txt = "pos48 %s pos6 %s tex_a2 %s u0/fbo %s" % tuple("n/a" if x is None or isinstance(x, str) else "%.2f,%.2f" % x for x in (main["pos"], quad["pos"] if quad else None, t2, u0))
+    if any(p[0] <= LOW or p[1] <= LOW for p in ps):
+        return "O1", txt
+    if miss:
+        return "undecided", "missing: " + "; ".join(miss) + " | " + txt
+    if not all(p[0] >= HIGH and p[1] >= HIGH for p in ps):
+        return "undecided", "positions between %.2f and %.2f | %s" % (LOW, HIGH, txt)
+    if t2[0] <= LOW or t2[1] <= LOW:
+        return "O2", txt
+    if not (t2[0] >= HIGH and t2[1] >= HIGH):
+        return "undecided", "texcoords between %.2f and %.2f | %s" % (LOW, HIGH, txt)
+    if u0[0] <= LOW or u0[1] <= LOW:
+        return "O3", txt
+    if u0[0] >= HIGH and u0[1] >= HIGH:
+        return "O4", txt
+    return "undecided", "u0 size between %.2f and %.2f | %s" % (LOW, HIGH, txt)
+
+
+def decide_all(samples, ev):
+    if not ev["szt"]:
+        return None
+    fulls = [signature(s["join"]) for s in samples if s["class"] == "full" and s["join"]["status"] == "matched"]
+    res, counts = [], {k: 0 for k in OUTCOMES + ("undecided",)}
+    for s in samples:
+        if s["class"] != "quadrant" or s["join"]["status"] != "matched":
+            continue
+        o, t = decide(s, fulls)
+        counts[o] += 1
+        res.append({"round": s["round"], "fbo": s["fbo"], "outcome": o, "text": t})
+    return {"samples": res, "counts": counts}
+
+
+def join_summary(samples, n_capv8, ev):
+    if n_capv8 == 0:
+        return {"available": False, "matched": 0, "samples": len(samples), "hints": {}}
+    lv = {"level": "bind" if ev["bind"] else "key",
+          "skips_keycap": sum(1 for x in ev["skips"] if x[2] == "keycap"), "skips_keytable": sum(1 for x in ev["skips"] if x[2] == "keytable")}
+    hints = {}
+    for s in samples:
+        for e in s["join"].get("count48", []):
+            hh = hints.setdefault(s["class"], {})
+            hh[e["hint"]] = hh.get(e["hint"], 0) + 1
+    return {**lv, "available": True, "matched": sum(1 for s in samples if s["join"]["status"] == "matched"),
+            "samples": len(samples), "hints": hints}
+
+
+def analyse(rundir):
+    path = None
+    for n in ("merged.log", "usbnet.log"):
+        if os.path.isfile(os.path.join(rundir, n)):
+            path = os.path.join(rundir, n)
+            break
+    if not path:
+        raise Bad("no merged.log or usbnet.log in %s" % rundir)
+    census = None
+    grid, unbind, draws, vps = {}, {}, {}, {}
+    pos = {}                                  # (round, fbo) -> (priority, line index): unbind line preferred, then grid
+    blocks, cur, n_capv8 = [], None, 0
+    ev = {"bind": False, "skips": [], "cap": None, "szt": False}
+    bad = 0
+    with open(path, errors="replace") as f:
+        for li, ln in enumerate(f):
+            if "SWEETGL: PIXELS capv8 skip fbo " in ln:
+                m = SKIP.search(ln)
+                if m:
+                    ev["skips"].append((li, int(m.group(1)), m.group(4)))
+                    ev["bind"] = True
+                    n_capv8 += 1
+                else:
+                    bad += 1
+                continue
+            if "SWEETGL: PIXELS capv8 skip cap" in ln:
+                ev["bind"] = True
+                continue
+            if "SWEETGL: PIXELS capv8 cap" in ln:
+                if ev["cap"] is None:
+                    ev["cap"] = li
+                continue
+            if "SWEETGL: PIXELS capv8 fbo " in ln:
+                m = CAPV8.search(ln)
+                if not m:
+                    bad += 1
+                    continue
+                n_capv8 += 1
+                fbo, w, h, dn = (int(x) for x in m.groups()[:4])
+                tag, rest = m.group(5), m.group(6) or ""
+                if cur is None or cur["fbo"] != fbo or cur["vp"] != (w, h) or dn < cur["last"] or (tag == "prog" and dn in cur["draws"]):
+                    cur = {"fbo": fbo, "vp": (w, h), "last": 0, "draws": {}, "end": li}
+                    blocks.append(cur)
+                cur["last"], cur["end"] = dn, li
+                d = cur["draws"].setdefault(dn, {"count": None, "tex": None, "verts": {}, "idx": None, "uni": {}, "prog": None, "src": None, "z": None, "t": {}})
+                if tag == "prog":
+                    mc = re.search(r"\bcount (\d+)", rest)
+                    d["count"] = int(mc.group(1)) if mc else None
+                    mp = re.match(r"(\d+)", rest)
+                    d["prog"] = int(mp.group(1)) if mp else None
+                    mt = re.search(r"\| tex (.*)$", rest)
+                    d["tex"] = mt.group(1).strip() if mt else None
+                elif tag == "v":
+                    for vm in VERT.finditer(rest):
+                        d["verts"][int(vm.group(1))] = tuple(float(x) for x in vm.groups()[1:])
+                    mi = re.search(r"\bmin (\d+) max (\d+)", rest)
+                    if mi:
+                        d["idx"] = (int(mi.group(1)), int(mi.group(2)))
+                elif tag == "s":
+                    d["src"] = {int(g[0]): (None if g[2] == "?" else tuple(int(x) for x in g[2].split("x")), g[3]) for g in SRC.findall(rest)}
+                    ev["szt"] = True
+                elif tag == "z":
+                    ev["szt"] = True
+                    zv = {int(g[0]): tuple(float(x) for x in g[1:]) for g in ZV.findall(rest)}
+                    d["z"] = zv if len(zv) == 4 and not rest.lstrip().startswith("-") else "unreadable: " + rest.strip()
+                elif tag == "t":
+                    ev["szt"] = True
+                    ma = re.match(r"a(\d+) (.*)$", rest)
+                    if ma:
+                        tv = {(g[0], int(g[1])): (float(g[2]), float(g[3])) for g in TV.findall(ma.group(2))}
+                        d["t"][int(ma.group(1))] = tv if len(tv) == 8 and not ma.group(2).lstrip().startswith("-") else "unreadable: " + ma.group(2).strip()
+                elif tag == "u":
+                    for um in UNI.finditer(rest):
+                        d["uni"][um.group(1)] = tuple(float(x) for x in um.groups()[1:])
+                continue
+            if "SWEETGL: BDROP census" in ln:
+                m = CENSUS.search(ln)
+                if m:
+                    census = tuple(int(x) for x in m.groups())
+                else:
+                    bad += 1
+                continue
+            if "SWEETGL: PIXELS unbind " in ln:
+                m = UNBIND.search(ln)
+                if m:
+                    fbo, w, h, nz, _of, wr, rd = (int(x) for x in m.groups())
+                    unbind[(rd, fbo)] = (w, h, nz, wr)
+                    pos[(rd, fbo)] = (1, li)
+                continue                      # 'unbind cap' etc: not data
+            if not any(k in ln for k in KINDS):
+                continue
+            if "SWEETGL: PIXELS grid r" in ln:
+                m = GRID.search(ln)
+                if m:
+                    rd, fbo, w, h = (int(x) for x in m.groups()[:4])
+                    if m.group(7) is not None:
+                        grid[(rd, fbo)] = (w, h, None, None)          # written 0
+                    else:
+                        grid[(rd, fbo)] = (w, h, int(m.group(5)), m.group(6).split("|"))
+                    if pos.get((rd, fbo), (0, 0))[0] < 1:
+                        pos[(rd, fbo)] = (0, li)
+                else:
+                    bad += 1
+            elif "SWEETGL: PIXELS capdraws r" in ln:
+                m = CAPDRAWS.search(ln)
+                if m:
+                    draws[(int(m.group(1)), int(m.group(2)))] = (int(m.group(3)), m.group(4), int(m.group(5)))
+                else:
+                    bad += 1
+            else:
+                m = CAPVP.search(ln)
+                if m:
+                    v = [int(x) for x in m.groups()]
+                    vps[(v[0], v[1])] = (v[4], v[5], v[6], v[11])      # first w, first h, first count, last count
+                else:
+                    bad += 1
+    keys = {}
+    for k, v in grid.items():
+        keys.setdefault(k, (v[0], v[1]))
+    for k, v in unbind.items():
+        keys.setdefault(k, (v[0], v[1]))
+    for k, v in vps.items():
+        keys.setdefault(k, (v[0], v[1]))
+    samples = []
+    for k in sorted(keys):
+        w, h = keys[k]
+        if not is_cap(w, h):
+            continue
+        g = grid.get(k)
+        u = unbind.get(k)
+        cells, rows = (g[2], g[3]) if g else (None, None)
+        cls = classify(cells, rows, u[2] if u else None)
+        d = draws.get(k)
+        vp = vps.get(k)
+        samples.append({"_pos": pos.get(k, (0, None))[1], "round": k[0], "fbo": k[1], "vp": "%dx%d" % (w, h), "class": cls, "cells": cells,
+                        "unbind_nonzero": u[2] if u else None,
+                        "draws": d[0] if d else None, "kinds": d[1] if d else None, "verts": d[2] if d else None,
+                        "capvp_first_count": vp[2] if vp else None, "capvp_last_count": vp[3] if vp else None})
+    for s in samples:
+        s["join"] = join_sample(s, blocks, ev)
+    counts = {c: sum(1 for s in samples if s["class"] == c) for c in CLASSES}
+    out = {"run": rundir, "log": os.path.basename(path), "bad_lines": bad, "samples": samples, "counts": counts}
+    if census:
+        out["census"] = {"t": census[0], "S": census[1], "T": census[2], "O": census[3]}
+        out["blur_present"] = sum(census[1:]) > 0
+    else:
+        out["census"] = None
+        out["blur_present"] = None
+    for s in samples:
+        del s["_pos"]
+    out["decide"] = decide_all(samples, ev) if n_capv8 else None
+    out["capv8_lines"] = n_capv8
+    out["join"] = join_summary(samples, n_capv8, ev)
+    out["per_class"] = {}
+    for c in CLASSES:
+        ss = [s for s in samples if s["class"] == c]
+        dr, vp = {}, {}
+        for s in ss:
+            if s["draws"] is not None:
+                dr[(s["draws"], s["verts"], s["kinds"])] = dr.get((s["draws"], s["verts"], s["kinds"]), 0) + 1
+            if s["capvp_first_count"] is not None:
+                vp[(s["capvp_first_count"], s["capvp_last_count"])] = vp.get((s["capvp_first_count"], s["capvp_last_count"]), 0) + 1
+        out["per_class"][c] = {"capdraws": [{"draws": k[0], "verts": k[1], "kinds": k[2], "n": n} for k, n in sorted(dr.items())],
+                               "capvp": [{"first_count": k[0], "last_count": k[1], "n": n} for k, n in sorted(vp.items())],
+                               "capdraws_missing": sum(1 for s in ss if s["draws"] is None),
+                               "capdraws_consistent": len(dr) <= 1, "capvp_consistent": len(vp) <= 1}
+    out["verdict"] = verdict(out)
+    return out
+
+
+def verdict(o):
+    if o["census"] is None:
+        return "n/a (missing BDROP census line)"
+    if not o["samples"]:
+        return "n/a (missing capture-FBO rows)"
+    if not o["blur_present"]:
+        return "blur-shader-ABSENT"
+    c, n = o["counts"], len(o["samples"])
+    if c["quadrant"] + c["sparse"] + c["empty"] == 0:
+        if c["full"] > 0:
+            return "capture-fbo-full (no capture problem in the log)"
+        return "n/a (missing grid rows, only nogrid capture FBOs)"
+    if c["quadrant"] + c["sparse"] == 0 and c["full"] == 0:
+        return "capture-fbo-empty"
+    return "blur-shader-present, capture-fbo-partial (quadrant %d/%d, full %d/%d)" % (c["quadrant"], n, c["full"], n)
+
+
+def short(v):
+    return v.split(" (")[0].replace("blur-shader-present, ", "")
+
+
+def render(o):
+    L = ["== %s (%s, bad_lines=%d)" % (o["run"], o["log"], o["bad_lines"])]
+    ce = o["census"]
+    L.append("  blur census: %s" % ("none" if ce is None else "t+%ds blur S/T/O %d/%d/%d -> blur_present=%s" % (ce["t"], ce["S"], ce["T"], ce["O"], o["blur_present"])))
+    n = len(o["samples"])
+    L.append("  capture FBOs (vp %d..%d wide, %d..%d high): %d samples; classes: %s" % (CAP_W_MIN, CAP_W_MAX, CAP_H_MIN, CAP_H_MAX, n, " ".join("%s %d" % (c, o["counts"][c]) for c in CLASSES)))
+    for c in CLASSES:
+        ss = [s for s in o["samples"] if s["class"] == c]
+        if not ss:
+            continue
+        e = ss[0]
+        L.append("  class %-8s n=%d example (round %d, fbo %d, vp %s, cells %s, unbind nonzero %s)" % (c, len(ss), e["round"], e["fbo"], e["vp"], e["cells"], e["unbind_nonzero"]))
+        pc = o["per_class"][c]
+        for d in pc["capdraws"]:
+            L.append("    capdraws: draws %d verts %d kinds %s  x%d" % (d["draws"], d["verts"], d["kinds"], d["n"]))
+        if pc["capdraws_missing"]:
+            L.append("    capdraws: missing for %d sample(s)" % pc["capdraws_missing"])
+        for d in pc["capvp"]:
+            L.append("    capvp: first count %d last count %d  x%d" % (d["first_count"], d["last_count"], d["n"]))
+        L.append("    consistent within class: capdraws %s, capvp %s" % ("yes" if pc["capdraws_consistent"] else "NO", "yes" if pc["capvp_consistent"] else "NO"))
+    j = o["join"]
+    if j["available"]:
+        for s in o["samples"]:
+            sj = s["join"]
+            if sj["status"] != "matched":
+                L.append("  join round %d fbo %d class %s draws %s: join=unmatched (%s)" % (s["round"], s["fbo"], s["class"], s["draws"], sj.get("reason")))
+                continue
+            if not sj["count48"]:
+                L.append("  join round %d fbo %d class %s draws %s: matched, no count-48 draw" % (s["round"], s["fbo"], s["class"], s["draws"]))
+            for e in sj["count48"]:
+                ext = "no vertices" if "x_min" not in e else "x %g..%g y %g..%g frac x %.3f y %.3f" % (e["x_min"], e["x_max"], e["y_min"], e["y_max"], e["fx"], e["fy"])
+                L.append("  join round %d fbo %d class %s draws %s: count48 draw %d %s idx %s ortho_ok %s tex [%s]" % (s["round"], s["fbo"], s["class"], s["draws"], e["draw"], ext, e["idx"], e["ortho_ok"], e["tex"]))
+                L.append("    hint: %s" % e["hint"])
+        for c, hh in sorted(j["hints"].items()):
+            L.append("  hints class %s: %s" % (c, " ".join("%s %d" % (k, v) for k, v in sorted(hh.items()))))
+        L.append("join level: %s" % ("bind" if j["level"] == "bind" else "key (no skip lines in the log)"))
+        L.append("skips keycap %d keytable %d" % (j["skips_keycap"], j["skips_keytable"]))
+        L.append("JOIN: matched %d of %d samples" % (j["matched"], j["samples"]))
+        L.append("JOIN-QUADRANT: matched %d of %d quadrant samples" % (quadrant_joined(o), sum(1 for s in o["samples"] if s["class"] == "quadrant")))
+        dc = o.get("decide")
+        if dc is None:
+            L.append("DECIDE: n/a (no s/z/t lines)")
+        else:
+            for x in dc["samples"]:
+                L.append("DECIDE: round %d fbo %d %s%s: %s" % (x["round"], x["fbo"], x["outcome"], " " + NAMES[x["outcome"]] if x["outcome"] in NAMES else "", x["text"]))
+            c = dc["counts"]
+            L.append("DECIDE-SUMMARY: " + " ".join("%s %d" % (k.lower(), c[k]) for k in OUTCOMES) + " undecided %d" % c["undecided"])
+    else:
+        L.append("JOIN: n/a (no capv8 lines)")
+    L.append("VERDICT: %s" % o["verdict"])
+    return L
+
+
+def quadrant_joined(o):
+    """quadrant-class samples whose capv8 block was joined AND carries a count-48 draw (the evidence batch 10 exists for)"""
+    return sum(1 for s in o["samples"] if s["class"] == "quadrant" and s["join"]["status"] == "matched" and s["join"]["count48"])
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="g11d-oracle")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--require-quadrant-join", type=int, default=0, metavar="N",
+                   help="FAIL (exit 1) unless at least N quadrant-class samples are joined to a capv8 block with a count-48 draw (g114b passed while joining 0 of 18)")
+    p.add_argument("runs", nargs="+")
+    try:
+        a = p.parse_args(argv)
+    except SystemExit as e:
+        if e.code == 0:
+            return 0
+        print("RESULT: ERROR g11d-oracle bad arguments")
+        return 2
+    res = []
+    try:
+        for r in a.runs:
+            res.append(analyse(resolve(r)))
+    except Bad as e:
+        print("usage error: %s\nRESULT: ERROR g11d-oracle missing run or log" % e)
+        return 2
+    if a.json:
+        print(json.dumps(res, indent=1))
+    else:
+        for o in res:
+            print("\n".join(render(o)))
+    bad = [o["run"] for o in res if o["census"] is None or not o["samples"]]
+    vs = ",".join(short(o["verdict"]) for o in res)
+    if bad:
+        print("RESULT: FAIL g11d-oracle runs=%d no capture-FBO rows or no census line in: %s verdict=%s" % (len(res), ", ".join(bad), vs))
+        return 1
+    if a.require_quadrant_join:
+        short_runs = [o["run"] for o in res if quadrant_joined(o) < a.require_quadrant_join]
+        if short_runs:
+            print("RESULT: FAIL g11d-oracle runs=%d quadrant-join < %d in: %s verdict=%s" % (len(res), a.require_quadrant_join, ", ".join(short_runs), vs))
+            return 1
+    print("RESULT: PASS g11d-oracle runs=%d verdict=%s" % (len(res), vs))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

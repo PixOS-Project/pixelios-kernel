@@ -1,0 +1,347 @@
+/*
+ * sweet_wlan_a80211.c - XNU glue of the Apple80211 ioctls and events on the Wi-Fi `en0` ifnet (patch 0201, T-7241; goal W-D7, research 110 s.3 and s.5).
+ * The logic is the host-tested bsd/dev/sweet_wlan_a80211.h (shim/sweet_wlan_a80211.h) over the station handler bsd/dev/sweet_wlan_sta.h; this file only
+ * supplies what the kernel provides: copyin/copyout of the user buffer behind req_data, one mutex, kev_post_msg_nowait, printf, and the if_ioctl hook.
+ * Not compiled against XNU here (CI builds the tree), not run on hardware. sweet_wlan_a80211_attach() takes any radio; sweet_wlan_a80211_radio_attach() (T-431f,
+ * called by sweet_wlan_en0_init after en0 is up) attaches the swsta_radio backend of sweet_wlan_radio.h with the 16.7 codec and an escan link that replays the
+ * ESCAN_RESULT events the boot-time G2 scan recorded (T-08fd, swr_replay_escan; the chip cannot scan again after the boot run). Without a recorded scan, or on a
+ * board without that G2 code, a scan is a counted, loud EIO with a WIFI GAP line and never an empty success.
+ */
+#include <sys/types.h>
+#include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/kern_event.h>
+#include <libkern/libkern.h>
+#include <kern/locks.h>
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/kpi_interface.h>
+
+#define SWSTA_MEMCPY memcpy
+#define SWSTA_MEMSET memset
+#define SWSTA_SNPRINTF snprintf
+#define SWSTA_MEMCMP memcmp
+#define SWSTA_PROBE_LOG(l) printf("SWEET PROBE: %s\n", (l))      /* patch 0363 (lowclk B3): the Set 383 key log of sweet_wlan_sta.h swsta_p383 */
+extern int sweet_probe_on(void);   /* patch 0363: bsd/dev/sweet_probe.c, boot-arg sweetprobe (0 / absent = off) */
+#include "sweet_wlan_sta.h"
+#include "sweet_wlan_a80211.h"
+#include "sweet_wlan_radio.h"
+
+static struct a80211 sw_a80211;
+static lck_mtx_t *sw_a80211_mtx;
+static ifnet_ioctl_func sw_a80211_prev;
+
+static int
+sw_a80211_copyin(void *ctx __unused, uint64_t uaddr, void *dst, uint32_t n)
+{
+	return copyin((user_addr_t)uaddr, dst, n);
+}
+
+static int
+sw_a80211_copyout(void *ctx __unused, const void *src, uint64_t uaddr, uint32_t n)
+{
+	return copyout(src, (user_addr_t)uaddr, n);
+}
+
+static void
+sw_a80211_lock(void *ctx __unused)
+{
+	lck_mtx_lock(sw_a80211_mtx);
+}
+
+static void
+sw_a80211_unlock(void *ctx __unused)
+{
+	lck_mtx_unlock(sw_a80211_mtx);
+}
+
+static int
+sw_a80211_kev(void *ctx __unused, const struct a80211_kev *k)
+{
+	struct kev_msg m;
+	uint32_t i;
+
+	bzero(&m, sizeof(m));
+	m.vendor_code = k->vendor;
+	m.kev_class = k->kclass;
+	m.kev_subclass = k->subclass;
+	m.event_code = k->code;
+	for (i = 0; i < k->n && i < 2; i++) {
+		m.dv[i].data_length = k->dv[i].len;
+		m.dv[i].data_ptr = (void *)(uintptr_t)k->dv[i].ptr;
+	}
+	return kev_post_msg_nowait(&m);          /* may be called from a radio thread: never wait */
+}
+
+static void
+sw_a80211_log(void *ctx __unused, const char *line)
+{
+	printf("SWEET WLAN: %s\n", line);
+}
+
+static void
+sw_a80211_gap(void *ctx __unused, const char *text)
+{
+	printf("WIFI GAP: %s\n", text);
+}
+
+static int
+sw_a80211_chain(void *ifp, unsigned long cmd, void *data)
+{
+	if (sw_a80211_prev == NULL) {
+		printf("WIFI GAP: A80211 chain has no previous if_ioctl: command 0x%lx refused\n", cmd);
+		return EOPNOTSUPP;
+	}
+	return (int)sw_a80211_prev((ifnet_t)ifp, cmd, data);
+}
+
+static errno_t
+sw_a80211_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+{
+	return (errno_t)a80211_if_ioctl(&sw_a80211, ifp, cmd, data);
+}
+
+/* Installs the A80211 handler in front of en0's own if_ioctl (SIOCGIFMEDIA, flags, multicast stay there). Call once, after sweet_wlan_en0_init() and before
+ * wifid starts. The radio and the codec stay owned by the caller. Returns 0, or a positive errno with a GAP line (nothing installed). */
+int
+sweet_wlan_a80211_attach(ifnet_t ifp, struct swsta_radio *radio, const struct swsta_codec *codec)
+{
+	static const struct a80211_io io = {
+		NULL, sw_a80211_copyin, sw_a80211_copyout, sw_a80211_lock, sw_a80211_unlock, sw_a80211_kev, sw_a80211_log, sw_a80211_gap
+	};
+	lck_grp_t *grp;
+
+	if (ifp == NULL || radio == NULL) {
+		printf("WIFI GAP: A80211 attach refused: no ifnet or no radio\n");
+		return EINVAL;
+	}
+	if (sw_a80211_mtx != NULL) {
+		printf("WIFI GAP: A80211 attach refused: already attached\n");
+		return EBUSY;
+	}
+	grp = lck_grp_alloc_init("sweet_a80211", LCK_GRP_ATTR_NULL);
+	sw_a80211_mtx = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+	sw_a80211_prev = ifp->if_ioctl;
+	a80211_init(&sw_a80211, radio, codec, &io, if_name(ifp), sw_a80211_chain);
+	sw_a80211.sta.probe = sweet_probe_on() ? 1u : 0u;    /* patch 0363: boot-arg sweetprobe=1 logs the Set 383 property keys (names only); a80211_init zeroed it */
+	ifp->if_ioctl = sw_a80211_if_ioctl;
+	printf("SWEET WLAN: A80211 ioctl glue installed on %s (SIOCSA80211 0x%lx, SIOCGA80211 0x%lx)\n", if_name(ifp), A80211_SIOCS, A80211_SIOCG);
+	return 0;
+}
+
+static struct swr sw_radio;
+static struct swr sw_scan_tab;         /* patch 0292: the scratch table of the live scan; written ONLY by the keep thread (events, under the en0 lock) after sw_scan_req reset it, read by swr_scan_finish (the same thread, under the radio lock) */
+
+/* The escan link of the radio (T-08fd): the chip scan ran once inside the boot run (G2 L23, patch 0174), which recorded every ESCAN_RESULT event of our sync id; this replays them to the sink.
+ * The listing is the boot-time one (stale), a gap line says so on every scan. No bus access, no store, no wait (sweet_wlan_radio.h swr_replay_escan). The record is written by the synchronous boot path
+ * (sweet_wlan_init) and read here without a lock: sweet_wlan_en0_init, which attaches this radio, must run after sweet_wlan_init returned (T-4505 keeps that order). */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+extern int sweet_wlan_g2_escan_rec(uint32_t i, uint32_t *status, uint8_t *out, uint32_t cap);
+extern uint32_t sweet_wlan_g2_escan_lost(void);
+
+static const struct swr_replay sw_radio_replay = { sweet_wlan_g2_escan_rec, sweet_wlan_g2_escan_lost, sw_a80211_gap, NULL };
+#else
+/* a board without the G2 scan code (sweet_wlan.c is SWEET only): no record to replay, the scan is refused loudly */
+static int
+sw_radio_no_rec(uint32_t i __unused, uint32_t *status __unused, uint8_t *out __unused, uint32_t cap __unused)
+{
+	return 0;
+}
+
+static const struct swr_replay sw_radio_replay = { sw_radio_no_rec, NULL, sw_a80211_gap, NULL };
+#endif
+
+/* patch 0292 (WIFI-COVERAGE D3/D4): the LIVE scan of the kept link. sw_scan_req is the radio's ascan.request (called by swr_scan_start under the handler's lock, i.e. from the iOS ioctl thread): it empties the scratch table and asks the keep thread (sweet_wlan.c
+ * sweet_wlan_keep_scan_request: one flag, no engine access, no lock). The keep thread feeds every ESCAN_RESULT event to sweet_wlan_a80211_scan_event (the sink: swr_event on the scratch table, same parser as the replay, no SSID or BSSID in any log line) and, when the scan ended,
+ * calls sweet_wlan_a80211_scan_done outside its en0 lock; that takes the handler's lock (the order the keep thread uses for every call into this file) and swr_scan_finish swaps the list in and posts SCAN_DONE. */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+extern int sweet_wlan_keep_scan_request(void);      /* bsd/dev/sweet_wlan.c (patch 0292): 0 accepted, else a positive errno (6 = scan off, 50 = link not UP, 16 = busy) */
+#else
+static int
+sweet_wlan_keep_scan_request(void)
+{
+	return 6;       /* a board without the G2 engine (sweet_wlan.c is SWEET only): no live scan */
+}
+#endif
+
+static int
+sw_scan_req(void *cx __unused)
+{
+	swr_tab_reset(&sw_scan_tab);
+	return sweet_wlan_keep_scan_request();
+}
+
+/* Attach point of the en0 path: puts the swsta_radio backend behind the A80211 handler on `ifp`. Returns 0 or a positive errno (GAP line, nothing installed). */
+int
+sweet_wlan_a80211_radio_attach(ifnet_t ifp)
+{
+	static const struct swr_link link = SWR_REPLAY_LINK(&sw_radio_replay);
+	static const struct swr_cb cb = { sw_a80211_log, sw_a80211_gap, NULL };
+
+	if (sw_a80211_mtx != NULL) {      /* before swr_init: a second attach must not wipe the live radio (review T-431f MEDIUM 1) */
+		printf("WIFI GAP: A80211 radio attach refused: already attached\n");
+		return EBUSY;
+	}
+	swr_init(&sw_radio, &link, &cb);
+	return sweet_wlan_a80211_attach(ifp, &sw_radio.radio, NULL);
+}
+
+/* 2026-11-11 (W-D3-weak-security, patch 0293): the join target's own record (IEs, rates, beacon, noise, SNR, chanspec) as the boot scan read it, handed over by the hook (sw_keep_capture) BEFORE the radio is attached. Stored here, outside sw_radio
+ * (swr_init wipes that), and applied by sweet_wlan_a80211_radio_attach_kept right after swr_kept_set, so Get 103 carries the real IEs from its first answer (Settings snapshots the record once). Not secret. */
+static struct {
+	uint8_t ok, bssid[6], ie_short, nrates, rates[16];
+	uint16_t chspec, beacon;
+	int16_t noise, snr;
+	uint32_t ie_len;
+	uint8_t ie[1024];
+} sw_kept_tgt;
+
+void
+sweet_wlan_a80211_kept_target(const uint8_t *bssid, const uint8_t *ie, uint32_t ie_len, uint32_t ie_short, uint32_t chspec, uint32_t beacon, int32_t noise, int32_t snr, const uint8_t *rates, uint32_t nrates)
+{
+	memset(&sw_kept_tgt, 0, sizeof sw_kept_tgt);
+	if (bssid == NULL || ie_len > sizeof sw_kept_tgt.ie || nrates > sizeof sw_kept_tgt.rates) {
+		printf("WIFI GAP: A80211 kept target record refused (no BSSID or too long), Get 103 will carry no IEs\n");
+		return;
+	}
+	memcpy(sw_kept_tgt.bssid, bssid, 6);
+	if (ie_len != 0 && ie != NULL) {
+		memcpy(sw_kept_tgt.ie, ie, ie_len);
+		sw_kept_tgt.ie_len = ie_len;
+	}
+	if (nrates != 0 && rates != NULL) {
+		memcpy(sw_kept_tgt.rates, rates, nrates);
+		sw_kept_tgt.nrates = (uint8_t)nrates;
+	}
+	sw_kept_tgt.ie_short = (uint8_t)ie_short;
+	sw_kept_tgt.chspec = (uint16_t)chspec; sw_kept_tgt.beacon = (uint16_t)beacon;
+	sw_kept_tgt.noise = (int16_t)noise; sw_kept_tgt.snr = (int16_t)snr;
+	sw_kept_tgt.ok = 1;
+}
+
+/* W-UI (sprint 2026-11-08, xnu patch 0268 keep mode): the same attach for the case that the boot run's link is still up. `ssid`, `bssid`, `channel`, `rssi` are what the FIRMWARE reported after L26
+ * (sweet_wlan_l25_hs.h swl25_live, copied by the caller before the engine record is reused); `ok` says which were read (1 ssid, 2 bssid, 4 channel, 8 rssi). Read once, not refreshed (a GAP says so). The radio then answers joined (sweet_wlan_radio.h swr_kept_set), the station is told so (ASSOC_DONE -> kev 9, 2, 3, 4)
+ * once the handler is installed. Prints the install line of sweet_wlan_a80211_attach and `SWEET WLAN: A80211 kept link announced` on success; any refusal is a WIFI GAP and nothing is announced. Returns 0 or a positive errno. */
+int
+sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t ssid_len, const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok)
+{
+	static const struct swr_link link = SWR_REPLAY_LINK(&sw_radio_replay);
+	static const struct swr_cb cb = { sw_a80211_log, sw_a80211_gap, NULL };
+	int rc;
+
+	if (sw_a80211_mtx != NULL) {
+		printf("WIFI GAP: A80211 radio attach refused: already attached\n");
+		return EBUSY;
+	}
+	swr_init(&sw_radio, &link, &cb);
+	swr_init(&sw_scan_tab, NULL, &cb);      /* patch 0292: the scratch table of the live scan; its gap lines (a record dropped, a bad event) print through the same callbacks */
+	swr_ascan_set(&sw_radio, sw_scan_req, NULL);      /* patch 0292: in keep mode Set 10 scans live; the replay link above is the fallback when the live scan is off */
+	(void)swr_kept_set(&sw_radio, ssid, ssid_len, bssid, channel, rssi, ok);      /* before the handler: swsta_init reads the power flag (on) */
+	if (sw_kept_tgt.ok) {      /* patch 0293: the join target's record, so that the very first Get 103 carries its IEs */
+		(void)swr_kept_target(&sw_radio, sw_kept_tgt.bssid, sw_kept_tgt.ie, sw_kept_tgt.ie_len, sw_kept_tgt.ie_short, sw_kept_tgt.chspec, sw_kept_tgt.beacon, sw_kept_tgt.noise, sw_kept_tgt.snr, sw_kept_tgt.rates, sw_kept_tgt.nrates);
+		memset(&sw_kept_tgt, 0, sizeof sw_kept_tgt);
+	} else {
+		swr_gap(&sw_radio, "no kept target record was handed over: Get 103 carries no IEs, Settings will show Weak Security");
+	}
+	if (!sw_radio.kept.joined) {
+		printf("WIFI GAP: A80211 kept attach: the boot link is unknown, the radio answers not joined\n");
+	}
+	rc = sweet_wlan_a80211_attach(ifp, &sw_radio.radio, NULL);
+	if (rc == 0 && swr_kept_announce(&sw_radio)) {
+		printf("SWEET WLAN: A80211 kept link announced on %s (Get 1/9/4/16/103/21 answer joined, join of the same SSID answers success)\n", if_name(ifp));
+	}
+	return rc;
+}
+
+/* The sink of the keep thread's ESCAN_RESULT events (sweet_wlan_g2.h swg_ke_escan): called with the en0 lock held, never with the handler's lock, from the keep thread only. status, the 12 B wl_escan_result header and the first record bytes, as swr_event wants them. */
+void
+sweet_wlan_a80211_scan_event(uint32_t status, const uint8_t *res, uint32_t len)
+{
+	swr_event(&sw_scan_tab, status, res, len);
+}
+
+/* The keep thread's live scan ended (kind SWR_SCAN_*, how long, ESCAN_RESULT events of ours): swap the collected list in and post SCAN_DONE. Outside the en0 lock. 0 = delivered, EINVAL = refused (GAP printed) */
+int
+sweet_wlan_a80211_scan_done(uint32_t kind, uint32_t ms, uint32_t ev)
+{
+	int r;
+
+	if (sw_a80211_mtx == NULL) {
+		printf("WIFI GAP: A80211 live scan done: no radio attached, iOS is not told\n");
+		return EINVAL;
+	}
+	lck_mtx_lock(sw_a80211_mtx);
+	r = swr_scan_finish(&sw_radio, &sw_scan_tab, kind, ms, ev);
+	lck_mtx_unlock(sw_a80211_mtx);
+	return r ? 0 : EINVAL;
+}
+
+/* Part A (sprint-wifi 2026-11-09, xnu patch 0273 keep thread): the firmware's current RSSI for the kept link, taken under the handler's lock (the ioctl path reads it there). 0 = taken, EINVAL = refused (GAP) */
+int
+sweet_wlan_a80211_kept_rssi(int32_t rssi)
+{
+	int ok;
+
+	if (sw_a80211_mtx == NULL) {
+		printf("WIFI GAP: A80211 kept RSSI refresh: no radio attached\n");
+		return EINVAL;
+	}
+	lck_mtx_lock(sw_a80211_mtx);
+	ok = swr_kept_rssi(&sw_radio, rssi);
+	lck_mtx_unlock(sw_a80211_mtx);
+	return ok ? 0 : EINVAL;
+}
+
+/* patch 0281 (W-D6 boot A, called by the keep thread outside the en0 lock): the keep thread's link-loss detector says the AP link is DOWN. Under the handler's lock (the ioctl path holds it when it reads the radio): swr_kept_clear clears kept.joined
+ * (Get 103 then answers not joined) and fires SWSTA_REV_LINK_DOWN (wifid gets LINK_CHANGED with isLinkDown = 1). `up` != 0 is refused: the UP side has its own call, sweet_wlan_a80211_kept_up (patch 0282), because it carries the values the firmware reported.
+ * No firmware command, no bus access. 0 = done, EINVAL = refused or nothing to clear (GAP printed) */
+int
+sweet_wlan_a80211_kept_link(int up)
+{
+	int ok;
+
+	if (up != 0) {
+		printf("WIFI GAP: A80211 kept link: UP goes through sweet_wlan_a80211_kept_up, not posted\n");
+		return EINVAL;
+	}
+	if (sw_a80211_mtx == NULL) {
+		printf("WIFI GAP: A80211 kept link DOWN: no radio attached, iOS is not told\n");
+		return EINVAL;
+	}
+	lck_mtx_lock(sw_a80211_mtx);
+	ok = swr_kept_clear(&sw_radio, 1);
+	lck_mtx_unlock(sw_a80211_mtx);
+	if (!ok) {
+		printf("WIFI GAP: A80211 kept link DOWN: the radio was not kept-joined or is already down, nothing posted\n");
+	}
+	return ok ? 0 : EINVAL;
+}
+
+/* patch 0282 (W-D6 boot B, called by the keep thread outside the en0 lock): the re-join is done. Under the handler's lock: swr_kept_up stores the BSSID / channel / RSSI the firmware reported (ok bits as swl25h.live_ok), sets kept.joined and fires SWSTA_REV_ASSOC_DONE result 0
+ * (kev 9, 2, 3, 4: LINK_CHANGED isLinkDown 0). No firmware command, no bus access. 0 = done, EINVAL = refused (GAP printed) */
+int
+sweet_wlan_a80211_kept_up(const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok)
+{
+	int r;
+
+	if (sw_a80211_mtx == NULL) {
+		printf("WIFI GAP: A80211 kept link UP: no radio attached, iOS is not told\n");
+		return EINVAL;
+	}
+	lck_mtx_lock(sw_a80211_mtx);
+	r = swr_kept_up(&sw_radio, bssid, channel, rssi, ok);
+	lck_mtx_unlock(sw_a80211_mtx);
+	if (!r) {
+		printf("WIFI GAP: A80211 kept link UP: refused by the radio (see the line above), nothing posted\n");
+	}
+	return r ? 0 : EINVAL;
+}
+
+void
+sweet_wlan_a80211_summary(void)
+{
+	swr_summary(&sw_radio);
+	swsta_summary(&sw_a80211.sta);
+	printf("SWEET WLAN: A80211 glue reqs=%u faults=%u big=%u bad=%u chained=%u ev_posted=%u ev_failed=%u\n", sw_a80211.reqs, sw_a80211.faults,
+	    sw_a80211.big, sw_a80211.bad, sw_a80211.chained, sw_a80211.ev_posted, sw_a80211.ev_failed);
+}

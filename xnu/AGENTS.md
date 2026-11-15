@@ -8,6 +8,6 @@ Numbered patches applied in order to Apple's open-source xnu-8796 by CI (`.githu
 - The kernel runs on cores without PAC and without SHA3/SVE: compile risky files with `clang optimize off` if the
   vectoriser emits instructions gs101 lacks (seen on hardware with patch 0081).
 - Drivers are polled and single-slot; keep DMA buffers physically contiguous and cache-maintained.
-- A new patch is not done until CI is green and a device boot result is recorded in the PR / handoff notes.
+- A new patch is not done until it builds and a device boot result (run label) is recorded in the super repo's docs/sprint log.
 
-- Coding rules: `docs/CODING-RULES.md` (CR-xx ids; each names its check). Read the rules for this area before editing; `tools/check-rules.py` enforces the lint ones in the gate.
+- Coding rules: see `shim/AGENTS.md`.

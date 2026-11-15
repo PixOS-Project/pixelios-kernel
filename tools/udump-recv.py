@@ -127,7 +127,10 @@ def _read_stripped(path):
     try:
         with open(path, "r") as f:
             return f.read().strip()
-    except OSError:
+    except FileNotFoundError:   # interface directories (1-1:1.0) have no idVendor/idProduct: the normal "not this device"   # lint-silent: expected interface directories have no idVendor: not this device
+        return None
+    except OSError as _err:
+        print(f"udump-recv GAP: OSError ignored in _read_stripped(): {_err}", file=sys.stderr)
         return None
 
 
@@ -144,7 +147,7 @@ def find_tty_node(dev_dir):
 def scan_once(sysfs):
     try:
         entries = sorted(os.listdir(sysfs))
-    except OSError:
+    except OSError:   # lint-silent: expected the sysfs directory is absent (no device): None means not present
         return None
     for name in entries:
         dev = os.path.join(sysfs, name)

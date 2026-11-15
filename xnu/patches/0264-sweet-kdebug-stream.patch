@@ -1,0 +1,319 @@
+SWEET kdebug stream (patch 0264, sprint-gpu 2026-11-08, R0 log only, no register or memory write outside the patch's own statics): boot-arg sweetkdbg=N (N ms, clamped 10..2000, default off: no thread, nothing printed) starts a kernel thread (bsd/dev/sweet_kdbg.c, sweet_kdbg_start next to sweet_pcsamp_start in sweet_ufs, bsd/conf/files) that every N ms drains XNU's own kdebug buffers (boot-arg trace=N [trace_wrap=1] [trace_typefilter=...]) through sweet_kdbg_drain (bsd/kern/kdebug.c: the KERN_KDREADTR merge and storage-unit release, with a kernel-address memcpy instead of copyout while sweet_kdbg_kernel_sink is set under ktrace_lock) and prints 'SWEET KDBG: <base64 of 1..2 raw 64-byte kd_buf records>' lines onto the USB UDP log, once per second 'SWEET KDBG: on records R lost L abs A ns T drained D lines N errs E', and 'SWEET KDBG GAP: ...' for every failure (kdebug not enabled once). Host: tools/kdbg2perfetto. Re-arm (nav27: tracing stopped ~10 s after boot): when the buffers exist and tracing is off, sweet_kdbg_rearm reports why (live flags; pid of the last kernel_debug_disable caller) and switches it back on with wrapping; 'SWEET KDBG GAP: tracing was off (...), re-armed' per re-arm (first 50), 'rearms N' in the summary.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1513eb7..818ef34 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_thrcpu.c			standard
+ bsd/dev/sweet_surfcpu.c		standard
+ bsd/dev/sweet_thrwait.c		standard
+ bsd/dev/sweet_pcsamp.c		standard
++bsd/dev/sweet_kdbg.c		standard
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_wlan_en0.c			standard
+diff --git a/bsd/dev/sweet_kdbg.c b/bsd/dev/sweet_kdbg.c
+new file mode 100644
+index 0000000..4710953
+--- /dev/null
++++ b/bsd/dev/sweet_kdbg.c
+@@ -0,0 +1,182 @@
++/*
++ * SWEET kdebug stream (patch 0264, sprint-gpu 2026-11-08, boot-arg sweetkdbg=N, default off: no thread, nothing printed). R0: log only, no register writes.
++ *
++ * XNU's own kdebug trace (the Instruments / ktrace event system; started at boot by boot-arg trace=<events> [trace_wrap=1] [trace_typefilter=<desc>],
++ * bsd/kern/kdebug_common.c:46,65) is drained every N ms (N = boot-arg, clamped 10..2000) from this kernel thread through sweet_kdbg_drain
++ * (bsd/kern/kdebug.c, the same merge + storage-unit release as the KERN_KDREADTR read) and printed as text so it rides the USB UDP log (patch 0075):
++ *   SWEET KDBG: <base64 of 1..2 raw 64-byte kd_buf records>                    (bsd/sys/kdebug_private.h, arm64 layout; <= 184 chars per line)
++ *   SWEET KDBG: on records R lost L abs A ns T drained D lines N errs E        (once per second; R = records in the last second, L = TRACE_LOST_EVENTS markers
++ *                                                                               in the last second, A / T = mach_absolute_time ticks / ns to map kd timestamps)
++ *   SWEET KDBG GAP: ...                                                        (every failure; kdebug not enabled once; drain errors at most once per second)
++ * Host: tools/kdbg2perfetto. Single thread, static buffers, printf only from this thread.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kdebug.h>
++#include <sys/kdebug_private.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
++
++extern int sweet_kdbg_drain(void *out, size_t *number, unsigned int *enabled);   /* bsd/kern/kdebug.c (patch 0264) */
++extern int sweet_kdbg_rearm(int *dis_pid, uint32_t *dis_n, uint32_t *live_flags);  /* bsd/kern/kdebug.c (patch 0264) */
++extern void sweet_kdbg_start(void);
++
++#define KDS_MIN_MS     10
++#define KDS_MAX_MS     2000
++#define KDS_READ_RECS  128                 /* records per drain call (8 KiB) */
++#define KDS_LINE_RECS  2                   /* records per printed line (the USB log cuts lines at ~260 chars: observed nav24) */
++#define KDS_MAX_CALLS  32                  /* drain calls per period, then the next period continues */
++
++_Static_assert(sizeof(kd_buf) == 64, "kd_buf is 64 bytes on arm64");
++
++static kd_buf kds_recs[KDS_READ_RECS];
++static char kds_line[((KDS_LINE_RECS * 64 + 2) / 3) * 4 + 1];
++static uint32_t kds_period_ms;
++
++static const char kds_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static void
++kds_encode(const uint8_t *in, size_t n, char *out)
++{
++	size_t o = 0;
++
++	for (size_t i = 0; i < n; i += 3) {
++		uint32_t v = (uint32_t)in[i] << 16;
++		size_t rem = n - i;
++
++		if (rem > 1) {
++			v |= (uint32_t)in[i + 1] << 8;
++		}
++		if (rem > 2) {
++			v |= in[i + 2];
++		}
++		out[o++] = kds_b64[(v >> 18) & 63];
++		out[o++] = kds_b64[(v >> 12) & 63];
++		out[o++] = rem > 1 ? kds_b64[(v >> 6) & 63] : '=';
++		out[o++] = rem > 2 ? kds_b64[v & 63] : '=';
++	}
++	out[o] = '\0';
++}
++
++static void
++sweet_kdbg_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t last_sum = 0, last_err = 0, recs = 0, lost = 0, lines = 0, errs = 0, drained = 0, filt = 0, rearms = 0;
++	int gap_said = 0;
++
++	for (;;) {
++		uint64_t now_abs, now_ns;
++		unsigned int enabled = 0;
++
++		delay_for_interval(kds_period_ms, 1000 * 1000);
++		for (int call = 0; call < KDS_MAX_CALLS; call++) {
++			size_t n = sizeof(kds_recs);
++			int err = sweet_kdbg_drain(kds_recs, &n, &enabled);
++
++			if (err != 0) {
++				errs++;
++				now_abs = mach_absolute_time();
++				absolutetime_to_nanoseconds(now_abs, &now_ns);
++				if (!enabled && !gap_said) {
++					gap_said = 1;
++					printf("SWEET KDBG GAP: kdebug not enabled (boot-arg trace=), drain error %d\n", err);
++				} else if (now_ns - last_err >= 1000000000ULL) {
++					last_err = now_ns;
++					printf("SWEET KDBG GAP: drain error %d (kdebug_enable %u, errs %llu)\n", err, enabled, errs);
++				}
++				break;
++			}
++			if (!enabled) {
++				int dpid = -1;
++				uint32_t dn = 0, lf = 0;
++
++				if (sweet_kdbg_rearm(&dpid, &dn, &lf)) {
++					rearms++;
++					if (rearms <= 50) {
++						printf("SWEET KDBG GAP: tracing was off (%s; last kernel_debug_disable by pid %d, %u calls; live flags 0x%x), re-armed with wrapping (re-arm %llu)\n",
++						    (lf & 0x8u) ? "storage full with KDBG_WRAPPED (no-wrap stop)" : "switched off", dpid, dn, lf, rearms);
++					}
++				} else if (!gap_said) {
++					gap_said = 1;
++					printf("SWEET KDBG GAP: kdebug not enabled (boot-arg trace=)\n");
++				}
++			}
++			if (n == 0) {
++				break;
++			}
++			/* n = records (kernel_debug_read counts records) */
++			size_t n_read = n;
++			/* sprint-gpu: in the scheduler subclass (class 1 / DBG_MACH_SCHED 0x40) keep only MACH_SCHED (0x0, context switch) and
++			 * MACH_MAKE_RUNNABLE (0x6, wakeup) (bsd/sys/kdebug.h:200,206); THREAD_SELECT / DISPATCH / CHOOSE_PROCESSOR were half of nav25's
++			 * records and the USB log delivered only 21% of the lines. Filtered records are counted (filt), never silent. */
++			{
++				size_t k = 0;
++
++				for (size_t i = 0; i < n; i++) {
++					uint32_t d = kds_recs[i].debugid;
++
++					if ((d >> 24) == 1 && ((d >> 16) & 0xff) == 0x40 && ((d >> 2) & 0x3fff) != 0x0 && ((d >> 2) & 0x3fff) != 0x6) {
++						filt++;
++						continue;
++					}
++					kds_recs[k++] = kds_recs[i];
++				}
++				drained += n;
++				n = k;
++			}
++			for (size_t i = 0; i < n; i += KDS_LINE_RECS) {
++				size_t m = n - i < KDS_LINE_RECS ? n - i : KDS_LINE_RECS;
++
++				kds_encode((const uint8_t *)&kds_recs[i], m * sizeof(kd_buf), kds_line);
++				printf("SWEET KDBG: %s\n", kds_line);
++				lines++;
++			}
++			for (size_t i = 0; i < n; i++) {
++				if (kds_recs[i].debugid == TRACE_LOST_EVENTS) {
++					lost++;
++				}
++			}
++			recs += n;
++			if (n_read < KDS_READ_RECS) {
++				break;
++			}
++		}
++		now_abs = mach_absolute_time();
++		absolutetime_to_nanoseconds(now_abs, &now_ns);
++		if (now_ns - last_sum >= 1000000000ULL) {
++			last_sum = now_ns;
++			printf("SWEET KDBG: on records %llu lost %llu abs %llu ns %llu drained %llu lines %llu errs %llu filt %llu rearms %llu\n",
++			    recs, lost, now_abs, now_ns, drained, lines, errs, filt, rearms);
++			recs = 0;
++			lost = 0;
++		}
++	}
++}
++
++void
++sweet_kdbg_start(void)
++{
++	int v = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetkdbg", &v, sizeof(v)) || v == 0) {
++		return;
++	}
++	if (v < 0) {
++		printf("SWEET KDBG GAP: sweetkdbg=%d ignored (a period in ms, %d..%d, is needed)\n", v, KDS_MIN_MS, KDS_MAX_MS);
++		return;
++	}
++	kds_period_ms = (uint32_t)v < KDS_MIN_MS ? KDS_MIN_MS : ((uint32_t)v > KDS_MAX_MS ? KDS_MAX_MS : (uint32_t)v);
++	if (kds_period_ms != (uint32_t)v) {
++		printf("SWEET KDBG: sweetkdbg=%d clamped to %u ms (%d..%d)\n", v, kds_period_ms, KDS_MIN_MS, KDS_MAX_MS);
++	}
++	printf("SWEET KDBG: period %u ms, %d records per line, kd_buf %d bytes\n", kds_period_ms, KDS_LINE_RECS, (int)sizeof(kd_buf));
++	if (kernel_thread_start(sweet_kdbg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET KDBG GAP: unavailable (kernel_thread_start failed)\n");
++	}
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index bf2c5d8..bd798fd 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_thrcpu_start(void);   /* patch 0187, bsd/dev/sweet_thrcpu.c */
+ extern void sweet_surfcpu_start(void);  /* patch 0194, bsd/dev/sweet_surfcpu.c */
+ extern void sweet_thrwait_start(void);  /* patch 0249, bsd/dev/sweet_thrwait.c */
+ extern void sweet_pcsamp_start(void);   /* patch 0263, bsd/dev/sweet_pcsamp.c */
++extern void sweet_kdbg_start(void);     /* patch 0264, bsd/dev/sweet_kdbg.c */
+ extern void sweet_cpustat_start(void);
+ extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+ /* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+@@ -790,6 +791,7 @@ sweet_ufs_init(void)
+ 	sweet_surfcpu_start();        /* no-op without boot-arg sweetsurfcpu=1 / sweetthrsample= */
+ 	sweet_thrwait_start();        /* no-op without boot-arg sweetthrwait=N */
+ 	sweet_pcsamp_start();         /* no-op without boot-arg sweetpcsamp=N */
++	sweet_kdbg_start();           /* no-op without boot-arg sweetkdbg=N */
+ 	sweet_cpustat_start();
+ 	sweet_el2_start();
+ 	sweet_keys_gs101_start();
+diff --git a/bsd/kern/kdebug.c b/bsd/kern/kdebug.c
+index 7417bf0..d3de940 100644
+--- a/bsd/kern/kdebug.c
++++ b/bsd/kern/kdebug.c
+@@ -259,6 +259,9 @@ extern void IOSleep(int);
+ 
+ unsigned int kdebug_enable = 0;
+ 
++/* SWEET patch 0264 (bsd/dev/sweet_kdbg.c): set only inside sweet_kdbg_drain, makes the read path copy to a kernel address instead of copyout */
++static int sweet_kdbg_kernel_sink;
++
+ // A static buffer to record events prior to the start of regular logging.
+ 
+ #define KD_EARLY_BUFFER_SIZE (16 * 1024)
+@@ -934,10 +937,16 @@ kernel_debug_early_end(void)
+ 	kernel_debug_string_early("early trace done");
+ }
+ 
++/* SWEET patch 0264: who switched tracing off last (pid of the current process at kernel_debug_disable), read by sweet_kdbg_drain */
++static volatile int sweet_kdbg_dis_pid = -1;
++static volatile uint32_t sweet_kdbg_dis_n;
++
+ void
+ kernel_debug_disable(void)
+ {
+ 	if (kdebug_enable) {
++		sweet_kdbg_dis_pid = proc_selfpid();
++		sweet_kdbg_dis_n++;
+ 		kdbg_set_tracing_enabled(false, 0);
+ 		kdbg_wakeup();
+ 	}
+@@ -2327,6 +2336,9 @@ kernel_debug_trace_write_to_file(user_addr_t *buffer, size_t *number,
+ 
+ 			RAW_file_written = 0;
+ 		}
++	} else if (sweet_kdbg_kernel_sink) {
++		memcpy((void *)*buffer, kd_buffer_trace.kdcopybuf, tempbuf_number * sizeof(kd_buf));
++		*buffer += (tempbuf_number * sizeof(kd_buf));
+ 	} else {
+ 		error = copyout(kd_buffer_trace.kdcopybuf, *buffer, tempbuf_number * sizeof(kd_buf));
+ 		*buffer += (tempbuf_number * sizeof(kd_buf));
+@@ -2335,6 +2347,56 @@ kernel_debug_trace_write_to_file(user_addr_t *buffer, size_t *number,
+ 	return error;
+ }
+ 
++/*
++ * SWEET patch 0264: in-kernel drain of the trace buffers (same merge and storage-unit release as the sysctl read, KERN_KDREADTR path).
++ * out = kernel buffer, *number in = bytes of room, out = number of kd_buf records written. Returns 0 or an errno; *enabled = kdebug_enable.
++ */
++int sweet_kdbg_drain(void *out, size_t *number, unsigned int *enabled);
++int sweet_kdbg_rearm(int *dis_pid, uint32_t *dis_n, uint32_t *live_flags);
++
++int
++sweet_kdbg_drain(void *out, size_t *number, unsigned int *enabled)
++{
++	int error;
++
++	ktrace_lock();
++	*enabled = kdebug_enable;
++	if (!(kd_control_trace.kdc_flags & KDBG_BUFINIT)) {
++		*number = 0;
++		ktrace_unlock();
++		return ENXIO;
++	}
++	sweet_kdbg_kernel_sink = 1;
++	error = _read_merged_trace_events((user_addr_t)out, number, NULL, NULL, false);
++	sweet_kdbg_kernel_sink = 0;
++	ktrace_unlock();
++	return error;
++}
++
++/*
++ * SWEET patch 0264 (nav27: tracing stopped ~10 s after boot, 'records 0' for the rest of the run): when the buffers exist but tracing is off,
++ * report why (live flags: KDBG_WRAPPED|KDBG_NOWRAP = the storage-full stop of kdebug_common.c:293-299; otherwise kernel_debug_disable(), whose
++ * last caller's pid is kept) and switch it back on with wrapping (the same kdbg_set_tracing_enabled call as KERN_KDENABLE, kdebug.c sysctl path).
++ * Returns 1 when it re-armed, 0 when tracing was on or the buffers are gone. The caller prints the GAP line.
++ */
++int
++sweet_kdbg_rearm(int *dis_pid, uint32_t *dis_n, uint32_t *live_flags)
++{
++	int r = 0;
++
++	ktrace_lock();
++	if ((kd_control_trace.kdc_flags & KDBG_BUFINIT) && !kdebug_enable) {
++		*dis_pid = sweet_kdbg_dis_pid;
++		*dis_n = sweet_kdbg_dis_n;
++		*live_flags = kd_control_trace.kdc_live_flags;
++		kd_control_trace.kdc_live_flags &= ~(KDBG_NOWRAP | KDBG_WRAPPED);
++		kdbg_set_tracing_enabled(true, KDEBUG_ENABLE_TRACE);
++		r = 1;
++	}
++	ktrace_unlock();
++	return r;
++}
++
+ #pragma mark - User space interface
+ 
+ static int

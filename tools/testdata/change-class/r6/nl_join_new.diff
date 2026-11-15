@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0301-sweet-log.patch b/xnu/patches/0301-sweet-log.patch
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/xnu/patches/0301-sweet-log.patch
+@@ -0,0 +1,9 @@
++diff --git a/x.c b/x.c
++--- a/x.c
+++++ b/x.c
++@@ -2,2 +2,3 @@ void f(void)
++ {
+++	printf("x"); //
++\ No newline at end of file
++ 	write32(a, 1);
++ }

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""panel2png: convert one patch-0276 panel readback (fcapctl panel FILE = live kern.sweetpanel, or a snap-NN.raw ring slot) to a PNG (ALL-ON T-23).
+
+  tools/panel2png RAW [OUT.png]      default OUT = RAW with .png
+  tools/panel2png --self-test
+
+Format [read xnu/patches/0276-sweet-fb-panel-readback.patch]: u32 'SPNL' magic, width, height, row bytes, ... header, then height rows of BGRA pixels.
+The live read has an 8 x u32 header (32 B), a ring slot 80 B (header + 48 B label, tools/fcap-screens.py). The pixel data is the LAST height*width*4
+bytes; the header length is printed and must be 32 or 80, anything else is a GAP and no PNG is written (exit 1).
+Last line: `RESULT: PASS panel2png RAW -> OUT WxH header=N presents=P swaps=S` | `RESULT: FAIL panel2png <why>`."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import os, struct, sys
+
+MAGIC = struct.unpack("<I", b"SPNL")[0]
+MAGIC_H = struct.unpack("<I", b"SPNH")[0]   # half-resolution ring slot (fcap captures) [obs]
+
+
+def convert(raw, out):
+    from PIL import Image
+    d = open(raw, "rb").read()
+    if len(d) < 32:
+        return "FAIL", "%s too short (%d B)" % (raw, len(d))
+    mg, w, h, rb, ox, oy, pres, sw = struct.unpack_from("<8I", d, 0)
+    if mg not in (MAGIC, MAGIC_H):
+        return "FAIL", "%s bad magic 0x%08x (want SPNL live / SPNH ring slot)" % (raw, mg)
+    px = w * h * 4
+    hdr = len(d) - px
+    if w == 0 or h == 0 or hdr not in (32, 80):
+        return "FAIL", "%s: %dx%d, %d B total -> header %d B (not 32/80), not converted (GAP)" % (raw, w, h, len(d), hdr)
+    Image.frombuffer("RGBA", (w, h), d[hdr:], "raw", "BGRA", 0, 1).convert("RGB").save(out)
+    return "PASS", "%s -> %s %dx%d header=%d presents=%d swaps=%d" % (raw, out, w, h, hdr, pres, sw)
+
+
+def self_test(tmp):
+    from PIL import Image
+    w, h = 4, 2
+    hdr = struct.pack("<8I", MAGIC, w, h, w * 4, 0, 0, 7, 9)
+    px = bytes([10, 20, 30, 255]) * (w * h)   # B G R A
+    cases, fails = [], 0
+    p = os.path.join(tmp, "t.raw"); open(p, "wb").write(hdr + px)
+    v, _ = convert(p, p + ".png")
+    ok = v == "PASS" and Image.open(p + ".png").getpixel((0, 0)) == (30, 20, 10)
+    cases.append(("live 32 B header, BGRA -> RGB", ok))
+    q = os.path.join(tmp, "s.raw"); open(q, "wb").write(hdr + b"lbl".ljust(48, b"\0") + px)
+    cases.append(("slot 80 B header", convert(q, q + ".png")[0] == "PASS"))
+    r = os.path.join(tmp, "b.raw"); open(r, "wb").write(hdr + px[:-4])
+    cases.append(("short pixel data refused", convert(r, r + ".png")[0] == "FAIL"))
+    for n, ok in cases:
+        fails += not ok
+        print("%s %s" % ("ok  " if ok else "FAIL", n))
+    print("RESULT: %s panel2png self-test cases=%d failed=%d" % ("PASS" if not fails else "FAIL", len(cases), fails))
+    return 1 if fails else 0
+
+
+def main(a):
+    if a[:1] == ["--self-test"]:
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            return self_test(t)
+    if len(a) not in (1, 2):
+        print("RESULT: FAIL panel2png bad arguments (usage: panel2png RAW [OUT.png])"); return 2
+    out = a[1] if len(a) == 2 else os.path.splitext(a[0])[0] + ".png"
+    try:
+        v, t = convert(a[0], out)
+    except OSError as e:
+        v, t = "FAIL", "%s: %s" % (a[0], e)
+    print("RESULT: %s panel2png %s" % (v, t))
+    return 0 if v == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

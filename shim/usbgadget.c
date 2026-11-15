@@ -69,6 +69,23 @@
 #define USBG_DCFG_DEVSPD_MASK	7u		/* 0071 patch (cleared with 7u) */
 #define USBG_DCFG_DEVADDR_MASK	(0x7fu << 3)	/* 0071 patch */
 #define USBG_DEVSPD_HS		0u	/* 0071 patch: speed bits cleared = HS */
+#ifdef USB_GADGET_SS
+/* SuperSpeed (build flag USB_GADGET_SS, port of xnu patch 0173; all field
+ * values are 0173's citations, Linux v6.12 drivers/usb/dwc3/core.h:113,
+ * 120,137,142,144,342,360,404,435-443,520-532, gadget.c:4105-4143, ep0.c):
+ * DCFG.DEVSPD [2:0] SUPERSPEED = 4, DSTS.CONNECTSPD [2:0] SUPERSPEED = 4
+ * (SUPERSPEED_PLUS = 5), GUSB2PHYCFG 0xc200, GUSB3PIPECTL 0xc2c0. */
+#define USBG_DEVSPD_SS		4u
+#define USBG_CONNSPD_SS		4u
+#define USBG_GUSB2PHYCFG	0xc200u	/* READ ONLY */
+#define USBG_GUSB3PIPECTL	0xc2c0u	/* READ ONLY */
+#define USBG_EP0_MPS_SS		512u	/* gadget.c:4105-4123 (0173) */
+#define USBG_BULK_MPS_SS	1024u	/* f_ecm.c:293-309 (0173); burst 0 */
+#define USBG_BULK_MPS_HS	512u
+/* Policy, not hardware (0173 UD_SS_WAIT_MS): not configured this long
+ * after RUN in SS mode -> restart once at high speed. */
+#define USBG_SS_WAIT_MS		10000u
+#endif
 
 #define USBG_DEVTEN_EVENTS	0x7u	/* 0071 patch: disc + reset + conndone */
 #define USBG_GEVNTSIZ_INTMASK	(1u << 31)	/* 0071 patch: polled */
@@ -115,6 +132,13 @@
 #define USBG_SETUP_LEN		8u	/* 0071 patch (setup TRB of 8 bytes) */
 #define USBG_EP0_DATA_CAP	512u	/* 0071 patch (UD_DATA 512 bytes) */
 #define USBG_EP0_MPS		64u	/* HS ep0 max packet; OUT TRB length is MPS-aligned (Linux ep0.c) */
+#ifdef USB_GADGET_SS
+/* ep0 OUT TRB at SS is 512 bytes (multiple of the SS ep0 max packet,
+ * ep0.c as 0173 notes); it lands in USBG_UD_DATA, which spans
+ * USBG_UD_DATA..+USBG_EP0_DATA_CAP (0x1100..0x1300) before USBG_UD_BULK_TRB. */
+_Static_assert(USBG_EP0_MPS_SS <= USBG_EP0_DATA_CAP,
+	       "SS ep0 OUT TRB must fit the ep0 data area");
+#endif
 #define USBG_PRTCAP_DEVICE	2u	/* GCTL bits 13:12 */
 #define USBG_BULK_MAX		4096u	/* one 4 KiB bulk buffer */
 #define USBG_N_BULK_TRB		4u	/* stage-2 task: 4-TRB bulk ring */
@@ -126,6 +150,8 @@
 #define USBG_CMD_TIMEOUT_MS	10u
 #define USBG_RUN_TIMEOUT_MS	500u
 
+_Static_assert(USBG_UD_DATA + USBG_EP0_DATA_CAP <= USBG_UD_BULK_TRB,
+	       "ep0 data area must end before the bulk TRB ring");
 _Static_assert((USBG_UD_EVT_SIZE & (USBG_UD_EVT_SIZE - 1)) == 0,
 	       "event buffer size must be a power of two");
 _Static_assert((USBG_N_BULK_TRB & (USBG_N_BULK_TRB - 1)) == 0,
@@ -152,6 +178,17 @@ static struct {
 	int bulk_busy;
 	unsigned bulk_trb;
 	uint32_t evt_printed;	/* one bit per device-event type shown */
+#ifdef USB_GADGET_SS
+	int ss_mode;		/* DCFG.DEVSPD = SuperSpeed in this session */
+	int ss_restarted;	/* the one HS restart was used */
+	int ss_restart_req;	/* set in the event handler, run from poll */
+	const char *ss_reason;	/* why the restart was requested */
+	int ss_confirmed;	/* a SS configuration reached bulk enable */
+	uint32_t ep0_mps;	/* 64, or 512 after a SS ConnectDone */
+	uint32_t bulk_mps;	/* bulk max packet last programmed, 0 = never */
+	uint32_t speed;		/* DSTS.CONNECTSPD at the last ConnectDone */
+	uint64_t ss_deadline;	/* ticks: RUN + USBG_SS_WAIT_MS */
+#endif
 } g;
 
 /* Sticky fault: prints once, then the gadget stays dead (fail closed). */
@@ -197,6 +234,54 @@ static int r32(uint32_t off, uint32_t *v)
 	return 0;
 }
 
+#ifdef USB_GADGET_SS
+/* Line builder (con_str is the only console symbol the audit allows). */
+static unsigned cat_str(char *b, unsigned p, unsigned cap, const char *t)
+{
+	while (*t && p + 1 < cap)
+		b[p++] = *t++;
+	b[p] = 0;
+	return p;
+}
+
+static unsigned cat_hex(char *b, unsigned p, unsigned cap, uint32_t v)
+{
+	int sh;
+
+	p = cat_str(b, p, cap, "0x");
+	for (sh = 28; sh >= 0; sh -= 4) {
+		if (p + 1 < cap)
+			b[p++] = "0123456789abcdef"[(v >> sh) & 0xfu];
+	}
+	b[p] = 0;
+	return p;
+}
+
+/* Read-only report (rule 8: shown, not guessed): the PHY/PIPE/DCFG/DSTS
+ * words before and after the soft reset. Reads only, no writes. */
+static int ss_report(const char *what)
+{
+	uint32_t p2, p3, dcfg, dsts;
+	char b[128];
+	unsigned p = 0;
+
+	if (r32(USBG_GUSB2PHYCFG, &p2) || r32(USBG_GUSB3PIPECTL, &p3) ||
+	    r32(USBG_DCFG, &dcfg) || r32(USBG_DSTS, &dsts))
+		return -1;
+	p = cat_str(b, p, sizeof(b), what);
+	p = cat_str(b, p, sizeof(b), " GUSB2PHYCFG=");
+	p = cat_hex(b, p, sizeof(b), p2);
+	p = cat_str(b, p, sizeof(b), " GUSB3PIPECTL=");
+	p = cat_hex(b, p, sizeof(b), p3);
+	p = cat_str(b, p, sizeof(b), " DCFG=");
+	p = cat_hex(b, p, sizeof(b), dcfg);
+	p = cat_str(b, p, sizeof(b), " DSTS=");
+	cat_hex(b, p, sizeof(b), dsts);	/* last field: cat_hex NUL-terminates b, the end index is not needed */
+	con_str("USB3:", b);
+	return 0;
+}
+#endif
+
 static uint64_t deadline_ms(unsigned ms)
 {
 	return g.hooks->ticks() + g.hooks->ticks_freq * ms / 1000u;
@@ -220,6 +305,7 @@ static int epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1,
 	    w32(USBG_DEPCMD(ep), cmd | USBG_DEPCMD_CMDACT))
 		return fault_set();
 	dl = deadline_ms(USBG_CMD_TIMEOUT_MS);
+	/* bounded: timed_out(dl), USBG_CMD_TIMEOUT_MS, below */
 	for (;;) {
 		uint32_t v;
 		if (r32(USBG_DEPCMD(ep), &v))
@@ -297,6 +383,22 @@ static int start_bulk_trb(uint32_t len)
 	return 0;
 }
 
+static void con_dec_l(const char *label, const char *head, uint32_t v);
+static void con_dec(const char *head, uint32_t v)
+{
+	con_dec_l("USB", head, v);
+}
+
+/* Current ep0 max packet: 64 (HS), 512 after a SuperSpeed ConnectDone. */
+static uint32_t ep0_mps(void)
+{
+#ifdef USB_GADGET_SS
+	return g.ep0_mps;
+#else
+	return USBG_EP0_MPS;
+#endif
+}
+
 /* Prime the setup TRB (0071 patch ud_start_setup). */
 static int arm_setup(void)
 {
@@ -324,21 +426,35 @@ static int ep0_stall(void)
  * stage (stage-2 task (c): DEPCFG / transfer resource / DALEPENA). */
 static int enable_ep1(void)
 {
+	uint32_t bulk_mps = 512;
+
 	if (g.ep1_on)
 		return 0;
+#ifdef USB_GADGET_SS
+	/* 1024 with burst 0 at SuperSpeed (0173: gadget.c:586-592, f_ecm.c),
+	 * 512 at HS. */
+	bulk_mps = g.proto.ss ? USBG_BULK_MPS_SS : USBG_BULK_MPS_HS;
+#endif
 	/* Linux dwc3 (ep0.c:663, gadget.c:553-569): DEPSTARTCFG with XferRscIdx
 	 * 2 (DEPCMD bits 31:16) once per configuration, issued through ep0
 	 * (physical ep 0), never through the endpoint being configured. */
 	if (epcmd(USBG_EP0OUT, USBG_DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
 	    epcmd(USBG_EP1IN, USBG_DEPCMD_SETEPCONFIG,
 		  USBG_DEPCFG_TYPE_BULK | USBG_DEPCFG_FIFO(1) |
-		  USBG_DEPCFG_MPS(512),
+		  USBG_DEPCFG_MPS(bulk_mps),
 		  USBG_DEPCFG_P1_DONE | USBG_DEPCFG_P1_NOTREADY |
 		  USBG_DEPCFG_P1_EPNUM(USBG_EP1IN), 0) ||
 	    epcmd(USBG_EP1IN, USBG_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
 	    w32(USBG_DALEPENA, USBG_DALEPENA_EP0 | (1u << USBG_EP1IN)))
 		return -1;
 	g.ep1_on = 1;
+#ifdef USB_GADGET_SS
+	g.bulk_mps = bulk_mps;
+	g.ss_confirmed = 1;	/* configured (SS or HS): no fallback needed */
+	if (g.proto.ss) {
+		con_dec_l("USB3:", "bulk max packet ", bulk_mps);
+	}
+#endif
 	return 0;
 }
 
@@ -357,6 +473,34 @@ static int ep0_handle_setup(void)
 	for (i = 0; i < USBG_SETUP_LEN; i++)
 		setup[i] = s[i];
 	rc = usbproto_setup(setup, &g.proto, &data, &len);
+#ifdef USB_GADGET_SS
+	if (rc == USBPROTO_STALL && g.proto.ss) {
+		/* Rule 8: every request refused at SuperSpeed is shown. */
+		char b[96];
+		unsigned p = cat_str(b, 0, sizeof(b),
+				     "GAP: ep0 request stalled bmRT/bReq=");
+		p = cat_hex(b, p, sizeof(b),
+			    ((uint32_t)setup[0] << 8) | setup[1]);
+		p = cat_str(b, p, sizeof(b), " wValue=");
+		cat_hex(b, p, sizeof(b),
+			(uint32_t)(setup[2] | ((uint32_t)setup[3] << 8)));
+		con_str("USB3", b);
+	}
+	if (rc == USBPROTO_OK_SET_SEL) {
+		/* ep0.c SET_SEL (0173): 6 data bytes accepted, not programmed
+		 * (no DGCMD periodic parameters; U1/U2 stay off). */
+		con_str("USB3", "GAP: SET_SEL acknowledged, not programmed");
+		g.ep0_state = EP0_DATA;
+		g.ep0_data_out = 2;	/* OUT stage, bytes discarded */
+		return start_ep_trb(USBG_EP0OUT, ep0_mps(), USBG_TRBCTL_DATA);
+	}
+	if (rc == USBPROTO_OK_ISOCH_DELAY) {
+		con_dec_l("USB3:", "SET_ISOCH_DELAY ns=",
+			(uint32_t)(setup[2] | ((uint32_t)setup[3] << 8)));
+		g.ep0_state = EP0_WAIT_STATUS2;
+		return 0;
+	}
+#endif
 	if (rc == USBPROTO_STALL)
 		return ep0_stall();
 	if (rc == USBPROTO_OK_DATA_IN && len == 0)
@@ -395,13 +539,13 @@ static int ep0_handle_setup(void)
 		/* Linux ep0.c:1009-1036 bounces non-MPS-aligned OUT lengths up to
 		 * a multiple of maxpacket: use a full-MPS TRB, copy the real
 		 * (<= 7) bytes on completion. */
-		return start_ep_trb(USBG_EP0OUT, USBG_EP0_MPS, USBG_TRBCTL_DATA);
+		return start_ep_trb(USBG_EP0OUT, ep0_mps(), USBG_TRBCTL_DATA);
 	}
 	return ep0_stall();
 }
 
 /* Decimal print helper (no libc): "EVT conndone speed=13". */
-static void con_dec(const char *head, uint32_t v)
+static void con_dec_l(const char *label, const char *head, uint32_t v)
 {
 	char buf[32], tmp[10];
 	unsigned p = 0, k = 0;
@@ -415,7 +559,7 @@ static void con_dec(const char *head, uint32_t v)
 	while (k && p + 1 < sizeof(buf))
 		buf[p++] = tmp[--k];
 	buf[p] = 0;
-	con_str("USB", buf);
+	con_str(label, buf);
 }
 
 /* Every distinct device event type is shown once per boot. */
@@ -466,18 +610,43 @@ static int handle_device_event(unsigned type)
 		uint32_t dsts;
 		if (r32(USBG_DSTS, &dsts))
 			return -1;
+		uint32_t mps = 64;
+#ifdef USB_GADGET_SS
+		/* 512 at SuperSpeed, 64 at HS/FS (gadget.c:4105-4143, 0173) */
+		if ((dsts & 7u) >= USBG_CONNSPD_SS)
+			mps = USBG_EP0_MPS_SS;
+		g.speed = dsts & 7u;
+		g.ep0_mps = mps;
+		g.proto.ss = mps == USBG_EP0_MPS_SS;
+		if (g.ss_mode && !g.ss_restarted && !g.ss_restart_req &&
+		    g.bulk_mps &&
+		    g.bulk_mps != (g.proto.ss ? USBG_BULK_MPS_SS :
+						USBG_BULK_MPS_HS)) {
+			/* contradicts the programmed bulk max packet; the
+			 * restart runs from usbgadget_poll after the ack */
+			g.ss_restart_req = 1;
+			g.ss_reason = "speed contradicts the programmed bulk max packet";
+		} else if (g.ss_restarted && g.bulk_mps &&
+			   g.bulk_mps != (g.proto.ss ? USBG_BULK_MPS_SS :
+						       USBG_BULK_MPS_HS)) {
+			con_str("USB3", "GAP: speed contradicts the bulk max packet, not restarted again");
+		}
+#endif
 		/* ep0 max packet 64 at high/full speed, modify action
 		 * (0071 patch connect-done path). */
 		if (epcmd(USBG_EP0OUT, USBG_DEPCMD_SETEPCONFIG,
-			  USBG_DEPCFG_MPS(64) | USBG_DEPCFG_MODIFY,
+			  USBG_DEPCFG_MPS(mps) | USBG_DEPCFG_MODIFY,
 			  USBG_DEPCFG_P1_DONE | USBG_DEPCFG_P1_NOTREADY,
 			  0) ||
 		    epcmd(USBG_EP0IN, USBG_DEPCMD_SETEPCONFIG,
-			  USBG_DEPCFG_MPS(64) | USBG_DEPCFG_MODIFY,
+			  USBG_DEPCFG_MPS(mps) | USBG_DEPCFG_MODIFY,
 			  USBG_DEPCFG_P1_DONE | USBG_DEPCFG_P1_NOTREADY |
 			  USBG_DEPCFG_P1_DIR_IN, 0))
 			return -1;
 		con_dec("EVT conndone speed=", dsts & 7u);	/* 0071 patch */
+#ifdef USB_GADGET_SS
+		con_dec_l("USB3:", "conndone speed=", dsts & 7u);
+#endif
 		return 0;
 	}
 	if (type == USBG_DEVEVT_DISCONNECT) {
@@ -514,7 +683,7 @@ static int handle_ep_event(unsigned ep, unsigned type, unsigned status)
 			volatile uint8_t *d = (volatile uint8_t *)
 					      (g.pool + USBG_UD_DATA);
 			unsigned i;
-			if (g.ep0_data_out)
+			if (g.ep0_data_out == 1)
 				for (i = 0; i < USBPROTO_LINE_CODING_LEN; i++)
 					g.proto.line_coding[i] = d[i];
 			g.ep0_state = EP0_WAIT_STATUS3;
@@ -565,6 +734,7 @@ static void stop_core(void)
 	    w32(USBG_DCTL, v & ~(USBG_DCTL_RUN_STOP | USBG_DCTL_ULSTCHNGREQ)))
 		return;
 	dl = deadline_ms(USBG_RUN_TIMEOUT_MS);
+	/* bounded: timed_out(dl), USBG_RUN_TIMEOUT_MS, is the loop condition */
 	while (!timed_out(dl)) {
 		if (r32(USBG_DSTS, &v) || (v & USBG_DSTS_DEVCTRLHLT))
 			return;
@@ -584,55 +754,26 @@ int usbgadget_faulted(void)
 	return g.fault;
 }
 
-int usbgadget_init(uintptr_t pool_pa, size_t pool_len,
-		   const struct usbgadget_hooks *hooks)
+/* Steps 1-6 of the bring-up: soft reset .. RUN. Called by usbgadget_init
+ * (ss = USB_GADGET_SS build) and once more at HS by the fallback. */
+static int hw_start(int ss)
 {
 	uint32_t v;
 	uint64_t dl;
 	int cleared = 0, running = 0;
 
-	g.inited = 0;
-	g.fault = 0;
-	g.evt_printed = 0;
-	g.hooks = hooks;
-	g.pool = pool_pa;
-	g.pool_pa = pool_pa;
-	g.evt_pos = 0;
-	g.ep1_on = 0;
-	g.bulk_busy = 0;
-	g.bulk_trb = 0;
-	g.ep0_data_out = 0;
-	for (unsigned i = 0; i < 4; i++)
-		g.rsc[i] = g.active[i] = 0;
-	usbproto_init(&g.proto);
-
-	if (!hooks || !hooks->ticks || !hooks->ticks_freq) {
-		con_str("USB", "gadget: no time hooks");
+#ifndef USB_GADGET_SS
+	(void)ss;
+#else
+	if (ss_report(ss ? "before soft reset (SS)" :
+			  "before soft reset (HS restart)"))
 		return -1;
-	}
-	if (pool_len < USBG_POOL_MIN || (pool_pa & 0xFFFu) != 0) {
-		/* The caller validates the pool against the FDT; this is
-		 * only the size/alignment re-check. */
-		con_str("USB", "gadget: bad DMA pool");
-		return -1;
-	}
-
-	/* Bring-up order per the stage-2 task (b) = the 0071 patch's
-	 * sweet_usb_gadget_start, minus everything Qualcomm-specific. */
-
-	/* 0. Refuse unless the controller is in device role (read only; Linux
-	 * skips the soft reset in host role, core.c:332-333). */
-	if (r32(USBG_GCTL, &v))
-		return -1;
-	if (((v >> 12) & 3u) != USBG_PRTCAP_DEVICE) {
-		con_str("USB", "gadget: core not in device mode");
-		return -1;
-	}
-
-	/* 1. Soft reset of the device controller, <= 500 ms (0071). */
+#endif
+/* 1. Soft reset of the device controller, <= 500 ms (0071). */
 	if (w32(USBG_DCTL, USBG_DCTL_CSFTRST))
 		return -1;
 	dl = deadline_ms(USBG_RESET_TIMEOUT_MS);
+	/* bounded: timed_out(dl), USBG_RESET_TIMEOUT_MS, is the loop condition */
 	while (!timed_out(dl)) {
 		if (r32(USBG_DCTL, &v))
 			return -1;
@@ -648,18 +789,30 @@ int usbgadget_init(uintptr_t pool_pa, size_t pool_len,
 	/* Linux core.c:363-367 waits 50 ms after the clear on older DWC_usb31;
 	 * the revision here is unknown, so always wait (bounded, tick based). */
 	dl = deadline_ms(50u);
+	/* bounded: timed_out(dl), 50 ms, is the loop condition (a fixed wait) */
 	while (!timed_out(dl))
 		;
 
-	/* 2. High speed (speed bits cleared), address 0 (0071). */
-	if (r32(USBG_DCFG, &v) ||
-	    w32(USBG_DCFG, v & ~(USBG_DCFG_DEVSPD_MASK |
-				 USBG_DCFG_DEVADDR_MASK)))
+	/* 2. High speed (speed bits cleared), address 0 (0071). With
+	 * USB_GADGET_SS and ss: DEVSPD = SuperSpeed (4); NUMP and every other
+	 * DCFG bit stay as read (0173; Linux core.h DCFG fields above). */
+#ifdef USB_GADGET_SS
+	if (ss_report("after soft reset"))
+		return -1;
+#endif
+	if (r32(USBG_DCFG, &v))
+		return -1;
+	v &= ~(USBG_DCFG_DEVSPD_MASK | USBG_DCFG_DEVADDR_MASK);
+#ifdef USB_GADGET_SS
+	if (ss)
+		v |= USBG_DEVSPD_SS;
+#endif
+	if (w32(USBG_DCFG, v))
 		return -1;
 
 	/* 3. Event buffer 0 in our pool (0071). */
-	if (w32(USBG_GEVNTADRLO, (uint32_t)(pool_pa + USBG_UD_EVT)) ||
-	    w32(USBG_GEVNTADRHI, (uint32_t)((pool_pa + USBG_UD_EVT) >> 32)) ||
+	if (w32(USBG_GEVNTADRLO, (uint32_t)(g.pool_pa + USBG_UD_EVT)) ||
+	    w32(USBG_GEVNTADRHI, (uint32_t)((g.pool_pa + USBG_UD_EVT) >> 32)) ||
 	    w32(USBG_GEVNTSIZ, USBG_GEVNTSIZ_INTMASK | USBG_UD_EVT_SIZE))
 		return -1;
 	if (r32(USBG_GEVNTCOUNT, &v) || w32(USBG_GEVNTCOUNT, v & 0xffffu))
@@ -694,6 +847,7 @@ int usbgadget_init(uintptr_t pool_pa, size_t pool_len,
 	/* Observation only (0071 prints the same): did the core leave
 	 * halt? Not a failure - poll() simply never sees events. */
 	dl = deadline_ms(USBG_RUN_TIMEOUT_MS);
+	/* bounded: timed_out(dl), USBG_RUN_TIMEOUT_MS, is the loop condition */
 	while (!timed_out(dl)) {
 		if (r32(USBG_DSTS, &v)) {
 			stop_core();	/* RUN_STOP is set: do not leave it running */
@@ -706,14 +860,164 @@ int usbgadget_init(uintptr_t pool_pa, size_t pool_len,
 	}
 	con_str("USB", running ? "gadget: running" :
 				"gadget: RUN_STOP set, core still halted");
+#ifdef USB_GADGET_SS
+	g.ss_mode = ss;
+	g.ss_deadline = deadline_ms(USBG_SS_WAIT_MS);
+#endif
 	g.inited = 1;
 	return 0;
+}
+
+/* Per-session software state (also run before the HS restart). */
+static void session_reset(void)
+{
+	g.evt_printed = 0;
+	g.evt_pos = 0;
+	g.ep0_state = EP0_SETUP;
+	g.ep1_on = 0;
+	g.bulk_busy = 0;
+	g.bulk_trb = 0;
+	g.ep0_data_out = 0;
+	for (unsigned i = 0; i < 4; i++)
+		g.rsc[i] = g.active[i] = 0;
+	usbproto_init(&g.proto);
+#ifdef USB_GADGET_SS
+	g.ss_mode = 0;
+	g.ss_restart_req = 0;
+	g.ss_confirmed = 0;
+	g.ep0_mps = USBG_EP0_MPS;
+	g.bulk_mps = 0;
+	g.speed = 0;
+#endif
+}
+
+#ifdef USB_GADGET_SS
+/* One restart at high speed, run from usbgadget_poll only (never from the
+ * event handler: the event buffer is rewritten and the core soft reset;
+ * 0173 notes the same). */
+/* Restart-specific stop (Linux v6.6 gadget.c:2682-2689: events in the
+ * buffer must be acknowledged before the core can halt; 0173 ud_restart
+ * does the same with a 1000 ms wait, ABL 0x24124-0x2414c). Acked events are
+ * dropped, not dispatched. Rule 8: a timeout and dropped events are logged. */
+static void stop_core_acking(void)
+{
+	uint32_t v, c, dropped = 0;
+	uint64_t dl;
+
+	if (r32(USBG_DCTL, &v) ||
+	    w32(USBG_DCTL, v & ~(USBG_DCTL_RUN_STOP | USBG_DCTL_ULSTCHNGREQ)))
+		return;
+	dl = deadline_ms(1000u);	/* 0173 ud_restart: 1000 ms (ABL 0x24124-0x2414c) */
+	/* bounded: timed_out(dl), 1000 ms, below */
+	for (;;) {
+		if (r32(USBG_DSTS, &v))
+			return;
+		if (v & USBG_DSTS_DEVCTRLHLT)
+			break;
+		if (r32(USBG_GEVNTCOUNT, &c))
+			return;
+		c &= 0xffffu;
+		if (c) {	/* Linux v6.6 gadget.c:2682-2689: ack, not dispatched */
+			if (w32(USBG_GEVNTCOUNT, c))
+				return;
+			g.evt_pos = (g.evt_pos + c) & (USBG_UD_EVT_SIZE - 1);
+			dropped += c / 4;
+		}
+		if (timed_out(dl)) {
+			con_str("USB3", "GAP: controller not halted 1000 ms after RUN_STOP=0; soft reset anyway");
+			break;
+		}
+	}
+	if (dropped)
+		con_dec_l("USB3", "GAP: events dropped: ", dropped);
+}
+
+static void ss_restart_hs(void)
+{
+	char buf[96];
+	unsigned p;
+
+	g.ss_restart_req = 0;
+	g.ss_restarted = 1;	/* never more than one restart */
+	p = cat_str(buf, 0, sizeof(buf), "GAP: ");
+	p = cat_str(buf, p, sizeof(buf), g.ss_reason ? g.ss_reason : "unknown");
+	cat_str(buf, p, sizeof(buf), ": restarting at high speed");
+	con_str("USB3", buf);
+	/* End every started transfer first (as drop_enumeration: databook,
+	 * Linux gadget.c dwc3_stop_active_transfers), else the re-armed setup
+	 * TRB hits "No Resource"; then halt the core (existing stop_core). */
+	if (end_transfer(USBG_EP1IN) || end_transfer(USBG_EP0OUT) ||
+	    end_transfer(USBG_EP0IN))
+		return;
+	g.inited = 0;
+	stop_core_acking();
+	if (g.fault)
+		return;
+	session_reset();
+	if (hw_start(0)) {
+		con_str("USB3", "GAP: HS restart failed");
+		fault_set();
+		return;
+	}
+	con_str("USB3", "high-speed restart done");
+}
+#endif
+
+int usbgadget_init(uintptr_t pool_pa, size_t pool_len,
+		   const struct usbgadget_hooks *hooks)
+{
+	uint32_t v;
+
+	g.inited = 0;
+	g.fault = 0;
+	g.hooks = hooks;
+	g.pool = pool_pa;
+	g.pool_pa = pool_pa;
+#ifdef USB_GADGET_SS
+	g.ss_restarted = 0;
+#endif
+	session_reset();
+
+#ifdef USB_GADGET_HS_ONLY
+	con_str("USB2", "GAP: gadget built HS-only (--usb2)");	/* rule 8 */
+#endif
+	if (!hooks || !hooks->ticks || !hooks->ticks_freq) {
+		con_str("USB", "gadget: no time hooks");
+		return -1;
+	}
+	if (pool_len < USBG_POOL_MIN || (pool_pa & 0xFFFu) != 0) {
+		/* The caller validates the pool against the FDT; this is
+		 * only the size/alignment re-check. */
+		con_str("USB", "gadget: bad DMA pool");
+		return -1;
+	}
+
+	/* Bring-up order per the stage-2 task (b) = the 0071 patch's
+	 * sweet_usb_gadget_start, minus everything Qualcomm-specific. */
+
+	/* 0. Refuse unless the controller is in device role (read only; Linux
+	 * skips the soft reset in host role, core.c:332-333). */
+	if (r32(USBG_GCTL, &v))
+		return -1;
+	if (((v >> 12) & 3u) != USBG_PRTCAP_DEVICE) {
+		con_str("USB", "gadget: core not in device mode");
+		return -1;
+	}
+
+#ifdef USB_GADGET_SS
+	return hw_start(1);
+#else
+	return hw_start(0);
+#endif
 }
 
 void usbgadget_poll(void)
 {
 	uint32_t count;
 	unsigned consumed = 0;
+#ifdef USB_GADGET_SS
+	unsigned skipped = 0;
+#endif
 
 	if (!g.inited || g.fault)
 		return;
@@ -723,6 +1027,11 @@ void usbgadget_poll(void)
 	while (count >= 4 && consumed < 16) {
 		const volatile uint32_t *ev = (const volatile uint32_t *)
 			(g.pool + USBG_UD_EVT + g.evt_pos);
+#ifdef USB_GADGET_SS
+		if (g.ss_restart_req)	/* speed change: old session is dead */
+			skipped++;
+		else
+#endif
 		if (handle_event(*ev))
 			return;	/* faulted: stay unacked, dead */
 		g.evt_pos = (g.evt_pos + 4) & (USBG_UD_EVT_SIZE - 1); /* 0071 patch */
@@ -731,6 +1040,23 @@ void usbgadget_poll(void)
 	}
 	if (consumed)
 		w32(USBG_GEVNTCOUNT, consumed * 4);	/* 0071 patch: ack */
+#ifdef USB_GADGET_SS
+	if (skipped)
+		con_dec_l("USB3", "GAP: batch skipped: ", skipped);
+#endif
+#ifdef USB_GADGET_SS
+	/* After the ack (the event is consumed): HS fallback, at most once. */
+	if (g.ss_mode && !g.ss_restarted && !g.fault) {
+		if (!g.ss_restart_req && !g.ss_confirmed &&
+		    timed_out(g.ss_deadline)) {
+			g.ss_restart_req = 1;
+			_Static_assert(USBG_SS_WAIT_MS == 10000u, "update the ss_reason text");
+			g.ss_reason = "not configured in 10000 ms";
+		}
+		if (g.ss_restart_req)
+			ss_restart_hs();
+	}
+#endif
 }
 
 size_t usbgadget_write(const char *buf, size_t len)

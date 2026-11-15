@@ -1,0 +1,91 @@
+#!/bin/sh
+# Point the kernel clone (and so all its worktrees) at COPIES of the tracked hooks (tools/hooks of the MAIN checkout -> <git-common-dir>/pixos-hooks), and give the
+# clone and every worktree under $PIXOS_WORKTREES_DIR (default $HOME/.t3/worktrees) the agent hooks (.claude/settings.json = tools/claude-settings.json) (TP-054, E10/E11).
+# The hooks are copied out of the working tree because core.hooksPath inside a working tree vanishes (silently, no hook runs) when the main checkout is on a branch
+# without tools/hooks, and an uncommitted edit there would be live at once (review kernel-hooks-r1 F2). After a hook change: run tools/install-hooks again.
+# Usage: tools/install-hooks [--check]. --check changes nothing. Idempotent. Last line RESULT: PASS|FAIL|ERROR ...; exit 0 / 1 (not installed, --check or after a failed install) / 2 (usage, not a git repo, no tree to install into).
+# Writes only: git config core.hooksPath, <git-common-dir>/pixos-hooks/*, <git-common-dir>/info/exclude (one line .claude/), <tree>/.claude/settings.json (never through a symlink; a differing one is kept as .pre-install-hooks).
+# Do not run it against the real clone before the driver has reviewed the hooks.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+mode=install
+case "${1:-}" in
+"") ;;
+--check) mode=check ;;
+*) echo "RESULT: ERROR usage: tools/install-hooks [--check]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "RESULT: ERROR usage: tools/install-hooks [--check]"; exit 2; }
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR   # a hook exports GIT_DIR=<linked worktree gitdir>: `git worktree list` then names THAT worktree first and the hooks landed in its private dir (2026-11-02)
+main=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+[ -n "$main" ] || { echo "RESULT: ERROR not inside a git repository"; exit 2; }
+common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -n "$common" ] || { echo "RESULT: ERROR no git dir for $main"; exit 2; }
+want="$common/pixos-hooks"
+wt_dir=${PIXOS_WORKTREES_DIR:-$HOME/.t3/worktrees}
+wt_dir=${wt_dir%/}
+src="$main/tools/claude-settings.json"
+hooks=
+for f in "$main"/tools/hooks/*; do
+	[ -f "$f" ] || continue
+	[ -x "$f" ] || { echo "RESULT: ERROR $f is not executable"; exit 2; }
+	hooks="$hooks ${f##*/}"
+done
+case "$hooks" in *" pre-commit"*) ;; *) echo "RESULT: ERROR $main/tools/hooks/pre-commit is missing (is this the kernel clone, with the hooks merged into its main checkout?)"; exit 2 ;; esac
+case "$hooks" in *" commit-msg"*) ;; *) echo "RESULT: ERROR $main/tools/hooks/commit-msg is missing"; exit 2 ;; esac
+[ -f "$src" ] || { echo "RESULT: ERROR $src missing"; exit 2; }
+bad=0
+say() { echo "$*"; }
+# the clone + every `git worktree list` path under $wt_dir (no temp file: a failing TMPDIR must not turn into a PASS over zero trees)
+list=$(git worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r w; do
+	case "$w" in "$main" | "$wt_dir"/*) echo "$w" ;; esac
+done)
+[ -n "$list" ] || { echo "RESULT: ERROR no tree to install into (git worktree list gave nothing for $main or $wt_dir)"; exit 2; }
+# hook copies
+for h in $hooks; do
+	if [ -f "$want/$h" ] && cmp -s "$main/tools/hooks/$h" "$want/$h" && [ -x "$want/$h" ]; then say "ok      $want/$h"
+	elif [ $mode = check ]; then say "MISSING $want/$h (absent, differs from $main/tools/hooks/$h or not executable)"; bad=$((bad + 1))
+	elif mkdir -p "$want" && cp "$main/tools/hooks/$h" "$want/$h.new.$$" && chmod 755 "$want/$h.new.$$" && mv -f "$want/$h.new.$$" "$want/$h"; then say "wrote   $want/$h"
+	else rm -f "$want/$h.new.$$"; say "FAILED  $want/$h"; bad=$((bad + 1)); fi
+done
+cur=$(git config --get core.hooksPath || { rc=$?; [ $rc = 1 ] || echo "install-hooks GAP: git config --get core.hooksPath failed rc=$rc" >&2; })
+if [ "$cur" = "$want" ]; then say "ok      core.hooksPath=$cur"
+elif [ $mode = check ]; then say "MISSING core.hooksPath='$cur' (want $want)"; bad=$((bad + 1))
+elif git config core.hooksPath "$want"; then say "set     core.hooksPath=$want (was '${cur:-unset}'; the old untracked .git/hooks/pre-commit is now unused)"
+else say "FAILED  git config core.hooksPath"; bad=$((bad + 1)); fi
+# .claude/ must be ignored in EVERY tree (a worktree on a branch without the .gitignore line would stage the copy): the shared info/exclude covers them all
+excl="$common/info/exclude"
+if grep -qx '\.claude/' "$excl" 2>/dev/null; then say "ok      $excl has .claude/"
+elif [ $mode = check ]; then say "MISSING .claude/ in $excl (a worktree whose .gitignore lacks it would show the copy as untracked)"; bad=$((bad + 1))
+elif mkdir -p "$common/info" && echo '.claude/' >>"$excl"; then say "wrote   $excl (.claude/)"
+else say "FAILED  $excl"; bad=$((bad + 1)); fi
+n=0
+nl='
+'
+oldifs=$IFS
+IFS=$nl
+set -f
+for wt in $list; do
+	IFS=$oldifs
+	dst="$wt/.claude/settings.json"
+	if [ ! -d "$wt" ]; then say "skip    $wt (directory missing, prunable)"; IFS=$nl; continue; fi
+	n=$((n + 1))
+	if [ -L "$wt/.claude" ] || [ -L "$dst" ]; then say "FAILED  $dst ($([ -L "$wt/.claude" ] && echo .claude || echo settings.json) is a symlink, not touched)"; bad=$((bad + 1))
+	elif [ -d "$dst" ]; then say "FAILED  $dst is a directory, not touched"; bad=$((bad + 1))
+	elif [ -f "$dst" ] && cmp -s "$src" "$dst"; then say "ok      $dst"
+	elif [ $mode = check ]; then say "MISSING $dst (absent or differs from $src)"; bad=$((bad + 1))
+	else
+		had=
+		if [ -e "$dst" ]; then   # keep the worktree's own differing file once (.claude/ is ignored: the backup stays local)
+			[ -e "$dst.pre-install-hooks" ] || cp -p "$dst" "$dst.pre-install-hooks"
+			had=" (replaced a differing file, old copy kept as $dst.pre-install-hooks)"
+		fi
+		if mkdir -p "$wt/.claude" && cp "$src" "$dst.new.$$" && mv -f "$dst.new.$$" "$dst"; then say "wrote   $dst$had"   # rename replaces a link, never its target
+		else rm -f "$dst.new.$$"; say "FAILED  $dst"; bad=$((bad + 1)); fi
+	fi
+	if ! git -C "$wt" check-ignore -q .claude/settings.json 2>/dev/null; then say "MISSING .claude/ is not ignored in $wt (.gitignore and info/exclude): the copy would be committed"; bad=$((bad + 1)); fi
+	IFS=$nl
+done
+IFS=$oldifs
+set +f
+[ $n -ge 1 ] || { echo "RESULT: ERROR no existing tree to install into"; exit 2; }
+if [ $bad = 0 ]; then echo "RESULT: PASS hooksPath=$want settings=$n tree(s) mode=$mode"; exit 0; fi
+echo "RESULT: FAIL $bad problem(s) mode=$mode$([ $mode = check ] && echo '; run tools/install-hooks')"; exit 1

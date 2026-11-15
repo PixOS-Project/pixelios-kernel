@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,5 +10,6 @@ static void kick(void)
+ {
+ 	boolean_t s = ml_set_interrupts_enabled(FALSE);
+ 	lck_spin_lock(&ring_lock);
++	IOLog("kick\n");
+ 	ring_head = next;
+ 	lck_spin_unlock(&ring_lock);
+

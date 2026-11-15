@@ -1,0 +1,172 @@
+SWEET stress nav (patch 0306, ALL-ON goal, user 2026-11-11 "humans do quick swipes repeatedly, are not patient, not all land in the exactly timed instant" + "every test must be a stress test"; sweetnav bit 0x800 or kern.sweetnavrun bit 0x800 via fcapctl nav, default off): the nav session of patches 0243/0275 with human-like input: drags 60-150 ms (flicks), taps 40-110 ms, settle 80-600 ms (the next action lands while the animation runs), think 10-150 ms, jitter taps +-25 px, drag start +-40 / end +-80 px (edge starts kept), home-page swipes zig-zag next/prev/next (net one page) 3 of 5 times, list scrolls repeated 0-2 times 30-120 ms apart. Draws once per gesture (xorshift32, seed logged 'SWEET NAV: STRESS on ... seed'), one 'SWEET NAV: STRESS act ...' line per action and 'STRESS repeat' per extra gesture; begin/inputend/end markers unchanged (the scorers cut the same windows). The unlock and the navigation gates (General probe, About gate and retries) are unchanged so the session keeps its place. Input injection only: no register, no store.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -412,6 +412,10 @@
+ 	uint64_t fNavQuietT0, fNavQuietSw, fNavQuietFlat;   /* patch 0275: quiet-display gate before a capture request */
+ 	UInt32 fNavApplibOnly;   /* patch 0275: kern.sweetnavrun 0x400 */
+ 	UInt32 fNavTap;   /* patch 0275: sweetnav bit 0x200 = scanout tap (kern.sweetnavcap bit 1) from spotlight-open begin to spotlight-close end of the last measured repetition */
++	/* patch 0306: sweetnav / kern.sweetnavrun bit 0x800 = STRESS nav (user 2026-11-11: every phone test is a stress test): per-gesture draws (fixed for the whole gesture,
++	 * the 10 ms ticks re-read the table row), xorshift32 state, burst (repeats left), zig-zag flip, a repeat in progress */
++	UInt32 fNavStress, fNavSRng, fNavSMs, fNavSSettle, fNavSBurst, fNavSFlip, fNavSRepeat, fNavSZig;
++	SInt32 fNavSdx0, fNavSdy0, fNavSdx1, fNavSdy1;
+ 	static void navCapFired(SweetHIDTouch *self, IOTimerEventSource *sender);
+ public:
+ 	int navRestart(unsigned v);   /* patch 0275: kern.sweetnavrun (hot loop: a new session on the running system) */
+@@ -460,6 +464,28 @@
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/* patch 0306: xorshift32 draw in [lo, hi] and a symmetric jitter in [-r, r] (stress nav; the calm table keeps its own LCG fNavRng) */
++static UInt32
++sweetNavSR(UInt32 *st, UInt32 lo, UInt32 hi)
++{
++	UInt32 x = *st ? *st : 0x9e3779b9u;
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*st = x;
++	return hi > lo ? lo + x % (hi - lo + 1) : lo;
++}
++static SInt32
++sweetNavSJ(UInt32 *st, SInt32 r)
++{
++	return (SInt32)sweetNavSR(st, 0, (UInt32)(2 * r)) - r;
++}
++static short
++sweetNavClamp(int v, int lo, int hi)
++{
++	return (short)(v < lo ? lo : v > hi ? hi : v);
++}
++
+ /* Patch 0152: host time (ns) of the latest finger-down, read by the latency probe of patch 0153 (SweetFramebuffer.cpp). 0 = none yet. */
+ extern "C" uint64_t sweet_touch_down_ns;
+ uint64_t sweet_touch_down_ns;
+@@ -675,8 +701,15 @@
+ 	fNavDs0 = 0;
+ 	fNavGateT0 = fNavGateCnt = fNavGateFlatT = 0;
+ 	fNavRng = 0x5eed1234;
++	fNavStress = fNavSRng = fNavSMs = fNavSSettle = fNavSBurst = fNavSFlip = fNavSRepeat = fNavSZig = 0;   /* patch 0306 */
++	fNavSdx0 = fNavSdy0 = fNavSdx1 = fNavSdy1 = 0;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
++		if (nav & 0x800) {   /* patch 0306: bit 11 = stress nav (fast flicks, impatient, repeated, jittered) */
++			fNavStress = 1;
++			fNavSRng = (UInt32)mach_absolute_time() | 1u;
++			IOLog("SWEET NAV: STRESS on (sweetnav bit 0x800) seed 0x%x: drags 60-150 ms, taps 40-110 ms, settle 80-600 ms, think 10-150 ms, jitter taps 25 drags 40/80 px, home zig-zag, scroll repeats 0-2\n", fNavSRng);
++		}
+ 		if (nav & 0x200) {   /* patch 0275: bit 9 = scanout tap around Spotlight in the last measured repetition */
+ 			fNavTap = 1;
+ 			IOLog("SWEET HID: nav scanout tap armed (sweetnav bit 0x200): spotlight-open begin .. spotlight-close end of the last measured repetition\n");
+@@ -833,6 +866,55 @@
+ 		act.x1 = act.x0;
+ 		act.y1 = act.y0;
+ 	}
++	if (self->fNavStress && i != 0) {
++		/*
++		 * Patch 0306 (ALL-ON, user 2026-11-11: "humans do quick swipes repeatedly, are not patient, not all land in the exactly timed instant"; every phone test is a stress
++		 * test): the draws are made once per gesture (st == 0) and applied on every tick, because each tick re-reads the table row. The unlock (index 0) and the
++		 * navigation gates (General probe, About gate/retries) stay as they are, so the session keeps its place; only how the gestures land changes. Input injection only.
++		 */
++		UInt32 *rs = &self->fNavSRng;
++		if (st == 0) {
++			bool edgeX = act.x0 <= 15, edgeY = act.y0 >= 2390;   /* edge back-swipe / home gesture: the start stays on its edge */
++			if (act.kind == 1) {
++				self->fNavSMs = sweetNavSR(rs, 60, 150);
++				self->fNavSdx0 = edgeX ? 0 : sweetNavSJ(rs, 40);
++				self->fNavSdy0 = edgeY ? 0 : sweetNavSJ(rs, 40);
++				self->fNavSdx1 = sweetNavSJ(rs, 80);
++				self->fNavSdy1 = sweetNavSJ(rs, 80);
++			} else if (act.kind == 0) {
++				self->fNavSMs = sweetNavSR(rs, 40, 110);
++				self->fNavSdx0 = self->fNavSdx1 = sweetNavSJ(rs, 25);
++				self->fNavSdy0 = self->fNavSdy1 = sweetNavSJ(rs, 25);
++			}
++			self->fNavSSettle = act.kind == 2 ? sweetNavSR(rs, 300, 1200) : sweetNavSR(rs, 80, act.settle < 600 ? act.settle : 600);
++			if (!self->fNavSRepeat) {
++				bool zig = strcmp(act.name, "home-page-next") == 0 || strcmp(act.name, "home-page-prev") == 0;
++				bool scroll = strcmp(act.name, "about-scroll-up") == 0 || strcmp(act.name, "about-scroll-down") == 0 ||
++				    strcmp(act.name, "settings-scroll-up") == 0 || strcmp(act.name, "settings-scroll-down") == 0;   /* no strstr in the kernel */
++				self->fNavSZig = zig ? 1 : 0;
++				self->fNavSBurst = zig ? (sweetNavSR(rs, 0, 4) >= 2 ? 2 : 0) : scroll ? sweetNavSR(rs, 0, 2) : 0;   /* zig-zag next,prev,next (net one page) 3 of 5 times */
++				self->fNavSFlip = 0;
++				IOLog("SWEET NAV: STRESS act %s ms %u settle %u d0 %d,%d d1 %d,%d burst %u%s rep %u\n", act.name, (unsigned)self->fNavSMs, (unsigned)self->fNavSSettle,
++				    (int)self->fNavSdx0, (int)self->fNavSdy0, (int)self->fNavSdx1, (int)self->fNavSdy1, (unsigned)self->fNavSBurst, self->fNavSZig ? " zig-zag" : "",
++				    self->fNavRep);
++			}
++		}
++		if (act.kind != 2) {
++			act.ms = (unsigned short)self->fNavSMs;
++			if (self->fNavSFlip) {
++				short tx = act.x0, ty = act.y0;
++				act.x0 = act.x1;
++				act.y0 = act.y1;
++				act.x1 = tx;
++				act.y1 = ty;
++			}
++			act.x0 = sweetNavClamp(act.x0 + self->fNavSdx0, 2, 1077);
++			act.y0 = sweetNavClamp(act.y0 + self->fNavSdy0, 2, 2397);
++			act.x1 = sweetNavClamp(act.x1 + self->fNavSdx1, 2, 1077);
++			act.y1 = sweetNavClamp(act.y1 + self->fNavSdy1, 2, 2397);
++		}
++		act.settle = (unsigned short)self->fNavSSettle;
++	}
+ 	const SweetNavAct *a = &act;
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+ 	if (st == 0 && i == 0) {
+@@ -842,7 +924,7 @@
+ 			self->fNavPref0 = sweet_exec_pref_count;   /* patch 0255 */
+ 		}
+ 	}
+-	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
++	if (st == 0 && !self->fNavSRepeat && !(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {   /* patch 0306: not on a stress repeat; patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 		if (self->fNavTap && self->fNavRep + 1 == self->fNavReps && strcmp(a->name, "spotlight-open") == 0) {   /* patch 0275 */
+ 			gSweetNavCap |= 2;
+@@ -866,6 +948,17 @@
+ 			IOLog("SWEET NAV: tap hold %d,%d ticks %u\n", (int)a->x1, (int)a->y1, ticks);   /* patch 0249: the up event above is at the tap's own coordinates */
+ 		}
+ 	}
++	if (st <= ticks + 1 && self->fNavStress && i != 0 && self->fNavSBurst > 0) {   /* patch 0306: the next gesture of the burst, 30-120 ms after the finger lifted (the animation is still running) */
++		self->fNavSBurst--;
++		self->fNavSRepeat = 1;
++		if (self->fNavSZig) {
++			self->fNavSFlip ^= 1;
++		}
++		IOLog("SWEET NAV: STRESS repeat %s left %u flip %u rep %u now %llu\n", a->name, (unsigned)self->fNavSBurst, (unsigned)self->fNavSFlip, self->fNavRep, sweetNavNs());
++		self->fNavStep = 0;
++		sender->setTimeoutMS(sweetNavSR(&self->fNavSRng, 30, 120));
++		return;
++	}
+ 	if (st <= ticks + 1) {   /* finger up (or the wait started): observe the animation for `settle` ms */
+ 		if (!(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {
+ 			IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+@@ -956,6 +1049,7 @@
+ 		IOLog("SWEET NAV: TAP off rep %u now %llu\n", self->fNavRep, sweetNavNs());
+ 	}
+ 	self->fNavStep = 0;
++	self->fNavSRepeat = self->fNavSFlip = self->fNavSBurst = self->fNavSZig = 0;   /* patch 0306 */
+ 	self->fNavIdx = i + 1;
+ 	if (self->fNavIdx >= SWEET_NAV_N) {
+ 		self->fNavIdx = 1;   /* later repetitions skip the unlock */
+@@ -966,7 +1060,7 @@
+ 		}
+ 	}
+ 	self->fNavRng = self->fNavRng * 1664525u + 1013904223u;
+-	sender->setTimeoutMS(150 + (self->fNavRng >> 16) % 451);   /* think time 150..600 ms */
++	sender->setTimeoutMS(self->fNavStress ? sweetNavSR(&self->fNavSRng, 10, 150) : 150 + (self->fNavRng >> 16) % 451);   /* think time 150..600 ms (patch 0306: stress 10..150 ms) */
+ }
+ 
+ /* Patch 0275: the capture repetition. Same gestures as the measured table (the calibrated ones and the General probe of patch 0269), settle doubled
+@@ -1153,6 +1247,12 @@
+ 	fNavCapIdx = 0;
+ 	fNavTap = (v & 0x200) ? 1 : 0;
+ 	fNavApplibOnly = (v & 0x400) ? 1 : 0;
++	fNavStress = (v & 0x800) ? 1 : 0;   /* patch 0306 */
++	fNavSBurst = fNavSFlip = fNavSRepeat = fNavSZig = 0;
++	if (fNavStress) {
++		fNavSRng = (UInt32)mach_absolute_time() | 1u;
++		IOLog("SWEET NAV: STRESS on (kern.sweetnavrun bit 0x800) seed 0x%x\n", fNavSRng);
++	}
+ 	if (fNavApplibOnly) {   /* no measured repetition: straight to the App Library pass */
+ 		fNavCap = 1;
+ 		fNavRep = fNavReps;

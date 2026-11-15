@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""tools/gate-times: read the gate time ledger (logs/gate-times.tsv, written by tools/check-all.sh through tools/gate-summary --append; PLAN-GATE-2X G1/G2).
+
+  tools/gate-times [--ledger F] [--manifest F]     per kind: median elapsed of the last 10 gates, the slowest step (median of the last 10), budget breaches
+  (cold gates, ledger column `cold`=1, tools/gate --cold: kept out of the warm medians; own line `cold median: n= median= last=` against the cold budget 1100 s; two consecutive cold breaches fail --check)
+  tools/gate-times --check [...]                   exit 1 when the last TWO gates of one kind both exceeded that kind's total budget (quick 360 s, formal 600 s;
+                                                   R42: the second occurrence of a breach is a finding). Not wired into check-rules: the watcher runs it every 10 gates.
+
+A single breach is only reported (the gate never fails by itself). Ledger columns: epoch label kind host base ran skipped elapsed steps(name:secs,..) cold(0|1, absent = 0).
+Last line: RESULT: PASS|FAIL gate-times kinds=.. . Exit 0 (report / check clean), 1 (--check breach), 2 (usage / unreadable ledger).
+"""
+import argparse, json, os, pathlib, statistics, subprocess, sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+TOTALS = {"quick": 360, "formal": 600, "cold": 1100}
+LAST = 10
+
+
+def ledger_path():
+    if os.environ.get("GATE_TIMES_FILE"):
+        return pathlib.Path(os.environ["GATE_TIMES_FILE"])
+    r = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    root = pathlib.Path(r.stdout.strip()).parent if r.returncode == 0 and r.stdout.strip() else REPO
+    return root / "logs" / "gate-times.tsv"
+
+
+def read_rows(path):
+    rows = []
+    for line in path.read_text().splitlines():
+        f = line.split("\t")
+        if len(f) < 9 or not f[0].isdigit() or not f[7].isdigit():
+            continue
+        steps = {}
+        for kv in f[8].split(","):
+            n, _, v = kv.rpartition(":")
+            if n and v.isdigit():
+                steps[n] = int(v)
+        rows.append({"epoch": int(f[0]), "label": f[1], "kind": f[2], "host": f[3], "base": f[4], "ran": int(f[5]), "skipped": int(f[6]),
+                     "elapsed": int(f[7]), "steps": steps, "cold": len(f) > 9 and f[9] == "1"})   # 9-column rows (before 2026-10-31) are warm
+    return rows
+
+
+def budgets(manifest_path):
+    try:
+        m = json.load(open(manifest_path))
+    except (OSError, ValueError):
+        return {}, TOTALS
+    return {r["step"]: r["budget_s"] for r in m["steps"] if isinstance(r.get("budget_s"), int)}, m.get("totals_s") or TOTALS
+
+
+def analyse(rows, per_step, totals):
+    """-> {kind: {"n","median","slowest": (step, secs)|None, "step_breaches": [(step, median, budget)], "consecutive": bool}}"""
+    out = {}
+    rows = [r for r in rows if not r["cold"]]   # cold gates have their own median (analyse_cold): a 1500 s cold run must not move the warm one
+    for kind in sorted({r["kind"] for r in rows}):
+        k = sorted((r for r in rows if r["kind"] == kind), key=lambda r: r["epoch"])
+        last = k[-LAST:]
+        med = int(statistics.median(r["elapsed"] for r in last))
+        names = sorted({n for r in last for n in r["steps"]})
+        meds = {n: int(statistics.median(r["steps"][n] for r in last if n in r["steps"])) for n in names}
+        slowest = max(meds.items(), key=lambda kv: kv[1]) if meds else None
+        breaches = [(n, v, per_step[n]) for n, v in sorted(meds.items()) if n in per_step and v > per_step[n]]
+        tot = totals.get(kind)
+        consec = tot is not None and len(k) >= 2 and all(r["elapsed"] > tot for r in k[-2:])
+        out[kind] = {"n": len(last), "median": med, "slowest": slowest, "step_breaches": breaches, "consecutive": consec, "total": tot}
+    return out
+
+
+def analyse_cold(rows, totals):
+    """-> None (no cold rows) or {"n","median","last","total","over","consecutive"} over the last LAST cold gates (any kind: a cold gate is formal)."""
+    k = sorted((r for r in rows if r["cold"]), key=lambda c: c["epoch"])
+    if not k:
+        return None
+    lastn = k[-LAST:]
+    tot = totals.get("cold")
+    med = int(statistics.median([c["elapsed"] for c in lastn]))
+    return {"n": len(lastn), "median": med, "last": k[-1]["elapsed"], "total": tot, "over": tot is not None and k[-1]["elapsed"] > tot,
+            "consecutive": tot is not None and len(k) > 1 and k[-1]["elapsed"] > tot and k[-2]["elapsed"] > tot}
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="gate-times")
+    ap.add_argument("--ledger")
+    ap.add_argument("--manifest", default=str(REPO / "tools" / "gate-manifest.json"))
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args(argv)
+    path = pathlib.Path(a.ledger) if a.ledger else ledger_path()
+    try:
+        rows = read_rows(path)
+    except OSError as e:
+        print("RESULT: PASS gate-times no ledger yet (%s: %s)" % (path, e))
+        return 0
+    per_step, totals = budgets(a.manifest)
+    res = analyse(rows, per_step, totals)
+    bad = []
+    cold = analyse_cold(rows, totals)
+    for kind, r in res.items():
+        print("%s: median of last %d = %ds (budget %s s)%s" % (kind, r["n"], r["median"], r["total"], "  OVER" if r["total"] and r["median"] > r["total"] else ""))
+        if r["slowest"]:
+            print("%s: slowest step %s median %ds" % (kind, r["slowest"][0], r["slowest"][1]))
+        for n, v, b in r["step_breaches"]:
+            print("%s: budget breach %s median %ds > %ds" % (kind, n, v, b))
+        if r["consecutive"]:
+            print("%s: the last two gates both exceeded the total budget of %ds" % (kind, r["total"]))
+            bad.append(kind)
+    if cold:
+        print("cold median: n=%d median=%ds last=%ds (budget %s s)%s" % (cold["n"], cold["median"], cold["last"], cold["total"], "  OVER" if cold["over"] else ""))
+        if cold["consecutive"]:
+            print("cold: the last two cold gates both exceeded the cold budget of %ds" % cold["total"])
+            bad.append("cold")
+    if a.check and bad:
+        print("RESULT: FAIL gate-times consecutive total-budget breach kinds=%s" % ",".join(bad))
+        return 1
+    print("RESULT: PASS gate-times kinds=%s gates=%d%s%s" % (",".join(res) or "-", len(rows), " cold-gates=%d" % sum(1 for r in rows if r["cold"]) if cold else "",
+                                                        (" consecutive-breach=" + ",".join(bad)) if bad else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

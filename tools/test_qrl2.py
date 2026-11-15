@@ -13,7 +13,7 @@ except ImportError:
     try:
         import cv2, numpy  # noqa: F401,F811
         HAVE_CV = True
-    except ImportError:
+    except ImportError:   # lint-silent: expected opencv is optional: the tests that need it are skipUnless(HAVE_CV) and say so
         HAVE_CV = False
 HAVE_GCC = shutil.which("gcc") is not None
 

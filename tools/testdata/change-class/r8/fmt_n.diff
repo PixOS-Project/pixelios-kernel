@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,5 +10,6 @@ void f(void)
+ {
+ 	foo();
+ 	bar();
++	printf("%n", &ring_head);
+ 	baz();
+ 	qux();
+ }

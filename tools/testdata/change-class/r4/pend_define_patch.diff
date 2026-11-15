@@ -1,0 +1,16 @@
+diff --git a/xnu/patches/0300-sweet-x.patch b/xnu/patches/0300-sweet-x.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-sweet-x.patch
+@@ -0,0 +1,11 @@
++witness
++
++diff --git a/osfmk/k.c b/osfmk/k.c
++--- a/osfmk/k.c
+++++ b/osfmk/k.c
++@@ -1,2 +1,5 @@
++ {
+++	printf("%d",
+++#define ml_io_write32 sweet_nop2
+++	    a);
++ 	ml_io_write32(a, 1);

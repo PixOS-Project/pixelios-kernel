@@ -1,0 +1,143 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -170,6 +170,127 @@
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++/*
++ * DEV STUB (T-eadd, W-KC): aks_wrap_key (sel 10) / aks_unwrap_key (sel 11).
++ * Layout read from libaks in the iOS 16.7 dyld shared cache (AppleKeyStore.framework
++ * aks_wrap_key 0x1f2ec2db8, aks_unwrap_key 0x1f2ec2ec8; IOConnectCallMethod):
++ *   wrap   in: scalars {handle, class}, struct = key (key_size B)
++ *          out: scalar {class}, struct = wrapped key (size in/out)
++ *   unwrap in: scalars {handle, class}, struct = wrapped key
++ *          out: no scalar, struct = key (size in/out)
++ * securityd shows 32 B in -> 40 B out (key + 8). The stub keeps the same +8 shape:
++ * wrapped = key || 8-byte tag {"SWAK", version, class, ~class, handle}. It does NO
++ * encryption (no SEP, no passcode, no storage) and makes NO security claim: it
++ * only lets keychain item writes complete. Every call is logged (loud, rule 8).
++ */
++#define SWEET_AKS_WRAP_TAG_LEN 8
++#define SWEET_AKS_WRAP_MAX_KEY 64
++
++static uint32_t sweet_aks_wrap_calls;
++static uint32_t sweet_aks_unwrap_calls;
++
++static void
++sweet_aks_wrap_tag(uint8_t *tag, uint64_t handle, uint64_t cls)
++{
++	tag[0] = 'S';
++	tag[1] = 'W';
++	tag[2] = 'A';
++	tag[3] = 'K';
++	tag[4] = 1;
++	tag[5] = (uint8_t)cls;
++	tag[6] = (uint8_t)~cls;
++	tag[7] = (uint8_t)handle;
++}
++
++/* Read the caller's input structure (inband or descriptor) into buf, at most max bytes. */
++static IOReturn
++sweet_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t len, uint32_t max)
++{
++	if (len > max) {
++		return kIOReturnBadArgument;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->readBytes(0, buf, len) != len) {
++			return kIOReturnVMError;
++		}
++		return kIOReturnSuccess;
++	}
++	if (args->structureInput == NULL) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(buf, args->structureInput, len);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sweet_aks_wrap_key(IOExternalMethodArguments *args, uint32_t in_scalars, uint32_t in_struct,
++    uint32_t out_scalars, uint32_t out_cap)
++{
++	uint8_t buf[SWEET_AKS_WRAP_MAX_KEY + SWEET_AKS_WRAP_TAG_LEN];
++	if (in_scalars < 2 || in_struct == 0) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn ret = sweet_aks_struct_in(args, buf, in_struct, SWEET_AKS_WRAP_MAX_KEY);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	if (out_cap < in_struct + SWEET_AKS_WRAP_TAG_LEN) {
++		return kIOReturnNoSpace;
++	}
++	sweet_aks_wrap_tag(buf + in_struct, args->scalarInput[0], args->scalarInput[1]);
++	ret = sweet_aks_struct_out(args, buf, in_struct + SWEET_AKS_WRAP_TAG_LEN);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	if (out_scalars >= 1) {
++		args->scalarOutput[0] = args->scalarInput[1];
++		args->scalarOutputCount = 1;
++	} else {
++		args->scalarOutputCount = 0;
++	}
++	sweet_aks_wrap_calls++;
++	IOLog("SWEET AKS: STUB wrap #%u handle %llu class %llu key %u B -> %u B (no encryption, dev only)\n",
++	    sweet_aks_wrap_calls, args->scalarInput[0], args->scalarInput[1], in_struct,
++	    in_struct + SWEET_AKS_WRAP_TAG_LEN);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sweet_aks_unwrap_key(IOExternalMethodArguments *args, uint32_t in_scalars, uint32_t in_struct,
++    uint32_t out_cap)
++{
++	uint8_t buf[SWEET_AKS_WRAP_MAX_KEY + SWEET_AKS_WRAP_TAG_LEN];
++	uint8_t tag[SWEET_AKS_WRAP_TAG_LEN];
++	if (in_scalars < 2 || in_struct <= SWEET_AKS_WRAP_TAG_LEN) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn ret = sweet_aks_struct_in(args, buf, in_struct,
++	    SWEET_AKS_WRAP_MAX_KEY + SWEET_AKS_WRAP_TAG_LEN);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	uint32_t klen = in_struct - SWEET_AKS_WRAP_TAG_LEN;
++	sweet_aks_wrap_tag(tag, args->scalarInput[0], args->scalarInput[1]);
++	if (memcmp(tag, buf + klen, 4) != 0 || tag[4] != buf[klen + 4] || tag[5] != buf[klen + 5] ||
++	    tag[6] != buf[klen + 6]) {
++		IOLog("SWEET AKS: STUB unwrap REFUSED handle %llu class %llu: tag mismatch (blob not from this stub or wrong class)\n",
++		    args->scalarInput[0], args->scalarInput[1]);
++		return kIOReturnBadArgument;
++	}
++	if (out_cap < klen) {
++		return kIOReturnNoSpace;
++	}
++	ret = sweet_aks_struct_out(args, buf, klen);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	args->scalarOutputCount = 0;
++	sweet_aks_unwrap_calls++;
++	IOLog("SWEET AKS: STUB unwrap #%u handle %llu class %llu %u B -> key %u B (no encryption, dev only)\n",
++	    sweet_aks_unwrap_calls, args->scalarInput[0], args->scalarInput[1], in_struct, klen);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -227,6 +348,12 @@
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		ret = sweet_aks_wrap_key(args, in_scalars, in_struct, out_scalars, out_struct);
++		break;
++	case kAKSUnwrapKey:
++		ret = sweet_aks_unwrap_key(args, in_scalars, in_struct, out_struct);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;

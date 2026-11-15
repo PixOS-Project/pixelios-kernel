@@ -162,7 +162,7 @@ new file mode 100644
 index 0000000..1ac5f54
 --- /dev/null
 +++ b/osfmk/arm64/kpc.c
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,173 @@
 +/*
 + * sweet: arm64 kpc backend. Apple's osfmk/arm64/kpc.c programs the Apple
 + * PMU (implementation-defined system registers) and ships only in the KDK's
@@ -176,8 +176,22 @@ index 0000000..1ac5f54
 +#include <kern/processor.h>
 +#include <sys/errno.h>
 +#include <kern/kpc.h>
++#include <kern/misc_protos.h>
 +
 +int kpc_pc_capture = 0;
++
++/* T-07 (silent-failure audit): the refused configuration calls say so (first 8, then one per 1000) */
++static uint32_t sweet_kpc_refused;
++
++static int
++sweet_kpc_refuse(const char *what)
++{
++	sweet_kpc_refused++;
++	if (sweet_kpc_refused <= 8 || sweet_kpc_refused % 1000 == 0) {
++		printf("SWEET GAP: kpc %s refused with ENOTSUP: this board has no PMU counter backend (patch 0008), call %u\n", what, sweet_kpc_refused);
++	}
++	return ENOTSUP;
++}
 +
 +void
 +kpc_arch_init(void)
@@ -292,25 +306,25 @@ index 0000000..1ac5f54
 +int
 +kpc_set_config_arch(struct kpc_config_remote *mp_config __unused)
 +{
-+	return ENOTSUP;
++	return sweet_kpc_refuse("set_config");
 +}
 +
 +int
 +kpc_set_period_arch(struct kpc_config_remote *mp_config __unused)
 +{
-+	return ENOTSUP;
++	return sweet_kpc_refuse("set_period");
 +}
 +
 +int
 +kpc_set_running_arch(struct kpc_running_remote *mp_config __unused)
 +{
-+	return ENOTSUP;
++	return sweet_kpc_refuse("set_running");
 +}
 +
 +int
 +kpc_set_sw_inc(uint32_t mask __unused)
 +{
-+	return ENOTSUP;
++	return sweet_kpc_refuse("set_sw_inc");
 +}
 +
 +void

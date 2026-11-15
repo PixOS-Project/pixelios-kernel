@@ -1,0 +1,380 @@
+sweet-touch-irq0 (lowclk 2026-11-14; design: docs/research/155-touch-ftm5-interrupt.md section 6 "Stage 0" and section 4 item 4): FTM5 touch interrupt STAGE 0 ONLY, read-only measurements behind boot-arg sweettouchirq=2. NO HARDWARE WRITE: this patch adds no store to any register (not pad CON/DAT, ECON, EFLTCON, EMASK, EPEND), no GIC call, no SPI attach, no handler. The host test (tools/test_touch_irq0_core.py) runs the core against a fake bus whose write slot fails the test when called and whose reads are checked against an independent offset list.
+Sources [read]: research 155 with its citations: Google kernel/gs gs101-common-touch.dtsi:12 (TS_INT = gpa9[0]), pinctrl-gs.c:79 (gpa9 bank: pad base 0xC0, eint_offset 0x18, fltcon_offset 0x28), pinctrl-exynos.h:21,27-29 (EFLTCON 0x800, ECON 0x700, EMASK 0x900, EPEND 0xA00); board.json touch_pin_irq = gpa9[0], soc.json gpa9_bank 0x174D00C0.
+sweettouchirq absent or 0 = behaviour unchanged: no mapping, no register read, no log line, the poll loop unchanged (every added call is behind the stage-0-on flag; the only added statements that run with it off are the flag tests). sweettouchirq=2 = stage 0. sweettouchirq=1 or any other value = `TOUCH GAP: sweettouchirq=%d: stage 1 not in this patch ...`, treated as 0.
+Stage 0 [reads only], from the touch thread, nothing from an interrupt: (a) once, right after tg_cmu_dump (before any write of the driver): map the alive page (ml_io_map of 0x174D0000, the page the irq pad already lives in) and READ pad CON (0x174D00C0), pad DAT (+0xC4), ECON (0x174D0718), EFLTCON (0x174D0828), EMASK (0x174D0918), EPEND (0x174D0A18); one line `SWEET TOUCH IRQ0: gpa9 read once: econ %#x [pin0 %u] efltcon %#x [byte0 %#x] emask %#x [bit0 %u] epend %#x [bit0 %u] con %#x [func %#x] dat %#x [pin0 %u]`. (b) tg_reset_and_ready: one DAT read right BEFORE each FIFO read; `SWEET TOUCH IRQ0: reset-wait i=%u dat=%d ev=%02x` for the first 40 iterations, `SWEET TOUCH IRQ0: reset-wait first DAT change %d -> %d, %u us after reset release (i=%u)`, and one `SWEET TOUCH IRQ0: reset-wait end: %u samples, dat first %d last %d, DAT changed|never changed, controller-ready seen|not seen` per reset. (c) main poll loop: one DAT read before each tg_drain; 2x2 counters {DAT low, high} x {events found, empty}, DAT edges, longest run of low-with-empty; one line at most every 10 s: `SWEET TOUCH IRQ0: passes %u low/found %u low/empty %u high/found %u high/empty %u edges %u maxrun_low_empty %u drain_err %u verdict LOW-confirmed|NOT-confirmed|pending`. Verdict (research 155 s.6 item 4): (low,found)+(high,empty) >= 95 % of passes, only from 100 passes on (the 100 is a GUESS); GAP lines: (low,empty) over 20 % of passes, and the transition to NOT-confirmed (do not enable stage 1). The poll timing (1 ms with events, 8 ms without) is unchanged; the added work is one MMIO read per pass.
+Failure handling [rule 7]: mapping failure, the irq pad not being gpa9[0] (bank 0x174D00C0 pin 0), a refused or failed read, all four EINT words reading 0xffffffff, a DAT word of 0xffffffff = a `TOUCH GAP: sweettouchirq=2: ...` line, stage 0 off, the poll continues. Whether the EINT words answer from XNU at all is research 155 U3: a bus fault (SError) on such a read would not be caught here.
+Judge: every access of the new code goes through sti_rd of bsd/dev/sweet_touch_irq0.h: one allowlist (sti_rows[], six offsets, word aligned); there is no write row and no write function; the ops table has a wr slot that the kernel glue leaves NULL and the core never calls.
+Files: new bsd/dev/sweet_touch_irq0.h (pure core between STI_CORE_BEGIN/END), bsd/dev/sweet_touch_gs101.c (boot-arg, mapping of the alive page, ops, the call sites). The sweettouchpoke allowlist is NOT changed. Diffed against the fully applied tree. ORDER: after 0354 (0348 is the last toucher of sweet_touch_gs101.c; 0354 does not touch it).
+NOT RUN ON HARDWARE, not reviewed. It has no new write, so by AGENTS.md rule 8 it needs no Opus review; the read of the EINT words (U3) is the one untested access. Stage 1 (CON/ECON/EMASK/EPEND writes, GIC attach of INTID 67) is NOT in this patch and needs its own rule-8 review.
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index ab65673..f7e9ff1 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -84,6 +84,8 @@
+ #include <stdint.h>
+ #include "sweet_ftm5.h"
+ #include "sweet_touch_poke.h"
++#define STI_LOG(...) printf(__VA_ARGS__)   /* patch 0355 */
++#include "sweet_touch_irq0.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -172,8 +174,24 @@ static struct {
+ 	bool down[FTM5_TOUCH_ID_MAX];
+ 	uint32_t unknown_seen[8];   /* patch 0348: byte 0 values already reported as SWEET GAP */
+ 	int last_x[FTM5_TOUCH_ID_MAX], last_y[FTM5_TOUCH_ID_MAX];
++	vm_offset_t alive;           /* patch 0355: alive pin controller page, READ ONLY use (sweet_touch_irq0.h); 0 = not mapped */
+ } tg;
+ 
++/* patch 0355 (sweettouchirq=2, stage 0): reads only. tg_sti_ops.wr stays NULL: no store to any register is reachable from sweet_touch_irq0.h */
++static struct sti tg_sti;
++static int
++tg_sti_rd(void *ctx, uint32_t off, uint32_t *v)
++{
++	(void)ctx;
++	if (!tg.alive) {
++		return -1;
++	}
++	*v = *(volatile uint32_t *)(tg.alive + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return 0;
++}
++static const struct sti_ops tg_sti_ops = { .ctx = NULL, .rd = tg_sti_rd };
++
+ static uint32_t
+ tg_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -1057,11 +1075,17 @@ tg_reset_and_ready(unsigned *logged)
+ 	tg_sleep_ms(10);
+ 	tg_pin_put(&tg.reset, 1);
+ 	t0 = tg_now_us();
++	sti_reset_begin(&tg_sti, t0);
+ 	while (tg_now_us() - t0 < 1500000u) {   /* GENERAL_TIMEOUT is not known: 1.5 s, GUESS */
+ 		uint8_t e[FTM5_EVENT_SIZE];
++		int irq0_dat = sti_dat(&tg_sti, &tg_sti_ops);   /* patch 0355: one DAT read right before the FIFO read; -1 = stage 0 off */
+ 		if (tg_read(cmd, 1, e, FTM5_EVENT_SIZE)) {
++			sti_reset_end(&tg_sti, 0);
+ 			return false;
+ 		}
++		if (irq0_dat >= 0) {
++			sti_reset_obs(&tg_sti, irq0_dat, e[0], tg_now_us());
++		}
+ 		if (e[0] != FTM5_EVT_NOEVENT && *logged < 200u) {
+ 			/* boot events are only logged: nothing is reported to HID before the controller is ready */
+ 			printf("SWEET TOUCH: boot ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
+@@ -1069,10 +1093,12 @@ tg_reset_and_ready(unsigned *logged)
+ 			(*logged)++;
+ 		}
+ 		if (ftm5_parse_event(e).kind == FTM5_READY) {
++			sti_reset_end(&tg_sti, 1);
+ 			return true;
+ 		}
+ 		tg_sleep_ms(5);
+ 	}
++	sti_reset_end(&tg_sti, 0);
+ 	return false;
+ }
+ 
+@@ -1102,6 +1128,12 @@ tg_run(void)
+ 		return;
+ 	}
+ 	tg_cmu_dump();    /* reads only, before any write below */
++	if (tg_sti.mode == 2) {   /* patch 0355 stage 0: map the alive page and read the EINT words + pad CON/DAT once, reads only */
++		if (tg.irq.bank_pa >= STI_OFF_CON) {
++			tg.alive = tg_map(tg.irq.bank_pa - STI_OFF_CON, 0x1000);
++		}
++		(void)sti_start(&tg_sti, &tg_sti_ops, tg.irq.bank_pa, tg.irq.pin, tg.alive != 0);
++	}
+ 	if (!tg_report_and_check_mux()) {
+ 		if (tg.poke[0]) {
+ 			printf("SWEET TOUCH: poke: skipped, the bus was left alone (see above)\n");
+@@ -1153,7 +1185,11 @@ tg_run(void)
+ 	}
+ 	printf("SWEET TOUCH: scanning, %dx%d raw -> %ux%u\n", (int)tg.max_x + 1, (int)tg.max_y + 1, tg.width, tg.height);
+ 	for (;;) {
++		int irq0_dat = sti_dat(&tg_sti, &tg_sti_ops);   /* patch 0355: one DAT read before the drain; -1 = stage 0 off */
+ 		int n = tg_drain(&logged);
++		if (irq0_dat >= 0) {
++			sti_loop_obs(&tg_sti, irq0_dat, n, tg_now_us());
++		}
+ 		if (n < 0) {
+ 			if (errors++ % 100u == 0) {
+ 				printf("SWEET TOUCH: FIFO read failed (%u)\n", errors);
+@@ -1211,6 +1247,11 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
+ 	(void)PE_parse_boot_argn("sweettouchcs", &cs, sizeof(cs));
++	{   /* patch 0355: sweettouchirq 0/absent = unchanged, 2 = read-only stage 0, 1 or other = GAP (stage 1 not in this patch) */
++		int irq0 = 0;
++		bool irq0_given = PE_parse_boot_argn("sweettouchirq", &irq0, sizeof(irq0));
++		sti_arg(&tg_sti, irq0_given, irq0);
++	}
+ 	(void)PE_parse_boot_argn("sweettouchpoke", tg.poke, sizeof(tg.poke));   /* longer values are cut: poke_parse then sees > 240 chars */
+ 	if (delay_s < 0 || delay_s > 3600) {
+ 		delay_s = 45;
+diff --git a/bsd/dev/sweet_touch_irq0.h b/bsd/dev/sweet_touch_irq0.h
+new file mode 100644
+index 0000000..86c843a
+--- /dev/null
++++ b/bsd/dev/sweet_touch_irq0.h
+@@ -0,0 +1,260 @@
++/*
++ * sweet_touch_irq0.h - FTM5 touch interrupt, STAGE 0 (patch 0355, boot-arg sweettouchirq=2): READ ONLY.
++ *
++ * The pure core (between STI_CORE_BEGIN and STI_CORE_END) is compiled and run by tools/test_touch_irq0_core.py with a fake bus that FAILS THE TEST on any write.
++ * NOTHING in this file stores to hardware: the only bus operation is rd(), and the allowlist below holds six read offsets of the alive pin controller (0x174D0000).
++ * The ops table has a wr slot only so that the host test can trap a mutant that calls it; the kernel glue leaves it NULL and the core never calls it.
++ * Spec: docs/research/155-touch-ftm5-interrupt.md section 6 "Stage 0" and section 4 item 4. The glue (mapping, boot-arg, call sites) is in sweet_touch_gs101.c.
++ * The glue must define STI_LOG(...) (printf in the kernel, a recorder in the host test) before including this file.
++ */
++#ifndef SWEET_TOUCH_IRQ0_H
++#define SWEET_TOUCH_IRQ0_H
++#ifndef STI_LOG
++#error "define STI_LOG(...) before including sweet_touch_irq0.h"
++#endif
++/* STI_CORE_BEGIN */
++#define STI_PAD_PA        0x174D00C0ull   /* gpa9 bank CON register: board.json touch_pin_irq = gpa9[0], soc.json gpa9_bank [research 155 s.1] */
++#define STI_ALIVE_PA      0x174D0000ull   /* pinctrl@174D0000 */
++/* offsets from STI_ALIVE_PA; ECON 0x700 + eint_offset 0x18, EFLTCON 0x800 + fltcon_offset 0x28, EMASK 0x900 + 0x18, EPEND 0xA00 + 0x18 [research 155 s.3, pinctrl-gs.c:79, pinctrl-exynos.h:27-29,21] */
++#define STI_OFF_CON       0x0C0u          /* pad CON, 4 bit per pin */
++#define STI_OFF_DAT       0x0C4u          /* pad DAT, bit per pin (the driver's PIN_DAT = 0x04 from the bank CON) */
++#define STI_OFF_ECON      0x718u
++#define STI_OFF_EFLTCON   0x828u
++#define STI_OFF_EMASK     0x918u
++#define STI_OFF_EPEND     0xA18u
++#define STI_RESET_LOG_MAX 40u             /* research 155 s.6 stage 0 item 2: first 40 reset-wait iterations are logged */
++#define STI_SUMMARY_US    10000000ull     /* one summary line at most every 10 s (brief); the note said 5 s */
++#define STI_MIN_PASSES    100u            /* GUESS: no verdict before this many passes (a tiny sample proves nothing) */
++#define STI_LOWEMPTY_PCT  20u             /* research 155 s.6 item 3: GAP when (low, empty) exceeds 20 % of passes */
++#define STI_GOOD_PCT      95u             /* research 155 s.6 item 4: (low, found) + (high, empty) >= 95 % = polarity LOW confirmed */
++
++enum { STI_V_PENDING = 0, STI_V_OK = 1, STI_V_BAD = 2 };
++
++/* The read-only allowlist: the ONLY offsets the core may read. There is no write row and no write path. */
++static const uint32_t sti_rows[] = { STI_OFF_CON, STI_OFF_DAT, STI_OFF_ECON, STI_OFF_EFLTCON, STI_OFF_EMASK, STI_OFF_EPEND };
++
++struct sti_ops {
++	void *ctx;
++	int (*rd)(void *ctx, uint32_t off, uint32_t *v);   /* read a word at STI_ALIVE_PA + off; -1 = not mapped / failed */
++	int (*wr)(void *ctx, uint32_t off, uint32_t v);    /* MUST be NULL in the kernel; never called by the core; the host test traps it */
++};
++
++struct sti {
++	int mode;                 /* 0 = off (behaviour unchanged), 2 = stage 0 */
++	int on;                   /* stage 0 running (mode 2, start read everything, no read has failed) */
++	uint32_t cnt[2][2];       /* [dat high][events found] */
++	uint32_t edges, run, maxrun, passes, drain_err, summaries;
++	int last_dat;
++	int tick_init, verdict;
++	uint64_t tick_us;
++	uint32_t ri;              /* reset-wait iteration */
++	int r_dat0, r_last, r_chg;
++	uint64_t r_t0;
++};
++
++/* boot-arg value: present/val as PE_parse_boot_argn gave them. 0 / absent = off; 2 = stage 0; 1 and anything else = GAP, off. */
++static void
++sti_arg(struct sti *st, int present, int val)
++{
++	st->mode = 0;
++	st->on = 0;
++	if (!present || val == 0) {
++		return;
++	}
++	if (val == 2) {
++		st->mode = 2;
++		return;
++	}
++	STI_LOG("TOUCH GAP: sweettouchirq=%d: stage 1 not in this patch (patch 0355 has the read-only stage 0 = 2 only), treated as 0\n", val);
++}
++
++static void
++sti_off(struct sti *st)
++{
++	st->on = 0;
++}
++
++/* the judge: allowlisted, word aligned, read only; a refused or failed read turns stage 0 off with a GAP */
++static int
++sti_rd(struct sti *st, const struct sti_ops *o, uint32_t off, uint32_t *v)
++{
++	unsigned i;
++	int ok = 0;
++
++	*v = 0;
++	for (i = 0; i < sizeof(sti_rows) / sizeof(sti_rows[0]); i++) {
++		if (sti_rows[i] == off) {
++			ok = 1;
++		}
++	}
++	if (!ok || (off & 3u) != 0u) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: read of alive offset %#x refused (not on the read allowlist), stage 0 off, poll continues\n", off);
++		sti_off(st);
++		return -2;
++	}
++	if (o->rd == NULL || o->rd(o->ctx, off, v) != 0) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: read of alive offset %#x failed (no mapping), stage 0 off, poll continues\n", off);
++		sti_off(st);
++		return -1;
++	}
++	return 0;
++}
++
++/* once, from the touch thread: the one-time reads. bank_pa/pin = the irq pad the driver parsed; mapped = the read window exists. 0 = stage 0 on. */
++static int
++sti_start(struct sti *st, const struct sti_ops *o, uint64_t bank_pa, uint32_t pin, int mapped)
++{
++	uint32_t con, dat, econ, eflt, emask, epend;
++
++	st->on = 0;
++	if (st->mode != 2) {
++		return -1;
++	}
++	if (!mapped) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: the alive pin controller window could not be mapped, stage 0 off, poll continues\n");
++		return -1;
++	}
++	if (bank_pa != STI_PAD_PA || pin != 0u) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: the irq pad is bank %#llx pin %u, not gpa9[0], the EINT offsets do not apply, stage 0 off, poll continues\n", (unsigned long long)bank_pa, pin);
++		return -1;
++	}
++	if (sti_rd(st, o, STI_OFF_CON, &con) || sti_rd(st, o, STI_OFF_DAT, &dat) || sti_rd(st, o, STI_OFF_ECON, &econ) ||
++	    sti_rd(st, o, STI_OFF_EFLTCON, &eflt) || sti_rd(st, o, STI_OFF_EMASK, &emask) || sti_rd(st, o, STI_OFF_EPEND, &epend)) {
++		return -1;
++	}
++	if (econ == 0xFFFFFFFFu && eflt == 0xFFFFFFFFu && emask == 0xFFFFFFFFu && epend == 0xFFFFFFFFu) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: all four EINT words read 0xffffffff (window not answering, research 155 U3), stage 0 off, poll continues\n");
++		return -1;
++	}
++	STI_LOG("SWEET TOUCH IRQ0: gpa9 read once: econ %#x [pin0 %u] efltcon %#x [byte0 %#x] emask %#x [bit0 %u] epend %#x [bit0 %u] con %#x [func %#x] dat %#x [pin0 %u]\n",
++	    econ, econ & 0xFu, eflt, eflt & 0xFFu, emask, emask & 1u, epend, epend & 1u, con, con & 0xFu, dat, dat & 1u);
++	st->on = 1;
++	st->last_dat = -1;
++	return 0;
++}
++
++/* one read of the pad DAT word (pin 0), called right before a FIFO read. 0 / 1 = level, -1 = stage 0 is off (the caller then skips every other call) */
++static int
++sti_dat(struct sti *st, const struct sti_ops *o)
++{
++	uint32_t d;
++
++	if (!st->on) {
++		return -1;
++	}
++	if (sti_rd(st, o, STI_OFF_DAT, &d)) {
++		return -1;
++	}
++	if (d == 0xFFFFFFFFu) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: the pad DAT word reads 0xffffffff (window not answering), stage 0 off, poll continues\n");
++		sti_off(st);
++		return -1;
++	}
++	return (int)(d & 1u);
++}
++
++/* reset-wait path: begin = reset released at t0; obs = one iteration (dat read BEFORE the FIFO read, ev = byte 0 of that read); end = the path returns */
++static void
++sti_reset_begin(struct sti *st, uint64_t t0_us)
++{
++	if (!st->on) {
++		return;
++	}
++	st->ri = 0;
++	st->r_dat0 = -1;
++	st->r_last = -1;
++	st->r_chg = 0;
++	st->r_t0 = t0_us;
++}
++
++static void
++sti_reset_obs(struct sti *st, int dat, uint32_t ev, uint64_t now_us)
++{
++	uint32_t i;
++
++	if (!st->on || dat < 0) {
++		return;
++	}
++	i = st->ri++;
++	if (i < STI_RESET_LOG_MAX) {
++		STI_LOG("SWEET TOUCH IRQ0: reset-wait i=%u dat=%d ev=%02x\n", i, dat, ev);
++	}
++	if (st->r_dat0 < 0) {
++		st->r_dat0 = dat;
++	} else if (dat != st->r_dat0 && !st->r_chg) {
++		st->r_chg = 1;
++		STI_LOG("SWEET TOUCH IRQ0: reset-wait first DAT change %d -> %d, %u us after reset release (i=%u)\n", st->r_dat0, dat, (unsigned)(now_us - st->r_t0), i);
++	}
++	st->r_last = dat;
++}
++
++static void
++sti_reset_end(struct sti *st, int ready)
++{
++	if (!st->on) {
++		return;
++	}
++	STI_LOG("SWEET TOUCH IRQ0: reset-wait end: %u samples, dat first %d last %d, %s, controller-ready %s\n", st->ri, st->r_dat0, st->r_last,
++	    st->r_chg ? "DAT changed" : "DAT never changed", ready ? "seen" : "not seen");
++}
++
++static void
++sti_summary(struct sti *st)
++{
++	uint32_t total = st->cnt[0][0] + st->cnt[0][1] + st->cnt[1][0] + st->cnt[1][1];
++	uint32_t good = st->cnt[0][1] + st->cnt[1][0];
++	int v = STI_V_PENDING;
++	const char *vs;
++
++	if (total >= STI_MIN_PASSES) {
++		v = (uint64_t)good * 100u >= (uint64_t)total * STI_GOOD_PCT ? STI_V_OK : STI_V_BAD;
++	}
++	vs = v == STI_V_OK ? "LOW-confirmed" : v == STI_V_BAD ? "NOT-confirmed" : "pending";
++	st->summaries++;
++	STI_LOG("SWEET TOUCH IRQ0: passes %u low/found %u low/empty %u high/found %u high/empty %u edges %u maxrun_low_empty %u drain_err %u verdict %s\n",
++	    total, st->cnt[0][1], st->cnt[0][0], st->cnt[1][1], st->cnt[1][0], st->edges, st->maxrun, st->drain_err, vs);
++	if (total >= STI_MIN_PASSES && (uint64_t)st->cnt[0][0] * 100u > (uint64_t)total * STI_LOWEMPTY_PCT) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: DAT low with an empty FIFO in %u of %u passes (over %u %%): stuck-low or inverted line (research 155 s.6 stage 0 item 3)\n",
++		    st->cnt[0][0], total, STI_LOWEMPTY_PCT);
++	}
++	if (v == STI_V_BAD && st->verdict != STI_V_BAD) {
++		STI_LOG("TOUCH GAP: sweettouchirq=2: polarity LOW not confirmed (%u of %u passes in the two expected cells, need %u %%): do not enable stage 1, write the 2x2 table into the sprint log\n",
++		    good, total, STI_GOOD_PCT);
++	}
++	st->verdict = v;
++}
++
++/* one pass of the main poll loop: dat = sti_dat() before the drain, n = the drain result (-1 = bus error, 0 = empty, > 0 = events handled) */
++static void
++sti_loop_obs(struct sti *st, int dat, int n, uint64_t now_us)
++{
++	if (!st->on || dat < 0) {
++		return;
++	}
++	if (st->last_dat >= 0 && st->last_dat != dat) {
++		st->edges++;
++	}
++	st->last_dat = dat;
++	if (n < 0) {
++		st->drain_err++;
++	} else {
++		st->cnt[dat][n > 0 ? 1 : 0]++;
++		st->passes++;
++		if (dat == 0 && n == 0) {
++			if (++st->run > st->maxrun) {
++				st->maxrun = st->run;
++			}
++		} else {
++			st->run = 0;
++		}
++	}
++	if (!st->tick_init) {
++		st->tick_init = 1;
++		st->tick_us = now_us;
++	} else if (now_us - st->tick_us >= STI_SUMMARY_US) {
++		st->tick_us = now_us;
++		sti_summary(st);
++	}
++}
++/* STI_CORE_END */
++#endif /* SWEET_TOUCH_IRQ0_H */

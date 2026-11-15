@@ -1,0 +1,48 @@
+SWEET synthetic swipe cadence in milliseconds (patch 0220, boot-arg sweetswipems=N, default off; T-359f, G-F55): replaces the whole-second gap between the finger-up of one synthetic swipe (0152) and the finger-down of the next with N ms (N 1..60000; a larger value is ignored with a SWEET GAP line), so a swipe can start while the previous animation still runs. sweetswipe=N must still be set (it enables the swipes, the 120 s start delay and the count of 0155). Logs 'SWEET HID: synthetic swipes every N ms'. Applies on top of 0152/0155. No hardware access, no register or store.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -378,6 +378,7 @@
+ 	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fSwipe;
+ 	UInt32 fSwipeSecs, fSwipeStep, fSwipeCount, fSwipeLimit;
++	UInt32 fSwipeMs;   /* patch 0220: boot-arg sweetswipems=N, milliseconds between swipes (finger-up to next finger-down); 0 = off, use sweetswipe seconds */
+ 	/* patch 0156: scripted taps / swipes (boot-arg sweetscript=T,x,y;T,x0,y0,x1,y1;...): the first step runs T seconds after the touch service started, each later step (T2 - T1) seconds after the previous one finished (so it drifts by the gesture time; equal or decreasing T gives 1 s) */
+ 	static void scriptFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fScript;
+@@ -485,10 +486,26 @@
+ 		if (PE_parse_boot_argn("sweetswipecount", &cnt, sizeof(cnt)) && cnt && cnt <= SWEET_SWIPE_MAX) {
+ 			fSwipeLimit = cnt;
+ 		}
++		/* Patch 0220 (T-359f, G-F55): sweetswipems=N replaces the whole-second gap after each finger-up with N milliseconds, so the next swipe can start while the
++		 * previous animation is still running (the 1 s floor left a 0.5 s idle seam per 2.34 s cycle, T-08c8). Log only, no register or store. 0 / absent = off.
++		 * An N above 60000 is not a cadence a bench wants: ignored with a GAP line (a stub never returns plain success unlogged). */
++		fSwipeMs = 0;
++		UInt32 ms = 0;
++		if (PE_parse_boot_argn("sweetswipems", &ms, sizeof(ms)) && ms) {
++			if (ms > 60000) {
++				IOLog("SWEET GAP: HID sweetswipems=%u ignored (above 60000 ms), using sweetswipe=%u s\n", ms, sw);
++			} else {
++				fSwipeMs = ms;
++			}
++		}
+ 		fSwipe = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::swipeFired);
+ 		if (fSwipe && _hidWorkLoop && _hidWorkLoop->addEventSource(fSwipe) == kIOReturnSuccess) {
+ 			fSwipe->setTimeoutMS(120 * 1000);
+-			IOLog("SWEET HID: synthetic swipes every %u s\n", sw);
++			if (fSwipeMs) {
++				IOLog("SWEET HID: synthetic swipes every %u ms (sweetswipems, sweetswipe=%u s not used for the gap)\n", fSwipeMs, sw);
++			} else {
++				IOLog("SWEET HID: synthetic swipes every %u s\n", sw);
++			}
+ 		}
+ 	}
+ 	/* Patch 0156: boot-arg sweetscript="T,x,y;T,x0,y0,x1,y1;..." (tap = 3 numbers, swipe = 5): a scripted touch sequence for UI tests (launch an
+@@ -607,7 +624,7 @@
+ 		self->touch(0, false, gx1[g], gy1[g]);
+ 		self->fSwipeStep = 0;
+ 		self->fSwipeCount++;
+-		sender->setTimeoutMS(self->fSwipeCount >= self->fSwipeLimit ? 6000 : self->fSwipeSecs * 1000);
++		sender->setTimeoutMS(self->fSwipeCount >= self->fSwipeLimit ? 6000 : (self->fSwipeMs ? self->fSwipeMs : self->fSwipeSecs * 1000));   /* patch 0220: ms cadence */
+ 	}
+ }
+ 

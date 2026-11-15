@@ -1,0 +1,82 @@
+diff --git a/bsd/dev/sweet_gpu_gs101.c b/bsd/dev/sweet_gpu_gs101.c
+index 108f077..8f197b5 100644
+--- a/bsd/dev/sweet_gpu_gs101.c
++++ b/bsd/dev/sweet_gpu_gs101.c
+@@ -14,6 +14,7 @@
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
+ #include <stdint.h>
++#include "sweet_gpu_pll.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ extern void sweet_gpu_job_run(volatile uint32_t *gpu, int s2mpu_open);   /* bsd/dev/sweet_gpu_job.c, only with boot-arg sweetgpujob=1 */
+@@ -85,6 +86,16 @@ sweet_gpu_gs101_init(void)
+ 		printf("SWEET GPU: CMU_G3D mux not selected, GPU block not touched\n");
+ 		return;
+ 	}
++	{
++		/* Read-only PLL words, same gate as the mux print above (patch 0203, T-4aa8): PLL_G3D at +0x140, PLL_G3D_L2 at +0x180, CON0..CON4 each */
++		uint32_t pg[5], pl[5];
++		for (unsigned i = 0; i < 5; i++) {
++			pg[i] = cmu[(0x140 + 4 * i) / 4];
++			pl[i] = cmu[(0x180 + 4 * i) / 4];
++		}
++		sg_pll_print("g3d", pg, printf);
++		sg_pll_print("g3dl2", pl, printf);
++	}
+ 	volatile uint32_t *g = sg_map(mali, 0x5000);
+ 	if (g == NULL) {
+ 		return;
+diff --git a/bsd/dev/sweet_gpu_pll.h b/bsd/dev/sweet_gpu_pll.h
+new file mode 100644
+index 0000000..df5ed3a
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_pll.h
+@@ -0,0 +1,47 @@
++/*
++ * CMU_G3D PLL_CON word decode for the read-only boot print (patch 0203), plain C so tools/test_0203_gpu_pll_print.py compiles this very text on the host.
++ * PLL_G3D = CMU_G3D +0x140 (CON0..CON4 at +0x140/+0x144/+0x148/+0x14C/+0x150), PLL_G3D_L2 = +0x180 (same stride): offsets read from source
++ * (soc-gs flexpmu_cal_local_gs101.h, docs/research/27 addendum 3). CON3 layout: ENABLE bit 31, LOCK bit 29, MDIV [25:16], PDIV [13:8], SDIV [2:0];
++ * kHz = 24576 * MDIV / (PDIV << SDIV). [read from source: Linux clk-pll.c pll_0516x/0517x/0518x; guess that CMU_G3D's PLLs use the same type as CMU_TOP's;
++ * confirmed ONLY by one match: observed CON3 0xA0620402 -> 24576 x 98 / (4 << 2) = 150528 kHz = the firmware's 151000 kHz init level, docs/research/27.]
++ * Nothing here touches hardware; the caller reads the five words.
++ */
++#ifndef SWEET_GPU_PLL_H
++#define SWEET_GPU_PLL_H
++#include <stdint.h>
++
++#define SG_PLL_OSC_KHZ 24576u
++
++struct sg_pll {
++	uint32_t en, lock, mdiv, pdiv, sdiv;
++	uint32_t khz;      /* 0 when pdiv == 0 (undecodable) */
++	int      gap;      /* 1 when pdiv == 0 */
++};
++
++static inline void
++sg_pll_decode(uint32_t con3, struct sg_pll *p)
++{
++	p->en   = (con3 >> 31) & 1u;
++	p->lock = (con3 >> 29) & 1u;
++	p->mdiv = (con3 >> 16) & 0x3FFu;
++	p->pdiv = (con3 >> 8) & 0x3Fu;
++	p->sdiv = con3 & 7u;
++	p->gap = (p->pdiv == 0);
++	p->khz = p->gap ? 0 : (uint32_t)(((uint64_t)SG_PLL_OSC_KHZ * p->mdiv) / ((uint64_t)p->pdiv << p->sdiv));
++}
++
++/* pf is printf (kernel) or a capturing stand-in (host test). con[0..4] = PLL_CON0..CON4. Rule 8: pdiv == 0 prints a counted `GPU GAP:` line. */
++static inline void
++sg_pll_print(const char *name, const uint32_t con[5], int (*pf)(const char *, ...))
++{
++	struct sg_pll p;
++
++	sg_pll_decode(con[3], &p);
++	pf("SWEET GPU: PLL %s con0=%#x con1=%#x con2=%#x con3=%#x con4=%#x en=%u lock=%u mdiv=%u pdiv=%u sdiv=%u khz=%u\n",
++	    name, con[0], con[1], con[2], con[3], con[4], p.en, p.lock, p.mdiv, p.pdiv, p.sdiv, p.khz);
++	if (p.gap) {
++		pf("GPU GAP: PLL %s con3=%#x has pdiv=0, khz not decodable (printed khz=0)\n", name, con[3]);
++	}
++}
++
++#endif /* SWEET_GPU_PLL_H */

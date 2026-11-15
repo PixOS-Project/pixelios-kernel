@@ -102,8 +102,30 @@ main(void)
 	assert(ftm5_parse_event(e).kind == FTM5_IGNORED);
 	mk(e, 0xF3, 0, 2, 0, 0, 0);    /* error: hard fault */
 	assert(ftm5_parse_event(e).kind == FTM5_IGNORED);
-	mk(e, 0x14, 0, 1, 0, 0, 0);    /* right class nibble, wrong low nibble */
+	/* patch 0348: dispatch on the high nibble (fts.c:4570); bits 3:2 = touch major high bits (fts.c:3083), as seen on hardware */
+	mk(e, 0x27, 1, FTM5_TYPE_FINGER, 500, 1200, 0);
+	assert(ftm5_parse_event(e).kind == FTM5_DOWN && ftm5_parse_event(e).id == 1);
+	assert(ftm5_parse_event(e).x == 500 && ftm5_parse_event(e).y == 1200);
+	mk(e, 0x2f, 1, FTM5_TYPE_FINGER, 501, 1201, 0);
+	assert(ftm5_parse_event(e).kind == FTM5_DOWN && ftm5_parse_event(e).x == 501);
+	mk(e, 0x2b, 1, FTM5_TYPE_FINGER, 502, 1202, 0);
+	assert(ftm5_parse_event(e).kind == FTM5_DOWN && ftm5_parse_event(e).y == 1202);
+	mk(e, 0x17, 2, FTM5_TYPE_FINGER, 10, 20, 0);
+	assert(ftm5_parse_event(e).kind == FTM5_DOWN && ftm5_parse_event(e).id == 2);
+	mk(e, 0x3f, 1, FTM5_TYPE_FINGER, 0, 0, 0);     /* the missed leave behind the 5.8 s stuck contact */
+	assert(ftm5_parse_event(e).kind == FTM5_UP && ftm5_parse_event(e).id == 1);
+	mk(e, 0x14, 0, 1, 0, 0, 0);    /* class 1 = enter whatever the low nibble (Linux does the same) */
+	assert(ftm5_parse_event(e).kind == FTM5_DOWN);
+	mk(e, 0x07, 0, 0, 0, 0, 0);    /* class 0, non-zero = controller ready handler */
+	assert(ftm5_parse_event(e).kind == FTM5_READY);
+	mk(e, 0xE3, 0, 0, 0, 0, 0);    /* debug: known, unused */
 	assert(ftm5_parse_event(e).kind == FTM5_IGNORED);
+	mk(e, 0x53, 0, 0, 0, 0, 0);    /* user report: known, unused */
+	assert(ftm5_parse_event(e).kind == FTM5_IGNORED);
+	for (unsigned c = 0x6u; c <= 0xDu; c++) {   /* classes with no handler: reported, never silent */
+		mk(e, (uint8_t)(c << 4 | 0x3u), 0, 1, 0, 0, 0);
+		assert(ftm5_parse_event(e).kind == FTM5_UNKNOWN);
+	}
 
 	/* scale: the panel is 1079x2399 raw onto 1080x2400, so it is the identity */
 	for (int v = 0; v <= 1079; v++) {

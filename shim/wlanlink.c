@@ -30,7 +30,7 @@ _Static_assert(WLAN_MEM == 0x60000000UL, "WLAN_MEM must be the pcie_1 MEM range 
 #endif
 _Static_assert(WLAN_LINK_N <= WLAN_SEQ_LAST, "--wlan-link=N: N beyond the last step of the table");
 
-#define DELAY_MAX_US	250000u
+#define DELAY_MAX_US	250000ull
 #define POLL_CAP	20000u
 #define ST_OK		0
 #define ST_TIMEOUT	1

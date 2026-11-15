@@ -59,9 +59,9 @@ class G(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
         self.assertIn("overlapping", r.stdout)
         os.remove(os.path.join(self.d, "xnu/patches/0102-wlan.patch")); self.git("rm", "-q", "--cached", "xnu/patches/0102-wlan.patch")
-        self.w("xnu/patches/0150-free.patch", "f"); self.git("add", "-A")
+        self.w("xnu/patches/0103-free.patch", "f"); self.git("add", "-A")
         self.assertEqual(self.pn("precommit").returncode, 0)
-        self.assertIn("RESERVED by", self.pn("status").stdout.split("0150")[1])  # reserved for everyone by the commit
+        self.assertIn("RESERVED by", self.pn("status").stdout.split("\n0103  ")[1])  # reserved for everyone by the commit
 
     def test_cd_chain_absolute_path_foreign_repo_and_heredoc(self):
         sup = tempfile.mkdtemp(prefix="psuper-"); self.addCleanup(shutil.rmtree, sup)
@@ -86,6 +86,38 @@ class G(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else "allow"
 
+    def test_upstream_tree_writes_are_denied_reads_pass(self):
+        """R11 / T-eff6: the fetched upstream XNU tree (xnu-pristine, localbuild/work/<label>/xnu) is never written by the agent."""
+        pr = os.path.join(self.d, "art/xnu-pristine/bsd/kern/kern_proc.c")
+        wk = os.path.join(self.d, "art/localbuild/work/lab1/xnu/osfmk/arm64/x.c")
+        for tool in ("Write", "Edit", "MultiEdit"):
+            self.assertEqual(self.hook(tool_name=tool, tool_input={"file_path": pr}), "deny", tool)
+        self.assertEqual(self.hook(tool_name="Write", tool_input={"file_path": wk}), "deny")
+        self.assertEqual(self.hook(tool_name="Write", tool_input={"file_path": os.path.join(self.d, "art/localbuild/work/lab1/build.log")}), "allow")
+        self.assertEqual(self.hook(tool_name="Write", tool_input={"file_path": os.path.join(self.d, "art/xnu-pristine-notes.md")}), "allow")
+        sup = self.d
+        for cmd in ("sed -i 's/a/b/' /h/pixelios-artifacts/xnu-pristine/bsd/kern/kern_proc.c",
+                    "echo x >> /h/pixelios-artifacts/xnu-pristine/README",
+                    "cp /tmp/f /h/pixelios-artifacts/localbuild/work/lab1/xnu/bsd/f.c",
+                    "cd /h/pixelios-artifacts/xnu-pristine && patch -p1 < /tmp/x.diff",
+                    "cd /h/pixelios-artifacts/xnu-pristine && git apply /tmp/x.diff",
+                    "rm -rf /h/pixelios-artifacts/xnu-pristine/doc",
+                    "tee /h/pixelios-artifacts/xnu-pristine/f < /tmp/x"):
+            self.assertEqual(self.hook2(sup, cmd), "deny", cmd)
+        for cmd in ("grep -rn BTOpenPath /h/pixelios-artifacts/xnu-pristine/bsd",
+                    "cat /h/pixelios-artifacts/xnu-pristine/README > /tmp/readme.txt",
+                    "cp /h/pixelios-artifacts/xnu-pristine/bsd/f.c /tmp/f.c",
+                    "diff -u /h/pixelios-artifacts/xnu-pristine/a.c /tmp/a.c > /tmp/a.diff",
+                    "sed -n 1,5p /h/pixelios-artifacts/xnu-pristine/README",
+                    "git commit -m 'never sed -i xnu-pristine/x' -- f",
+                    "cat <<'EOF' > /tmp/doc.md\nsed -i x xnu-pristine/f\nEOF",
+                    "ls /h/pixelios-artifacts/localbuild/work/lab1/build.log"):
+            self.assertEqual(self.hook2(sup, cmd), "allow", cmd)
+        out = subprocess.run([sys.executable, os.path.join(self.d, "tools/patch-guard")], input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": pr}, "cwd": self.d}),
+                             env=self.env, capture_output=True, text=True).stdout
+        why = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("Instead:", why); self.assertIn("xnu/patches/", why); self.assertIn("Escape:", why); self.assertIn("R11", why)
+
     def test_broken_guard_fails_open(self):
         os.remove(os.path.join(self.d, "tools/patch-numbers"))  # the guard's helper is gone: no decision, exit 0
         self.assertEqual(self.hook(tool_name="Write", tool_input={"file_path": os.path.join(self.d, "xnu/patches/0190-x.patch")}), "allow")
@@ -102,14 +134,13 @@ class G(unittest.TestCase):
         # M1: a stray reservation ref must not break the hook
         blob = self.git("hash-object", "-w", "--stdin").stdout if False else subprocess.run(["git", "-C", self.d, "hash-object", "-w", "--stdin"], input="o\nn\n", env=self.env, capture_output=True, text=True).stdout.strip()
         self.git("update-ref", "refs/patch-numbers/junk", blob)
-        self.w("xnu/patches/0150-free.patch", "f"); self.git("add", "-A")
+        self.w("xnu/patches/0103-free.patch", "f"); self.git("add", "-A")
         self.assertEqual(self.pn("precommit").returncode, 0)
 
     def test_installed_hook_fails_open_but_blocks_a_collision(self):
         self.pn("install-hook")
         hook = os.path.join(self.d, ".git/hooks/pre-commit")
-        text = open(hook).read().replace("$HOME/.t3/worktrees/common-tools/kernel/tools/patch-numbers", os.path.join(self.d, "tools/patch-numbers"))
-        open(hook, "w").write(text); os.chmod(hook, 0o755)
+        self.assertNotIn("common-tools", open(hook).read())   # AP-241: the hook must not point at a worktree that can be deleted
         self.git("checkout", "-qb", "wifi2"); self.w("xnu/patches/0102-wlan.patch", "w"); self.git("add", "-A")
         r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "x"], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)          # collision with gpu's 0102: blocked
@@ -118,6 +149,23 @@ class G(unittest.TestCase):
         self.w("docs.txt", "d"); self.git("add", "docs.txt")
         r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "doc"], env=self.env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_installed_hook_missing_script_is_loud(self):
+        self.pn("install-hook")
+        os.remove(os.path.join(self.d, "tools/patch-numbers"))
+        self.w("docs.txt", "d"); self.git("add", "docs.txt")
+        r = subprocess.run(["git", "-C", self.d, "commit", "-qm", "doc"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("patch numbers NOT checked", r.stderr)
+
+    def test_installed_hook_blocks_a_collision_from_a_linked_worktree(self):
+        # review patch-hook-toplevel-r1 F2: the real failure case is a commit in a LINKED worktree (hooks are shared through the common dir)
+        self.pn("install-hook")
+        wt = self.d + "-wt"; self.addCleanup(shutil.rmtree, wt, True)
+        self.git("worktree", "add", "-q", "-b", "wifi3", wt)
+        with open(os.path.join(wt, "xnu/patches/0102-wlan.patch"), "w") as f: f.write("w")
+        subprocess.run(["git", "-C", wt, "add", "-A"], env=self.env, check=True)
+        r = subprocess.run(["git", "-C", wt, "commit", "-qm", "x"], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0, r.stderr); self.assertIn("overlapping", r.stderr + r.stdout)
 
     def test_claim(self):
         self.assertEqual(self.pn("claim", "0140", "--owner", "a", "--name", "foo").returncode, 0)

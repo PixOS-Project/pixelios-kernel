@@ -49,6 +49,13 @@ static int poll_fault, time_frozen;
 static uint64_t now, fake_freq;
 /* M_OK answers after apm_delay polls; M_NEVER never completes (the request stays pending); M_NOREPLY takes the request but sends no reply */
 enum { M_OK, M_NEVER, M_NOREPLY, M_RET, M_BADSEQ } mode;
+static unsigned fail_rd_n, rd_seen;	/* pmicsrc_host_test: the fail_rd_n-th FUNC_READ (1-based) answers with an APM RETURN error, 0 = none */
+/* pmicsrc_clear_host_test: FUNC_WRITE (fn 1, cmd[1] WRITE_VAL [15:8]) is applied to pmic[reg] and logged as (w0 without the seq, w1); the fail_wr_n-th write answers with an APM RETURN error and is
+ * not applied; ignore_wr acknowledges every write without applying it (a latch that does not clear). */
+static struct { uint32_t w0, w1; } wrlog[16];
+static unsigned nwr, fail_wr_n, nfn;
+static char fnseq[64];	/* the FUNC of every request the APM completed, in order: 'R' read, 'W' write, 'U' update */
+static int ignore_wr;
 static unsigned apm_delay, apm_left, apm_busy;
 static unsigned busy_writes, replay_hazard;	/* the fake's verdicts: writes the real APM would be hurt by */
 static uint32_t apm_w[4], apm_slot_o;
@@ -85,9 +92,21 @@ static void apm_complete(void)	/* the APM finishes its transaction: only now doe
 	r0 = apm_w[0] + (mode == M_BADSEQ ? (1u << 16) : 0);
 	if (fn == 2 && !fail_upd && !ignore_upd)
 		pmic[reg] = (pmic[reg] & ~mask) | (val & mask);
+	if (nfn < sizeof(fnseq) - 1)
+		fnseq[nfn++] = fn == 0 ? 'R' : fn == 1 ? 'W' : fn == 2 ? 'U' : '?';
+	if (fn == 1) {
+		assert(nwr < 16);
+		wrlog[nwr].w0 = apm_w[0] & 0xffffu;
+		wrlog[nwr].w1 = apm_w[1];
+		nwr++;
+		if (!ignore_wr && !(fail_wr_n && nwr == fail_wr_n))
+			pmic[reg] = val;
+	}
 	if (fn == 2 && bump_out1)
 		pmic[0x16]++;
-	r1 = (fn == 0 ? pmic[reg] << 8 : 0) | (mode == M_RET || (fn == 2 && fail_upd) || (fn == 0 && reg == 0x16 && fail_r16) ? 2u << 24 : 0);
+	if (fn == 0)
+		rd_seen++;
+	r1 = (fn == 0 ? pmic[reg] << 8 : 0) | (mode == M_RET || (fn == 0 && fail_rd_n && rd_seen == fail_rd_n) || (fn == 2 && fail_upd) || (fn == 1 && fail_wr_n && nwr == fail_wr_n) || (fn == 0 && reg == 0x16 && fail_r16) ? 2u << 24 : 0);
 	setS(RSP_BASE_O + ESZ * sf + 0, r0);
 	setS(RSP_BASE_O + ESZ * sf + 4, r1);
 	setS(RSP_FRONT_O, (sf + 1) % QLEN);
@@ -169,6 +188,10 @@ static void setup(uint32_t q_elem_size)	/* the descriptor's q_elem_size as the A
 	memset(wlog, 0, sizeof(wlog));
 	nw = stray = nbell = 0;
 	fail_upd = ignore_upd = bump_out1 = fail_r16 = 0;
+	fail_rd_n = rd_seen = 0;
+	nwr = fail_wr_n = nfn = 0;
+	memset(fnseq, 0, sizeof(fnseq));
+	ignore_wr = 0;
 	bad_rpa = bad_wpa = 0;
 	wfaults = poll_fault = time_frozen = 0;
 	mode = M_OK;
@@ -547,7 +570,7 @@ static void test_guard(void)
 	setup(ESZ);
 	assert(acpm_describe(&cfg, &h) == ACPM_OK);
 	slot = h.req_base_pa + 16 * h.rf;
-	acpm_guard(&g, &cfg, &h, slot);
+	acpm_guard(&g, &cfg, &h, slot, ACPM_ELEM_BYTES);
 	assert(g.armed && g.slot_ok && g.front_ok && !g.rear_ok);
 	assert(g.slot_lo == want_slot && g.slot_hi == want_slot + 16);			/* exactly one 16-byte slot */
 	assert(g.front_pa == SRAM + REQ_FRONT_O && g.front_new == 0);
@@ -602,6 +625,9 @@ static void test_describe_and_text(void)
 	setup(64);
 	assert(acpm_describe(&cfg, &h) == ACPM_E_DESC && h.why == ACPM_W_ESZ && h.have_desc && h.d[14] == 64 && h.esz_b == 64 && h.qlen == QLEN);
 	assert(acpm_qword(&cfg, &h, 0, 0, &v) && v == GARB(REQ_BASE_O / 4));
+	/* review 0363 finding 7: acpm_describe is the 16-byte-only client: a 32-byte channel (the SLC element size) is refused here */
+	setup(32);
+	assert(acpm_describe(&cfg, &h) == ACPM_E_DESC && h.why == ACPM_W_ESZ && h.esz_b == 32);
 	setup(ESZ);
 	setS(desc_off() + 0x18, SRAMSZ + 4);	/* a base outside SRAM: no dump */
 	assert(acpm_describe(&cfg, &h) == ACPM_E_DESC && !acpm_qword(&cfg, &h, 0, 0, &v));

@@ -1,0 +1,174 @@
+SWEET nav witnesses (patch 0247, T-3c9c, G-10b-nav; R0 log only, no register or memory write outside the patch's own statics): (W1) boot-arg sweetfps=2 (sweetfps=1 unchanged) adds a dense 64x64 cell-centre grid to the per-swap sample of 0141, compared sample by sample with the previous swap, and appends ` distinct4k N small_chg M` to the SWEET FPS line (old fields unchanged; small_chg = swaps with 1-2 changed samples), loud SWEET FPS GAP when the surface is smaller than 64x64; (W3) SWEET PROCCPU gets a third process, the Settings app (p_comm Preferences): ` pf_pid P pf_us U` appended, one line per pid change (-1 = not running) and a task_info-failed line; (W4) the nav action app-launch of 0243 taps icon rep%3 of Stocks / Tips / Shortcuts (coordinates read off the nav2 camera frame) instead of the Settings-icon tap that opened no app, and logs `SWEET NAV: app-launch icon K at X,Y`.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -555,6 +555,9 @@ struct pc_find {
+ 	int bb_pid, sb_pid;
+ 	uint64_t bb_us, sb_us;
+ 	int bb_kr, sb_kr;   /* 0 = task_info ok; else its error, or -1 when proc_task() was NULL (review pg0-r1 F4) */
++	int pf_pid;   /* patch 0244: the Settings app, p_comm "Preferences" (docs/research/B-A6-dangling-machservices.md names the process) */
++	uint64_t pf_us;
++	int pf_kr;
+ };
+ 
+ static int
+@@ -563,7 +566,8 @@ pc_callout(proc_t p, void *arg)
+ 	struct pc_find *f = (struct pc_find *)arg;
+ 	const char *nm = proc_name_address(p);
+ 	int is_bb = (strncmp(nm, "backboardd", MAXCOMLEN) == 0), is_sb = (strncmp(nm, "SpringBoard", MAXCOMLEN) == 0);
+-	if (is_bb || is_sb) {
++	int is_pf = (strncmp(nm, "Preferences", MAXCOMLEN) == 0);
++	if (is_bb || is_sb || is_pf) {
+ 		task_t t = proc_task(p);
+ 		task_absolutetime_info_data_t ti;
+ 		mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
+@@ -581,10 +585,14 @@ pc_callout(proc_t p, void *arg)
+ 			f->bb_pid = proc_pid(p);
+ 			f->bb_us = us;
+ 			f->bb_kr = kr;
+-		} else {
++		} else if (is_sb) {
+ 			f->sb_pid = proc_pid(p);
+ 			f->sb_us = us;
+ 			f->sb_kr = kr;
++		} else {
++			f->pf_pid = proc_pid(p);
++			f->pf_us = us;
++			f->pf_kr = kr;
+ 		}
+ 	}
+ 	return PROC_RETURNED;
+@@ -593,8 +601,8 @@ pc_callout(proc_t p, void *arg)
+ static void
+ sm_proccpu_line(void)
+ {
+-	static int bb_said, sb_said, bb_tf_said, sb_tf_said;
+-	struct pc_find f = { -1, -1, 0, 0, 0, 0 };
++	static int bb_said, sb_said, bb_tf_said, sb_tf_said, pf_tf_said, pf_last_pid = -2;
++	struct pc_find f = { -1, -1, 0, 0, 0, 0, -1, 0, 0 };
+ 	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, pc_callout, &f, NULL, NULL);
+ 	if (f.bb_pid < 0 && !bb_said) {
+ 		bb_said = 1;
+@@ -612,7 +620,16 @@ sm_proccpu_line(void)
+ 		sb_tf_said = 1;
+ 		printf("SWEET PROCCPU: SpringBoard pid %d task_info failed (%d)\n", f.sb_pid, f.sb_kr);
+ 	}
+-	printf("SWEET PROCCPU: bb_pid %d bb_us %llu sb_pid %d sb_us %llu\n", f.bb_pid, f.bb_us, f.sb_pid, f.sb_us);
++	/* patch 0244: every change of the Settings app's pid is a line (-1 = not running: it has not been launched yet, or it died), so an app that dies at once shows */
++	if (f.pf_pid != pf_last_pid) {
++		printf("SWEET PROCCPU: Preferences pid %d (was %d)%s\n", f.pf_pid, pf_last_pid, f.pf_pid < 0 ? " not running" : "");
++		pf_last_pid = f.pf_pid;
++	}
++	if (f.pf_pid >= 0 && f.pf_kr != 0 && !pf_tf_said) {
++		pf_tf_said = 1;
++		printf("SWEET PROCCPU: Preferences pid %d task_info failed (%d)\n", f.pf_pid, f.pf_kr);
++	}
++	printf("SWEET PROCCPU: bb_pid %d bb_us %llu sb_pid %d sb_us %llu pf_pid %d pf_us %llu\n", f.bb_pid, f.bb_us, f.sb_pid, f.sb_us, f.pf_pid, f.pf_us);
+ }
+ 
+ /*
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -750,15 +750,18 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	 * content differs from the previous one ("distinct") and the longest gap between distinct frames in the second ("jank"). One
+ 	 * line per second that had a distinct frame (an idle second prints every 10th). Read-only.
+ 	 */
+-	static int fps_on = -1;
++	static int fps_on = -1, fps_dense;
+ 	if (fps_on < 0) {
+ 		int v = 0;
+ 		fps_on = (PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		fps_dense = (fps_on && v == 2) ? 1 : 0;   /* patch 0244: sweetfps=2 adds the dense 64x64 witness below */
+ 	}
+ 	if (!fps_on) {
+ 		return;
+ 	}
+ 	static uint32_t last_hash, n_swaps, n_dist, idle_secs;
++	static uint32_t n_dist4k, n_small, dense_prev[64 * 64];   /* patch 0244 */
++	static bool dense_have, dense_gap_said;
+ 	static uint64_t sec_start, last_dist_t, max_gap_ns;
+ 	uint64_t now_ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+@@ -777,6 +780,38 @@ AppleCLCD::swap(const uint8_t *rec)
+ 				hash = (hash ^ px) * 16777619u;
+ 			}
+ 		}
++		if (fps_dense) {
++			/*
++			 * Dense witness (patch 0244, boot-arg sweetfps=2, log only, G-10b-nav W1): a 64x64 grid at the CENTRE of each cell (x = (2gx+1)(w-1)/128), so it
++			 * shares no point with the 32x32 grid above, compared sample by sample with the previous swap. distinct4k = swaps with >= 1 changed sample,
++			 * small_chg = swaps with 1 or 2 changed samples (a change the 32x32 grid can easily miss). ~4096 loads per swap (the cost of this mode).
++			 */
++			if (s->width >= 64 && s->height >= 64) {
++				uint32_t changed = 0, k = 0;
++				for (uint32_t gy = 0; gy < 64; gy++) {
++					const uint8_t *drow = (const uint8_t *)(s->kernelAddress() + s->offset +
++					    (uint64_t)((uint64_t)(2 * gy + 1) * (s->height - 1) / 128) * s->bytesPerRow);
++					for (uint32_t gx = 0; gx < 64; gx++) {
++						uint32_t px;
++						memcpy(&px, drow + (uint64_t)((uint64_t)(2 * gx + 1) * (s->width - 1) / 128) * 4, 4);
++						if (dense_have && px != dense_prev[k]) {
++							changed++;
++						}
++						dense_prev[k++] = px;
++					}
++				}
++				if (dense_have && changed > 0) {
++					n_dist4k++;
++					if (changed <= 2) {
++						n_small++;
++					}
++				}
++				dense_have = true;
++			} else if (!dense_gap_said) {
++				dense_gap_said = true;
++				IOLog("SWEET FPS GAP: sweetfps=2 dense grid needs a surface >= 64x64, got %ux%u: distinct4k stays 0\n", (unsigned)s->width, (unsigned)s->height);
++			}
++		}
+ 		n_swaps++;
+ 		if (hash != last_hash) {
+ 			n_dist++;
+@@ -792,10 +827,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		sec_start = now_ns;
+ 	}
+ 	if (now_ns - sec_start >= 1000000000ull) {
+-		if (n_dist > 0 || (++idle_secs % 10) == 0) {
+-			IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000));
++		if (n_dist > 0 || n_dist4k > 0 || (++idle_secs % 10) == 0) {
++			if (fps_dense) {
++				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u distinct4k %u small_chg %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000), n_dist4k, n_small);
++			} else {
++				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000));
++			}
+ 		}
+-		n_swaps = n_dist = 0;
++		n_swaps = n_dist = n_dist4k = n_small = 0;
+ 		max_gap_ns = 0;
+ 		sec_start = now_ns;
+ 	}
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -660,10 +660,23 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLog("SWEET NAV: done reps %u\n", self->fNavReps);   /* the host stops on this line */
+ 		return;
+ 	}
+-	const SweetNavAct *a = &sweetNavActs[i];
++	SweetNavAct act = sweetNavActs[i];
++	if (strcmp(act.name, "app-launch") == 0) {
++		/* patch 0244 (T-3c9c): the Settings-icon tap of nav1/nav2 opened no app (camera frames: the same home page after the tap). Repetition r taps icon r%3 of the home
++		 * page the session is on after app-home: Stocks, Tips, Shortcuts. Touch coordinates read off the nav2 app-launch camera frame (an anchor check: the same mapping puts
++		 * the Settings icon of the home-page-prev frame at 640,1717 against the calibrated 676,1720), +-30 px [guess until the frame of the new boot]. */
++		static const short icons[3][2] = { { 398, 300 }, { 665, 1158 }, { 907, 883 } };
++		unsigned k = self->fNavRep % 3;
++		act.x0 = icons[k][0];
++		act.y0 = icons[k][1];
++	}
++	const SweetNavAct *a = &act;
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+ 	if (st == 0) {
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++		if (a == &act && strcmp(a->name, "app-launch") == 0) {
++			IOLog("SWEET NAV: app-launch icon %u at %d,%d\n", self->fNavRep % 3, (int)a->x0, (int)a->y0);
++		}
+ 	}
+ 	if (a->kind != 2 && st <= ticks) {
+ 		int x = a->x0 + (a->x1 - a->x0) * (int)st / (int)ticks;

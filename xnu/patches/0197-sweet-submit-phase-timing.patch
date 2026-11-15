@@ -1,0 +1,249 @@
+SWEET Mali selector-3 (GPU submit) phase timing (patch 0197, boot-arg sweetsubmittm=1, default off; R0 LOG ONLY: no register access added, no behaviour change; PLAN-60FPS P-G1 slice 9, ticket T-fb3e, docs/reviews/T-eb7b-proof.md "Named next cut"): per second one line `SWEET MALI SUBMIT: calls N done D err E waited W sleeps S fl_us .. pre_us .. sml_us .. loop_us .. mmio_us .. wake_us .. post_us .. total_us .. cpu_us .. cpu_loop_us .. max_total_us ..` = summed wall time of the phases of SweetMaliUserClient::externalMethod case 3 / sweet_mali_submit (client lock wait, owns() pre-work, sm_lock wait, wait-behind-previous-job loop, MMIO start sequence, thread_wakeup, unlock/return) and the thread's own CPU time (thread_get_runtime_self) in the call and inside the loop; field meanings in the comment above tm_on in bsd/dev/sweet_mali.c. Needs patches 0104, 0105, 0145. Code: bsd/dev/sweet_mali.c, bsd/dev/sweet_mali.h, iokit/Kernel/arm/SweetMali.cpp.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -389,6 +389,119 @@ sm_proccpu_line(void)
+ 	printf("SWEET PROCCPU: bb_pid %d bb_us %llu sb_pid %d sb_us %llu\n", f.bb_pid, f.bb_us, f.sb_pid, f.sb_us);
+ }
+ 
++/*
++ * Selector 3 phase timing (patch 0197, boot-arg sweetsubmittm=1, default off; docs/reviews/T-eb7b-proof.md "Named next cut"): R0 LOG ONLY, no register access added, no
++ * behaviour change; with the boot-arg off every hook returns after one load. Per second one line
++ * `SWEET MALI SUBMIT: calls N done D err E waited W sleeps S fl_us .. pre_us .. sml_us .. loop_us .. mmio_us .. wake_us .. post_us .. total_us .. cpu_us .. cpu_loop_us .. max_total_us ..`
++ * Phases of one successful call, wall time summed over the second (mach ticks, converted at print):
++ *   fl    SweetMaliUserClient::externalMethod entry -> client lock fLock held
++ *   pre   fLock held -> sweet_mali_submit entry (owns(), logging checks)
++ *   sml   sweet_mali_submit entry -> sm_lock held (lock wait; sm_thread holds it while polling)
++ *   loop  sm_lock held -> wait-behind-previous-job loop done (SLEEPS while a job is in flight: submit_wait of SWEET PERF)
++ *   mmio  loop done -> the JS_COMMAND_NEXT start write done (3 refuse-check reads + bookkeeping + 6 writes)
++ *   wake  start write done -> thread_wakeup(sm.thread) returned
++ *   post  thread_wakeup returned -> back in externalMethod after sm_lock and fLock were released
++ *   total externalMethod entry -> post end (= fl+pre+sml+loop+mmio+wake+post, up to the clock reads between them)
++ * cpu_us = CPU time the thread itself ran inside the call (thread_get_runtime_self, user+kernel), cpu_loop_us the part of it inside `loop`: wall - cpu is time the
++ * thread was blocked or preempted. waited = calls that found a job in flight on first check, sleeps = sleep iterations of the loop, err = non-zero returns (their
++ * phases are not summed), done = calls closed by the post hook (calls - done is at most the calls in flight at the snapshot).
++ */
++static int tm_on = -1;
++static uint64_t tm_calls, tm_waited, tm_sleeps, tm_fl, tm_pre, tm_sml, tm_loop, tm_mmio, tm_wake, tm_cpu_loop;   /* under sm_lock (ticks, except counts) */
++static uint64_t tm_done, tm_err, tm_post, tm_total, tm_cpu, tm_max;                                              /* atomics (post hook runs without sm_lock) */
++
++static int
++tm_enabled(void)
++{
++	if (tm_on < 0) {
++		int v = 0;
++		tm_on = (PE_parse_boot_argn("sweetsubmittm", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		if (tm_on) {
++			printf("SWEET MALI SUBMIT: on (phase timing of selector 3, log only; fields in patch 0197)\n");
++		}
++	}
++	return tm_on;
++}
++
++static uint64_t
++tm_ticks(void)
++{
++	uint64_t t;
++	clock_get_uptime(&t);
++	return t;
++}
++
++static uint64_t
++tm_to_us(uint64_t ticks)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(ticks, &ns);
++	return ns / 1000;
++}
++
++void
++sweet_mali_tm_begin(struct sweet_mali_submit_tm *tm)
++{
++	bzero(tm, sizeof(*tm));
++	if (tm_enabled()) {
++		tm->on = 1;
++		tm->t_entry = tm_ticks();
++		tm->cpu_entry = thread_get_runtime_self();
++	}
++}
++
++void
++sweet_mali_tm_flock(struct sweet_mali_submit_tm *tm)
++{
++	if (tm->on) {
++		tm->t_flock = tm_ticks();
++	}
++}
++
++void
++sweet_mali_submit_tm_post(const struct sweet_mali_submit_tm *tm, int ret)
++{
++	if (!tm->on) {
++		return;
++	}
++	if (ret != 0) {
++		os_atomic_add(&tm_err, 1, relaxed);
++		return;
++	}
++	uint64_t now = tm_ticks(), tot = now - tm->t_entry;
++	os_atomic_add(&tm_done, 1, relaxed);
++	os_atomic_add(&tm_post, now - tm->t_done, relaxed);
++	os_atomic_add(&tm_total, tot, relaxed);
++	os_atomic_add(&tm_cpu, thread_get_runtime_self() - tm->cpu_entry, relaxed);
++	os_atomic_max(&tm_max, tot, relaxed);
++}
++
++static void
++sm_submit_tm_tick(void)
++{
++	static uint64_t last_us;
++	static unsigned quiet;
++
++	if (!tm_enabled()) {
++		return;
++	}
++	uint64_t now = now_us();
++	if (now - last_us < 1000000) {
++		return;
++	}
++	last_us = now;
++	lck_mtx_lock(&sm_lock);
++	uint64_t calls = tm_calls, waited = tm_waited, sleeps = tm_sleeps, fl = tm_fl, pre = tm_pre, sml = tm_sml, lp = tm_loop, mm = tm_mmio, wk = tm_wake, cl = tm_cpu_loop;
++	tm_calls = tm_waited = tm_sleeps = tm_fl = tm_pre = tm_sml = tm_loop = tm_mmio = tm_wake = tm_cpu_loop = 0;
++	lck_mtx_unlock(&sm_lock);
++	uint64_t done = os_atomic_xchg(&tm_done, 0, relaxed), err = os_atomic_xchg(&tm_err, 0, relaxed), post = os_atomic_xchg(&tm_post, 0, relaxed);
++	uint64_t total = os_atomic_xchg(&tm_total, 0, relaxed), cpu = os_atomic_xchg(&tm_cpu, 0, relaxed), mx = os_atomic_xchg(&tm_max, 0, relaxed);
++	if (calls > 0 || err > 0 || (++quiet % 10) == 0) {
++		printf("SWEET MALI SUBMIT: calls %llu done %llu err %llu waited %llu sleeps %llu fl_us %llu pre_us %llu sml_us %llu loop_us %llu mmio_us %llu wake_us %llu post_us %llu total_us %llu cpu_us %llu cpu_loop_us %llu max_total_us %llu\n",
++		    calls, done, err, waited, sleeps, tm_to_us(fl), tm_to_us(pre), tm_to_us(sml), tm_to_us(lp), tm_to_us(mm), tm_to_us(wk), tm_to_us(post), tm_to_us(total), tm_to_us(cpu), tm_to_us(cl), tm_to_us(mx));
++	}
++}
++
+ static void
+ sm_perf_tick(void)
+ {
+@@ -472,6 +585,7 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 		(void)lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.thread, THREAD_UNINT, dl);
+ 		lck_mtx_unlock(&sm_lock);
+ 		sm_perf_tick();
++		sm_submit_tm_tick();
+ 	}
+ }
+ 
+@@ -619,10 +733,21 @@ sweet_mali_unmap(uint64_t va, uint32_t n)
+  * Returns 0 and the seqno to wait on. */
+ int
+ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
++{
++	return sweet_mali_submit_tm(jc, req, seq, NULL);
++}
++
++int
++sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali_submit_tm *tm)
+ {
+ 	unsigned slot = (req & SWEET_MALI_REQ_FS) ? 0u : 1u;
+ 	uint64_t t0 = now_us();
++	int tmon = tm != NULL && tm->on;                       /* patch 0197: log-only stamps, see tm_ticks() */
++	uint64_t s_ent = 0, s_lk = 0, s_lp = 0, s_cmd = 0, s_wk = 0, c_lk = 0, c_lp = 0, n_sleep = 0, was_busy = 0;
+ 
++	if (tmon) {
++		s_ent = tm_ticks();
++	}
+ 	if (!sweet_mali_ready()) {
+ 		return ENXIO;
+ 	}
+@@ -630,6 +755,11 @@ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sm_lock);
++	if (tmon) {
++		s_lk = tm_ticks();
++		c_lk = thread_get_runtime_self();
++		was_busy = sm.busy && !sm.dead;
++	}
+ 	while (sm.busy && !sm.dead) {
+ 		uint64_t dl;
+ 		if (now_us() - t0 > 2 * JOB_TIMEOUT_US) {
+@@ -637,8 +767,13 @@ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
+ 			return ETIMEDOUT;
+ 		}
+ 		clock_interval_to_deadline(2000, NSEC_PER_USEC, &dl);
++		n_sleep++;
+ 		(void)lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.seq_done, THREAD_UNINT, dl);
+ 	}
++	if (tmon) {
++		s_lp = tm_ticks();
++		c_lp = thread_get_runtime_self();
++	}
+ 	perf_subwait_us += now_us() - t0;
+ 	if (sm.dead) {
+ 		lck_mtx_unlock(&sm_lock);
+@@ -662,8 +797,25 @@ sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq)
+ 	wr(R_JS_BASE(slot) + JS_CONFIG_NEXT, JS_CONFIG_VAL);
+ 	sm.busy = 1;
+ 	wr(R_JS_BASE(slot) + JS_COMMAND_NEXT, JS_CMD_START);
++	if (tmon) {
++		s_cmd = tm_ticks();
++	}
+ 	*seq = sm.busy_seq;
+ 	thread_wakeup((event_t)&sm.thread);
++	if (tmon) {
++		s_wk = tm_ticks();
++		tm->t_done = s_wk;
++		tm_calls++;
++		tm_waited += was_busy;
++		tm_sleeps += n_sleep;
++		tm_fl += tm->t_flock - tm->t_entry;
++		tm_pre += s_ent - tm->t_flock;
++		tm_sml += s_lk - s_ent;
++		tm_loop += s_lp - s_lk;
++		tm_mmio += s_cmd - s_lp;
++		tm_wake += s_wk - s_cmd;
++		tm_cpu_loop += c_lp - c_lk;
++	}
+ 	lck_mtx_unlock(&sm_lock);
+ 	return 0;
+ }
+--- a/bsd/dev/sweet_mali.h
++++ b/bsd/dev/sweet_mali.h
+@@ -23,6 +23,14 @@ int sweet_mali_query(struct sweet_mali_info *o);
+ int sweet_mali_map(const uint64_t *pa16k, uint32_t n16k, uint32_t flags, uint64_t *va_out);
+ int sweet_mali_unmap(uint64_t va, uint32_t n16k);
+ int sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq);
++/* patch 0197 (boot-arg sweetsubmittm=1, default off, R0 log only): phase timing of selector 3. The caller (SweetMaliUserClient case 3) stamps the entry and the
++ * client-lock acquisition into tm, sweet_mali_submit_tm stamps the driver phases, sweet_mali_submit_tm_post closes the call after the client lock is released.
++ * Boot-arg off: every function below returns after one load, tm->on stays 0, no timer is read. */
++struct sweet_mali_submit_tm { uint64_t on, t_entry, t_flock, cpu_entry, t_done; };
++void sweet_mali_tm_begin(struct sweet_mali_submit_tm *tm);
++void sweet_mali_tm_flock(struct sweet_mali_submit_tm *tm);
++int sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali_submit_tm *tm);
++void sweet_mali_submit_tm_post(const struct sweet_mali_submit_tm *tm, int ret);   /* ret = the IOReturn/errno of the call: non-zero only counts err */
+ int sweet_mali_wait(uint64_t seq, uint64_t timeout_us);
+ /* patch 0186: read-only, lock-free peek for logging (may be one job stale): last submitted and last completed seqno. 0 ok, ENXIO driver not up or dead. */
+ int sweet_mali_seq_peek(uint64_t *submitted, uint64_t *done);
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -453,12 +453,15 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	case 3:                         /* submit */
+ 		if (args->scalarInputCount == 2 && args->scalarOutputCount >= 1) {
+ 			uint64_t seq = 0;
++			struct sweet_mali_submit_tm tm;         /* patch 0197: phase timing, boot-arg sweetsubmittm=1, log only */
++			sweet_mali_tm_begin(&tm);
+ 			IOLockLock(fLock);
++			sweet_mali_tm_flock(&tm);
+ 			if (!owns(args->scalarInput[0])) {
+ 				ret = kIOReturnNotPermitted;
+ 			} else {
+ 				SM_UC_LOG("SWEET MALI: uc submit va=%#llx\n", args->scalarInput[0]);
+-				ret = errno_to_ioreturn(sweet_mali_submit(args->scalarInput[0], (uint32_t)args->scalarInput[1] & SWEET_MALI_REQ_FS, &seq));
++				ret = errno_to_ioreturn(sweet_mali_submit_tm(args->scalarInput[0], (uint32_t)args->scalarInput[1] & SWEET_MALI_REQ_FS, &seq, &tm));
+ 				if (ret != 0) { SM_UC_ERR("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); } else { SM_UC_LOG("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); }
+ 				if (ret == kIOReturnSuccess) {
+ 					fLastSeq = seq;
+@@ -467,6 +470,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 				}
+ 			}
+ 			IOLockUnlock(fLock);
++			sweet_mali_submit_tm_post(&tm, (int)ret);
+ 		}
+ 		break;
+ 	case 4:                         /* wait (no client lock held: other threads may keep working) */

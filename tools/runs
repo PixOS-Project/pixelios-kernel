@@ -55,7 +55,7 @@ def scan(all_wt, kind=None):
             base = os.path.join(root, "logs", sub)
             try:
                 names = sorted(os.listdir(base))
-            except OSError:
+            except OSError:   # lint-silent: expected a result dir that vanished or is unreadable has no runs to list: next dir
                 continue
             for n in names:
                 p = os.path.join(base, n)
@@ -99,7 +99,7 @@ def load(kind, d):
         rec["verdict"], rec["reason"], rec["git"], rec["text"] = m2.group(1), m2.group(2).strip(), None, txt
         try:
             rec["argkey"] = argkey(open(os.path.join(d, "run.args")).read())
-        except OSError:
+        except OSError:   # lint-silent: expected a probe dir without a readable run.args (older format) has no argkey: None
             rec["argkey"] = None
         u, f = os.path.join(d, "usb.txt"), os.path.join(d, "fboot.log")
         if os.path.exists(u) and os.path.exists(f):

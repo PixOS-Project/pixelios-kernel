@@ -1,0 +1,43 @@
+ALL-ON T-06 (silent-failure audit, mali_pt_unmap rc): the BO free path (sweet_mali_unmap_inner) discarded every mali_pt_unmap result although mali_va_free had just confirmed the range was allocated; a page that unmaps to 0 (page table vs VA allocator disagree) now counts and gives one SWEET GAP line after the unlock. Log only: no new register, firmware or bus write; the unmap, clean and flush are unchanged. The map-failure rollback keeps (void): pages past the failing one are expected unmapped.
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -1399,27 +1399,37 @@
+ 	if (n == 0 || n > 0x10000 || (va & (PAGE_SIZE - 1)) || va < MALI_VA_START || va > MALI_VA_END || (uint64_t)n * PAGE_SIZE > MALI_VA_END - va) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sm_lock);
+ 	if (mali_va_free(&sm.va, va, n * 4u)) {        /* not (fully) allocated: touch nothing */
+ 		lck_mtx_unlock(&sm_lock);
+ 		return EINVAL;
+ 	}
++	/* patch 0325 (ALL-ON T-06): mali_va_free above confirmed the whole range was allocated, so every 4K page of it must be mapped;
++	 * a page that unmaps to 0 means the page table and the VA allocator disagree (double free or a lost map). Counted, logged after
++	 * the unlock; the unmap itself is unchanged. */
++	uint32_t not_mapped = 0;
+ 	for (uint32_t j = 0; j < n * 4u; j++) {
+-		(void)mali_pt_unmap(&sm.pt, va + (uint64_t)j * MALI_PG);
++		if (mali_pt_unmap(&sm.pt, va + (uint64_t)j * MALI_PG) == 0) {
++			not_mapped++;
++		}
+ 	}
+ 	e = 0;
+ 	sm_pt_clean(va, (uint64_t)n * PAGE_SIZE);
+ 	if (as_flush(va, (uint64_t)n * PAGE_SIZE)) {
+ 		sm.dead = 1;
+ 		printf("SWEET MALI: AS0 flush after unmap did not complete, device marked dead\n");
+ 		e = EIO;
+ 	}
+ 	lck_mtx_unlock(&sm_lock);
++	if (not_mapped) {
++		printf("SWEET GAP: MALI free va 0x%llx n %u pages: %u of %u 4K pages not mapped (page table vs VA allocator disagree)\n",
++		    (unsigned long long)va, n, not_mapped, n * 4u);
++	}
+ 	return e;
+ }
+ 
+ /* patch 0227: the one place that writes a job into the hardware (moved verbatim out of sweet_mali_submit_tm; lock held, no job in flight). Returns 0 started, EBUSY slot/IRQ state
+  * not clean (nothing written). Same checks, same register writes, same order as before. */
+ static int
+ sm_start_locked(uint64_t jc, unsigned slot, uint64_t seq)
+ {

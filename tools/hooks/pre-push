@@ -1,0 +1,23 @@
+#!/bin/sh
+# PixOS kernel repo pre-push (T-536a): content + identity guard for pushes to PUBLIC remotes (R66). core.hooksPath points at the copies of tools/hooks, so the
+# older <git-dir>/hooks/pre-push written by `public-push-guard install-hook` never runs in this clone: this tracked copy is the one that does.
+# Uses this worktree's tools/public-push-guard, else the main checkout's. Fails CLOSED only for a PUBLIC url (same patterns as the PUB rules in
+# tools/public-push-guard.rules, plus the lines of the optional gitignored tools/public-push-guard.urls). No bypass flag or env var.
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+CD=$(git rev-parse --git-common-dir 2>/dev/null)
+T=$TOP/tools/public-push-guard
+[ -n "$TOP" ] && [ -f "$T" ] || T=$CD/../tools/public-push-guard
+if [ -f "$T" ] && command -v python3 >/dev/null 2>&1; then exec python3 "$T" "$@"; fi
+URL=$2
+LC=$(printf '%s' "$URL" | tr 'A-Z' 'a-z')
+PUB=0
+case "$LC" in *github.com:pixos-project/*|*github.com/pixos-project/*|*pixos-project/*) PUB=1;; esac
+for U in "$TOP/tools/public-push-guard.urls" "$CD/../tools/public-push-guard.urls"; do
+  [ -f "$U" ] && while IFS= read -r L; do [ -n "$L" ] && case "$URL" in *"$L"*) PUB=1;; esac; done < "$U"
+done
+if [ $PUB = 0 ]; then
+  echo "public-push-guard: tool missing, private remote $URL allowed" >&2
+  exit 0
+fi
+echo "RESULT: FAIL public-push-guard missing (${T:-not inside a work tree}) or python3 missing: push to public remote refused, merge trunk into this branch or fix the hook" >&2
+exit 1

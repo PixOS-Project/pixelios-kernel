@@ -1,0 +1,155 @@
+SWEET navigation bench (patch 0243, T-5020, G-10b; boot-arg sweetnav=R, default off): built-in human-paced session through SweetHIDTouch::touch (home page swipes, Settings > General > About, list scrolls, edge back-swipes, home, Spotlight pull-down, app launch, idle, close; 18 actions, 150..600 ms fixed-seed think time, 100-350 ms finger-speed drags), R=1..5 repetitions (the unlock only in the first), first action sweetnavstart=S s after the touch service (default 130). Logs 'SWEET NAV: ACTION name begin|inputend|end rep R now NS' (NS = the SWEET SWAPT clock, needs sweetpace=1) and 'SWEET NAV: done reps R' 4 s after the last action; replaces sweetswipe and sweetscript. Loud SWEET GAP lines: typing not injected, uncalibrated guesses, missing sweetpace, clamped values. Input injection only: no register, no store, no hardware access.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -383,11 +383,50 @@
+ 	IOTimerEventSource *fScript;
+ 	UInt32 fScriptIdx, fScriptStep, fScriptN;
+ 	struct { UInt32 t; SInt32 x0, y0, x1, y1; bool swipe; } fScriptEnt[24];
++	/* patch 0243: boot-arg sweetnav=R runs a built-in human-paced navigation session R times (G-10b nav bench) */
++	static void navFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fNav;
++	UInt32 fNavReps, fNavRep, fNavIdx, fNavStep, fNavRng;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+ #define SWEET_SWIPE_STEPS 20
+ #define SWEET_SWIPE_MAX 400   /* default number of swipes; boot-arg sweetswipecount overrides (patch 0155) */
++
++/* Patch 0243 (T-5020, G-10b): the built-in navigation session of sweetnav=R. kind 0 = tap (finger down `ms` ms), 1 = drag from (x0,y0) to (x1,y1) over `ms` ms
++ * (10 ms per touch sample), 2 = wait (no input). `settle` = ms the action is observed after the finger lifts (the animation / app launch under test).
++ * Coordinates: 1080x2400 touch space; unlock, home swipe, Settings icon (page 1), General and About rows are calibrated on hardware
++ * [obs docs/research/61-gpu-black-icons-sampler2drect.md, G-11b g79-g82]; the edge back-swipe, list scrolls and Spotlight pull-down are NOT calibrated [guess]:
++ * a wrong guess shows as a missing animation in the per-action table, never as a silent pass. Typing is not injectable (no HID keyboard path): see the GAP line. */
++struct SweetNavAct { const char *name; unsigned char kind; short x0, y0, x1, y1; unsigned short ms, settle; };
++static const SweetNavAct sweetNavActs[] = {
++	{ "unlock",           1,  540, 2350,  540,  900, 200, 2500 },   /* index 0: first repetition only */
++	{ "home-page-next",   1,  900, 1200,  200, 1200, 250,  700 },
++	{ "home-page-prev",   1,  200, 1200,  900, 1200, 250,  700 },
++	{ "settings-open",    0,  676, 1720,    0,    0, 100, 3000 },
++	{ "general-open",     0,  500, 1900,    0,    0, 100, 1500 },
++	{ "about-open",       0,  500,  370,    0,    0, 100, 1800 },
++	{ "about-scroll-up",  1,  540, 1800,  540,  700, 350,  900 },
++	{ "about-scroll-down", 1, 540,  700,  540, 1800, 350,  900 },
++	{ "about-back",       1,    5, 1200,  700, 1200, 250, 1200 },   /* edge back-swipe [guess] */
++	{ "general-back",     1,    5, 1200,  700, 1200, 250, 1200 },
++	{ "settings-scroll-up", 1, 540, 1800, 540,  700, 350,  900 },
++	{ "settings-scroll-down", 1, 540, 700, 540, 1800, 350,  900 },
++	{ "app-home",         1,  540, 2398,  540, 1200, 200, 1500 },   /* calibrated: 2350 does not work inside an app */
++	{ "app-launch",       0,  676, 1720,    0,    0, 100, 3000 },   /* Settings icon (page 1) from the home screen after app-home: the same tap as settings-open, which animated 3/3 in nav1 [obs]; no longer behind Spotlight (T-b872) */
++	{ "app-idle",         2,    0,    0,    0,    0,   0, 3000 },
++	{ "app-close",        1,  540, 2398,  540, 1200, 200, 1500 },
++	{ "spotlight-open",   1,  540,  500,  540, 1500, 300, 1500 },   /* pull-down on the home screen [guess] */
++	{ "spotlight-close",  1,  540, 2398,  540, 1200, 250, 1500 },   /* home swipe (the app-home gesture): nav1's swipe-up animated 1 of 3 reps and the app-launch tap after it 0 of 3 [guess: Spotlight stayed open under its keyboard]; verified by the camera frame at this marker (T-b872) */
++};
++#define SWEET_NAV_N ((unsigned)(sizeof(sweetNavActs) / sizeof(sweetNavActs[0])))
++static uint64_t
++sweetNavNs(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);   /* the clock `SWEET SWAPT: now` prints (patch 0186) */
++	return ns;
++}
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
+@@ -547,9 +586,100 @@
+ 			fScript = NULL;
+ 		}
+ 	}
++	/* Patch 0243 (T-5020, G-10b): boot-arg sweetnav=R (1..5) runs the built-in navigation session R times, human paced (150..600 ms think time from a fixed-seed
++	 * LCG, finger-speed drags), sweetnavstart=S seconds after the touch service started (default 130, max 3600). Logs `SWEET NAV: ACTION <name> begin|inputend|end
++	 * rep R now NS` (NS = the clock of SWEET SWAPT) so the host cuts the frame gaps by action; `SWEET NAV: done` 4 s after the last action. Replaces sweetswipe and
++	 * sweetscript (all drive finger 0). Input injection only: no register, no store. */
++	UInt32 nav = 0, navs = 130;
++	fNavReps = fNavRep = fNavIdx = fNavStep = 0;
++	fNavRng = 0x5eed1234;
++	fNav = NULL;
++	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
++		if (nav > 5) {
++			IOLog("SWEET GAP: HID sweetnav=%u clamped to 5 repetitions\n", nav);
++			nav = 5;
++		}
++		if (PE_parse_boot_argn("sweetnavstart", &navs, sizeof(navs)) && navs > 3600) {
++			IOLog("SWEET GAP: HID sweetnavstart=%u clamped to 3600 s\n", navs);
++			navs = 3600;
++		}
++		UInt32 pace = 0;
++		if (!PE_parse_boot_argn("sweetpace", &pace, sizeof(pace)) || !pace) {
++			IOLog("SWEET GAP: HID sweetnav without sweetpace=1: no SWEET SWAPT frame timestamps, the host scorer has nothing to cut\n");
++		}
++		IOLog("SWEET GAP: HID sweetnav: Spotlight typing is not injected (no HID keyboard path); spotlight-open / spotlight-close only. Edge back-swipe, list scrolls and the Spotlight pull-down are uncalibrated guesses\n");
++		fNav = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::navFired);
++		if (fNav && _hidWorkLoop && _hidWorkLoop->addEventSource(fNav) == kIOReturnSuccess) {
++			fNavReps = nav;
++			fNavIdx = 0;
++			fNav->setTimeoutMS(navs * 1000);
++			IOLog("SWEET HID: nav session, %u repetition(s) of %u actions, first at %u s\n", nav, SWEET_NAV_N, navs);
++			if (fSwipe) {
++				fSwipe->cancelTimeout();
++				IOLog("SWEET HID: nav session replaces the synthetic swipes\n");
++			}
++			if (fScript) {
++				fScript->cancelTimeout();
++				IOLog("SWEET HID: nav session replaces the touch script\n");
++			}
++		} else {
++			IOLog("SWEET GAP: HID sweetnav=%u not started (timer or work loop unavailable)\n", nav);
++			if (fNav) {
++				fNav->release();
++				fNav = NULL;
++			}
++		}
++	}
+ 	return true;
+ }
+ 
++void
++SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	unsigned i = self->fNavIdx, st = self->fNavStep;
++
++	if (self->fNavRep >= self->fNavReps) {
++		IOLog("SWEET NAV: done reps %u\n", self->fNavReps);   /* the host stops on this line */
++		return;
++	}
++	const SweetNavAct *a = &sweetNavActs[i];
++	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
++	if (st == 0) {
++		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++	}
++	if (a->kind != 2 && st <= ticks) {
++		int x = a->x0 + (a->x1 - a->x0) * (int)st / (int)ticks;
++		int y = a->y0 + (a->y1 - a->y0) * (int)st / (int)ticks;
++		self->touch(0, true, x, y);
++		self->fNavStep = st + 1;
++		sender->setTimeoutMS(10);
++		return;
++	}
++	if (a->kind != 2 && st == ticks + 1) {
++		self->touch(0, false, a->x1, a->y1);
++	}
++	if (st <= ticks + 1) {   /* finger up (or the wait started): observe the animation for `settle` ms */
++		IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++		self->fNavStep = ticks + 2;
++		sender->setTimeoutMS(a->settle);
++		return;
++	}
++	IOLog("SWEET NAV: ACTION %s end rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++	self->fNavStep = 0;
++	self->fNavIdx = i + 1;
++	if (self->fNavIdx >= SWEET_NAV_N) {
++		self->fNavIdx = 1;   /* later repetitions skip the unlock */
++		self->fNavRep++;
++		if (self->fNavRep >= self->fNavReps) {
++			sender->setTimeoutMS(4000);
++			return;
++		}
++	}
++	self->fNavRng = self->fNavRng * 1664525u + 1013904223u;
++	sender->setTimeoutMS(150 + (self->fNavRng >> 16) % 451);   /* think time 150..600 ms */
++}
++
+ #define SWEET_SCRIPT_STEPS 20
+ void
+ SweetHIDTouch::scriptFired(OSObject *owner, IOTimerEventSource *sender)

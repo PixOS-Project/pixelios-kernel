@@ -1,0 +1,24 @@
+#!/bin/bash
+# gate-identity: print the identity of the gate environment, one key=value per line. Run INSIDE the gate container, cwd = the checkout
+# (tools/remote-job gate-pre runs it through the same prefix as the gate and diffs it with tools/gate-identity.expected).
+# image: the id the wrapper measured on the host (GATE_IMAGE_ID). verlist: sha256 of the provisioning verlist.sh output (GATE_VERLIST, mounted by the wrapper).
+# armtc: sha256 of 3 lines: sha256 of bin/aarch64-none-elf-gcc, its --version first line, sha256 of the sorted (by name) sha256sum list of every file in bin/.
+#   Same function on lab-host, offload-host and in the container (measured equal 2026-10-27). MISSING if the toolchain is not mounted.
+# SRC (arg 1, default: the repo containing this script) = the checkout to hash (tools/third_party). tools/remote-job ships THIS script from the tool repo
+# as an overlay and runs `bash overlay .`, so a commit that predates tools/gate-identity (or carries a different one) is measured by the tool's copy.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+cd "${1:-$(dirname "$0")/..}" || exit 2
+h() { if command -v "$1" >/dev/null 2>&1; then "$@" 2>&1 | sha256sum | cut -d' ' -f1; else echo MISSING; fi; }
+echo "image=${GATE_IMAGE_ID:-MISSING}"
+if [ -r "${GATE_VERLIST:-/nonexistent}" ]; then echo "verlist=$(bash "$GATE_VERLIST" 2>&1 | sha256sum | cut -d' ' -f1)"; else echo "verlist=MISSING"; fi
+armtc() {
+	local t="${ARM_TC:-$HOME/.local/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf}" g
+	g="$t/bin/aarch64-none-elf-gcc"; [ -x "$g" ] || { echo MISSING; return; }
+	{ sha256sum <"$g" | cut -d' ' -f1; "$g" --version 2>&1 | head -1; (cd "$t/bin" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); } | sha256sum | cut -d' ' -f1
+}
+echo "armtc=$(armtc)"
+echo "gcc=$(h gcc --version)"; echo "ld=$(h ld --version)"
+echo "glibc=$(getconf GNU_LIBC_VERSION 2>&1)"; echo "py=$(python3 -V 2>&1)"
+# keep identical to tools/gate-import-remote (lg=): bytecode (only .pyc inside __pycache__; a sourceless .pyc elsewhere is importable, so hashed) differs per python version and is not source; LC_ALL=C pins the sort
+echo "third_party=$(find -L tools/third_party -type f -not \( -path '*/__pycache__/*' -name '*.pyc' \) -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)"

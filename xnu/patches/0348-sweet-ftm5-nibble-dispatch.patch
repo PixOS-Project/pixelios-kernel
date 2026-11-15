@@ -1,0 +1,78 @@
+sweet-ftm5-nibble-dispatch (lowclk 2026-11-13, plan docs/LOWCLK-PLAN.md row T1): the FTM5 event parser (bsd/dev/sweet_ftm5.h, patch 0088) matched byte 0 as a whole
+(0x13 / 0x23 / 0x33), but Google's driver dispatches on its high nibble only [read kernel/google-modules/touch/fts_touch f87fd67f ftm5/fts.c:4570
+`eventId = evt_data[0] >> 4`, handlers installed per class at fts.c:5289-5295] and bits 3:2 of byte 0 carry the top two bits of the touch major
+[read fts.c:3083 `major = ((event[0] & 0x0C) << 2) | ...`]. So motion events 0x27 / 0x2b / 0x2f and leave 0x3f were dropped [obs 2026-11-13 06:12Z and 08:25Z
+boots: 27 x34, 2f x14, 2b x12, 3f x2; one missed leave held a contact down for 5.8 s (down 3395.899, up 3401.699)]. Now: class 0 (non-zero byte) = controller ready,
+classes 1 / 2 / 3 = enter / motion / leave, classes 4 / 5 / E / F = status / user / debug / error (ignored as before, ftsSoftware.h:384-389), any other class =
+new kind FTM5_UNKNOWN: the driver prints `SWEET GAP: touch: FTM5 event byte0 XX has no handler class ... (patch 0348, once per value)` once per byte 0 value
+(rule 7). Coordinates, ids and types are unchanged. The release-on-missed-leave timer from the plan is not added: the stuck contact came from the dropped 0x3f,
+which this fixes at the cause. No hardware access (parser + one log line). Host test: shim/ftm5_host_test.c (shim/build.sh applies this patch's sweet_ftm5.h
+hunk to the header it extracts from 0088). ORDER: after 0088.
+--- a/bsd/dev/sweet_ftm5.h
++++ b/bsd/dev/sweet_ftm5.h
+@@ -46,6 +46,7 @@
+ 	FTM5_UP,           /* contact left */
+ 	FTM5_CANCEL,       /* palm or grip: the contact is not a finger, release it */
+ 	FTM5_IGNORED,      /* status/user/debug/error events, hover, bad ids */
++	FTM5_UNKNOWN,      /* byte 0 class with no handler in the Linux driver (fts.c:5289-5295): the caller logs a GAP (patch 0348) */
+ };
+ 
+ struct ftm5_ev {
+@@ -103,18 +104,28 @@
+ 		r.kind = FTM5_NONE;
+ 		return r;
+ 	}
+-	if (e[0] == FTM5_EVT_CONTROLLER_READY) {
++	/* Patch 0348: dispatch on the high nibble only, like fts_event_handler (fts.c:4570 eventId = evt_data[0] >> 4,
++	 * handlers installed by class at fts.c:5289-5295). Bits 3:2 of byte 0 are the top bits of the touch major
++	 * (fts.c:3083), so 0x27 / 0x2b / 0x2f are motion and 0x3f a leave: matching the whole byte dropped them
++	 * (observed 2026-11-13: 27 x34, 2f x14, 2b x12, 3f x2; a missed 0x3f left a contact down for 5.8 s). */
++	unsigned cls = (unsigned)e[0] >> 4;
++
++	if (cls == (FTM5_EVT_CONTROLLER_READY >> 4)) {
+ 		r.kind = FTM5_READY;
+ 		return r;
+ 	}
+-	if (e[0] != FTM5_EVT_ENTER_POINT && e[0] != FTM5_EVT_MOTION_POINT && e[0] != FTM5_EVT_LEAVE_POINT) {
++	if (cls != (FTM5_EVT_ENTER_POINT >> 4) && cls != (FTM5_EVT_MOTION_POINT >> 4) && cls != (FTM5_EVT_LEAVE_POINT >> 4)) {
++		/* status 0x4, user 0x5, debug 0xE, error 0xF: known classes this driver does not use (ftsSoftware.h:384-389) */
++		if (cls != 0x4u && cls != 0x5u && cls != 0xEu && cls != 0xFu) {
++			r.kind = FTM5_UNKNOWN;
++		}
+ 		return r;
+ 	}
+ 	r.id = e[1] >> 4;
+ 	if (r.id >= FTM5_TOUCH_ID_MAX) {
+ 		return r;           /* "Invalid touch ID", fts.c:3063: not reported */
+ 	}
+-	if (e[0] == FTM5_EVT_LEAVE_POINT) {
++	if (cls == (FTM5_EVT_LEAVE_POINT >> 4)) {
+ 		r.kind = FTM5_UP;   /* every known type releases (fts.c:3232-3250) */
+ 		return r;
+ 	}
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -170,6 +170,7 @@
+ 	uint32_t delay_s;
+ 	int sleep_chan;
+ 	bool down[FTM5_TOUCH_ID_MAX];
++	uint32_t unknown_seen[8];   /* patch 0348: byte 0 values already reported as SWEET GAP */
+ 	int last_x[FTM5_TOUCH_ID_MAX], last_y[FTM5_TOUCH_ID_MAX];
+ } tg;
+ 
+@@ -991,6 +992,15 @@
+ 		break;
+ 	case FTM5_NONE:
+ 		return;
++	case FTM5_UNKNOWN:
++		/* rule 7: an event class no handler exists for is never dropped silently; once per byte 0 value (patch 0348) */
++		if (!(tg.unknown_seen[e[0] >> 5] & (1u << (e[0] & 31u)))) {
++			tg.unknown_seen[e[0] >> 5] |= 1u << (e[0] & 31u);
++			printf("SWEET GAP: touch: FTM5 event byte0 %02x has no handler class (fts.c:5289-5295), dropped: "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x (patch 0348, once per value)\n",
++			    e[0], e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}

@@ -1,0 +1,11 @@
+diff --git a/shim/mmu.c b/shim/mmu.c
+--- a/shim/mmu.c
++++ b/shim/mmu.c
+@@ -126,6 +126,7 @@ int mmu_enable(struct mmu_info *info, uintptr_t fdt)
+
+ 	uint64_t sctlr = rsr("sctlr_el1");
+ 	info->sctlr_before = sctlr;
++	ramlog_line("mmu on next");
+ 	sctlr &= ~(SCTLR_A | SCTLR_WXN);
+ 	sctlr |= SCTLR_M | SCTLR_C | SCTLR_I;
+ 	wsr("sctlr_el1", sctlr);

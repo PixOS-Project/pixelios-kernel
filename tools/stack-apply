@@ -3,10 +3,19 @@
 #   tools/stack-apply [--only-new PATCH] [--keep]
 #   --only-new PATCH   still applies the whole stack, but the verdict is about PATCH (name, path or number, e.g. 0088)
 #   --keep             keep the scratch copy (printed) for inspection
-# Pristine clone (shallow, made on first use, needs network): ~/pixelios-artifacts/xnu-pristine. The scratch copy lives under
-# ~/pixelios-artifacts/scratch/ (SSD, never /tmp) and is deleted afterwards. Stagers fetch libpthread/bearssl/hfs from GitHub;
+# Pristine clone (shallow, made on first use, needs network): ~/pixelios-artifacts/xnu-pristine. It is cloned into a private temp dir next to it and
+# renamed into place, so a failed or concurrent clone never leaves (or deletes) a half pristine another job reads. The scratch copy lives under
+# ~/pixelios-artifacts/scratch/ (SSD, never /tmp) and is deleted afterwards. Stagers fetch libpthread/bearssl/hfs from GitHub unless the pinned
+# commits are in the local mirror (tools/xnu-src-mirror, as tools/xnu-local-build does; seeded here when the network is reachable);
 # `xcrun` is stubbed (empty TargetConditionals.h) as in docs/research/14-patch-audit.md. Like CI (dxb) the .sh run first.
-# Progress: ~/pixelios-artifacts/scratch/stack-apply.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+# Progress: ~/pixelios-artifacts/scratch/stack-apply.<pid>.log (one per run, so two gate lanes never interleave). Exit: 0 PASS or SKIPPED, 1 FAIL, 2 ERROR.
+# NO NETWORK (review r42-gate-r1 F2; the formal gate container runs --network=none, tools/remote-job:111): when the pristine clone or a pinned stager source is
+# missing AND `git ls-remote` of the pristine url cannot connect (rc 128 or timeout), the step prints "STACK-APPLY NOT RUN: no network ..." + RESULT: SKIPPED and exits 0;
+# tools/check-all.sh puts "stack-apply not run: no network" on the GATE line. Never silent: the xnu-build step still applies the whole stack as real XNU (AP-257) but
+# skips a patch that does not `git apply --check` (CI does too), so only this step proves a strict in-order apply. A reachable network with a failing clone/stager stays ERROR.
+# Env (host tests): STACK_APPLY_REMOTE (default the GitHub url), STACK_APPLY_PROBE_TIMEOUT s (default 20).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -15,17 +24,45 @@ TAG=xnu-8796.141.3
 only=""; keep=0
 while [ $# -gt 0 ]; do case "$1" in
 	--only-new) only=$2; shift 2 ;; --keep) keep=1; shift ;;
-	*) echo "unknown option $1 (see the header of tools/stack-apply)" >&2; exit 2 ;; esac; done
-mkdir -p "$A/scratch"; LOG=$A/scratch/stack-apply.log; : >"$LOG"
+	*) echo "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
+REMOTE=${STACK_APPLY_REMOTE:-https://github.com/apple-oss-distributions/xnu}
+mkdir -p "$A/scratch"; LOG=$A/scratch/stack-apply.$$.log; : >"$LOG"
 W=""
 cleanup() { [ -z "$W" ] || [ "$keep" = 1 ] || rm -rf -- "$W"; }
 trap cleanup EXIT
-finish() { local res=$1; shift; { echo "RESULT: $res $1"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
+finish() { local res=$1; shift; { echo "RESULT: $res $1"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS|SKIPPED) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
 
 P=$A/xnu-pristine
+[ ! -e "$P" ] || [ -d "$P/.git" ] || finish ERROR "$P exists but is not a git clone (delete it so the next run can clone $TAG)"
+stagers=("$ROOT"/xnu/patches/*.sh); patches=("$ROOT"/xnu/patches/*.patch)
+# pinned stager sources from the local mirror (tools/xnu-src-mirror env prints the git url rewrites); incomplete or no tool = the stagers need the network
+menv=""; mirror_ok=0; MT=$ROOT/tools/xnu-src-mirror
+mirror_env() {
+	local merr; menv=""; mirror_ok=0
+	[ -x "$MT" ] || { echo "stack-apply: no tools/xnu-src-mirror: stagers need the network" >>"$LOG"; return 0; }
+	merr=$(mktemp "$A/scratch/stack-mirror-XXXXXX")
+	if menv=$("$MT" env --stack "$ROOT/xnu/patches" --dir "$A/git-mirror" 2>"$merr"); then
+		grep -q '^xnu-src-mirror: NOT mirrored' "$merr" || mirror_ok=1
+	else menv=""; fi
+	cat "$merr" >>"$LOG"; rm -f "$merr"
+}
+mirror_env
+if [ ! -d "$P/.git" ] || [ "$mirror_ok" = 0 ]; then
+	# network needed: rc 128 / timeout = cannot connect (NOT RUN, loud, exit 0); rc 2 = connected but no such tag (ERROR); rc 0 = go on
+	prc=0; timeout "${STACK_APPLY_PROBE_TIMEOUT:-20}" git ls-remote -q --exit-code "$REMOTE" "refs/tags/$TAG" >>"$LOG" 2>&1 || prc=$?
+	case $prc in
+	0) ;;
+	2) finish ERROR "$REMOTE is reachable but has no tag $TAG" ;;
+	*) echo "STACK-APPLY NOT RUN: no network ($REMOTE unreachable, git ls-remote rc=$prc; the pristine clone or the pinned stager sources are not cached here)"
+	   finish SKIPPED "stack-apply NOT RUN: no network; the numbered stack was NOT applied in order here (the xnu-build step still builds it, AP-257)" ;;
+	esac
+	if [ "$mirror_ok" = 0 ] && [ -x "$MT" ]; then "$MT" seed --stack "$ROOT/xnu/patches" --dir "$A/git-mirror" >>"$LOG" 2>&1 || true; mirror_env; fi
+fi
 if [ ! -d "$P/.git" ]; then
-	rm -rf -- "$P"
-	git clone -q --depth 1 --branch "$TAG" https://github.com/apple-oss-distributions/xnu "$P" >>"$LOG" 2>&1 || { rm -rf -- "$P"; finish ERROR "cannot clone pristine $TAG (network?)" "$(tail -n 3 "$LOG")"; }
+	C=$(mktemp -d "$A/xnu-pristine.clone.XXXXXX")
+	git clone -q --depth 1 --branch "$TAG" "$REMOTE" "$C/xnu" >>"$LOG" 2>&1 || { rm -rf -- "$C"; finish ERROR "cannot clone pristine $TAG from $REMOTE (network reachable)" "$(tail -n 3 "$LOG")"; }
+	mv -T -- "$C/xnu" "$P" 2>>"$LOG" || [ -d "$P/.git" ] || { rm -rf -- "$C"; finish ERROR "cannot move the clone into $P"; }   # lost the race to a concurrent run: theirs is fine
+	rm -rf -- "$C"
 fi
 [ "$(git -C "$P" describe --tags --exact-match 2>/dev/null)" = "$TAG" ] || finish ERROR "$P is not at tag $TAG (delete it to re-clone)"
 W=$(mktemp -d "$A/scratch/stack-XXXXXX")
@@ -34,9 +71,8 @@ mkdir -p "$W/.stub/sdk/usr/include"; : >"$W/.stub/sdk/usr/include/TargetConditio
 printf '#!/bin/sh\necho "%s"\n' "$W/.stub/sdk" >"$W/.stub/xcrun"; chmod +x "$W/.stub/xcrun"
 cd "$W"
 
-stagers=("$ROOT"/xnu/patches/*.sh); patches=("$ROOT"/xnu/patches/*.patch)
 for s in "${stagers[@]}"; do
-	env MACHINE_CONFIG=SWEET MACOS_VERSION=13.5 PATH="$W/.stub:$PATH" bash "$s" >>"$LOG" 2>&1 \
+	( eval "$menv"; env MACHINE_CONFIG=SWEET MACOS_VERSION=13.5 PATH="$W/.stub:$PATH" bash "$s" ) >>"$LOG" 2>&1 \
 		|| finish ERROR "stager $(basename "$s") failed (network?)" "$(tail -n 5 "$LOG" | cut -c1-200)"
 done
 total=${#patches[@]}; ok=0; failed=""; err=""; onlyname=""; onlyok=""

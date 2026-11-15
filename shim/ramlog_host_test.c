@@ -140,6 +140,70 @@ static void test_total_cursor(void)
 	assert(ramlog_total() == 0);
 }
 
+/* Sequential-read cursor (2026-11-11 all-on: pstore_save was O(lines x bytes)): any read order, re-reads, appends that evict and wrap
+ * between reads, and a truncating cap all return what a scan from the oldest byte returns (model = the appended strings). */
+static unsigned lcg = 12345u;
+static unsigned rnd(unsigned n) { lcg = lcg * 1103515245u + 12345u; return (lcg >> 8) % n; }
+
+static void check_line(unsigned k, unsigned total, unsigned lines, unsigned cap)
+{
+	char buf[RAMLOG_LINE_MAX], want[RAMLOG_LINE_MAX];
+	unsigned a = total - lines + k, n = 1 + (a * 7u) % 90u;
+	for (unsigned j = 0; j < n; j++)
+		want[j] = (char)('a' + (a + j) % 26u);
+	want[n] = 0;
+	if (n > cap - 1) {
+		n = cap - 1;
+		want[n] = 0;
+	}
+	unsigned got = ramlog_copy_line(k, buf, cap);
+	assert(got == n && !strcmp(buf, want));
+}
+
+static void append_model(unsigned a)
+{
+	char line[RAMLOG_LINE_MAX];
+	unsigned n = 1 + (a * 7u) % 90u;
+	for (unsigned j = 0; j < n; j++)
+		line[j] = (char)('a' + (a + j) % 26u);
+	line[n] = 0;
+	ramlog_line(line);
+}
+
+static void test_read_cursor(void)
+{
+	char buf[RAMLOG_LINE_MAX];
+	unsigned total = 0;
+	ramlog_reset();
+	for (unsigned round = 0; round < 40; round++) {
+		unsigned add = round == 0 ? 2000 : rnd(300);
+		for (unsigned i = 0; i < add; i++)
+			append_model(total++);
+		unsigned lines = ramlog_lines();
+		assert(lines > 0 && lines <= total);
+		for (unsigned k = 0; k < lines; k++)		/* forward (pstore pass 1/2, USB pump) */
+			check_line(k, total, lines, RAMLOG_LINE_MAX);
+		for (unsigned k = lines; k-- > 0;)		/* backward */
+			check_line(k, total, lines, RAMLOG_LINE_MAX);
+		for (unsigned i = 0; i < 200; i++)		/* random, small caps, re-reads */
+			check_line(rnd(lines), total, lines, 2 + rnd(RAMLOG_LINE_MAX - 1));
+		check_line(lines - 1, total, lines, RAMLOG_LINE_MAX);
+		check_line(lines - 1, total, lines, RAMLOG_LINE_MAX);
+		assert(ramlog_copy_line(lines, buf, sizeof buf) == 0 && buf[0] == 0);
+		check_line(0, total, lines, RAMLOG_LINE_MAX);
+		check_line(0, total, lines, RAMLOG_LINE_MAX);	/* cursor at line 1, then an append that evicts (log is full) moves head */
+		append_model(total++);
+		lines = ramlog_lines();
+		check_line(1, total, lines, RAMLOG_LINE_MAX);
+		append_model(total++);				/* an append between two reads of the same index */
+		lines = ramlog_lines();
+		check_line(0, total, lines, RAMLOG_LINE_MAX);
+		check_line(lines - 1, total, lines, RAMLOG_LINE_MAX);
+	}
+	ramlog_reset();
+	assert(ramlog_copy_line(0, buf, sizeof buf) == 0);
+}
+
 int main(void)
 {
 	test_page_count();
@@ -148,6 +212,7 @@ int main(void)
 	test_overflow();
 	test_eviction_keeps_whole_lines();
 	test_total_cursor();
-	printf("PASS ramlog host test: page count, copy, wraparound, overflow, whole-line eviction, total cursor\n");
+	test_read_cursor();
+	printf("PASS ramlog host test: page count, copy, wraparound, overflow, whole-line eviction, total cursor, read cursor\n");
 	return 0;
 }

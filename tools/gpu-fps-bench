@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""gpu-fps-bench: frame-time benchmark of a nav run (sprint-gpu 2026-11-08).
+
+usage: tools/gpu-fps-bench RUN_DIR [--rows] [--strict] [--json OUT]
+
+What it measures, per action of the nav script (SWEET NAV: ACTION <a> begin/end rep N):
+  drawn frame  = a SWEET SWAPT present whose GPU job count since the previous present is > 4
+                 (the render server drew layers; a present of unchanged content costs 2-4 jobs and
+                 0.2-0.3 ms GPU). Per-frame proof that pixels changed does not exist in the log: the
+                 32x32 / 64x64 samplers disagree per bin, so the GPU work is the frame signal. On
+                 nav20 it agrees with `busy_us >= 1000` on all but a few presents.
+  animation    = drawn frames from the action's begin to the next action's begin, split where two drawn
+                 frames are more than STALL_MS apart (a stall: reported, not hidden).
+  fps          = (drawn frames - segments) / summed segment time  (= 1000 / mean frame interval while animating)
+  trickle      = a run of >= TRICKLE_N consecutive intervals of 50-250 ms: a steady slow update (caret blink, icons
+                 filling in, nobody CPU-busy on nav20 spotlight-open), not an animation running slow; it is
+                 counted in its own column (frames, rate) and NOT in fps. A single slow interval between fast ones
+                 is a hitch and stays in fps.
+  low1         = 1000 / p99 frame interval (1% low), jank = intervals > 25 ms (missed >= 1 vsync)
+  latency      = ms from the action's begin marker (touch down) to its first drawn frame
+A row = one action over its reps: fps of the pooled frames, `dead` reps (no drawn frame) listed.
+Headline: fps_min = lowest row fps over rows animated in every rep (strict) or in >= 2/3 reps.
+This is the climb number of the GPU sprint: it does not depend on how long an animation lasts.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import re, sys, json, statistics as st
+
+STALL_MS = 250.0
+JANK_MS = 25.0
+SLOW_MS = 50.0
+TRICKLE_N = 3
+JOBS_DRAWN = 4
+SKIP = ("app-idle",)
+# v2 (user OK 2026-11-09, sprint-gpu goal thread): edge frames. Drawn frames are grouped into clusters linked by intervals <= LINK_MS (2 vsyncs + jitter);
+# a cluster of >= ANIM_N frames is animation. A rep's span runs from the first frame of its first animation cluster to the last frame of its last one;
+# every interval inside the span counts (hitches between clusters stay in fps). Frames before the span (the response before a push starts: highlight,
+# then the app building the page) are LATENCY (anim_lat_ms = action begin -> span start), frames after it (Clock icon ticks, scroll-indicator update)
+# are AMBIENT; both are counted in their own column (edge), never in fps. A rep without an animation cluster keeps all its frames (v1 rule).
+# --v1 reproduces the v1 numbers exactly.
+LINK_MS = 34.0
+ANIM_N = 4
+SMALL_JOBS = 12
+
+
+def span_of(fr):
+    """(i0, i1): index range of the animation span of fr (frame tuples sorted by time), or (0, len-1) when no cluster has ANIM_N frames."""
+    cl, start = [], 0
+    for k in range(1, len(fr) + 1):
+        if k == len(fr) or fr[k][0] - fr[k - 1][0] > LINK_MS:
+            cl.append((start, k - 1))
+            start = k
+    an = [c for c in cl if c[1] - c[0] + 1 >= ANIM_N]
+    if not an:
+        return 0, len(fr) - 1
+    # v2.1 (user OK 2026-11-09): trailing clusters made only of small frames (<= SMALL_JOBS GPU jobs: the live Clock icon's second-hand bursts) after the
+    # last cluster that holds a larger frame are ambient too
+    big = [c for c in an if max(fr[k][1] for k in range(c[0], c[1] + 1)) > SMALL_JOBS]
+    end = big[-1][1] if big else an[-1][1]
+    return an[0][0], end   # no input animation expected: a static app screen
+
+ACT = re.compile(r"SWEET NAV: ACTION (\S+) (begin|inputend|end) rep (\d+) now (\d+)")
+SWT = re.compile(r"SWEET SWAPT: n (\d+) now (\d+) vsync (\d+) prev (\d+) gpu_seq (\d+) gpu_done (\d+) busy_us (\d+)")
+
+
+def load(path):
+    acts, swaps, last = [], [], None
+    with open(path, "rb") as f:
+        for raw in f:
+            l = raw.decode("utf-8", "replace")
+            m = SWT.search(l)
+            if m:
+                now, seq, busy = int(m.group(2)), int(m.group(5)), int(m.group(7))
+                jobs = None if last is None else seq - last
+                last = seq
+                swaps.append((now / 1e6, jobs, busy / 1000.0))
+                continue
+            m = ACT.search(l)
+            if m:
+                acts.append((m.group(1), m.group(2), int(m.group(3)), int(m.group(4)) / 1e6))
+    return acts, sorted(swaps)
+
+
+def pct(xs, p):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * p / 100.0
+    i = int(k)
+    return xs[i] if i + 1 >= len(xs) else xs[i] + (xs[i + 1] - xs[i]) * (k - i)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+    run = argv[0].rstrip("/")
+    rows_out, strict = "--rows" in argv, "--strict" in argv
+    jout = argv[argv.index("--json") + 1] if "--json" in argv else None
+    acts, swaps = load(run + "/usbnet.log")
+    if not swaps:
+        print("RESULT: FAIL gpu-fps-bench no SWEET SWAPT rows (needs SWEETGL swap timing)")
+        return 1
+    begins = sorted((t, a, r) for a, k, r, t in acts if k == "begin")
+    if not begins:
+        print("RESULT: FAIL gpu-fps-bench no SWEET NAV: ACTION markers")
+        return 1
+    v1 = "--v1" in argv
+    print("gpu-fps-bench %s" % ("v1 (all drawn frames)" if v1 else "v2.1 (edge frames before/after the animation span and trailing small-frame clusters = latency/ambient, user OK 2026-11-09)"))
+    reps = {}
+    for i, (t0, a, r) in enumerate(begins):
+        t1 = begins[i + 1][0] if i + 1 < len(begins) else t0 + 3000.0
+        fr = [s for s in swaps if t0 <= s[0] < t1 and s[1] is not None and s[1] > JOBS_DRAWN]
+        reps.setdefault(a, []).append((r, t0, fr))
+    order = [a for _, a, _ in begins if a not in SKIP]
+    order = list(dict.fromkeys(order))
+    table, pooled_iv = {}, []
+    for a in order:
+        ivs, segs, span, lat, stalls, dead, nrep, trk, edge, alat = [], 0, 0.0, [], 0, [], 0, [], 0, []
+        for r, t0, fr in reps[a]:
+            nrep += 1
+            if len(fr) < 2:
+                dead.append(r)
+                continue
+            lat.append(fr[0][0] - t0)
+            if not v1:
+                i0, i1 = span_of(fr)
+                edge += len(fr) - (i1 - i0 + 1)
+                fr = fr[i0:i1 + 1]
+                alat.append(fr[0][0] - t0)
+                if len(fr) < 2:
+                    continue
+            seg_start = fr[0][0]
+            segs += 1
+            ds = [y[0] - x[0] for x, y in zip(fr, fr[1:])]
+            slow = [SLOW_MS < d <= STALL_MS for d in ds]
+            intr = [False] * len(ds)   # part of a trickle run
+            i = 0
+            while i < len(ds):
+                if slow[i]:
+                    j = i
+                    while j < len(ds) and slow[j]:
+                        j += 1
+                    if j - i >= TRICKLE_N:
+                        for k in range(i, j):
+                            intr[k] = True
+                    i = j
+                else:
+                    i += 1
+            for k, d in enumerate(ds):
+                if d > STALL_MS:
+                    stalls += 1
+                elif intr[k]:
+                    trk.append(d)
+                else:
+                    ivs.append(d)
+            # animation time = sum of the counted intervals (stall and trickle time removed)
+        span = sum(ivs)
+        fps = (len(ivs)) / span * 1000.0 if span > 0 else None
+        p99 = pct(ivs, 99)
+        table[a] = dict(reps=nrep, anim=nrep - len(dead), dead=dead, frames=len(ivs) + segs, fps=fps,
+                        low1=(1000.0 / p99) if p99 else None, jank=sum(1 for d in ivs if d > JANK_MS), intervals=len(ivs),
+                        p50_ms=pct(ivs, 50), p99_ms=p99, stalls=stalls, trickle=len(trk), trickle_hz=(len(trk) / sum(trk) * 1000.0) if trk else None, lat_ms=st.median(lat) if lat else None,
+                        edge=edge, anim_lat_ms=st.median(alat) if alat else None)
+        pooled_iv += ivs
+    if rows_out:
+        print(f"{'action':22s} {'anim':>5s} {'frames':>6s} {'fps':>6s} {'low1':>6s} {'p50ms':>6s} {'p99ms':>6s} {'jank':>9s} {'stall':>5s} {'trickle':>11s} {'lat_ms':>7s} {'edge':>5s} {'alat_ms':>7s}")
+        for a in order:
+            t = table[a]
+            f = lambda v, w=6, p=1: (f"{v:{w}.{p}f}" if v is not None else f"{'-':>{w}s}")
+            print(f"{a:22s} {t['anim']}/{t['reps']:<3d} {t['frames']:6d} {f(t['fps'])} {f(t['low1'])} {f(t['p50_ms'])} {f(t['p99_ms'])} "
+                  f"{t['jank']:4d}/{t['intervals']:<4d} {t['stalls']:5d} {t['trickle']:3d}@{f(t['trickle_hz'], 5, 1)}Hz {f(t['lat_ms'], 7, 0)} {t['edge']:5d} {f(t['anim_lat_ms'], 7, 0)}")
+    need = (lambda t: t["anim"] == t["reps"]) if strict else (lambda t: t["anim"] >= 2 or t["anim"] == t["reps"])
+    ok = [a for a in order if need(table[a]) and table[a]["fps"] is not None]
+    unmeas = [f"{a}({table[a]['anim']}/{table[a]['reps']})" for a in order if table[a]["dead"]]
+    if not ok:
+        print("RESULT: FAIL gpu-fps-bench no row animated")
+        return 1
+    worst = min(ok, key=lambda a: table[a]["fps"])
+    pf = len(pooled_iv) / sum(pooled_iv) * 1000.0 if pooled_iv else 0
+    lows = min(ok, key=lambda a: table[a]["low1"] or 0)
+    jank = sum(table[a]["jank"] for a in ok)
+    nint = sum(table[a]["intervals"] for a in ok)
+    lat = [table[a]["lat_ms"] for a in ok if table[a]["lat_ms"] is not None]
+    rc = 1 if (strict and unmeas) else 0
+    print(f"RESULT: {'FAIL' if rc else 'PASS'} gpu-fps-bench fps_min={table[worst]['fps']:.1f} ({worst}) fps_pooled={pf:.1f} "
+          f"low1_min={table[lows]['low1']:.1f} ({lows}) jank={jank}/{nint} stalls={sum(table[a]['stalls'] for a in ok)} "
+          f"trickle={sum(table[a]['trickle'] for a in ok)} lat_p50_ms={st.median(lat):.0f} rows={len(ok)} unmeasured={','.join(unmeas) or 'none'}"
+          + ("" if v1 else f" edge={sum(table[a]['edge'] for a in ok)} alat_p50_ms={st.median([table[a]['anim_lat_ms'] for a in ok if table[a]['anim_lat_ms'] is not None]):.0f} witness=v2.1"))
+    if jout:
+        json.dump(dict(run=run, rows=table, fps_min=table[worst]["fps"], worst=worst, fps_pooled=pf), open(jout, "w"), indent=1)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,17 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+--- a/xnu/patches/0300-x.patch
++++ b/xnu/patches/0300-x.patch
+@@ -12,6 +12,7 @@
+ +++ b/k.c
+ @@ -1,3 +1,4 @@
+  	a();
+++	printf("moved");
+ +	foo();
+  	b();
+  	c();
+@@ -40,6 +41,5 @@
+  	y1();
+-+	printf("moved");
+  	d();
+  	e();
+  	f();

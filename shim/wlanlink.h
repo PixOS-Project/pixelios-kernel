@@ -21,3 +21,4 @@ struct wlan_hold { int on; unsigned hi, probed; };	/* caller-owned state of a he
 int wlan_link_hold(struct wlan_hold *h);
 /* Tear down a link left up by a successful wlan_link_hold() (XNU did not come): the same table T rows, `LINK release restore=ok|FAILED`; 0 ok, 1 failed, 2 nothing was held (nothing written). */
 int wlan_link_release(struct wlan_hold *h);
+#include "wlanh1.h"	/* wlan_h1_after_hold(): the H1 read-only probe shim.c runs right after wlan_link_hold() */

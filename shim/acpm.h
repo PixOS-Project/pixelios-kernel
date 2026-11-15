@@ -149,6 +149,14 @@ int acpm_pmic_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct
 int acpm_s11_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t);
 /* S2MPG10 register read of the four PCIe-PHY LDO control registers of soc.json wlan (s10_l16m..l19m_ctrl only), for --wlan-rails (docs/research/29); no PMIC write is expressible */
 int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t);
+/* Reset-source latches for --pmic-src (docs/research/139): exactly S2MPG10 STATUS1/STATUS2/PWRONSRC/OFFSRC (0xC..0xF) and S2MPG11 STATUS1/OFFSRC (0xC, 0xD); any other pair (INT1..INT6 included) is ACPM_E_ARG. FUNC_READ only. */
+enum { ACPM_SRC_S10 = 0, ACPM_SRC_S11 = 1 };
+int32_t acpm_pmic_src_read(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t *val, struct acpm_trace *t);
+#ifdef PMIC_SRC_CLEAR
+/* --pmic-src-clear images ONLY (docs/research/142, ALL-ON T-02/T-24): the one PMIC write of that flag, a FUNC_WRITE of the VALUE 0 to exactly S2MPG10 OFFSRC 0xF, S2MPG10 PWRONSRC 0xE or
+ * S2MPG11 OFFSRC 0xD (what Google's BCL driver does after reading them). Any other (chip, register) or any value != 0 is ACPM_E_ARG before any IPC. One request, no retry. */
+int32_t acpm_pmic_src_clear(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t val, struct acpm_trace *t);
+#endif
 /* GPU_RAIL_ON images only (--gpu-rail-on): switch the mode field of S2MPG11 BUCK2S_CTRL (soc.json acpm.s2mpg11.rail_on): on = off -> on-normal (only from exactly 'off' and
  * with OUT1 inside the window, *out1 = OUT1), off = restore to off (nothing to do if already off: ACPM_E_ON). t->a = pre-read, t->b = the update (or the refusal). The only S2MPG11 write. */
 int acpm_s11_rail_set(const struct acpm_cfg *c, int on, struct acpm_trace *t, uint32_t *out1);
@@ -171,3 +179,19 @@ int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct 
 int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t);
 /* GPU_CLK images only: like acpm_dvfs_set for G3D (5) / G3DL2 (6) ONLY, but the request is also sent when the pre-read equals khz. */
 int acpm_dvfs_reassert(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t);
+/* MIF_CLK images only (T-5030): FREQ_REQ for MIF (dom 0) to the table top row (soc.json acpm.dvfs MIF ceiling) and nothing else; pre-read in t->a, request in t->b. */
+int acpm_dvfs_mif_top(const struct acpm_cfg *c, struct acpm_trace *t);
+#if defined(MIF_CLK_LEVEL_KHZ) && !defined(MIF_CLK)
+#error "MIF_CLK_LEVEL_KHZ needs MIF_CLK"
+#endif
+#ifdef SWEET_PROBE
+/* --sweet-probe images ONLY (xnu patch 0363, docs/research/161 s.1): the SLC service on ACPM channel soc.json acpm.slc.ch_id (10) / async_ch_id (11).
+ * acpm_slc_describe: reads only (channel 10 or 11, element 16 or 32 B accepted; another channel is ACPM_E_ARG).
+ * acpm_slc_version: ONE fixed PT_VERSION (0xd005) request on channel 10, *ver = reply word 1 = (major << 16) | minor; t->a = the transaction. No argument parameter: PT_CHECK / PT_ENABLE / PT_MUTATE / PT_DISABLE and the PMON opcodes are not expressible. */
+int acpm_slc_describe(const struct acpm_cfg *c, uint32_t ch, struct acpm_chan *h);
+int acpm_slc_version(const struct acpm_cfg *c, uint32_t *ver, struct acpm_trace *t);
+#endif
+/* Images that contain code able to build a FREQ_REQ (acpm.c dvfs_set): the CPU, GPU or MIF client. */
+#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK) || defined(MIF_CLK)
+#define ACPM_DVFS_WRITER 1
+#endif

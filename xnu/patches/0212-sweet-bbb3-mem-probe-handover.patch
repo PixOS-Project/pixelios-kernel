@@ -1,0 +1,254 @@
+SWEET T-bbb3 log-only witnesses (patch 0212, PLAN-60FPS G-F20 limiter check): (1) `SWEET MEM:` cached-memory probe (read / copy / pointer-chase per CPU at 32K..32M, 3 repeats, medians) run once by a bound kernel thread after all selected CPUs are up (SweetCPU.cpp -> sweet_mem_probe_start); (2) under sweetperf=1 per second `SWEET PERF: jobfine` (50 us bins of submit -> completion seen) and `SWEET PERF: handover` (completion seen -> next job start stamp). R0 LOG ONLY: no MMIO and no register write (MIDR_EL1 is read); no knob, no behaviour change except ~10 s of CPU time on a bound thread at boot.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -14,6 +14,10 @@
+ #include <kern/kalloc.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/cpu_number.h>
++/* bsd/ does not see these (MACH_KERNEL_PRIVATE); both are exported, non-static kernel functions (sched_prim.c, thread.c) */
++extern processor_t thread_bind(processor_t);
++extern void thread_terminate_self(void);
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
+ #include <mach/host_info.h>
+@@ -252,6 +256,13 @@
+ static struct { uint64_t seq, us, t; } perf_long[PERF_LONG_N];
+ static unsigned perf_long_n;
+ static uint64_t perf_long_drop;
++/* patch 0212 (T-bbb3, log only): (1) fine job-time histogram, 50 us bins up to 1000 us (bin 20 = >= 1000 us): the 200 us completion poll shows as a comb;
++ * (2) handover = completion seen (perf_job_done) -> next job's start stamp (sweet_mali_submit, just before the JS_COMMAND_NEXT write), gaps >= HO_FAR_US are "far" (idle
++ * between bursts, not counted in the sum). Printed once per second by sm_perf_tick: `SWEET PERF: jobfine ...` and `SWEET PERF: handover ...`. No register access. */
++#define PERF_FINE_N 21
++#define HO_FAR_US 5000
++#define HO_NB 7
++static uint64_t perf_fine[PERF_FINE_N], perf_last_done_us, ho_n, ho_sum, ho_max, ho_far, ho_hist[HO_NB];
+ 
+ static void
+ perf_job_done(void)
+@@ -261,6 +272,8 @@
+ 	perf_jobs++;
+ 	perf_busy_us += d;
+ 	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
++	perf_fine[d >= 1000 ? PERF_FINE_N - 1 : d / 50]++;   /* patch 0212 */
++	perf_last_done_us = now_us();
+ 	if (d >= PERF_LONG_US) {   /* patch 0210, lock held */
+ 		if (perf_long_n < PERF_LONG_N) {
+ 			perf_long[perf_long_n].seq = sm.busy_seq;
+@@ -554,7 +567,19 @@
+ 	memcpy(lj, perf_long, ljn * sizeof(lj[0]));
+ 	perf_long_n = 0;
+ 	perf_long_drop = 0;
++	uint64_t fine[PERF_FINE_N], hoh[HO_NB], hon = ho_n, hosum = ho_sum, homax = ho_max, hofar = ho_far;   /* patch 0212 */
++	memcpy(fine, perf_fine, sizeof(fine));
++	memcpy(hoh, ho_hist, sizeof(hoh));
++	bzero(perf_fine, sizeof(perf_fine));
++	bzero(ho_hist, sizeof(ho_hist));
++	ho_n = ho_sum = ho_max = ho_far = 0;
+ 	lck_mtx_unlock(&sm_lock);
++	if (jobs != 0) {
++		printf("SWEET PERF: jobfine b50 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7:%llu 8:%llu 9:%llu 10:%llu 11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu 17:%llu 18:%llu 19:%llu ge1000:%llu\n",
++		    fine[0], fine[1], fine[2], fine[3], fine[4], fine[5], fine[6], fine[7], fine[8], fine[9], fine[10], fine[11], fine[12], fine[13], fine[14], fine[15], fine[16], fine[17], fine[18], fine[19], fine[20]);
++		printf("SWEET PERF: handover n %llu sum_us %llu max_us %llu far %llu lt25 %llu lt50 %llu lt100 %llu lt200 %llu lt500 %llu lt1000 %llu ge1000 %llu\n",
++		    hon, hosum, homax, hofar, hoh[0], hoh[1], hoh[2], hoh[3], hoh[4], hoh[5], hoh[6]);
++	}
+ 	for (unsigned i = 0; i < ljn; i++) {
+ 		printf("SWEET PERF: longjob seq %llu us %llu t %llu\n", lj[i].seq, lj[i].us, lj[i].t);
+ 	}
+@@ -667,6 +692,157 @@
+ 	return 0;
+ }
+ 
++/*
++ * SWEET MEM (patch 0212, T-bbb3, log only; ticket question: is memory the clock-independent limiter of the GPU path?). One kernel thread, started once after every
++ * selected CPU is up (SweetCPU.cpp, before launchd), binds itself to each online CPU in turn and measures cached kernel memory (kalloc_data, normal WB): read (sum of 64-bit
++ * loads, 4 accumulators), copy (memcpy) and dependent pointer chase (random cycle over 64 B lines) at sizes inside L1/L2, inside L2/L3 and past L3, 3 repeats each, median printed:
++ *   `SWEET MEM: cpu=N midr=0x.. size=S read_mbps=.. copy_mbps=.. chase_ns=.. rep=3`   (MB/s = 1e6 bytes/s; chase_ns = ns per dependent load)
++ * No MMIO and no register write (MIDR_EL1 is read). A failed allocation or bind prints `SWEET GAP: MEM ...`; the thread ends after the last line (`SWEET MEM: done`).
++ */
++#define MEM_NSZ 6
++#define MEM_REP 3
++static const size_t mem_sizes[MEM_NSZ] = { 32u << 10, 128u << 10, 512u << 10, 2u << 20, 8u << 20, 32u << 20 };
++
++static uint64_t
++mem_ns(void)
++{
++	uint64_t t, ns;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns;
++}
++
++static uint64_t
++mem_med3(uint64_t a, uint64_t b, uint64_t c)
++{
++	if (a > b) { uint64_t x = a; a = b; b = x; }
++	if (b > c) { b = c; }
++	return a > b ? a : b;
++}
++
++static void
++mem_probe_cpu(unsigned cpu, uint8_t *buf, size_t bufsz)
++{
++	uint64_t midr = 0;
++	processor_t pr = cpu_to_processor((int)cpu);
++	if (pr == PROCESSOR_NULL) {
++		printf("SWEET GAP: MEM cpu=%u has no processor, skipped\n", cpu);
++		return;
++	}
++	processor_t prev = thread_bind(pr);
++	thread_block(THREAD_CONTINUE_NULL);
++	if ((unsigned)cpu_number() != cpu) {
++		printf("SWEET GAP: MEM cpu=%u bind failed (running on cpu %d), skipped\n", cpu, cpu_number());
++		thread_bind(prev);
++		return;
++	}
++	__asm__ volatile ("mrs %0, midr_el1" : "=r" (midr));
++	for (unsigned si = 0; si < MEM_NSZ; si++) {
++		size_t sz = mem_sizes[si];
++		uint64_t rd[MEM_REP], cp[MEM_REP], ch[MEM_REP];
++		if (2 * sz > bufsz) {
++			printf("SWEET GAP: MEM size %zu exceeds the buffer, skipped\n", sz);
++			continue;
++		}
++		uint64_t *a = (uint64_t *)buf, *b = (uint64_t *)(buf + sz);
++		size_t nw = sz / 8, nl = sz / 64;
++		uint32_t *perm = (uint32_t *)b;   /* chase scratch: nl * 4 bytes <= sz, reused as the copy destination afterwards */
++		for (size_t i = 0; i < nl; i++) {
++			perm[i] = (uint32_t)i;
++		}
++		uint64_t rng = 0x9e3779b97f4a7c15ull ^ sz;
++		for (size_t i = nl - 1; i > 0; i--) {   /* Sattolo: one cycle through every line */
++			rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
++			size_t j = (size_t)(rng % i);
++			uint32_t t = perm[i]; perm[i] = perm[j]; perm[j] = t;
++		}
++		for (size_t i = 0; i < nl; i++) {
++			a[(size_t)perm[i] * 8] = (uint64_t)(uintptr_t)&a[(size_t)perm[(i + 1) % nl] * 8];
++		}
++		for (size_t i = 0; i < nw; i++) {
++			if ((i & 7) != 0) {
++				a[i] = i;
++			}
++		}
++		size_t passes = ((64u << 20) / sz) ? ((64u << 20) / sz) : 1;
++		for (unsigned r = 0; r < MEM_REP; r++) {
++			volatile uint64_t sink;
++			uint64_t t0 = mem_ns(), s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++			for (size_t p = 0; p < passes; p++) {
++				for (size_t i = 0; i + 4 <= nw; i += 4) {
++					s0 += a[i]; s1 += a[i + 1]; s2 += a[i + 2]; s3 += a[i + 3];
++				}
++			}
++			sink = s0 + s1 + s2 + s3;
++			(void)sink;
++			uint64_t dt = mem_ns() - t0;
++			rd[r] = dt ? (uint64_t)passes * sz * 1000ull / dt : 0;
++			t0 = mem_ns();
++			for (size_t p = 0; p < passes; p++) {
++				memcpy(b, a, sz);
++			}
++			dt = mem_ns() - t0;
++			cp[r] = dt ? (uint64_t)passes * sz * 1000ull / dt : 0;
++			/* the copy destroyed the chase scratch only (b), a is intact: chase over a */
++			uint64_t *q = a;
++			size_t steps = 1u << 21;
++			t0 = mem_ns();
++			for (size_t i = 0; i < steps; i++) {
++				q = (uint64_t *)(uintptr_t)*q;
++			}
++			dt = mem_ns() - t0;
++			sink = (uint64_t)(uintptr_t)q;
++			ch[r] = dt * 10 / steps;   /* ns x10 */
++		}
++		uint64_t c10 = mem_med3(ch[0], ch[1], ch[2]);
++		printf("SWEET MEM: cpu=%u midr=0x%llx size=%zu read_mbps=%llu copy_mbps=%llu chase_ns=%llu.%llu rep=%d\n", cpu, midr, sz,
++		    mem_med3(rd[0], rd[1], rd[2]), mem_med3(cp[0], cp[1], cp[2]), c10 / 10, c10 % 10, MEM_REP);
++	}
++	thread_bind(prev);
++}
++
++static void
++mem_probe_thread(void *arg, wait_result_t w __unused)
++{
++	unsigned ncpu = (unsigned)(uintptr_t)arg;
++	size_t bufsz = 2 * mem_sizes[MEM_NSZ - 1];
++	uint8_t *buf = kalloc_data(bufsz, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		printf("SWEET GAP: MEM allocation of %zu bytes failed, no SWEET MEM lines\n", bufsz);
++		thread_terminate_self();
++		return;
++	}
++	printf("SWEET MEM: start ncpu=%u buf=%zu cache line 64 B, sizes 32K..32M, rep %d (patch 0212, log only)\n", ncpu, bufsz, MEM_REP);
++	for (unsigned c = 0; c < ncpu; c++) {
++		mem_probe_cpu(c, buf, bufsz);
++	}
++	kfree_data(buf, bufsz);
++	printf("SWEET MEM: done\n");
++	thread_terminate_self();
++}
++
++void
++sweet_mem_probe_start(unsigned ncpu)
++{
++	static int started;
++	thread_t th;
++	uint32_t on = 0;
++	if (__sync_lock_test_and_set(&started, 1)) {
++		return;
++	}
++	/* T-f7d7: the probe's 64 MiB kalloc_data takes the free pages below the UFS DMA buffer and the Wi-Fi DMA blocks (UFS DMA 0x8854dc000 -> 0x8894a4000), which pushed the
++	 * G1 block outside the reviewed G2 window; so it runs only on request (xrun --intent gpu passes sweetmem=1). Off is logged, never silent. */
++	if (!PE_parse_boot_argn("sweetmem", &on, sizeof(on)) || on == 0) {
++		printf("SWEET MEM: probe off (boot-arg sweetmem=1 runs the 64 MiB cached-memory probe, patch 0212)\n");
++		return;
++	}
++	if (kernel_thread_start(mem_probe_thread, (void *)(uintptr_t)ncpu, &th) != KERN_SUCCESS) {
++		printf("SWEET GAP: MEM probe thread did not start\n");
++		return;
++	}
++	thread_deallocate(th);
++}
++
+ int
+ sweet_mali_ready(void)
+ {
+@@ -851,6 +1027,20 @@
+ 	sm.faulted = 0;
+ 	sm.busy_start_us = now_us();
+ 	perf_start_us = sm.busy_start_us;
++	if (perf_last_done_us != 0) {   /* patch 0212: completion seen -> this job's start stamp, lock held */
++		uint64_t h = perf_start_us - perf_last_done_us;
++		if (h >= HO_FAR_US) {
++			ho_far++;
++		} else {
++			ho_n++;
++			ho_sum += h;
++			if (h > ho_max) {
++				ho_max = h;
++			}
++			ho_hist[h < 25 ? 0 : h < 50 ? 1 : h < 100 ? 2 : h < 200 ? 3 : h < 500 ? 4 : h < 1000 ? 5 : 6]++;
++		}
++		perf_last_done_us = 0;
++	}
+ 	wr(R_JS_BASE(slot) + JS_HEAD_NEXT, (uint32_t)jc);
+ 	wr(R_JS_BASE(slot) + JS_HEAD_NEXT + 4, (uint32_t)(jc >> 32));
+ 	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT, SHADERS);
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -24,6 +24,7 @@
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
++extern "C" void sweet_mem_probe_start(unsigned ncpu);
+ static uint64_t sweet_clk_ticks[SWEET_SMP_MAX_CPUS], sweet_clk_midr[SWEET_SMP_MAX_CPUS], sweet_clk_frq;
+ static uint64_t sweet_clk_adds;
+ 
+@@ -254,6 +255,7 @@
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
++	sweet_mem_probe_start(topology->num_cpus);   /* patch 0212 (T-bbb3): log-only memory probe thread, bsd/dev/sweet_mali.c */
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);

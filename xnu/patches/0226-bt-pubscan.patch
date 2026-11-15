@@ -1,0 +1,138 @@
+SWEET Bluetooth: boot-arg sweetbtpubscan=1 (patch 0226, ticket T-4b11, W-BTUP): diagnostic tx-side rewrite on bluetoothd's kctl stream only (new ops tx sbu_tx_kctl; sbu_cmd/probe/sweep keep calling sbu_tx and are never rewritten) of HCI_LE_Set_Scan_Parameters (0x200b, plen 7) Own_Address_Type 0x01 (random) -> 0x00 (public), Core v5.4 Vol 4 Part E s.7.8.10. Decompile [bin, docs/reviews/T-4b11-proof.md]: bluetoothd sends HCI_LE_Set_Random_Address (0x2005) only after LE_InitMultipleAdvertising succeeds; without extended advertising that is the Broadcom VSC 0xfd48 (_BCM_CreateMultipleAdvInstance), which this chip answers 0x01 [obs 20261107T092258Z-bt-up10], so Scan Enable ON returns 0x12 (s.7.8.11). The rewritten command is a valid Core command; passive scan (LE_Scan_Type 0) puts no own address on air. H4 framing parser for types 01/02/03/05; unknown type or a tx error inside a packet disables the knob (loud); one BT GAP row per rewrite; the BT HCI tx trace shows the bytes the chip gets. Default behaviour unchanged.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index 2bfee96..4b335c1 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1482,8 +1482,115 @@ sbu_cts(int *cts)
+ 	return 0;
+ }
+ 
++/*
++ * patch 0226 (T-4b11, W-BTUP): boot-arg sweetbtpubscan=1. On bluetoothd's tx stream (kctl path only; sbu_cmd/probe/sweep call sbu_tx directly and are never
++ * rewritten), the Own_Address_Type of HCI_LE_Set_Scan_Parameters (0x200b, plen 7, parameter offset 5; Core v5.4 Vol 4 Part E s.7.8.10) is rewritten from
++ * 0x01 (random) to 0x00 (public). Why [bin, docs/reviews/T-4b11-proof.md]: bluetoothd sends HCI_LE_Set_Random_Address (0x2005) only from sub_100191448 after
++ * LE_InitMultipleAdvertising reports status 0; without extended advertising that init is the Broadcom VSC 0xfd48 (_BCM_CreateMultipleAdvInstance), which this
++ * chip answers 0x01 [obs bt-up10 `rx 04 0e 04 01 48 fd 01`], so no 2005 is sent, and s.7.8.11 makes Scan Enable ON with Own_Address_Type 0x01 and no random
++ * address return 0x12 [obs bt-up10, 19/19]. The rewritten command is still a valid Core command; with LE_Scan_Type 0x00 (passive) no packet carries the own
++ * address. Diagnostic knob, not a fix: one BT GAP row per rewrite, every other Own_Address_Type value and a non-passive LE_Scan_Type are logged and passed; the rewrite row is printed only after sbu_tx took the bytes; the BT HCI tx trace shows the bytes
++ * the chip gets. Framing: H4 types 01/02/03/05 with their header lengths (Core Vol 4 Part A s.2 + Part E s.5.4); any other type byte, or a tx error inside a
++ * packet, stops the rewrite for the rest of the boot (loud). Known limit (review T-4b11-0226 #1, accepted for diagnostic boots): the parser state is not reset when
++ * a kctl client disconnects inside a packet (struct sweet_bt_ops has no connect hook); bt-up10 had every tx row a whole command [obs].
++ */
++static bool sbu_pubscan_on;
++static unsigned sbu_pubscan_n;
++static unsigned sbu_tx_off, sbu_tx_hlen, sbu_tx_need;     /* offset in the current H4 packet, its header length (type byte included), its total length */
++static uint8_t sbu_tx_type, sbu_tx_hdr[5], sbu_tx_scantype;
++
++static unsigned        /* rewrites made in p[0..n) (review T-4b11-0226 #2: counted and logged by the caller only after the chip took the bytes) */
++sbu_txrw(uint8_t *p, size_t n)
++{
++	unsigned nrw = 0;
++
++	for (size_t i = 0; i < n && sbu_pubscan_on; i++) {
++		uint8_t b = p[i];
++
++		if (sbu_tx_off == 0) {
++			sbu_tx_type = b;
++			sbu_tx_hlen = b == 0x01 ? 4u : b == 0x02 ? 5u : b == 0x03 ? 4u : b == 0x05 ? 5u : 0u;   /* type + cmd opcode2 plen1 | ACL handle2 len2 | SCO handle2 len1 | ISO handle2 len2 */
++			if (sbu_tx_hlen == 0) {
++				sbu_pubscan_on = false;
++				SBU_GAP(SG_OTHER, "sweetbtpubscan: tx byte %#x is no H4 packet type: rewrite disabled for the rest of the boot", b);
++				return nrw;
++			}
++			sbu_tx_hdr[0] = b;
++			sbu_tx_off = 1;
++			continue;
++		}
++		if (sbu_tx_off < sbu_tx_hlen) {
++			sbu_tx_hdr[sbu_tx_off++] = b;
++			if (sbu_tx_off == sbu_tx_hlen) {
++				unsigned plen = sbu_tx_type == 0x01 || sbu_tx_type == 0x03 ? sbu_tx_hdr[3] :
++				    sbu_tx_type == 0x02 ? (unsigned)(sbu_tx_hdr[3] | (sbu_tx_hdr[4] << 8)) : (unsigned)((sbu_tx_hdr[3] | (sbu_tx_hdr[4] << 8)) & 0x3fff);
++
++				sbu_tx_need = sbu_tx_hlen + plen;
++				if (plen == 0) {
++					sbu_tx_off = 0;
++				}
++			}
++			continue;
++		}
++		if (sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u) {    /* 0x200b parameter 0 = LE_Scan_Type */
++			sbu_tx_scantype = b;
++		}
++		if (sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u + 5u) {    /* 0x200b parameter 5 = Own_Address_Type */
++			if (sbu_tx_hdr[3] != 7) {
++				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b plen %u (need 7): nothing rewritten", sbu_tx_hdr[3]);
++			} else if (sbu_tx_scantype != 0x00) {       /* review T-4b11-0226 #3: an active scan would put the public address in SCAN_REQ */
++				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b LE_Scan_Type %#x is not passive: nothing rewritten", sbu_tx_scantype);
++			} else if (b == 0x01) {
++				p[i] = 0x00;
++				nrw++;
++			} else {
++				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b Own_Address_Type %#x is not 0x01: nothing rewritten", b);
++			}
++		}
++		if (++sbu_tx_off == sbu_tx_need) {
++			sbu_tx_off = 0;
++		}
++	}
++	return nrw;
++}
++
++#define SBU_TXRW_MAX    512
++static int
++sbu_tx_kctl(const void *data, size_t len)
++{
++	uint8_t buf[SBU_TXRW_MAX];
++	const uint8_t *p = data;
++	int e = 0;
++
++	if (!sbu_pubscan_on) {
++		return sbu_tx(data, len);
++	}
++	for (size_t off = 0; off < len && e == 0; off += SBU_TXRW_MAX) {     /* chunks only while the knob is on: a write over 512 bytes shows as several trace rows */
++		size_t m = len - off < SBU_TXRW_MAX ? len - off : SBU_TXRW_MAX;
++
++		unsigned nrw;
++
++		memcpy(buf, p + off, m);
++		nrw = sbu_txrw(buf, m);
++		e = sbu_tx(buf, m);
++		for (unsigned k = 0; k < nrw; k++) {
++			if (e == 0) {
++				sbu_pubscan_n++;
++				printf("BT GAP: sweetbtpubscan=1 rewrote Own_Address_Type of bluetoothd's 0x200b from 0x01 (random, no 0x2005 sent) to 0x00 (public) on the way to the chip (x%u); diagnostic knob, bluetoothd still believes random\n", sbu_pubscan_n);
++			} else {
++				SBU_GAP(SG_OTHER, "sweetbtpubscan: a 0x200b rewrite was not sent: tx error %d", e);
++			}
++		}
++	}
++	if (e != 0 && sbu_pubscan_on && sbu_tx_off != 0) {     /* the chip got part of a packet: the framing of the rest is not known */
++		sbu_pubscan_on = false;
++		SBU_GAP(SG_OTHER, "sweetbtpubscan: tx error %d inside an H4 packet: rewrite disabled for the rest of the boot", e);
++	}
++	return e;
++}
++
+ /* sw_open/sw_close stay NULL: the polarity and meaning of /dev/btwake, /dev/btpoweroff, /dev/btreset is BT-S3 O4 (open), every open is a GAP + error. */
+-static const struct sweet_bt_ops sbu_ops = { .termios_get = sbu_termios_get, .termios_set = sbu_termios_set, .tx = sbu_tx, .cts = sbu_cts };
++static const struct sweet_bt_ops sbu_ops = { .termios_get = sbu_termios_get, .termios_set = sbu_termios_set, .tx = sbu_tx_kctl, .cts = sbu_cts };
+ 
+ static uint32_t
+ sbu_k_rd(uint32_t pa)
+@@ -1657,6 +1764,14 @@ sweet_bt_uart_attach(void)
+ 			printf("BT GAP: sweetbtnopadv=1 active: LE feature bit 13 (Periodic Advertising) is cleared in the 0x2003 Command Complete on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
+ 		}
+ 	}
++	{       /* patch 0226 (T-4b11): boot-arg sweetbtpubscan=1, Own_Address_Type 0x01 -> 0x00 in bluetoothd's 0x200b on the way to the chip; default off */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtpubscan", &v, sizeof(v)) && v == 1) {
++			sbu_pubscan_on = true;
++			printf("BT GAP: sweetbtpubscan=1 active: Own_Address_Type 0x01 (random) in bluetoothd's 0x200b is rewritten to 0x00 (public) on the way to the chip (diagnostic knob, not a fix; bluetoothd sends no 0x2005 because the chip refuses VSC 0xfd48; one BT GAP row per rewrite)\n");
++		}
++	}
+ 	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
+ 		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
+ 		(void)sbu_power_off();

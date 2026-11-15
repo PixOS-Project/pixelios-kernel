@@ -1,0 +1,21 @@
+diff --git a/shim/x.c b/shim/x.c
+index e39597c..088d97f 100644
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,11 +1,16 @@
+ #include <stdint.h>
+ void write32(uint32_t a, uint32_t v);
+ int printf(const char *, ...);
++int g_state;
+ int f(int err, uint32_t a)
+ {
+ 	if (err)
+ 		/* best effort: log it */
+ 		printf("x\n");
+ 	write32(a, 1);
++	// cdiff --git a/docs/a.md b/docs/a.md
++	g_state = 1;
++	write32(a, 2);
++	if (err) return 3;
+ 	return 0;
+ }

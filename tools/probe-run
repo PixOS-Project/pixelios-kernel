@@ -1,6 +1,6 @@
 #!/bin/bash
-# One shim probe cycle: phone-state -> build -> USB capture -> fboot -> wait for the result line -> phone back? -> ONE report.
-#   tools/probe-run [--touch-probe[=OPTS] | --build-args "..."] [--expect REGEX]... [--timeout S] [--label NAME] [--lock-wait S]
+# One shim probe cycle: build -> phone lock -> `tools/phone goto fastboot` -> USB capture -> fboot -> wait for the result line -> phone back? -> ONE report.
+#   tools/probe-run [--touch-probe[=OPTS] | --build-args "..."] [--expect REGEX]... [--timeout S] [--label NAME] [--lock-wait S] [--kind probe|xnu|udump]
 #   tools/probe-run --dry-run --from-dir DIR [--expect REGEX]...     (re-read DIR/usb.txt, touches nothing)
 #   tools/probe-run --self-test
 # First line: RESULT: PASS|FAIL|HANG|TIMEOUT|ERROR ...   Exit 0 PASS / 1 FAIL, HANG or TIMEOUT / 2 ERROR.
@@ -9,15 +9,19 @@
 # --timeout defaults to 600 when the build args contain --wlan-link (the LINK steps need ~170-190 s, AP-14). --reject REGEX (repeatable; default for "LINK summary" expects: stopped=timeout|fault|refused or restore=FAILED) turns a found run into FAIL (TP-015 amendment).
 # HANG = expected line never came AND the phone is not back (fastboot/recovery) within the wait window (120 s): hold Power+VolDown.
 # The phone legitimately leaves USB for a while when the shim reboots, so "absent" right after the result line is normal.
-# Test hooks (self-test only): PR_PHONE (tools/phone) PR_PHONE_STATE PR_TO_FASTBOOT PR_FBOOT PR_USBLOG PR_BUILD PR_BACK (seconds to wait for the phone) PR_USBPRESENT (command: exit 0 if a Google USB device is on the bus).
+# USB port preflight (AP-177, review xrun-usbport-r1 F9; host only, before the build and the phone lock): on a >= 5000 Mb/s link (tools/usb-port) the run is REFUSED (RESULT: ERROR, exit 2) when the build args contain --usb2 (HS-only shim gadget)
+#   or when shim/build.sh does not know --usb2 yet (the SuperSpeed-by-default shim gadget is on branch fix/shim-usb3, not on trunk): the HS-only shim gives 0 B of USB log on a USB 3 link. Phone not on the bus = loud USBPORT NOTE, not a refusal; a SECOND Google device on the bus refuses the run (AGENTS rule 2). Link < 5000: nothing to do.
+# Test hooks (self-test only): PR_GOTO_TIMEOUT (kill limit of `phone goto`, default 150 s) PR_USBPORT (tools/usb-port) PR_BUILDSRC (shim/build.sh, grepped for the case label `--usb2)`; a comment or usage text does not count; setting either prints PROBE-RUN WARNING) PR_PHONE (tools/phone) PR_PHONE_STATE PR_TO_FASTBOOT PR_FBOOT PR_USBLOG PR_BUILD PR_BACK (seconds to wait for the phone) PR_USBPRESENT (command: exit 0 if a Google USB device is on the bus).
 # The phone leaves USB for about 30 s after a shim run and then shows up in recovery (observed by the Wi-Fi agent, HANDOFF session 28; not re-measured): waiting for it is part of the run (default 120 s), and a slow return is
 # reported as such, never as a hang. HANG (hold Power+VolDown) needs: expected lines missing AND no Google USB device at all after the window.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 cd "$(dirname "$0")/.." || exit 2
 PS=${PR_PHONE_STATE:-tools/phone-state}; PH=${PR_PHONE:-tools/phone}; TOFB=${PR_TO_FASTBOOT:-tools/to-fastboot.sh}; FBOOT=${PR_FBOOT:-tools/fboot.sh}
-USBLOG=${PR_USBLOG:-"python3 tools/usb-log.py"}; BUILD=${PR_BUILD:-./build.sh}; BACK=${PR_BACK:-120}; USBP=${PR_USBPRESENT:-"grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor"}
+USBLOG=${PR_USBLOG:-"python3 tools/usb-log.py"}; BUILD=${PR_BUILD:-./build.sh}; USBPORT=${PR_USBPORT:-tools/usb-port}; BUILDSRC=${PR_BUILDSRC:-shim/build.sh}; BACK=${PR_BACK:-120}; USBP=${PR_USBPRESENT:-"grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor"}
 . tools/plock.sh   # TP-020: the phone lock is taken after the build, right before the phone is used
 
-usage() { echo "usage: $0 [--touch-probe[=OPTS] | --build-args \"...\"] [--expect REGEX]... [--reject REGEX]... [--timeout S] [--label NAME] | --dry-run --from-dir DIR | --self-test" >&2; exit 2; }
+usage() { echo "usage: $0 [--touch-probe[=OPTS] | --build-args \"...\"] [--expect REGEX]... [--reject REGEX]... [--timeout S] [--label NAME] [--kind probe|xnu|udump] | --dry-run --from-dir DIR | --self-test" >&2; exit 2; }
 
 check_expects() { # LOG -> sets missing (list of unmatched regexes)
 	local e; missing=()
@@ -59,18 +63,19 @@ phone_back() { # waits up to $BACK s for fastboot or recovery (recovery -> to-fa
 }
 
 main() {
-	local lockwait=0 args=() timeout="" label=probe from="" touch="" cap="" rc extra
+	local lockwait=0 args=() timeout="" kind=probe label=probe from="" touch="" cap="" rc extra
 	expects=(); rejects=(); dry=""
 	while [ $# -gt 0 ]; do case "$1" in
 		--touch-probe|--touch-probe=*) touch=1; args+=(--pstore-fast "$1"); shift ;;
 		--build-args) [ $# -ge 2 ] || usage; read -ra extra <<<"$2"; args+=("${extra[@]}"); shift 2 ;;
 		--expect) [ $# -ge 2 ] || usage; expects+=("$2"); shift 2 ;;
 		--reject) [ $# -ge 2 ] || usage; rejects+=("$2"); shift 2 ;;
+		--kind) kind=${2:-}; shift 2 ;;
 		--timeout) timeout=${2:-}; shift 2 ;; --label) label=${2:-}; shift 2 ;;
 		--dry-run) dry=1; shift ;; --from-dir) from=${2:-}; shift 2 ;; --lock-wait) lockwait=${2:-0}; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;;
 		*) usage ;; esac; done
 	# the shim sends ~12 sections spaced 3 s apart BEFORE the touch/ACPM lines (first seen at ~65 s): 60 s cut them off
-	[ -n "$timeout" ] || { [ -n "$touch" ] && timeout=240 || timeout=60; case "${args[*]}" in *--wlan-link*) timeout=600 ;; esac; }
+	[ -n "$timeout" ] || { [ -n "$touch" ] && timeout=240 || timeout=60; case "${args[*]}" in *--wlan-link*|*--wlan-hold*) timeout=600 ;; esac; }
 	[[ "$timeout" =~ ^[0-9]+$ ]] || usage
 	label=$(echo "$label" | tr -c 'A-Za-z0-9._-' _)
 	[ ${#args[@]} -gt 0 ] || [ -n "$dry" ] || usage
@@ -97,6 +102,20 @@ main() {
 	printf '%s\n' "${args[*]}" >"$dir/run.args"   # review B2: tools/runs groups history by these build args (the form), labels are unique per run
 	trap '[ -z "$cap" ] || kill "$cap" 2>/dev/null; plock_drop' EXIT
 
+	# 0. AP-177: the shim gadget is HS-only until fix/shim-usb3 lands; a USB 3 link then gives 0 B of USB log. Host only, before the build and the lock.
+	local up upsp
+	[ -z "${PR_USBPORT:-}${PR_BUILDSRC:-}" ] || echo "PROBE-RUN WARNING: test hook PR_USBPORT/PR_BUILDSRC set: the USB port preflight is NOT the real one (AP-177 guard replaced)" >&2
+	up=$($USBPORT 2>&1) || { grep -q 'usbport: 0 Google' <<< "$up" || ! grep -Eq 'usbport: [2-9][0-9]* Google' <<< "$up" || report ERROR "USB port check failed: a second Google (18d1) USB device is on the bus (AGENTS rule 2: never risk touching another phone; detach it): $(tail -1 <<< "$up" | cut -c1-160)"
+		grep -q 'usbport: 0 Google' <<< "$up" || report ERROR "USB port check failed: $(tail -1 <<< "$up" | cut -c1-160)"
+		echo "USBPORT NOTE: phone not on the bus before the lock; the link speed was NOT checked" >&2; up=""; }
+	upsp=$(sed -n 's/^usb-port: [^ ]* speed=\([0-9][0-9]*\).*/\1/p' <<< "$up" | head -1)
+	if [ -n "$upsp" ] && [ "$upsp" -ge 5000 ]; then
+		if [[ " ${args[*]} " == *" --usb2 "* ]]; then
+			report ERROR "usbport: ${upsp} Mb/s link and the build args contain --usb2 (HS-only shim gadget): 0 B of USB log on a USB 3 link (AP-177); use a USB 2 port or drop --usb2"
+		elif ! grep -Eq -- '^[[:space:]]*--usb2\)' "$BUILDSRC" 2>/dev/null; then
+			report ERROR "usbport: ${upsp} Mb/s link: shim gadget is HS-only until fix/shim-usb3 lands; use a USB 2 port or wait (AP-177; $BUILDSRC does not know --usb2)"
+		fi
+	fi
 	# 1. build (no phone lock: builds and gates never hold it)
 	# gadget window is only a MINIMUM (shim.c usb_gadget_finish runs after the probe): default 600 s would idle the phone ~10 min before its reset
 	mkdir -p shim/out   # shim/out is shared with gates: build under its lock and boot a private copy (same as xrun)
@@ -106,17 +125,17 @@ main() {
 	  (cd shim && USB_WINDOW=${USB_WINDOW:-30} $BUILD --board bluejay --avb --usb-gadget "${args[@]}" 9>&-) &&
 	  { [ ! -f shim/out/shim-boot-avb.img ] || { cp shim/out/shim-boot-avb.img "$dir/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$dir/shim-boot-avb.img.meta.json" 2>/dev/null; true; }; } ) 9>shim/out/.build.lock >"$dir/build.log" 2>&1 ||
 		report ERROR "build failed (see $dir/build.log: $(tail -1 "$dir/build.log" | cut -c1-100))"
-	# 2. take the phone, then check it is in fastboot
+	# 2. take the phone, then let the state machine converge it to fastboot (R38: no own readiness check, no fallback, no wait loop; same call as xrun's recovery)
 	plock_take probe-run "$lockwait" || report ERROR "phone lock busy: $PLOCK_MSG"
-	if ! $PS --expect fastboot --wait 20 >/dev/null 2>&1; then
-		timeout 120 $TOFB 60 >/dev/null 2>&1 && $PS --expect fastboot --wait 20 >/dev/null 2>&1 ||
-			report ERROR "phone is not in fastboot: reboot it to the bootloader (hold Power+VolDown) or run tools/to-fastboot.sh, check tools/phone-state"
-	fi
+	local grc=0; timeout "${PR_GOTO_TIMEOUT:-150}" $PH goto fastboot --timeout 120 >"$dir/goto.log" 2>&1 || grc=$?
+	# review r1 F3: goto prints its user prompt (NEED USER: hold Power+VolDown / check cable) and extra lines (Timeout exceeded) BEFORE its RESULT line: keep the last 3 lines
+	if [ $grc = 124 ]; then report ERROR "phone goto fastboot killed after ${PR_GOTO_TIMEOUT:-150} s: $(tail -3 "$dir/goto.log" | tr '\n' ' ' | cut -c1-240) (see $dir/goto.log)"
+	elif [ $grc != 0 ]; then report ERROR "phone goto fastboot failed: $(tail -3 "$dir/goto.log" | tr '\n' ' ' | cut -c1-240) (see $dir/goto.log)"; fi
 	# 3. capture BEFORE the boot (the gadget enumerates seconds after fboot)
 	local t0; t0=$(date +%s)
 	$USBLOG capture --out "$log" >/dev/null 2>"$dir/capture.err" & cap=$!
 	# 4. boot
-	$FBOOT --expect probe --max-age-min $(( lockwait / 60 + 30 )) "$dir/shim-boot-avb.img" >"$dir/fboot.log" 2>&1 ||
+	$FBOOT --expect "$kind" --max-age-min $(( lockwait / 60 + 30 )) "$dir/shim-boot-avb.img" >"$dir/fboot.log" 2>&1 ||
 		report ERROR "fboot refused/failed (see $dir/fboot.log: $(tail -1 "$dir/fboot.log" | cut -c1-100))"
 	# 5. wait for every expect, bounded
 	local end=$(( $(date +%s) + timeout )) timed_out=""
@@ -145,59 +164,90 @@ main() {
 	fi
 	if [ ${#missing[@]} = 0 ]; then
 		[ $rc = 0 ] && report PASS "all ${#expects[@]} expect(s) found, phone back: $back"
-		$USBP && report PASS "all ${#expects[@]} expect(s) found, phone on USB but not fastboot/recovery yet after ${BACK}s (tools/phone-state)"
-		report PASS "all ${#expects[@]} expect(s) found, phone not back and no Google USB device after ${BACK}s (the lines were found; if tools/phone-state still shows it absent, hold Power+VolDown)"
+		$USBP && report PASS "all ${#expects[@]} expect(s) found, phone on USB but not fastboot/recovery yet after ${BACK}s (tools/phone state)"
+		report PASS "all ${#expects[@]} expect(s) found, phone not back and no Google USB device after ${BACK}s (the lines were found; if tools/phone state still shows it absent, hold Power+VolDown)"
 	fi
 	[ $rc = 0 ] && report FAIL "missing: ${missing[*]} (within ${timeout}s), phone back: $back"
-	$USBP && report FAIL "missing: ${missing[*]} (within ${timeout}s); the phone is on USB but not fastboot/recovery after ${BACK}s: tools/phone-state"
-	report HANG "missing: ${missing[*]} and no Google USB device after ${BACK}s: hold Power+VolDown, then tools/phone-state"
+	$USBP && report FAIL "missing: ${missing[*]} (within ${timeout}s); the phone is on USB but not fastboot/recovery after ${BACK}s: tools/phone state"
+	report HANG "missing: ${missing[*]} and no Google USB device after ${BACK}s: hold Power+VolDown, then tools/phone state"
 }
 
 selftest() {
 	local PRE="" d self fail=0; d=$(mktemp -d); self=$(readlink -f "$0"); trap 'rm -rf "$d"' RETURN
-	# phone-state stub: answers from ST_STATE; ST_GONE=1: only the first call (the pre-flight) sees fastboot
+	# phone-state stub (post-run phone_back only): answers from ST_STATE
 	cat >"$d/ps" <<'S'
 #!/bin/bash
 want=${2:-}; n=$(cat "$ST_CNT" 2>/dev/null || echo 0); echo $((n+1)) >"$ST_CNT"
-st=$ST_STATE; [ -z "$ST_GONE" ] || [ "$n" != 0 ] || st=fastboot
+st=$ST_STATE   # R38: the pre-flight no longer calls this stub (it is `goto` on the phone stub), so ST_GONE only matters there
 [ "$st" = "$want" ] && { echo "RESULT: PASS state=$st"; exit 0; }
 echo "RESULT: FAIL state=$st"; exit 1
 S
-	printf '#!/bin/bash\necho "RESULT: PASS state=${ST_PHONE:-absent} target=none steps=0"\n' >"$d/ph"   # tools/phone state stub
+	# tools/phone stub: `goto TARGET` records its args and reaches fastboot iff ST_STATE=fastboot or ST_GONE=1 (R38: probe-run converges, it does not check); `state` answers ST_PHONE
+	cat >"$d/ph" <<'S'
+#!/bin/bash
+if [ "$1" = goto ]; then echo "$*" >>"$ST_CNT.goto"
+	[ -z "$ST_HANG" ] || { echo "waiting"; exec sleep 30; }
+	[ "$ST_STATE" = fastboot ] || [ -n "$ST_GONE" ] || { echo "NEED USER: hold Power+VolDown"; echo "RESULT: FAIL state=absent target=$2 steps=1"; exit 1; }
+	echo "RESULT: PASS state=$2 target=$2 steps=0"; exit 0; fi
+echo "RESULT: PASS state=${ST_PHONE:-absent} target=none steps=0"
+S
 	printf '#!/bin/bash\nexit 1\n' >"$d/tofb"
-	printf '#!/bin/bash\nexit 0\n' >"$d/fboot"
+	printf '#!/bin/bash\n[ -z "$ST_KIND" ] || [ "$2" = "$ST_KIND" ] || exit 1\nexit 0\n' >"$d/fboot"
 	printf '#!/bin/bash\nmkdir -p out\n' >"$d/build"
 	cat >"$d/usblog" <<'S'
 #!/bin/bash
 [ "$1" = capture ] && { [ -z "$ST_LOG" ] || printf '%b' "$ST_LOG" >"$3"; exec sleep 100; }
 S
+	# usb-port stub: UP_SPEED (Mb/s, default 480), UP_ZERO=1: phone not on the bus; UP_TWO=1: a second Google device; buildsrc / buildsrc2: stand-ins for shim/build.sh without / with --usb2
+	cat >"$d/usbport" <<'S'
+#!/bin/bash
+[ -z "$UP_TWO" ] || { echo "usb-port: 1-6 speed=480 product=4ee0"; echo "usb-port: 4-3 speed=5000 product=4ee7"; echo "RESULT: ERROR usbport: 2 Google (18d1) USB devices in /sys, need exactly one"; exit 2; }
+[ -z "$UP_ZERO" ] || { echo "RESULT: ERROR usbport: 0 Google (18d1) USB devices in /sys, need exactly one"; exit 2; }
+echo "usb-port: 4-3 speed=${UP_SPEED:-480} product=4ee0"; echo "RESULT: PASS usbport 4-3 speed=${UP_SPEED:-480}"
+S
 	chmod +x "$d"/*
+	printf '%s\n' 'usage: build.sh [--usb-gadget]' >"$d/buildsrc"; printf '\t\t--usb-gadget) usb_gadget=1; shift ;;\n\t\t--usb2) usb2=1; shift ;;\n' >"$d/buildsrc2"
+	printf '%s\n' 'usage: build.sh [--usb-gadget] [--usb2]' '# TODO: add --usb2) later' '		--usb2-not-yet) :;;' >"$d/buildsrc3"   # --usb2 only in a usage line / comment / other option: must NOT lift the guard (review usb3-default-r1 F6)
 	local R='SWEET TOUCH: identify: rx\nSWEET TOUCH RESULT: opts=0x1 id=ok\n'
 	chk() { # name expected_rc expected_word env...
 		local n=$1 erc=$2 w=$3 out rc; shift 3
-		rm -rf "$d/cnt" "$d/w" "$d/lock"; mkdir -p "$d/w/tools" "$d/w/shim"; cp "$self" "$d/w/tools/probe-run"
-		cp "$(dirname "$self")/phone-lock" "$(dirname "$self")/plock.sh" "$d/w/tools/"; ( cd "$d/w" && PHONE_LOCK_DIR="$d/lock" eval "$PRE" )
+		rm -rf "$d/cnt" "$d/cnt.goto" "$d/w" "$d/lock"; mkdir -p "$d/w/tools" "$d/w/shim"; cp "$self" "$d/w/tools/probe-run"
+		cp "$(dirname "$self")/phone-lock" "$(dirname "$self")/phone_lock_end.py" "$(dirname "$self")/phone_lock_root.py" "$(dirname "$self")/plock.sh" "$(dirname "$self")/simseams.py" "$d/w/tools/"; ( cd "$d/w" && PHONE_LOCK_DIR="$d/lock" eval "$PRE" )
 		out=$(cd "$d/w" && env PHONE_LOCK_DIR="$d/lock" PR_PHONE_STATE="$d/ps" PR_TO_FASTBOOT="$d/tofb" PR_FBOOT="$d/fboot" PR_USBLOG="$d/usblog" \
-			PR_BUILD="$d/build" PR_PHONE="$d/ph" PR_BACK=3 PR_USBPRESENT=${PR_USBPRESENT:-false} PR_STILL=${PR_STILL:-1} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t $CHK_ARGS 2>&1); rc=$?
-		if [ $rc = "$erc" ] && echo "$out" | head -1 | grep -Eq "^RESULT: $w" && echo "$out" | grep -q '^dir: logs/probe/' \
+			PR_BUILD="$d/build" PR_PHONE="$d/ph" PR_BACK=3 PR_USBPORT="$d/usbport" PR_BUILDSRC="$d/buildsrc" PR_USBPRESENT=${PR_USBPRESENT:-false} PR_STILL=${PR_STILL:-1} ST_CNT="$d/cnt" "$@" ./tools/probe-run --touch-probe=run --timeout 4 --label t $CHK_ARGS 2>&1); rc=$?
+		if [ $rc = "$erc" ] && echo "$out" | grep -Ev '^(USBPORT NOTE|PROBE-RUN WARNING)' | head -1 | grep -Eq "^RESULT: $w" && { [ -z "${CHK_NOTE:-}" ] || echo "$out" | grep -q '^USBPORT NOTE: phone not on the bus'; } && { [ -z "${CHK_WARN:-}" ] || echo "$out" | grep -q '^PROBE-RUN WARNING: test hook PR_USBPORT/PR_BUILDSRC set'; } && echo "$out" | grep -q '^dir: logs/probe/' \
 			&& { [ "$w" = ERROR ] || ls "$d"/w/logs/probe/*/report.txt >/dev/null 2>&1; }; then echo "ok   $n"
 		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
 	}
 	chk success         0 PASS  ST_STATE=fastboot "ST_LOG=$R"
+	# AP-177 port preflight (review xrun-usbport-r1 F9): each refusal ends before the build (no shim-boot image, no lock)
+	chk usb3-hs-only-shim 2 "ERROR usbport: 5000 Mb/s link: shim gadget is HS-only until fix/shim-usb3 lands" UP_SPEED=5000 ST_STATE=fastboot "ST_LOG=$R"
+	chk usb3-ss-shim-ok 0 PASS UP_SPEED=5000 PR_BUILDSRC="$d/buildsrc2" ST_STATE=fastboot "ST_LOG=$R"   # a build.sh that knows --usb2 (SS-by-default shim): 5000 allowed
+	CHK_ARGS="--build-args --usb2" chk usb3-usb2-arg 2 "ERROR usbport: 5000 Mb/s link and the build args contain --usb2" UP_SPEED=5000 PR_BUILDSRC="$d/buildsrc2" ST_STATE=fastboot "ST_LOG=$R"
+	chk usb2-link-ok 0 PASS UP_SPEED=480 ST_STATE=fastboot "ST_LOG=$R"
+	CHK_WARN=1 chk usb3-hook-warning 2 "ERROR usbport: 5000 Mb/s link: shim gadget is HS-only" UP_SPEED=5000 ST_STATE=fastboot "ST_LOG=$R"   # F6: a replaced guard says so on stderr
+	chk usb3-usb2-only-in-comment 2 "ERROR usbport: 5000 Mb/s link: shim gadget is HS-only" UP_SPEED=5000 PR_BUILDSRC="$d/buildsrc3" ST_STATE=fastboot "ST_LOG=$R"   # F6: a usage line / comment / --usb2-not-yet does not lift the guard
+	chk usb-port-two-devices 2 "ERROR USB port check failed: a second Google" UP_TWO=1 ST_STATE=fastboot "ST_LOG=$R"   # F6: AGENTS rule 2, said so in the message
+	CHK_NOTE=1 chk usb-port-absent-note 0 PASS UP_ZERO=1 ST_STATE=fastboot "ST_LOG=$R"
 	[ "$(cat "$d"/w/logs/probe/*/run.args 2>/dev/null)" = "--pstore-fast --touch-probe=run" ] && echo "ok   run.args" || { echo "FAIL run.args: $(cat "$d"/w/logs/probe/*/run.args 2>&1)"; fail=1; }   # review round 2 B4: tools/runs groups history by this file
 	chk success-gone    0 PASS  ST_STATE=absent ST_GONE=1 "ST_LOG=$R"     # phone absent after the result line: still PASS
 	chk expect-missing  1 FAIL  ST_STATE=fastboot 'ST_LOG=noise\n'
 	chk never-back      1 HANG  ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
 	chk start-absent    2 ERROR ST_STATE=absent ST_LOG=
+	[ "$(cat "$d"/cnt.goto 2>/dev/null)" = "goto fastboot --timeout 120" ] && echo "ok   goto-called-once" || { echo "FAIL goto-called-once: $(cat "$d"/cnt.goto 2>&1)"; fail=1; }   # R38: the pre-flight is ONE `tools/phone goto fastboot`, nothing else
+	chk start-absent-msg 2 "ERROR phone goto fastboot failed: NEED USER: hold Power\+VolDown RESULT: FAIL state=absent" ST_STATE=absent ST_LOG=   # review r1 F3: the ERROR carries goto's user prompt AND its RESULT line
+	chk start-goto-hung 2 "ERROR phone goto fastboot killed after 2 s: waiting" PR_GOTO_TIMEOUT=2 ST_HANG=1 ST_STATE=absent ST_LOG=   # exit 124: no RESULT line, say it was killed
 	chk found-usb-present 0 PASS PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 "ST_LOG=$R"
 	chk still-logging   1 FAIL PR_STILL=600 ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # review 13 H3: timed out while the shim was still logging: FAIL "raise --timeout", not HANG
-	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with phone-state advice, not "hold Power+VolDown"
+	chk missing-usb-present 1 FAIL PR_USBPRESENT=true ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # on USB, not fastboot: FAIL with `phone state` advice, not "hold Power+VolDown"
 	chk timeout-shim-alive 1 TIMEOUT PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # TP-015: missing lines + shim-probe + log still growing = TIMEOUT
 	chk REV-timeout-but-phone-back 1 "FAIL missing: .* phone back" PR_STILL=600 ST_PHONE=shim-probe ST_STATE=fastboot 'ST_LOG=noise\n'   # review B1a: the phone came back: a real FAIL
 	CHK_ARGS="--reject bad" chk REV-timeout-reject-matched 1 FAIL PR_STILL=600 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=bad\n'   # B1b
 	chk REV-shim-listed-but-silent 1 HANG PR_STILL=0 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # B1c: listed but the log is not growing
 	chk REV2-hung-after-limit 1 HANG PR_STILL=6 ST_PHONE=shim-probe ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'   # round 2 B2: shim-probe, silent past the limit, phone never back: not TIMEOUT
 	chk timeout-not-shim 1 HANG ST_PHONE=absent ST_STATE=absent ST_GONE=1 'ST_LOG=noise\n'
+	CHK_ARGS="--kind xnu" chk kind-xnu-passed 0 PASS ST_KIND=xnu ST_STATE=fastboot "ST_LOG=$R"   # H1b: a --boot-xnu probe image is kind=xnu; fboot must be asked for it
+	chk kind-default-probe-refused 2 ERROR ST_KIND=xnu ST_STATE=fastboot "ST_LOG=$R"   # default stays --expect probe: an xnu image is refused
 	CHK_ARGS="--reject bad" chk reject-hit 1 FAIL ST_STATE=fastboot "ST_LOG=${R}bad\n"
 	PRE='tools/phone-lock acquire --owner other --pid '$$' >/dev/null' chk lock-busy 2 ERROR ST_STATE=fastboot "ST_LOG=$R"   # TP-020: another owner holds the phone
 	PRE=

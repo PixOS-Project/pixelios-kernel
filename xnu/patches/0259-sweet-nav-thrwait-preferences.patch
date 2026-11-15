@@ -1,0 +1,80 @@
+SWEET nav15 (patch 0259, T-18b3, G-10b-nav; log only, no register or memory write outside the patch's own statics): the THRWAIT sampler (patch 0249/0250) also samples the Preferences process (third entry next to backboardd and SpringBoard) and prints every entry of the current Preferences pid once per second as `SWEET THRWAIT: pref pid P tid T idx I hint H ev E pc PC lr LR n N`, outside the 24-row top list that would cut it. Why: nav14 rep 2 (20261108T120635Z-gputest-nav14): the About gate was satisfied (68 swaps, flat 504 ms) and three About taps gave 0 swaps; the sampler named no Preferences thread, so a dead About cannot be told from a tap that reached an idle app versus a tap that never reached it.
+diff --git a/bsd/dev/sweet_thrwait.c b/bsd/dev/sweet_thrwait.c
+index e16ebda..1449b7d 100644
+--- a/bsd/dev/sweet_thrwait.c
++++ b/bsd/dev/sweet_thrwait.c
+@@ -147,15 +147,16 @@ struct thw_proc {
+ 	uint64_t ent[THW_MAX_T * THW_W];
+ };
+ 
+-static struct thw_proc thw_p[2];      /* [0] backboardd, [1] SpringBoard */
+-static int thw_last_pid[2] = { -1, -1 };
++#define THW_NP 3   /* patch 0259 (T-18b3): backboardd, SpringBoard, Preferences */
++static struct thw_proc thw_p[THW_NP];      /* [0] backboardd, [1] SpringBoard, [2] Preferences (patch 0259) */
++static int thw_last_pid[THW_NP] = { -1, -1, -1 };
+ static uint32_t thw_period_ms;
+ 
+ /* patch 0250 (T-4604): one inventory line per thread, the first time it is seen blocked with a user state: `SWEET THRWAIT: thread pid P tid T idx I tsd TSD sp SP`. tsd is the thread's
+  * TPIDRRO_EL0 (pthread TSD base), sp its user stack pointer: the host joins them to the pointer libsweetgl LAGPH prints as `tid` (the thread that runs the swap) to name which
+  * THRWAIT tid that thread is. At most THW_MAX_T tids per process are remembered (a pid change forgets them); a full list is reported once. */
+-static uint64_t thw_seen[2][THW_MAX_T];
+-static int thw_nseen[2];
++static uint64_t thw_seen[THW_NP][THW_MAX_T];
++static int thw_nseen[THW_NP];
+ 
+ static int
+ thw_seen_new(int w, uint64_t tid, int *full)
+@@ -177,7 +178,7 @@ static int
+ thw_callout(proc_t p, __unused void *arg)
+ {
+ 	const char *nm = proc_name_address(p);
+-	int which = (strncmp(nm, "backboardd", MAXCOMLEN) == 0) ? 0 : ((strncmp(nm, "SpringBoard", MAXCOMLEN) == 0) ? 1 : -1);
++	int which = (strncmp(nm, "backboardd", MAXCOMLEN) == 0) ? 0 : ((strncmp(nm, "SpringBoard", MAXCOMLEN) == 0) ? 1 : ((strncmp(nm, "Preferences", MAXCOMLEN) == 0) ? 2 : -1));
+ 	if (which >= 0) {
+ 		struct thw_proc *t = &thw_p[which];
+ 		task_t task = proc_task(p);
+@@ -209,8 +210,8 @@ thw_now_ns(void)
+ static void
+ sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	static const char *const names[2] = { "backboardd", "SpringBoard" };
+-	int nf_said[2] = { 0, 0 }, trunc_said[2] = { 0, 0 }, notask_said[2] = { 0, 0 }, noregs_said[2] = { 0, 0 }, seenfull_said[2] = { 0, 0 };
++	static const char *const names[THW_NP] = { "backboardd", "SpringBoard", "Preferences" };
++	int nf_said[THW_NP] = { 0, 0, 0 }, trunc_said[THW_NP] = { 0, 0, 0 }, notask_said[THW_NP] = { 0, 0, 0 }, noregs_said[THW_NP] = { 0, 0, 0 }, seenfull_said[THW_NP] = { 0, 0, 0 };
+ 	unsigned lines = 0;
+ 	int cap_said = 0;
+ 	uint64_t last_print = thw_now_ns();
+@@ -230,11 +231,11 @@ sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
+ 			continue;
+ 		}
+ 		delay_for_interval(thw_period_ms, 1000 * 1000);   /* ms; the same call and scale as bsd/dev/sweet_restart.c:138 */
+-		thw_p[0].pid = thw_p[1].pid = -1;
++		thw_p[0].pid = thw_p[1].pid = thw_p[2].pid = -1;
+ 		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, thw_callout, NULL, NULL, NULL);
+ 		/* no lock held from here on */
+ 		rounds++;
+-		for (int w = 0; w < 2; w++) {
++		for (int w = 0; w < THW_NP; w++) {
+ 			struct thw_proc *t = &thw_p[w];
+ 			if (t->pid < 0) {
+ 				if (!nf_said[w]) {
+@@ -317,6 +318,19 @@ sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
+ 				printf("SWEET THRWAIT: pid %d tid 0x%llx idx %d hint %u ev 0x%llx pc 0x%llx lr 0x%llx n %u\n", e->pid, e->tid, e->idx, e->hint, e->ev, e->pc, e->lr, e->n);
+ 				lines++;
+ 			}
++			/* patch 0259 (T-18b3): Preferences rows on their own, so the 24-row top list (highest n first, backboardd/SpringBoard first on equal n) cannot cut them: every
++			 * entry of the current Preferences pid, `SWEET THRWAIT: pref pid P tid ... n N` (nav14 rep 2: About dead, the sampler named no Preferences thread). */
++			if (thw_last_pid[2] >= 0) {
++				for (unsigned s2 = 0; s2 < THW_TAB && lines < THW_CAP; s2++) {
++					const struct thw_ent *e = &thw_tab[s2];
++
++					if (e->n == 0 || e->pid != thw_last_pid[2]) {
++						continue;
++					}
++					printf("SWEET THRWAIT: pref pid %d tid 0x%llx idx %d hint %u ev 0x%llx pc 0x%llx lr 0x%llx n %u\n", e->pid, e->tid, e->idx, e->hint, e->ev, e->pc, e->lr, e->n);
++					lines++;
++				}
++			}
+ 			thw_clear();
+ 			rounds = waiting = running = 0;
+ 		}

@@ -1,0 +1,127 @@
+SWEET GAP lines for two silent-success holes (patch 0169; AP-102, research 87 U1, research 86 row 13). (1) IOUserClient.cpp: loud 'SWEET GAP: ioservice AppleM2ScalerCSCDriver lookup xN (process) found 0|1' when any process looks up the YCbCr scaler class AppleM2ScalerCSCDriver through io_service_get_matching_service(s) (matching dict has an OSString IOProviderClass / IOClass / IONameMatch / IOName equal to it); first 8 lookups, then every 64th; always on (independent of boot-arg sweetiolog), read-only, no allocation, does not change the lookup result. [obs research 87 U1 (iOS 16.7 20H392 dyld cache disassembly): IOSurfaceAcceleratorCreate in attach_surface_texture is reachable only for YCbCr FourCCs (420f etc.), never for BGRA/RGhA/L008/A008/format 0; a NULL result makes CA skip the attach. The class name AppleM2ScalerCSCDriver is confirmed in research 87.] The notification path (internal_io_service_add_notification) is NOT hooked. (2) SweetSurface.cpp: the 0162 create-key logger also walks every dictionary of IOSurfacePlaneInfo and logs each key the plane parse (patch 0046) does not read as 'SWEET GAP: surface plane key <name> xCOUNT (process)' (same dedupe table as 0162). [src research 86 row 13 / 87 U3: the b3a8 plane dict keys (PlaneWidth, Height, BytesPerRow, Offset, Size, ElementWidth, BytesPerElement) were compared with patch 0046/0163 by hand only; this logs any other key on hardware.] Compile-check: see the driver; no hardware result. (3) SweetSurface.cpp: the 0162 ignored-key table grows from 48 to 96 entries and its name field from 64 to 96 bytes (review 0169 F1/F2: plane keys share the table with create keys and selectors). Only top-level IOProviderClass/IOClass/IONameMatch/IOName are checked, so a missing scaler GAP line does not prove the scaler is never looked up (review 0169 F3).
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2652,6 +2652,33 @@
+ 	IOLog("IOK %s: %s %.240s -> %s\n", name, what, text, result);
+ 	OSSafeReleaseNULL(ser);
+ }
++
++/* Patch 0169 (research 87 U1): loud 'SWEET GAP:' line when any process looks up the IOService class AppleM2ScalerCSCDriver (the YCbCr scaler
++ * that IOSurfaceAcceleratorCreate matches; we have no such driver). Always on (independent of sweetiolog), read-only, no allocation. */
++static bool
++sweet_dict_names_m2scaler(OSDictionary *dict)
++{
++	static const char *const keys[] = { "IOProviderClass", "IOClass", "IONameMatch", "IOName" };
++	for (unsigned int i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++		OSString *v = OSDynamicCast(OSString, dict->getObject(keys[i]));
++		if (v != NULL && v->isEqualTo("AppleM2ScalerCSCDriver")) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++sweet_note_m2scaler_lookup(int found)
++{
++	static SInt32 sweet_m2scaler_n;
++	uint32_t n = (uint32_t)OSIncrementAtomic(&sweet_m2scaler_n) + 1;
++	if (n <= 8 || (n % 64) == 0) {
++		char proc[32];
++		proc_selfname(proc, (int)sizeof(proc));
++		IOLog("SWEET GAP: ioservice AppleM2ScalerCSCDriver lookup x%u (%s) found %d\n", n, proc, found);
++	}
++}
+ #endif
+ 
+ kern_return_t
+@@ -2676,6 +2703,14 @@
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		OSIterator *found = IOService::getMatchingServices( dict );
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_dict_names_m2scaler(dict)) {   /* patch 0169 */
++			int nfound = 0;
++			if (found != NULL) {
++				nfound = found->getNextObject() != NULL ? 1 : 0;
++				found->reset();
++			}
++			sweet_note_m2scaler_lookup(nfound);
++		}
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+ 			unsigned int count = 0;
+@@ -2776,6 +2811,9 @@
+ 		*service = IOService::copyMatchingService( dict );
+ 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_dict_names_m2scaler(dict)) {   /* patch 0169 */
++			sweet_note_m2scaler_lookup(*service != NULL ? 1 : 0);
++		}
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+ 			sweet_iolog_dict(sname, "matching1", dict,
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -501,14 +501,14 @@
+ /* Patch 0162 (AP-102, silent-success stubs; loud format 'SWEET GAP: <area> <what> xCOUNT (process)'): every IOSurface create key we do not read, and every selector we accept-and-ignore (default branch) or answer
+  * Unsupported, is logged ONCE per boot with its name, then again when its count reaches 10 / 100 / 1000 / 10000, so the next missing feature shows in the log
+  * (IOSurfaceAddress was ignored for two days and every call "succeeded"). Entries: "key <name>" or "sel <n> (<why>)". */
+-#define SWEET_IGN_MAX 48
+-static struct { char name[64]; uint32_t n; } sweet_ign[SWEET_IGN_MAX + 1];   /* [SWEET_IGN_MAX] collects the overflow */
++#define SWEET_IGN_MAX 96
++static struct { char name[96]; uint32_t n; } sweet_ign[SWEET_IGN_MAX + 1];   /* [SWEET_IGN_MAX] collects the overflow */
+ static uint32_t sweet_ign_count;
+ 
+ static void
+ sweet_note_ignored(const char *kind, const char *what, uint32_t sel)
+ {
+-	char name[64];
++	char name[96];
+ 	if (sel != 0xffffffffu) {
+ 		snprintf(name, sizeof(name), "%s %u (%s)", kind, sel, what);
+ 	} else {
+@@ -554,6 +554,20 @@
+ 	return false;
+ }
+ 
++/* Patch 0169 (research 86 row 13): keys of one IOSurfacePlaneInfo element dictionary that the plane parse (patch 0046) does not read. */
++static bool
++sweet_known_plane_key(const char *k)
++{
++	static const char *const known[] = { "IOSurfacePlaneWidth", "IOSurfacePlaneHeight", "IOSurfacePlaneBytesPerElement", "IOSurfacePlaneElementWidth",
++		"IOSurfacePlaneElementHeight", "IOSurfacePlaneBytesPerRow", "IOSurfacePlaneOffset", "IOSurfacePlaneSize" };
++	for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
++		if (strcmp(k, known[i]) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* Patch 0161 (G-11 icons): QuartzCore's GL renderer wraps its CPU images into IOSurfaces whose pixels live in the CLIENT's memory: IOSurfaceCreate with the key
+  * IOSurfaceAddress (20 of 35 image formats) or selector 6 (WrapClientImage). Our create ignored the address and handed out zeroed memory, so every icon image
+  * reached the GPU empty (g92: 19 backboardd 180x180 surfaces, locks 2 / wunlocks 1 by backboardd, 0 nonzero words, never written by anyone). The surface now
+@@ -939,6 +953,23 @@
+ 			}
+ 			it->release();
+ 		}
++		OSArray *pl = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));   /* patch 0169: nested plane keys */
++		for (unsigned int pi = 0; pl != NULL && pi < pl->getCount(); pi++) {
++			OSDictionary *pdict = OSDynamicCast(OSDictionary, pl->getObject(pi));
++			OSCollectionIterator *pit = pdict != NULL ? OSCollectionIterator::withCollection(pdict) : NULL;
++			if (pit != NULL) {
++				OSObject *pk;
++				while ((pk = pit->getNextObject()) != NULL) {
++					const OSSymbol *psym = OSDynamicCast(OSSymbol, pk);
++					const OSString *pstr = OSDynamicCast(OSString, pk);
++					const char *pcs = psym != NULL ? psym->getCStringNoCopy() : (pstr != NULL ? pstr->getCStringNoCopy() : NULL);
++					if (pcs != NULL && !sweet_known_plane_key(pcs)) {
++						sweet_note_ignored("plane key", pcs, 0xffffffffu);
++					}
++				}
++				pit->release();
++			}
++		}
+ 	}
+ 	if (ret == kIOReturnSuccess) {   /* patch 0161: pixels that live in the creating process */
+ 		OSNumber *addr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));

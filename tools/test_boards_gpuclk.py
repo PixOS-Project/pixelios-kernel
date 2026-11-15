@@ -22,10 +22,10 @@ class GpuClk(unittest.TestCase):
         self.assertEqual((d["G3D"]["idx"], d["G3DL2"]["idx"]), (5, 6))
         self.assertEqual(d["G3D"]["rates_khz"], [848000, 762000, 701000, 572000, 510000, 471000, 400000, 351000, 302000, 251000, 202000, 151000])
         self.assertEqual(d["G3DL2"]["rates_khz"], [996000, 885000, 750000, 603000, 434000, 302000, 151000])
-        self.assertEqual((d["G3D"]["ceiling_khz"], d["G3DL2"]["ceiling_khz"]), (151000, 151000))
+        self.assertEqual((d["G3D"]["ceiling_khz"], d["G3DL2"]["ceiling_khz"]), (762000, 996000))
 
-    def test_gpu_ceiling_is_the_init_level(self):
-        for name, ceil in (("G3D", 202000), ("G3DL2", 302000), ("G3D", 848000)):
+    def test_gpu_ceiling_is_pinned(self):
+        for name, ceil in (("G3D", 151000), ("G3D", 202000), ("G3D", 572000), ("G3D", 848000), ("G3DL2", 151000), ("G3DL2", 302000), ("G3DL2", 750000), ("G3D", 510000), ("G3DL2", 603000)):
             a = acpm()
             for x in a["dvfs"]["domains"]:
                 if x["name"] == name:
@@ -52,13 +52,82 @@ class GpuClk(unittest.TestCase):
 
     def test_macros_and_cpu_requests(self):
         h = boards.c_header("bluejay")
-        for line in ("#define ACPM_DVFS_N 3", "#define ACPM_DVFS_NALL 5", "#define ACPM_DVFS_GPU_IDXS 5, 6",
-                     "#define ACPM_DVFS_IDXS 2, 3, 4, 5, 6", "#define GPU_CLK_KHZ 0x24dd8UL"):
+        for line in ("#define ACPM_DVFS_N 3", "#define ACPM_DVFS_NALL 7", "#define ACPM_DVFS_GPU_IDXS 5, 6",
+                     "#define ACPM_DVFS_IDXS 2, 3, 4, 5, 6, 0, 1", "#define GPU_CLK_KHZ 0x24dd8UL"):
             self.assertIn(line, h)
-        self.assertIn("#define ACPM_DVFS_CEILS 1803000, 1836000, 1826000, 151000, 151000", h)
+        self.assertIn("#define ACPM_DVFS_CEILS 1803000, 2253000, 2802000, 762000, 996000, 3172000, 100000", h)
         self.assertEqual(boards.dvfs_requests("bluejay", "1803000,0,0"), [1803000, 0, 0])
         with self.assertRaises(ValueError):	# the GPU clocks are not --dvfs targets: still exactly three values
             boards.dvfs_requests("bluejay", "1803000,0,0,151000,151000")
+
+
+class GpuPairs(unittest.TestCase):
+    """--gpu-clk-level (T-a214): the DT v2 pair table is a pinned constant, every value an fvmap row, G3DL2 >= G3D, pairs 1..3 are at or below the ceiling (row 1 = 996000/762000 = stock max, sprint-gpu 2026-11-08); row 0 is refused."""
+
+    def test_pair_table_macro(self):
+        h = boards.c_header("bluejay")
+        self.assertIn("#define GPU_CLK_NLEVELS 4", h)
+        self.assertIn("#define GPU_CLK_PAIRS { 996000, 848000 }, { 996000, 762000 }, { 885000, 701000 }, { 750000, 572000 }", h)
+        self.assertEqual(len(boards._GPU_DVFS_V2), 12)
+        # T-50eb review F1: the observed fvmap uV of the ceiling pair, aligned with the pairs, 0 = not observed
+        self.assertIn("#define GPU_CLK_UVS { 775000, 756250 }, { 775000, 718750 }, { 775000, 700000 }, { 731250, 662500 }", h)
+
+    def test_uv_pin_is_required_for_the_ceiling_pair(self):
+        saved = dict(boards._GPU_DVFS_UV)
+        try:
+            boards._GPU_DVFS_UV.clear()
+            with self.assertRaises(ValueError) as cm:
+                boards._gpu_clk_pairs_check(acpm()["dvfs"])
+            self.assertIn("_GPU_DVFS_UV", str(cm.exception))
+        finally:
+            boards._GPU_DVFS_UV.update(saved)
+        self.assertEqual(boards._GPU_DVFS_UV, {(996000, 848000): (775000, 756250), (996000, 762000): (775000, 718750), (885000, 701000): (775000, 700000), (750000, 572000): (731250, 662500)})
+
+    def test_levels_0_to_3_are_accepted(self):
+        self.assertEqual(boards.gpu_clk_level("bluejay", "3"), (750000, 572000))
+        self.assertEqual(boards.gpu_clk_level("bluejay", "1"), (996000, 762000))
+        self.assertEqual(boards.gpu_clk_level("bluejay", "2"), (885000, 701000))
+
+    def test_other_levels_are_refused_with_a_reason(self):
+        for bad, why in (("0", "above the ceiling"),                          ("4", "only DT pair indexes 0..3"), ("-1", "only DT pair indexes"), ("11", "only DT pair indexes"), ("x", "not a number"), ("", "not a number"), ("3.0", "not a number")):
+            with self.assertRaises(ValueError) as cm:
+                boards.gpu_clk_level("bluejay", bad)
+            self.assertIn(why, str(cm.exception), bad)
+
+    def test_mutants_are_refused(self):
+        saved = (boards._GPU_DVFS_V2, dict(boards._GPU_DVFS_CEIL))
+        try:
+            # a pair whose value is not an fvmap row
+            boards._GPU_DVFS_V2 = saved[0][:3] + ((750000, 573000),) + saved[0][4:]
+            with self.assertRaises(ValueError):
+                boards._gpu_clk_pairs_check(acpm()["dvfs"])
+            # G3DL2 below G3D
+            boards._GPU_DVFS_V2 = saved[0][:3] + ((603000, 701000),) + saved[0][4:]
+            with self.assertRaises(ValueError):
+                boards._gpu_clk_pairs_check(acpm()["dvfs"])
+            # a ceiling that is not an accepted pair
+            boards._GPU_DVFS_V2 = saved[0]
+            boards._GPU_DVFS_CEIL.update({"G3D": 510000, "G3DL2": 750000})
+            with self.assertRaises(ValueError):
+                boards._gpu_clk_pairs_check(acpm()["dvfs"])
+        finally:
+            boards._GPU_DVFS_V2, boards._GPU_DVFS_CEIL = saved[0], saved[1]
+            boards._GPU_DVFS_CEIL.update(saved[1])
+        boards._gpu_clk_pairs_check(acpm()["dvfs"])
+
+    def test_raised_ceiling_or_broken_order_in_soc_json_is_refused(self):
+        a = acpm()
+        for x in a["dvfs"]["domains"]:
+            if x["name"] == "G3DL2":
+                x["ceiling_khz"] = 750000
+        with self.assertRaises(ValueError):
+            boards._acpm_dvfs_check(a)
+        a = acpm()
+        for x in a["dvfs"]["domains"]:
+            if x["name"] == "G3D":
+                x["rates_khz"] = [x for x in x["rates_khz"] if x != 572000]
+        with self.assertRaises(ValueError):
+            boards._acpm_dvfs_check(a)
 
 
 class S11(unittest.TestCase):

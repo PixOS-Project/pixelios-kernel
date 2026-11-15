@@ -1,0 +1,1251 @@
+SWEET Bluetooth transport, kernel side (patch 0189, BT-S3 f; ticket T-7eba; docs/research/BT-S3-transport-decision.md D-1 = option (a), plain UART kctl). New bsd/dev/sweet_bt.c registers, when the ADT has the node /bluetooth (tools/mkadt.py, BT-S3 e): kctl "com.apple.uart.bluetooth" (BlueTool, matrix M17) and "com.apple.uart.sk.bluetooth" as the SAME plain control (M10', no Skywalk: M12-M14 not implemented), TIOCGETA/TIOCSETA sockopts (M15, M16), H4 send (M19), and the char devices /dev/btwake /dev/btpoweroff /dev/btreset (M11, M21-M23). A hook in the default case of ctl_ioctl (bsd/kern/kern_control.c) serves TIOCMGET (M20), which the stock kernel answered with a silent ENOTSUP. BT-S4a (T-e930) adds the backend bsd/dev/sweet_bt_uart.c (gs101 UART16 serial@175B0000 polled, USI mode, BT_REG_ON gpp16-2 / DEV_WAKE gpp14-3, power order A10/A27; enabled only by boot-arg sweetbt=1, store list in the file header) and the RX relay sweet_bt_rx; without sweetbt=1 there is NO backend, so every operation that needs one logs its "BT GAP:" line (matrix section 4 texts, first 8 calls and every power of two, " xN") and returns an error (ENOTSUP/ENXIO/EINVAL), never success; only a connect succeeds (control layer) and says so. A later patch supplies struct sweet_bt_ops via sweet_bt_set_ops(). The init is called from sweet_ufs_init and from the USB root disk init (idempotent). Termios mode, polarity of the switches and the node permissions (0666) are not measured: the polarity is BT-S3 O4 (open), the mode is a [guess]. Reads cannot be hooked (socket buffer), a missing RX path shows as M43. Not built on hardware, not run. Host test: tools/test_sweet_bt_c.py.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8d3eb47..aac6d3c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,8 @@ bsd/dev/sweet_keys_gs101.c		standard
+ bsd/dev/sweet_touch_gs101.c		standard
+ bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/sweet_wlan.c			standard
++bsd/dev/sweet_bt.c			standard
++bsd/dev/sweet_bt_uart.c		standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_mmio_log.c		standard
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+new file mode 100644
+index 0000000..f51e108
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,307 @@
++/*
++ * Bluetooth transport, kernel side (patch 0189, BT-S3 f; docs/research/BT-S3-transport-decision.md D-1 = option (a) plain UART kctl).
++ * bluetoothd / BlueTool talk to the BCM4389 controller through a kernel control (PF_SYSTEM, SYSPROTO_CONTROL, SOCK_DGRAM) and three
++ * switch devices. This file provides those rows (conformance matrix docs/research/109-bt-conformance-matrix.md):
++ *   M17  kctl "com.apple.uart.bluetooth"      BlueTool; M10' kctl "com.apple.uart.sk.bluetooth" registered as the SAME plain control (no Skywalk,
++ *                                              rows M12-M14 are absent; bluetoothd needs the M49 byte patch to use it)
++ *   M15/M16 TIOCGETA/TIOCSETA (getsockopt/setsockopt, level 2), M19 H4 bytes (send), M20 TIOCMGET (ioctl; kern_control.c hook)
++ *   M11/M21-M23 /dev/btwake, /dev/btpoweroff, /dev/btreset (open = assert, close = release; polarity is BT-S3 O4, unknown)
++ * There is NO backend yet (no gs101 HCI UART driver, no REG_ON/reset/wake GPIO wiring: nothing here is invented). Every operation that
++ * needs one logs its `BT GAP:` line (rule 8, texts from matrix section 4, rate-limited: first 8 calls and every power of two, " xN") and
++ * returns an error, never success. A later patch fills struct sweet_bt_ops through sweet_bt_set_ops(); until then a connect is the only
++ * success (the control layer itself) and says so. Registered only when the ADT has the node /bluetooth (tools/mkadt.py, BT-S3 e).
++ * Reads cannot be hooked (a kctl socket read is served from the socket buffer), so a missing RX path shows as M43 (HCI silent).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/termios.h>
++#include <sys/ioctl.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++#define SBT_CTL_PLAIN   "com.apple.uart.bluetooth"       /* M17 [bin: BlueTool 0x10091b8f0] */
++#define SBT_CTL_SK      "com.apple.uart.sk.bluetooth"    /* M10 [bin: bluetoothd 0x1006d346a] */
++#define SBT_NCTL        2
++#define SBT_NSW         3
++#define SBT_TIOCGETA    0x40487413u                      /* M15 [bin 0x40487413]; checked against <sys/ttycom.h> below */
++#define SBT_TIOCSETA    0x80487414u                      /* M16 [bin 0x80487414] */
++#define SBT_TIOCMGET    0x4004746au                      /* M20 [bin 0x4004746a] */
++_Static_assert(SBT_TIOCGETA == TIOCGETA && SBT_TIOCSETA == TIOCSETA && SBT_TIOCMGET == TIOCMGET, "BT ioctl numbers");
++
++#include "sweet_bt.h"   /* struct sweet_bt_ops (the backend contract), sweet_bt_set_ops, sweet_bt_rx, sweet_bt_uart_attach */
++
++enum { G_CONNECT, G_BUSY, G_SETA, G_GETA, G_OPT, G_TX, G_CTS, G_IOCTL, G_SW, G_BADLEN, G_RX, G_N };
++
++static struct {
++	bool started;
++	const struct sweet_bt_ops *ops;
++	kern_ctl_ref ref[SBT_NCTL];
++	int busy[SBT_NCTL];
++	int uart_busy;                  /* 1 while either control is connected */
++	u_int32_t unit[SBT_NCTL];       /* unit of the connected client, for ctl_enqueuedata (RX) */
++	int cmajor;
++	uint32_t gap_n[G_N];
++} sbt;
++
++/* One loud line per kind at the first 8 calls, then at every power of two, with the running count (rule 8, AP-102). */
++#define SBT_GAP(slot, fmt, ...) do { \
++	uint32_t n_ = __atomic_add_fetch(&sbt.gap_n[slot], 1, __ATOMIC_RELAXED); \
++	if (n_ <= 8 || (n_ & (n_ - 1)) == 0) { \
++		printf("BT GAP: " fmt " x%u\n", ##__VA_ARGS__, n_); \
++	} \
++} while (0)
++
++static const char *const sbt_sw_name[SBT_NSW] = { "btwake", "btpoweroff", "btreset" };
++
++void
++sweet_bt_set_ops(const struct sweet_bt_ops *ops)
++{
++	sbt.ops = ops;
++}
++
++static int
++sbt_index(kern_ctl_ref ref)
++{
++	for (int i = 0; i < SBT_NCTL; i++) {
++		if (sbt.ref[i] != NULL && sbt.ref[i] == ref) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++/*
++ * RX toward bluetoothd/BlueTool (patch 0189 backend contract): the backend calls this with bytes read from the UART; they are queued on the
++ * connected control with ctl_enqueuedata (one client at a time, SBT_NCTL controls share one UART). No client = the bytes are dropped and the
++ * drop is a loud GAP (rule 8), never silent. Returns 0 or an errno.
++ */
++int
++sweet_bt_rx(const void *data, size_t len)
++{
++	for (int i = 0; i < SBT_NCTL; i++) {
++		if (sbt.ref[i] != NULL && __atomic_load_n(&sbt.busy[i], __ATOMIC_ACQUIRE)) {
++			errno_t err = ctl_enqueuedata(sbt.ref[i], sbt.unit[i], (void *)(uintptr_t)data, len, 0);
++			if (err != 0) {
++				SBT_GAP(G_RX, "kctl RX enqueue failed (error %d, %zu bytes dropped)", (int)err, len);
++			}
++			return err;
++		}
++	}
++	SBT_GAP(G_RX, "UART RX %zu bytes with no connected client; dropped", len);
++	return ENOTCONN;
++}
++
++static errno_t
++sbt_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++int i = sbt_index(ref);
++
++	if (i < 0) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&sbt.uart_busy, 1, __ATOMIC_ACQ_REL)) {      /* both controls drive ONE UART: one client at a time across them (review r1 F6) */
++		SBT_GAP(G_BUSY, "kctl %s: the UART already has a client (one UART, one client across both controls); connect refused", i ? SBT_CTL_SK : SBT_CTL_PLAIN);
++		return EBUSY;
++	}
++	__atomic_store_n(&sbt.busy[i], 1, __ATOMIC_RELEASE);
++	sbt.unit[i] = sac->sc_unit;
++	*unitinfo = &sbt.busy[i];
++	if (sbt.ops == NULL) {
++		SBT_GAP(G_CONNECT, "kctl %s connect accepted but no UART backend (gs101 HCI UART driver absent); every transfer fails",
++		    i ? SBT_CTL_SK : SBT_CTL_PLAIN);
++	}
++	return 0;
++}
++
++static errno_t
++sbt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
++{
++#pragma unused(unit, unitinfo)
++	int i = sbt_index(ref);
++
++	if (i >= 0 && __atomic_exchange_n(&sbt.busy[i], 0, __ATOMIC_ACQ_REL)) {
++		__atomic_store_n(&sbt.uart_busy, 0, __ATOMIC_RELEASE);      /* only the holder frees the UART */
++	}
++	return 0;
++}
++
++static errno_t
++sbt_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
++{
++#pragma unused(ref, unit, unitinfo, flags)
++	errno_t err = 0;
++
++	if (sbt.ops == NULL || sbt.ops->tx == NULL) {
++		SBT_GAP(G_TX, "kctl read/write path absent (H4 bytes not relayed)");
++		err = ENXIO;
++	} else {
++		for (mbuf_t it = m; it != NULL && err == 0; it = mbuf_next(it)) {
++			err = sbt.ops->tx(mbuf_data(it), mbuf_len(it));
++		}
++	}
++	mbuf_freem(m);      /* a send callback owns the chain, on success and on error */
++	return err;
++}
++
++static errno_t
++sbt_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
++{
++#pragma unused(ref, unit, unitinfo)
++	if ((u_int32_t)opt != SBT_TIOCSETA) {
++		SBT_GAP(G_OPT, "kctl setsockopt %#x unknown (only TIOCSETA is a row); refused", (unsigned)opt);
++		return ENOPROTOOPT;
++	}
++	if (len != sizeof(struct termios)) {
++		SBT_GAP(G_BADLEN, "kctl TIOCSETA length %zu is not sizeof(struct termios) %zu; refused", len, sizeof(struct termios));
++		return EINVAL;
++	}
++	if (sbt.ops == NULL || sbt.ops->termios_set == NULL) {
++		SBT_GAP(G_SETA, "kctl TIOCSETA ignored (baud/flow control not applied to the UART)");
++		return ENOTSUP;
++	}
++	return sbt.ops->termios_set(data, len);
++}
++
++static errno_t
++sbt_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
++{
++#pragma unused(ref, unit, unitinfo)
++	if ((u_int32_t)opt != SBT_TIOCGETA) {
++		SBT_GAP(G_OPT, "kctl getsockopt %#x unknown (only TIOCGETA is a row); refused", (unsigned)opt);
++		return ENOPROTOOPT;
++	}
++	if (*len < sizeof(struct termios)) {
++		SBT_GAP(G_BADLEN, "kctl TIOCGETA buffer %zu is smaller than struct termios %zu; refused", *len, sizeof(struct termios));
++		return EINVAL;
++	}
++	if (sbt.ops == NULL || sbt.ops->termios_get == NULL) {
++		SBT_GAP(G_GETA, "kctl TIOCGETA unsupported");
++		return ENOTSUP;
++	}
++	return sbt.ops->termios_get(data, len);
++}
++
++/*
++ * Called from the default case of ctl_ioctl (bsd/kern/kern_control.c, same patch), which answered every unknown ioctl with a silent ENOTSUP.
++ * `name` is the connected control's name (NULL if none). Other controls keep ENOTSUP, unlogged, as before.
++ */
++int sweet_bt_kctl_ioctl(const char *name, unsigned long cmd, void *data);
++
++int
++sweet_bt_kctl_ioctl(const char *name, unsigned long cmd, void *data)
++{
++	if (name == NULL || (strcmp(name, SBT_CTL_PLAIN) != 0 && strcmp(name, SBT_CTL_SK) != 0)) {
++		return ENOTSUP;
++	}
++	if ((uint32_t)cmd != SBT_TIOCMGET) {
++		SBT_GAP(G_IOCTL, "kctl ioctl %#lx unknown (only TIOCMGET is a row); refused", cmd);
++		return ENOTSUP;
++	}
++	if (sbt.ops == NULL || sbt.ops->cts == NULL) {
++		SBT_GAP(G_CTS, "kctl TIOCMGET unsupported (CTS unknown)");
++		return ENOTSUP;
++	}
++	return sbt.ops->cts((int *)data);
++}
++
++static int
++sbt_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++#pragma unused(flags, devtype, p)
++	int which = minor(dev);
++
++	if (which < 0 || which >= SBT_NSW) {
++		return ENXIO;
++	}
++	if (sbt.ops == NULL || sbt.ops->sw_open == NULL) {
++		SBT_GAP(G_SW, "devnode /dev/%s has no GPIO backend (REG_ON/reset/wake not wired); open refused", sbt_sw_name[which]);
++		return ENXIO;
++	}
++	return sbt.ops->sw_open(which);
++}
++
++static int
++sbt_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++#pragma unused(flags, devtype, p)
++	int which = minor(dev);
++
++	if (which < 0 || which >= SBT_NSW) {
++		return ENXIO;
++	}
++	if (sbt.ops != NULL && sbt.ops->sw_close != NULL) {
++		return sbt.ops->sw_close(which);
++	}
++	return 0;       /* the open was refused, nothing is held */
++}
++
++static const struct cdevsw sbt_cdevsw = {
++	.d_open       = sbt_open,
++	.d_close      = sbt_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = eno_rdwrt,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* Idempotent; called from sweet_ufs_init and the USB root disk init (either boot path). */
++void sweet_bt_init(void);
++
++void
++sweet_bt_init(void)
++{
++	static const char *const names[SBT_NCTL] = { SBT_CTL_PLAIN, SBT_CTL_SK };
++	DTEntry node;
++
++	if (sbt.started) {
++		return;
++	}
++	sbt.started = true;
++	if (SecureDTLookupEntry(NULL, "/bluetooth", &node) != kSuccess) {
++		printf("BT GAP: node-bluetooth no /bluetooth ADT node; BT transport (kctl, /dev/bt*) not registered\n");
++		return;
++	}
++	for (int i = 0; i < SBT_NCTL; i++) {
++		struct kern_ctl_reg reg;
++
++		bzero(&reg, sizeof(reg));
++		strlcpy(reg.ctl_name, names[i], sizeof(reg.ctl_name));
++		reg.ctl_flags = 0;      /* no CTL_FLAG_PRIVILEGED: bluetoothd runs as mobile (O13); SOCK_DGRAM [bin M10] */
++		reg.ctl_connect = sbt_connect;
++		reg.ctl_disconnect = sbt_disconnect;
++		reg.ctl_send = sbt_send;
++		reg.ctl_setopt = sbt_setopt;
++		reg.ctl_getopt = sbt_getopt;
++		errno_t err = ctl_register(&reg, &sbt.ref[i]);
++		if (err != 0) {
++			sbt.ref[i] = NULL;
++			printf("BT GAP: kctl %s not registered (ctl_register error %d); its client cannot connect\n", names[i], (int)err);
++		}
++	}
++	sbt.cmajor = cdevsw_add(-1, &sbt_cdevsw);
++	if (sbt.cmajor < 0) {
++		printf("BT GAP: devnode /dev/btwake /dev/btpoweroff /dev/btreset absent (cdevsw_add failed)\n");
++	} else {
++		for (int i = 0; i < SBT_NSW; i++) {
++			/* 0666: opened as mobile by bluetoothd (O4 says only the open matters). [guess: no user/group policy is cited] */
++			if (devfs_make_node(makedev(sbt.cmajor, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", sbt_sw_name[i]) == NULL) {
++				printf("BT GAP: devnode /dev/%s absent (devfs_make_node failed)\n", sbt_sw_name[i]);
++			}
++		}
++	}
++	sweet_bt_uart_attach();   /* bsd/dev/sweet_bt_uart.c: gs101 UART16 + REG_ON/DEV_WAKE backend; boot-arg sweetbt=1 powers it, else one GAP line */
++	printf("BT GAP: skywalk rows M12-M14 not implemented; %s is a plain control (bluetoothd needs the M49 byte patch)\n", SBT_CTL_SK);
++}
+diff --git a/bsd/dev/sweet_bt.h b/bsd/dev/sweet_bt.h
+new file mode 100644
+index 0000000..0013903
+--- /dev/null
++++ b/bsd/dev/sweet_bt.h
+@@ -0,0 +1,22 @@
++/*
++ * Bluetooth transport backend contract (patch 0189; BT-S4a, ticket T-e930). sweet_bt.c owns the kernel controls and /dev/bt* switches;
++ * sweet_bt_uart.c owns the gs101 UART16 and the REG_ON / DEV_WAKE pins and plugs in through struct sweet_bt_ops.
++ */
++#ifndef SWEET_BT_H
++#define SWEET_BT_H
++#include <stddef.h>
++
++/* Backend: all hooks optional; a NULL hook is a logged GAP + error in sweet_bt.c. */
++struct sweet_bt_ops {
++	int (*termios_get)(void *buf, size_t *len);          /* TIOCGETA */
++	int (*termios_set)(const void *buf, size_t len);     /* TIOCSETA */
++	int (*tx)(const void *data, size_t len);             /* one H4 fragment toward the controller */
++	int (*cts)(int *cts);                                /* TIOCMGET: modem bits */
++	int (*sw_open)(int which);                           /* 0 btwake, 1 btpoweroff, 2 btreset */
++	int (*sw_close)(int which);
++};
++
++void sweet_bt_set_ops(const struct sweet_bt_ops *ops);
++int sweet_bt_rx(const void *data, size_t len);          /* backend -> connected control (ctl_enqueuedata); drops loudly without a client */
++void sweet_bt_uart_attach(void);                        /* sweet_bt_uart.c, called once from sweet_bt_init */
++#endif
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+new file mode 100644
+index 0000000..36edcd4
+--- /dev/null
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -0,0 +1,813 @@
++/*
++ * Bluetooth HCI UART backend for sweet_bt.c (patch 0189, BT-S4a, ticket T-e930; docs/research/BT-S4a-uart16-u4.md, docs/specs/SPEC-BT.md
++ * U4 A1-A3 A6-A10 A24 A27). The BCM4389 sits on gs101 UART16 (serial@175B0000, APM_USI1_UART) with three GPIOs: BT_REG_ON gpp16-2,
++ * DEV_WAKE gpp14-3 (outputs), HOST_WAKE gpa6-6 (input, EINT: its IRQ is a logged gap). Everything is polled; no interrupt is taken.
++ *
++ * STORE LIST (every register this file can write; sbu_wr() refuses anything else with a GAP line and EPERM):
++ *   UART16 block 0x175B0000: ULCON UCON UFCON UMCON UBRDIV UFRACVAL UINTM UTXH (0x00-0x08,0x0C,0x20,0x28,0x2C,0x38) USI_CON USI_OPTION (0xC4,0xC8)
++ *   USI mode register  0x174204E4 (sysreg_apm 0x174204E0 + usi-offset 4), bits [2:0] only through sbu_usi_mode()
++ *   GPIO              0x10840200 gpp16 CON, 0x10840204 gpp16 DAT (bit 2), 0x108401C0 gpp14 CON, 0x108401C4 gpp14 DAT (bit 3)
++ * Everything else is read-only here: CMU_APM mux/div (0x17401000, 0x17401004, 0x1740180C; raw words logged, BT-S4c) to derive the baud clock, the four CMU_APM clock gates
++ * (0x17402010 0x17402038 0x1740203C 0x174020A4, bit 21; checked before any UART16 access), UART status, UMSTAT.
++ *   ALIVE pinctrl      0x174D0060 gpa3 CON, bits [15:0] only (UART16 pad function 2, sbu_pads, T-e3c9); gpa3 DAT 0x174D0064 and PUD 0x174D0068 are read only
++ * sbu_wr() also refuses a GPIO/USI store that would change a bit outside the one field of that register (read-modify-write audit, review r1 F4).
++ * Boot-arg: sweetbt=1 enables (a bare `sweetbt` may parse as 1 too [guess]); gs101 boards only (sweet_usb_board_is_gs101, review r1 F1).
++ * Not built on hardware, not run (S4b). Host test: tools/test_sweet_bt_c.py --uart.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>      /* delay() (osfmk/kern/clock.h:337, XNU_KERNEL_PRIVATE) */
++#include "sweet_bt.h"
++
++extern bool sweet_usb_board_is_gs101(void);     /* patch 0157 (sweet_usbroot.c) */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++/* ---- addresses [src docs/research/BT-S4a-uart16-u4.md; each line cites it] ---- */
++#define SBU_UART        0x175B0000u     /* A6, DT serial@175B0000 */
++#define SBU_USI_MODE    0x174204E4u     /* A8: sysreg_apm 0x174204e0 + usi-offset 4; mask 0x7 := 1 (exynos_tty.c:2596-2611) */
++#define SBU_CMU_MUXF    0x17401000u     /* CMU_APM CLK_CON_MUX_MUX_CLKCMU_APM_FUNC: select bit 4 (mainline clk-gs101.c:1666-1667) OR bits [1:0] (vendor cmucal-sfr.c:2995-2999); layout unproven, BT-S4c s.2 */
++#define SBU_CMU_MUXS    0x17401004u     /* ...APM_FUNCSRC: select bit 3 (mainline :1668-1669) OR bits [1:0] (vendor); idx 0 = pll_alv_div2_apm in both (clk-gs101.c:1656, cmucal-node.c:128-133) */
++#define SBU_CMU_DIV     0x1740180Cu     /* CLK_CON_DIV_DIV_CLK_APM_USI1_UART, DIVRATIO bits [6:0] (clk-gs101.c:1679-1680, :1465) */
++#define SBU_CMU_GATE_FUNC 0x17402010u   /* gout_apm_func (clk-gs101.c:1470, :1693-1694), bit 21 (GATE(..., 21, 0, 0)) */
++#define SBU_CMU_GATE_IPCLK 0x17402038u  /* gout_apm_apm_usi1_uart_ipclk (clk-gs101.c:1480, :1729-1732) */
++#define SBU_CMU_GATE_PCLK 0x1740203Cu   /* gout_apm_apm_usi1_uart_pclk (clk-gs101.c:1481, :1733-1736) */
++#define SBU_CMU_GATE_RST 0x174020A4u    /* gout_apm_clk_apm_usi1_uart_clk (clk-gs101.c:1506, :1832-1836) */
++#define SBU_GATE_EN     (1u << 21)      /* gate bit of every GATE() above; set = clock enabled (generic clk-gate, flags 0) */
++#define SBU_PLL_DIV2    393216000u      /* pll_alv_div2_apm fixed rate (clk-gs101.c:1660) */
++#define SBU_OSCCLK      24576000u       /* mout_apm_func parent idx 0 = OSCCLK_APM, FIXEDRATE 24576000 (cmucal-node.c:122-127, :2955; clk-gs101.c:1654-1655) */
++#define SBU_G16_CON     0x10840200u     /* gpp16 (pinctrl_peric0 0x10840000 + 0x200), pin 2 = BT_REG_ON, A1 */
++#define SBU_G16_DAT     0x10840204u
++#define SBU_G14_CON     0x108401C0u     /* gpp14 (+0x1c0), pin 3 = DEV_WAKE, A2 */
++#define SBU_G14_DAT     0x108401C4u
++#define SBU_GA3_CON     0x174D0060u     /* gpa3 (pinctrl_alive 0x174D0000 + 0x60, mainline pinctrl-gs101 gs101_pin_alive) pins 0-3 = UART16 RXD TXD RTSn CTSn [obs: stock DT uart16-bus samsung,pins gpa3-0..3, pin-function 2, pin-pud 0] */
++#define SBU_GA3_DAT     0x174D0064u
++#define SBU_GA3_PUD     0x174D0068u
++#define SBU_GA3_FUNC    0x2222u         /* four nibbles of function 2 */
++#define SBU_REGON_PIN   2
++#define SBU_DEVWAKE_PIN 3
++
++#define U_ULCON 0x00u
++#define U_UCON  0x04u
++#define U_UFCON 0x08u
++#define U_UMCON 0x0Cu
++#define U_UTRSTAT 0x10u
++#define U_UERSTAT 0x14u
++#define U_UFSTAT 0x18u
++#define U_UMSTAT 0x1Cu
++#define U_UTXH  0x20u
++#define U_URXH  0x24u
++#define U_UBRDIV 0x28u
++#define U_UFRACVAL 0x2Cu
++#define U_UINTM 0x38u
++#define U_USI_CON 0xC4u
++#define U_USI_OPT 0xC8u
++
++#define SBU_ULCON_8N1   0x3u            /* CS8, no parity, one stop (serial_s3c.h:33-44) */
++#define SBU_UCON        0x3C5u          /* S5PV210_UCON_DEFAULT (serial_s3c.h:238-243): polling reads only UFSTAT/UTRSTAT, modes are inert */
++#define SBU_UFCON       0x117u          /* S5PV210_UFCON_DEFAULT 0x111 | RESETTX | RESETRX (serial_s3c.h:245-247; exynos_tty.c:1677-1679) */
++#define SBU_UMCON_AFC   (1u << 4)       /* auto flow control (serial_s3c.h:143) */
++#define SBU_UMCON_RTS   (1u << 0)       /* RTS low = chip may send (serial_s3c.h:144) */
++#define SBU_UFSTAT_TXFULL (1u << 24)    /* S5PV210_UFSTAT_TXFULL (serial_s3c.h:225) */
++#define SBU_UFSTAT_RXMASK 0xFFu         /* RX count bits [7:0] (serial_s3c.h:229) */
++#define SBU_UTRSTAT_RXDR (1u << 0)      /* receive buffer data ready (research BT-S4a s.2: UTRSTAT RXDR BIT(0)) */
++#define SBU_UTRSTAT_TXE (1u << 2)       /* transmitter empty (serial_s3c.h:171) */
++#define SBU_MAX_BAUD    4000000u        /* MAX_BAUD of the vendor driver (exynos_tty.c:269); 9.6 M is the AOC UART, not this path (U3) */
++#define SBU_SPIN        (1u << 22)      /* bounded polls, then ETIMEDOUT + GAP */
++#define SBU_RXBUF       256
++
++/* ---- register access: one audited write helper, the read/write functions are replaceable by the host test ---- */
++struct sbu_hw {
++	uint32_t (*rd)(uint32_t pa);
++	void (*wr)(uint32_t pa, uint32_t v);
++	void (*udelay)(unsigned us);
++	void (*msleep)(unsigned ms);
++};
++
++struct sbu_region { uint32_t pa, size; uintptr_t va; };
++static struct sbu_region sbu_regions[] = {
++	{ SBU_UART, 0x1000, 0 }, { 0x17420000u, 0x1000, 0 }, { 0x17400000u, 0x3000, 0 }, { 0x10840000u, 0x1000, 0 }, { 0x174D0000u, 0x1000, 0 },
++};
++
++static struct {
++	bool attached, powered, uart_ok, rx_thread;
++	uint32_t baud, rate;
++	uint32_t clk_hz;        /* BT-S4e: the baud clock the BCM4389's answer settled (0 = not probed; sbu_clk_rate decides) */
++	bool clk_osc;
++	struct termios tio;
++	uint32_t tx_bytes, rx_bytes, rx_err;
++	struct sbu_hw hw;
++} sbu;
++
++enum { SG_STORE, SG_CLK, SG_TXFULL, SG_RXERR, SG_OTHER };   /* the slot names document the kind; the counter is per call site */
++#define SBU_GAP(slot, fmt, ...) do { \
++	static uint32_t cnt_;   /* one counter per call site: a different gap is never rate-limited by another */ \
++	uint32_t n_ = __atomic_add_fetch(&cnt_, 1, __ATOMIC_RELAXED); \
++	if (n_ <= 8 || (n_ & (n_ - 1)) == 0) { \
++		printf("BT GAP: " fmt " x%u\n", ##__VA_ARGS__, n_); \
++	} \
++} while (0)
++
++static uint32_t
++sbu_rd(uint32_t pa)
++{
++	return sbu.hw.rd(pa);
++}
++
++static bool
++sbu_store_ok(uint32_t pa)
++{
++	if (pa >= SBU_UART && pa < SBU_UART + 0x1000) {
++		uint32_t o = pa - SBU_UART;
++		return o == U_ULCON || o == U_UCON || o == U_UFCON || o == U_UMCON || o == U_UTXH || o == U_UBRDIV || o == U_UFRACVAL ||
++		       o == U_UINTM || o == U_USI_CON || o == U_USI_OPT;
++	}
++	return pa == SBU_USI_MODE || pa == SBU_G16_CON || pa == SBU_G16_DAT || pa == SBU_G14_CON || pa == SBU_G14_DAT || pa == SBU_GA3_CON;
++}
++
++/* The bits a store may change in the SHARED registers (gpp14 also carries WLAN_EN, its CON/DAT bits must survive; USI mode keeps [31:3]); 0xFFFFFFFF = whole register. */
++static uint32_t
++sbu_change_mask(uint32_t pa)
++{
++	switch (pa) {
++	case SBU_G16_CON:   return 0xFu << (4 * SBU_REGON_PIN);
++	case SBU_G16_DAT:   return 1u << SBU_REGON_PIN;
++	case SBU_G14_CON:   return 0xFu << (4 * SBU_DEVWAKE_PIN);
++	case SBU_G14_DAT:   return 1u << SBU_DEVWAKE_PIN;
++	case SBU_GA3_CON:   return 0xFFFFu;
++	case SBU_USI_MODE:  return 0x7u;
++	default:            return 0xFFFFFFFFu;
++	}
++}
++
++/* The only write path. `why` NULL = data byte (UTXH), counted not logged; every other store logs one line. */
++static int
++sbu_wr(uint32_t pa, uint32_t v, const char *why)
++{
++	if (!sbu_store_ok(pa)) {
++		SBU_GAP(SG_STORE, "UART16 backend refused a store to %#x (not on the store list)", pa);
++		return EPERM;
++	}
++	uint32_t mask = sbu_change_mask(pa);
++	if (mask != 0xFFFFFFFFu && ((sbu.hw.rd(pa) ^ v) & ~mask) != 0) {
++		SBU_GAP(SG_STORE, "UART16 backend refused a store to %#x = %#x: it would change bits outside %#x of the shared register", pa, v, mask);
++		return EPERM;
++	}
++	if (why != NULL) {
++		printf("BT UART: wr %#x <- %#x (%s)\n", pa, v, why);
++	}
++	sbu.hw.wr(pa, v);
++	return 0;
++}
++
++/* ---- baud clock (A7) and divisors: the vendor driver's math (exynos_tty.c:1768-1790, 1873-1905) ---- */
++/*
++ * The two sources disagree on the mux select field (research BT-S4c s.2): mainline = bit 4 (func) / bit 3 (funcsrc), width 1; vendor = bits [1:0], width 2.
++ * Until a raw word is on record, only the cases BOTH layouts decode to the same parent are accepted (note s.4 case table); every other case is a GAP, no baud.
++ */
++static int
++sbu_clk_rate(uint32_t *hz, bool *osc)
++{
++	uint32_t rf = sbu_rd(SBU_CMU_MUXF), rs = sbu_rd(SBU_CMU_MUXS), rd = sbu_rd(SBU_CMU_DIV), d = (rd & 0x7F) + 1;
++	uint32_t fv = rf & 3, fm = (rf >> 4) & 1, sv = rs & 3, sm = (rs >> 3) & 1;
++
++	printf("BT UART: cmu_apm mux_func raw %#x funcsrc raw %#x div raw %#x\n", rf, rs, rd);
++	*osc = false;
++	if (fv == 0 && fm == 0) {          /* vendor idx 0 = oscclk, mainline idx 0 = oscclk; funcsrc not consulted */
++		*hz = SBU_OSCCLK / d;
++		printf("BT UART: uart16 baud clock %u Hz (oscclk / %u)%s\n", *hz, d, *hz / 16 < SBU_MAX_BAUD ? ", 4M unreachable" : "");
++		SBU_GAP(SG_CLK, "uart16 baud clock %u Hz derived (oscclk %u / %u, both mux layouts agree), NOT observed on hardware (SPEC-BT A7)", *hz, SBU_OSCCLK, d);
++		*osc = true;
++		return 0;
++	}
++	if (fv == 3 && fm == 0) {          /* vendor idx 3 = oscclk and mainline idx 0 = oscclk agree, but the case is outside the note s.4 table: refused until a raw word is on record */
++		SBU_GAP(SG_CLK, "uart16 baud clock parent outside the pinned table (mux_func raw %#x: vendor select 3 = oscclk, mainline bit4 0 = oscclk); no baud set", rf);
++		return EIO;
++	}
++	if (fv != 1 || fm != 1) {          /* the layouts name different parents */
++		SBU_GAP(SG_CLK, "uart16 baud clock parent conflict (mux_func raw %#x: vendor select %u, mainline bit4 %u); no baud set", rf, fv, fm);
++		return EIO;
++	}
++	if (sv != 0 || sm != 0) {          /* both say funcsrc; only funcsrc idx 0 (pll_alv_div2) agreed and sourced */
++		SBU_GAP(SG_CLK, "uart16 baud clock parent unknown (funcsrc raw %#x: vendor select %u, mainline bit3 %u; only funcsrc idx 0 = pll_alv_div2 is sourced); no baud set", rs, sv, sm);
++		return EIO;
++	}
++	*hz = SBU_PLL_DIV2 / d;
++	SBU_GAP(SG_CLK, "uart16 baud clock %u Hz derived (pll_alv_div2 %u / %u, both mux layouts agree), NOT observed on hardware (SPEC-BT A7)", *hz, SBU_PLL_DIV2, d);
++	return 0;
++}
++
++/*
++ * BT-S4e (ticket T-5c3c, research BT-S4d s.4-5): the one word pair the sources cannot decide, observed on this phone (BT-S4c run):
++ * vendor select 1 (funcsrc -> funcsrc select 0 = pll_alv_div2) against mainline bit 4 clear (oscclk). Both candidates are derived from the
++ * same DIVRATIO; the BCM4389's answer to HCI Reset at 115200 decides, vendor first (BT-S4d s.3 leans to it). Read-only: no CMU store.
++ */
++struct sbu_cand { uint32_t hz; bool osc; const char *layout; };
++
++static bool
++sbu_clk_conflict(uint32_t rf, uint32_t rs, uint32_t rd)
++{
++	return rf == 0x1 && rs == 0x0 && rd == 0x1;      /* exactly the words seen on hardware (BT-S4c run); any other word, a mid-switch BUSY bit or another DIVRATIO is refused (review T-5c3c F1) */
++}
++
++/* Returns the number of baud-clock candidates in the order they are tried: 2 for the conflict word, 1 where both layouts agree, 0 = refused (GAP logged). */
++static int
++sbu_clk_cands(struct sbu_cand c[2])
++{
++	uint32_t rf = sbu_rd(SBU_CMU_MUXF), rs = sbu_rd(SBU_CMU_MUXS), rd = sbu_rd(SBU_CMU_DIV), d = (rd & 0x7F) + 1;
++
++	if (sbu_clk_conflict(rf, rs, rd)) {
++		printf("BT UART: cmu_apm mux_func raw %#x funcsrc raw %#x div raw %#x\n", rf, rs, rd);
++		c[0] = (struct sbu_cand){ SBU_PLL_DIV2 / d, false, "vendor" };
++		c[1] = (struct sbu_cand){ SBU_OSCCLK / d, true, "mainline" };
++		SBU_GAP(SG_CLK, "uart16 baud clock parent conflict (mux_func raw %#x: vendor select 1 = funcsrc, pll_alv_div2 / %u = %u Hz; mainline bit4 0 = oscclk / %u = %u Hz): both are tried, the chip's answer to HCI Reset decides (BT-S4e)", rf, d, c[0].hz, d, c[1].hz);
++		return 2;
++	}
++	if (sbu_clk_rate(&c[0].hz, &c[0].osc) != 0) {
++		return 0;
++	}
++	c[0].layout = "agreed";
++	return 1;
++}
++
++/* Read-only gate check (review r1 F2, research BT-S4a s.4): an access to a gated APB slave may hang, no poll bound ends that, so UART16 is never touched with a gate off. */
++static int
++sbu_clk_gates(void)
++{
++	uint32_t g[4] = { sbu_rd(SBU_CMU_GATE_FUNC), sbu_rd(SBU_CMU_GATE_IPCLK), sbu_rd(SBU_CMU_GATE_PCLK), sbu_rd(SBU_CMU_GATE_RST) };
++
++	printf("BT UART: cmu_apm gates func %#x ipclk %#x pclk %#x rstnsync %#x (bit 21 = enabled)\n", g[0], g[1], g[2], g[3]);
++	if (!(g[0] & SBU_GATE_EN) || !(g[1] & SBU_GATE_EN) || !(g[2] & SBU_GATE_EN) || !(g[3] & SBU_GATE_EN)) {
++		SBU_GAP(SG_CLK, "uart16 clock gate off (func %#x ipclk %#x pclk %#x rstnsync %#x; bit 21 clear): uart16 not touched, backend not started", g[0], g[1], g[2], g[3]);
++		return EIO;
++	}
++	return 0;
++}
++
++int sbu_baud_regs(uint32_t rate, uint32_t baud, uint32_t *ubrdiv, uint32_t *frac);
++
++int
++sbu_baud_regs(uint32_t rate, uint32_t baud, uint32_t *ubrdiv, uint32_t *frac)
++{
++	if (rate == 0 || baud == 0 || baud > SBU_MAX_BAUD) {
++		return EINVAL;
++	}
++	uint32_t div = rate / baud;
++	if (div < 16) {
++		return EINVAL;      /* UBRDIV = div/16 - 1 would wrap */
++	}
++	uint32_t quot = div / 16 - 1;
++	if (quot > 0xFFFFu) {
++		return EINVAL;      /* UBRDIV width not cited [guess: 16 bits]; refusing is the safe side */
++	}
++	if ((div & 15) != 15) {
++		uint32_t rd = rate / div, ru = rate / (div + 1);
++		uint32_t drd = rd > baud ? rd - baud : baud - rd, dru = ru > baud ? ru - baud : baud - ru;
++		if (drd > dru) {
++			div++;
++		}
++	}
++	*ubrdiv = quot;
++	*frac = div & 15;
++	return 0;
++}
++
++static int
++sbu_wait(uint32_t reg, uint32_t mask, uint32_t want)
++{
++	for (uint32_t i = 0; i < SBU_SPIN; i++) {
++		if ((sbu_rd(SBU_UART + reg) & mask) == want) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++static int
++sbu_set_baud(uint32_t baud)
++{
++	uint32_t hz = 0, q, f;
++	bool osc = false;
++	int e = 0;
++
++	if (sbu.clk_hz != 0) {          /* BT-S4e: the chip answered HCI Reset at this clock; the unproven mux decode is not consulted again */
++		hz = sbu.clk_hz;
++		osc = sbu.clk_osc;
++	} else {
++		e = sbu_clk_rate(&hz, &osc);
++	}
++	if (e == 0) {
++		e = sbu_baud_regs(hz, baud, &q, &f);
++	}
++	if (e != 0) {
++		SBU_GAP(SG_OTHER, "uart16 baud %u refused (error %d%s)", baud, e, e == EINVAL && hz / 16 < baud ? ": above the baud clock limit rate/16" : "");
++		return e;
++	}
++	if (osc && baud != 115200) {      /* research BT-S4c s.4 item 3: on oscclk only 115200 (s.3 table) is allowed; no other baud, no silent downgrade */
++		SBU_GAP(SG_CLK, "uart16 baud %u refused on oscclk (%u Hz): only 115200 is allowed there (BT-S4c s.4)", baud, hz);
++		return EINVAL;
++	}
++	if (sbu_wait(U_UTRSTAT, SBU_UTRSTAT_TXE, SBU_UTRSTAT_TXE) != 0) {     /* do not cut a pending frame (the 0xfc18 command) */
++		SBU_GAP(SG_TXFULL, "uart16 transmitter not empty before the baud change; baud unchanged");
++		return ETIMEDOUT;
++	}
++	if ((e = sbu_wr(SBU_UART + U_UBRDIV, q, "ubrdiv")) != 0 || (e = sbu_wr(SBU_UART + U_UFRACVAL, f, "ufracval")) != 0) {
++		return e;
++	}
++	sbu.baud = baud;
++	sbu.rate = hz;
++	printf("BT UART: baud %u UBRDIV %u UFRACVAL %u (actual %u)\n", baud, q, f, hz / (16 * (q + 1) + f));
++	return 0;
++}
++
++static int
++sbu_flow(bool afc)
++{
++	return sbu_wr(SBU_UART + U_UMCON, afc ? SBU_UMCON_AFC : SBU_UMCON_RTS, afc ? "umcon afc rts/cts" : "umcon rts asserted, no flow control");
++}
++
++static void sbu_witness(const char *when);
++
++/* ---- A8: USI mode, then the engine, then 8N1 FIFO mode ---- */
++static int
++sbu_uart_open(uint32_t baud)
++{
++	int e;
++	uint32_t v = sbu_rd(SBU_USI_MODE);
++
++	if ((e = sbu_wr(SBU_USI_MODE, (v & ~7u) | 1u, "usi mode := uart")) != 0) {
++		return e;
++	}
++	v = sbu_rd(SBU_USI_MODE);
++	printf("BT UART: set usi mode - 0x%x (register %#x)\n", v & 7u, v);
++	if ((v & 7u) != 1u) {
++		SBU_GAP(SG_OTHER, "usi mode read back %#x, not 1; uart16 not opened", v);
++		return EIO;
++	}
++	if ((e = sbu_wr(SBU_UART + U_USI_CON, 1, "usi reset set")) != 0) {
++		return e;
++	}
++	sbu.hw.udelay(1);
++	if ((e = sbu_wr(SBU_UART + U_USI_CON, 0, "usi reset clear")) != 0) {
++		return e;
++	}
++	sbu.hw.udelay(1);
++	if ((e = sbu_wr(SBU_UART + U_USI_OPT, 2, "usi hwacg clkreq")) != 0 || (e = sbu_wr(SBU_UART + U_UINTM, 0xF, "mask all uart irq (polling)")) != 0 ||
++	    (e = sbu_flow(true)) != 0 || (e = sbu_wr(SBU_UART + U_UFCON, SBU_UFCON, "fifo on, reset tx/rx")) != 0) {
++		return e;
++	}
++	sbu.hw.udelay(1);
++	if ((e = sbu_wr(SBU_UART + U_UCON, SBU_UCON, "ucon")) != 0 || (e = sbu_wr(SBU_UART + U_ULCON, SBU_ULCON_8N1, "ulcon 8N1")) != 0 ||
++	    (e = sbu_set_baud(baud)) != 0) {
++		return e;
++	}
++	sbu_witness("open");
++	SBU_GAP(SG_OTHER, "uart16 pad PUD/DRV (uart16_bus pud 0) and the rts-gpio-control pad state are not programmed; only the gpa3-0..3 function is (sbu_pads)");
++	SBU_GAP(SG_OTHER, "uart16 UMCON RTS trigger level left at its reset value (DT rts-trig-level 1 has no cited UMCON field)");
++	sbu.uart_ok = true;
++	sbu.tio.c_cflag = CS8 | CREAD | CLOCAL | CRTS_IFLOW | CCTS_OFLOW;
++	sbu.tio.c_ispeed = sbu.tio.c_ospeed = baud;
++	return 0;
++}
++
++/* ---- A9/A10/A27: GPIOs and power sequence ---- */
++static int
++sbu_gpio_out(uint32_t con, uint32_t dat, unsigned pin, bool level, const char *name)
++{
++	uint32_t c = sbu_rd(con);
++	int e = sbu_wr(dat, (sbu_rd(dat) & ~(1u << pin)) | (level ? 1u << pin : 0), name);
++
++	if (e == 0) {
++		e = sbu_wr(con, (c & ~(0xFu << (4 * pin))) | (1u << (4 * pin)), name);      /* function 1 = output (A1, A2) */
++	}
++	return e;
++}
++
++static int
++sbu_pin(uint32_t dat, unsigned pin, bool level, const char *name)
++{
++	return sbu_wr(dat, (sbu_rd(dat) & ~(1u << pin)) | (level ? 1u << pin : 0), name);
++}
++
++int sbu_power_on(void);
++int sbu_power_off(void);
++
++/* BT-S4h (T-e3c9 H1): the UART16 pads are gpa3-0..3 function 2 on the stock kernel (pinctrl default state) and nothing in this backend muxed them. Log CON/DAT/PUD
++ * raw, set function 2 on the four nibbles only when CON differs (store list: gpa3 CON, mask 0xFFFF; PUD is only logged). */
++static int
++sbu_pads(void)
++{
++	uint32_t c = sbu_rd(SBU_GA3_CON);
++	int e = 0;
++
++	printf("BT UART: pads before gpa3 CON %#x DAT %#x PUD %#x (want CON[15:0] %#x)\n", c, sbu_rd(SBU_GA3_DAT), sbu_rd(SBU_GA3_PUD), SBU_GA3_FUNC);
++	if ((c & 0xFFFFu) != SBU_GA3_FUNC) {
++		e = sbu_wr(SBU_GA3_CON, (c & ~0xFFFFu) | SBU_GA3_FUNC, "gpa3-0..3 := uart16 function 2");
++		printf("BT UART: pads after gpa3 CON %#x DAT %#x PUD %#x\n", sbu_rd(SBU_GA3_CON), sbu_rd(SBU_GA3_DAT), sbu_rd(SBU_GA3_PUD));
++	}
++	return e;
++}
++
++/* BT-S4h read-only witness (H2/H3/H5): REG_ON/DEV_WAKE levels, UART modem/FIFO state and the gpa3 pad levels at one moment. UERSTAT is not read (reading clears it). */
++static void
++sbu_witness(const char *when)
++{
++	printf("BT UART: witness %s regon %u devwake %u umcon %#x umstat %#x utrstat %#x ufstat %#x ga3dat %#x\n", when,
++	    (sbu_rd(SBU_G16_DAT) >> SBU_REGON_PIN) & 1u, (sbu_rd(SBU_G14_DAT) >> SBU_DEVWAKE_PIN) & 1u, sbu_rd(SBU_UART + U_UMCON),
++	    sbu_rd(SBU_UART + U_UMSTAT), sbu_rd(SBU_UART + U_UTRSTAT), sbu_rd(SBU_UART + U_UFSTAT), sbu_rd(SBU_GA3_DAT));
++}
++
++int
++sbu_power_on(void)
++{
++	int e;
++
++	if ((e = sbu_pads()) != 0) {
++		return e;
++	}
++	/* A9 initial state, A10 order: REG_ON low (output), DEV_WAKE low, msleep 30, REG_ON high, DEV_WAKE high, 10-20 ms (nitrous.c:551-583,596-617) */
++	if ((e = sbu_gpio_out(SBU_G16_CON, SBU_G16_DAT, SBU_REGON_PIN, false, "BT_REG_ON low")) != 0 ||
++	    (e = sbu_gpio_out(SBU_G14_CON, SBU_G14_DAT, SBU_DEVWAKE_PIN, false, "DEV_WAKE low")) != 0) {
++		return e;
++	}
++	sbu.hw.msleep(30);
++	if ((e = sbu_pin(SBU_G16_DAT, SBU_REGON_PIN, true, "BT_REG_ON high")) != 0 || (e = sbu_pin(SBU_G14_DAT, SBU_DEVWAKE_PIN, true, "DEV_WAKE high")) != 0) {
++		return e;
++	}
++	sbu.hw.msleep(20);
++	sbu.powered = true;
++	SBU_GAP(SG_OTHER, "gpp16-2/gpp14-3 PUD not programmed (A1/A2 pud 0), the reset/bootloader value is kept; bt sleep clock and rails (A5/U2) not provided");
++	SBU_GAP(SG_OTHER, "dev-wake held high while powered (A24 per-Tx wake/release and 100 ms autosuspend absent; LPM A26 off); host-wake IRQ A25 not wired");
++	return 0;
++}
++
++int
++sbu_power_off(void)
++{
++	int e = sbu_pin(SBU_G14_DAT, SBU_DEVWAKE_PIN, false, "DEV_WAKE low");     /* A27 order: DEV_WAKE low, then REG_ON low */
++	int e2 = sbu_pin(SBU_G16_DAT, SBU_REGON_PIN, false, "BT_REG_ON low");     /* REG_ON goes low even when the DEV_WAKE store failed (review T-5c3c F4) */
++
++	if (e == 0) {
++		e = e2;
++	}
++	sbu.powered = false;
++	sbu.uart_ok = false;
++	printf("BT UART: power off (tx %u bytes, rx %u bytes, rx errors %u)\n", sbu.tx_bytes, sbu.rx_bytes, sbu.rx_err);
++	return e;
++}
++
++/* HCI byte trace (T-2c90, rule 8: the first chip talk must be visible): first 200 transfers, up to 24 bytes each, hex. Pure printf; no register access. */
++static uint32_t sbu_trace_n;
++
++static void
++sbu_trace(const char *dir, const uint8_t *p, size_t len)
++{
++	char hex[24 * 3 + 1];
++	size_t k = len < 24 ? len : 24;
++
++	if (sbu_trace_n >= 200) {
++		if (sbu_trace_n == 200) {
++			sbu_trace_n++;
++			printf("BT HCI: trace cap reached (200 transfers); later transfers are not logged\n");
++		}
++		return;
++	}
++	sbu_trace_n++;
++	for (size_t i = 0; i < k; i++) {
++		snprintf(hex + 3 * i, 4, "%02x ", p[i]);
++	}
++	hex[3 * k] = 0;
++	printf("BT HCI: %s %zu bytes: %s%s\n", dir, len, hex, len > k ? "..." : "");
++}
++
++/* ---- the sweet_bt_ops ---- */
++static int
++sbu_tx(const void *data, size_t len)
++{
++	const uint8_t *p = data;
++
++	if (!sbu.powered || !sbu.uart_ok) {
++		SBU_GAP(SG_OTHER, "H4 tx of %zu bytes while the controller is not powered/opened; refused", len);
++		return ENXIO;
++	}
++	sbu_trace("tx", p, len);
++	for (size_t i = 0; i < len; i++) {
++		if (sbu_wait(U_UFSTAT, SBU_UFSTAT_TXFULL, 0) != 0) {
++			SBU_GAP(SG_TXFULL, "uart16 tx fifo stayed full (flow control stuck?); %zu of %zu bytes sent", i, len);
++			return ETIMEDOUT;
++		}
++		(void)sbu_wr(SBU_UART + U_UTXH, p[i], NULL);
++		sbu.tx_bytes++;
++	}
++	return 0;
++}
++
++/*
++ * BT-S4e probe: with the conflict word, one candidate clock is tried by what the chip does. H4 HCI Reset (01 03 0c 00) goes out at 115200 under the candidate
++ * divisor and the RX FIFO is read for the Command Complete event 04 0e 04 <ncmd> 03 0c <status>. No answer in two rounds of 300 ms = wrong clock (or a dead
++ * chip): the controller is powered off again (A27 order) so the next candidate starts from a clean ROM state, never from a half-parsed packet.
++ * Only stores already on the store list; the rx thread is not running yet, so this function owns the FIFO.
++ */
++static const uint8_t sbu_hci_reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++#define SBU_PROBE_BUF   128
++#define SBU_PROBE_MS    300
++
++static bool
++sbu_probe_listen(uint8_t *buf, size_t *n, uint32_t *err, uint8_t *status)
++{
++	for (unsigned t = 0; t <= SBU_PROBE_MS; t += 10) {
++		*err |= sbu_rd(SBU_UART + U_UERSTAT);
++		while (*n < SBU_PROBE_BUF && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++			buf[(*n)++] = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++			sbu.rx_bytes++;
++		}
++		for (size_t i = 0; i + 7 <= *n; i++) {
++			if (buf[i] == 0x04 && buf[i + 1] == 0x0e && buf[i + 2] == 0x04 && buf[i + 4] == 0x03 && buf[i + 5] == 0x0c) {
++				*status = buf[i + 6];
++				return true;
++			}
++		}
++		if (t < SBU_PROBE_MS) {
++			sbu.hw.msleep(10);
++		}
++	}
++	return false;
++}
++
++/* 0 = the chip answered (powered, open at 115200 on this candidate's clock); ETIMEDOUT = no answer (powered off again); any other errno = the start failed (powered off). */
++static int
++sbu_probe_one(const struct sbu_cand *c)
++{
++	uint8_t buf[SBU_PROBE_BUF], status = 0xFF, late[16];
++	size_t n = 0, nl = 0;
++	int sent = 0;
++	uint32_t q = 0, f = 0, err = 0;
++	bool ok = false;
++	int e = sbu_baud_regs(c->hz, 115200, &q, &f);
++
++	if (e != 0) {
++		return e;
++	}
++	sbu.clk_hz = c->hz;
++	sbu.clk_osc = c->osc;
++	if ((e = sbu_power_on()) == 0 && (e = sbu_uart_open(115200)) == 0) {
++		for (int round = 0; round < 2 && !ok && e == 0; round++) {
++			e = sbu_tx(sbu_hci_reset, sizeof(sbu_hci_reset));
++			sent += e == 0;
++			ok = e == 0 && sbu_probe_listen(buf, &n, &err, &status);
++		}
++		sbu_witness("after-probe");
++	}
++	printf("BT UART: baud probe layout=%s uart16 clock %u Hz UBRDIV %u UFRACVAL %u: %s (rx %zu bytes, uart error flags %#x)\n",
++	    c->layout, c->hz, q, f, ok ? "chip answered HCI Reset" : (e != 0 ? "start or transmit failed before any answer" : "no answer"), n, err);
++	if (n != 0) {
++		sbu_trace("rx", buf, n);
++	}
++	if (ok) {
++		/* a second Command Complete (the answer to a Reset sent in round 2, or a duplicate) must not reach bluetoothd as a stray event: with two Resets in flight
++		 * the settle is one full listen window, else 20 ms (review T-5c3c F6) */
++		for (unsigned t = 0; t < (sent == 2 ? SBU_PROBE_MS : 20u); t += 10) {
++			sbu.hw.msleep(10);
++			while (nl < 1024 && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++				uint8_t b = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++
++				if (nl < sizeof(late)) {
++					late[nl] = b;
++				}
++				nl++;
++				sbu.rx_bytes++;
++			}
++		}
++		if (nl != 0) {
++			printf("BT UART: baud probe drained %zu late bytes after the answer\n", nl);
++			sbu_trace("rx", late, nl < sizeof(late) ? nl : sizeof(late));
++		}
++		if (status != 0) {
++			SBU_GAP(SG_OTHER, "baud probe: HCI Reset Command Complete status %#x (not 0); the chip answered, the clock is settled, the reset itself failed", status);
++		}
++		return 0;
++	}
++	(void)sbu_power_off();
++	sbu.clk_hz = 0;
++	sbu.clk_osc = false;
++	return e != 0 ? e : ETIMEDOUT;
++}
++
++/* One polling pass (the rx thread calls it every tick): drain the RX FIFO into the connected control. Returns bytes queued. */
++size_t sbu_rx_poll(void);
++
++size_t
++sbu_rx_poll(void)
++{
++	uint8_t buf[SBU_RXBUF];
++	size_t n = 0;
++
++	if (!sbu.uart_ok) {
++		return 0;
++	}
++	uint32_t err = sbu_rd(SBU_UART + U_UERSTAT);       /* reading clears the error flags */
++	if (err != 0) {
++		sbu.rx_err++;
++		SBU_GAP(SG_RXERR, "uart16 rx error flags %#x (overrun/frame/break); bytes may be lost", err);
++	}
++	/* a FIFO that is completely full may read as count 0 (the full state is a separate UFSTAT bit [guess, not cited]), so RXDR counts as data too */
++	while (n < sizeof(buf) && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++		buf[n++] = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++	}
++	if (n != 0) {
++		sbu.rx_bytes += (uint32_t)n;
++		sbu_trace("rx", buf, n);
++		(void)sweet_bt_rx(buf, n);
++	}
++	return n;
++}
++
++static int
++sbu_termios_get(void *buf, size_t *len)
++{
++	if (!sbu.uart_ok) {
++		SBU_GAP(SG_OTHER, "TIOCGETA while the uart is not open");
++		return ENXIO;
++	}
++	memcpy(buf, &sbu.tio, sizeof(sbu.tio));
++	*len = sizeof(sbu.tio);
++	return 0;
++}
++
++static int
++sbu_termios_set(const void *buf, size_t len)
++{
++	const struct termios *t = buf;
++	int e;
++
++	if (!sbu.uart_ok || len != sizeof(*t)) {
++		SBU_GAP(SG_OTHER, "TIOCSETA refused (uart open %d, length %zu)", sbu.uart_ok, len);
++		return sbu.uart_ok ? EINVAL : ENXIO;
++	}
++	if (t->c_ispeed != t->c_ospeed) {
++		SBU_GAP(SG_OTHER, "TIOCSETA ispeed %lu != ospeed %lu: one clock drives both; refused", (unsigned long)t->c_ispeed, (unsigned long)t->c_ospeed);
++		return EINVAL;
++	}
++	if (t->c_ospeed == 0 || t->c_ospeed > SBU_MAX_BAUD) {
++		SBU_GAP(SG_OTHER, "TIOCSETA speed %lu outside 1..%u; refused", (unsigned long)t->c_ospeed, SBU_MAX_BAUD);
++		return EINVAL;
++	}
++	if ((t->c_cflag & (CSIZE | PARENB | CSTOPB)) != CS8) {
++		SBU_GAP(SG_OTHER, "TIOCSETA cflag %#lx: only 8N1 is implemented (ULCON stays 8N1); refused", (unsigned long)t->c_cflag);
++		return EINVAL;
++	}
++	if (t->c_iflag != 0 || t->c_oflag != 0 || t->c_lflag != 0) {
++		SBU_GAP(SG_OTHER, "TIOCSETA iflag %#lx oflag %#lx lflag %#lx ignored (raw 8N1 only; reported back as zero)", (unsigned long)t->c_iflag, (unsigned long)t->c_oflag, (unsigned long)t->c_lflag);
++	}
++	if ((e = sbu_set_baud((uint32_t)t->c_ospeed)) != 0) {       /* baud first: a refused speed leaves UMCON untouched */
++		return e;
++	}
++	bool afc = (t->c_cflag & (CRTS_IFLOW | CCTS_OFLOW)) == (CRTS_IFLOW | CCTS_OFLOW);
++	if ((e = sbu_flow(afc)) != 0) {
++		return e;
++	}
++	sbu.tio.c_iflag = sbu.tio.c_oflag = sbu.tio.c_lflag = 0;
++	sbu.tio.c_cflag = CS8 | CREAD | CLOCAL | (afc ? (CRTS_IFLOW | CCTS_OFLOW) : 0);      /* the effective state, not the request */
++	sbu.tio.c_ispeed = sbu.tio.c_ospeed = t->c_ospeed;
++	return 0;
++}
++
++static int
++sbu_cts(int *cts)
++{
++	if (!sbu.uart_ok) {
++		SBU_GAP(SG_OTHER, "TIOCMGET while the uart is not open");
++		return ENXIO;
++	}
++	*cts = (sbu_rd(SBU_UART + U_UMSTAT) & 1u) ? TIOCM_CTS : 0;
++	return 0;
++}
++
++/* sw_open/sw_close stay NULL: the polarity and meaning of /dev/btwake, /dev/btpoweroff, /dev/btreset is BT-S3 O4 (open), every open is a GAP + error. */
++static const struct sweet_bt_ops sbu_ops = { .termios_get = sbu_termios_get, .termios_set = sbu_termios_set, .tx = sbu_tx, .cts = sbu_cts };
++
++static uint32_t
++sbu_k_rd(uint32_t pa)
++{
++	for (size_t i = 0; i < sizeof(sbu_regions) / sizeof(sbu_regions[0]); i++) {
++		if (pa >= sbu_regions[i].pa && pa < sbu_regions[i].pa + sbu_regions[i].size && sbu_regions[i].va != 0) {
++			return *(volatile uint32_t *)(sbu_regions[i].va + (pa - sbu_regions[i].pa));
++		}
++	}
++	SBU_GAP(SG_OTHER, "read of unmapped %#x returns 0", pa);
++	return 0;
++}
++
++static void
++sbu_k_wr(uint32_t pa, uint32_t v)
++{
++	for (size_t i = 0; i < sizeof(sbu_regions) / sizeof(sbu_regions[0]); i++) {
++		if (pa >= sbu_regions[i].pa && pa < sbu_regions[i].pa + sbu_regions[i].size && sbu_regions[i].va != 0) {
++			*(volatile uint32_t *)(sbu_regions[i].va + (pa - sbu_regions[i].pa)) = v;
++			return;
++		}
++	}
++	SBU_GAP(SG_OTHER, "write of unmapped %#x dropped", pa);
++}
++
++static void sbu_k_udelay(unsigned us) { delay((int)us); }
++static void sbu_k_msleep(unsigned ms) { delay((int)(ms * 1000)); }
++
++static void
++sbu_rx_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	static int chan;
++
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetbtrx", 1);
++		(void)sbu_rx_poll();
++	}
++}
++
++void
++sweet_bt_uart_attach(void)
++{
++	int want = 0;
++
++	if (sbu.attached) {
++		return;
++	}
++	sbu.attached = true;
++	if (!PE_parse_boot_argn("sweetbt", &want, sizeof(want)) || want != 1) {
++		printf("BT GAP: hci uart backend present but not enabled (boot-arg sweetbt=1 powers the controller); kctl and /dev/bt* are registered but every transfer fails\n");
++		return;
++	}
++	if (!sweet_usb_board_is_gs101()) {      /* the /bluetooth ADT node is emitted for every board; the addresses below are gs101-only (review r1 F1) */
++		printf("BT GAP: hci uart backend is gs101-only (board is not gs101); sweetbt=1 ignored, no register touched\n");
++		return;
++	}
++	if (sbu.hw.rd == NULL) {        /* the host test presets sbu.hw with a fake register file */
++		sbu.hw = (struct sbu_hw){ sbu_k_rd, sbu_k_wr, sbu_k_udelay, sbu_k_msleep };
++		for (size_t i = 0; i < sizeof(sbu_regions) / sizeof(sbu_regions[0]); i++) {
++			sbu_regions[i].va = (uintptr_t)ml_io_map(sbu_regions[i].pa, sbu_regions[i].size);
++			if (sbu_regions[i].va == 0) {
++				printf("BT GAP: ml_io_map(%#x) failed; hci uart backend not started\n", sbu_regions[i].pa);
++				sbu.hw.rd = NULL;
++				return;
++			}
++		}
++	}
++	if (sbu_clk_gates() != 0) {
++		return;     /* nothing was written yet: no power-off needed */
++	}
++	bool settled = false;       /* BT-S4e: the probe already powered the controller and opened the uart on the answering clock */
++
++	{       /* read-only clock pre-check (review T-833a F6): a clock the backend refuses must stop it BEFORE REG_ON, USI mode or any UART store */
++		struct sbu_cand cand[2], use[2];
++		uint32_t q, f;
++		int nc = sbu_clk_cands(cand), nu = 0;
++
++		for (int i = 0; i < nc; i++) {
++			if (sbu_baud_regs(cand[i].hz, 115200, &q, &f) == 0) {
++				use[nu++] = cand[i];
++			} else {
++				printf("BT GAP: uart16 baud clock candidate %s %u Hz unusable for 115200\n", cand[i].layout, cand[i].hz);
++			}
++		}
++		if (nu == 0) {
++			printf("BT GAP: uart16 baud clock unusable for 115200; backend not started, nothing written\n");
++			return;
++		}
++		if (nc == 2) {      /* BT-S4e: the chip's answer settles the layout; sbu_probe_one leaves the controller powered and open on the answering clock */
++			int e = ETIMEDOUT;
++
++			for (int i = 0; i < nu && e == ETIMEDOUT; i++) {
++				e = sbu_probe_one(&use[i]);
++				if (e == 0) {
++					printf("BT UART: baud probe answered layout=%s uart16 clock %u Hz\n", use[i].layout, use[i].hz);
++					SBU_GAP(SG_CLK, "uart16 baud clock %u Hz settled by the chip's answer (layout %s), not by a source (BT-S4e); the CMU_APM mux layout stays unproven", use[i].hz, use[i].layout);
++				}
++			}
++			if (e != 0) {
++				printf("BT GAP: uart16 baud probe: no candidate clock got an answer to HCI Reset (error %d); backend not started, controller powered off\n", e);
++				return;
++			}
++			settled = true;
++		}
++	}
++	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
++		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
++		(void)sbu_power_off();
++		return;
++	}
++	sweet_bt_set_ops(&sbu_ops);
++	thread_t th;
++	if (kernel_thread_start(sbu_rx_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		sbu.rx_thread = true;
++	} else {
++		printf("BT GAP: uart16 rx polling thread not started; received bytes are never relayed\n");
++	}
++	printf("BT UART: backend up (uart16 %u baud 8N1, polled rx); HOST_WAKE irq, pad PUD/DRV, sleep clock are GAPs\n", sbu.baud);
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6f05187..4ebb0d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -60,6 +60,7 @@ extern void sweet_usb_probe(void);
+ extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
+ extern void sweet_touch_gs101_init(void);
+ extern void sweet_gpu_gs101_init(void);     /* bsd/dev/sweet_gpu_gs101.c, read-only, needs boot-arg sweetgpu= */
++extern void sweet_bt_init(void);            /* bsd/dev/sweet_bt.c (patch 0189), no-op without the ADT node /bluetooth */
+ extern void sweet_wlan_init(void);          /* bsd/dev/sweet_wlan.c, read-only stage 1, needs boot-arg sweetwlan= and ADT /sweet-wlan */
+ 
+ #define REG_CAP         0x00
+@@ -741,6 +742,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	sweet_gpu_gs101_init();       /* no-op without boot-arg sweetgpu= */
+ 	sweet_wlan_init();            /* no-op without boot-arg sweetwlan= */
++	sweet_bt_init();              /* no-op (one GAP line) without the ADT node /bluetooth */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usbroot.c b/bsd/dev/sweet_usbroot.c
+index c2b812b..c01dcbf 100644
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -32,6 +32,7 @@
+ 
+ /* bsd/dev/sweet_usb.c and bsd/dev/sweet_ufs.c */
+ extern void sweet_usb_probe(void);
++extern void sweet_bt_init(void);   /* bsd/dev/sweet_bt.c (patch 0189) */
+ extern bool sweet_usb_ready(void);
+ extern bool sweet_usb_is_gs101(void);
+ extern bool sweet_usb_board_is_gs101(void);
+@@ -859,6 +860,7 @@ ur_rootdev(dev_t *dev)
+ 	}
+ 	UR_TRACE("starting the USB device");
+ 	sweet_usb_probe();
++	sweet_bt_init();        /* idempotent; the USB root path never reaches sweet_ufs_init */
+ 	UR_TRACE("sweet_usb_probe returned, gs101 %d ready %d", sweet_usb_is_gs101(), sweet_usb_ready());
+ 	if (!sweet_usb_is_gs101()) {
+ 		printf("SWEET USBROOT: gs101 USB device did not start\n");
+diff --git a/bsd/kern/kern_control.c b/bsd/kern/kern_control.c
+index 539730e..4e42d15 100644
+--- a/bsd/kern/kern_control.c
++++ b/bsd/kern/kern_control.c
+@@ -142,6 +142,7 @@ static int ctl_sofreelastref(struct socket *so);
+ static int ctl_bind(struct socket *, struct sockaddr *, struct proc *);
+ static int ctl_connect(struct socket *, struct sockaddr *, struct proc *);
+ static int ctl_disconnect(struct socket *);
++extern int sweet_bt_kctl_ioctl(const char *name, unsigned long cmd, void *data);   /* bsd/dev/sweet_bt.c (patch 0189) */
+ static int ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+     struct ifnet *ifp, struct proc *p);
+ static int ctl_send(struct socket *, int, struct mbuf *,
+@@ -1422,7 +1423,7 @@ static int
+ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+     struct ifnet *ifp, struct proc *p)
+ {
+-#pragma unused(so, ifp, p)
++#pragma unused(ifp, p)
+ 	int     error = ENOTSUP;
+ 
+ 	switch (cmd) {
+@@ -1466,6 +1467,15 @@ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+ 	}
+ 
+ 		/* add controls to get list of NKEs */
++
++	default: {
++		/* patch 0189 (BT-S3 f): a kctl socket has no other ioctl; the Bluetooth UART controls answer TIOCMGET (M20), everything
++		 * else keeps the stock ENOTSUP, unlogged. */
++		struct ctl_cb *kcb = (struct ctl_cb *)so->so_pcb;
++
++		error = sweet_bt_kctl_ioctl((kcb != NULL && kcb->kctl != NULL) ? kcb->kctl->name : NULL, cmd, data);
++		break;
++	}
+ 	}
+ 
+ 	return error;

@@ -1,0 +1,163 @@
+SWEET IOSurface traps 4/5 = detach/release (patch 0297, sprint GPU 2026-11-11, defect 1 lead from a sibling port, checked against IOSurface.framework iOS 16.7 _IOSurfaceClientRelease 0x1a39827bc: every release of an IOSurfaceClient sends trap 4 (id) then trap 5 (id) unconditionally; trap 5 alone undoes a create/lookup whose client was not built, research 136). Patch 0046 ran trapRelease for both: trap 4 dropped the ref (unmap + user count), trap 5 then found nothing (NotFound, the framework skipped its child-table cleanup) or, after a lookup of the same id by another thread between the two traps, destroyed the NEW ref under the new client (its view unmapped, its user count gone, the id could leave the surface table = SweetMali import NotFound). Now trap 4 marks one client of the live ref detached (lookups skip a fully detached ref and map a fresh one), trap 5 releases a detached client first, else a live one (failure path); returnSurface's undo drops its own ref by pointer; a trap with no ref logs a GAP (sweet_note_ignored). No hardware access.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -65,8 +65,8 @@
+ 	kSweetSurfaceTrapDecrementUse   = 1,
+ 	kSweetSurfaceTrapLock           = 2,
+ 	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
++	kSweetSurfaceTrapDetach         = 4,   /* patch 0297: was "Release"; the client is about to drop its IOSurfaceClient */
++	kSweetSurfaceTrapRelease        = 5,   /* patch 0297: was "ReleaseFailed"; the real release (also on create/lookup failure) */
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+@@ -479,6 +479,7 @@
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
+ 	uint8_t       uses[2];   /* patch 0290: this client holds use category 0/1 (traps 0/1 on the client's 0->1 / 1->0 transitions) */
++	uint32_t      detached;  /* patch 0297: trap 4s not yet followed by their trap 5 (<= count); a ref with detached == count is invisible to lookups */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -676,6 +677,9 @@
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);   /* patch 0297 */
++	SweetSurfaceRef *findDetached(uint32_t id, unsigned int *index);         /* patch 0297 */
++	void dropRefLocked(SweetSurfaceRef *ref);                                /* patch 0297 */
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -728,13 +732,14 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Lock held. */
++/* Lock held. Patch 0297: only refs with a client the framework still uses (count > detached); a ref whose every client sent trap 4
++ * (detach) is waiting for its trap 5 and must not be handed to a new lookup (that lookup gets a fresh ref and mapping instead). */
+ SweetSurfaceRef *
+ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached < ref->count) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -908,8 +913,10 @@
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {
+-		/* The caller never learns the id: undo this create/lookup. */
+-		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
++		/* The caller never learns the id: undo this create/lookup (by pointer, patch 0297: a detached ref of the same id is not ours to drop). */
++		IOLockLock(fLock);
++		dropRefLocked(ref);
++		IOLockUnlock(fLock);
+ 	}
+ 	return ret;
+ }
+@@ -1608,18 +1615,84 @@
+ 	return ret;
+ }
+ 
++/* Lock held. Patch 0297: a ref waiting for trap 5 (detached > 0), oldest first. */
++SweetSurfaceRef *
++IOSurfaceRootUserClient::findDetached(uint32_t id, unsigned int *index)
++{
++	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
++		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
++		if (ref->surface->id == id && ref->detached > 0) {
++			if (index != NULL) {
++				*index = i;
++			}
++			return ref;
++		}
++	}
++	return NULL;
++}
++
++/* Lock held. One create/lookup of ref is undone; the last one unmaps it and drops its user count (patch 0297: by pointer). */
++void
++IOSurfaceRootUserClient::dropRefLocked(SweetSurfaceRef *ref)
++{
++	unsigned int index = fRefs->getNextIndexOfObject(ref, 0);
++	if (index == (unsigned int)-1) {
++		sweet_note_ignored("surface ref drop", "ref not in the client table", 0);
++		return;
++	}
++	if (ref->detached > ref->count - 1) {
++		ref->detached = ref->count - 1;
++	}
++	if (--ref->count == 0) {
++		fRefs->removeObject(index);     /* unmaps and drops the user count */
++	}
++}
++
++/*
++ * Patch 0297. IOSurface.framework's _IOSurfaceClientRelease (iOS 16.7, research 136) sends, once per IOSurfaceClient whose local
++ * count reached 0 and after taking it out of its own id table: trap 4 (id), unmaps its view, then trap 5 (id). Trap 5 alone undoes a
++ * create/lookup whose client could not be built (Lookup, LookupFromMachPort, CreateChild, WrapClientImage/Memory). Before 0297 both
++ * traps ran trapRelease: one release dropped the ref at trap 4, and a lookup of the same id between trap 4 and trap 5 (another thread)
++ * got a fresh ref that trap 5 then destroyed under the new client (unmapped view, user count gone, the id could leave the surface
++ * table: SweetMali import NotFound). Now trap 4 only marks one client of the ref detached; trap 5 releases a detached client first.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	SweetSurfCpuScope cpuScope(1, 4);   /* patch 0194: traps 4 and 5 */
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		ref->detached++;
++	}
++	IOLockUnlock(fLock);
++	if (ref == NULL) {
++		sweet_note_ignored("surface trap 4 (detach)", "no live ref for the id", (uint32_t)(uintptr_t)id);
++		return kIOReturnNotFound;
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+ 	SweetSurfCpuScope cpuScope(1, 4);   /* patch 0194: traps 4 and 5 */
+-	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+-	if (ref != NULL && --ref->count == 0) {
+-		fRefs->removeObject(index);     /* unmaps and drops the user count */
++	SweetSurfaceRef *ref = findDetached((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		ref->detached--;
++	} else {
++		ref = findRef((uint32_t)(uintptr_t)id, NULL);   /* trap 5 without trap 4: a create/lookup whose client was never built */
++	}
++	if (ref != NULL) {
++		dropRefLocked(ref);
+ 	}
+ 	IOLockUnlock(fLock);
+-	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++	if (ref == NULL) {
++		sweet_note_ignored("surface trap 5 (release)", "no ref for the id", (uint32_t)(uintptr_t)id);
++		return kIOReturnNotFound;
++	}
++	return kIOReturnSuccess;
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+@@ -1627,8 +1700,8 @@
+ 	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseDecrement },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },    /* patch 0297 */
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+ IOExternalTrap *

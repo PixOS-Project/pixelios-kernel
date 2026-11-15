@@ -3,6 +3,9 @@
 The Pixel has no serial console, so the log is shown on the panel as QR codes that a camera reads.
 It works in the shim and inside XNU. Two formats exist; the host reader (`tools/qr-log.py`) decodes both.
 
+Status 2026-10-29: QR is the **fallback** channel. The main debug channel is the USB network log (`tools/xrun --usbnet`, see
+`docs/AUTOMATION.md`) (read from source: `AGENTS.md`).
+
 ## QL2 (XNU default, `sweetqr_fmt=2`)
 
 The kernel reads its console ring from the first byte, in the background, and turns it into an append-only stream:

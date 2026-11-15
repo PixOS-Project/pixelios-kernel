@@ -1,0 +1,217 @@
+sweet-sampler-deep (lowclk 2026-11-14): the process sampler (0054/0055) reaches deeper, prints short rows and takes its pace from two boot-args.
+Why [read docs/research/153-coreduetd-biome-runaway.md]: the caller of coreduetd's endless _DKBiomeQuery is unknown; the SMP backtrace row was cut by the USB log line
+limit (about 358 characters) and the walk (16 frames) did not reach above `_DKKnowledgeStorage _executeQuery:error:`; the sampler also ran only every 120 s.
+Changed (read-only: no register, no hardware access, no new write): (1) boot-args sweetsampleiv=N (seconds between samples, decimal 5..600, default 120) and
+sweetsamplemax=N (samples, decimal 1..60, default 40 = what 0055 left; the brief's "10" is the 0054 value). Read as strings (PE_parse_boot_arg_str with literal names, not PE_parse_boot_argn
+into a char[]); empty, hex, signed, trailing text or out of range logs `SWEET GAP: sweetsample...` and keeps the default. The first sample stays at 90 s.
+(2) the frame walk goes up to SWEET_SMP_BT_MAX = 48 frames (osfmk/kern/exception.c, was 16). Guards of 0054 kept (fp non-zero, 8-aligned, readable through
+vm_map_read_user, next fp above this one); added: fp must be below vm_map_max(map). NOT added: a per-thread stack range, no cited source for it in this tree.
+(3) rows: first row unchanged in format "SMP name tN pc 0x.. lr 0x.. sp 0x.. bt 0x.. ...", further frames in "SMP name tN bt[k] 0x.. ..." rows, k = 0-based index of the
+first frame on the row; at most 8 addresses per row and every row shorter than 200 characters (SMP_ROW_LIM). The header row (slide, mh) is untouched.
+With neither boot-arg the output equals today's except: the first row ends where the 200 character bound is reached instead of holding up to 16 frames, the rest
+follows in bt[k] rows, and walks can be deeper than 16 frames. Documented in the header of sweet_sample.c.
+Host test: tools/test_sweet_sample_core.py compiles the SMP_CORE block (parse + row split). The kernel glue is not run there.
+ORDER: after 0055 (and 0054).
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1016,6 +1016,9 @@
+  * pointer backtrace of every thread of a task, from the saved user state.
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
++extern void sweet_sample_print_bt(const char *name, int tn, uint64_t pc, uint64_t lr, uint64_t sp, const uint64_t *bt, int nbt);
++
++#define SWEET_SMP_BT_MAX 48     /* frames walked per thread (patch 0352; 0055: 16) */
+ 
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1035,28 +1038,27 @@
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
+-		int n;
++		uint64_t bt[SWEET_SMP_BT_MAX];
++		int nbt = 0;
+ 		uint64_t fp;
+ 
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		/* guards as in 0054: non-zero, 8-aligned, readable, and the next frame lies above this one; 0352 adds: inside the user map */
++		while (nbt < SWEET_SMP_BT_MAX && fp != 0 && (fp & 7) == 0 && fp < (uint64_t)vm_map_max(map)) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+ 			}
+-			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			bt[nbt++] = frame[1];
+ 			if (frame[0] <= fp) {
+ 				break;
+ 			}
+ 			fp = frame[0];
+ 		}
+-		printf("%s\n", line);
++		sweet_sample_print_bt(name, tn++, get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), bt, nbt);
+ 	}
+ 	task_unlock(task);
+ }
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,21 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * First sample 90 s after start, then every sweetsampleiv seconds (default
++ * 120; 5..600), sweetsamplemax samples at most (default 40; 1..60). A value
++ * that is not a plain decimal number or lies outside its range logs
++ * "SWEET GAP: sweetsample..." and the default stays.
++ *
++ * Backtrace rows (patch 0352). The backtrace is walked up to 48 frames
++ * (osfmk/kern/exception.c SWEET_SMP_BT_MAX) and printed as rows that are
++ * shorter than 200 characters (the USB log cuts a line at about 358):
++ *   first row   "SMP name tN pc 0x.. lr 0x.. sp 0x.. bt 0x.. 0x.. ..."  (as before)
++ *   next rows   "SMP name tN bt[k] 0x.. 0x.. ..."  k = index (0-based) of the first
++ *               frame on the row, the frames of the first row are bt[0..k-1]
++ * A row holds at most 8 addresses and as many as fit under 200 characters.
++ * Differs from patch 0054/0055 only in: the first row now ends where the 200
++ * character bound is reached (it held up to 16 frames, one long line), the
++ * remaining frames follow in "bt[k]" rows, and a walk can now reach 48 frames.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -26,6 +40,102 @@
+ 
+ static char sweet_sample_names[128];
+ 
++/* SMP_CORE_BEGIN: pure parts, compiled by tools/test_sweet_sample_core.py on the host */
++#define SMP_FIRST_S      90      /* first sample after start, seconds */
++#define SMP_IV_DEF       120     /* sweetsampleiv default, seconds */
++#define SMP_IV_MIN       5
++#define SMP_IV_MAX       600
++#define SMP_MAX_DEF      40      /* sweetsamplemax default */
++#define SMP_MAX_MIN      1
++#define SMP_MAX_MAX      60
++#define SMP_ROW_LIM      200     /* every printed row is shorter than this */
++#define SMP_ROW_ADDRS    8       /* addresses per row at most */
++#define SMP_ADDR_LEN     19      /* " 0x" + 16 hex digits, the longest address */
++
++/* Plain decimal s in [lo, hi] -> 0 and *out = value. Anything else (empty, sign, hex,
++ * trailing text, out of range) -> -1 and *out = def. */
++static int
++sweet_sample_dec(const char *s, int lo, int hi, int def, int *out)
++{
++	long v = 0;
++	int nd = 0;
++	*out = def;
++	for (; s != NULL && *s >= '0' && *s <= '9'; s++, nd++) {
++		if (nd >= 6) {
++			return -1;
++		}
++		v = v * 10 + (*s - '0');
++	}
++	if (s == NULL || *s != '\0' || nd == 0 || v < lo || v > hi) {
++		return -1;
++	}
++	*out = (int)v;
++	return 0;
++}
++
++/* One row of the backtrace of thread tn, starting at frame k of bt[0..nbt-1]. The first row
++ * (first != 0) is the old format with pc/lr/sp, later rows carry "bt[k]". Returns how many
++ * frames went on the row (0 only if not even one fits, which the caller reports). */
++static int
++sweet_sample_row(char *buf, size_t sz, const char *name, int tn, uint64_t pc, uint64_t lr, uint64_t sp,
++    const uint64_t *bt, int nbt, int k, int first)
++{
++	int n, cnt = 0;
++	if (first) {
++		n = snprintf(buf, sz, "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn,
++		    (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)sp);
++	} else {
++		n = snprintf(buf, sz, "SMP %s t%d bt[%d]", name, tn, k);
++	}
++	if (n < 0 || n >= SMP_ROW_LIM) {
++		return 0;
++	}
++	while (k + cnt < nbt && cnt < SMP_ROW_ADDRS && n + SMP_ADDR_LEN < SMP_ROW_LIM && (size_t)(n + SMP_ADDR_LEN) < sz) {
++		n += snprintf(buf + n, sz - n, " 0x%llx", (unsigned long long)bt[k + cnt]);
++		cnt++;
++	}
++	return cnt;
++}
++/* SMP_CORE_END */
++
++/* Print the whole backtrace of one thread (osfmk/kern/exception.c, task lock held). */
++void sweet_sample_print_bt(const char *name, int tn, uint64_t pc, uint64_t lr, uint64_t sp, const uint64_t *bt, int nbt);
++
++void
++sweet_sample_print_bt(const char *name, int tn, uint64_t pc, uint64_t lr, uint64_t sp, const uint64_t *bt, int nbt)
++{
++	char row[SMP_ROW_LIM + 8];
++	int k = 0, got;
++	bool first = true;
++	do {
++		got = sweet_sample_row(row, sizeof(row), name, tn, pc, lr, sp, bt, nbt, k, first);
++		if (got == 0 && (!first || nbt > 0)) {
++			printf("SWEET GAP: sweetsample: %s t%d bt row cannot hold a frame, %d frame(s) dropped\n", name, tn, nbt - k);
++			if (first) {
++				/* still print the pc/lr/sp row, without frames */
++				(void)snprintf(row, sizeof(row), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn,
++				    (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)sp);
++				printf("%s\n", row);
++			}
++			return;
++		}
++		printf("%s\n", row);
++		k += got;
++		first = false;
++	} while (k < nbt);
++}
++
++/* value of a boot-arg already read as a string (valid: found): decimal in [lo, hi], else GAP + def */
++static int
++sweet_sample_chk(const char *argname, const char *val, int lo, int hi, int def)
++{
++	int v;
++	if (sweet_sample_dec(val, lo, hi, def, &v) != 0) {
++		printf("SWEET GAP: %s=\"%s\" is not a decimal number in %d..%d, keeping the default %d\n", argname, val, lo, hi, def);
++	}
++	return v;
++}
++
+ static bool
+ sweet_sample_wanted(const char *name)
+ {
+@@ -64,17 +174,24 @@
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static int chan;
++	int iv, nmax;
++	char argbuf[16];
+ 	if (!PE_parse_boot_argn("sweetsample", sweet_sample_names, sizeof(sweet_sample_names))) {
+ 		strlcpy(sweet_sample_names, "SpringBoard,backboardd", sizeof(sweet_sample_names));
+ 	}
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	/* read as STRINGS (PE_parse_boot_argn into a char[] would store the int value, not the text) */
++	iv = PE_parse_boot_arg_str("sweetsampleiv", argbuf, sizeof(argbuf)) ?
++	    sweet_sample_chk("sweetsampleiv", argbuf, SMP_IV_MIN, SMP_IV_MAX, SMP_IV_DEF) : SMP_IV_DEF;
++	nmax = PE_parse_boot_arg_str("sweetsamplemax", argbuf, sizeof(argbuf)) ?
++	    sweet_sample_chk("sweetsamplemax", argbuf, SMP_MAX_MIN, SMP_MAX_MAX, SMP_MAX_DEF) : SMP_MAX_DEF;
++	(void)tsleep(&chan, PZERO, "sweetsmp", SMP_FIRST_S * hz);
++	for (int i = 0; i < nmax; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", iv * hz);
+ 	}
+ }
+ 

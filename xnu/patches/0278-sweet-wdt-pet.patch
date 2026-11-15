@@ -1,0 +1,610 @@
+SWEET WDT (patch 0278 = patch 0193 ported onto the current stack (only change: the drain-loop pet sits after the 0267 2 ms/100 ms sleep); text below is 0193's; patch 0193, docs/specs/SPEC-WDT.md, PR-4): re-arm the gs101 cluster-0 SoC watchdog and pet it from polled threads, default OFF behind sweetwdt=<s>[,stop=<s>]. HW-WRITE: WTCON/WTDAT/WTCNT + SYSIP_DAT0=0xFC via the existing SMC form; no PMU gate write.
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_devoverlay.c		standard
+ bsd/dev/sweet_qr.c			standard
+ bsd/dev/sweet_restart.c			standard
++bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -40,6 +40,12 @@ extern int (*PE_halt_restart)(unsigned int type);
+ 
+ static uint64_t sweet_pmu_pa, sweet_mode_off, sweet_swreset_off;
+ 
++/* Patch 0193 (bsd/dev/sweet_wdt.c, SPEC-WDT SQ1/SQ2/SQ5/SQ6): the SoC watchdog block. */
++extern void sweet_wdt_parse(void);
++extern void sweet_wdt_missing(const char *what);
++extern void sweet_wdt_setup(uint64_t pmu_pa, uint32_t sysip_off);
++extern void sweet_wdt_poll(int may_arm);
++
+ static uint64_t
+ sweet_pmu_write(uint64_t pa, uint64_t val)
+ {
+@@ -53,6 +59,13 @@ sweet_pmu_write(uint64_t pa, uint64_t val)
+ 	return x0;
+ }
+ 
++/* SPEC-WDT SQ6/D4: SYSIP_DAT0 = 0xFC (fastboot) through the existing SMC form; the only PMU write of the watchdog block. */
++void
++sweet_set_bootloader_mode(void)
++{
++	(void)sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++}
++
+ /* No locks, no allocation: usable from the panic path. Does not return. */
+ static void __attribute__((noreturn))
+ sweet_machine_reset(int to_bootloader)
+@@ -104,6 +117,7 @@ sweet_restart_armed(void)
+ void
+ sweet_restart_poll(void)
+ {
++	sweet_wdt_poll(0);      /* pet only; the USB-log drain thread is the arming caller (SPEC-WDT SQ5) */
+ 	if (sweet_restart_deadline != 0 && mach_absolute_time() >= sweet_restart_deadline) {
+ 		sweet_restart_deadline = 0;
+ 		printf("SWEET RESTART: resetting now (bootloader=%d)\n", sweet_restart_bl);
+@@ -219,21 +233,26 @@ sweet_restart_start(void)
+ 		return;
+ 	}
+ 	started = 1;
++	sweet_wdt_parse();      /* FIRST, before the early returns below (SPEC-WDT SQ1) */
+ 	if (SecureDTLookupEntry(NULL, "/sweet-reset", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 8) {
+ 		printf("SWEET RESTART: no /sweet-reset node\n");
++		sweet_wdt_missing("sweet-reset node");
+ 		return;
+ 	}
+ 	sweet_pmu_pa = reg[0];
+ 	sweet_rst_probe(sweet_pmu_pa);
+ 	if (SecureDTGetProperty(node, "mode-offset", (void const **)&off, &size) != kSuccess || size < 4) {
++		sweet_wdt_missing("mode-offset");
+ 		return;
+ 	}
+ 	sweet_mode_off = off[0];
+ 	if (SecureDTGetProperty(node, "swreset-offset", (void const **)&off, &size) != kSuccess || size < 4) {
++		sweet_wdt_missing("swreset-offset");
+ 		return;
+ 	}
+ 	sweet_swreset_off = off[0];
++	sweet_wdt_setup(sweet_pmu_pa, (uint32_t)sweet_mode_off);       /* read-only SQ2; arming waits for the drain thread */
+ 	PE_halt_restart = sweet_halt_restart;
+ 
+ 	arg[0] = 0;
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1292,6 +1292,8 @@ ud_log_note(socket_t so, struct sockaddr_in *to, char *msg, int len, size_t max)
+ 	return ud_log_send(so, to, msg, (size_t)len);
+ }
+ 
++extern void sweet_wdt_poll(int may_arm);       /* bsd/dev/sweet_wdt.c */
++
+ static void
+ ud_log_round(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, struct ud_log_arp *a,
+     char *chunk, uint32_t chunk_max)
+@@ -1343,6 +1345,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	for (;;) {
+ 		/* patch 0267: 2 ms while console bytes are pending (back-pressure from ud_log_drain), else 100 ms as before */
+ 		ud_sleep_ms((so != NULL && sweet_log_position() > pos) ? 2 : 100);
++		sweet_wdt_poll(1);      /* patch 0193 (SPEC-WDT SQ5): BEFORE the configured check, so a missing host does not stop the pets; the only arming caller (0278: also called on the 2 ms 0267 path; sweet_wdt_poll pets at most once per WDT_PET_MS) */
+ 		if (!ud.configured) {
+ 			continue;
+ 		}
+--- a/iokit/Kernel/arm/SweetWatchdog.cpp
++++ b/iokit/Kernel/arm/SweetWatchdog.cpp
+@@ -49,7 +49,7 @@ IOWatchdog::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOWatchdogUserClient");
+ 	setProperty("IOPMUPrimary", 1ULL, 32);
+ 	registerService();
+-	IOLog("SWEET WDT: IOWatchdog registered (accepts check-ins, never fires)\n");
++	IOLog("SWEET WDT: IOWatchdog registered (accepts check-ins, stub; SoC watchdog is petted by the kernel poll)\n");
+ 	return true;
+ }
+ 
+@@ -74,6 +74,21 @@ IOWatchdogUserClient::clientClose(void)
+ 
+ static uint64_t sweet_wdt_logged;       /* selectors already logged (< 64) */
+ 
++/* Patch 0193 (SPEC-WDT section 7 rows M01-M11): the stub accepts every selector; each one says so as a GAP line, once, next to the "-> ok" line (rule 8). */
++static const char * const sweet_wdt_gap_text[10] = {
++	"WDT GAP: IOWatchdog sel 0 (CheckEnabled) answered 0, stub",
++	"WDT GAP: IOWatchdog sel 1 (Checkin) accepted, does not pet the SoC watchdog",
++	"WDT GAP: IOWatchdog sel 2 (panic request) accepted as a no-op, no panic",
++	"WDT GAP: IOWatchdog sel 3 (DisableUserspaceMonitoring) accepted, no state kept",
++	"WDT GAP: IOWatchdog sel 4 (ReenableUserspaceMonitoring) accepted, no state kept",
++	"WDT GAP: IOWatchdog sel 5 (CheckUserspaceDefanged) answered 0, stub",
++	"WDT GAP: IOWatchdog sel 6 (TestCPUHang) accepted, nothing triggered",
++	"WDT GAP: IOWatchdog sel 7 (TestSocWatchdog) accepted, SoC watchdog not fired by the stub",
++	"WDT GAP: IOWatchdog sel 8 (TestIOKitBusy) accepted, nothing triggered",
++	"WDT GAP: IOWatchdog sel 9 (CheckIOKitMonitoringEnabled) answered zeros, stub",
++};
++
++
+ IOReturn
+ IOWatchdogUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -101,6 +116,11 @@ IOWatchdogUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		IOLog("SWEET WDT: %s sel %u in %u/%u out %u/%u -> ok\n", name, selector,
+ 		    args->scalarInputCount, args->structureInputSize,
+ 		    args->scalarOutputCount, args->structureOutputSize);
++		if (selector < 10) {
++			IOLog("%s\n", sweet_wdt_gap_text[selector]);
++		} else {
++			IOLog("WDT GAP: IOWatchdog sel %u unknown, accepted as success\n", selector);
++		}
+ 	}
+ 	return kIOReturnSuccess;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_wdt.c
+@@ -0,0 +1,468 @@
++/*
++ * SWEET WDT (patch 0193, docs/specs/SPEC-WDT.md, PR-4): re-arm the gs101 cluster-0 SoC watchdog and pet it from polled threads, so a
++ * hang (or the deliberate `stop=` test) resets the phone into the bootloader by itself. DEFAULT OFF: without the boot-arg
++ * sweetwdt=<period_s>[,stop=<after_s>] nothing below touches a register (one "not armed" line is printed, SQ1).
++ *
++ * Tags in comments: [spec X] = SPEC-WDT section; [O Rnn] = docs/research/PR4-wdt-oracle.md row (Linux s3c2410_wdt.c gs101 variant,
++ * ABL decompile, Android capture on this phone).
++ *
++ * Writes: WTCON, WTDAT, WTCNT of the cluster-0 block, and ONE SMC write (SYSIP_DAT0 = 0xFC) through sweet_restart.c. Everything
++ * else is a read. No PMU gate write (D3), cluster 1 untouched (D5), no UFS/flash write, no dedicated sleeping thread (D2).
++ * The logic is portable C so tools/wdt_host_test.c compiles this very file on the host (SWEET_WDT_HOST) with a fake register file.
++ */
++#include <stdint.h>
++static uint32_t wdt_off_mask, wdt_off_cnt, wdt_off_rst, wdt_off_sysip;   /* PMU offsets from the ADT /sweet-wdt and /sweet-reset (set by wdt_map) */
++
++#ifdef SWEET_WDT_HOST
++#include "wdt_host_env.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++extern void sweet_set_bootloader_mode(void);            /* bsd/dev/sweet_restart.c: sweet_pmu_write(SYSIP_DAT0, 0xFC) */
++#endif
++
++/* [O R03] register layout of the cluster-0 block; [O R04] WTMINCNT is a vendor register, read-only here */
++#define WDT_WTCON       0x00u
++#define WDT_WTDAT       0x04u
++#define WDT_WTCNT       0x08u
++#define WDT_WTMINCNT    0x10u
++#define WTCON_RSTEN     (1u << 0)
++#define WTCON_ENABLE    (1u << 5)
++#define WTCON_DIV128    (3u << 3)
++#define WTCON_DBGACK    (1u << 16)
++#define WTCON_CHECK_MASK 0x0001FF3Du    /* prescale 15:8, DBGACK 16, ENABLE 5, DIV 4:3, INTEN 2, RSTEN 0; readback equalled the written value on this phone (0x15739 -> 0x15739, O R20 obs) */
++#define PMU_MASK_BIT    (1u << 2)       /* [O R08] 0x1244 bit 2: reset allowed (inverted mask) */
++#define PMU_CNT_BIT     (1u << 8)       /* [O R08] 0x1220 bit 8: counter enabled */
++#define SYSIP_BOOTLOADER 0xfcu          /* [spec D4] SYSIP_DAT0 value ABL reads as "fastboot" */
++#define WDT_TICKS_PER_S 192000u         /* [O R05] 24.576 MHz / 128 */
++#define WDT_PERIOD_MIN  10u             /* [spec SQ1] accepted range */
++#define WDT_PERIOD_MAX  60u
++#define WDT_STOP_MIN    1u
++#define WDT_STOP_MAX    600u
++#define WDT_PET_MS      1000u           /* [spec SQ5] at most one pet per second */
++#define WDT_REPORT_MS   60000u          /* [spec SQ5] one pet summary per 60 s */
++
++#ifndef SWEET_WDT_HOST
++/* ---- kernel port: ADT, mappings, MMIO, clock (not compiled by the host test; reviewed by hand, Opus HW-WRITE review) ---- */
++static volatile uint32_t *wdt_regs;
++static volatile uint32_t *wdt_pmu_page[4];
++static uint32_t wdt_pmu_page_off[4];
++
++/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++#define wdt_boot_arg_sweetwdt(buf, len) PE_parse_boot_arg_str("sweetwdt", (buf), (len))
++
++static uint64_t
++wdt_now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static void
++wdt_delay_ms(unsigned ms)
++{
++	delay_for_interval(ms, 1000 * 1000);
++}
++
++#define wdt_log(...)    printf(__VA_ARGS__)
++
++static uint32_t
++wdt_rd(uint32_t off)
++{
++	return wdt_regs[off / 4];
++}
++
++static void
++wdt_wr(uint32_t off, uint32_t v)
++{
++	wdt_regs[off / 4] = v;
++}
++
++/* PMU registers are read through a mapping of the page pmu_pa + (off & ~0xfff) they live in: the soc table gives the offsets (R3), the pages follow */
++static int
++wdt_pmu_map(uint64_t pmu_pa, uint32_t off)
++{
++	uint32_t page = off & ~0xfffu;
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		if (wdt_pmu_page[i] != NULL && wdt_pmu_page_off[i] == page) {
++			return 0;
++		}
++		if (wdt_pmu_page[i] == NULL) {
++			wdt_pmu_page[i] = (volatile uint32_t *)ml_io_map((vm_offset_t)(pmu_pa + page), 0x1000);
++			wdt_pmu_page_off[i] = page;
++			return wdt_pmu_page[i] == NULL ? -1 : 0;
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++wdt_pmu_rd(uint32_t off)
++{
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		if (wdt_pmu_page[i] != NULL && wdt_pmu_page_off[i] == (off & ~0xfffu)) {
++			return wdt_pmu_page[i][(off & 0xfffu) / 4];
++		}
++	}
++	return 0;       /* unmapped offset reads as 0 (review pr4-wdt F1): the SET-bit gate checks of SQ3 then refuse; all-ones is also refused there */
++}
++
++static void
++wdt_set_bootloader(void)
++{
++	sweet_set_bootloader_mode();    /* sweet_pmu_write(pmu + SYSIP_DAT0, 0xFC): the existing SMC form, bsd/dev/sweet_restart.c */
++}
++
++/* [spec SQ2] ADT /sweet-wdt (tools/mkadt.py): reg = CL0 block; the three PMU offsets; then map the WDT block and the PMU pages the offsets live in */
++static int
++wdt_map(uint64_t pmu_pa, uint32_t sysip_off, const char **what)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	uint32_t const *off = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-wdt", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		*what = "read fault: sweet-wdt node";
++		return -1;
++	}
++	if (SecureDTGetProperty(node, "pmu-rst-mask-off", (void const **)&off, &size) != kSuccess || size < 4) {
++		*what = "read fault: pmu-rst-mask-off";
++		return -1;
++	}
++	wdt_off_mask = off[0];
++	if (SecureDTGetProperty(node, "pmu-cnt-en-off", (void const **)&off, &size) != kSuccess || size < 4) {
++		*what = "read fault: pmu-cnt-en-off";
++		return -1;
++	}
++	wdt_off_cnt = off[0];
++	if (SecureDTGetProperty(node, "pmu-rst-stat-off", (void const **)&off, &size) != kSuccess || size < 4) {
++		*what = "read fault: pmu-rst-stat-off";
++		return -1;
++	}
++	wdt_off_rst = off[0];
++	wdt_off_sysip = sysip_off;
++	wdt_regs = (volatile uint32_t *)ml_io_map((vm_offset_t)reg[0], (vm_size_t)reg[1]);
++	if (wdt_regs == NULL) {
++		*what = "map failed: wdt";
++		return -1;
++	}
++	if (wdt_pmu_map(pmu_pa, wdt_off_mask) != 0 || wdt_pmu_map(pmu_pa, wdt_off_cnt) != 0 ||
++	    wdt_pmu_map(pmu_pa, wdt_off_rst) != 0 || wdt_pmu_map(pmu_pa, wdt_off_sysip) != 0) {
++		*what = "map failed: pmu";
++		return -1;
++	}
++	return 0;
++}
++#endif /* !SWEET_WDT_HOST */
++
++/* [spec D1, O R06/R09] prescale/count from the period; returns 0 or -1 (out of range). 30 s -> 0x57, 0xFFAF, WTCON 0x00015739 (= Android, O R07). */
++static int
++wdt_period_calc(unsigned period_s, uint32_t *prescale, uint32_t *count, uint32_t *wtcon)
++{
++	uint64_t ticks, div;
++
++	if (period_s < WDT_PERIOD_MIN || period_s > WDT_PERIOD_MAX) {
++		return -1;
++	}
++	ticks = (uint64_t)period_s * WDT_TICKS_PER_S;
++	div = (ticks + 0xFFFFu - 1) / 0xFFFFu;                  /* ceil(ticks / 0xFFFF) divisions */
++	if (div < 1 || div > 0x100u) {
++		return -1;
++	}
++	*prescale = (uint32_t)(div - 1);
++	*count = (uint32_t)((ticks + div - 1) / div);
++	if (*count > 0xFFFFu) {
++		return -1;
++	}
++	*wtcon = (*prescale << 8) | WTCON_DBGACK | WTCON_ENABLE | WTCON_DIV128 | WTCON_RSTEN;       /* INTEN (bit 2) clear */
++	return 0;
++}
++
++static int
++wdt_digits(const char **pp, unsigned max, unsigned *out)
++{
++	const char *p = *pp;
++	unsigned v = 0;
++	int n = 0;
++
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (unsigned)(*p++ - '0');
++		if (++n > 6 || v > max) {
++			return -1;
++		}
++	}
++	if (n == 0) {
++		return -1;
++	}
++	*out = v;
++	*pp = p;
++	return 0;
++}
++
++/* [spec SQ1] "<period_s>[,stop=<after_s>]", digits only, nothing after; 0 ok, -1 bad */
++static int
++wdt_parse_arg(const char *arg, unsigned *period_s, unsigned *stop_s)
++{
++	const char *p = arg;
++	unsigned per = 0, stp = 0;
++
++	if (wdt_digits(&p, WDT_PERIOD_MAX, &per) != 0 || per < WDT_PERIOD_MIN) {
++		return -1;
++	}
++	if (*p == ',') {
++		if (strncmp(p, ",stop=", 6) != 0) {
++			return -1;
++		}
++		p += 6;
++		if (wdt_digits(&p, WDT_STOP_MAX, &stp) != 0 || stp < WDT_STOP_MIN) {
++			return -1;
++		}
++	}
++	if (*p != 0) {
++		return -1;
++	}
++	*period_s = per;
++	*stop_s = stp;
++	return 0;
++}
++
++enum { WDT_OFF = 0, WDT_PARSED = 1, WDT_READY = 2 };
++
++static int wdt_mode;                    /* WDT_OFF until a valid sweetwdt; READY once SQ2 passed (set with release) */
++static unsigned wdt_period, wdt_stop;
++static uint32_t wdt_prescale, wdt_count, wdt_wtcon_arm;
++static uint32_t wdt_threshold_ms;       /* [spec SQ5] period / 3 */
++static uint64_t wdt_parse_ms;
++static int wdt_arm_started;             /* once-flag (cmpxchg); separate from wdt_armed [spec SQ4, r2 R2-9] */
++static int wdt_armed;                   /* published with release when the WDT runs after SQ4 + SQ6 */
++static int wdt_sysip_ok;
++static int wdt_first_poll_done, wdt_stopped, wdt_stop_ignored;
++static uint64_t wdt_arm_ms, wdt_last_poll_ms, wdt_last_pet_ms, wdt_last_report_ms, wdt_stop_at_ms;
++static uint32_t wdt_pets, wdt_max_gap_ms;
++
++#define ALOAD(p)        __atomic_load_n((p), __ATOMIC_ACQUIRE)
++#define ASTORE(p, v)    __atomic_store_n((p), (v), __ATOMIC_RELEASE)
++#define ACAS(p, old, v) ({ __typeof__(*(p)) _o = (old); __atomic_compare_exchange_n((p), &_o, (v), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); })
++
++/* [spec SQ4] stop (clear ENABLE+RSTEN) then read back; returns 1 when the WDT is still enabled afterwards */
++static int
++wdt_stop_hw(void)
++{
++	uint32_t con = wdt_rd(WDT_WTCON);
++
++	wdt_wr(WDT_WTCON, con & ~(WTCON_ENABLE | WTCON_RSTEN));
++	return (wdt_rd(WDT_WTCON) & (WTCON_ENABLE | WTCON_RSTEN)) != 0;
++}
++
++/* [spec SQ1] called first thing from sweet_restart_start, before its early returns */
++void
++sweet_wdt_parse(void)
++{
++	char arg[32];
++	unsigned per = 0, stp = 0;
++
++	arg[0] = 0;
++	if (!wdt_boot_arg_sweetwdt(arg, (int)sizeof(arg)) || arg[0] == 0) {
++		wdt_log("SWEET WDT: soc watchdog not armed (no sweetwdt)\n");        /* default; a state, not a gap */
++		return;
++	}
++	if (wdt_parse_arg(arg, &per, &stp) != 0 || wdt_period_calc(per, &wdt_prescale, &wdt_count, &wdt_wtcon_arm) != 0) {
++		wdt_log("WDT GAP: bad sweetwdt: %s\n", arg);
++		return;
++	}
++	wdt_period = per;
++	wdt_stop = stp;
++	wdt_threshold_ms = per * 1000u / 3u;
++	wdt_parse_ms = wdt_now_ms();
++	wdt_log("SWEET WDT: sweetwdt=%u stop=%u parsed, arm waits for the first USB-log poll\n", per, stp);
++	ASTORE(&wdt_mode, WDT_PARSED);
++}
++
++/* [spec SQ1] sweetwdt given but /sweet-reset or its offsets are missing: say so, never arm */
++void
++sweet_wdt_missing(const char *what)
++{
++	if (ALOAD(&wdt_mode) == WDT_PARSED) {
++		wdt_log("WDT GAP: read fault: %s\n", what);
++		ASTORE(&wdt_mode, WDT_OFF);
++	}
++}
++
++/* [spec SQ2] thread context, once: map, read the inherited state, write NOTHING. No arm without it. */
++void
++sweet_wdt_setup(uint64_t pmu_pa, uint32_t sysip_off)
++{
++	const char *what = NULL;
++	uint32_t con, dat, cnt, cnt10, minc, pm, pc, rs, sy;
++
++	if (ALOAD(&wdt_mode) != WDT_PARSED) {
++		return;
++	}
++	if (wdt_map(pmu_pa, sysip_off, &what) != 0) {
++		wdt_log("WDT GAP: %s\n", what);                  /* "map failed: wdt|pmu" or "read fault: ..." */
++		ASTORE(&wdt_mode, WDT_OFF);
++		return;
++	}
++	con = wdt_rd(WDT_WTCON);
++	dat = wdt_rd(WDT_WTDAT);
++	cnt = wdt_rd(WDT_WTCNT);
++	wdt_delay_ms(10);
++	cnt10 = wdt_rd(WDT_WTCNT);
++	minc = wdt_rd(WDT_WTMINCNT);
++	pm = wdt_pmu_rd(wdt_off_mask);
++	pc = wdt_pmu_rd(wdt_off_cnt);
++	rs = wdt_pmu_rd(wdt_off_rst);
++	sy = wdt_pmu_rd(wdt_off_sysip);
++	wdt_log("SWEET WDT: inherited wtcon=0x%x wtdat=0x%x wtcnt=0x%x wtcnt10=0x%x wtmincnt=0x%x pmu1244=0x%x pmu1220=0x%x rst_stat=0x%x sysip=0x%x\n",
++	    con, dat, cnt, cnt10, minc, pm, pc, rs, sy);
++	if (con == 0xFFFFFFFFu) {
++		wdt_log("WDT GAP: read fault: wtcon all-ones\n");
++		ASTORE(&wdt_mode, WDT_OFF);
++		return;
++	}
++	wdt_log("SWEET WDT: cluster 1 left stopped by the shim (D5)\n");
++	ASTORE(&wdt_mode, WDT_READY);
++}
++
++/* [spec SQ3, SQ4, SQ6] runs once from the first drain-thread poll. Returns with wdt_armed published iff the WDT runs and SYSIP_DAT0 is verified or a stop failed. */
++static void
++wdt_arm_now(uint64_t now)
++{
++	uint32_t pm, pc, rb, sy0, sy1;
++
++	wdt_stop_at_ms = wdt_stop ? now + (uint64_t)wdt_stop * 1000u : 0;       /* set on every path that can publish wdt_armed, so SQ7 never ignores silently */
++	pm = wdt_pmu_rd(wdt_off_mask);
++	pc = wdt_pmu_rd(wdt_off_cnt);
++	if (pm == 0xFFFFFFFFu || pc == 0xFFFFFFFFu) {                       /* review pr4-wdt F1: an all-ones read has every bit set and would pass SQ3 */
++		wdt_log("WDT GAP: read fault: pmu gate all-ones (0x1244=0x%x 0x1220=0x%x), not armed\n", pm, pc);
++		return;
++	}
++	if (!(pm & PMU_MASK_BIT) || !(pc & PMU_CNT_BIT)) {                  /* SQ3: check, never write (D3) */
++		wdt_log("WDT GAP: PMU gate not set (0x1244=0x%x 0x1220=0x%x), not armed\n", pm, pc);
++		return;
++	}
++	(void)wdt_stop_hw();                                                /* SQ4 (a) */
++	wdt_wr(WDT_WTDAT, wdt_count);                                       /* (b) count first ... */
++	wdt_wr(WDT_WTCNT, wdt_count);
++	wdt_wr(WDT_WTCON, wdt_wtcon_arm);                                   /* (c) ... WTCON last [O R09, R14] */
++	rb = wdt_rd(WDT_WTCON);
++	if ((rb & WTCON_CHECK_MASK) != (wdt_wtcon_arm & WTCON_CHECK_MASK)) {       /* review pr4-wdt F2: prescale/DIV/INTEN too, not only ENABLE+RSTEN */
++		if (wdt_stop_hw()) {
++			wdt_log("WDT GAP: stop readback, WDT still armed\n");      /* keep petting: a failed stop must not become a reset */
++			wdt_arm_ms = now;
++			ASTORE(&wdt_armed, 1);
++		} else {
++			wdt_log("WDT GAP: arm readback wtcon=0x%x\n", rb);
++		}
++		return;
++	}
++	wdt_arm_ms = now;
++	sy0 = wdt_pmu_rd(wdt_off_sysip);                                    /* SQ6 (review pr4-wdt F3: no print between the enable and this write): SYSIP_DAT0 = 0xFC, only together with the arm */
++	wdt_set_bootloader();
++	sy1 = wdt_pmu_rd(wdt_off_sysip);
++	wdt_log("SWEET WDT: armed period=%u threshold_ms=%u wtcon=0x%x count=0x%x readback_wtcon=0x%x\n",
++	    wdt_period, wdt_threshold_ms, wdt_wtcon_arm, wdt_count, rb);
++	wdt_log("SWEET WDT: SYSIP_DAT0 0x%x -> 0x%x\n", sy0, sy1);
++	if (sy1 != SYSIP_BOOTLOADER) {
++		wdt_log("WDT GAP: SYSIP_DAT0 write/readback\n");
++		if (wdt_stop_hw()) {
++			wdt_log("WDT GAP: stop readback, WDT still armed\n");
++			ASTORE(&wdt_armed, 1);                                  /* still running: keep petting; sysip_ok stays 0 so SQ7 is ignored */
++		}
++		return;
++	}
++	wdt_sysip_ok = 1;
++	ASTORE(&wdt_armed, 1);
++}
++
++/*
++ * [spec SQ5] called from sweet_restart_poll (may_arm = 0) and from the top of the USB-log drain loop (may_arm = 1, the only arming caller).
++ * Takes no lock of its own, allocates nothing; prints are state changes + one line per 60 s (never one per poll).
++ */
++void
++sweet_wdt_poll(int may_arm)
++{
++	uint64_t now, prev, lastpet;
++	uint32_t gap, mx;
++
++	if (ALOAD(&wdt_mode) != WDT_READY) {
++		return;                                                         /* default-off fast path: one load, no register */
++	}
++	now = wdt_now_ms();
++	prev = __atomic_exchange_n(&wdt_last_poll_ms, now, __ATOMIC_ACQ_REL);
++	if (!ALOAD(&wdt_armed)) {
++		if (!may_arm) {
++			return;
++		}
++		if (ACAS(&wdt_first_poll_done, 0, 1)) {
++			wdt_log("SWEET WDT: first poll at +%u ms after parse\n", (unsigned)(now - wdt_parse_ms));
++		}
++		if (ACAS(&wdt_arm_started, 0, 1)) {
++			wdt_arm_now(now);
++		}
++		return;                                                         /* the first pet follows on the next poll */
++	}
++	if (prev != 0 && now > prev) {                                      /* poll-to-poll gap across all callers [spec SQ5, U4] */
++		gap = (uint32_t)(now - prev);
++		mx = ALOAD(&wdt_max_gap_ms);
++		while (gap > mx && !__atomic_compare_exchange_n(&wdt_max_gap_ms, &mx, gap, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		}
++		if (gap > wdt_threshold_ms) {
++			wdt_log("WDT GAP: pet gap %u ms (threshold %u)\n", gap, wdt_threshold_ms);
++		}
++	}
++	if (wdt_stop_at_ms != 0 && now >= wdt_stop_at_ms) {                 /* [spec SQ7] deliberate stop */
++		if (wdt_sysip_ok) {
++			if (ACAS(&wdt_stopped, 0, 1)) {
++				wdt_log("SWEET WDT: test: petting stopped at +%u s, reset expected within %u s\n",
++				    (unsigned)((now - wdt_arm_ms) / 1000u), wdt_period);
++			}
++		} else if (ACAS(&wdt_stop_ignored, 0, 1)) {
++			wdt_log("WDT GAP: stop test ignored (SYSIP_DAT0 not 0xFC)\n");
++		}
++	}
++	if (ALOAD(&wdt_stopped)) {
++		return;                                                         /* keep polling, never write WTCNT again */
++	}
++	lastpet = ALOAD(&wdt_last_pet_ms);
++	if (lastpet != 0 && now - lastpet < WDT_PET_MS) {
++		return;
++	}
++	if (!ACAS(&wdt_last_pet_ms, lastpet, now ? now : 1)) {              /* one caller wins the pet slot */
++		return;
++	}
++	if (lastpet == 0) {
++		uint32_t before = wdt_rd(WDT_WTCNT);
++
++		wdt_wr(WDT_WTCNT, wdt_count);
++		(void)__atomic_fetch_add(&wdt_pets, 1, __ATOMIC_RELAXED);
++		wdt_last_report_ms = now;
++		wdt_log("SWEET WDT: pet n=1 max_gap_ms=%u wtcnt=0x%x wtcnt_before=0x%x ms_since_arm=%u\n",
++		    ALOAD(&wdt_max_gap_ms), wdt_count, before, (unsigned)(now - wdt_arm_ms));
++		return;
++	}
++	wdt_wr(WDT_WTCNT, wdt_count);
++	(void)__atomic_fetch_add(&wdt_pets, 1, __ATOMIC_RELAXED);
++	if (now - wdt_last_report_ms >= WDT_REPORT_MS) {
++		wdt_last_report_ms = now;
++		wdt_log("SWEET WDT: pet n=%u max_gap_ms=%u wtcnt=0x%x\n", ALOAD(&wdt_pets), ALOAD(&wdt_max_gap_ms), wdt_count);
++	}
++}
++

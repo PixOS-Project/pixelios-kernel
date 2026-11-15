@@ -1,0 +1,100 @@
+SWEET test panic (patch 0195, T-118f, rule 8; PR-2 rerun): boot-arg sweetpanic=<S> (1..600 s, absent or 0 = off, default off; test only) starts a kernel thread at the end of the gs101 USB probe, after the USB log thread, that waits until the USB gadget is configured (at most 120 s, else a SWEET GAP line says the panic may leave no log), sleeps S s, prints "SWEET PANIC TEST: firing now" (the log thread sends it; the thread waits 1 s) and calls panic() so the stock panic path (patch 0182 sweet_halt_restart) is exercised with the log flowing. Why: ufsroot=nosuchpart panics ~60 ms after the USB probe, before the host configures the gadget, so pr-2-panic left no log (docs/research/123-pr2-no-usb-log.md s3, s5 item 1). No hardware write. Rule 8: a set sweetpanic always logs "SWEET GAP: sweetpanic=S set (test only)"; a value above 600 logs SWEET GAP and is ignored; a start without the USB log thread (sweetusblog=0 or no interface) is refused with SWEET GAP and does not panic. Host test tools/test_0195_sweet_panic.py. Not run on hardware.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1318,6 +1318,83 @@
+ }
+ 
+ /*
++ * Test panic (patch 0195, T-118f, PR-2 rerun): boot-arg sweetpanic=<S> (1..SWEET_PANIC_MAX seconds; absent or 0 = off, the default)
++ * makes this kernel thread wait until the USB gadget is configured (the log can flow; at most SWEET_PANIC_CFG_WAIT_S s), sleep S s
++ * more, print "SWEET PANIC TEST: firing now" (the log thread sends it within its 100 ms rounds; this thread waits 1 s for that)
++ * and call panic(). Why: `ufsroot=nosuchpart` panics ~60 ms after the USB probe, 0.45 s before the host has configured the gadget,
++ * so the pr-2-panic run (123-pr2-no-usb-log.md s3) left no log of the panic and no panic-to-reset interval. No hardware write: the
++ * panic goes through the stock panic path (patch 0182 sweet_halt_restart); this only decides WHEN. Rule 8: a value outside the range
++ * or a start that cannot work is logged as SWEET GAP (never silently ignored), and a set sweetpanic always logs SWEET GAP at start.
++ */
++#define SWEET_PANIC_MAX         600
++#define SWEET_PANIC_CFG_WAIT_S  120
++
++/* SWEET_PANIC_DECIDE_BEGIN (the host test compiles this function out of the patch text) */
++static int
++sweet_panic_decide(uint32_t v)
++{
++	if (v == 0) {
++		return 0;               /* off */
++	}
++	if (v > SWEET_PANIC_MAX) {
++		return -1;              /* out of range: logged, ignored */
++	}
++	return 1;                       /* armed */
++}
++/* SWEET_PANIC_DECIDE_END */
++
++static void
++sweet_panic_thread(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg, i;
++
++	for (i = 0; i < SWEET_PANIC_CFG_WAIT_S * 10 && !ud.configured; i++) {
++		ud_sleep_ms(100);
++	}
++	if (!ud.configured) {
++		printf("SWEET GAP: sweetpanic=%u: the USB gadget was not configured after %u s, the panic below may leave no log on the host\n",
++		    secs, (unsigned)SWEET_PANIC_CFG_WAIT_S);
++	} else {
++		printf("SWEET FAULT TEST: USB configured after ~%u ms, test fault in %u s\n", i * 100, secs);
++	}
++	for (i = 0; i < secs; i++) {
++		ud_sleep_ms(1000);
++	}
++	printf("SWEET FAULT TEST: firing now (test fault after %u s, test only)\n", secs);
++	ud_sleep_ms(1000);              /* let the log thread (100 ms rounds) send the line before the other CPUs are halted */
++	panic("SWEET PANIC TEST: sweetpanic=%u elapsed", secs);
++}
++
++static void
++sweet_panic_test_start(bool log_thread_started)
++{
++	uint32_t secs = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetpanic", &secs, sizeof(secs))) {
++		return;
++	}
++	switch (sweet_panic_decide(secs)) {
++	case 0:
++		return;
++	case -1:
++		printf("SWEET GAP: sweetpanic=%u outside 1..%d, ignored (no panic test)\n", secs, SWEET_PANIC_MAX);
++		return;
++	}
++	if (!log_thread_started) {
++		printf("SWEET GAP: sweetpanic=%u refused: the USB log thread did not start (sweetusblog=0 or no network interface), "
++		    "the panic would leave no log; not panicking\n", secs);
++		return;
++	}
++	printf("SWEET GAP: sweetpanic=%u set (test only): this boot will panic on purpose %u s after the USB gadget is configured\n", secs, secs);
++	if (kernel_thread_start(sweet_panic_thread, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GAP: sweetpanic=%u: kernel_thread_start failed, no panic test\n", secs);
++	}
++}
++
++/*
+  * Pixel 6a (gs101). tools/mkadt.py adds /sweet-usb (compatible
+  * google,gs101-dwusb3) on bluejay only: reg = the DWC3 core (0x11110000),
+  * dma-pool-range = the "abl" reserved DRAM range. ABL leaves the DWC_usb31
+@@ -1694,8 +1771,11 @@
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
++	bool log_started = false;
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		log_started = true;
+ 	}
++	sweet_panic_test_start(log_started);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

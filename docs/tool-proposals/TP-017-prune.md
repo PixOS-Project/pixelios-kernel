@@ -24,4 +24,4 @@ Lists (a) `proposed` entries older than `--stale-days` (candidates for `rejected
 none (read-only, no device access). Deletions stay a user decision.
 
 ## amendments
-(none)
+2026-10-28 (TP-043): the unused-tool half of `prune` (and `--unused-days`) moved to `tools/tool-census`; prune keeps the stale-proposal half.

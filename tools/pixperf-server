@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""pixperf-server: host side of the Wi-Fi throughput test (sprint-wifi Part A); the client is tools/pixperf.c on the phone.
+
+  tools/pixperf-server [--bind ADDR] [--port 5299] [--log FILE] [--no-ping] [--once]
+  tools/pixperf-server --self-test
+
+The host-side numbers are the ones that count: this server measures every rate itself (not the phone's tool).
+--bind defaults to PIXOS_PERF_HOST from the environment (the driver sources the gitignored .env); the address is never in git.
+
+Protocol (one TCP control connection per test, port P; UDP data on port P too):
+  client -> "PIXPERF1 <test> <seconds> <udp_kbit_s> <udp_len>\\n"   test = down | up | udpup | udpdown
+  down    : the server writes for <seconds>; rate = bytes ACKED by the phone (written minus the unsent+unacked queue, SIOCOUTQ)
+  up      : the client writes for <seconds>; rate = bytes the server read
+  udpup   : the client sends datagrams [magic u32, seq u32, t_us u64, pad] at <udp_kbit_s>; the server counts got/lost/reordered/dup
+            by seq; the client then sends "SENT <n>\\n" on the control connection
+  udpdown : the client first sends one "HELO" datagram from its UDP socket (the server learns its address); the server sends at
+            <udp_kbit_s>; the client answers "GOT <n> <lost> <reord> <dup> <maxseq>\\n"
+  For every test the server prints one line per second (`pixperf-server: <test> t=<s> mbit=<x>`) and one summary line
+  `PIXPERF RESULT test=<t> secs=<s> bytes=<n> mbit_avg=<x> mbit_min1s=<x> [udp fields] rtt_p50_ms=<x> rtt_n=<n>`.
+  RTT: while a test runs, the server pings the phone (`ping -i 0.2`, the system ping) and reports p50/p90 of the replies.
+Last line of --self-test: RESULT: PASS|FAIL pixperf-server self-test.
+"""
+import argparse, fcntl, os, socket, struct, subprocess, sys, threading, time
+
+MAGIC = 0x50585046   # "PXPF"
+HDR = struct.Struct("!IIQ")
+SIOCOUTQ = 0x5411    # Linux TIOCOUTQ == SIOCOUTQ: bytes in the send queue not yet acked
+
+
+def log(f, s):
+    line = "pixperf-server: " + s
+    print(line, flush=True)
+    if f:
+        f.write(line + "\n"); f.flush()
+
+
+class Pinger:
+    def __init__(self, ip):
+        self.ip, self.rtts, self.p = ip, [], None
+
+    def start(self):
+        try:
+            self.p = subprocess.Popen(["ping", "-n", "-i", "0.2", self.ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as e:
+            print("pixperf-server GAP: ping %s not started (%s): no RTT under load in this run" % (self.ip, e), file=sys.stderr)
+            self.p = None; return
+        threading.Thread(target=self._rd, daemon=True).start()
+
+    def _rd(self):
+        for l in self.p.stdout:
+            i = l.find("time=")
+            if i >= 0:
+                try: self.rtts.append(float(l[i + 5:].split()[0]))
+                except ValueError: pass   # lint-silent: expected a time= field that is not a number (ping's "time<1ms" form): that one line has no RTT
+
+    def stop(self):
+        if self.p:
+            self.p.terminate()
+            try: self.p.wait(2)
+            except subprocess.TimeoutExpired: self.p.kill()
+        r = sorted(self.rtts)
+        if not r: return "rtt_p50_ms=none rtt_n=0"
+        return "rtt_p50_ms=%.1f rtt_p90_ms=%.1f rtt_max_ms=%.1f rtt_n=%d" % (r[len(r) // 2], r[min(len(r) - 1, len(r) * 9 // 10)], r[-1], len(r))
+
+
+class Meter:
+    def __init__(self, f, test):
+        self.f, self.test, self.t0, self.last, self.lastb, self.n, self.per = f, test, time.monotonic(), time.monotonic(), 0, 0, []
+
+    def tick(self, total):
+        now = time.monotonic()
+        if now - self.last >= 1.0:
+            mb = (total - self.lastb) * 8 / (now - self.last) / 1e6
+            self.per.append(mb); log(self.f, "%s t=%d mbit=%.1f" % (self.test, len(self.per), mb))
+            self.last, self.lastb = now, total
+
+    def summary(self, total):
+        dt = time.monotonic() - self.t0
+        return "secs=%.1f bytes=%d mbit_avg=%.1f mbit_min1s=%.1f" % (dt, total, total * 8 / dt / 1e6 if dt > 0 else 0, min(self.per) if self.per else 0)
+
+
+def serve_one(c, addr, udp, f, ping):
+    c.settimeout(10)
+    line = b""
+    while not line.endswith(b"\n") and len(line) < 200:
+        b = c.recv(1)
+        if not b: return
+        line += b
+    w = line.decode(errors="replace").split()
+    if len(w) != 5 or w[0] != "PIXPERF1":
+        log(f, "GAP bad request from %s: %r" % (addr[0], line[:80])); return
+    test, secs, kbit, ulen = w[1], float(w[2]), int(w[3]), int(w[4])
+    log(f, "test %s from %s secs=%g udp_kbit=%d len=%d" % (test, addr[0], secs, kbit, ulen))
+    pg = Pinger(addr[0]) if ping else None
+    if pg: pg.start()
+    extra = ""
+    try:
+        if test == "down":
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
+            buf, sent, m, end = os.urandom(65536), 0, Meter(f, test), time.monotonic() + secs
+            c.settimeout(5)
+            while time.monotonic() < end:
+                sent += c.send(buf)
+                outq = struct.unpack("i", fcntl.ioctl(c.fileno(), SIOCOUTQ, b"\0" * 4))[0]
+                m.tick(sent - outq)
+            outq = struct.unpack("i", fcntl.ioctl(c.fileno(), SIOCOUTQ, b"\0" * 4))[0]
+            acked = sent - outq
+            extra = m.summary(acked) + " written=%d unacked_at_end=%d" % (sent, outq)
+            c.shutdown(socket.SHUT_WR)
+        elif test == "up":
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+            got, m = 0, Meter(f, test)
+            c.settimeout(secs + 15)
+            while True:
+                b = c.recv(262144)
+                if not b: break
+                got += len(b); m.tick(got)
+            extra = m.summary(got)
+        elif test == "udpup":
+            seen, got, reord, dup, maxseq, nbytes, m = set(), 0, 0, 0, -1, 0, Meter(f, test)
+            # until the client's "SENT n" line arrives on the control connection (a slow sender takes longer than <seconds>), at most secs + 300 s
+            import select
+            udp.settimeout(0); c.setblocking(False); end = time.monotonic() + secs + 300; ctl = b""
+            while time.monotonic() < end and b"\n" not in ctl:
+                r, _, _ = select.select([udp, c], [], [], 0.5)
+                if c in r:
+                    try:
+                        more = c.recv(100)
+                        if not more: break
+                        ctl += more
+                    except BlockingIOError: pass   # lint-silent: expected select() woke on the control socket with no byte ready (non-blocking recv)
+                if udp not in r: continue
+                try: d, a = udp.recvfrom(65536)
+                except BlockingIOError: continue   # lint-silent: expected select() woke with no datagram ready (non-blocking recv)
+                if len(d) < HDR.size: continue
+                mg, seq, _ = HDR.unpack_from(d)
+                if mg != MAGIC or a[0] != addr[0]: continue
+                if seq in seen: dup += 1; continue
+                seen.add(seq); got += 1; nbytes += len(d); m.tick(nbytes)
+                if seq < maxseq: reord += 1
+                maxseq = max(maxseq, seq)
+            while True:                                  # datagrams still in flight behind the SENT line
+                r, _, _ = select.select([udp], [], [], 1.0)
+                if not r: break
+                try: d, a = udp.recvfrom(65536)
+                except BlockingIOError: break   # lint-silent: expected the drain found no datagram left (non-blocking recv)
+                if len(d) >= HDR.size and HDR.unpack_from(d)[0] == MAGIC and a[0] == addr[0]:
+                    seq = HDR.unpack_from(d)[1]
+                    if seq in seen: dup += 1
+                    else:
+                        seen.add(seq); got += 1; nbytes += len(d)
+                        if seq < maxseq: reord += 1
+                        maxseq = max(maxseq, seq)
+            c.setblocking(True)
+            r = ctl.decode(errors="replace").split()
+            sent = int(r[1]) if len(r) >= 2 and r[0] == "SENT" else -1
+            extra = m.summary(nbytes) + " sent=%d got=%d lost=%d reord=%d dup=%d" % (sent, got, (sent - got) if sent >= 0 else -1, reord, dup)
+        elif test == "udpdown":
+            udp.settimeout(5)
+            while True:
+                d, a = udp.recvfrom(65536)
+                if d[:4] == b"HELO" and a[0] == addr[0]: break
+            ulen = max(HDR.size, min(ulen, 1472)); pad = b"\0" * (ulen - HDR.size)
+            per_s = kbit * 1000 / 8 / ulen; t0 = time.monotonic(); n = 0
+            while True:
+                el = time.monotonic() - t0
+                if el >= secs: break
+                while n < el * per_s:
+                    udp.sendto(HDR.pack(MAGIC, n, int(time.monotonic() * 1e6)) + pad, a); n += 1
+                time.sleep(0.0005)
+            c.settimeout(10); r = c.recv(200).decode(errors="replace").split()
+            extra = "secs=%.1f sent=%d mbit_offered=%.1f client=%s" % (time.monotonic() - t0, n, n * ulen * 8 / secs / 1e6, "_".join(r))
+        else:
+            log(f, "GAP unknown test %s" % test); return
+    except (OSError, ValueError, IndexError) as e:
+        extra = (extra + " " if extra else "") + "ERROR %s: %s" % (type(e).__name__, e)
+    rt = pg.stop() if pg else "rtt=off"
+    log(f, "")
+    line = "PIXPERF RESULT test=%s peer=phone %s %s" % (test, extra, rt)
+    print(line, flush=True)
+    if f: f.write(line + "\n"); f.flush()
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bind", default=os.environ.get("PIXOS_PERF_HOST", ""))
+    ap.add_argument("--port", type=int, default=5299)
+    ap.add_argument("--log"); ap.add_argument("--no-ping", action="store_true"); ap.add_argument("--once", action="store_true")
+    a = ap.parse_args(argv)
+    if not a.bind:
+        print("RESULT: ERROR pixperf-server: no --bind and no PIXOS_PERF_HOST (source the gitignored .env)"); return 2
+    f = open(a.log, "a") if a.log else None
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); ls.bind((a.bind, a.port)); ls.listen(4)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20); udp.bind((a.bind, a.port))
+    log(f, "listening tcp+udp port %d (address from PIXOS_PERF_HOST, not printed)" % a.port)
+    while True:
+        c, addr = ls.accept()
+        try: serve_one(c, addr, udp, f, not a.no_ping)
+        finally: c.close()
+        if a.once: return 0
+
+
+def self_test():
+    """loopback: run the server in a thread and the C client is not needed: a python client speaks the protocol."""
+    import io, contextlib
+    port = 52990 + os.getpid() % 7
+    t = threading.Thread(target=lambda: main(["--bind", "127.0.0.1", "--port", str(port), "--no-ping"]), daemon=True); t.start(); time.sleep(0.3)
+    out = []
+    def run(test, body):
+        c = socket.create_connection(("127.0.0.1", port)); c.sendall(("PIXPERF1 %s 2 8000 1200\n" % test).encode()); body(c); c.close(); time.sleep(0.3)
+    def down(c):
+        n = 0
+        while True:
+            b = c.recv(65536)
+            if not b: break
+            n += len(b)
+        out.append(("down", n))
+    def up(c):
+        end = time.monotonic() + 2; b = b"x" * 65536
+        while time.monotonic() < end: c.sendall(b)
+        c.shutdown(socket.SHUT_WR); time.sleep(0.2)
+    def udpup(c):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for i in range(500): u.sendto(HDR.pack(MAGIC, i, 0) + b"\0" * 100, ("127.0.0.1", port)); time.sleep(0.002) if i % 50 == 0 else None
+        time.sleep(3.2); c.sendall(b"SENT 500\n"); time.sleep(0.2)
+    run("down", down); run("up", up); run("udpup", udpup)
+    ok = out and out[0][1] > 1e6
+    print("RESULT: %s pixperf-server self-test (down bytes=%d)" % ("PASS" if ok else "FAIL", out[0][1] if out else 0))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]: sys.exit(self_test())
+    sys.exit(main(sys.argv[1:]))

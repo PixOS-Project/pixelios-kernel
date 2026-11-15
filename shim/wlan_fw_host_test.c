@@ -1,4 +1,4 @@
-/* Host test of the firmware container parser (xnu patch 0128, bsd/dev/sweet_wlan_fw.h): synthetic blobs only, never the real firmware. */
+/* Host test of the firmware container parser (xnu patches 0128 + 0185, bsd/dev/sweet_wlan_fw.h): synthetic blobs only, never the real firmware. */
 #include <stdio.h>
 #include <string.h>
 #include "sweet_wlan_fw.h"
@@ -29,6 +29,20 @@ static size_t build(uint8_t *c)
 	return (off + 7) & ~(size_t)7;
 }
 
+/* swf_gaps() (patch 0185, X-W7 F1-F4): the exact lines the glue logs as WIFI GAP: fw ... for a parsed container with `n` entries of build() */
+static void check_gaps(struct swf_entry *e, unsigned n, int want_clm)
+{
+	struct swf_gap g[SWF_GAP_MAX];
+	unsigned k = swf_gaps(e, n, g);
+
+	CHECK(k == 4);
+	if (k != 4) return;
+	CHECK(strcmp(g[0].what, want_clm ? "CLM packed but not loaded (no clmload yet)" : "no CLM entry in the container") == 0 && strcmp(g[0].sev, "high") == 0);
+	CHECK(strcmp(g[1].what, "no txcap_blob (stock has none, not loaded)") == 0 && strcmp(g[1].sev, "low") == 0);
+	CHECK(strcmp(g[2].what, "cal/clm = unsuffixed default, no region pick") == 0 && strcmp(g[2].sev, "medium") == 0);
+	CHECK(strstr(g[3].what, "/vendor/etc/wifi") && strstr(g[3].what, "/vendor/firmware") && strcmp(g[3].sev, "low") == 0);
+}
+
 int main(void)
 {
 	uint8_t c[512], d[512];
@@ -57,6 +71,29 @@ int main(void)
 			memcpy(d, c, sizeof d); d[swf_le32(c + SWF_HDR + SWF_ENTRY * i + 8) + (b ? e[i].length - 1 : 0)] ^= 1u << b;
 			CHECK(swf_parse(d, len, e, &n) == 6);
 		}
+	/* gap lines: full container, a container without CLM (1- and 2-entry containers pass swf_parse, F6), and the CLM tag only as the 3rd/1st entry */
+	CHECK(swf_parse(c, len, e, &n) == 0 && n == 3);
+	check_gaps(e, n, 1);
+	check_gaps(e, 2, 0);		/* FW, NVRM only */
+	check_gaps(e, 1, 0);		/* FW only */
+	check_gaps(e, 0, 0);		/* never parsed this way, but the gap list must not depend on n > 0 */
+	{
+		struct swf_entry r[3] = { e[2], e[0], e[1] };	/* CLM first: order does not matter */
+
+		check_gaps(r, 3, 1);
+	}
+	{
+		struct swf_entry r[2] = { e[0], e[1] };
+
+		r[1].tag[3] = 'X';		/* "NVRX": only an exact "CLM " counts */
+		check_gaps(r, 2, 0);
+		memcpy(r[1].tag, "CLM!", 4);	/* near miss */
+		check_gaps(r, 2, 0);
+		memcpy(r[1].tag, "CLM ", 4);
+		check_gaps(r, 2, 1);
+		memcpy(r[1].tag, "cLM ", 4);
+		check_gaps(r, 2, 0);
+	}
 	if (fails) { printf("RESULT: FAIL wlan_fw_host_test (%u checks)\n", fails); return 1; }
 	printf("RESULT: PASS wlan_fw_host_test\n");
 	return 0;

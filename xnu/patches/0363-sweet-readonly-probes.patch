@@ -1,0 +1,210 @@
+sweet-readonly-probes (lowclk 2026-11-15, goal LOWCLK-GAPS B1-B3, research docs/research/161-readonly-probes-slc-psci-wifi.md): ONE probe boot that answers three unknowns with QUERY-ONLY calls. Nothing here writes hardware; every firmware command of the batch is a read.
+B1 SLC service over ACPM channel 10 (shim/sweetprobe.c + shim/acpm.c acpm_slc_describe / acpm_slc_version, build.sh --sweet-probe): the descriptors of channel 10 (slc-acpm) and 11 (its async notification channel) are READ, and ONE fixed PT_VERSION (0xd005) request goes out on channel 10 only when its descriptor validated and both queues are empty [read SG kernel/google-modules/soc/gs @ 20407875 drivers/soc/google/pt/slc_acpm.c:29-36, :126-195; research 161 s.1]. PT_CHECK (0xd003) is DROPPED: it pops a resize event and reports no enabled state [read slc_acpm.c:226-254]. PT_VERSION answers service liveness and version only: it CANNOT tell which SLC partitions are enabled (no command in the pinned source reads that, research 161 s.0, U1 stays open); a GAP line says so on every probe boot.
+B2 PSCI (shim): PSCI_VERSION and PSCI_FEATURES of CPU_SUSPEND 64-bit (0xC4000001), CPU_OFF (0x84000002) and CPU_SUSPEND 32-bit (0x84000001), through a fixed id table and ONE smc in shim/sweetprobe_smc.c; CPU_SUSPEND / CPU_OFF / CPU_ON themselves are never called [read Linux v6.6 psci.h:33-50, :125-135; research 161 s.2].
+B3 Wi-Fi (this patch carries the glue, the engine code is in the regenerated headers of 0201/0206): WLC_GET_PM (85), GET_VAR country, GET_VAR chanspecs, read once (P2 at the first swl25_live after L26 = "joined"; P1 "l25start", before the 4-way, is compiled but NOT armed: review 0363 finding 3, a stalled GET there would end the join; a probe GET without an answer at P2 also stops L25 and the G2 undo runs, so Wi-Fi is off for that boot, logged as `L25 STOP`: review 0363 Opus finding 1), one ioctl at a time, no retry; three new rows in the L25 store whitelist (sweet_wlan_l25_wl.h, 20 -> 23 rows; SET_PM 86, SET country and WLC_SET_COUNTRY 84 have none; the per-band chanspecs input form is refused). The Set 383 key log (sweet_wlan_sta.h swsta_p383, glue in 0201): the KEY NAME and L of every Apple80211 Set 383 call, de-duplicated (32 keys), never a value; the request is still answered "not handled".
+This patch: bsd/dev/sweet_probe.c (boot-arg sweetprobe: absent / 0 = everything off, 1 = on, any other value a GAP and off; prints the shim tokens sweetprobe_pv/pf1/pf2/pf3/c10a/c10b/c11a/c11b/slcrc/slcv/slce/slcs as `SWEET PROBE:` lines with a GAP per failure, refusal, unsupported reply and missing token), the call from SweetCPU.cpp next to the --mif-clk print (patch 0214), and the glue in sweet_wlan.c that arms the Wi-Fi round (P2 only) (swl25_probe_set). Rule 8: the new hardware-facing code is the shim PT_VERSION request (acpm.c xfer_eb with 32-byte element support) and the three whitelist rows; the Opus review of them: docs/reviews/0363-probes-review-opus.md (super repo), SAFE WITH CONDITIONS, findings 1-3 fixed in 2d1e8325.
+Host tests: shim/sweetprobe_host_test.c (fake 16/32 B SLC APM + fake PSCI), shim/wlan_l25_wl_host_test.c, wlan_l25_host_pr.h, wlan_sta_host_test.c; tools/sweetprobe_audit.py (source + object audit, 30 mutants), tools/test_sweetprobe_wifi_mutants.py. Not run on hardware. Boot plan: standard root, kernel with this patch, image built with tools/build-xnu-image.sh --sweet-probe (adds sweetprobe=1), grep `SWEET PROBE:`.
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -126,6 +126,7 @@
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_exitlog.c		standard
++bsd/dev/sweet_probe.c		standard
+ bsd/dev/sweet_wlan_en0.c			standard
+ bsd/dev/sweet_wlan_a80211.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -177,6 +177,7 @@
+ 	return mode;
+ }
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* not declared by vm/pmap.h in this tree: same extern as patch 0028:81, 0067:12 */
++extern int sweet_probe_on(void);   /* patch 0363: bsd/dev/sweet_probe.c, boot-arg sweetprobe (0 / absent = off) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ 
+@@ -3397,6 +3398,7 @@
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
++	swl25_probe_set(sweet_probe_on() ? 1u : 0u);    /* patch 0363 (lowclk B3): boot-arg sweetprobe=1 arms the read-only GET round (P2 only) (WLC_GET_PM, country, chanspecs) of swl25_probe_wifi; 0 / absent = no call, no line */
+ 	if (level >= 24) {      /* T-48a0 / review r1 F3: the credentials are taken FIRST, so swc_load wipes the RAM region on every path below (a refusal, a stage-1 failure, a rev downgrade); they reach the L24 list through hw.jc */
+ 		sweet_wlan_creds(&hw, level);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -19,6 +19,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
++extern "C" void sweet_probe_tokens(void);   /* patch 0363: bsd/dev/sweet_probe.c */
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ 
+ class SweetCPU;
+@@ -300,6 +301,7 @@
+ 			IOLog("SWEET DVFS: no sweetmif* boot-arg (shim not built with --mif-clk, or no room on the command line: see the shim GAP line): MIF/INT not read\n");
+ 		}
+ 	}
++	sweet_probe_tokens();   /* patch 0363 (lowclk B1/B2): the PSCI + SLC probe results the shim appended (sweetprobe_*), only with boot-arg sweetprobe=1 */
+ 	{
+ 		unsigned int busy_s = 0;
+ 		if (PE_parse_boot_argn("sweetbusy", &busy_s, sizeof(busy_s)) && busy_s != 0) {
+diff --git a/bsd/dev/sweet_probe.c b/bsd/dev/sweet_probe.c
+new file mode 100644
+index 00000000..1a595fa4
+--- /dev/null
++++ b/bsd/dev/sweet_probe.c
+@@ -0,0 +1,149 @@
++/*
++ * Patch 0363 (lowclk B1-B3, docs/research/161): the read-only probe batch of the LOWCLK goal. NO HARDWARE ACCESS here: this file only parses boot-args and prints
++ * `SWEET PROBE:` lines. The queries themselves are made elsewhere and are all query-only:
++ *   - the shim (build.sh --sweet-probe, shim/sweetprobe.c): PSCI_VERSION + PSCI_FEATURES x3 and the SLC service on ACPM channel 10/11 (two descriptor reads and ONE fixed
++ *     PT_VERSION 0xd005 request; PT_CHECK / ENABLE / MUTATE / DISABLE are not expressible); the results arrive as the sweetprobe_* tokens below because the shim console
++ *     never reaches the host in a handover boot (same route as --mif-clk, patch 0214, and --pmic-src, patch 0318);
++ *   - the Wi-Fi driver (sweet_wlan_l25_hs.h swl25_probe_wifi): WLC_GET_PM, GET_VAR country, GET_VAR chanspecs at two points of the boot; printed there;
++ *   - the Apple80211 handler (sweet_wlan_sta.h swsta_p383): the Set 383 property KEY NAMES iOS sends (never a value); printed there.
++ * Boot-arg sweetprobe: absent or 0 = everything off (no query, no line); 1 = on; any other value = one GAP line and off. The shim tokens are decimal, 0 = not read:
++ *   sweetprobe_pv sweetprobe_pf1 sweetprobe_pf2 sweetprobe_pf3   PSCI_VERSION, PSCI_FEATURES(CPU_SUSPEND 0xC4000001), (CPU_OFF 0x84000002), (CPU_SUSPEND32 0x84000001): raw 32-bit
++ *                                                                results, a negative PSCI code is shown unsigned (4294967295 = -1 = NOT_SUPPORTED) [src Linux v6.6 psci.h:125-135]
++ *   sweetprobe_c10a/b sweetprobe_c11a/b   ACPM channel 10 / 11 descriptor: a = qlen | esz raw << 9 | type << 16 | poll << 20 | why << 24 | present << 31, b = rr | rf << 8 | sr << 16 | sf << 24
++ *   sweetprobe_slcrc   0 PT_VERSION sent and answered, 1 refused or failed after the descriptor validated, 2 channel 10 descriptor refused (nothing sent), 4 queues not empty (nothing sent)
++ *   sweetprobe_slcv    PT_VERSION reply word 1 = (major << 16) | minor [src SG kernel/google-modules/soc/gs @ 20407875 drivers/soc/google/pt/slc_acpm.c:183-195]
++ *   sweetprobe_slce / sweetprobe_slcs   after a failed request: err | published << 8 | why << 16, and the four queue pointers rr | rf << 8 | sr << 16 | sf << 24
++ * Without the shim flag no sweetprobe_* token exists: one GAP line says so (a command line without room for the tokens looks the same; the shim then printed a GAP on its own console).
++ */
++#include <sys/types.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++int sweet_probe_on(void);
++void sweet_probe_tokens(void);
++
++static int sweet_probe_state = -1;     /* -1 not parsed yet */
++
++/* sweetprobe=1: probes on. Parsed once; any value but 0 / 1 is a GAP and off. Called from the CPU bring-up, the Wi-Fi init and the Apple80211 attach. */
++int
++sweet_probe_on(void)
++{
++	uint32_t v = 0;
++
++	if (sweet_probe_state >= 0) {
++		return sweet_probe_state;
++	}
++	sweet_probe_state = 0;
++	if (PE_parse_boot_argn("sweetprobe", &v, sizeof(v))) {
++		if (v == 1) {
++			sweet_probe_state = 1;
++		} else if (v != 0) {
++			printf("SWEET PROBE: GAP sweetprobe=%u is not 0 or 1: probes off\n", v);
++		}
++	}
++	return sweet_probe_state;
++}
++
++static const char *const sp_tok[12] = { "sweetprobe_pv", "sweetprobe_pf1", "sweetprobe_pf2", "sweetprobe_pf3", "sweetprobe_c10a", "sweetprobe_c10b",
++	                                "sweetprobe_c11a", "sweetprobe_c11b", "sweetprobe_slcrc", "sweetprobe_slcv", "sweetprobe_slce", "sweetprobe_slcs" };
++enum { SP_PV, SP_PF1, SP_PF2, SP_PF3, SP_C10A, SP_C10B, SP_C11A, SP_C11B, SP_SLCRC, SP_SLCV, SP_SLCE, SP_SLCS };
++
++static void
++sweet_probe_psci(const uint32_t *t)
++{
++	const int32_t f1 = (int32_t)t[SP_PF1], f2 = (int32_t)t[SP_PF2];
++
++	printf("SWEET PROBE: psci ver=0x%08x (%u.%u) feat_cpu_suspend64=0x%08x feat_cpu_off=0x%08x feat_cpu_suspend32=0x%08x\n", t[SP_PV], t[SP_PV] >> 16, t[SP_PV] & 0xffffu,
++	    t[SP_PF1], t[SP_PF2], t[SP_PF3]);
++	printf("SWEET PROBE: psci decode suspend_format=%s osi=%u cpu_off=%s\n", f1 < 0 ? "unsupported" : ((t[SP_PF1] & 2u) ? "ext" : "orig"), f1 < 0 ? 0u : (t[SP_PF1] & 1u),
++	    f2 < 0 ? "unsupported" : "supported");
++	if ((int32_t)t[SP_PV] < 0) {
++		printf("SWEET PROBE: GAP psci PSCI_VERSION returned %d: no PSCI version, FEATURES results not trustworthy\n", (int32_t)t[SP_PV]);
++	}
++	if (f1 < 0) {
++		printf("SWEET PROBE: GAP psci feat 0xC4000001 returned %d (NOT_SUPPORTED): the 64-bit CPU_SUSPEND id is not offered by this EL3, the OS-side idle state (cpuidle) cannot use it\n", f1);
++	}
++	if (f2 < 0) {
++		printf("SWEET PROBE: GAP psci feat 0x84000002 returned %d (NOT_SUPPORTED): CPU_OFF is not offered, a CPU cannot be powered off through PSCI\n", f2);
++	}
++	if ((int32_t)t[SP_PF3] < 0) {
++		printf("SWEET PROBE: psci feat 0x84000001 (CPU_SUSPEND 32-bit) returned %d: the 32-bit id is not offered\n", (int32_t)t[SP_PF3]);
++	}
++}
++
++static void
++sweet_probe_chan(const char *nm, uint32_t a, uint32_t b)
++{
++	const uint32_t why = (a >> 24) & 0x7f;
++
++	if (a >> 31 && why == 0) {
++		printf("SWEET PROBE: slc %s desc=ok qlen=%u esz=%u type=%u poll=%u rr=%u rf=%u sr=%u sf=%u\n", nm, a & 0x1ff, (a >> 9) & 0x7f, (a >> 16) & 0xf, (a >> 20) & 1,
++		    b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, b >> 24);
++	} else {
++		printf("SWEET PROBE: slc %s desc=refused why=%u (ACPM_W_*, shim/acpm.h) present=%u qlen=%u esz=%u type=%u poll=%u rr=%u rf=%u sr=%u sf=%u\n", nm, why, a >> 31,
++		    a & 0x1ff, (a >> 9) & 0x7f, (a >> 16) & 0xf, (a >> 20) & 1, b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, b >> 24);
++		printf("SWEET PROBE: GAP slc %s descriptor refused why=%u: no request was sent on it\n", nm, why);
++	}
++}
++
++static void
++sweet_probe_slc(const uint32_t *t, const int *have)
++{
++	const uint32_t rc = t[SP_SLCRC], v = t[SP_SLCV];
++
++	sweet_probe_chan("ch10", t[SP_C10A], t[SP_C10B]);
++	sweet_probe_chan("ch11", t[SP_C11A], t[SP_C11B]);
++	if (!have[SP_SLCRC]) {
++		printf("SWEET PROBE: GAP slc no sweetprobe_slcrc token: PT_VERSION result unknown\n");
++	} else if (rc == 0) {
++		printf("SWEET PROBE: slc version=0x%08x major=%u minor=%u async_ok=%u (PT_VERSION; PT_CHECK not sent)\n", v, v >> 16, v & 0xffffu, v >= 0x10008u ? 1u : 0u);
++		if ((v >> 16) != 1u) {
++			printf("SWEET PROBE: GAP slc version major %u is not 1: protocol unknown, no SLC command will ever be sent on this firmware\n", v >> 16);
++		}
++	} else if (rc == 1) {
++		const uint32_t e = t[SP_SLCE], s = t[SP_SLCS];
++
++		printf("SWEET PROBE: GAP slc PT_VERSION no usable reply (err=%u published=%u why=%u state=%u/%u/%u/%u rr/rf/sr/sf): channel left as is\n", e & 0xff, (e >> 8) & 0xff,
++		    (e >> 16) & 0xff, s & 0xff, (s >> 8) & 0xff, (s >> 16) & 0xff, s >> 24);
++	} else if (rc == 2) {
++		printf("SWEET PROBE: GAP slc ch10 descriptor refused why=%u: PT_VERSION not sent\n", (t[SP_C10A] >> 24) & 0x7f);
++	} else if (rc == 4) {
++		printf("SWEET PROBE: GAP slc ch10 queue not empty (rr=%u rf=%u sr=%u sf=%u): nothing written\n", t[SP_C10B] & 0xff, (t[SP_C10B] >> 8) & 0xff, (t[SP_C10B] >> 16) & 0xff,
++		    t[SP_C10B] >> 24);
++	} else {
++		printf("SWEET PROBE: GAP slc PT_VERSION rc=%u is not a known result code (0, 1, 2, 4)\n", rc);
++	}
++	printf("SWEET PROBE: GAP slc enabled state of the partitions is NOT readable with PT_VERSION (PT_CHECK is a resize-event pop and was not sent)\n");
++}
++
++/* Called once from the CPU bring-up (iokit/Kernel/arm/SweetCPU.cpp), next to the --mif-clk print. */
++void
++sweet_probe_tokens(void)
++{
++	uint32_t t[12];
++	int have[12];
++	int any = 0;
++	unsigned int k;
++
++	for (k = 0; k < 12; k++) {
++		t[k] = 0;
++		have[k] = PE_parse_boot_argn(sp_tok[k], &t[k], sizeof(t[k])) ? 1 : 0;
++		any = any || have[k];
++	}
++	if (!sweet_probe_on()) {
++		if (any) {
++			printf("SWEET PROBE: tokens present but sweetprobe=0, not printed\n");
++		}
++		return;
++	}
++	if (!any) {
++		printf("SWEET PROBE: GAP no sweetprobe_* token: the image was built without --sweet-probe, or the command line had no room for the tokens (see the shim GAP line)\n");
++		return;
++	}
++	if (!(have[SP_PV] && have[SP_PF1] && have[SP_PF2] && have[SP_PF3])) {
++		printf("SWEET PROBE: GAP psci tokens missing (pv %u pf1 %u pf2 %u pf3 %u): result unknown\n", have[SP_PV], have[SP_PF1], have[SP_PF2], have[SP_PF3]);
++	} else {
++		sweet_probe_psci(t);
++	}
++	sweet_probe_slc(t, have);
++}

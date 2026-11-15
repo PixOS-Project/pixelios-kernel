@@ -46,6 +46,7 @@ static inline __attribute__((always_inline)) void vfmt(char *o, unsigned cap, co
 {
 	unsigned p = 0;
 
+	/* bounded: f is the format literal, ends at its NUL (a trailing '%' breaks out below) */
 	for (; *f; f++) {
 		char t[24];
 		const char *s = t;
@@ -56,6 +57,7 @@ static inline __attribute__((always_inline)) void vfmt(char *o, unsigned cap, co
 			p = put_c(o, cap, p, *f);
 			continue;
 		}
+		/* bounded: stops at the first non-flag character, at the latest the NUL */
 		for (f++; *f == '#' || *f == '-' || *f == '0'; f++) {
 			alt |= *f == '#';
 			left |= *f == '-';
@@ -64,12 +66,14 @@ static inline __attribute__((always_inline)) void vfmt(char *o, unsigned cap, co
 		while (*f >= '0' && *f <= '9')
 			w = w * 10 + (unsigned)(*f++ - '0');
 		unsigned ll = 0;
+		/* bounded: stops at the first non-'l' character, at the latest the NUL */
 		while (*f == 'l') {
 			ll = 1;
 			f++;
 		}
 		if (*f == 's') {
 			s = va_arg(ap, const char *);
+			/* bounded: the NUL of the string (literal or a buffer the caller terminated) */
 			while (s[n])
 				n++;
 		} else if (*f == 'c') {
@@ -83,6 +87,7 @@ static inline __attribute__((always_inline)) void vfmt(char *o, unsigned cap, co
 			do {
 				r[k++] = "0123456789abcdef"[v % b];
 				v /= b;
+				/* bounded: v /= b (b = 10 or 16) reaches 0 (<= 20 digits for 64 bits) */
 			} while (v);
 			if (zero && !left)
 				while (k < w)
@@ -91,6 +96,7 @@ static inline __attribute__((always_inline)) void vfmt(char *o, unsigned cap, co
 				r[k++] = 'x';
 				r[k++] = '0';
 			}
+			/* bounded: k drops by one per pass (k <= sizeof r) */
 			while (k)
 				t[n++] = r[--k];
 		} else {
@@ -119,16 +125,20 @@ static void vsay(const char *pfx, const char *fmt, va_list ap)
 	const char *s = buf;
 	unsigned pl = 0;
 
+	/* bounded: pfx is a string literal, ends at its NUL */
 	while (pfx[pl])
 		pl++;
 	vfmt(buf, sizeof(buf), fmt, ap);
+	/* bounded: s advances by k >= 1 per pass (SAY_MAX - pl > 0) until its NUL */
 	while (*s) {
 		unsigned n = 0, k, i;
+		/* bounded: the NUL of the string (literal or a buffer the caller terminated) */
 		while (s[n])
 			n++;
 		k = n;
 		if (n > SAY_MAX - pl) {
 			k = SAY_MAX - pl;
+			/* bounded: k drops by one per pass until 0 */
 			while (k && s[k] != ' ')
 				k--;
 			if (!k)
@@ -498,6 +508,7 @@ static int cmu_wait_idle(struct tp *t, uintptr_t pa)
 	unsigned polls = 0;
 	uint64_t t0 = us();
 
+	/* bounded: expired(): TP_MAX_POLLS or TP_MUX_BUSY_TIMEOUT_US; caller checks BUSY */
 	while ((rd(t, pa) & busy) && !t->fault && !expired(t0, TP_MUX_BUSY_TIMEOUT_US, &polls)) {
 	}
 	return !t->fault && !(rd(t, pa) & busy);
@@ -597,10 +608,12 @@ static void spi_flush(struct tp *t)
 	wr(t, SPI + TP_SPI_CH_CFG, rd(t, SPI + TP_SPI_CH_CFG) & ~(TP_CH_RXCH_ON | TP_CH_TXCH_ON));
 	wr(t, SPI + TP_SPI_CH_CFG, (rd(t, SPI + TP_SPI_CH_CFG) | TP_CH_SW_RST) & ~TP_CH_HS_EN);
 	t0 = us();
+	/* bounded: expired(): TP_MAX_POLLS polls or 1000 us */
 	while (TP_ST_TX_LVL(rd(t, SPI + TP_SPI_STATUS)) && !t->fault && !expired(t0, 1000u, &polls)) {
 	}
 	t0 = us();
 	polls = 0;
+	/* bounded: expired(): TP_MAX_POLLS polls or 1000 us */
 	while (TP_ST_RX_LVL(rd(t, SPI + TP_SPI_STATUS)) && !t->fault && !expired(t0, 1000u, &polls))
 		(void)rd(t, SPI + TP_SPI_RX_DATA);
 	wr(t, SPI + TP_SPI_CH_CFG, rd(t, SPI + TP_SPI_CH_CFG) & ~TP_CH_SW_RST);
@@ -734,6 +747,7 @@ static int abl_burst(struct tp *t, const uint8_t *tx, uint64_t *rx, unsigned len
 			*rx = acc;
 		polls = 0;
 		t0 = us();
+		/* bounded: expired(): TP_MAX_POLLS polls or 1000 us */
 		while (TP_ST_TX_LVL(rd(t, SPI + TP_SPI_STATUS)) && !t->fault && !expired(t0, 1000u, &polls)) {
 		}
 	}
@@ -742,6 +756,7 @@ static int abl_burst(struct tp *t, const uint8_t *tx, uint64_t *rx, unsigned len
 	wr(t, SPI + TP_SPI_CH_CFG, rd(t, SPI + TP_SPI_CH_CFG) | TP_CH_SW_RST);
 	polls = 0;
 	t0 = us();
+	/* bounded: expired(): TP_MAX_POLLS polls or 1000 us */
 	while (TP_ST_RX_LVL(rd(t, SPI + TP_SPI_STATUS)) && !t->fault && !expired(t0, 1000u, &polls))
 		(void)rd(t, SPI + TP_SPI_RX_DATA);
 	return err;
@@ -1358,13 +1373,35 @@ static uint32_t dvfs_want(unsigned i)
 }
 #endif
 
-int touch_probe_dvfs(unsigned step)
+#ifdef TOUCH_DVFS_WRITE
+/* L-28 (xnu patch 0367): what the screen lines say, kept for the XNU command
+ * line. before = step 1 FREQ_GET, after = the step 2 read-back (0 = not read),
+ * rc: 0 every asked cluster read back at the asked rate, 1 request refused or
+ * failed, 2 a read-back differs, 3 a read-back failed, 4 step 2 not reached. */
+#endif
+
+int touch_probe_dvfs(unsigned step, struct touch_dvfs_res *res)
 {
+	/* style-allow: func-len one linear probe (describe, step 1 read, step 2 write + read-back),
+	 * reviewed as a whole */
+	/* style-allow: sized-types int is the status type of the acpm_* calls (0 = ok) */
+	/* style-allow: assert audited object (touchprobe.o): every refusal is handled and logged
+	 * (rule 6), no shim_assert_fail */
 	struct acpm_cfg c;
 	struct acpm_trace t;
 	uint32_t dom, khz, v[8];
 	int e = ACPM_OK, i, n = acpm_dvfs_ndom(), got = 0;
 
+#ifndef TOUCH_DVFS_WRITE
+	(void)res;	/* only a TOUCH_DVFS_WRITE image records the CPU result */
+#else
+	if (res) {
+		res->on = 1;
+		res->asked[0] = dvfs_want(0);
+		res->asked[1] = dvfs_want(1);
+		res->asked[2] = dvfs_want(2);
+	}
+#endif
 	acpm_cfg_init(&c);
 	if (step == 0) {
 		c.ch_id = c.dvfs_ch;		/* describe the DVFS channel, not the PMIC one */
@@ -1388,6 +1425,13 @@ int touch_probe_dvfs(unsigned step)
 				got++;
 			}
 		}
+#ifdef TOUCH_DVFS_WRITE
+		if (res) {	/* constant offsets: the audit allows no variable-index store here */
+			res->before[0] = v[0];
+			res->before[1] = v[1];
+			res->before[2] = v[2];
+		}
+#endif
 		say_result("dvfs read: %d/%d domains %s", got, n, e ? "REFUSED-or-FAILED, nothing more is touched" : "ok");
 		return e;
 	}
@@ -1399,6 +1443,7 @@ int touch_probe_dvfs(unsigned step)
 	/* step 2: the clusters one at a time in index order; a refusal or failure stops the rest (no second try). The read-back below
 	 * is printed even after a failure: it shows what the firmware did, and it (not the request return codes) decides the result. */
 	int asked = 0, match = 0, differ = 0, unver = 0;
+	uint32_t av[3] = { 0, 0, 0 };
 
 	for (i = 0; i < n && !e; i++) {
 		(void)acpm_dvfs_dom(i, &dom);
@@ -1423,6 +1468,8 @@ int touch_probe_dvfs(unsigned step)
 		khz = 0;
 		if (!acpm_dvfs_get(&c, dom, &khz, &t))
 			say("DVFS %s readback rate=%u kHz (asked %u)", dvfs_name(dom), khz, want);
+		if (i < 3)
+			av[i] = t.a.err ? 0 : khz;
 		dvfs_xfer_line("readback", dom, &t.a);
 		if (want) {
 			asked++;
@@ -1433,6 +1480,12 @@ int touch_probe_dvfs(unsigned step)
 			else
 				differ++;
 		}
+	}
+	if (res) {
+		res->after[0] = av[0];
+		res->after[1] = av[1];
+		res->after[2] = av[2];
+		res->rc = asked && match == asked ? 0 : differ ? 2 : unver ? 3 : 1;
 	}
 	if (asked && match == asked) {
 		say_result("dvfs set: ok %d/%d read back", match, asked);
@@ -1450,7 +1503,14 @@ int touch_probe_dvfs(unsigned step)
 
 void touch_probe_dump(void) {}
 int touch_probe_rails(unsigned step) { (void)step; return -1; }
-int touch_probe_dvfs(unsigned step) { (void)step; return -1; }
+int touch_probe_dvfs(unsigned step, struct touch_dvfs_res *res)
+{
+	/* style-allow: sized-types int is the status type of the acpm_* calls (0 = ok) */
+	/* style-allow: assert audited object (touchprobe.o): no shim_assert_fail */
+	(void)step;
+	(void)res;
+	return -1;
+}
 void touch_probe_run(unsigned opts) { (void)opts; }
 
 #endif

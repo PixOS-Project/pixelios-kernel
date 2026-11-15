@@ -8,7 +8,7 @@
 #include <string.h>
 
 struct fdt_builder {
-	uint8_t buf[12288];
+	uint8_t buf[12288] __attribute__((aligned(8)));
 	uint32_t struct_pos;
 	uint32_t str_pos;
 	uint32_t rsv_pos;	/* next free /memreserve/ slot (starts at 40) */

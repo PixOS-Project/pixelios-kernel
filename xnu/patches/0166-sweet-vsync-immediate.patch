@@ -1,0 +1,69 @@
+SWEET immediate vsync tick on enable (patch 0166, boot-arg sweetvsync_imm=1, default off; research 60 lever 2, research 52): when CoreAnimation enables vsync notifications (selector 72, type 5, CA_FORCE_TIMER=1 path) send ONE vsync callback immediately (host time now, count unchanged, the 16.7 ms timer keeps its cadence) instead of waiting up to a period; skipped while the display is off or the QR log holds the panel; at most one immediate tick per vsync period; counts enables, ticks sent and skipped and logs them (after the lock is dropped) for the first 10 enables and then every 50 (SWEET FB: vsync_imm: ...), one 'sweetvsync_imm on|off' line at the first enable. Consumer of docs/research/60 and 52 (G-13).
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -310,6 +310,7 @@
+ 	sender->wakeAtTime(next);
+ }
+ 
++static volatile uint64_t sweet_fb_vsync_count_mirror;   /* patch 0166: fVsyncCount is protected; the user client reads this copy (written in vsyncFired) */
+ static uint64_t sweet_fb_last_vsync_ns;   /* patch 0146: host time of the last vsync callback sent to CA, for the swap-after-vsync latency */
+ 
+ void
+@@ -356,6 +357,7 @@
+ 		sweet_fb_last_vsync_ns = vns;
+ 	}
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_vsync_count_mirror = count;
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a2 is the vsync's host time and
+ 	 * a2 + a3 the next one (a3 = the refresh period). a3 was 0, so CA saw every frame deadline as already past
+@@ -1072,7 +1074,49 @@
+ 			IOLockLock(fFB->fLock);
+ 			fFunc[type] = args->scalarInput[0];
+ 			fRefcon[type] = args->scalarInput[1];
++			/*
++			 * Immediate vsync tick on enable (patch 0166, boot-arg sweetvsync_imm=1, default off; research 60 lever 2, research 52): with CA_FORCE_TIMER=1
++			 * CoreAnimation enables vsync notifications only while it has frames (5483 on/off toggles, g64), and our free-running 16.7 ms timer
++			 * delivers the first tick up to one period later. Send one vsync callback right now (host time = now, count unchanged, the
++			 * regular timer keeps its own cadence). Counted and logged every 200 enables so the effect is visible (rule 8).
++			 */
++			static int imm = -1;
++			static uint64_t imm_enables, imm_sent, imm_skipped, imm_last;
++			bool imm_log_first = false, imm_log_stats = false;
++			if (imm < 0) {
++				int v = 0;
++				imm = (PE_parse_boot_argn("sweetvsync_imm", &v, sizeof(v)) && v != 0) ? 1 : 0;
++				imm_log_first = true;
++			}
++			if (imm && type == SWEET_FB_NOTIFY_VSYNC && args->scalarInput[0] != 0) {
++				uint64_t inow = mach_absolute_time(), iperiod;
++				nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &iperiod);
++				uint64_t ic = sweet_fb_vsync_count_mirror;
++				uint64_t ivalues[6] = {
++					(uint32_t)ic, (uint32_t)(ic >> 32),
++					(uint32_t)inow, (uint32_t)(inow >> 32),
++					(uint32_t)iperiod, (uint32_t)(iperiod >> 32),
++				};
++				imm_enables++;
++				/* at most one immediate tick per vsync period (review 0166 #1): a burst of enables must not out-pace the 16.7 ms timer */
++				if (fFB->fPowerOff || sweet_qr_hold || fPort == MACH_PORT_NULL || fFunc[type] == 0 || (imm_last != 0 && inow - imm_last < iperiod)) {
++					imm_skipped++;
++				} else {
++					notify(SWEET_FB_NOTIFY_VSYNC, ivalues, 6);
++					imm_sent++;
++					imm_last = inow;
++				}
++				imm_log_stats = imm_enables <= 10 || (imm_enables % 50) == 0;   /* the first 10 and every 50th: a bench run must show the counters */
++			}
++			uint64_t l_en = imm_enables, l_sent = imm_sent, l_skip = imm_skipped;
++			int l_imm = imm;
+ 			IOLockUnlock(fFB->fLock);
++			if (imm_log_first) {
++				IOLog("SWEET FB: sweetvsync_imm %s\n", l_imm ? "on: one immediate vsync tick when CA enables type 5 (max one per period)" : "off");
++			}
++			if (imm_log_stats) {
++				IOLog("SWEET FB: vsync_imm: %llu enables, %llu immediate ticks sent, %llu skipped (rate limit / no port / display off)\n", l_en, l_sent, l_skip);
++			}
+ 			char name[32];
+ 			proc_selfname(name, sizeof(name));
+ 			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,

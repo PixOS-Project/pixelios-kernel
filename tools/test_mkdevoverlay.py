@@ -51,7 +51,7 @@ class Rejects(unittest.TestCase):
             m.parse(blob)
 
     def test_magic(self): self.bad(b'SWEETDEX' + self.good[8:])
-    def test_version(self): self.bad(self.good[:8] + struct.pack('<I', 2) + self.good[12:])
+    def test_version(self): self.bad(self.good[:8] + struct.pack('<I', 3) + self.good[12:])
     def test_count_too_big(self): self.bad(self.good[:12] + struct.pack('<I', 5000) + self.good[16:])
     def test_count_past_end(self): self.bad(self.good[:12] + struct.pack('<I', 2) + self.good[16:])
     def test_truncated(self):
@@ -96,6 +96,19 @@ class Rejects(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0); self.assertIn('40 MiB', r.stderr)
 
 
+    def test_packer_refuses_over_observed_device_limit(self):
+        for size, ok in ((20 << 20, True), (22 << 20, False)):
+            d = tree({'usr/lib/a': b''})
+            with open(os.path.join(d, 'usr/lib/a'), 'wb') as f:
+                f.truncate(size)
+            out = os.path.join(d, 'o.bin')
+            r = run(d, out)
+            if ok:
+                self.assertEqual(r.returncode, 0); self.assertIn('WARNING', r.stderr); self.assertTrue(os.path.exists(out))
+            else:
+                self.assertEqual(r.returncode, 1); self.assertIn('RESULT: FAIL', r.stdout)
+                self.assertIn('HANDOFF.md:174', r.stdout); self.assertFalse(os.path.exists(out))
+
     def test_control_bytes_case_and_long_names(self):
         for p in ('/usr/lib/a\x7fb', '/usr/lib/a\x1fb', '/usr/lib/\xe9', '/usr/lib/a.SweetOrig', '/usr/lib/a.SWEETTMP', '/usr/lib/' + 'n' * 246):
             self.assertIsNotNone(m.path_check(p), repr(p))
@@ -132,3 +145,63 @@ class Rejects(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Whiteout(unittest.TestCase):
+    """xnu patch 0280: DIR/<path>.sweetwhiteout (empty) packs a removal; files below /private/var/mobile/ are owned by mobile."""
+    def tree(self, files):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        for p, body in files.items():
+            os.makedirs(os.path.dirname(d + p), exist_ok=True)
+            open(d + p, "wb").write(body)
+        return d
+
+    def setUp(self):
+        import mkdevoverlay as mm
+        self._guard = mm.whiteout_guard
+        mm.whiteout_guard = lambda paths: None   # the image check has its own test below
+
+    def tearDown(self):
+        import mkdevoverlay as mm
+        mm.whiteout_guard = self._guard
+
+    def test_guard_refuses_a_root_image_file(self):
+        import mkdevoverlay as mm
+        from test_overlay_std import standard_root_image   # R13: the gate container mounts the image; a missing one FAILS, never skips
+        img = standard_root_image()
+        self.assertTrue(os.path.isfile(img), "standard root image %s missing on this host (R13: stage it, do not skip)" % img)
+        os.environ["MKDEVOVERLAY_WH_IMAGE"] = img
+        try:
+            with self.assertRaises(SystemExit) as c:
+                self._guard(["/usr/local/bin/wifid-probe"])   # in the standard root (review 0280 F1)
+            self.assertIn("has that file", str(c.exception))
+            self._guard(["/usr/local/bin/no-such-tool"])       # absent: allowed
+        finally:
+            os.environ.pop("MKDEVOVERLAY_WH_IMAGE", None)
+
+    def test_whiteout_entry(self):
+        import mkdevoverlay as mm
+        ents = mm.collect(self.tree({"/usr/local/bin/added.sweetwhiteout": b"", "/usr/local/bin/keep": b"x"}))
+        got = {p: (mode, data) for p, mode, uid, gid, data in ents}
+        self.assertEqual(got["/usr/local/bin/added"], (0xFFFF, b""))
+        self.assertEqual(got["/usr/local/bin/keep"][1], b"x")
+        back = mm.parse(mm.pack(ents))
+        self.assertIn(("/usr/local/bin/added", 0xFFFF, 0, 0, b"", True), back)
+
+    def test_whiteout_outside_allow_and_nonempty_refused(self):
+        import mkdevoverlay as mm
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/usr/lib/libSystem.B.dylib.sweetwhiteout": b""}))
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/usr/local/bin/x.sweetwhiteout": b"not empty"}))
+
+    def test_bt_paths_and_mobile_owner(self):
+        import mkdevoverlay as mm
+        ents = mm.collect(self.tree({"/Applications/BTApp.app/BTApp": b"bin",
+                                     "/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist": b"pl"}))
+        own = {p: (uid, gid) for p, mode, uid, gid, data in ents}
+        self.assertEqual(own["/Applications/BTApp.app/BTApp"], (0, 0))
+        self.assertEqual(own["/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist"], (501, 501))
+        with self.assertRaises(SystemExit):
+            mm.collect(self.tree({"/Applications/BTApp.app/Info.plist": b"x"}))   # only the binary is allowed

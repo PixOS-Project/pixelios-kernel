@@ -1,0 +1,135 @@
+SWEET gesture sysctl (patch 0312, ALL-ON T-31, coordinator 2026-11-11: the nav must check the UI state before every step): kern.sweetgesture (write, root, struct sweet_gesture {magic 'SGST', id, x0, y0, x1, y1, ms}) injects ONE tap (x0==x1, y0==y1, held ms) or drag (finger moves every 10 ms over ms (the nav session tick; 8 ms steps did not trigger the bottom-edge home swipe, T-36)) on the HID work loop; refused EBUSY while a nav session / script / gesture runs, EINVAL outside 1080x2400 or ms not 20..2000. Lines 'SWEET GESTURE: id N begin ... now NS' / 'end now NS' (kernel clock of the SWEET NAV markers). kern.sweetfbcount (read) = swaps + distinct frames presented (2 x u64) for a 'UI settled' test. A userland driver (pixnav) reads the screen (kern.sweetpanel, patch 0276), classifies it, and decides the next gesture: navigation by intent with a state check, never a timed blind tap. Replaces the kernel-side recovery of the withdrawn patch 0311. Input injection + counter reads only: no register, no store to hardware.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -398,6 +398,12 @@
+ 	/* patch 0243: boot-arg sweetnav=R runs a built-in human-paced navigation session R times (G-10b nav bench) */
+ 	static void navFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fNav;
++	/* patch 0312: one injected gesture from userland (kern.sweetgesture), the closed-loop ALL-ON nav driver decides what and when */
++	static void gestFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fGest;
++	UInt32 fGestOn, fGestStep, fGestSteps, fGestId, fGestMs;
++	int fGestX0, fGestY0, fGestX1, fGestY1;
++	int gestureStart(int x0, int y0, int x1, int y1, unsigned ms, unsigned id);
+ 	UInt32 fNavReps, fNavRep, fNavIdx, fNavStep, fNavRng;
+ 	UInt32 fNavWakeTaps, fNavWakeSt;   /* patch 0254: unlock retries (wake taps sent), 1 = the wake tap finger is down */
+ 	uint64_t fNavSw0;   /* patch 0254: swap count at the start of the unlock attempt */
+@@ -702,6 +708,9 @@
+ 	fNavGateT0 = fNavGateCnt = fNavGateFlatT = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNavStress = fNavSRng = fNavSMs = fNavSSettle = fNavSBurst = fNavSFlip = fNavSRepeat = fNavSZig = 0;   /* patch 0306 */
++	fGest = NULL;   /* patch 0312 */
++	fGestOn = fGestStep = fGestSteps = fGestId = fGestMs = 0;
++	fGestX0 = fGestY0 = fGestX1 = fGestY1 = 0;
+ 	fNavSdx0 = fNavSdy0 = fNavSdx1 = fNavSdy1 = 0;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
+@@ -1283,6 +1292,108 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweetnavrun, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_navrun_sysctl, "I",
+     "sweet nav: write R|0x100|0x200 to start a session on the running system");
+ 
++/*
++ * Patch 0312 (ALL-ON T-31, coordinator 2026-11-11: the nav must check the UI state before every step; kernel taps at fixed coordinates on timers cannot):
++ * kern.sweetgesture (write, root, struct sweet_gesture below) injects ONE tap or drag; a userland driver (pixnav) reads the screen (kern.sweetpanel,
++ * patch 0276), decides the next gesture and waits for it. A drag moves the finger every 10 ms (the nav session's tick) from (x0,y0) to (x1,y1) over `ms`; a tap (x0==x1, y0==y1)
++ * holds for `ms`. Refused with EBUSY while a nav session (patches 0243/0275) or another gesture runs, EINVAL outside the panel or ms not in 20..2000.
++ * Lines: 'SWEET GESTURE: id N begin x0,y0 -> x1,y1 ms M now NS' / 'SWEET GESTURE: id N end now NS' (kernel clock of the SWEET NAV markers).
++ * kern.sweetfbcount (read): swaps and distinct frames presented so far (two u64), the driver's 'UI settled' test without a 10 MB panel read.
++ * Input injection + counter reads only: no register, no store to hardware.
++ */
++struct sweet_gesture { uint32_t magic, id; int32_t x0, y0, x1, y1; uint32_t ms; };   /* magic 'SGST' */
++#define SWEET_GESTURE_MAGIC 0x54534753u
++int
++SweetHIDTouch::gestureStart(int x0, int y0, int x1, int y1, unsigned ms, unsigned id)
++{
++	if (x0 < 0 || x0 > 1079 || x1 < 0 || x1 > 1079 || y0 < 0 || y0 > 2399 || y1 < 0 || y1 > 2399 || ms < 20 || ms > 2000) {
++		IOLog("SWEET GESTURE: id %u refused (EINVAL): %d,%d -> %d,%d ms %u\n", id, x0, y0, x1, y1, ms);
++		return EINVAL;
++	}
++	if (fGestOn || (fNav && (fNavRep < fNavReps || fNavCap == 1 || fNavCap == 2 || fNavStep != 0)) || (fScript && fScriptIdx < fScriptN)) {
++		IOLog("SWEET GESTURE: id %u refused (EBUSY): gesture %u nav rep %u/%u step %u\n", id, fGestOn, fNavRep, fNavReps, fNavStep);
++		return EBUSY;
++	}
++	if (!fGest) {
++		fGest = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::gestFired);
++		if (!fGest || !_hidWorkLoop || _hidWorkLoop->addEventSource(fGest) != kIOReturnSuccess) {
++			IOLog("SWEET GAP: HID sweetgesture: timer or work loop unavailable\n");
++			if (fGest) {
++				fGest->release();
++				fGest = NULL;
++			}
++			return ENODEV;
++		}
++	}
++	fGestX0 = x0;
++	fGestY0 = y0;
++	fGestX1 = x1;
++	fGestY1 = y1;
++	fGestMs = ms;
++	fGestId = id;
++	fGestSteps = ms / 10 ? ms / 10 : 1;   /* 10 ms ticks like the nav session (navFired): with 8 ms steps the bottom-edge home swipe never left an app (T-36 A/B, job 8198), the nav's 10 ms one did (job 8cce) */
++	fGestStep = 0;
++	fGestOn = 1;
++	IOLog("SWEET GESTURE: id %u begin %d,%d -> %d,%d ms %u now %llu\n", id, x0, y0, x1, y1, ms, sweetNavNs());
++	fGest->setTimeoutMS(1);
++	return 0;
++}
++
++void
++SweetHIDTouch::gestFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	unsigned st = self->fGestStep, n = self->fGestSteps;
++	if (st <= n) {
++		int x = self->fGestX0 + (self->fGestX1 - self->fGestX0) * (int)st / (int)n;
++		int y = self->fGestY0 + (self->fGestY1 - self->fGestY0) * (int)st / (int)n;
++		self->touch(0, true, x, y);
++		self->fGestStep = st + 1;
++		sender->setTimeoutMS(10);
++		return;
++	}
++	self->touch(0, false, self->fGestX1, self->fGestY1);
++	IOLog("SWEET GESTURE: id %u end now %llu\n", self->fGestId, sweetNavNs());
++	self->fGestOn = 0;
++}
++
++static int
++sweet_gesture_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	struct sweet_gesture g;
++	if (!req->newptr) {
++		return EINVAL;
++	}
++	if (req->newlen != sizeof(g)) {
++		return EINVAL;
++	}
++	int err = SYSCTL_IN(req, &g, sizeof(g));
++	if (err) {
++		return err;
++	}
++	if (g.magic != SWEET_GESTURE_MAGIC) {
++		IOLog("SWEET GESTURE: refused: bad magic 0x%x\n", g.magic);
++		return EINVAL;
++	}
++	if (!gSweetTouch) {
++		return ENODEV;
++	}
++	return gSweetTouch->gestureStart(g.x0, g.y0, g.x1, g.y1, g.ms, g.id);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetgesture, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED, NULL, 0, sweet_gesture_sysctl, "S",
++    "sweet: inject one tap/drag (struct sweet_gesture, patch 0312)");
++
++static int
++sweet_fbcount_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	uint64_t v[2] = { sweet_fb_swap_count, sweet_fb_distinct_count };
++	return SYSCTL_OUT(req, v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetfbcount, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fbcount_sysctl, "S",
++    "sweet: swaps and distinct frames presented so far (2 x u64, patch 0312)");
++
+ #define SWEET_SCRIPT_STEPS 20
+ void
+ SweetHIDTouch::scriptFired(OSObject *owner, IOTimerEventSource *sender)

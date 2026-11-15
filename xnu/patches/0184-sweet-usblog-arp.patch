@@ -1,0 +1,120 @@
+SWEET usb log ARP wait (patch 0184, rule 8): the live USB log replay (bsd/dev/sweet_usb.c ud_log_thread, patch 0075, ud_log_drain, patch 0179) intermittently lost the HEAD of the boot replay (6 of ~20 runs, e.g. run el2-4-b3: usbnet.log starts mid-line). Cause [read from source]: XNU ARP keeps only arp_maxhold=16 packets per unresolved entry and drops the oldest (Q_DROPHEAD; in_arp.c:212, 288, 1505-1512), and sock_send returns success for a held packet, so 0179's resend-on-error never fires; the replay burst (~20 datagrams of 1400 B) is sent before the host 192.168.7.1 answers ARP. Fix: every 100 ms round ud_log_round first calls arp_lookup_ip(ud.ifp, 192.168.7.1, NULL hint, NULL packet) (in_arp.c:1291-1610, in_arp.h:36-72; with no packet an unresolved entry only sends an ARP request and returns EJUSTRETURN) and sends nothing, keeping pos, until it returns 0 (checked every round, an expired entry would drop the same way; a NULL ifp or any error keeps waiting). Rule 8: when ARP resolves it sends one datagram "SWEET USBLOG: ARP for 192.168.7.1 resolved after ~N ms (last arp_lookup_ip error E); replay starts now" (again after any later wait), and if the 64 KiB start window of patch 0075 skipped older bytes, once "SWEET GAP: usb log replay starts at byte X; N older boot bytes not sent (only the last 64 KiB is replayed)"; both as own datagrams, never printf. The 64 KiB window is unchanged. Host test tools/test_usblog_arp_c.py. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 4acb5f7..0000000 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -35,6 +35,8 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <netinet/in_arp.h>
++#include <net/if_dl.h>
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+@@ -1204,16 +1206,95 @@
+ 	}
+ }
+ 
++/*
++ * PixOS patch 0184 (rule 8): XNU ARP holds only arp_maxhold=16 packets per unresolved entry and drops the oldest
++ * (in_arp.c:212, 288, 1505-1512) while sock_send reports success, so the replay burst sent before 192.168.7.1 answers
++ * lost its head. Send nothing until arp_lookup_ip (no packet, no hint: it only sends the ARP request and returns
++ * EJUSTRETURN while unresolved) returns 0; checked every round, an expired entry would drop the same way. Every wait and
++ * the 64 KiB replay window are reported as their own datagrams (never printf: the ring is read by this thread).
++ */
++struct ud_log_arp {
++	uint32_t rounds;        /* 100 ms rounds spent waiting for ARP since the last resolution */
++	int last_err;           /* last arp_lookup_ip error (ENXIO: no ifp) */
++	int announced;          /* the "resolved" line was sent at least once */
++	int gap_sent;           /* the initial-window GAP line is done */
++	uint64_t start;         /* initial reader position (bytes before it are never sent) */
++};
++
++static int
++ud_log_arp_ready(struct ud_log_arp *a, struct sockaddr_in *to)
++{
++	struct sockaddr_dl sdl;
++	errno_t e;
++
++	if (ud.ifp == NULL) {        /* defensive: the thread starts only with ud.ifp set (0075), review r1 F5 */
++		e = ENXIO;
++	} else {
++		bzero(&sdl, sizeof(sdl));
++		e = arp_lookup_ip(ud.ifp, to, &sdl, sizeof(sdl), NULL, NULL);
++	}
++	if (e != 0) {
++		a->rounds++;
++		a->last_err = (int)e;
++		return 0;
++	}
++	return 1;
++}
++
++static int
++ud_log_note(socket_t so, struct sockaddr_in *to, char *msg, int len, size_t max)
++{
++	if (len < 0) {
++		len = 0;
++	} else if (len >= (int)max) {
++		len = (int)max - 1;
++	}
++	return ud_log_send(so, to, msg, (size_t)len);
++}
++
++static void
++ud_log_round(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, struct ud_log_arp *a,
++    char *chunk, uint32_t chunk_max)
++{
++	static char msg[200];
++
++	if (sweet_log_position() <= *pos) {
++		return;                 /* nothing pending: no ARP lookup, so an idle link sends no probes (review r1 F1) */
++	}
++	if (!ud_log_arp_ready(a, to)) {
++		return;                 /* keep pos: nothing is sent, retry next round */
++	}
++	if (!a->announced || a->rounds > 0) {
++		if (ud_log_note(so, to, msg, snprintf(msg, sizeof(msg), "\nSWEET USBLOG: ARP for 192.168.7.1 resolved after "
++		    "~%u ms (last arp_lookup_ip error %d); replay starts now\n", a->rounds * 100, a->last_err), sizeof(msg)) != 0) {
++			return;
++		}
++		a->announced = 1;
++		a->rounds = 0;
++	}
++	if (a->start > 0 && !a->gap_sent) {
++		if (ud_log_note(so, to, msg, snprintf(msg, sizeof(msg), "\nSWEET GAP: usb log replay starts at byte %llu; "
++		    "%llu older boot bytes not sent (only the last 64 KiB is replayed)\n", (unsigned long long)a->start,
++		    (unsigned long long)a->start), sizeof(msg)) != 0) {
++			return;
++		}
++	}
++	a->gap_sent = 1;
++	ud_log_drain(so, to, pos, g, chunk, chunk_max);
++}
++
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	static char chunk[1400];
+ 	struct ud_log_gap g = { 0, 0, 0 };
++	struct ud_log_arp ua = { 0, 0, 0, 0, 0 };
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
++	ua.start = pos;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+@@ -1228,7 +1309,7 @@
+ 			so = NULL;
+ 			continue;
+ 		}
+-		ud_log_drain(so, &to, &pos, &g, chunk, sizeof(chunk));
++		ud_log_round(so, &to, &pos, &g, &ua, chunk, sizeof(chunk));
+ 	}
+ }
+ 

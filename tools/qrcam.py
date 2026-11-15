@@ -17,7 +17,7 @@ def detectors(cv2):
 def _single(cv2, det, im):
     try:
         t, _pts, _ = det.detectAndDecode(im)
-    except cv2.error:        # degenerate candidate (zero-area contour): not a QR, move on
+    except cv2.error:        # degenerate candidate (zero-area contour): not a QR, move on   # lint-silent: expected a degenerate candidate is not a QR: skipped (comment)
         return None
     return t or None
 
@@ -25,7 +25,7 @@ def _single(cv2, det, im):
 def _multi(cv2, det, im):
     try:
         ok, infos, _pts, _ = det.detectAndDecodeMulti(im)
-    except cv2.error:
+    except cv2.error:   # lint-silent: expected a degenerate candidate yields no multi-code result
         return []
     return [t for t in infos if t] if ok else []
 
@@ -40,7 +40,7 @@ def find_quads(cv2, np, img, dets, want):
     for det in dets:
         try:
             ok, pts = det.detectMulti(img)
-        except cv2.error:
+        except cv2.error:   # lint-silent: expected a degenerate candidate yields no quad
             continue
         for q in (pts if ok and pts is not None else []):
             q = q.reshape(4, 2)

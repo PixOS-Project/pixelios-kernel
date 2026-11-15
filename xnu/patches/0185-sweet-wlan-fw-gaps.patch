@@ -1,0 +1,73 @@
+SWEET WLAN firmware container gaps (patch 0185, rule 8; X-W7 F1-F3, super docs/research/X-W7-wifi-file-map.md:22-24, 40): sweet_wlan_fwcheck() (patch 0128, gap lines of 0137) printed the container entries but said nothing about what the chip does not get.
+Cause [read from source]: the container carries FW, NVRM and CLM (tools/pack_wlanfw.py:12,19), but no patch looks up the "CLM " entry (no clmload level yet), no txcap blob is packed (stock vendor.img has none [observed, debugfs]) and the unsuffixed cal/clm go in with no region variant chosen (stock has _EU/_JPN/_MMW/_ROW).
+Fix: after the entry loop, the lines of swf_gaps() (bsd/dev/sweet_wlan_fw.h), each printed with swl_gap("fw", ...) once per boot: "CLM packed but not loaded (no clmload yet)" [high] when a "CLM " entry is present, else "no CLM entry in the container" [high] (a container without CLM passed silently, X-W7 F6); "no txcap_blob (stock has none, not loaded)" [low]; "cal/clm = unsuffixed default, no region pick" [medium]; "stock fw path unsettled (Kbuild /vendor/etc/wifi vs image /vendor/firmware)" [low] (F4: PixOS loads no file by name, so the disagreement is gap-logged until the module params are captured).
+T-0600: the decision is the pure swf_gaps(), host-tested by shim/wlan_fw_host_test.c with mutants in tools/test_wlan_fw_gap_mutants.py (gap dropped, CLM presence ignored/inverted, text or severity lost).
+Log only: no register access, no store, no behaviour change. Rows in super docs/KNOWN-GAPS-WIFI.md. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -191,6 +191,8 @@
+ 	unsigned int psize = 0, n = 0, i;
+ 	uint64_t pa, len;
+ 	struct swf_entry e[SWF_MAX_ENTRIES];
++	struct swf_gap g[SWF_GAP_MAX];
++	unsigned int ng;
+ 	int rc;
+ 
+ 	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
+@@ -222,6 +224,11 @@
+ 		    e[i].length, e[i].offset, e[i].crc);
+ 	}
+ 	printf("SWEET WLAN: fw container ok at %#llx, %llu bytes, %u entries\n", pa, len, n);
++	/* patch 0185 (X-W7 F1-F4, rule 8): what the container does not give the chip yet; log only, swf_gaps() is host-tested */
++	ng = swf_gaps(e, n, g);
++	for (i = 0; i < ng; i++) {
++		swl_gap("fw", g[i].what, g[i].sev);
++	}
+ 	sw_fw_note((uint8_t const *)ml_static_ptovirt((vm_offset_t)pa), e, n);
+ }
+ 
+diff --git a/bsd/dev/sweet_wlan_fw.h b/bsd/dev/sweet_wlan_fw.h
+--- a/bsd/dev/sweet_wlan_fw.h
++++ b/bsd/dev/sweet_wlan_fw.h
+@@ -86,4 +86,39 @@
+ 	*count = n;
+ 	return 0;
+ }
++
++/*
++ * Patch 0185 (X-W7 F1-F4, rule 8): what the container does NOT give the chip, as data so the host test can mutate it. The glue prints each one as
++ * swl_gap("fw", what, sev). Order and texts are the gap keys (docs/KNOWN-GAPS-WIFI.md); the text carries no run value so the key is stable.
++ *   CLM:    entry "CLM " present -> packed but never loaded (no clmload level yet); absent -> a 1- or 2-entry container passes swf_parse (F6) and says nothing
++ *   txcap:  never packed, never loaded (stock vendor.img has no txcap_blob)
++ *   region: cal/clm go in unsuffixed, no _EU/_JPN/_MMW/_ROW variant chosen
++ *   path:   stock runtime file path unsettled (Kbuild /vendor/etc/wifi vs image /vendor/firmware, F4); PixOS loads no file by name
++ */
++#define SWF_GAP_MAX 4u
++
++struct swf_gap {
++	const char *what, *sev;
++};
++
++static unsigned
++swf_gaps(const struct swf_entry *e, unsigned n, struct swf_gap g[SWF_GAP_MAX])
++{
++	unsigned i, k = 0, clm = 0;
++
++	for (i = 0; i < n; i++) {
++		if (e[i].tag[0] == 'C' && e[i].tag[1] == 'L' && e[i].tag[2] == 'M' && e[i].tag[3] == ' ') {
++			clm = 1;
++		}
++	}
++	g[k].what = clm ? "CLM packed but not loaded (no clmload yet)" : "no CLM entry in the container";
++	g[k++].sev = "high";
++	g[k].what = "no txcap_blob (stock has none, not loaded)";
++	g[k++].sev = "low";
++	g[k].what = "cal/clm = unsuffixed default, no region pick";
++	g[k++].sev = "medium";
++	g[k].what = "stock fw path unsettled (Kbuild /vendor/etc/wifi vs image /vendor/firmware)";
++	g[k++].sev = "low";
++	return k;
++}
+ #endif

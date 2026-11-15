@@ -1,0 +1,366 @@
+SWEET Bluetooth: boot-arg sweetbtnopcf=1 (patch 0231, ticket T-b58f, W-BTSCAN), diagnostic knob, default off, no change without it: bluetoothd's HCI vendor command 0xfce9 with sub-op 05 (_BCM_LEMetaPCFServiceUUID) or 07 (_BCM_LEMetaScanFilterUUID) is not sent to the chip and bluetoothd gets the Command Complete the chip gave for the same sub-op + action in bt-up14, injected by the rx thread only between chip events (the 0217 H4 framer, now also on with this knob). bt-up14 [obs 20261107T121323Z-bt-up14]: with the filter installed the chip reported 0 LE advertisements in 256 s, the same 200b/200c bytes without it 13 in 20 s. The tx parser (0226) now copies into an out buffer so a command can be held until its sub-op + action byte are known; unknown action, a lost rx framer or a full answer queue send the command unchanged with a BT GAP row. Review T-b58f-0231 F1: the rx side (framer + answer delivery) runs on its own flag sbu_nopcf_rx that the tx parser never clears, so answers queued before a tx-parser stop still drain; F3: a lost framer names sweetbtnopcf; the boot-arg parse is its own function (host-tested). Fewer bytes reach the chip; no register store added.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index d41f94f..c971aaa 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1880,6 +1880,31 @@ static unsigned sbu_rw200b_n, sbu_rw_off, sbu_rw_plen, sbu_rw_other;
+ static uint8_t sbu_rw_evt, sbu_rw_opl;
+ static uint16_t sbu_rw_opc;
+ 
++/*
++ * patch 0231 (T-b58f, W-BTSCAN): boot-arg sweetbtnopcf=1, diagnostic knob, not a fix. bluetoothd sends a Broadcom PCF service-UUID scan filter before every LE scan
++ * [bin docs/research/BT-S3-fce9-pcf-scan-filter.md: fce9 sub-op 05 = _BCM_LEMetaPCFServiceUUID 0x100138810, 07 = _BCM_LEMetaScanFilterUUID 0x100139098]; with it the chip
++ * reported 0 LE advertisements for 256 s while the same 200b/200c bytes without it gave 13 per 20 s [obs bt-up14, docs/reviews/T-4ee1-proof.md]. On bluetoothd's tx stream
++ * (sbu_tx_kctl only) whole `01 e9 fc` packets with sub-op 05 or 07 are held back from the chip (fewer bytes reach the chip, no new store) and bluetoothd gets the Command
++ * Complete the chip gave for the same sub-op + action in every bt-up14 cycle [obs, 13/13 identical]. The answer is handed to sweet_bt_rx by the rx thread only between chip
++ * events (the H4 framer below at sbu_rw_off == 0), never inside one. Unknown action byte, plen < 2, a full answer queue or a lost framer: the command is sent unchanged (loud).
++ * One `BT GAP: sweetbtnopcf=1 withheld` row per command; it names sub-op, action and plen, never the UUID bytes (rule 4). The injected bytes show as `BT HCI: rx-synth` rows.
++ */
++static bool sbu_nopcf_on;
++static bool sbu_nopcf_rx;            /* patch 0231 review F1: rx side (framer + answer delivery) of sweetbtnopcf; set with sbu_nopcf_on, never cleared by the tx parser, so answers already queued still drain */
++static bool sbu_rw_lost;             /* patch 0231: the rx framer stopped (non-event packet): event boundaries are no longer known */
++static unsigned sbu_nopcf_n;
++static const struct {
++	uint8_t sub, act, len, b[10];
++} sbu_pcf_ans[] = {             /* [obs bt-up14 usbnet.log: rx rows after each fce9 tx, every cycle the same bytes] */
++	{ 0x05, 0x00, 9, { 0x04, 0x0e, 0x06, 0x01, 0xe9, 0xfc, 0x00, 0x05, 0x00 } },
++	{ 0x07, 0x00, 10, { 0x04, 0x0e, 0x07, 0x01, 0xe9, 0xfc, 0x00, 0x07, 0x00, 0x07 } },
++	{ 0x05, 0x02, 9, { 0x04, 0x0e, 0x06, 0x01, 0xe9, 0xfc, 0x00, 0x05, 0x02 } },
++	{ 0x07, 0x02, 10, { 0x04, 0x0e, 0x07, 0x01, 0xe9, 0xfc, 0x00, 0x07, 0x02, 0x08 } },
++};
++#define SBU_PCF_Q       8u
++static uint8_t sbu_pcf_q[SBU_PCF_Q];          /* index into sbu_pcf_ans; single producer (kctl tx), single consumer (rx thread) */
++static unsigned sbu_pcf_qh, sbu_pcf_qt;        /* head (rx thread), tail (tx); free-running, __atomic */
++
+ static void
+ sbu_rw200b(uint8_t *p, size_t n)
+ {
+@@ -1893,7 +1918,11 @@ sbu_rw200b(uint8_t *p, size_t n)
+ 				sbu_rw200b_on = false;
+ 				sbu_rw200c_on = false;
+ 				sbu_nopadv_on = false;
++				sbu_rw_lost = true;
+ 				SBU_GAP(SG_OTHER, "sweetbtrw200b: non-event packet type %#x: rewrite disabled for the rest of the boot", b);
++				if (sbu_nopcf_rx) {     /* review F3: name the knob that is on */
++					SBU_GAP(SG_OTHER, "sweetbtnopcf: rx framer lost at non-event packet type %#x: queued answers wait for a quiet rx pass, later fce9 05/07 are sent unchanged", b);
++				}
+ 				return;
+ 			} else {        /* garbage: pass through, framing resumes at the next 0x04; counted loudly */
+ 				sbu_rw_other++;
+@@ -1947,6 +1976,33 @@ sbu_rw200b(uint8_t *p, size_t n)
+ 	}
+ }
+ 
++/* patch 0231: hand bluetoothd the queued fce9 answers, only at a chip event boundary (rx thread only). n = chip bytes of this pass. */
++static void
++sbu_pcf_deliver(size_t n)
++{
++	unsigned h = __atomic_load_n(&sbu_pcf_qh, __ATOMIC_RELAXED);
++	unsigned t = __atomic_load_n(&sbu_pcf_qt, __ATOMIC_ACQUIRE);
++
++	if (h == t) {
++		return;
++	}
++	if (sbu_rw_lost) {      /* no framer: only a pass in which the chip sent nothing counts as a boundary */
++		if (n != 0) {
++			return;
++		}
++		SBU_GAP(SG_OTHER, "sweetbtnopcf: rx framer lost, a queued fce9 answer is delivered at a quiet rx pass (may split a chip event)");
++	} else if (sbu_rw_off != 0) {
++		return;         /* inside a chip event: wait for its end */
++	}
++	for (; h != t; h++) {
++		unsigned k = sbu_pcf_q[h % SBU_PCF_Q];
++
++		sbu_trace("rx-synth", sbu_pcf_ans[k].b, sbu_pcf_ans[k].len);
++		(void)sweet_bt_rx(sbu_pcf_ans[k].b, sbu_pcf_ans[k].len);
++	}
++	__atomic_store_n(&sbu_pcf_qh, h, __ATOMIC_RELEASE);
++}
++
+ /* One polling pass (the rx thread calls it every tick): drain the RX FIFO into the connected control. Returns bytes queued. */
+ size_t sbu_rx_poll(void);
+ 
+@@ -1963,7 +2019,7 @@ sbu_rx_poll(void)
+ 	if (err != 0) {
+ 		sbu.rx_err++;
+ 		SBU_GAP(SG_RXERR, "uart16 rx error flags %#x (overrun/frame/break); bytes may be lost", err);
+-		if ((sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on) && sbu_rw_off != 0) {     /* patch 0217: bytes may be lost, the H4 framing of the rewrite parser is no longer known: restart at the next 0x04 */
++		if ((sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on || (sbu_nopcf_rx && !sbu_rw_lost)) && sbu_rw_off != 0) {     /* patch 0217: bytes may be lost, the H4 framing of the rewrite parser is no longer known: restart at the next 0x04 */
+ 			sbu_rw_off = 0;
+ 			SBU_GAP(SG_RXERR, "sweetbtrw200b: framing reset after rx error");
+ 		}
+@@ -1975,11 +2031,14 @@ sbu_rx_poll(void)
+ 	if (n != 0) {
+ 		sbu.rx_bytes += (uint32_t)n;
+ 		sbu_trace("rx", buf, n);       /* the trace shows the chip's real bytes, before any sweetbtrw200b rewrite */
+-		if (sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on) {
++		if (sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on || (sbu_nopcf_rx && !sbu_rw_lost)) {
+ 			sbu_rw200b(buf, n);
+ 		}
+ 		(void)sweet_bt_rx(buf, n);
+ 	}
++	if (sbu_nopcf_rx) {
++		sbu_pcf_deliver(n);
++	}
+ 	return n;
+ }
+ 
+@@ -2074,27 +2133,99 @@ static unsigned sbu_pubscan_n;
+ static unsigned sbu_tx_off, sbu_tx_hlen, sbu_tx_need;     /* offset in the current H4 packet, its header length (type byte included), its total length */
+ static uint8_t sbu_tx_type, sbu_tx_hdr[5], sbu_tx_scantype;
+ 
+-static unsigned        /* rewrites made in p[0..n) (review T-4b11-0226 #2: counted and logged by the caller only after the chip took the bytes) */
+-sbu_txrw(uint8_t *p, size_t n)
++static uint8_t sbu_pcf_hold[6];       /* patch 0231: the first bytes of a command that may be fce9 05/07, not yet sent */
++static unsigned sbu_pcf_nhold;
++static bool sbu_pcf_drop;            /* patch 0231: the rest of the current packet is withheld */
++static uint8_t sbu_pcf_sub;
++
++static void
++sbu_txp_off(const char *why)        /* the tx parser stops for the rest of the boot: both tx knobs off, loud */
++{
++	if (sbu_pubscan_on) {
++		sbu_pubscan_on = false;
++		SBU_GAP(SG_OTHER, "sweetbtpubscan: %s: rewrite disabled for the rest of the boot", why);
++	}
++	if (sbu_nopcf_on) {
++		sbu_nopcf_on = false;
++		SBU_GAP(SG_OTHER, "sweetbtnopcf: %s: fce9 05/07 pass unchanged for the rest of the boot", why);
++	}
++}
++
++/* patch 0231: the held command got byte b at offset pos (sbu_pcf_hold has it). 0 = keep holding, 1 = send the held bytes unchanged, 2 = withhold the command (answer queued) */
++static int
++sbu_pcf_check(unsigned pos, uint8_t b)
++{
++	switch (pos) {
++	case 0: return 0;
++	case 1: return b == 0xe9 ? 0 : 1;
++	case 2: return b == 0xfc ? 0 : 1;
++	case 3: return b == 0 ? 1 : 0;      /* plen 0: no sub-op, passes */
++	case 4:
++		sbu_pcf_sub = b;
++		if (b != 0x05 && b != 0x07) {
++			return 1;       /* every other fce9 sub-op passes, silent (not this knob's business) */
++		}
++		if (sbu_pcf_hold[3] < 2) {
++			SBU_GAP(SG_OTHER, "sweetbtnopcf: fce9 sub %#x plen %u has no action byte: sent unchanged", b, sbu_pcf_hold[3]);
++			return 1;
++		}
++		return 0;
++	default: break;
++	}
++	for (unsigned k = 0; k < sizeof(sbu_pcf_ans) / sizeof(sbu_pcf_ans[0]); k++) {
++		if (sbu_pcf_ans[k].sub == sbu_pcf_sub && sbu_pcf_ans[k].act == b) {
++			unsigned t = __atomic_load_n(&sbu_pcf_qt, __ATOMIC_RELAXED);
++
++			if (sbu_rw_lost) {
++				SBU_GAP(SG_OTHER, "sweetbtnopcf: rx framer lost: fce9 sub %#x action %#x sent unchanged", sbu_pcf_sub, b);
++				return 1;
++			}
++			if (t - __atomic_load_n(&sbu_pcf_qh, __ATOMIC_ACQUIRE) >= SBU_PCF_Q) {
++				SBU_GAP(SG_OTHER, "sweetbtnopcf: answer queue full (%u): fce9 sub %#x action %#x sent unchanged", SBU_PCF_Q, sbu_pcf_sub, b);
++				return 1;
++			}
++			sbu_pcf_q[t % SBU_PCF_Q] = (uint8_t)k;
++			__atomic_store_n(&sbu_pcf_qt, t + 1, __ATOMIC_RELEASE);
++			sbu_nopcf_n++;
++			printf("BT GAP: sweetbtnopcf=1 withheld fce9 sub 0x%02x action 0x%02x plen %u (x%u): not sent to the chip, bluetoothd gets the bt-up14 Command Complete; diagnostic knob, the controller has no PCF filter\n",
++			    sbu_pcf_sub, b, sbu_pcf_hold[3], sbu_nopcf_n);
++			return 2;
++		}
++	}
++	SBU_GAP(SG_OTHER, "sweetbtnopcf: fce9 sub %#x action %#x has no recorded answer: sent unchanged", sbu_pcf_sub, b);
++	return 1;
++}
++
++/* Copies p[0..n) to out (room n + 6) with the tx knobs applied; returns the bytes to send. *nrw = 0x200b rewrites in out (review T-4b11-0226 #2: counted and logged by the caller only after the chip took the bytes) */
++static size_t
++sbu_txrw(const uint8_t *p, size_t n, uint8_t *out, unsigned *nrw)
+ {
+-	unsigned nrw = 0;
++	size_t o = 0;
+ 
+-	for (size_t i = 0; i < n && sbu_pubscan_on; i++) {
++	*nrw = 0;
++	for (size_t i = 0; i < n; i++) {
+ 		uint8_t b = p[i];
++		unsigned pos = sbu_tx_off;      /* offset of b in its H4 packet */
++		bool end = false;               /* b is the last byte of its packet */
+ 
++		if (!sbu_pubscan_on && !sbu_nopcf_on) {
++			out[o++] = b;
++			continue;
++		}
+ 		if (sbu_tx_off == 0) {
+ 			sbu_tx_type = b;
+ 			sbu_tx_hlen = b == 0x01 ? 4u : b == 0x02 ? 5u : b == 0x03 ? 4u : b == 0x05 ? 5u : 0u;   /* type + cmd opcode2 plen1 | ACL handle2 len2 | SCO handle2 len1 | ISO handle2 len2 */
+ 			if (sbu_tx_hlen == 0) {
+-				sbu_pubscan_on = false;
+-				SBU_GAP(SG_OTHER, "sweetbtpubscan: tx byte %#x is no H4 packet type: rewrite disabled for the rest of the boot", b);
+-				return nrw;
++				char why[48];
++
++				snprintf(why, sizeof(why), "tx byte %#x is no H4 packet type", b);
++				sbu_txp_off(why);
++				out[o++] = b;
++				continue;
+ 			}
+ 			sbu_tx_hdr[0] = b;
+ 			sbu_tx_off = 1;
+-			continue;
+-		}
+-		if (sbu_tx_off < sbu_tx_hlen) {
++		} else if (sbu_tx_off < sbu_tx_hlen) {
+ 			sbu_tx_hdr[sbu_tx_off++] = b;
+ 			if (sbu_tx_off == sbu_tx_hlen) {
+ 				unsigned plen = sbu_tx_type == 0x01 || sbu_tx_type == 0x03 ? sbu_tx_hdr[3] :
+@@ -2103,51 +2234,71 @@ sbu_txrw(uint8_t *p, size_t n)
+ 				sbu_tx_need = sbu_tx_hlen + plen;
+ 				if (plen == 0) {
+ 					sbu_tx_off = 0;
++					end = true;
+ 				}
+ 			}
+-			continue;
++		} else {
++			if (sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u) {    /* 0x200b parameter 0 = LE_Scan_Type */
++				sbu_tx_scantype = b;
++			}
++			if (sbu_pubscan_on && sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u + 5u) {    /* 0x200b parameter 5 = Own_Address_Type */
++				if (sbu_tx_hdr[3] != 7) {
++					SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b plen %u (need 7): nothing rewritten", sbu_tx_hdr[3]);
++				} else if (sbu_tx_scantype != 0x00) {       /* review T-4b11-0226 #3: an active scan would put the public address in SCAN_REQ */
++					SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b LE_Scan_Type %#x is not passive: nothing rewritten", sbu_tx_scantype);
++				} else if (b == 0x01) {
++					b = 0x00;
++					(*nrw)++;
++				} else {
++					SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b Own_Address_Type %#x is not 0x01: nothing rewritten", b);
++				}
++			}
++			if (++sbu_tx_off == sbu_tx_need) {
++				sbu_tx_off = 0;
++				end = true;
++			}
+ 		}
+-		if (sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u) {    /* 0x200b parameter 0 = LE_Scan_Type */
+-			sbu_tx_scantype = b;
++		if (sbu_pcf_drop) {             /* patch 0231: the rest of a withheld command */
++			sbu_pcf_drop = !end;
++			continue;
+ 		}
+-		if (sbu_tx_type == 0x01 && sbu_tx_hdr[1] == 0x0b && sbu_tx_hdr[2] == 0x20 && sbu_tx_off == 4u + 5u) {    /* 0x200b parameter 5 = Own_Address_Type */
+-			if (sbu_tx_hdr[3] != 7) {
+-				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b plen %u (need 7): nothing rewritten", sbu_tx_hdr[3]);
+-			} else if (sbu_tx_scantype != 0x00) {       /* review T-4b11-0226 #3: an active scan would put the public address in SCAN_REQ */
+-				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b LE_Scan_Type %#x is not passive: nothing rewritten", sbu_tx_scantype);
+-			} else if (b == 0x01) {
+-				p[i] = 0x00;
+-				nrw++;
+-			} else {
+-				SBU_GAP(SG_OTHER, "sweetbtpubscan: 0x200b Own_Address_Type %#x is not 0x01: nothing rewritten", b);
++		if (sbu_pcf_nhold != 0 || (pos == 0 && sbu_nopcf_on && b == 0x01)) {
++			int v;
++
++			sbu_pcf_hold[sbu_pcf_nhold++] = b;
++			v = sbu_pcf_check(pos, b);
++			if (v == 1 || (v == 0 && end)) {
++				memcpy(out + o, sbu_pcf_hold, sbu_pcf_nhold);
++				o += sbu_pcf_nhold;
++				sbu_pcf_nhold = 0;
++			} else if (v == 2) {
++				sbu_pcf_nhold = 0;
++				sbu_pcf_drop = !end;
+ 			}
++			continue;
+ 		}
+-		if (++sbu_tx_off == sbu_tx_need) {
+-			sbu_tx_off = 0;
+-		}
++		out[o++] = b;
+ 	}
+-	return nrw;
++	return o;
+ }
+ 
+ #define SBU_TXRW_MAX    512
+ static int
+ sbu_tx_kctl(const void *data, size_t len)
+ {
+-	uint8_t buf[SBU_TXRW_MAX];
++	uint8_t buf[SBU_TXRW_MAX + sizeof(sbu_pcf_hold)];
+ 	const uint8_t *p = data;
+ 	int e = 0;
+ 
+-	if (!sbu_pubscan_on) {
++	if (!sbu_pubscan_on && !sbu_nopcf_on) {
+ 		return sbu_tx(data, len);
+ 	}
+-	for (size_t off = 0; off < len && e == 0; off += SBU_TXRW_MAX) {     /* chunks only while the knob is on: a write over 512 bytes shows as several trace rows */
++	for (size_t off = 0; off < len && e == 0; off += SBU_TXRW_MAX) {     /* chunks only while a knob is on: a write over 512 bytes shows as several trace rows */
+ 		size_t m = len - off < SBU_TXRW_MAX ? len - off : SBU_TXRW_MAX;
+-
+ 		unsigned nrw;
++		size_t o = sbu_txrw(p + off, m, buf, &nrw);
+ 
+-		memcpy(buf, p + off, m);
+-		nrw = sbu_txrw(buf, m);
+-		e = sbu_tx(buf, m);
++		e = o != 0 ? sbu_tx(buf, o) : 0;        /* o == 0: the chunk was all withheld (or held for the next write) */
+ 		for (unsigned k = 0; k < nrw; k++) {
+ 			if (e == 0) {
+ 				sbu_pubscan_n++;
+@@ -2157,9 +2308,16 @@ sbu_tx_kctl(const void *data, size_t len)
+ 			}
+ 		}
+ 	}
+-	if (e != 0 && sbu_pubscan_on && sbu_tx_off != 0) {     /* the chip got part of a packet: the framing of the rest is not known */
+-		sbu_pubscan_on = false;
+-		SBU_GAP(SG_OTHER, "sweetbtpubscan: tx error %d inside an H4 packet: rewrite disabled for the rest of the boot", e);
++	if (e != 0 && (sbu_pubscan_on || sbu_nopcf_on) && (sbu_tx_off != 0 || sbu_pcf_nhold != 0)) {     /* the chip got part of a packet: the framing of the rest is not known */
++		char why[48];
++
++		if (sbu_pcf_nhold != 0) {
++			SBU_GAP(SG_OTHER, "sweetbtnopcf: %u held command bytes dropped after tx error %d", sbu_pcf_nhold, e);
++			sbu_pcf_nhold = 0;
++		}
++		sbu_pcf_drop = false;
++		snprintf(why, sizeof(why), "tx error %d inside an H4 packet", e);
++		sbu_txp_off(why);
+ 	}
+ 	return e;
+ }
+@@ -2233,6 +2391,22 @@ sbu_rx_thread(void *arg, wait_result_t w)
+ 	}
+ }
+ 
++static void
++sbu_nopcf_parse(void)       /* patch 0231: own function so the host test runs the boot-arg parse (review F2) */
++{
++	int v = 0;
++
++	if (PE_parse_boot_argn("sweetbtnopcf", &v, sizeof(v))) {
++		if (v == 1) {
++			sbu_nopcf_on = true;
++			sbu_nopcf_rx = true;
++			printf("BT GAP: sweetbtnopcf=1 active: bluetoothd's fce9 sub-op 05/07 (PCF service-UUID scan filter) is not sent to the chip, bluetoothd gets the bt-up14 Command Complete at an rx event boundary (diagnostic knob, not a fix; one BT GAP row per withheld command)\n");
++		} else if (v != 0) {
++			printf("BT GAP: sweetbtnopcf=%d ignored: only 1 is defined\n", v);
++		}
++	}
++}
++
+ void
+ sweet_bt_uart_attach(void)
+ {
+@@ -2403,6 +2577,7 @@ sweet_bt_uart_attach(void)
+ 			printf("BT GAP: sweetbtpubscan=1 active: Own_Address_Type 0x01 (random) in bluetoothd's 0x200b is rewritten to 0x00 (public) on the way to the chip (diagnostic knob, not a fix; bluetoothd sends no 0x2005 because the chip refuses VSC 0xfd48; one BT GAP row per rewrite)\n");
+ 		}
+ 	}
++	sbu_nopcf_parse();       /* patch 0231 (T-b58f): boot-arg sweetbtnopcf=1, withhold bluetoothd's fce9 05/07 PCF scan filter from the chip and answer it; default off */
+ 	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
+ 		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
+ 		(void)sbu_power_off();

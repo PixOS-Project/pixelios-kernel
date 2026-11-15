@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Boot-print vs run-marker lint (AP-229): a print a patch adds must not match a marker that FAILS every run.
+Why: patch 0182's boot line "SWEET GAP: no panic region ..." matched tools/xrun_report.py's `panic/hang/watchdog` marker and ended the proof run RESULT: FAIL, a phone slot lost (AP-229).
+tools/xrun_report.py:558-562 turns two markers into RESULT: FAIL by themselves: `panic/hang/watchdog` and `root mount failed`. The lint takes their regexes (and the `<AREA> GAP:` exemption,
+xrun_report.py:512) from xrun_report itself, so it cannot drift. Statements are found per added `+` line of xnu/patches/*.patch: a printf-family call (printf, kprintf, IOLog, os_log*, DBG*, dprintf)
+or a WRAPPER up to its `;` (a #define: up to its last continuation line). Wrappers are derived from the stack: every added function-like `#define NAME(...)` whose body calls a print or an
+already known wrapper (SM_UC_LOG, UR_TRACE, SWEET_HFSTRACE, HIDLogError ...; --wrappers lists them). A call opened on a context line and continued on added lines counts. The string
+literals of the statement are concatenated like the compiler does and tested PER LOG LINE (split at the literal \\n, as xrun_report counts lines), so the GAP exemption applies to the line it is
+on. Comments are not strings and are ignored. Limits: a wrapper defined in the XNU tree itself (not in a patch) is not known; a `%s GAP:` format is not exempt (the area is unknown here); only
+xnu/patches/*.patch is scanned.
+Do instead of tripping it: reword the line without the marker words, or exclude it in xrun_report.py (with a test in tools/test_xrun_report.py). There is no escape.
+  tools/lint-boot-markers [--patches DIR] [--wrappers]
+Exit 0 PASS, 1 FAIL (BOOT PRINT HITS MARKER lines), 2 usage. Last line: RESULT: PASS|FAIL boot-markers patches=N statements=M hits=K wrappers=W"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import glob
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import xrun_report as xr  # noqa: E402
+
+FAILING = ("panic/hang/watchdog", "root mount failed")   # the markers xrun_report.py turns into RESULT: FAIL by themselves
+BASE_PRINT = r"k?printf|IOLog\w*|os_log\w*|DBG\w*|dprintf"
+STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
+DEFINE = re.compile(r"^\s*#\s*define\s+(\w+)(\([^)]*\))?")   # a function-like macro has "(" right after the name
+LOGLINE = re.compile(r"\\n")   # the C escape in the source: xrun_report counts one log line per "\n" (xrun_report.py:510-513)
+
+
+def print_re(names=()):
+    return re.compile(r"\b(?:%s)\s*\(" % "|".join([BASE_PRINT, *sorted(re.escape(n) for n in names)]))
+
+
+def wrappers(files_lines):
+    """Names of function-like macros an added `#define NAME(...) body` whose body (continuation lines joined) calls a print: printf-family or an already known wrapper, to a fixpoint.
+    Derived from the stack, not hand-kept (review r42-gate-r1 F5): SM_UC_LOG/SM_UC_ERR (0113), UR_TRACE (0157), SWEET_HFSTRACE (0171), HIDLog* and HIDServiceLog* (0058) ... A macro whose
+    body prints nothing (HIDLogInfo `do { } while (0)`) is not a wrapper. A wrapper defined outside the patches (in the XNU tree itself) is not found: it is not an added line."""
+    defs = []
+    for lines in files_lines:
+        i = 0
+        while i < len(lines):
+            raw = lines[i]
+            m = DEFINE.match(raw[1:]) if raw.startswith("+") and not raw.startswith("+++") else None
+            if not m or not m.group(2):
+                i += 1
+                continue
+            body = [raw[1 + m.end():]]
+            while body[-1].rstrip().endswith("\\") and i + 1 < len(lines) and lines[i + 1][:1] in ("+", " "):
+                i += 1
+                body.append(lines[i][1:])
+            text = re.sub(r"/\*.*?\*/|//.*$", "", " ".join(b.rstrip("\\") for b in body))
+            defs.append((m.group(1), STR.sub('""', text)))   # a "printf(" inside a string is no call
+            i += 1
+    names = set()
+    while True:
+        rx = print_re(names)
+        new = {n for n, body in defs if n not in names and rx.search(body)}
+        if not new:
+            return names
+        names |= new
+
+
+def statements(patch_lines, rx):
+    """Yield (first_line_no, joined_text) for every print statement that has at least one ADDED line, in a patch's lines. A call is a printf-family call or a wrapper (rx), up to its `;`
+    (a macro definition: up to the end of its last continuation line); the string literals of the statement are concatenated like the compiler does. A call opened on a context line and
+    continued on added lines is seen too (r1 F5.2); removed lines are skipped; comments are not strings."""
+    cur = None   # [start line, strings, added?, in #define?]
+
+    def feed(no, line, added):
+        nonlocal cur
+        out = []
+        isdef = False
+        m = DEFINE.match(line)
+        if m:
+            line, isdef = line[m.end():], True   # the macro's own name is a definition, not a call
+        line = re.sub(r"/\*.*?\*/|//.*$", "", line)
+        if cur is not None and cur[3] and not isdef:
+            isdef = True
+        while True:
+            if cur is None:
+                p = rx.search(line)
+                if not p:
+                    return out, False
+                cur = [no, [], False, isdef]
+                line = line[p.start():]
+            cur[2] = cur[2] or added
+            masked = STR.sub(lambda mm: '"' + " " * (len(mm.group(0)) - 2) + '"', line)   # a ';' inside a string is no terminator
+            semi = masked.find(";")
+            if semi < 0:
+                cur[1].extend(STR.findall(line))
+                if cur[3] and not line.rstrip().endswith("\\"):   # a #define body ends with its last logical line
+                    if cur[2]:
+                        out.append((cur[0], "".join(cur[1])))
+                    cur = None
+                return out, True
+            cur[1].extend(STR.findall(line[:semi]))
+            if cur[2]:
+                out.append((cur[0], "".join(cur[1])))
+            cur = None
+            line = line[semi + 1:]
+            isdef = False
+
+    for no, raw in enumerate(patch_lines, 1):
+        if raw.startswith(("@@", "diff ", "index ", "+++ ", "--- ")):
+            if cur is not None and cur[2]:
+                yield cur[0], "".join(cur[1])
+            cur = None
+            continue
+        kind = raw[:1]
+        if kind not in ("+", " "):
+            continue   # removed lines and "\ No newline" markers
+        res, _ = feed(no, raw[1:], kind == "+")
+        for r in res:
+            yield r
+    if cur is not None and cur[2]:
+        yield cur[0], "".join(cur[1])
+
+
+def hits_of(text):
+    """Labels of FAILING markers a printed text trips as xrun_report would count it: per LOG LINE (split at the literal \\n), the way xrun_report.py:510-513 counts them, so the
+    `<AREA> GAP:` exemption (xrun_report.py:513) applies to the line it is on and not to the whole joined string, and words glued across a newline never form a marker (r1 F5.3)."""
+    out = []
+    for piece in LOGLINE.split(text):
+        t = piece.replace("\\t", " ").replace("\\r", " ").strip()
+        for lab, rx in xr.MARKERS:
+            if lab not in FAILING or not re.search(rx, t) or lab in out:
+                continue
+            if lab == "panic/hang/watchdog" and xr.GAP_ANY.match(t) and not xr.PANIC_EVENT.search(t):
+                continue   # a counted "<AREA> GAP:" line is no panic event
+            out.append(lab)
+    return out
+
+
+def main(argv):
+    d = os.path.join(HERE, "..", "xnu", "patches")
+    a = list(argv)
+    show_wrappers = False
+    while a:
+        k = a.pop(0)
+        if k == "--patches" and a:
+            d = a.pop(0)
+        elif k == "--wrappers":
+            show_wrappers = True
+        else:
+            print("usage: lint-boot-markers [--patches DIR] [--wrappers]", file=sys.stderr)
+            return 2
+    files = sorted(glob.glob(os.path.join(d, "*.patch")))
+    n = hits = 0
+    texts = {}
+    for p in files:
+        with open(p, errors="replace") as fh:
+            texts[p] = fh.read().split("\n")
+    wr = wrappers(texts.values())
+    if show_wrappers:
+        print("\n".join(sorted(wr)))
+        return 0
+    rx = print_re(wr)
+    for p in files:
+        lines = texts[p]
+        for no, text in statements(lines, rx):
+            n += 1
+            for lab in hits_of(text):
+                hits += 1
+                print("BOOT PRINT HITS MARKER %s:%d marker '%s' (fails every run, tools/xrun_report.py): %r" % (os.path.basename(p), no, lab, text[:160]))
+                print("  why: the run summary counts this line as a panic/mount failure and the proof run ends RESULT: FAIL (AP-229)")
+                print("  do instead: reword the print without the marker words, or exclude it in xrun_report.py with a test; no escape")
+    print("RESULT: %s boot-markers patches=%d statements=%d hits=%d wrappers=%d" % ("PASS" if hits == 0 and files else "FAIL", len(files), n, hits, len(wr)))
+    return 0 if hits == 0 and files else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

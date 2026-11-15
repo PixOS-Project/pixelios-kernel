@@ -1,0 +1,231 @@
+/*
+ * SweetWlanRegistry.cpp - publishes the IO80211 controller and the en0 interface object that wifid and configd look for (xnu patch 0200, T-2144;
+ * SPEC-WIFI Part F rows W1-W3). What is published, and the cited reason for every name, is in iokit/Kernel/arm/SweetWlanRegistry.h (a verbatim copy
+ * of shim/wlan_registry.h, host-tested by shim/wlan_registry_host_test.c); this file only turns those tables into IOKit calls.
+ *
+ * The real classes live in IONetworkingFamily / IO80211Family kexts, which this kernel does not have (precedent: IONetworkStack, patch 0099), so
+ * IONetworkController, IO80211Controller and IONetworkInterface here are empty IOService subclasses that exist only so the class chain answers
+ * IOObjectConformsTo / IOServiceMatching (iokit/Kernel/IOService.cpp:7560-7564 matches IOProviderClass with metaCast). They carry no behaviour: there is
+ * no network driver behind them, and no user client (IOServiceOpen fails, SPEC-WIFI W6).
+ * Gate: published only when the ADT has the `wlan` node launchd's _LimitLoadToDeviceTree evaluates (WR_ADT_GATE_NAME) and boot-arg sweetwlanreg is not 0.
+ * Not compiled against a device here (CI builds the tree), not run on hardware.
+ */
+#include <pexpert/arm64/board_config.h>   /* defines SWEET (as SweetPlatformExpert.cpp) */
+
+#if defined(SWEET)
+#include <IOKit/IOService.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/c++/OSData.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/OSAtomic.h>
+#include <pexpert/pexpert.h>
+
+#include "SweetWlanRegistry.h"
+
+class IONetworkController : public IOService {
+	OSDeclareDefaultStructors(IONetworkController);
+};
+OSDefineMetaClassAndStructors(IONetworkController, IOService);
+
+class IO80211Controller : public IONetworkController {
+	OSDeclareDefaultStructors(IO80211Controller);
+};
+OSDefineMetaClassAndStructors(IO80211Controller, IONetworkController);
+
+class SweetWLANController : public IO80211Controller {
+	OSDeclareDefaultStructors(SweetWLANController);
+};
+OSDefineMetaClassAndStructors(SweetWLANController, IO80211Controller);
+
+class IONetworkInterface : public IOService {
+	OSDeclareDefaultStructors(IONetworkInterface);
+};
+OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
+
+class SweetWLANInterface : public IONetworkInterface {
+	OSDeclareDefaultStructors(SweetWLANInterface);
+};
+OSDefineMetaClassAndStructors(SweetWLANInterface, IONetworkInterface);
+
+/* The 6 MAC bytes the table names (WR_MAC_SRC = /chosen mac-address-wifi0); NULL when the ADT lacks them (the caller prints the GAP). */
+static OSData *
+sweet_wlan_reg_mac(void)
+{
+	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+	OSData *mac = NULL;
+
+	if (chosen != NULL) {
+		OSData *d = OSDynamicCast(OSData, chosen->getProperty("mac-address-wifi0"));
+		if (d != NULL && d->getLength() == WR_MAC_LEN) {
+			mac = d;
+			mac->retain();
+		}
+		chosen->release();
+	}
+	return mac;
+}
+
+/* returns the number of properties set; every property that cannot be set is a WIFI GAP line, never a silent skip. `props`/`nprops`: wr_obj tables at publish time, wr_live_props (W-UI) after the ifnet exists;
+ * `bsd_name` replaces the NULL string of the BSD Name row. */
+static unsigned
+sweet_wlan_reg_props_of(IOService *to, const char *oname, const struct wr_prop *props, size_t nprops, const char *bsd_name)
+{
+	unsigned set = 0;
+
+	for (size_t i = 0; i < nprops; i++) {
+		const struct wr_prop *p = &props[i];
+		bool ok = false;
+
+		switch (p->kind) {
+		case WR_STR:
+			if (p->str == NULL && bsd_name == NULL) {
+				break;
+			}
+			ok = to->setProperty(p->key, p->str != NULL ? p->str : bsd_name);
+			break;
+		case WR_NUM:
+			ok = to->setProperty(p->key, p->num, p->bits);
+			break;
+		case WR_BOOL:
+			ok = to->setProperty(p->key, p->num != 0);
+			break;
+		case WR_ADT_DATA: {
+			OSData *mac = sweet_wlan_reg_mac();
+			if (mac == NULL) {
+				IOLog("WIFI GAP: W2 %s: ADT has no 6-byte %s; %s.%s not published\n", oname, p->str, oname, p->key);
+			} else {
+				ok = to->setProperty(p->key, mac);
+				mac->release();
+			}
+			break;
+		}
+		}
+		if (ok) {
+			set++;
+		} else if (p->kind != WR_ADT_DATA) {
+			IOLog("WIFI GAP: W3 %s.%s setProperty failed\n", oname, p->key);
+		}
+	}
+	return set;
+}
+
+static unsigned
+sweet_wlan_reg_props(IOService *to, const struct wr_obj *o)
+{
+	return sweet_wlan_reg_props_of(to, o->name, o->props, o->nprops, NULL);
+}
+
+/* W-UI (sprint 2026-11-08): the interface object, kept after the publish so the ifnet's name can be put on it when en0 exists (sweet_wlan_registry_set_bsd_name). A tiny spin flag guards the pointer and the pending
+ * name only (no IOKit call under it); the properties are set outside it (setProperty is idempotent, a double set is harmless). The publish runs from SweetPlatformExpert::start, the caller from the keep thread after the
+ * boot join: normally the publish is first, a name that arrives earlier is kept and applied by the publish (printed as pending). */
+static IOService *sweet_wlan_reg_ifc;
+static char sweet_wlan_reg_pending[16];
+static volatile UInt32 sweet_wlan_reg_busy;
+
+static void
+sweet_wlan_reg_enter(void)
+{
+	while (!OSCompareAndSwap(0, 1, &sweet_wlan_reg_busy)) {
+	}
+}
+
+static void
+sweet_wlan_reg_leave(void)
+{
+	(void)OSCompareAndSwap(1, 0, &sweet_wlan_reg_busy);
+}
+
+static void
+sweet_wlan_reg_apply_live(IOService *ifc, const char *name)
+{
+	unsigned n = sweet_wlan_reg_props_of(ifc, "interface", wr_live_props, WR_NLIVE, name);
+
+	IOLog("SWEET WIFI: registry: %s set on the interface object (%u of %u props: %s, IOPrimaryInterface, IOBuiltin, IOLocation)\n", WR_BSD_NAME_KEY, n, (unsigned)WR_NLIVE, name);
+	if (n != WR_NLIVE) {
+		IOLog("WIFI GAP: W3 registry: only %u of %u live properties could be set on the interface object\n", n, (unsigned)WR_NLIVE);
+	}
+}
+
+/* Called once the en0 ifnet exists (patch 0268 keep hand-over). Returns 0 = set, 1 = the interface object is not published yet (the name is kept and set by the publish; a GAP line says so), -1 = refused. */
+extern "C" int
+sweet_wlan_registry_set_bsd_name(const char *name)
+{
+	IOService *ifc;
+
+	if (name == NULL || name[0] == 0 || strlen(name) >= sizeof sweet_wlan_reg_pending) {
+		IOLog("WIFI GAP: W3 registry: BSD Name not set: no valid interface name given\n");
+		return -1;
+	}
+	sweet_wlan_reg_enter();
+	ifc = sweet_wlan_reg_ifc;
+	if (ifc != NULL) {
+		ifc->retain();
+	} else {
+		strlcpy(sweet_wlan_reg_pending, name, sizeof sweet_wlan_reg_pending);
+	}
+	sweet_wlan_reg_leave();
+	if (ifc == NULL) {
+		IOLog("WIFI GAP: W3 registry: BSD Name %s pending: the interface object is not published yet (sweetwlanreg=0, no ADT wlan node, or the publish has not run)\n", name);
+		return 1;
+	}
+	sweet_wlan_reg_apply_live(ifc, name);
+	ifc->release();
+	return 0;
+}
+
+extern "C" void
+sweet_wlan_registry_publish(void)
+{
+	uint32_t on = 1;
+	(void)PE_parse_boot_argn(WR_BOOTARG, &on, sizeof(on));
+	if (on == 0) {
+		IOLog("WIFI GAP: W3 %s=0, IO80211 controller and en0 interface not published\n", WR_BOOTARG);
+		return;
+	}
+
+	IORegistryEntry *root = IORegistryEntry::fromPath("/", gIODTPlane);
+	OSCollectionIterator *it = (root != NULL) ? IODTFindMatchingEntries(root, kIODTRecursive, WR_ADT_GATE_NAME) : NULL;
+	IORegistryEntry *wlan = (it != NULL) ? OSDynamicCast(IORegistryEntry, it->getNextObject()) : NULL;
+	bool gate = (wlan != NULL);
+	OSSafeReleaseNULL(it);
+	OSSafeReleaseNULL(root);
+	if (!gate) {
+		IOLog("WIFI GAP: W1 no ADT node named '%s': IO80211 controller and en0 interface not published\n", WR_ADT_GATE_NAME);
+		return;
+	}
+
+	SweetWLANController *ctl = OSTypeAlloc(SweetWLANController);
+	SweetWLANInterface *ifc = OSTypeAlloc(SweetWLANInterface);
+	bool ok = (ctl != NULL && ifc != NULL && ctl->init() && ifc->init() && ctl->attach(IOService::getServiceRoot()));
+	if (ok) {
+		unsigned nc = sweet_wlan_reg_props(ctl, &wr_controller);
+		ok = ifc->attach(ctl);
+		if (ok) {
+			unsigned ni = sweet_wlan_reg_props(ifc, &wr_interface);
+			char pend[sizeof sweet_wlan_reg_pending];
+
+			ctl->registerService();
+			ifc->registerService();
+			ifc->retain();
+			sweet_wlan_reg_enter();
+			sweet_wlan_reg_ifc = ifc;
+			strlcpy(pend, sweet_wlan_reg_pending, sizeof pend);
+			sweet_wlan_reg_leave();
+			if (pend[0] != 0) {
+				sweet_wlan_reg_apply_live(ifc, pend);
+			}
+			IOLog("SWEET WIFI: published %s (%u props) and %s %s (%u props) role=%s\n", wr_controller.chain[3], nc, wr_interface.chain[2],
+			    WR_IFNAME, ni, WR_ROLE);
+		}
+	}
+	if (!ok) {
+		IOLog("WIFI GAP: W3 IO80211 controller/interface allocation or attach failed: nothing published\n");
+	}
+	for (size_t g = 0; g < WR_NGAPS; g++) {
+		IOLog("%s\n", wr_gaps[g]);
+	}
+	OSSafeReleaseNULL(ifc);
+	OSSafeReleaseNULL(ctl);
+}
+#endif /* SWEET */

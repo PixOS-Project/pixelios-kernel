@@ -11,6 +11,8 @@ to the end of the merged log by whole-line matching (difflib, so lines the phone
 not the other do not break the alignment); only the lines after the overlap are appended. No overlap = the log scrolled
 past between two snapshots: a `[...gap...]` line is inserted. Prints a one-line coverage summary to stderr.
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import difflib, glob, os, sys
 
 GAP = "[...gap...]"
@@ -50,7 +52,10 @@ def load_qr2(files):
         try:
             with open(f[:-4] + ".json") as fh:
                 meta = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:   # lint-silent: expected a capture without its .json sidecar has no metadata: the file mtime orders it
+            meta = {}
+        except (OSError, ValueError) as _err:
+            print(f"qrmerge GAP: {f[:-4]}.json unreadable ({type(_err).__name__}: {_err}): ordered by file mtime", file=sys.stderr)
             meta = {}
         sess.append((meta.get("t_first") or os.path.getmtime(f), f, meta))
     lines, sidx, times, gaps, info = [], [], [], 0, []

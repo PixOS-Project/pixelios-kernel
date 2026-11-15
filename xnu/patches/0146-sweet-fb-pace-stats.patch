@@ -1,0 +1,70 @@
+SWEET frame pacing statistics (patch 0146, boot-arg sweetpace=1, default off; G-10 step 2b): read-only per-second line `SWEET PACE: swaps N gap_ms <10:a <25:b <40:c <60:d <100:e >=100:f since_vsync_ms avg X max Y` = distribution of the gaps between consecutive IOMFB swaps and the delay between the last vsync callback and CoreAnimation swap (its render latency). Tells whether the ~22-28 distinct fps are quantized by the vsync/deadline pacing (peaks at 17/33/50 ms) or by render latency. No hardware access.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -275,11 +275,18 @@
+ 	return true;
+ }
+ 
++static uint64_t sweet_fb_last_vsync_ns;   /* patch 0146: host time of the last vsync callback sent to CA, for the swap-after-vsync latency */
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
++	{
++		uint64_t vns;
++		absolutetime_to_nanoseconds(now, &vns);
++		sweet_fb_last_vsync_ns = vns;
++	}
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a2 is the vsync's host time and
+@@ -391,6 +398,47 @@
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ 	/*
++	 * Frame pacing statistics (patch 0146, boot-arg sweetpace=1, default off; G-10): one line per second
++	 * `SWEET PACE: swaps N gap_ms <10:a <25:b <40:c <60:d <100:e >=100:f since_vsync_ms avg X max Y`
++	 * = how the gaps between consecutive swaps distribute (a swap stream locked to the 16.7 ms vsync shows peaks at 17/33/50 ms) and how
++	 * long after the last vsync callback CoreAnimation delivers its swap (its render latency). Read-only, no hardware access.
++	 */
++	static int pace_on = -1;
++	if (pace_on < 0) {
++		int v = 0;
++		pace_on = (PE_parse_boot_argn("sweetpace", &v, sizeof(v)) && v != 0) ? 1 : 0;
++	}
++	if (pace_on) {
++		static uint64_t last_swap_ns, sec_start_ns, sv_sum_ns, sv_max_ns;
++		static uint32_t bk[6], n_pace;
++		uint64_t pn;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &pn);
++		if (last_swap_ns != 0) {
++			uint64_t g = (pn - last_swap_ns) / 1000000;
++			bk[g < 10 ? 0 : g < 25 ? 1 : g < 40 ? 2 : g < 60 ? 3 : g < 100 ? 4 : 5]++;
++		}
++		last_swap_ns = pn;
++		if (sweet_fb_last_vsync_ns != 0 && pn >= sweet_fb_last_vsync_ns) {
++			uint64_t d = pn - sweet_fb_last_vsync_ns;
++			sv_sum_ns += d;
++			if (d > sv_max_ns) {
++				sv_max_ns = d;
++			}
++		}
++		n_pace++;
++		if (sec_start_ns == 0) {
++			sec_start_ns = pn;
++		}
++		if (pn - sec_start_ns >= 1000000000ull) {
++			IOLog("SWEET PACE: swaps %u gap_ms <10:%u <25:%u <40:%u <60:%u <100:%u >=100:%u since_vsync_ms avg %u max %u\n", n_pace,
++			    bk[0], bk[1], bk[2], bk[3], bk[4], bk[5], n_pace ? (uint32_t)(sv_sum_ns / n_pace / 1000000) : 0, (uint32_t)(sv_max_ns / 1000000));
++			memset(bk, 0, sizeof bk);
++			n_pace = 0;
++			sv_sum_ns = sv_max_ns = 0;
++			sec_start_ns = pn;
++		}
++	}
++	/*
+ 	 * Frame statistics (patch 0141, boot-arg sweetfps=1, default off; G-10): CoreAnimation swaps every vsync even when nothing
+ 	 * changes, so the swap rate is not a render rate. Sample a 32x32 grid of layer 0's surface at every swap, count the swaps whose
+ 	 * content differs from the previous one ("distinct") and the longest gap between distinct frames in the second ("jank"). One

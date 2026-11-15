@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include "ramlog.h"
 
 /*
@@ -11,6 +12,17 @@ static char ramlog_buf[RAMLOG_SIZE];
 static unsigned ramlog_head;
 static unsigned ramlog_used;
 static unsigned ramlog_appended;	/* lines ever appended: stable cursor across eviction */
+/*
+ * Sequential-read cursor for ramlog_copy_line: the byte offset (from head)
+ * where retained line cur_idx starts. Every reader walks the lines in order
+ * (pstore_save x2, USB pump, pager); without it each call rescanned from the
+ * oldest byte, O(lines x bytes) per pstore save. MMU off (Device memory), a
+ * full 32 KiB log and 2 saves per WLAN hold step made the shim take minutes
+ * before the XNU jump (all_demo4 [obs 2026-11-11]: USB 260 s after fastboot
+ * boot, 52 s with the cursor). Cleared on every append and reset (an append
+ * can evict and move head).
+ */
+static uint32_t cur_idx, cur_off, cur_ok;
 
 static unsigned idx(unsigned i)
 {
@@ -22,9 +34,11 @@ static unsigned idx(unsigned i)
 
 void ramlog_reset(void)
 {
+	/* style-allow: assert ramlog.c is on the assert report path (STYLE-C) */
 	ramlog_head = 0;
 	ramlog_used = 0;
 	ramlog_appended = 0;
+	cur_ok = 0;
 }
 
 /* Advance head past the oldest stored line (or drop everything if the
@@ -44,17 +58,19 @@ static void drop_oldest_line(void)
 
 void ramlog_line(const char *line)
 {
-	unsigned len = 0;
+	/* style-allow: assert ramlog.c is on the assert report path (STYLE-C) */
+	uint32_t len = 0;
 	while (line[len] && len < RAMLOG_LINE_MAX - 1)
 		len++;
 	while (ramlog_used + len + 1 > RAMLOG_SIZE)
 		drop_oldest_line();
-	unsigned pos = ramlog_used;
-	for (unsigned i = 0; i < len; i++)
+	uint32_t pos = ramlog_used;
+	for (uint32_t i = 0; i < len; i++)
 		ramlog_buf[idx(pos + i)] = line[i];
 	ramlog_buf[idx(pos + len)] = '\n';
 	ramlog_used += len + 1;
 	ramlog_appended++;
+	cur_ok = 0;
 }
 
 unsigned ramlog_total(void)
@@ -71,16 +87,25 @@ unsigned ramlog_lines(void)
 	return count;
 }
 
-unsigned ramlog_copy_line(unsigned index, char *dst, unsigned cap)
+uint32_t ramlog_copy_line(uint32_t index, char *dst, uint32_t cap)
 {
+	/* style-allow: assert ramlog.c is on the assert report path (STYLE-C) */
 	if (!cap)
 		return 0;
-	unsigned seen = 0, out = 0;
-	for (unsigned k = 0; k < ramlog_used; k++) {
+	uint32_t seen = 0, out = 0, k = 0;
+	/* resume at a known line start (same content: no append since) */
+	if (cur_ok && index >= cur_idx && cur_off <= ramlog_used) {
+		seen = cur_idx;
+		k = cur_off;
+	}
+	for (; k < ramlog_used; k++) {
 		char c = ramlog_buf[idx(k)];
 		if (c == '\n') {
 			if (seen == index) {
 				dst[out] = 0;
+				cur_idx = index + 1;
+				cur_off = k + 1;
+				cur_ok = 1;
 				return out;
 			}
 			seen++;

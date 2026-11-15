@@ -63,6 +63,7 @@ void wait_ticks(uint64_t ticks)
 	uint64_t start;
 	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
 	uint64_t until = start + ticks;
+	/* bounded: until = start + ticks (CNTPCT deadline), the break below */
 	for (;;) {
 		uint64_t now;
 		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
@@ -108,6 +109,7 @@ static void uart_char(char c)
 	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
 	uint64_t deadline = start + counter_freq() / 1000; /* ~1 ms */
 	if (base[UART_UFCON / 4] & 1) {
+		/* bounded: 1 ms deadline below; expiry sets uart_dead (no GAP: UART dead) */
 		while (base[UART_UFSTAT / 4] & UART_TX_FULL) {
 			uint64_t now;
 			__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
@@ -117,6 +119,7 @@ static void uart_char(char c)
 			}
 		}
 	} else {
+		/* bounded: 1 ms deadline below; expiry sets uart_dead (no GAP: UART dead) */
 		while (!(base[UART_UTRSTAT / 4] & UART_TXE)) {
 			uint64_t now;
 			__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
@@ -132,6 +135,7 @@ static void uart_char(char c)
 
 static void uart_text(const char *s)
 {
+	/* bounded: the NUL of the string (literal or a buffer the caller terminated) */
 	while (*s)
 		uart_char(*s++);
 }
@@ -149,7 +153,7 @@ void con_set_video(uintptr_t base, unsigned width, unsigned height, unsigned str
 void con_clear(uint32_t bg)
 {
 	for (unsigned y = 0; y < fb_h; y++) {
-		volatile uint32_t *line = con_fb + y * (fb_stride / 4);
+		volatile uint32_t *line = con_fb + (uintptr_t)y * (fb_stride / 4);
 		for (unsigned x = 0; x < fb_w; x++)
 			line[x] = bg;
 	}
@@ -169,8 +173,8 @@ static void put_char(int col, char ch, uint32_t fg)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
 			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (fb_stride / 4)
-						       + x0 + gx * SCALE;
+				volatile uint32_t *p = con_fb + (uintptr_t)(y0 + gy * SCALE + sy) * (fb_stride / 4)
+						       + x0 + (uintptr_t)gx * SCALE;
 				for (int sx = 0; sx < SCALE; sx++)
 					p[sx] = c;
 			}
@@ -179,6 +183,7 @@ static void put_char(int col, char ch, uint32_t fg)
 
 static int put_str(int col, const char *s, uint32_t fg)
 {
+	/* bounded: the NUL of the string (literal or a buffer the caller terminated) */
 	while (*s)
 		put_char(col++, *s++, fg);
 	return col;
@@ -199,6 +204,7 @@ static void fmt_dec(char *buf, unsigned v)
 	do {
 		tmp[n++] = (char)('0' + v % 10);
 		v /= 10;
+		/* bounded: v /= 10 reaches 0 (<= 10 digits for 32 bits) */
 	} while (v);
 	for (int i = 0; i < n; i++)
 		buf[i] = tmp[n - 1 - i];
@@ -316,6 +322,7 @@ static unsigned pager_content_rows(void)
 static void pager_render_line(const char *s)
 {
 	unsigned n = 0;
+	/* bounded: the NUL of the string (literal or a buffer the caller terminated) */
 	while (s[n])
 		n++;
 	unsigned lab = n < LABEL_COLS ? n : LABEL_COLS;
@@ -407,6 +414,7 @@ void pager_replay(void)
 		wait_ticks(counter_freq() * 3);
 		return;
 	}
+	/* bounded: remaining drops by PAGER_HOLD_S (12) per page and the inner loop breaks at 0 */
 	while (remaining) {
 		for (unsigned p = 1; p <= pages; p++) {
 			con_clear(0xff000000U);

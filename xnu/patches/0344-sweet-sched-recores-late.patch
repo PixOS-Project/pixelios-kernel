@@ -1,0 +1,133 @@
+SWEET scheduler core recommendation, late re-apply + readback (patch 0344, lowclk 2026-11-13; scheduler state only: no register, bus, firmware or memory write outside the scheduler's own state). Defect [read osfmk/kern/sched_prim.c sched_update_recommended_cores + obs line order in runs b1, b7, count5, nav37]: patch 0270 applies boot-arg sweetrecores=MASK in AppleCLCD::start, before SweetCPU::startAll has started a secondary CPU; with MASK = 0x1e no requested core is online, so the scheduler sets the boot CPU's bit again ("add boot processor or we hang"), and nothing applies MASK later (sched_mark_processor_online_locked only sets the online bit): every core stayed recommended. This patch (1) makes 0270's call (sched_perfcontrol_update_recommended_cores) once more from SweetCPU::startAll right after 'SWEET CPU: N/N CPUs initialized' (a kernel thread, preemption enabled, no lock held: the context the call asks for), and (2) reads the result back at both points under sched_available_cores_lock: `SWEET SCHED: recommended cores <early|late>: requested 0x.. effective 0x.. online 0x.. (cpus 0x.., ...)` (effective = OR of every pset's recommended_bitmask, online = sched_online_processors; without the boot-arg the late line says `requested none`). `SWEET GAP: SCHED recommended cores ...` when effective & online is not requested & online (early: expected for a mask without the boot CPU, the text says it is re-applied; late: the mask is NOT in effect, with the failsafe / sleep-override flags), when the mask is refused (0270's rule), or when at the late point the scheduler's requested mask is neither the boot-arg nor "nobody asked" (another caller, e.g. SWEET THERMAL patch 0336, changed it: left alone). No new boot-arg. With cpus=8 a mask must name the cores that should run threads (0x1e would now really keep logical 5-7 idle). Tests: tools/test_recores.py (host model tools/recores_host_test.c). ORDER: applies after patch 0270 (its AppleCLCD::start block is context).
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -7426,6 +7426,90 @@
+ }
+ 
+ /*
++ * Patch 0344 (lowclk 2026-11-13; scheduler state only, no register, bus or firmware access): boot-arg sweetrecores (patch 0270) again, at a point where it can work.
++ * Defect [read]: patch 0270 calls sched_perfcontrol_update_recommended_cores(MASK) in AppleCLCD::start, before SweetCPU::startAll has started a secondary CPU
++ * [obs runs b1, b7, count5, nav37: the 0270 line precedes "SWEET CPU: requested="]. Only the boot CPU is in sched_online_processors then, so with MASK = 0x1e
++ * sched_update_recommended_cores() finds no requested core online and sets the boot CPU's bit again ("add boot processor or we hang"); the secondaries are
++ * registered as recommended (processor_init) and processor_up() only sets their online bit, so nothing ever applies MASK: every core stays recommended.
++ *
++ * sweet_recores_point(0) = early, after 0270's call (AppleCLCD::start): reads back and prints, changes nothing.
++ * sweet_recores_point(1) = late, from SweetCPU::startAll after "N/N CPUs initialized" (a kernel thread, preemption enabled, no lock held: the context
++ * sched_perfcontrol_update_recommended_cores_reason() asks for): makes 0270's call once more, then reads back and prints.
++ * Both print `SWEET SCHED: recommended cores <early|late>: requested 0x.. effective 0x.. online 0x..`; effective = the OR of every pset's recommended_bitmask,
++ * online = sched_online_processors, both read under sched_available_cores_lock. `SWEET GAP: SCHED recommended cores ...` when effective & online is not
++ * requested & online (requested = every CPU when the boot-arg is absent), when the mask is refused (0270's rule), or when the scheduler's requested mask is no longer
++ * the boot-arg at the late point (another caller, e.g. SWEET THERMAL patch 0336, changed it: it is left alone; a mask nobody set yet is applied).
++ * The early GAP ("not in effect yet") is expected on every boot whose mask leaves out the boot CPU: it is the observed defect of the early call, the late line is the result.
++ * Side effect of a mask that now works [read sched_update_recommended_cores]: processor_avail_count_user drops by the cores left out, so user space sees fewer
++ * available CPUs (host_info avail_cpus, osfmk/kern/host.c), and the kernel's own failsafe (sched_consider_recommended_cores) can recommend every core again for a starving realtime thread.
++ */
++void sweet_recores_read(uint64_t *req, uint64_t *eff, uint64_t *online, uint32_t *held);
++void sweet_recores_point(int late);
++
++void
++sweet_recores_read(uint64_t *req, uint64_t *eff, uint64_t *online, uint32_t *held)
++{
++	uint64_t e = 0;
++	spl_t s = splsched();
++
++	simple_lock(&sched_available_cores_lock, LCK_GRP_NULL);
++	for (pset_node_t node = &pset_node0; node != NULL; node = node->node_list) {
++		for (int pset_id = lsb_first(node->pset_map); pset_id >= 0; pset_id = lsb_next(node->pset_map, pset_id)) {
++			e |= pset_array[pset_id]->recommended_bitmask;
++		}
++	}
++	*req = perfcontrol_requested_recommended_cores & usercontrol_requested_recommended_cores;
++	*eff = e;
++	*online = sched_online_processors;
++	*held = (perfcontrol_failsafe_active ? 1u : 0u) | (perfcontrol_sleep_override ? 2u : 0u);   /* while either is set the scheduler stores a request without applying it */
++	simple_unlock(&sched_available_cores_lock);
++	splx(s);
++}
++
++/* SWEET-RECORES-LOGIC-BEGIN (tools/test_recores.py compiles from here to the END mark against tools/recores_host_test.c) */
++void
++sweet_recores_point(int late)
++{
++	const char *when = late ? "late" : "early";
++	uint32_t rc = 0, held = 0;
++	uint64_t req = 0, eff = 0, online = 0, want;
++	unsigned int ncpu = ml_get_cpu_count();
++	uint32_t cpus = ncpu >= 32 ? 0xffffffffu : ((1u << ncpu) - 1);
++	bool have = PE_parse_boot_argn("sweetrecores", &rc, sizeof(rc));
++	bool valid = have && (rc & cpus) != 0 && (rc & ~cpus) == 0;      /* patch 0270's rule: a core in the mask, no bit above the CPU count */
++
++	if (!late && !valid) {
++		return;         /* early: nothing was asked, or patch 0270 printed its own refusal GAP; the late point reports */
++	}
++	if (late && have && !valid) {
++		printf("SWEET GAP: SCHED recommended cores late: sweetrecores=0x%x refused (cpus 0x%x): not applied, every core stays recommended\n", rc, cpus);
++	}
++	if (late && valid) {
++		sweet_recores_read(&req, &eff, &online, &held);
++		if (req != rc && req != ALL_CORES_RECOMMENDED) {
++			/* ALL_CORES_RECOMMENDED = nobody asked yet (AppleCLCD::start has not run: IOKit matching order is not fixed): apply. Anything else is another caller's mask. */
++			printf("SWEET GAP: SCHED recommended cores late: the scheduler's requested mask is 0x%llx, not sweetrecores 0x%x (another caller changed it after the early call): not re-applied, effective 0x%llx online 0x%llx\n",
++			    req, rc, eff, online);
++			return;
++		}
++		sched_perfcontrol_update_recommended_cores(rc);
++	}
++	sweet_recores_read(&req, &eff, &online, &held);
++	want = valid ? rc : cpus;
++	if (valid) {
++		printf("SWEET SCHED: recommended cores %s: requested 0x%x effective 0x%llx online 0x%llx (cpus 0x%x, sweetrecores, patch 0344)\n", when, rc, eff, online, cpus);
++	} else {
++		printf("SWEET SCHED: recommended cores %s: requested none effective 0x%llx online 0x%llx (cpus 0x%x, patch 0344)\n", when, eff, online, cpus);
++	}
++	if ((eff & online) != (want & online)) {
++		printf("SWEET GAP: SCHED recommended cores %s: effective & online 0x%llx is not requested & online 0x%llx (held %u: 1 failsafe, 2 sleep)%s\n",
++		    when, eff & online, want & online, held,
++		    late ? ": the mask is NOT in effect" : ": not in effect yet (the early call runs before the secondary CPUs are online), re-applied after the CPU start");
++	}
++}
++/* SWEET-RECORES-LOGIC-END */
++
++/*
+  * Consider whether we need to activate the recommended cores failsafe
+  *
+  * Called from quantum timer interrupt context of a realtime thread
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -25,6 +25,7 @@
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
+ extern "C" void sweet_mem_probe_start(unsigned ncpu);
++extern "C" void sweet_recores_point(int late);   /* patch 0344: osfmk/kern/sched_prim.c */
+ static uint64_t sweet_clk_ticks[SWEET_SMP_MAX_CPUS], sweet_clk_midr[SWEET_SMP_MAX_CPUS], sweet_clk_frq;
+ static uint64_t sweet_clk_adds;
+ 
+@@ -261,6 +262,7 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	sweet_recores_point(1);   /* patch 0344: boot-arg sweetrecores once more now that every CPU is online (0270's early call cannot take effect), + effective mask readback; scheduler state only */
+ 	{
+ 		uint64_t fvpa = 0;
+ 		if (PE_parse_boot_argn("sweetfvmap", &fvpa, sizeof(fvpa)) && fvpa != 0) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -237,6 +237,7 @@
+ 
+ extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* patch 0270: osfmk/kern/sched_prim.c */
+ extern "C" unsigned int ml_get_cpu_count(void);   /* patch 0270 */
++extern "C" void sweet_recores_point(int late);   /* patch 0344: osfmk/kern/sched_prim.c */
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -265,6 +266,7 @@
+ 				sched_perfcontrol_update_recommended_cores(rc);
+ 				IOLog("SWEET SCHED: recommended cores 0x%x of 0x%x (sweetrecores, patch 0270): other cores take interrupts and bound threads only\n", rc, online);
+ 			}
++			sweet_recores_point(0);   /* patch 0344: read the effective mask back (log only); the call above runs before the secondary CPUs are online */
+ 		}
+ 	}
+ 	PE_current_console(&video);

@@ -19,7 +19,7 @@ def tracked(root, *globs):
     for rel, p in sorted(seen.items()):
         try:
             yield rel, p.read_text(errors="replace").splitlines()
-        except OSError:
+        except OSError:   # lint-silent: expected a file that vanished while scanning has no lines to check
             continue
 
 

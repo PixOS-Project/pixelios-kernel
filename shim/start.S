@@ -22,6 +22,11 @@ _start:
 	lsr	x21, x21, #2
 	msr	spsel, #1
 	adr	x1, _stack_top
+#ifdef EL2_TRAP
+	cmp	x21, #2				/* (a) --el2-trap: the EL2 path gets its own stack (SPEC 3.3.1) */
+	adr	x2, _el2_stack_top
+	csel	x1, x2, x1, eq
+#endif
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
@@ -37,9 +42,17 @@ _start:
 	str	x21, [x1]
 	cmp	x21, #2
 	b.ne	3f
+#ifdef EL2_TRAP
+	bl	el2_census			/* (b) before HCR_EL2 is overwritten (SPEC 3.2) */
+	adr	x1, el2_vectors			/* (c) EL2 vectors; VBAR_EL1 stays `vectors` */
+	msr	vbar_el2, x1
+	adr	x1, vectors
+	msr	vbar_el1, x1
+#else
 	adr	x1, vectors
 	msr	vbar_el2, x1
 	msr	vbar_el1, x1
+#endif
 	mov	x2, #(1 << 31)			/* HCR_EL2: RW only (AArch64 EL1; AMO/IMO/FMO=0) */
 	msr	hcr_el2, x2
 	mrs	x2, midr_el1
@@ -77,6 +90,9 @@ _start:
 	mov	x3, #9
 	orr	x2, x2, x3			/* SRE (bit 0) | Enable (bit 3) */
 	msr	icc_sre_el2, x2
+#ifdef EL2_TRAP
+	bl	el2_enable			/* (d) after the hcr_el2 / vttbr_el2 writes above, before the eret (SPEC 3.3.1, 3.3.7) */
+#endif
 	isb
 	adr	x2, 3f
 	msr	elr_el2, x2

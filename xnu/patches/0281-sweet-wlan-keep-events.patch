@@ -1,0 +1,71 @@
+SWEET WLAN keep events (patch 0281, W-D6 boot A, branch wlan/rejoin; docs/research/W-D6-rejoin-dhcp.md): the keep phase no longer consumes WL_EVENT items unread. (1) Every ring-2 item of type 0xE is decoded (sweet_wlan_g2.h swg_ke_event, the frame parse factored out of swg_e_event into the pure swg_e_fparse) and printed as ONE line `SWEET WLAN: keep event type T flags F status S reason R auth A datalen D item_len L` (no address, no ifname); an unknown or short frame is a `WIFI GAP: keep event ...` line. (2) The consumed event buffer is re-posted under a fresh pktid (swg_ke_flush: the existing swg_d4d_post store kind, ten item words + H2D-WR slot + doorbell 0, judged by the L25 whitelist as class L2 buffer post, L7 index, L9 doorbell, as Linux msgbuf.c and OpenBSD if_bwfm_pci.c do for every event), after the ring-2 read-index update; events that arrive inside the RSSI refresh ioctl go the same way (swg_e_items keep branch) and the refresh drains ring 2 first (swl25_rssi_drain) so a busy ring 2 no longer skips every refresh. (3) Link-down detector (swg_ke_note): LINK with flag 0x01 clear, DEAUTH 5, DEAUTH_IND 6, DISASSOC 11, DISASSOC_IND 12 or SET_SSID with a non-zero status take UP -> DOWN exactly once (`SWEET WLAN: keep link DOWN cause C status S reason R`); a link-up event while DOWN is logged and the state stays DOWN (UP needs a new 4-way, patch 0282). WLC_GET_RSSI = 0 is logged as a hint only. (4) On DOWN the keep thread (this patch, bsd/dev/sweet_wlan.c) tells iOS and sends NOTHING to the firmware: sweet_wlan_a80211_kept_link(0) clears kept.joined (swr_kept_clear) and fires SWSTA_REV_LINK_DOWN (wifid gets LINK_CHANGED isLinkDown 1; a join of the kept SSID now fails), en0_link_only(e, 0) turns IFF_RUNNING off and posts KEV_DL_LINK_OFF without failing the flow ring. (5) DHCP credentials: a credential blob with ip == 0 AND gw == 0 runs the join and the 4-way as before and skips L26 (`SWEET WLAN: L26 not run: DHCP credentials (no static address)`); exactly one of the two zero stays refused. The headers (sweet_wlan_g2.h, sweet_wlan_l25_hs.h, sweet_wlan_l25_glue.h, sweet_wlan_radio.h, sweet_wlan_en0.h, sweet_wlan_a80211.c) are regenerated in place in patches 0174, 0206, 0199 and 0201 from shim/ (tools/gen-wlan-hunks, tools/gen-wlan-en0-patch, tools/gen-wlan-a80211-patch), as for 0273; this patch holds the hand-written glue hunks of sweet_wlan.c. New firmware-facing stores: only the event-buffer re-post above (existing store kind, existing whitelist classes). Not run on hardware.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2274,6 +2274,7 @@ static struct {
+ } sw_keep_join;
+ extern int sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t ssid_len, const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok);   /* bsd/dev/sweet_wlan_a80211.c (patch 0201) */
+ extern int sweet_wlan_a80211_kept_rssi(int32_t rssi);                                                                          /* bsd/dev/sweet_wlan_a80211.c (patch 0201, Part A) */
++extern int sweet_wlan_a80211_kept_link(int up);                                                                              /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0281): the AP link is lost; up != 0 not built */
+ extern int sweet_wlan_registry_set_bsd_name(const char *name);                                                                 /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
+ 
+ static struct {
+@@ -2409,7 +2410,7 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 	struct swg_wx *x = &sw_gx;
+ 	struct en0 *e = &sw_keep_en;
+ 	struct en0_live *b = &sw_keep_live;
+-	uint32_t polls = 0, items = 0, got, busy, nrssi = 0, rssi_off = 0;
++	uint32_t polls = 0, items = 0, got, busy, nrssi = 0, rssi_off = 0, kdown = 0;
+ 	uint64_t t_pass = 0, t_p0, l_link = 0, l_judge = 0, l_cache = 0, l_nlink = 0, l_pass = 0, ns_[5];
+ 	uint64_t pass_max = 0, gap_max = 0, t_end_busy = 0, d_;
+ 	uint64_t t_alive = 0, iv_alive = 0, t_rssi = 0, iv_rssi = 0;
+@@ -2466,21 +2467,34 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 		rr = 1;
+ 		if (!rssi_off && !x->stopped && !x->d4dstop && !b->dead && mach_absolute_time() - t_rssi >= iv_rssi) {    /* patch 0273 (Part A): the firmware's RSSI every 5 s (read-only WLC_GET_RSSI, judged, under the lock) */
+ 			t_rssi = mach_absolute_time();
+-			rr = swl25_live_rssi(x, &swl25_H, &rssi_now);
+-			if (x->d4dstop && !x->stopped) {        /* review perf-c F1: a SOFT stop inside the optional refresh (no store failed, no undo ran): the data path is kept, the refresh is off for this boot */
+-				x->d4dstop = 0u;
+-				rssi_off = 1u;
+-				swl_gap("keep", "RSSI refresh aborted by a soft stop inside the ioctl (see the STOP line above): data path kept, refresh off", "high");
+-				printf("WIFI GAP: keep: RSSI refresh aborted (soft stop inside WLC_GET_RSSI, line above): the en0 data path continues, no further refresh this boot\n");
+-				rr = 1;
++			if (swl25_rssi_drain(x) == 0) {         /* patch 0281: ring 2 carries events now; drain it (decode, consume, re-post) so the idle check of the refresh is not failed for ever. A stop in the drain is the data path's stop, not the refresh's: the loop below ends on it */
++				rr = swl25_live_rssi(x, &swl25_H, &rssi_now);
++				if (x->d4dstop && !x->stopped) {        /* review perf-c F1: a SOFT stop inside the optional refresh (no store failed, no undo ran): the data path is kept, the refresh is off for this boot */
++					x->d4dstop = 0u;
++					rssi_off = 1u;
++					swl_gap("keep", "RSSI refresh aborted by a soft stop inside the ioctl (see the STOP line above): data path kept, refresh off", "high");
++					printf("WIFI GAP: keep: RSSI refresh aborted (soft stop inside WLC_GET_RSSI, line above): the en0 data path continues, no further refresh this boot\n");
++					rr = 1;
++				}
+ 			}
+ 		}
++		if (x->kl_new) {        /* patch 0281: the link-loss detector (swg_ke_note, ring-2 events) went UP -> DOWN in this pass: tell iOS below, outside the lock, once */
++			x->kl_new = 0u;
++			kdown = 1u;
++		}
+ 		d_ = mach_absolute_time() - t_p0;
+ 		t_pass += d_;
+ 		if (d_ > pass_max) pass_max = d_;
+ 		if (t_end_busy != 0u && t_p0 - t_end_busy > gap_max) gap_max = t_p0 - t_end_busy;     /* read-only: the time from the end of a busy pass to the start of the next pass */
+ 		t_end_busy = busy ? mach_absolute_time() : 0u;
+ 		sw_en0_unlock();
++		if (kdown) {            /* patch 0281 (W-D6 boot A): the AP link is lost. No firmware command: iOS is told (radio: joined cleared, LINK_CHANGED isLinkDown 1; en0: IFF_RUNNING off, KEV_DL_LINK_OFF, link_up 0) and the flow ring stays open */
++			kdown = 0u;
++			rc = sweet_wlan_a80211_kept_link(0);
++			if (rc != 0) swl_gap("keep", "link DOWN not delivered to Apple80211 (see the GAP line above)", "high");
++			en0_link_only(e, 0u);
++			printf("SWEET WLAN: keep link DOWN told to iOS: radio rc %d, en0 link off (flow ring kept open, no firmware command)\n", rc);
++		}
+ 		if (rr == 0) {          /* outside the en0 lock: the Apple80211 radio takes its own lock (the ioctl path holds it), so no lock order is formed */
+ 			nrssi++;
+ 			if (sweet_wlan_a80211_kept_rssi(rssi_now) == 0) {
+@@ -2509,6 +2523,7 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 			l_pass = t_pass; l_link = swp_t_link; l_judge = swp_t_judge; l_cache = swp_t_cache; l_nlink = swp_n_link;
+ 			printf("SWEET WLAN: en0 poll alive polls=%u rx=%u tx=%u nquiet=%u gaps=%u r2=%u ev=%u ds=%u items=%u rx_drop=%u tx_drop=%u tx_blocked=%u tx_waits=%u kicks=%u dgaps=%u blk=%u blkw=%u plans=%u\n", polls, e->rx_frames,
+ 			       e->tx_frames, x->nquiet, swl_gap_tot + swl_gap_over, x->kr2n, x->kr2ev, x->kr2ds, items, e->rx_drop, e->tx_drop, e->tx_blocked, e->tx_waits, sw_keep.kicks, swl_dpg_tot, sw_g2_blk_n, sw_g2_blk_words, sw_plan_n);
++			printf("SWEET WLAN: keep events decoded=%u undecoded=%u reposted=%u link=%s up_events_while_down=%u\n", x->kev_n, x->kev_gap, x->kev_rp, x->klink ? "DOWN" : "UP", x->kl_up_n);
+ 		}
+ 		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
+ 		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */

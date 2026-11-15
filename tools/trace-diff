@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""trace-diff: golden-regs CSV + first-divergence diff (TP-036). Host-only, stdlib only, never touches a phone.
+
+Usage:
+  tools/trace-diff golden-regs DIR --block wifi|gpu|dpu [--out CSV] [--iomem F --iomem-match RE]
+                              [--bar0 PA] [--bar2 PA] [--va-only]
+  tools/trace-diff diff --golden CSV --run RUN_DIR|LOGFILE [--from MARK] [--to MARK] [--reads]
+                        [--mask ADDR,...] [--collapse-polls] [--by-offset]
+
+golden-regs: DIR/trace-S.txt (ftrace text: rwmmio_write, rwmmio_post_read, pcicfg/{rd,w}{32,16,8}[_ret], MARK lines)
+  joined with DIR/vmallocinfo-S.txt (only `ioremap` rows; phys = phys + addr - va_start; `ioremap vmap` rows without
+  phys= (pstore persistent_ram page vmaps) have no PA: one TRACE NOTE each, counted as vmap_nophys=N on RESULT). If that file is missing the
+  fallback vmallocinfo-coldboot.txt is used and reported as a TRACE GAP (module reloads move mappings).
+  CSV columns: seq,ts,src,mark,caller,op,width,space,win,addr,val   (op W|R|CW|CR; addr/val hex; header `#` lines hold the
+  sha256 of every input and `# block=`). Width is copied from the trace (bits, e.g. width=32), also for config rows;
+  the XNU `SWEET MMIO` lines must use the same unit. A CR (config read) row has no val: the kprobe captures only the
+  user pointer, not the value read.
+  Callers may carry `+off/len [module]` and a second ` -> writel+off/len [module]` (6.1 GKI rwmmio): the first function
+  name is the caller. --va-only: a block row with no VA->PA join is written as space=va addr=<VA> instead of being
+  dropped (one TRACE GAP line with the count; for vmallocinfo captured under kptr_restrict, itself a TRACE GAP).
+  Block filter: caller regex (wifi ^(dhd|dhdpcie|si_|osl_|pcie_|bcm|ai_|exynos_pcie_rc_|check_exynos_pcie_)  gpu ^(kbase|gpu_|mali_|slc_|mgm_|pixel_)  dpu ^(decon|dpp|dsim|dqe_|dpu_|exynos_(drm|crtc|...)|exynos_mipi|__set_phy_|gs_(panel|dsi|dcs));
+  prefixes = text symbols of mali_kbase/mali_pixel/exynos-drm/gs-panel/phy-exynos-mipi-dsim .ko, nm, vendor_dlkm blobs.tar 20261027T224642Z).
+  gpu `gpu_`/`pixel_` and dpu `__set_phy_` are generic: use gpu/dpu only on traces captured with golden-pull mmio-filter-gpu|dpu (module-filtered)
+  or phys inside an --iomem range whose name matches --iomem-match. The rest counts as other=N. Unjoined addresses are
+  counted only for rows whose caller matches the block (others are other=N); they are not written to the CSV.
+  Wi-Fi: pos 0x80 / 0x84 config writes (last w32) are the BAR0 / BAR2 windows; --bar0 PA maps [PA,PA+0x8000) to
+  space=bar0 win=<last 0x80 write> addr=phys-PA, --bar2 PA maps [PA,PA+0x400000) to space=bar2 win=<last 0x84 write>
+  addr=phys-PA (win and offset kept apart: the BAR0 internal layout is not cited, no win+off sum is assumed; matches
+  swl_wr(space, win, off, val)); cfg/mmio rows have an empty win, mmio rows carry addr=phys.
+  Truncated captures: an ftrace header `# entries-in-buffer/entries-written: A/B` with A != B, or a `LOST n EVENTS`
+  line, is a TRACE GAP (these exact strings are [guess], not cited yet). A trace_marker line that is not `MARK <row>
+  [done]` is a TRACE GAP. Window state is reset per trace file (a BAR access before that file's own window write is a WIFI GAP). Nested vmallocinfo
+  ranges resolve to the innermost one.
+  The CSV is refused (exit 2) inside a git checkout (raw traces may hold MACs, AGENTS rule 4).
+  RESULT: PASS block=B rows=N unjoined=0 vmap_nophys=N csv=PATH   (exit 0)
+  RESULT: PARTIAL ... gaps=N vmap_nophys=N         (exit 1: any unjoined/unparsed row, WIFI GAP, zero rows)
+  RESULT: ERROR ...                                 (exit 2)
+
+diff: run side = lines containing `SWEET MMIO (W|R|CW|CR) <block> <space> <win|-> 0x<addr> <width> 0x<val>` from RUN_DIR/usbnet.log if present (AP-141: merged.log repeats it), else RUN_DIR/*.log,
+  or the given file (other blocks' lines are ignored and counted). Golden rows in [--from, --to] (whole mark sections,
+  inclusive) are compared in order, writes only (W, CW) unless --reads (then R/CR too; --mask ADDRs skip the val check).
+  A row matches on (op, space, win, addr, width) and then val.
+  The run has no marks, so it is assumed to start at the --from section; without --to, extra run rows are a divergence,
+  with --to they are ignored. --collapse-polls merges consecutive identical (op,space,win,addr,val) rows on both sides.
+  Prints `FIRST DIVERGENCE at golden seq S (mark M): golden <row> | run <row or END>` and the 5 preceding matched rows.
+  RESULT: PASS no divergence through <mark|END> compared=N   (exit 0)
+  RESULT: FAIL first divergence seq=S                        (exit 1)
+  RESULT: PARTIAL run has no SWEET MMIO lines (XNU per-store log not built yet, TP-036)   (exit 2)
+  RESULT: PARTIAL ... (exit 2) also for unparsed SWEET MMIO lines (RUN GAP; the line must match exactly, a prefix is
+  allowed, trailing junk is not) and for compared=0 (empty range); an inverted --from/--to or a CSV without `# block=` is ERROR.
+  RESULT: ERROR ...                                          (exit 2)
+  --by-offset: order-free. Same inputs, range, --reads, --mask, --collapse-polls (applied before grouping). Rows are
+  grouped by (op, space, win, addr, width); per key the ordered value lists are compared (order across keys ignored;
+  R/CR keys in --mask or with golden val None compare by count only). One line per key, non-MATCH keys first, each group sorted by addr then op, capped at 200
+  (`... N more`; counts cover all keys):
+  `OFFSET <op> <space> <win|-> 0x<addr> <width> golden=<n> run=<m> MATCH|VALUES|MISSING|EXTRA`
+  VALUES adds ` first_diff=<i> golden_val=0x.. run_val=0x..|END` (END = that side has fewer values). MISSING = golden only,
+  EXTRA = run only (counted only without --to; with --to run rows beyond the golden count of a key are cut and run-only keys
+  ignored, both printed as a `note: --to: ignored ...` line and ` ignored=N` rows on RESULT).
+  RESULT: PASS by-offset keys=K match=K [ignored=N]                       (exit 0; ignored=N only with --to, also on FAIL/PARTIAL)
+  RESULT: FAIL by-offset keys=K match=A values=B missing=C extra=D first_match=F   (exit 1; F = keys on both sides
+  whose first value matches: golden often writes a key once per cycle, a run once)
+  RESULT: PARTIAL by-offset ... RUN GAP [ignored=N] (exit 2); no SWEET MMIO lines / compared=0 / bad range as above.
+  As in plain diff, --from does not bound the run side: run rows before the --from section count as EXTRA.
+"""
+import argparse
+import bisect
+import glob
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+CALLERS = {"wifi": r"^(dhd|dhdpcie|si_|osl_|pcie_|bcm|ai_|exynos_pcie_rc_|check_exynos_pcie_)", "gpu": r"^(kbase|gpu_|mali_|slc_|mgm_|pixel_)", "dpu": r"^(decon|dpp|dsim|dqe_|dpu_|exynos_(drm|crtc|partial|hibernation|atomic|plane|dqe|tui|recovery)|exynos_mipi|__set_phy_|gs_(panel|dsi|dcs))"}
+HEX = r"(?:0x[0-9a-fA-F]+|0)"
+RE_LINE = re.compile(r"^\s*(\S.*?)-(\d+)\s+\[(\d+)\]\s+\S+\s+([0-9.]+):\s+(\S+?):\s*(.*)$")
+RE_RW = re.compile(r"^(\S+?)(?:\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+)?(?:\s+\[\S+\])?(?:\s+->\s+\S+(?:\s+\[\S+\])?)?\s+width=(\d+)\s+val=(%s)\s+addr=(%s)\s*$" % (HEX, HEX))
+RE_VMAP = re.compile(r"^\s*(0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+)\s+\d+\s+\S+\s+ioremap vmap\s*$")
+RE_VM = re.compile(r"^\s*(0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+)\s+\d+\s+(\S+?)(?:\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+)?(?:\s+\[\S+\])?\s.*\bphys=(0x[0-9a-fA-F]+)\s.*\bioremap\b")
+RE_KP_NAME = re.compile(r"^(?:pcicfg/)?(rd|w)(32|16|8)(_ret)?$")
+RE_RUN = re.compile(r"SWEET MMIO (W|R|CW|CR) (\S+) (\S+) (-|0x[0-9a-fA-F]+) 0x([0-9a-fA-F]+) (\d+) 0x([0-9a-fA-F]+)\s*$")
+RE_BUF = re.compile(r"^#\s*entries-in-buffer/entries-written:\s*(\d+)/(\d+)")
+RE_LOST = re.compile(r"LOST\s+\d+\s+EVENTS")
+RE_LOOSE = re.compile(r"\b(rwmmio_write|rwmmio_post_read|(?:pcicfg/)?(?:rd|w)(?:32|16|8)(?:_ret)?):")
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def in_git(path):
+    anc = os.path.abspath(path)
+    while not os.path.isdir(anc):
+        anc = os.path.dirname(anc)
+    r = subprocess.run(["git", "-C", anc, "rev-parse", "--is-inside-work-tree"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+NOTES = []
+
+
+def load_vm(path, gaps):
+    rows = []
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            if not re.search(r"\bioremap\b", line):
+                continue
+            m = RE_VM.match(line)
+            mv = None if m or "phys=" in line else RE_VMAP.match(line)
+            if mv:
+                # VM_MAP page vmap (Android pstore persistent_ram): phys_addr 0 is not printed (mm/vmalloc.c:4137-4147 v6.1),
+                # so the range has no PA. Kept with phys None so a trace row inside it (also when nested in an ioremap range)
+                # stays unjoined and is counted there (review golden-d10-r1 F3/F4).
+                NOTES.append("TRACE NOTE: vmap row without phys= (not joinable) line %d in %s: %s" % (n, os.path.basename(path), line.strip()))
+                rows.append((int(mv.group(1), 16), int(mv.group(2), 16), None))
+                continue
+            if not m:
+                gaps.append("TRACE GAP: unparsed vmallocinfo line %d in %s: %s" % (n, os.path.basename(path), line.strip()))
+                continue
+            rows.append((int(m.group(1), 16), int(m.group(2), 16), int(m.group(4), 16)))
+    if rows and all(r[0] == 0 and r[1] == 0 for r in rows):
+        gaps.append("TRACE GAP: %s has only all-zero ioremap addresses (kptr_restrict at capture): no VA->PA join possible" % os.path.basename(path))
+    nz = sum(1 for r in rows if r[0] == 0 and r[1] == 0)
+    if nz and nz != len(rows):
+        # mixed file (golden-6 vmallocinfo-coldboot.txt: 12225 zero-address lines, research 105 item 6): the zero rows cannot join, say so
+        gaps.append("TRACE GAP: %s has %d of %d ioremap/vmap rows with all-zero addresses (kptr_restrict at capture): those rows cannot be VA->PA joined" % (os.path.basename(path), nz, len(rows)))
+    rows.sort(key=lambda r: (r[0], r[1]))   # phys may be None (vmap rows): never compare it (golden-6 crash, research 105 item 6)
+    return rows
+
+
+class Vm:
+    def __init__(self, rows):
+        self.rows = rows
+        self.starts = [r[0] for r in rows]
+        self.maxend = []
+        m = 0
+        for r in rows:
+            m = max(m, r[1])
+            self.maxend.append(m)
+
+    def phys(self, va):
+        """Innermost (largest start) range containing va; ranges may nest."""
+        i = bisect.bisect_right(self.starts, va) - 1
+        while i >= 0 and va < self.maxend[i]:
+            if va < self.rows[i][1]:
+                if self.rows[i][2] is None:
+                    return None  # innermost range is a vmap without phys=
+                return self.rows[i][2] + (va - self.rows[i][0])
+            i -= 1
+        return None
+
+
+def load_iomem(path, pat):
+    rx = re.compile(pat)
+    out = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = re.match(r"^\s*([0-9a-fA-F]+)-([0-9a-fA-F]+)\s*:\s*(.*)$", line)
+            if m and rx.search(m.group(3)):
+                out.append((int(m.group(1), 16), int(m.group(2), 16)))
+    return out
+
+
+def cmd_golden(a):
+    def res(kind, extra, code):
+        print("RESULT: %s %s" % (kind, extra))
+        return code
+    if a.block not in CALLERS:
+        return res("ERROR", "unknown block %s" % a.block, 2)
+    d = a.dir
+    traces = sorted(glob.glob(os.path.join(d, "trace-*.txt")))
+    if not os.path.isdir(d) or not traces:
+        return res("ERROR", "no %s/trace-*.txt" % d, 2)
+    out = a.out or os.path.join(d, "%s-regs.csv" % a.block)
+    if in_git(out) or in_git(d):
+        return res("ERROR", "output/input %s is inside a git checkout (golden data never goes into git)" % out, 2)
+    if (a.iomem is None) != (a.iomem_match is None):
+        return res("ERROR", "--iomem and --iomem-match go together", 2)
+    ranges = []
+    if a.iomem:
+        if not os.path.isfile(a.iomem):
+            return res("ERROR", "missing %s" % a.iomem, 2)
+        ranges = load_iomem(a.iomem, a.iomem_match)
+    rx = re.compile(CALLERS[a.block])
+    gaps = []
+    hdr = ["# block=%s" % a.block]
+    rows = []
+    seq = 0
+    other = 0
+    unjoined = 0
+    unparsed = 0
+    vaonly = 0
+    win = {0x80: None, 0x84: None}
+    wifi = a.block == "wifi"
+    if wifi and a.bar0 is None:
+        gaps.append("WIFI GAP: no --bar0, BAR0 rows not normalised")
+    bar0 = int(a.bar0, 0) if a.bar0 else None
+    bar2 = int(a.bar2, 0) if a.bar2 else None
+    if a.iomem:
+        hdr.append("# input iomem %s sha256=%s" % (os.path.basename(a.iomem), sha(a.iomem)))
+    for tp in traces:
+        suffix = os.path.basename(tp)[len("trace-"):-len(".txt")]
+        vp = os.path.join(d, "vmallocinfo-%s.txt" % suffix)
+        if not os.path.isfile(vp):
+            fb = os.path.join(d, "vmallocinfo-coldboot.txt")
+            if not os.path.isfile(fb):
+                return res("ERROR", "no %s and no fallback vmallocinfo-coldboot.txt" % vp, 2)
+            gaps.append("TRACE GAP: %s missing, using fallback vmallocinfo-coldboot.txt (module reloads move mappings)" % vp)
+            vp = fb
+        hdr.append("# input %s sha256=%s" % (os.path.basename(tp), sha(tp)))
+        hdr.append("# input %s sha256=%s" % (os.path.basename(vp), sha(vp)))
+        vmg = []
+        vm = Vm(load_vm(vp, vmg))
+        gaps.extend(vmg)
+        mark = ""
+        win = {0x80: None, 0x84: None}
+        with open(tp, errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                if line.startswith("#"):
+                    mb = RE_BUF.match(line)
+                    if mb and mb.group(1) != mb.group(2):
+                        gaps.append("TRACE GAP: ftrace header entries-in-buffer/entries-written %s/%s in %s: %d entries lost (format [guess], not cited)"
+                                    % (mb.group(1), mb.group(2), os.path.basename(tp), int(mb.group(2)) - int(mb.group(1))))
+                    continue
+                if not line.strip():
+                    continue
+                if RE_LOST.search(line):
+                    gaps.append("TRACE GAP: 'LOST n EVENTS' line %d in %s (format [guess], not cited): %s" % (n, os.path.basename(tp), line.strip()))
+                    continue
+                if "tracing_mark_write:" in line:
+                    m = RE_LINE.match(line)
+                    mm = re.match(r"^MARK\s+(.+?)(\s+done)?\s*$", m.group(6)) if m else None
+                    if mm and m.group(5) == "tracing_mark_write":
+                        mark = "" if mm.group(2) else mm.group(1)
+                    else:
+                        unparsed += 1
+                        gaps.append("TRACE GAP: unparsed mark line %d in %s: %s" % (n, os.path.basename(tp), line.strip()))
+                    continue
+                if not RE_LOOSE.search(line):
+                    continue
+                m = RE_LINE.match(line)
+                ev = m.group(5) if m else None
+                ts = m.group(4) if m else ""
+                body = m.group(6) if m else ""
+                kp = RE_KP_NAME.match(ev) if ev else None
+                row = None
+                bad = False
+                if ev in ("rwmmio_write", "rwmmio_post_read"):
+                    r = RE_RW.match(body)
+                    if not r:
+                        bad = True
+                    else:
+                        caller = r.group(1)
+                        width = int(r.group(2))
+                        val = int(r.group(3), 16)
+                        va = int(r.group(4), 16)
+                        op = "W" if ev == "rwmmio_write" else "R"
+                        phys = vm.phys(va)
+                        hit = bool(rx.search(caller))
+                        if phys is None and hit and a.va_only:
+                            vaonly += 1
+                            row = (ts, mark, caller, op, str(width), "va", "", "0x%x" % va, "0x%x" % val, os.path.basename(tp))
+                        elif phys is None:
+                            if hit:
+                                unjoined += 1
+                                if unjoined <= 5:
+                                    gaps.append("TRACE GAP: unjoined addr 0x%x (%s) at %s line %d" % (va, caller, os.path.basename(tp), n))
+                                else:
+                                    gaps.append(None)
+                            else:
+                                other += 1
+                            continue
+                        else:
+                            if not hit and any(lo <= phys <= hi for lo, hi in ranges):
+                                hit = True
+                            space, addr, wv = "mmio", phys, None
+                            if wifi and bar0 is not None and bar0 <= phys < bar0 + 0x8000:
+                                hit = True
+                                space = "bar0"
+                                if win[0x80] is None:
+                                    gaps.append("WIFI GAP: BAR0 access before any window write (0x80) at %s line %d, win left empty" % (os.path.basename(tp), n))
+                                wv = win[0x80]
+                                addr = phys - bar0
+                            elif wifi and bar2 is not None and bar2 <= phys < bar2 + 0x400000:
+                                hit = True
+                                space = "bar2"
+                                if win[0x84] is None:
+                                    gaps.append("WIFI GAP: BAR2 access before any window write (0x84) at %s line %d, win left empty" % (os.path.basename(tp), n))
+                                wv = win[0x84]
+                                addr = phys - bar2
+                            if not hit:
+                                other += 1
+                                continue
+                            row = (ts, mark, caller, op, str(width), space, "" if wv is None else "0x%x" % wv, "0x%x" % addr, "0x%x" % val, os.path.basename(tp))
+                elif kp:
+                    kind, w, ret = kp.groups()
+                    f2 = dict(re.findall(r"(\w+)=(\S+)", body))
+                    try:
+                        if ret:
+                            if int(f2["rc"], 0) != 0:
+                                gaps.append("TRACE GAP: config read returned rc=%s at %s line %d" % (f2["rc"], os.path.basename(tp), n))
+                                unparsed += 1
+                            continue
+                        pos = int(f2["pos"], 0)
+                        int(f2["devfn"], 0)
+                        if kind == "w":
+                            val = int(f2["val"], 0)
+                        else:
+                            int(f2["vptr"], 0)
+                            val = None
+                    except (KeyError, ValueError):
+                        bad = True
+                    else:
+                        if not wifi:
+                            other += 1
+                            continue
+                        if kind == "w":
+                            if w == "32" and pos in win:
+                                win[pos] = val
+                            row = (ts, mark, "", "CW", w, "cfg", "", "0x%x" % pos, "0x%x" % val, os.path.basename(tp))
+                        else:
+                            row = (ts, mark, "", "CR", w, "cfg", "", "0x%x" % pos, "", os.path.basename(tp))
+                else:
+                    bad = True
+                if bad:
+                    unparsed += 1
+                    if unparsed <= 5:
+                        gaps.append("TRACE GAP: unparsed line %d: %s" % (n, line.strip()))
+                    else:
+                        gaps.append(None)
+                    continue
+                if row:
+                    seq += 1
+                    rows.append((seq,) + row)
+    try:
+        with open(out, "w") as f:
+            f.write("\n".join(hdr) + "\n")
+            f.write("seq,ts,src,mark,caller,op,width,space,win,addr,val\n")
+            for r in rows:
+                s, ts, mark, caller, op, width, space, wn, addr, val, src = r
+                f.write(",".join(str(x) for x in (s, ts, src, mark, caller, op, width, space, wn, addr, val)) + "\n")
+    except OSError as e:
+        return res("ERROR", "cannot write %s: %s" % (out, e), 2)
+    order = []
+    cnt = {}
+    for r in rows:
+        mk = r[2] or "-"
+        if mk not in cnt:
+            cnt[mk] = [0, 0]
+            order.append(mk)
+        cnt[mk][0 if r[4] in ("W", "CW") else 1] += 1
+    for mk in order:
+        print("mark=%s writes=%d reads=%d" % (mk, cnt[mk][0], cnt[mk][1]))
+    for g in gaps:
+        if g:
+            print(g)
+    for nt in NOTES:
+        print(nt)
+    if vaonly:
+        print("TRACE GAP: --va-only: %d rows carry the kernel VA (space=va), not a PA; offsets are only comparable inside one capture" % vaonly)
+    ngaps = len(gaps) + (1 if vaonly else 0)
+    print("other=%d" % other)
+    if not rows:
+        ngaps += 1
+        print("TRACE GAP: zero rows for block %s" % a.block)
+    if ngaps:
+        return res("PARTIAL", "block=%s rows=%d unjoined=%d unparsed=%d gaps=%d vmap_nophys=%d csv=%s" % (a.block, len(rows), unjoined, unparsed, ngaps, len(NOTES), out), 1)
+    return res("PASS", "block=%s rows=%d unjoined=0 vmap_nophys=%d csv=%s" % (a.block, len(rows), len(NOTES), out), 0)
+
+
+def load_csv(path):
+    rows = []
+    block = None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                m = re.match(r"# block=(\S+)", line)
+                if m:
+                    block = m.group(1)
+                continue
+            if line.startswith("seq,"):
+                continue
+            p = line.split(",")
+            if len(p) != 11:
+                raise ValueError("bad CSV row: %s" % line)
+            rows.append({"seq": int(p[0]), "mark": p[3], "op": p[5], "space": p[7],
+                         "win": int(p[8], 16) if p[8] else None,
+                         "addr": int(p[9], 16), "val": int(p[10], 16) if p[10] else None, "width": p[6]})
+    if block is None:
+        raise ValueError("no '# block=' header in %s" % path)
+    return block, rows
+
+
+def fmt(r):
+    return "%s %s %s 0x%x %s %s" % (r["op"], r["space"], "-" if r["win"] is None else "0x%x" % r["win"], r["addr"], r["width"], "-" if r["val"] is None else "0x%x" % r["val"])
+
+
+def by_offset(a, gs, rs, mask, badrun, res):
+    def key(r):
+        return (r["op"], r["space"], -1 if r["win"] is None else r["win"], r["addr"], r["width"])
+    gk, rk = {}, {}
+    for lst, d in ((gs, gk), (rs, rk)):
+        for r in lst:
+            d.setdefault(key(r), []).append(r["val"])
+    keys = sorted(set(gk) | set(rk), key=lambda k: (k[3], k[0], k[1], k[2], k[4]))
+    cnt = {"MATCH": 0, "VALUES": 0, "MISSING": 0, "EXTRA": 0}
+    lines = []
+    ign_keys = ign_rows = cut_rows = 0
+    first = 0   # keys on both sides whose FIRST value matches (golden often repeats a key per cycle, the run once)
+    for k in keys:
+        gv, rv = gk.get(k), rk.get(k)
+        if gv is None and a.to is not None:
+            ign_keys += 1   # with --to run rows outside the golden range are ignored (counted, rule 8)
+            ign_rows += len(rv)
+            continue
+        if gv is None:
+            st, extra = "EXTRA", ""
+        elif rv is None:
+            st, extra = "MISSING", ""
+        else:
+            if a.to is not None and len(rv) > len(gv):
+                cut_rows += len(rv) - len(gv)
+                rv = rv[:len(gv)]
+            if k[0] in ("R", "CR") and (k[3] in mask or any(v is None for v in gv)):
+                bad = None if len(gv) == len(rv) else min(len(gv), len(rv))
+            else:
+                bad = next((i for i in range(max(len(gv), len(rv))) if (gv[i] if i < len(gv) else "E") != (rv[i] if i < len(rv) else "E")), None)
+            if bad != 0:
+                first += 1
+            if bad is None:
+                st, extra = "MATCH", ""
+            else:
+                def hv(v, i):
+                    return "END" if i >= len(v) else ("-" if v[i] is None else "0x%x" % v[i])
+                st, extra = "VALUES", " first_diff=%d golden_val=%s run_val=%s" % (bad, hv(gv, bad), hv(rv, bad))
+        cnt[st] += 1
+        lines.append((st == "MATCH", "OFFSET %s %s %s 0x%x %s golden=%d run=%d %s%s" % (
+            k[0], k[1], "-" if k[2] < 0 else "0x%x" % k[2], k[3], k[4], len(gv or ()), len(rv or ()), st, extra)))
+    lines = [ln for _, ln in sorted(lines, key=lambda x: x[0])]   # stable: non-MATCH keys first so the 200 cap never hides them (review r1 F4)
+    for ln in lines[:200]:
+        print(ln)
+    if len(lines) > 200:
+        print("... %d more" % (len(lines) - 200))
+    n = len(lines)
+    ign = ""
+    if a.to is not None:
+        print("note: --to: ignored %d run-only key(s) (%d rows) and %d run rows past a key's golden count" % (ign_keys, ign_rows, cut_rows))
+        ign = " ignored=%d" % (ign_rows + cut_rows)
+    bad = cnt["VALUES"] + cnt["MISSING"] + cnt["EXTRA"]
+    if bad:
+        return res("FAIL", "by-offset keys=%d match=%d values=%d missing=%d extra=%d first_match=%d%s" % (n, cnt["MATCH"], cnt["VALUES"], cnt["MISSING"], cnt["EXTRA"], first, ign), 1)
+    if badrun:
+        return res("PARTIAL", "by-offset keys=%d all match but %d unparsed SWEET MMIO lines (RUN GAP)%s" % (n, len(badrun), ign), 2)
+    return res("PASS", "by-offset keys=%d match=%d%s" % (n, n, ign), 0)
+
+
+def cmd_diff(a):
+    def res(kind, extra, code):
+        print("RESULT: %s %s" % (kind, extra))
+        return code
+    try:
+        block, g = load_csv(a.golden)
+    except (OSError, ValueError) as e:
+        return res("ERROR", "golden: %s" % e, 2)
+    run = a.run
+    files = sorted(glob.glob(os.path.join(run, "*.log"))) if os.path.isdir(run) else [run]
+    if os.path.isdir(run) and os.path.isfile(os.path.join(run, "usbnet.log")):
+        files = [os.path.join(run, "usbnet.log")]   # AP-141: an xrun dir's merged.log repeats every usbnet.log line; read the USB log once
+        print("run log: %s (usbnet.log only; merged.log/other *.log skipped, AP-141)" % files[0])
+    if not files or not all(os.path.isfile(x) for x in files):
+        return res("ERROR", "no run log at %s" % run, 2)
+    rrows = []
+    badrun = []
+    foreign = 0
+    for fp in files:
+        with open(fp, errors="replace") as f:
+            for line in f:
+                if "SWEET MMIO" not in line:
+                    continue
+                m = RE_RUN.search(line)
+                if not m:
+                    badrun.append(line.strip())
+                    continue
+                if m.group(2) != block:
+                    foreign += 1
+                    continue
+                rrows.append({"op": m.group(1), "space": m.group(3),
+                              "win": None if m.group(4) == "-" else int(m.group(4), 16),
+                              "addr": int(m.group(5), 16),
+                              "width": m.group(6), "val": int(m.group(7), 16), "seq": None, "mark": None})
+    if foreign:
+        print("note: %d SWEET MMIO lines of other blocks ignored" % foreign)
+    if badrun:
+        print("RUN GAP: %d unparsed SWEET MMIO lines (first: %s)" % (len(badrun), badrun[0]))
+    if not rrows and not badrun:
+        return res("PARTIAL", "run has no SWEET MMIO lines (XNU per-store log not built yet, TP-036)", 2)
+    marks = [r["mark"] for r in g]
+    for nm, v in (("--from", a.from_), ("--to", a.to)):
+        if v is not None and v not in marks:
+            return res("ERROR", "%s mark %s not in golden CSV" % (nm, v), 2)
+    lo = marks.index(a.from_) if a.from_ is not None else 0
+    hi = len(g) - 1 - marks[::-1].index(a.to) if a.to is not None else len(g) - 1
+    if lo > hi:
+        return res("ERROR", "inverted range: --from %s starts after the last --to %s" % (a.from_, a.to), 2)
+    ops = ("W", "CW", "R", "CR") if a.reads else ("W", "CW")
+    mask = set()
+    for x in (a.mask or "").split(","):
+        if x.strip():
+            mask.add(int(x, 0))
+    gs = [r for r in g[lo:hi + 1] if r["op"] in ops]
+    rs = [r for r in rrows if r["op"] in ops]
+
+    def collapse(lst, name):
+        out = []
+        merged = 0
+        for r in lst:
+            k = (r["op"], r["space"], r["win"], r["addr"], r["val"])
+            if out and out[-1][0] == k:
+                merged += 1
+                continue
+            out.append((k, r))
+        if a.collapse_polls:
+            print("collapse-polls: %s merged %d rows" % (name, merged))
+        return [r for _, r in out]
+    if a.collapse_polls:
+        gs = collapse(gs, "golden")
+        rs = collapse(rs, "run")
+
+    def same(x, y):
+        if (x["op"], x["space"], x["win"], x["addr"], x["width"]) != (y["op"], y["space"], y["win"], y["addr"], y["width"]):
+            return False
+        if x["op"] in ("R", "CR") and (x["addr"] in mask or x["val"] is None):
+            return True
+        return x["val"] == y["val"]
+    last = a.to if a.to is not None else "END"
+    if not gs:
+        return res("PARTIAL", "no golden rows to compare in [%s, %s] (compared=0)" % (a.from_, last), 2)
+    if a.by_offset:
+        return by_offset(a, gs, rs, mask, badrun, res)
+    for i, x in enumerate(gs):
+        y = rs[i] if i < len(rs) else None
+        if y is None or not same(x, y):
+            for p in gs[max(0, i - 5):i]:
+                print("  matched seq=%d mark=%s %s" % (p["seq"], p["mark"], fmt(p)))
+            print("FIRST DIVERGENCE at golden seq %d (mark %s): golden %s | run %s" % (x["seq"], x["mark"], fmt(x), fmt(y) if y else "END"))
+            return res("FAIL", "first divergence seq=%d" % x["seq"], 1)
+    if len(rs) > len(gs) and a.to is None:
+        x = rs[len(gs)]
+        for p in gs[max(0, len(gs) - 5):]:
+            print("  matched seq=%d mark=%s %s" % (p["seq"], p["mark"], fmt(p)))
+        s = (gs[-1]["seq"] + 1) if gs else 1
+        print("FIRST DIVERGENCE at golden seq %d (mark %s): golden END | run %s" % (s, gs[-1]["mark"] if gs else "-", fmt(x)))
+        return res("FAIL", "first divergence seq=%d" % s, 1)
+    if badrun:
+        return res("PARTIAL", "no divergence through %s compared=%d but %d unparsed SWEET MMIO lines (RUN GAP)" % (last, len(gs), len(badrun)), 2)
+    return res("PASS", "no divergence through %s compared=%d" % (last, len(gs)), 0)
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="trace-diff", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("golden-regs")
+    g.add_argument("dir")
+    g.add_argument("--block", required=True)
+    g.add_argument("--out")
+    g.add_argument("--iomem")
+    g.add_argument("--iomem-match")
+    g.add_argument("--bar0")
+    g.add_argument("--bar2")
+    g.add_argument("--va-only", action="store_true")
+    d = sub.add_parser("diff")
+    d.add_argument("--golden", required=True)
+    d.add_argument("--run", required=True)
+    d.add_argument("--from", dest="from_")
+    d.add_argument("--to")
+    d.add_argument("--reads", action="store_true")
+    d.add_argument("--mask")
+    d.add_argument("--collapse-polls", action="store_true")
+    d.add_argument("--by-offset", action="store_true")
+    try:
+        a = p.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code else 0
+    return cmd_golden(a) if a.cmd == "golden-regs" else cmd_diff(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

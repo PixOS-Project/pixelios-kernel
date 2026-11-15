@@ -1,0 +1,34 @@
+SWEET IOSurface plane bytes-per-row + sel 9 key names (patch 0163, research 76): the reply's per-plane bytes-per-row moves from plane+0x08 to plane+0x10 (where IOSurface.framework's GetBytesPerRowOfPlane reads it: it returned 0 for every multi-plane surface); selector 9 (SetValue, accepted and ignored) now also logs the KEY name of each value a client sets as a SWEET GAP line, to learn what WeatherPoster etc. send. Not built yet (host-light).
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -794,7 +794,7 @@
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);   /* patch 0163: the framework reads per-plane bytes-per-row at plane+0x10 (GetBytesPerRowOfPlane 0x1a3983438, research 76 s.3.1); +0x08 stays 0 */
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+@@ -1071,6 +1071,21 @@
+ 		}
+ 		sweet_surf_log_once("sel", selector);
+ 		sweet_note_ignored("sel", "accepted and ignored, reply zeroed", selector);
++		if (selector == 9 && args->structureInput != NULL && args->structureInputSize > 8) {   /* patch 0163: which values do clients set? (research 76 s.1.1: struct in = u32 id, 4 pad, binary CFArray [value, key]) */
++			OSString *perr = NULL;
++			OSObject *o = OSUnserializeBinary((const char *)args->structureInput + 8, args->structureInputSize - 8, &perr);
++			OSArray *arr = OSDynamicCast(OSArray, o);
++			if (arr != NULL && arr->getCount() == 2) {
++				OSString *k = OSDynamicCast(OSString, arr->getObject(1));
++				if (k != NULL) {
++					sweet_note_ignored("sel 9 SetValue key", k->getCStringNoCopy(), 0xffffffffu);
++				}
++			} else if (arr != NULL && arr->getCount() == 1) {
++				sweet_note_ignored("sel 9 SetValues", "(dictionary form)", 0xffffffffu);
++			}
++			OSSafeReleaseNULL(o);
++			OSSafeReleaseNULL(perr);
++		}
+ 		return kIOReturnSuccess;
+ 	}
+ }

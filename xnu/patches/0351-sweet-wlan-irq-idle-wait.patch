@@ -1,0 +1,72 @@
+sweet-wlan-irq-idle-wait (lowclk 2026-11-14, tracker L-18): with the doorbell armed the keep thread's idle wait is 100 ms instead of 5 ms, and an en0_output
+kick can no longer be lost between the pass and the wait.
+Observed (hardware, B10d job 3ff3, kernel k6, 2026-11-14): sweetwifiirq=1 kept the doorbell on for 775 s (364543 interrupts, 0 spurious, 0 storm), and over the
+600 s bench the phone averaged 2.83 busy cores against 2.74 in two boots with the doorbell off: +0.09 core [obs].
+Cause [read sweet_wlan.c sw_keep_thread]: the end-of-pass wait was `assert_wait_timeout(.., busy ? 100u : 5000u, NSEC_PER_USEC)` in every mode, so the 5 ms idle
+poll ran at full rate while the doorbell was armed and interrupts added passes instead of replacing polls.
+Changed: (1) while sw_irq.mode is SWI_MODE_DB and the doorbell is live (sw_irq.on, gate not closed: the conditions of sw_irq_peek), an idle pass waits
+SW_KEEP_IDLE_DB_US = 100000 (100 ms); a busy pass stays 100 us; mode 0, mode 2 (read-only), a closed gate and a doorbell that turned itself off (swi_teardown
+clears sw_irq.on) keep 5000 us, evaluated at every wait, so the fall-back is the very next wait. (2) the lost-kick race, closed first because at 100 ms
+it would cost up to 100 ms of transmit latency: sw_en0_kick (the only EN0_KICK site: en0_output posted or queued a frame) sets sw_keep.kickf with
+os_atomic_store release before thread_wakeup; the keep thread takes it with os_atomic_xchg acquire right after assert_wait_timeout (always, so a stale flag
+is cleared too) and calls clear_wait like sw_irq_peek() does. The other thread_wakeup on sw_keep.kick, sw_irq_wake (ISR), is covered by sw_irq_peek (0347)
+and sets no flag.
+Doorbell-silent rule (0349, SWI_SILENT_MAX 200, constant unchanged): it counts poll passes that found work while irqs did not rise [read
+sweet_wlan_irq.h swi_post]. A dead doorbell therefore still ends after 200 such passes; with this patch each of them can follow an idle pass of 100 ms, so
+the bound is about 200 x 100 ms = 20 s (it was 200 x 5 ms = 1 s); passes that found work are busy and wait 100 us.
+Not changed: no register, address, access kind or value (thread timing and one atomic flag); the poll's got, items and busy accounting; the rules and
+constants of 0347/0349/0350. No hardware access. ORDER: after 0350.
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2389,6 +2389,7 @@
+ 	volatile uint32_t go;           /* sweet_wlan_init has returned: the hand-over may start */
+ 	uint32_t kick;                  /* patch 0273: the event the poll thread sleeps on (EN0_KICK wakes it) */
+ 	uint32_t kicks;
++	uint32_t kickf;                 /* patch 0351: set by every en0_output kick, taken by the keep thread right after it asserts its wait (a kick between the pass and the wait is not lost) */
+ 	char bootarg[64];
+ } sw_keep;
+ 
+@@ -2398,6 +2399,7 @@
+ {
+ 	if (sw_keep.armed) {
+ 		sw_keep.kicks++;
++		os_atomic_store(&sw_keep.kickf, 1u, release);     /* patch 0351: before the wakeup, so a thread that has not waited yet still sees it */
+ 		thread_wakeup((event_t)&sw_keep.kick);
+ 	}
+ }
+@@ -2763,6 +2765,14 @@
+ 	printf("SWEET WLAN IRQ: irqs %u missed %u spurious %u storm %u mode %s\n", sw_irq.irqs, sw_irq.missed, sw_irq.spurious, sw_irq.storm, swi_mode_str(&sw_irq));
+ }
+ 
++/* patch 0351: the doorbell is armed and serving: the keep thread's idle wait may be long. Same conditions as sw_irq_peek; mode 0, 2, a gate-closed pass and a doorbell that turned itself off (st->on = 0 in swi_teardown) are all false */
++#define SW_KEEP_IDLE_DB_US 100000u
++static int
++sw_irq_db_live(void)
++{
++	return sw_irq.mode == SWI_MODE_DB && sw_irq.on && !sw_irq.gate_closed;
++}
++
+ /* the poll thread should not go to sleep over an interrupt that arrived during the pass (the ISR's wakeup came before the wait was asserted) */
+ static int
+ sw_irq_peek(void)
+@@ -2895,6 +2905,7 @@
+ 	int32_t rssi_now = 0;
+ 	int rc, found, rr, rjx;
+ 	uint64_t t_ro = 0, t_irq5 = 0, iv_irq5 = 0;     /* patch 0347 */
++	uint32_t kick_pend;                             /* patch 0351 */
+ 	uint32_t kr2_0;                                 /* patch 0350: ring-2 items consumed before this pass */
+ 	struct swi_ro irq_ro;
+ 	int irq_ro_have = 0, irq_on_pass = 0;
+@@ -3067,8 +3078,10 @@
+ 		}
+ 		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
+ 		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */
+-		assert_wait_timeout((event_t)&sw_keep.kick, THREAD_UNINT, busy ? 100u : 5000u, NSEC_PER_USEC);
+-		if (sw_irq_peek()) {            /* patch 0347: an interrupt came in during the pass (its wakeup preceded the wait): do not sleep through it */
++		/* patch 0351: with the doorbell live the idle wait is SW_KEEP_IDLE_DB_US (an interrupt or a kick ends it early); the doorbell off, gated or any other mode keeps 5 ms, read at every wait */
++		assert_wait_timeout((event_t)&sw_keep.kick, THREAD_UNINT, busy ? 100u : (sw_irq_db_live() ? SW_KEEP_IDLE_DB_US : 5000u), NSEC_PER_USEC);
++		kick_pend = os_atomic_xchg(&sw_keep.kickf, 0u, acquire) != 0u;     /* patch 0351: always taken (clears a stale flag too); an en0_output kick that came before the wait asserted */
++		if (sw_irq_peek() || kick_pend) {            /* patch 0347: an interrupt came in during the pass (its wakeup preceded the wait): do not sleep through it */
+ 			clear_wait(current_thread(), THREAD_AWAKENED);
+ 		}
+ 		thread_block(THREAD_CONTINUE_NULL);

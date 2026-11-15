@@ -42,7 +42,10 @@ def _read_stripped(path):
     try:
         with open(path, "r") as f:
             return f.read().strip()
-    except OSError:
+    except FileNotFoundError:   # interface directories (1-1:1.0) have no idVendor/idProduct: the normal "not this device"   # lint-silent: expected interface directories have no idVendor: not this device
+        return None
+    except OSError as _err:
+        print(f"usb-log GAP: OSError ignored in _read_stripped(): {_err}", file=sys.stderr)
         return None
 
 
@@ -59,7 +62,7 @@ def find_tty_node(dev_dir):
 def scan_once(sysfs):
     try:
         entries = sorted(os.listdir(sysfs))
-    except OSError:
+    except OSError:   # lint-silent: expected the sysfs directory is absent (no device): None means not present
         return None
     for name in entries:
         dev = os.path.join(sysfs, name)
@@ -164,7 +167,9 @@ def drain(fd, tee, quiet=0.3):
     while time.monotonic() < deadline and select.select([fd], [], [], quiet)[0]:
         try:
             data = os.read(fd, READ_SIZE)
-        except OSError:
+        except OSError as _err:
+            if _err.errno not in CLEAN_READ_ERRNOS:   # ENODEV/EIO is the documented end of a capture
+                print(f"usb-log GAP: OSError ignored in drain(): {_err}", file=sys.stderr)
             return
         if not data:
             return

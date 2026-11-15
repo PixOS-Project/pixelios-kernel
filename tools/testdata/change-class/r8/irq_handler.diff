@@ -1,0 +1,11 @@
+diff --git a/shim/shim.c b/shim/shim.c
+--- a/shim/shim.c
++++ b/shim/shim.c
+@@ -1101,5 +1101,6 @@ static void irq_handler(void)
+ 	else if (id == PTIMER_INTID)
+ 		wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
+ 	wsr("icc_eoir1_el1", iar);
++	ramlog_line("irq");
+ 	isb();
+ }
+

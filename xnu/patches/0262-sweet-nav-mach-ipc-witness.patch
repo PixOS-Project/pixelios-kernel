@@ -1,0 +1,350 @@
+SWEET nav20 (patch 0262, T-e392, G-10b-nav; log only, no register or memory write outside the patch's own statics): Mach IPC witness for the Preferences process, armed together with the THRWAIT sampler (boot-arg sweetthrwait != 0). Why: nav18/nav19 dead About rep: Preferences main thread idles in mach_msg2_trap (hint 0, ev != 0, unlike its hint-2 siblings), the missing message is not nameable from any shim log (docs/reviews/T-55ec-proof.md sec 6). Lines: `SWEET IPCW: snd` (message sent by a Preferences thread: msgh_id, destination port, its kobject type, receiver name and receiver pid, reply port and whether it is a special reply port), `SWEET IPCW: to` (message sent TO Preferences by another task: sender pid, msgh_id, destination), `SWEET IPCW: rcv` / `rcv-err` (message received by a Preferences thread: msgh_id and the name of the receive right it arrived on, or the receive error), and once per second `SWEET THRWAIT: prefrcv` per Preferences thread (hint, ev, the thread's continuation unslid for symbolisation, receive object, io_bits, receive-right name, queued count, special-reply flag). All lines carry `now` in the clock of SWEET NAV / SWEET THRWAIT. Capped at 40000 IPCW lines per boot (loud `cap reached`). The destination port is read under a port lock taken and dropped before the real ipc_kmsg_send takes it; no printf under a lock.
+diff --git a/bsd/dev/sweet_thrwait.c b/bsd/dev/sweet_thrwait.c
+index 1449b7d..f2f787a 100644
+--- a/bsd/dev/sweet_thrwait.c
++++ b/bsd/dev/sweet_thrwait.c
+@@ -39,6 +39,10 @@ extern char *proc_name_address(void *p);      /* bsd/kern/kern_proc.c:1390 */
+ extern int sweet_thrwait_task(task_t task, uint64_t *out, int max, int *total);   /* osfmk/kern/exception.c, THW_W (8) words per thread */
+ extern int sweet_thrwait_slide(task_t task, uint64_t *slide);                     /* osfmk/kern/exception.c */
+ extern void sweet_thrwait_start(void);
++/* patch 0262 (T-e392): Mach IPC witness for Preferences, osfmk/kern/exception.c */
++extern volatile int sweet_ipcw_on;
++extern void sweet_ipcw_arm(task_t task, int pid);
++extern int sweet_thrwait_rcv(task_t task, uint64_t *out, int max, int *total);   /* 12 words per thread */
+ 
+ #define THW_TAB     512        /* aggregation table entries */
+ #define THW_TOP     24         /* rows printed per second */
+@@ -151,6 +155,11 @@ struct thw_proc {
+ static struct thw_proc thw_p[THW_NP];      /* [0] backboardd, [1] SpringBoard, [2] Preferences (patch 0259) */
+ static int thw_last_pid[THW_NP] = { -1, -1, -1 };
+ static uint32_t thw_period_ms;
++/* patch 0262 (T-e392): receive state of the Preferences threads, sampled once per printed second inside the proc callout (the proc ref is held there) */
++static int thw_rcv_due;
++static int thw_rcv_pid = -1;
++static int thw_rcv_n;
++static uint64_t thw_rcv[THW_MAX_T * 12];
+ 
+ /* patch 0250 (T-4604): one inventory line per thread, the first time it is seen blocked with a user state: `SWEET THRWAIT: thread pid P tid T idx I tsd TSD sp SP`. tsd is the thread's
+  * TPIDRRO_EL0 (pthread TSD base), sp its user stack pointer: the host joins them to the pointer libsweetgl LAGPH prints as `tid` (the thread that runs the swap) to name which
+@@ -194,6 +203,14 @@ thw_callout(proc_t p, __unused void *arg)
+ 			}
+ 			(void)sweet_thrwait_task(task, t->ent, THW_MAX_T, &t->n);
+ 			t->kept = (t->n < THW_MAX_T) ? t->n : THW_MAX_T;
++			if (which == 2) {
++				sweet_ipcw_arm(task, t->pid);   /* patch 0262: the IPC witness compares task pointers only */
++				if (thw_rcv_due) {
++					thw_rcv_n = 0;
++					(void)sweet_thrwait_rcv(task, thw_rcv, THW_MAX_T, &thw_rcv_n);
++					thw_rcv_pid = t->pid;
++				}
++			}
+ 		}
+ 	}
+ 	return PROC_RETURNED;
+@@ -232,7 +249,12 @@ sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		delay_for_interval(thw_period_ms, 1000 * 1000);   /* ms; the same call and scale as bsd/dev/sweet_restart.c:138 */
+ 		thw_p[0].pid = thw_p[1].pid = thw_p[2].pid = -1;
++		thw_rcv_pid = -1;
++		thw_rcv_due = (thw_now_ns() - last_print >= 1000000000ULL);
+ 		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, thw_callout, NULL, NULL, NULL);
++		if (thw_p[2].pid < 0) {
++			sweet_ipcw_arm(TASK_NULL, -1);   /* Preferences gone: the IPC witness stops comparing */
++		}
+ 		/* no lock held from here on */
+ 		rounds++;
+ 		for (int w = 0; w < THW_NP; w++) {
+@@ -331,6 +353,18 @@ sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
+ 					lines++;
+ 				}
+ 			}
++			/* patch 0262 (T-e392): receive state of every Preferences thread, `SWEET THRWAIT: prefrcv`. kind 2 = the receive object was read (hint PortReceive/PortSetReceive),
++			 * kind 1 = waiting without a receive object, 0 = running. cont = the thread's continuation, unslid (symbolise against the kernel image). hint 0 with ev != 0 = a wait that
++			 * is not a Mach receive (nav18 main thread): cont names which one. st/obj/bits/rname/nmsg/spec/link/opt only for kind 2. */
++			if (thw_rcv_pid >= 0) {
++				for (int i = 0; i < thw_rcv_n && i < THW_MAX_T && lines < THW_CAP; i++) {
++					const uint64_t *r = &thw_rcv[i * 12];
++
++					printf("SWEET THRWAIT: prefrcv t %llu pid %d tid 0x%llx idx %d kind %llu hint %llu ev 0x%llx cont 0x%llx wq 0x%llx st 0x%llx obj 0x%llx bits 0x%llx rname 0x%llx nmsg %llu spec %llu link %llu opt 0x%llx\n",
++					    now, thw_rcv_pid, r[0], i, r[11], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9] & 0xffff, (r[9] >> 16) & 1, (r[9] >> 20) & 7, r[10]);
++					lines++;
++				}
++			}
+ 			thw_clear();
+ 			rounds = waiting = running = 0;
+ 		}
+@@ -356,6 +390,8 @@ sweet_thrwait_start(void)
+ 	printf("SWEET THRWAIT: period %u ms\n", thw_period_ms);
+ 	if (kernel_thread_start(sweet_thrwait_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		sweet_ipcw_on = 1;   /* patch 0262 (T-e392): arms `SWEET IPCW:` lines (osfmk/kern/exception.c) */
++		printf("SWEET IPCW: armed (Preferences snd/to/rcv + THRWAIT prefrcv)\n");
+ 	} else {
+ 		printf("SWEET THRWAIT: unavailable (kernel_thread_start failed)\n");
+ 	}
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index bcde034..ad42958 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -2871,6 +2871,8 @@ ipc_kmsg_option_check(
+  *		MACH_SEND_INVALID_DEST	   Caller still has message.
+  *      MACH_SEND_INVALID_OPTIONS  Caller still has message.
+  */
++extern void sweet_ipcw_send(ipc_kmsg_t kmsg);   /* osfmk/kern/exception.c, patch 0262 */
++
+ mach_msg_return_t
+ ipc_kmsg_send(
+ 	ipc_kmsg_t              kmsg,
+@@ -2910,6 +2912,8 @@ ipc_kmsg_send(
+ 
+ 	ipc_voucher_send_preprocessing(kmsg);
+ 
++	sweet_ipcw_send(kmsg);   /* patch 0262 (T-e392): log-only Preferences IPC witness, no-op unless armed by sweetthrwait */
++
+ 	port = hdr->msgh_remote_port;
+ 	assert(IP_VALID(port));
+ 	ip_mq_lock(port);
+diff --git a/osfmk/ipc/mach_msg.c b/osfmk/ipc/mach_msg.c
+index 9771464..306c368 100644
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -116,6 +116,8 @@
+ 
+ #include <libkern/coreanalytics/coreanalytics.h>
+ 
++extern void sweet_ipcw_rcv(ipc_object_t object, mach_port_name_t rname, ipc_kmsg_t kmsg, mach_msg_return_t mr);   /* osfmk/kern/exception.c, patch 0262 (T-e392) */
++
+ #ifndef offsetof
+ #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
+ #endif /* offsetof */
+@@ -227,6 +229,8 @@ mach_msg_receive_results_kevent(
+ 	ipc_kmsg_t        kmsg = self->ith_kmsg;
+ 	mach_port_seqno_t seqno = self->ith_seqno;
+ 
++	sweet_ipcw_rcv(object, receiver_name, mr == MACH_MSG_SUCCESS ? kmsg : IKM_NULL, mr);   /* patch 0262 (T-e392): log-only Preferences IPC witness */
++
+ 	mach_msg_size_t   cpout_msg_size = 0, cpout_aux_size = 0;
+ 
+ 	/*
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a9a7fc1..60f5cfe 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -74,6 +74,11 @@
+ #include <ipc/ipc_notify.h>
+ #include <ipc/ipc_space.h>
+ #include <ipc/ipc_pset.h>
++#include <ipc/ipc_kmsg.h>   /* patch 0262 (T-e392) */
++#include <ipc/ipc_port.h>
++#include <ipc/ipc_mqueue.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <ipc/ipc_machdep.h>
+ 
+ #include <kern/ipc_tt.h>
+@@ -1252,6 +1257,205 @@ sweet_thrwait_slide(task_t task, uint64_t *slide)
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
++/*
++ * SWEET Mach IPC witness for Preferences (patch 0262, T-e392, G-10b-nav). R0: log only, no register or memory write outside this block's own statics.
++ * Armed by the sampler (bsd/dev/sweet_thrwait.c, boot-arg sweetthrwait != 0); it hands over the Preferences task each round. Three line kinds:
++ *   SWEET IPCW: snd   a message sent BY a Preferences thread (at ipc_kmsg_send entry): destination port, its kobject type, receiver name in its space and receiver pid
++ *   SWEET IPCW: to    a message sent TO Preferences by another task (same hook, destination receiver task == Preferences): sender pid, msgh_id
++ *   SWEET IPCW: rcv   a message received by a Preferences thread (mach_msg_receive_results_kevent): the name of the receive right (ith_receiver_name) and msgh_id;
++ *                     rcv-err = a receive that returned without a message (mr)
++ * `main 1` = the sending / receiving thread is the first thread of the task queue (the run-loop thread). Pointers are raw kernel addresses (as THRWAIT ev).
++ * Lines are capped (SWEET_IPCW_CAP per boot, then one `cap` line). The destination port is read under ip_mq_lock taken and dropped here before the real
++ * ipc_kmsg_send takes it (no printf under a port lock). The sender's own header words are read from the kmsg it owns.
++ */
++#define SWEET_IPCW_CAP 40000
++volatile int sweet_ipcw_on;
++static task_t volatile sweet_ipcw_task;   /* compared with current_task() / a receiver's task; dereferenced only when equal to current_task() */
++static volatile int sweet_ipcw_pid = -1;
++static volatile uint32_t sweet_ipcw_lines;
++
++void sweet_ipcw_arm(task_t task, int pid);
++void sweet_ipcw_send(ipc_kmsg_t kmsg);
++void sweet_ipcw_rcv(ipc_object_t object, mach_port_name_t rname, ipc_kmsg_t kmsg, mach_msg_return_t mr);
++int sweet_thrwait_rcv(task_t task, uint64_t *out, int max, int *total);
++
++void
++sweet_ipcw_arm(task_t task, int pid)
++{
++	sweet_ipcw_task = task;
++	sweet_ipcw_pid = pid;
++}
++
++static int
++sweet_ipcw_cap(void)
++{
++	uint32_t n = sweet_ipcw_lines;
++
++	if (n >= SWEET_IPCW_CAP) {
++		if (n == SWEET_IPCW_CAP) {
++			sweet_ipcw_lines = n + 1;
++			printf("SWEET IPCW: cap reached %d\n", SWEET_IPCW_CAP);
++		}
++		return 1;
++	}
++	sweet_ipcw_lines = n + 1;
++	return 0;
++}
++
++static uint64_t
++sweet_ipcw_now(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++void
++sweet_ipcw_send(ipc_kmsg_t kmsg)
++{
++	task_t pt = sweet_ipcw_task;
++	task_t ct;
++	thread_t th;
++	mach_msg_header_t *h;
++	ipc_port_t dp, lp;
++	uint32_t dbits, kot, act, rname;
++	task_t rtask = TASK_NULL;
++	int is_snd, is_to, main_thr, rpid = -1, spid;
++	uint64_t now;
++
++	if (!sweet_ipcw_on || pt == TASK_NULL || sweet_ipcw_lines > SWEET_IPCW_CAP) {
++		return;
++	}
++	ct = current_task();
++	th = current_thread();
++	h = ikm_header(kmsg);
++	dp = h->msgh_remote_port;
++	if (!IP_VALID(dp)) {
++		return;
++	}
++	ip_mq_lock(dp);
++	dbits = io_bits(ip_to_object(dp));
++	kot = (uint32_t)ip_kotype(dp);
++	act = ip_active(dp) ? 1 : 0;
++	rname = ip_get_receiver_name(dp);
++	if (ip_in_a_space(dp)) {
++		ipc_space_t sp = ip_get_receiver(dp);
++
++		if (sp != IS_NULL && sp != ipc_space_kernel && sp != ipc_space_reply) {
++			rtask = sp->is_task;
++		}
++	}
++	ip_mq_unlock(dp);
++	is_snd = (ct == pt);
++	is_to = (!is_snd && rtask == pt);
++	if (!is_snd && !is_to) {
++		return;
++	}
++	if (sweet_ipcw_cap()) {
++		return;
++	}
++	now = sweet_ipcw_now();
++	lp = h->msgh_local_port;
++	main_thr = (queue_first(&ct->threads) == (queue_entry_t)&th->task_threads);
++	if (is_snd) {
++		rpid = (rtask != TASK_NULL) ? task_pid(rtask) : -1;
++		printf("SWEET IPCW: snd now %llu pid %d tid 0x%llx main %d id %d sz %u bits 0x%x dest 0x%llx dbits 0x%x kot %u act %u rname 0x%x rpid %d local 0x%llx lspec %d\n",
++		    now, sweet_ipcw_pid, thread_tid(th), main_thr, h->msgh_id, h->msgh_size, h->msgh_bits, (uint64_t)(uintptr_t)dp, dbits, kot, act, rname, rpid,
++		    (uint64_t)(uintptr_t)lp, IP_VALID(lp) ? (int)lp->ip_specialreply : -1);
++	} else {
++		spid = task_pid(ct);
++		printf("SWEET IPCW: to now %llu spid %d stid 0x%llx id %d sz %u bits 0x%x dest 0x%llx dbits 0x%x kot %u act %u rname 0x%x rpid %d local 0x%llx lspec %d\n",
++		    now, spid, thread_tid(th), h->msgh_id, h->msgh_size, h->msgh_bits, (uint64_t)(uintptr_t)dp, dbits, kot, act, rname, sweet_ipcw_pid,
++		    (uint64_t)(uintptr_t)lp, IP_VALID(lp) ? (int)lp->ip_specialreply : -1);
++	}
++}
++
++void
++sweet_ipcw_rcv(ipc_object_t object, mach_port_name_t rname, ipc_kmsg_t kmsg, mach_msg_return_t mr)
++{
++	task_t pt = sweet_ipcw_task;
++	thread_t th;
++	task_t ct;
++	int main_thr;
++
++	if (!sweet_ipcw_on || pt == TASK_NULL || sweet_ipcw_lines > SWEET_IPCW_CAP) {
++		return;
++	}
++	ct = current_task();
++	if (ct != pt) {
++		return;
++	}
++	th = current_thread();
++	if (sweet_ipcw_cap()) {
++		return;
++	}
++	main_thr = (queue_first(&ct->threads) == (queue_entry_t)&th->task_threads);
++	if (mr != MACH_MSG_SUCCESS || kmsg == IKM_NULL) {
++		printf("SWEET IPCW: rcv-err now %llu pid %d tid 0x%llx main %d mr 0x%x obj 0x%llx rname 0x%x\n", sweet_ipcw_now(), sweet_ipcw_pid, thread_tid(th), main_thr, (unsigned)mr,
++		    (uint64_t)(uintptr_t)object, rname);
++	} else {
++		mach_msg_header_t *h = ikm_header(kmsg);
++
++		printf("SWEET IPCW: rcv now %llu pid %d tid 0x%llx main %d id %d sz %u bits 0x%x obj 0x%llx rname 0x%x\n", sweet_ipcw_now(), sweet_ipcw_pid, thread_tid(th), main_thr, h->msgh_id,
++		    h->msgh_size, h->msgh_bits, (uint64_t)(uintptr_t)object, rname);
++	}
++}
++
++/*
++ * One sample of the receive state of every thread of `task` (Preferences) for the once-per-second `SWEET THRWAIT: prefrcv` rows: 12 words per thread
++ * {tid, hint, ev, continuation (unslid), waitq word, ith_state, ith_object, io_bits, receiver_name, msgcount|specialreply<<16|sync_link_state<<20, option, kind}. kind 0 =
++ * not in TH_WAIT, 1 = TH_WAIT without a receive object read, 2 = TH_WAIT with the receive object read. The object is dereferenced ONLY when block_hint is
++ * PortReceive/PortSetReceive and ith_state is MACH_RCV_IN_PROGRESS / _TIMED (saved.receive is a union: any other wait would alias other fields): the thread then holds a
++ * reference on the object until it runs again, and thread_lock (held here) keeps it from running. Only plain field loads, no lock taken, no pointer followed further.
++ */
++int
++sweet_thrwait_rcv(task_t task, uint64_t *out, int max, int *total)
++{
++	thread_t thread;
++	int idx = 0;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (idx < max) {
++			uint64_t *o = &out[idx * 12];
++			spl_t s = splsched();
++
++			bzero(o, 12 * sizeof(uint64_t));
++			thread_lock(thread);
++			o[0] = thread_tid(thread);
++			if (thread->state & TH_WAIT) {
++				o[1] = (uint64_t)thread->block_hint;
++				o[2] = (uint64_t)thread->wait_event;
++				o[3] = thread->continuation ? (uint64_t)VM_KERNEL_UNSLIDE(thread->continuation) : 0;
++				o[4] = (uint64_t)thread->waitq.wq_q;
++				o[11] = 1;
++				if ((thread->block_hint == kThreadWaitPortReceive || thread->block_hint == kThreadWaitPortSetReceive) &&
++				    (thread->ith_state == MACH_RCV_IN_PROGRESS || thread->ith_state == MACH_RCV_IN_PROGRESS_TIMED) && thread->ith_object != IO_NULL) {
++					ipc_object_t obj = thread->ith_object;
++
++					o[5] = (uint64_t)thread->ith_state;
++					o[6] = (uint64_t)(uintptr_t)obj;
++					o[7] = (uint64_t)io_bits(obj);
++					o[10] = (uint64_t)thread->ith_option;
++					o[11] = 2;
++					if (io_otype(obj) == IOT_PORT) {
++						ipc_port_t port = ip_object_to_port(obj);
++
++						o[8] = (uint64_t)port->ip_receiver_name;
++						o[9] = (uint64_t)port->ip_messages.imq_msgcount | ((uint64_t)port->ip_specialreply << 16) | ((uint64_t)port->ip_sync_link_state << 20);
++					}
++				}
++			}
++			thread_unlock(thread);
++			splx(s);
++		}
++		idx++;
++	}
++	*total = idx;
++	task_unlock(task);
++	return 0;
++}
++
+ kern_return_t
+ bsd_exception(
+ 	exception_type_t        exception,

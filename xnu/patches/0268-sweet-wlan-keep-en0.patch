@@ -1,0 +1,888 @@
+SWEET WLAN keep (patch 0268, sprint-wifi 2026-11-08, boot arg sweetwlankeep=1 together with sweetwlan=26; without the boot arg every path is the behaviour of patches 0174..0267 unchanged): after a finished L26 (WLC ping 10/10) the one-shot G2 hook no longer tears the link down. Today swg_go runs swg_undo (PCIe 0xC34 := 0, EP Command := 0x2 = bus master OFF, RC Command restored), the hook puts cfg 0x80 back, disarms the L25 store judge and sets h->g2 = 0, and W17 re-halts the CA7 and SYS_MEM wrapper (RESET_CTL := 1): the firmware dies seconds after it joined. With the boot arg: sweet_wlan_g2.h (patch 0174 copy, regenerated) skips the undo and the cfg 0x84 := 0 and sets x->kept (printed: `G2 keep: dongle left running`, a WIFI GAP naming what is not restored); the hook keeps h->g2 = 1 (the data path's host/DATA/doorbell stores exist only in sw3_wr's g2 branch and are judged by the L25 whitelist, which stays armed with h->l25w intact), leaves cfg 0x80 on the PCIe window the last doorbell used (sw_g2_bar0 moves it only on a difference, the list entry is repeatable), wipes the PMK copy, keeps bus and engine state static, and tells W17 (struct swl_wx keep) to skip the CA7/SM/ATU2/cfg 0x88 restore rows and the halt judgement (GAP instead of the STOP). The Apple en0 ifnet is then built over the live engine (new bsd/dev/sweet_wlan_en0_bus.h = shim/wlan_en0_bus.h, host-tested) by a kernel thread that waits for sweet_wlan_init to return, hands over with en0_live_up (engine quiet mode, boot address pixos_en0_ip through the existing sweet_wlan_en0_apply, now exported) and polls every 5 ms: ring 2 is read, printed as a WIFI GAP per unhandled item (events, DS_ENTER_REQ not acked, others) and consumed with the existing D2H-RD slot + doorbell pair, then rings 3/4 and the link watch; a stop of the engine ends the thread with no further store. One recursive mutex serialises that thread against the stack's transmit (EN0_LOCK in wlan_en0.h en0_output, patch 0199 regenerated). No new store kind: host-memory ring/index/payload stores and PCIe doorbell 0 only, all through the existing DP15 executor and the L25 judge. Not run on hardware. W-UI (sprint 2026-11-08, same patch): the kept link is made visible to iOS. (1) After en0_live_up the poll thread installs the Apple80211 handler on en0 with sweet_wlan_a80211_radio_attach_kept (patch 0201; the keep hand-over had no call to sweet_wlan_a80211_radio_attach, so wifid's SIOCGA80211 reached en0's own `ioctl unsupported`); a failure is a WIFI GAP. (2) The SSID, BSSID, channel and RSSI the FIRMWARE reports after L26 (sweet_wlan_l25_hs.h swl25_live) are copied by sw_keep_capture in the G2 hook and handed to that radio backend (kept link: Get 1/9/4/16/103/21 answer joined, same-SSID join succeeds, other join/leave/power off refused with a GAP; read once at the hand-over, not refreshed, a GAP says so); the record is wiped after the hand-over. (3) sweet_wlan_registry_set_bsd_name (patch 0200) puts `BSD Name` (kIOBSDNameKey), IOPrimaryInterface, IOBuiltin and IOLocation on the published SweetWLANInterface. No new hardware access: host memory and registry only.
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -60,6 +60,37 @@
+ #include "sweet_wlan_cred.h"
+ #include "sweet_wlan_l25_wl.h"
+ #include "sweet_wlan_l25_glue.h"
++/* patch 0268 (sprint 2026-11-08, boot arg sweetwlankeep=1): the en0 ifnet over the LIVE engine state. The three headers below are the ones sweet_wlan_en0.c includes plus sweet_wlan_en0_bus.h (shim/wlan_en0_bus.h, host-tested by
++ * wlan_en0_live_host_test.c). They live in THIS translation unit because the bus implementation is a set of static inline functions over struct swg_wx / struct swl25h and the static engine functions (swg_hrd, swg_dp_exec, swl25_H), which exist only here
++ * (a second copy in sweet_wlan_en0.c would be a second engine and a second swl25_H). sweet_wlan_en0.c keeps its own copy of the en0 code (never called, its bus refuses every exec) and exports sweet_wlan_en0_apply for the boot address. */
++#include <kern/locks.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <net/if.h>
++#include <net/if_var.h>
++#include <net/if_media.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/net_kev.h>
++#include <net/bpf.h>
++#include <netinet/in.h>
++static void sw_en0_lock(void);
++static void sw_en0_unlock(void);
++#define EN0_LOCK() sw_en0_lock()                  /* the recursive lock of the keep poll thread vs the stack's transmit (en0_output), defined with sw_keep below */
++#define EN0_UNLOCK() sw_en0_unlock()
++#define EN0_XFLAGS(ifp) ((ifp)->if_xflags)
++#define EN0_XF_NOAUTO IFXF_NX_NOAUTO
++#define EN0_EFLAGS(ifp) ifnet_eflags(ifp)
++#define EN0_EF_ENQUEUE_MULTI IFEF_ENQUEUE_MULTI
++#include "sweet_wlan_en0.h"
++#include "sweet_wlan_en0_bus.h"
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* not declared by vm/pmap.h in this tree: same extern as patch 0028:81, 0067:12 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+@@ -2005,24 +2036,266 @@
+ 	return (uint64_t)(sp - bottom);
+ }
+ 
++/* ---- patch 0268 (sprint 2026-11-08): keep. Boot arg sweetwlankeep=1 (with sweetwlan=26): after a finished L26 the G2 engine is NOT undone (sweet_wlan_g2.h swg_go) and the dongle keeps running; the en0 ifnet is built over the
++ * live engine (sweet_wlan_en0_bus.h en0_live_up) by a kernel thread that then polls it every 5 ms. Without the boot arg nothing in this block runs: sw_keep.armed stays 0, the lock is never created, sw_en0_lock() returns at once.
++ * The engine state (sw_gx), its bus (sw_gb), swl25_H, the G1/DATA blocks (kmem_alloc_contig KMA_PERMANENT) and struct sw_hw (static in sweet_wlan_init) all outlive the hook; the hook's stack frame is not used after it returns.
++ * Serialisation: ONE recursive mutex (sw_keep.mtx). The poll thread holds it around swg_keep_r2 + en0_live_poll (every bus call, every engine store of the receive side); the stack's transmit takes it inside en0_output (wlan_en0.h
++ * EN0_LOCK) around the copy into e->scratch and en0_tx_post (every bus call of the transmit side); en0_live_up takes it only around its two bus sections (h2d sync, rx fill), NOT around en0_set_link whose boot address (SIOCAIFADDR)
++ * makes the stack send (ARP) through en0_output on the same thread. Recursive because the poll thread's frame delivery (ifnet_input) can reach en0_output on its own thread. Not held while the engine is stopped: both sides test x->stopped /
++ * x->d4dstop under the lock before any store (swg_dp_exec and en0l_exec refuse too). A mutex, not a spinlock: the holders do MMIO reads (tens of microseconds per store: sw3_g2_ok reads 17 words of link state) and cache maintenance. */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);      /* osfmk/kern/thread.h, XNU-private; declared the same way by sweet_restart.c */
++extern void thread_terminate_self(void);                                              /* osfmk/kern/thread.h, as sweet_mali.c declares it */
++extern int sweet_wlan_en0_apply(ifnet_t ifp, const struct en0_cfg *c);                /* sweet_wlan_en0.c (patch 0268 exports the boot-address hook) */
++
++static struct swg_bus sw_gb;            /* the engine's bus, static: it outlives the hook in the keep case */
++static struct swg_wx sw_gx;             /* T-eabd: static, not on the kernel stack (4480 B frame of the L24 overflow, docs/reviews/T-ed1c-proof.md); zeroed by every hook call */
++static struct en0 sw_keep_en;
++static struct en0_live sw_keep_live;
++
++/* W-UI (sprint 2026-11-08): the link the dongle keeps, as the FIRMWARE reported it after L26 (swl25_H.live_*: SSID element of its association request, WLC_GET_BSSID, chanspec, WLC_GET_RSSI; never the
++ * credentials or the L25 cfg, both wiped before the hand-over anyway). The hook copies them into this record (sw_keep_capture).
++ * It is handed to the Apple80211 radio backend (sweet_wlan_a80211_radio_attach_kept) by the poll thread and wiped there; it carries no key. */
++static struct {
++	uint8_t ssid[32];
++	uint32_t ssid_len;
++	uint8_t bssid[6];
++	uint32_t ok;
++	uint32_t live, chan;            /* W-UI: swl25_H.live_ok (1 ssid, 2 bssid, 4 channel, 8 rssi) and the 20 MHz primary channel the firmware reported */
++	int32_t rssi;
++} sw_keep_join;
++extern int sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t ssid_len, const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok);   /* bsd/dev/sweet_wlan_a80211.c (patch 0201) */
++extern int sweet_wlan_registry_set_bsd_name(const char *name);                                                                 /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
++
++static struct {
++	lck_mtx_t *mtx;
++	thread_t volatile owner;
++	uint32_t depth;
++	volatile uint32_t armed;        /* the thread exists */
++	volatile uint32_t go;           /* sweet_wlan_init has returned: the hand-over may start */
++	char bootarg[64];
++} sw_keep;
++
++/* recursive: the owner is only ever set by the thread that holds the mutex, so `owner == current_thread()` is true only for the holder */
++static void
++sw_en0_lock(void)
++{
++	thread_t t = current_thread();
++
++	if (sw_keep.mtx == NULL) {
++		return;
++	}
++	if (sw_keep.owner == t) {
++		sw_keep.depth++;
++		return;
++	}
++	lck_mtx_lock(sw_keep.mtx);
++	sw_keep.owner = t;
++	sw_keep.depth = 1;
++}
++
++static void
++sw_en0_unlock(void)
++{
++	if (sw_keep.mtx == NULL) {
++		return;
++	}
++	if (sw_keep.owner != current_thread() || sw_keep.depth == 0) {
++		swl_gap("keep", "en0 lock released by a thread that does not hold it", "high");
++		printf("WIFI GAP: keep: en0 unlock without the lock (depth %u)\n", sw_keep.depth);
++		return;
++	}
++	if (--sw_keep.depth == 0) {
++		sw_keep.owner = NULL;
++		lck_mtx_unlock(sw_keep.mtx);
++	}
++}
++
++/* the hand-over checks that need no thread: 0 = en0_live_up will not refuse (the same checks, en0l_precheck prints its own GAP) and the station MAC is known */
++static int
++sw_keep_precheck(void)
++{
++	unsigned k;
++
++	if (en0l_precheck(&sw_gx, &swl25_H) != 0) {
++		return -1;
++	}
++	for (k = 0; k < 6u; k++) {
++		if (swl25_H.l.mac[k] != 0) {
++			return 0;
++		}
++	}
++	swl_gap("keep", "station MAC unknown (all zero), en0 cannot be attached", "high");
++	printf("WIFI GAP: keep: station MAC is all zero, en0 cannot be attached\n");
++	return -1;
++}
++
++/* hook, kept case: copy what the radio backend needs to say "joined" (see sw_keep_join) from the FIRMWARE's own report after L26 (swl25_H.live_*, sweet_wlan_l25_hs.h swl25_live: the SSID element of
++ * its association request, WLC_GET_BSSID, "chanspec", WLC_GET_RSSI), never from the credentials or the L25 cfg. A missing SSID or BSSID is a GAP (the backend then answers not joined). */
++static void
++sw_keep_capture(void)
++{
++	memset(&sw_keep_join, 0, sizeof sw_keep_join);
++	if ((swl25_H.live_ok & 3u) != 3u || swl25_H.live_ssid_len == 0u || swl25_H.live_ssid_len > 32u) {
++		swl_gap("keep", "firmware SSID or BSSID not read, the kept link will answer not joined", "high");
++		printf("WIFI GAP: keep: the firmware's SSID or BSSID was not read (live_ok %#x): Apple80211 will answer not joined\n", (unsigned)swl25_H.live_ok);
++		return;
++	}
++	memcpy(sw_keep_join.ssid, swl25_H.live_ssid, swl25_H.live_ssid_len);
++	sw_keep_join.ssid_len = swl25_H.live_ssid_len;
++	memcpy(sw_keep_join.bssid, swl25_H.live_bssid, 6);
++	sw_keep_join.chan = swl25_H.live_chan;
++	sw_keep_join.rssi = swl25_H.live_rssi;
++	sw_keep_join.live = swl25_H.live_ok;
++	sw_keep_join.ok = 1u;
++	printf("SWEET WLAN: keep: firmware link values (SSID len %u, BSSID, chan %u, rssi %d, ok %#x) captured for the Apple80211 radio\n", (unsigned)sw_keep_join.ssid_len,
++	    (unsigned)sw_keep_join.chan, (int)sw_keep_join.rssi, (unsigned)sw_keep_join.live);
++}
++
++/* the keep run cannot go on: run the undo the engine skipped (EP/RC command, 0xC34, cfg 0x84) now, loudly; the hook continues as a normal run */
++static void
++sw_keep_abort(const char *why)
++{
++	sw_gx.kept = 0;
++	swc_wipe(&sw_keep_join, (uint32_t)sizeof sw_keep_join);
++	printf("SWEET WLAN: G2 keep ABORTED (%s): the normal undo runs now\n", why);
++	swl_gap("g2", "keep aborted, the normal undo ran after the engine", "high");
++	(void)swg_undo(&sw_gx);
++	if (sw_gx.rt.win != 0u) {
++		(void)swg_win(&sw_gx, 0u);
++	}
++}
++
++/* review sprint-wifi-0268-opus C1: every way out of the poll thread that did not already stop the engine runs the normal undo (EP Command := 0x2 bus master off, RC Command, 0xC34 := 0: the stores of the 10/10 run's
++ * undo) under the lock, so a running dongle is never left with bus mastering on and nobody consuming. On a dead bus the undo's own stores fail loudly; that is the best that can be done. */
++static void
++sw_keep_end(struct swg_wx *x, const char *why)
++{
++	sw_en0_lock();
++	if (!x->stopped) {
++		x->fail = why;
++		printf("SWEET WLAN: keep ends (%s): the normal undo runs now\n", why);
++		(void)swg_stop(x, SWG_E_STOPPED);
++	}
++	sw_en0_unlock();
++}
++
++/* the poll thread. Waits for sweet_wlan_init to return (the Apple80211 radio comment of patch 0201: the ifnet must be created after sweet_wlan_init returned), builds en0 over the live engine, then every 5 ms:
++ * ring 2 (swg_keep_r2: read, print, consume), rings 3/4 and the link watch (en0_live_poll). Ends, printing why, when the engine stopped (stopped / d4dstop) or the bus died: no store after that. */
++static void
++sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	struct swg_wx *x = &sw_gx;
++	struct en0 *e = &sw_keep_en;
++	struct en0_live *b = &sw_keep_live;
++	uint32_t polls = 0, items = 0;
++	int rc, found;
++
++	while (!sw_keep.go) {
++		delay_for_interval(10, 1000 * 1000);
++	}
++	found = PE_parse_boot_argn(EN0_BOOTARG, sw_keep.bootarg, sizeof sw_keep.bootarg);
++	if (!found) {
++		swl_gap("keep", "pixos_en0_ip absent, en0 stays unaddressed", "medium");
++	}
++	x->quiet = 1;           /* the engine's per-store success lines are counted (nquiet), failures still print: ~33 lines per frame otherwise */
++	printf("SWEET WLAN: en0 hand-over starts (engine level %u, ring-0 WR %u, ring-2 RD %u, boot address %s)\n", (unsigned)x->d4dlv, x->d4wr, x->d4rd, found ? "set" : "not set");
++	rc = en0_live_up(e, b, x, &swl25_H, swl25_H.l.mac, found ? sw_keep.bootarg : NULL, sweet_wlan_en0_apply);
++	if (rc != 0) {
++		swl_gap("keep", "en0 hand-over refused, the dongle runs unattended", "high");
++		printf("WIFI GAP: keep: en0 hand-over refused (rc %d): the undo runs (bus master off)\n", rc);
++		swc_wipe(&sw_keep_join, (uint32_t)sizeof sw_keep_join);
++		sw_keep_end(x, "keep: en0 hand-over refused");
++		thread_terminate_self();
++		return;
++	}
++	/* W-UI: en0 exists and has its address. The Apple80211 handler goes in front of en0's ioctl exactly as patch 0199's sweet_wlan_en0_init does (sweet_wlan_a80211_radio_attach), but with the kept radio backend
++	 * that answers "joined" with the captured join; its own install line is printed by the glue. A failure is a GAP, never silent. Then the registry interface object gets its BSD Name (patch 0200). */
++	{
++		char nm[IFNAMSIZ];
++		int ra = sw_keep_join.ok ? sweet_wlan_a80211_radio_attach_kept(e->ifp, sw_keep_join.ssid, sw_keep_join.ssid_len, sw_keep_join.bssid, sw_keep_join.chan, sw_keep_join.rssi, sw_keep_join.live) : EINVAL;
++
++		swc_wipe(&sw_keep_join, (uint32_t)sizeof sw_keep_join);
++		if (ra != 0) {
++			swl_gap("keep", "Apple80211 radio not attached on the kept en0, wifid/Settings get 'ioctl unsupported'", "high");
++			printf("WIFI GAP: keep: en0 is up without the Apple80211 kept radio (rc %d, see the lines above)\n", ra);
++		}
++		snprintf(nm, sizeof nm, "%s", if_name(e->ifp));
++		ra = sweet_wlan_registry_set_bsd_name(nm);
++		if (ra != 0) {
++			swl_gap("keep", "registry BSD Name not set on the interface object (see the W3 line above)", "medium");
++			printf("WIFI GAP: keep: registry BSD Name %s not set (rc %d)\n", nm, ra);
++		}
++	}
++	for (;;) {
++		sw_en0_lock();
++		if (!x->stopped && !x->d4dstop) {
++			(void)swg_keep_r2(x);
++		}
++		items += en0_live_poll(e, b);
++		sw_en0_unlock();
++		polls++;
++		if (x->stopped || x->d4dstop || b->dead) {
++			break;
++		}
++		if (polls % 2000u == 0u) {
++			printf("SWEET WLAN: en0 poll alive polls=%u rx=%u tx=%u nquiet=%u gaps=%u r2=%u ev=%u ds=%u items=%u\n", polls, e->rx_frames, e->tx_frames, x->nquiet,
++			       swl_gap_tot + swl_gap_over, x->kr2n, x->kr2ev, x->kr2ds, items);
++		}
++		delay_for_interval(5, 1000 * 1000);
++	}
++	printf("SWEET WLAN: en0 poll thread ends after %u polls: stopped=%d code=%d d4dstop=%u bus_dead=%u rx=%u tx=%u nquiet=%u gaps=%u: no further poll\n", polls, x->stopped, x->code, (unsigned)x->d4dstop,
++	       (unsigned)b->dead, e->rx_frames, e->tx_frames, x->nquiet, swl_gap_tot + swl_gap_over);
++	sw_keep_end(x, "keep: poll thread ends");
++	thread_terminate_self();
++}
++
++/* hook, kept case: create the lock and the poll thread (it waits for sw_keep_release). 0 = ready, -1 = nothing created that outlives the call */
++static int
++sw_keep_arm(struct sw_hw *h)
++{
++	static lck_grp_t *grp;
++	thread_t t = THREAD_NULL;
++
++	(void)h;
++	grp = lck_grp_alloc_init("sweet_wlan_en0", LCK_GRP_ATTR_NULL);
++	sw_keep.mtx = grp != NULL ? lck_mtx_alloc_init(grp, LCK_ATTR_NULL) : NULL;
++	if (sw_keep.mtx == NULL || kernel_thread_start(sw_keep_thread, NULL, &t) != KERN_SUCCESS) {
++		swl_gap("keep", "lock or poll thread could not be created", "high");
++		printf("WIFI GAP: keep: lock or poll thread could not be created\n");
++		sw_keep.mtx = NULL;
++		return -1;
++	}
++	thread_deallocate(t);
++	sw_keep.armed = 1;
++	return 0;
++}
++
++/* called when sweet_wlan_init is left, on every path (sweet_wlan_creds_scrub) */
++static void
++sw_keep_release(void)
++{
++	if (sw_keep.armed) {
++		sw_keep.go = 1;
++	}
++}
++
+ /* the W17 hook (struct swl_wx g2): runs G2 while the CA7 runs, puts the BAR0 window back, and reports; W17 re-halts the CA7 and restores cfg 0x84 next whatever this returns */
+ static int
+ sw_g2_hook(struct swl_wx *x, uint32_t sh)
+ {
+ 	struct sw_hw *h = x->b->ctx;
+-	struct swg_bus gb;
+-	static struct swg_wx g;       /* T-eabd: static, not on the kernel stack (4480 B frame of the L24 overflow, docs/reviews/T-ed1c-proof.md); G2 is single-threaded and runs once per boot, zeroed below on every call */
+ 	uint32_t w80 = h->cfg[SWW_CFG_WIN / 4];
+ 	unsigned i;
++	uint32_t keep = 0;
+ 	int rc, refused = 0;
+ 
+-	gb.rd = sw_g2_rd;
+-	gb.wr = sw_g2_wr;
+-	gb.wr16 = sw_g2_wr16;
+-	gb.delay_ms = sw_g2_delay;
+-	gb.ctx = h;
+-	gb.stack_room = sw_g2_stack_room;
+-	memset(&g, 0, sizeof g);
++	sw_gb.rd = sw_g2_rd;
++	sw_gb.wr = sw_g2_wr;
++	sw_gb.wr16 = sw_g2_wr16;
++	sw_gb.delay_ms = sw_g2_delay;
++	sw_gb.ctx = h;
++	sw_gb.stack_room = sw_g2_stack_room;
++	memset(&sw_gx, 0, sizeof sw_gx);
+ 	if (!h->g2ok) {
+ 		swl_gap("g2", "not run: glue list refused or G2 not armed", "high");
+ 		printf("SWEET WLAN: G2 RESULT not run (G2 not armed)\n");
+@@ -2036,55 +2309,86 @@
+ 		rc = 1;
+ 		refused = 1;
+ 	} else {
+-		g.b = &gb;
+-		swg_hr(&g, SWG_HR_HOOK, "g2_hook");
+-		g.in.sh = sh;
+-		g.in.end = SWW_RAM_BASE + x->ram_bytes;
++		sw_gx.b = &sw_gb;
++		swg_hr(&sw_gx, SWG_HR_HOOK, "g2_hook");
++		sw_gx.in.sh = sh;
++		sw_gx.in.end = SWW_RAM_BASE + x->ram_bytes;
+ 		for (i = 0; i < SWG_IDX_N; i++) {
+-			g.in.idx[i] = h->g2pa + h->g2plan.b[SWD_IDX_H2D_W + i].off;
++			sw_gx.in.idx[i] = h->g2pa + h->g2plan.b[SWD_IDX_H2D_W + i].off;
+ 		}
+ 		for (i = 0; i < SWG_RM_N; i++) {
+-			g.in.ring[i] = h->g2pa + h->g2plan.b[SWD_H2D_CTRL + i].off;
++			sw_gx.in.ring[i] = h->g2pa + h->g2plan.b[SWD_H2D_CTRL + i].off;
++		}
++		sw_gx.in.trap = h->g2pa + h->g2plan.b[SWD_TRAP].off;
++		sw_gx.in.scratch = h->g2pa + h->g2plan.b[SWD_SCRATCH].off;
++		sw_gx.in.blk = h->g2pa;
++		sw_gx.in.blk_len = h->g2plan.total;
++		sw_gx.in.evbuf = h->g2pa + h->g2plan.b[SWD_EVBUF].off;
++		sw_gx.in.respbuf = h->g2pa + h->g2plan.b[SWD_RESPBUF].off;
++		sw_gx.in.ioctbuf = h->g2pa + h->g2plan.b[SWD_IOCTBUF].off;
++		sw_gx.in.clm = h->g2clm;       /* L22c: set by sw_g2_clm_set only after the CRC32 check, NULL otherwise (the shim STOPs loudly at sweetwlan=24) */
++		sw_gx.in.clmlen = h->g2clmlen;
++		sw_gx.d4b = h->d4b;
++		sw_gx.jc = h->jc;           /* T-4a7f: the same table the list's L24 entries were built from (NULL until the credentials reader sets it) */
++		sw_gx.njc = h->njc;
++		if (PE_parse_boot_argn("sweetwlankeep", &keep, sizeof keep) && keep == 1u) {        /* patch 0268: keep the dongle running after a finished L26 (see sw_keep_arm) */
++			if (h->d4b >= 13) {
++				sw_gx.keep = 1;
++			} else {
++				swl_gap("g2", "sweetwlankeep=1 ignored: needs sweetwlan=26", "high");
++				printf("SWEET WLAN: sweetwlankeep=1 ignored: it needs sweetwlan=26 (d4b %d)\n", h->d4b);
++			}
+ 		}
+-		g.in.trap = h->g2pa + h->g2plan.b[SWD_TRAP].off;
+-		g.in.scratch = h->g2pa + h->g2plan.b[SWD_SCRATCH].off;
+-		g.in.blk = h->g2pa;
+-		g.in.blk_len = h->g2plan.total;
+-		g.in.evbuf = h->g2pa + h->g2plan.b[SWD_EVBUF].off;
+-		g.in.respbuf = h->g2pa + h->g2plan.b[SWD_RESPBUF].off;
+-		g.in.ioctbuf = h->g2pa + h->g2plan.b[SWD_IOCTBUF].off;
+-		g.in.clm = h->g2clm;       /* L22c: set by sw_g2_clm_set only after the CRC32 check, NULL otherwise (the shim STOPs loudly at sweetwlan=24) */
+-		g.in.clmlen = h->g2clmlen;
+-		g.d4b = h->d4b;
+-		g.jc = h->jc;           /* T-4a7f: the same table the list's L24 entries were built from (NULL until the credentials reader sets it) */
+-		g.njc = h->njc;
+ 		h->l25arm = 0;
+ 		h->l25on = 0;
+ 		if (h->d4b >= 12) {     /* T-d84f (L25/L26): the DATA block, the cfg from the credentials, the RSNE hook and the store judge's layout BEFORE the L23 scan, one pure step (swl25g_wl_arm prints every missing input and takes the hook down again on any refusal; T-3784); disarmed below on the only exit of swg_go */
+-			h->l25arm = swl25g_wl_arm(&g, &sw_l25g, &h->l25w, &h->g2plan, h->g2pa, &sw_cred, NULL, h->dpa, h->dlen, SW_G2_ALIAS_LO, SW_G2_ALIAS_HI, sw_l25w_rd, h) == 1;
++			h->l25arm = swl25g_wl_arm(&sw_gx, &sw_l25g, &h->l25w, &h->g2plan, h->g2pa, &sw_cred, NULL, h->dpa, h->dlen, SW_G2_ALIAS_LO, SW_G2_ALIAS_HI, sw_l25w_rd, h) == 1;
+ 		}
+-		h->g2x = &g;
+-		rc = swg_go(&g);
++		h->g2x = &sw_gx;
++		rc = swg_go(&sw_gx);
+ 		h->g2x = NULL;
++		if (sw_gx.kept) {
++			sw_keep_capture();      /* W-UI: before the disarm wipes the cfg */
++		}
+ 		if (h->d4b >= 12) {
+-			swl25g_disarm(&g, &sw_l25g);
++			swl25g_disarm(&sw_gx, &sw_l25g);      /* the PMK copy is wiped in the keep case too: the data path needs no key (the dongle holds the PTK/GTK) */
++		}
++		if (sw_gx.kept) {       /* patch 0268: keep only with the L25 store judge live (the only judge of the host/DATA/doorbell stores the data path makes) and a hand-over that will be accepted */
++			if (!(h->l25arm && h->l25on)) {
++				sw_keep_abort("the L25 store judge is not live");
++			} else if (sw_keep_precheck() != 0) {
++				sw_keep_abort("the en0 hand-over would be refused");
++			} else if (sw_keep_arm(h) != 0) {
++				sw_keep_abort("the poll thread could not be started");
++			}
++		}
++		if (!sw_gx.kept) {
++			h->l25arm = 0;
++			h->l25on = 0;
++			memset(&h->l25w, 0, sizeof h->l25w);
++		}
++		printf("SWEET WLAN: stack headroom min %u (samples %u)\n", sw_gx.hr_min, sw_gx.hr_n);
++		if (!sw_gx.kept) {
++			sw_gx.b = NULL;       /* the bus is static now (sw_gb); a stray later use of the engine finds no bus */
++		} else {
++			x->keep = 1;          /* W17: no CA7/SM re-halt, no STOP */
+ 		}
+-		h->l25arm = 0;
+-		h->l25on = 0;
+-		memset(&h->l25w, 0, sizeof h->l25w);
+-		printf("SWEET WLAN: stack headroom min %u (samples %u)\n", g.hr_min, g.hr_n);
+-		g.b = NULL;       /* gb dies with this frame */
+ 	}
+-	if (h->cfg[SWW_CFG_WIN / 4] != w80 && (sw3_wr(h, SWW_CFG, 0, SWW_CFG_WIN, w80) != 0 || h->cfg[SWW_CFG_WIN / 4] != w80)) {
++	if (!sw_gx.kept && h->cfg[SWW_CFG_WIN / 4] != w80 && (sw3_wr(h, SWW_CFG, 0, SWW_CFG_WIN, w80) != 0 || h->cfg[SWW_CFG_WIN / 4] != w80)) {
+ 		swl_gap("g2", "glue: BAR0 window not put back", "high");
+ 		printf("SWEET WLAN: G2 glue: BAR0 window %#x not put back to %#x\n", h->cfg[SWW_CFG_WIN / 4], w80);
+ 		rc = rc ? rc : -1;
+ 	}
+-	h->g2 = 0;
++	if (sw_gx.kept) {
++		/* patch 0268, K2: h->g2 stays 1 (sw3_wr takes nothing else while it is set, and the data path's host/DATA/doorbell stores exist only in that branch, judged by the L25 whitelist); cfg 0x80 stays where the last doorbell left it (SWW_WIN_PCIE): sw_g2_bar0 only moves it when it differs, and the list entry for it is repeatable */
++		printf("SWEET WLAN: G2 keep: h->g2 stays 1, cfg 0x80 stays %#x, L25 judge armed (live %d), bus and engine state static\n", h->cfg[SWW_CFG_WIN / 4], h->l25on);
++	} else {
++		h->g2 = 0;
++	}
+ 	if (refused) {
+ 		return rc;
+ 	}
+-	if (g.d4dstop || g.d4dlv < 17u) { printf("SWEET WLAN: G2 RESULT %s rc=%d stores=%u mask %#x undo=%s d4d=%s\n", rc ? "STOPPED" : "done", rc, g.nstore, g.mask, g.restore ? "ok" : "FAILED", g.d4dstop ? "stopped" : "-"); } else { printf("SWEET WLAN: G2 RESULT %s rc=%d stores=%u mask %#x undo=%s d4d=%u\n", rc ? "STOPPED" : "done", rc, g.nstore, g.mask, g.restore ? "ok" : "FAILED", (unsigned)g.d4dlv); }     /* sprint 2026-11-08: the level as a number; the old 8-entry name table "17".."24" was read past its end at d4dlv 26 (kernel data abort, run join26a) */
++	if (sw_gx.d4dstop || sw_gx.d4dlv < 17u) { printf("SWEET WLAN: G2 RESULT %s rc=%d stores=%u mask %#x undo=%s d4d=%s\n", rc ? "STOPPED" : "done", rc, sw_gx.nstore, sw_gx.mask, sw_gx.kept ? "kept" : sw_gx.restore ? "ok" : "FAILED", sw_gx.d4dstop ? "stopped" : "-"); } else { printf("SWEET WLAN: G2 RESULT %s rc=%d stores=%u mask %#x undo=%s d4d=%u\n", rc ? "STOPPED" : "done", rc, sw_gx.nstore, sw_gx.mask, sw_gx.kept ? "kept" : sw_gx.restore ? "ok" : "FAILED", (unsigned)sw_gx.d4dlv); }     /* sprint 2026-11-08: the level as a number; the old 8-entry name table "17".."24" was read past its end at d4dlv 26 (kernel data abort, run join26a) */
+ 	return rc;
+ }
+ 
+@@ -2178,6 +2482,7 @@
+ sweet_wlan_creds_scrub(int *guard)
+ {
+ 	(void)guard;
++	sw_keep_release();      /* patch 0268: sweet_wlan_init is over (every path): the keep poll thread may start the en0 hand-over */
+ 	swc_wipe(sw_jc, (uint32_t)sizeof sw_jc);
+ 	swc_wipe(&sw_cred, (uint32_t)sizeof sw_cred);
+ 	swc_wipe(&sw_l25g, (uint32_t)sizeof sw_l25g);
+--- a/bsd/dev/sweet_wlan_wr.h
++++ b/bsd/dev/sweet_wlan_wr.h
+@@ -533,6 +533,7 @@
+ 	int (*g2)(struct swl_wx *x, uint32_t sh);       /* run G2 (patch 0174): set by the glue at sweetwlan=12 only; W17 calls it after F3 confirmed the live window 0, before the re-halt */
+ 	int g2rc;                                       /* run G2: what the hook returned (0 = done and undone; not called: 1) */
+ 	int w15;                                        /* patch 0174 (D-12): 1 only at sweetwlan=15 (set by the glue): row W15 runs and SWT_W15 tuples are live */
++	int keep;                                       /* patch 0268 (sprint 2026-11-08, boot arg sweetwlankeep=1): set by the G2 hook when swg_go kept the dongle running; W17 then neither re-halts the CA7/SM nor judges the halt (a printed GAP instead of the STOP) */
+ };
+ 
+ static inline const char *
+@@ -2351,8 +2352,21 @@
+ 			printf("SWEET WLAN: W17 G2 hook returned %d, re-halt follows\n", x->g2rc);
+ 		}
+ 	}
++	if (x->keep) {          /* patch 0268: the G2 hook kept the dongle running. Only the cfg 0x84 row (group W84) is restored: the others need the CA7/SM in reset or a store the hook state (h->g2 stays 1) refuses; each is named below */
++		x->armed &= SWW_RG_W84;
++		swl_gap("keep", "W17: CA7/SM not re-halted, ATU2 and cfg 0x88 not restored", "high");
++		printf("SWEET WLAN: W17 KEEP: the CA7 and the SYS_MEM wrapper are NOT put back in reset (the firmware keeps running), ATU region 2 stays enabled, cfg 0x88 stays as it is; only cfg 0x84 := 0 is restored\n");
++		printf("WIFI GAP: w17 keep: halted=0 on purpose; restore rows skipped: SM RESET_CTL := 1, CA7 RESET_CTL := 1, ATU region 2 disable, cfg 0x88; F2/F1-PCIe dumps not made\n");
++	}
+ 	swl_restore(x);
+ 	x->halted = x->ca_ok;
++	if (x->keep) {
++		printf("SWEET WLAN: W17 keep: restore=%s, halted=%d (accepted: no STOP)\n", swl_rsname(x->restore), x->halted);
++		if (x->restore == SWW_RS_FAILED) {
++			swl_gap("keep", "W17: cfg 0x84 restore failed", "high");
++		}
++		return 0;
++	}
+ 	if (!x->halted) {
+ 		x->stopped = 1;
+ 		x->stop_code = SWW_E_HALT;
+--- a/bsd/dev/sweet_wlan_en0.c
++++ b/bsd/dev/sweet_wlan_en0.c
+@@ -64,8 +64,9 @@
+ }
+ 
+ /* EN9 apply hook: plumb IPv4 and SIOCAIFADDR on a kernel socket (the 0073 pattern). The values come from en0_boot_cfg(), never from this file. */
+-static int
+-sw_en0_apply(ifnet_t ifp, const struct en0_cfg *c)
++/* patch 0268: not static any more, sweet_wlan.c (the keep hand-over) applies the same boot address through it */
++int
++sweet_wlan_en0_apply(ifnet_t ifp, const struct en0_cfg *c)
+ {
+ 	struct ifaliasreq ifra;
+ 	struct sockaddr_in *a;
+@@ -105,7 +106,7 @@
+ 	sw_en0.bus.d2h_wr = sw_en0_wr;
+ 	sw_en0.bus.d2h_item = sw_en0_item;
+ 	sw_en0.bus.rxbuf = sw_en0_rxbuf;
+-	sw_en0.apply = sw_en0_apply;
++	sw_en0.apply = sweet_wlan_en0_apply;
+ 	if (PE_parse_boot_argn(EN0_BOOTARG, bootarg, sizeof(bootarg))) {
+ 		sw_en0.bootarg = bootarg;
+ 	}
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_en0_bus.h
+@@ -0,0 +1,388 @@
++/* wlan_en0_bus.h - the `struct en0_bus` of wlan_en0.h on the live engine state after L25 (sprint 2026-11-08, W-IOSPING prerequisite).
++ *
++ * The XNU `en0` ifnet (wlan_en0.h, poll mode) names its transport as four callbacks; this file implements them on what the one-shot L25 hook leaves behind:
++ *   exec    -> swg_dp_exec (sweet_wlan_g2d.h): every store of every tx post, rx re-post and D2H consume still goes through the DP15 audit (swdp_audit twice: en0 and the executor),
++ *              the kind sequence, the old-word compare against the shadows and the read-back. Only three plan shapes are accepted (tx = PAYLOAD+ITEM+WRIDX+DB, rx post = ITEM ring 1
++ *              +WRIDX+DB, consume = RDIDX+DB ring 3/4); anything else is a printed refusal. exec < 0 means "not executed" for the callers; after a store failed in the MIDDLE of a plan
++ *              the engine is hard-stopped (d4dstop, swg_dp_exec) and every later exec is refused, so a half-written slot is never committed by an index.
++ *   d2h_wr  -> the D2H write index slot of the ring in the G1 block (x->in.idx[SWG_IDX(SWD_IDX_D2H_W)] + 4 * (ring - 2), as swl25_d2h reads it).
++ *   d2h_item-> the item words of ring 3 / ring 4 in the G1 block (x->in.ring[ring] + idx * isz, as swl25_item reads them), copied into a bus-owned buffer.
++ *   rxbuf   -> the rx buffer of request slot `slot` in the DATA block, read word by word through the engine bus (x->b->rd, space SWG_SP_DATA, as swl25_dread does).
++ * A read that fails or reads all ones (dead link) latches `dead`: one GAP, then d2h_wr answers 0xFFFFFFFF (en0 prints its own "write index outside the ring"), d2h_item answers
++ * NULL and exec refuses (en0 prints the DP15 gap). The bus never calls swg_stop (its undo would restore EP/RC command registers under a live data path).
++ *
++ * Limits of L25 lifted HERE (none needs a change in a file this slice does not own):
++ *  (1) SWL25_SHADOW_ITEMS = 16 (sweet_wlan_l25.h:34): the ring-1 and flow-ring shadows (struct swl25 sh_r1 / sh_fl) cover 16 items, a later slot stops the engine (swg_dp_shadow NULL
++ *      -> SWG_E_ADDR). en0_live_up installs bus-owned shadows of the FULL rings (ring 1: 2048 items, patch 0167 swd_rings[1]; flow ring: SWL25_FLOW_DEPTH items) in x->dpsh[0..1],
++ *      seeded from the L25 shadows (the first 16 items), the rest zero (the glue allocates the G1/DATA blocks zeroed; the L25 shadows assume the same).
++ *  (2) rx buffers are posted once by L25 (16): wlan_en0.h en0_poll_rx refills the pool after the completions of a poll pass, in batches (patch 0357: request slots from the book, ring 1 wraps at its depth, epoch =
++ *      absolute count, swdp_ring_post, one doorbell per batch); en0_live_up tops the pool up to env.rx_slots (the count swdp_rx_pick chose, 16..255) with en0_rx_fill. The H2D read cursors those posts check come from en0l_h2d_sync below (wlan_en0.h never moves them).
++ *  (3) tx buffers are used once by L25 (swl25h.txb never released): en0_live_up releases the slots whose tx status L25 already consumed (h->txdone), en0_poll_tx frees a slot at its status.
++ * Limits NOT lifted (listed in the sprint report): SWDP_NSLOT = 16 tx buffers (sweet_wlan_data.h, the audit's request-id range; the rx pool is larger since patch 0357), and the DP15 all-ones old word (below).
++ *
++ * The all-ones old word: swg_d4d_st (sweet_wlan_g2.h:1719) stops the engine with SWG_E_DEAD when the OLD word it reads is 0xFFFFFFFF, for item and payload words alike. A flow-ring item of
++ * a BROADCAST frame holds the destination MAC in item bytes 8..11 (swdp_build_txpost), i.e. an all-ones word, so the lap that reuses that slot (every 64 posts) - or any tx buffer
++ * whose last payload held an all-ones word (e.g. IP broadcast) - would stop the engine and run swg_undo. Until sweet_wlan_g2.h defines SWG_DP_SHADOW_ONES_OK (= the dead-link check is
++ * skipped when the shadow word is all ones too, which the compare right behind it needs anyway) the bus keeps `ff_guard` on: such a plan is REFUSED before the first store with a GAP, the
++ * engine stays alive and the ring does not advance. */
++#ifndef WLAN_EN0_BUS_H
++#define WLAN_EN0_BUS_H
++
++#ifndef WLAN_EN0_H
++#error "wlan_en0_bus.h needs wlan_en0.h (struct en0, struct en0_bus) first"
++#endif
++#ifndef SWEET_WLAN_L25_HS_H
++#error "wlan_en0_bus.h needs sweet_wlan_l25_hs.h (struct swl25h) and the engine (sweet_wlan_g2.h) first"
++#endif
++
++#define EN0L_R1_MAX     2048u                       /* ring-1 items: swd_rings[1] { "h2d rxpost", 2048, 32 }, xnu patch 0167:185 */
++#define EN0L_FLOW_MAX   SWL25_FLOW_DEPTH            /* flow ring items (sweet_wlan_l25.h:24) */
++#define EN0L_ONES       0xFFFFFFFFu
++#define EN0L_GAP_FF     "WIFI GAP: EN-L plan refused: a word it overwrites is all ones and the DP15 dead-link check (g2.h:1719) would stop the engine; needs SWG_DP_SHADOW_ONES_OK"
++
++struct en0_live {
++	struct swg_wx *x;
++	struct swl25h *h;
++	struct en0 *en;                     /* the ifnet state whose H2D read cursors the bus refreshes (see en0l_h2d_sync) */
++	struct swdp_env *env;               /* = &en0.env: the envelope exec hands to swg_dp_exec */
++	uint32_t rx_dataoffset;
++	uint8_t dead, ff_guard;
++	uint32_t execs, refused, failed, ff_refused, bad_reads, last_slot, last_need;
++	uint32_t sh_r1[EN0L_R1_MAX * SWDP_ISZ_RXPOST / 4u];        /* old words of ring 1, the whole ring */
++	uint32_t sh_fl[EN0L_FLOW_MAX * SWDP_ISZ_TX_EXT / 4u];      /* old words of the flow ring, the whole ring (large enough for the extended item too) */
++	uint8_t it3[SWDP_ISZ_TX_CMPLT], it4[SWDP_ISZ_RX_CMPLT];    /* the last item handed out per ring */
++	uint8_t rxb[SWL25_BUF_SZ + 4u];                            /* the last rx buffer handed out (+4: whole-word copy) */
++	uint32_t blkw[SWL25_BUF_SZ / 4u + 1u];                     /* Part A: the words of one rd_blk call (rx buffer or D2H item) */
++	uint32_t blk_reads;
++};
++
++static inline void en0l_gap(const char *what, uint32_t a)
++{
++	char b[160];
++
++	snprintf(b, sizeof b, "%s %u", what, (unsigned)a);
++	SWDP_GAP(b);
++}
++
++/* latch the bus dead with one GAP; later calls only count */
++static inline void en0l_dead(struct en0_live *b, const char *why, uint32_t a)
++{
++	b->bad_reads++;
++	if (!b->dead) {
++		b->dead = 1u;
++		en0l_gap(why, a);
++	}
++}
++
++/* ---- H2D read cursors ----
++ * wlan_en0.h posts with swdp_ring_post() on COPIES of e->rxpost / e->flow.ring, and that function refuses when (rd + depth - wr - 1) % depth == 0; nothing in wlan_en0.h ever moves
++ * `rd` (the dongle's read index, H2D-RD slot of the ring in the G1 block, which swg_dp_room reads inside exec for its own full check). Left alone, the host books would call
++ * the flow ring full after depth - 1 = 63 posts and ring 1 after 2047, and the wrap this bus exists for would never happen. The bus therefore refreshes both cursors from the
++ * G1 block (swdp_h2d_rd_set: refuses an index outside the ring) at the start of every poll pass (en0_poll_tx's first d2h_wr) and at hand-over. A caller's post copies the cursor
++ * before the plan and writes the copy back after it, so a refresh inside exec would be overwritten; the next poll pass is the sync point. A stale cursor can only make the host see
++ * LESS room than there is (a burst of more than depth - 1 tx posts without a poll is dropped with the EN6 gap, which is the safe side). */
++static inline void en0l_h2d_sync(struct en0_live *b)
++{
++	struct swg_wx *x = b->x;
++	struct en0 *e = b->en;
++	uint32_t v = 0u;
++
++	if (b->dead || e == NULL)
++		return;
++	if (swg_hrd(x, x->in.idx[SWG_IDX(SWD_IDX_H2D_R)] + 4ull * swdp_h2d_slot(SWDP_RING_RXPOST), &v) ||
++	    (v == EN0L_ONES) || swdp_h2d_rd_set(&e->rxpost, v)) {
++		en0l_dead(b, "WIFI GAP: EN-L H2D read index of ring 1 unreadable, all ones or outside the ring, value", v);
++		return;
++	}
++	if (swg_hrd(x, x->in.idx[SWG_IDX(SWD_IDX_H2D_R)] + 4ull * swdp_h2d_slot(swdp_ringid(e->env.flowid)), &v) ||
++	    (v == EN0L_ONES) || swdp_h2d_rd_set(&e->flow.ring, v))
++		en0l_dead(b, "WIFI GAP: EN-L H2D read index of the flow ring unreadable, all ones or outside the ring, value", v);
++}
++
++/* ---- exec ---- */
++
++/* the accepted plan shapes (see the header comment); NULL = not one of them */
++static inline const char *en0l_plan_name(const struct swdp_store *s, uint32_t n)
++{
++	if (n == 4u && s[0].kind == SWDP_SK_PAYLOAD)
++		return "en0 tx";
++	if (n >= 3u && n <= SWDP_MAX_STORES_RXB && s[0].kind == SWDP_SK_ITEM && s[0].ring == SWDP_RING_RXPOST) {     /* patch 0357: [ITEM ring 1 x (n - 2), WRIDX, DB]: one item (the old shape) or a batch */
++		uint32_t i;
++
++		for (i = 0; i + 2u < n; i++)
++			if (s[i].kind != SWDP_SK_ITEM || s[i].ring != SWDP_RING_RXPOST)
++				return NULL;
++		return s[n - 2u].kind == SWDP_SK_WRIDX && s[n - 1u].kind == SWDP_SK_DB ? (n == 3u ? "en0 rxpost" : "en0 rxpost batch") : NULL;
++	}
++	if (n == 2u && s[0].kind == SWDP_SK_RDIDX && s[0].ring == SWDP_RING_TXCPL)
++		return "en0 consume r3";
++	if (n == 2u && s[0].kind == SWDP_SK_RDIDX && s[0].ring == SWDP_RING_RXCPL)
++		return "en0 consume r4";
++	return NULL;
++}
++
++/* 1 when any word the plan overwrites has an all-ones SHADOW (= old) word: swg_d4d_st would stop the engine on it */
++static inline int en0l_ff_old(struct en0_live *b, const struct swdp_store *s, uint32_t n)
++{
++	uint32_t i, k, nw;
++	const uint32_t *sh;
++
++	for (i = 0; i < n; i++) {
++		if (s[i].kind != SWDP_SK_ITEM && s[i].kind != SWDP_SK_PAYLOAD)
++			continue;
++		nw = (s[i].len + 3u) / 4u;         /* swg_dp_run: item len / 4 words, payload (len + 3) / 4 words */
++		for (k = 0; k < nw; k++) {
++			sh = swg_dp_shadow(b->x, b->env, s[i].addr + 4ull * k);
++			if (sh != NULL && *sh == EN0L_ONES)
++				return 1;
++		}
++	}
++	return 0;
++}
++
++static inline int en0l_exec(void *ctx, const struct swdp_store *s, uint32_t n)
++{
++	struct en0_live *b = ctx;
++	const char *nm = en0l_plan_name(s, n);
++	int r;
++
++	if (b->dead) {
++		b->refused++;
++		return -1;                          /* en0_run_plan prints SWDP_GAP_DP15 */
++	}
++	if (nm == NULL) {
++		b->refused++;
++		en0l_gap("WIFI GAP: EN-L plan shape not accepted by the en0 bus, stores", n);
++		return -2;
++	}
++	if (b->ff_guard && en0l_ff_old(b, s, n)) {
++		b->ff_refused++;
++		SWDP_GAP(EN0L_GAP_FF);
++		return -3;
++	}
++	r = swg_dp_exec(b->x, b->env, s, n, nm, 0);
++	if (r != 0) {
++		b->failed++;                        /* swg_dp_exec printed its WIFI GAP line; the engine soft/hard-stopped */
++		return r < 0 ? r : -4;
++	}
++	b->execs++;
++	return 0;
++}
++
++/* ---- D2H reads ---- */
++
++static inline uint32_t en0l_d2h_wr(void *ctx, uint32_t ring_id)
++{
++	struct en0_live *b = ctx;
++	struct swg_wx *x = b->x;
++	uint32_t v = 0u;
++
++	if (b->dead || ring_id < SWDP_RING_TXCPL || ring_id > SWDP_RING_RXCPL) {
++		if (!b->dead)
++			en0l_gap("WIFI GAP: EN-L d2h_wr for a ring that is not 3 or 4, ring", ring_id);
++		return EN0L_ONES;
++	}
++	if (swg_hrd(x, x->in.idx[SWG_IDX(SWD_IDX_D2H_W)] + 4ull * swdp_d2h_slot(ring_id), &v)) {
++		en0l_dead(b, "WIFI GAP: EN-L D2H write index read failed (bus stopped or block), ring", ring_id);
++		return EN0L_ONES;
++	}
++	if (v == EN0L_ONES)
++		en0l_dead(b, "WIFI GAP: EN-L D2H write index reads all ones (dead link), ring", ring_id);
++	else if (ring_id == SWDP_RING_TXCPL)
++		en0l_h2d_sync(b);                       /* once per poll pass (the first call of en0_poll_tx) and per tx status */
++	return v;
++}
++
++static inline const uint8_t *en0l_d2h_item(void *ctx, uint32_t ring_id, uint32_t idx)
++{
++	struct en0_live *b = ctx;
++	struct swg_wx *x = b->x;
++	uint32_t isz, i, v, depth;
++	uint8_t *o;
++
++	if (b->dead)
++		return NULL;
++	if (ring_id < SWDP_RING_TXCPL || ring_id > SWDP_RING_RXCPL) {
++		en0l_gap("WIFI GAP: EN-L d2h_item for a ring that is not 3 or 4, ring", ring_id);
++		return NULL;
++	}
++	isz = ring_id == SWDP_RING_TXCPL ? SWDP_ISZ_TX_CMPLT : SWDP_ISZ_RX_CMPLT;
++	o = ring_id == SWDP_RING_TXCPL ? b->it3 : b->it4;
++	depth = b->env->depth_d2h[ring_id - 2u];
++	if (idx >= depth) {
++		en0l_gap("WIFI GAP: EN-L d2h_item index outside the ring, index", idx);
++		return NULL;
++	}
++	if (x->b->rd_blk != NULL) {             /* Part A: the item in one cache pass (= isz / 4 flushing swg_hrd reads) */
++		uint32_t ho;
++
++		if (x->stopped || swg_hoff(x, x->in.ring[ring_id] + (uint64_t)idx * isz, isz, &ho) || x->b->rd_blk(x->b->ctx, SWG_SP_HOST, ho, b->blkw, isz / 4u)) {
++			en0l_dead(b, "WIFI GAP: EN-L D2H item read failed, ring", ring_id);
++			return NULL;
++		}
++		for (i = 0; i < isz / 4u; i++)
++			swdp_p32(o + 4u * i, b->blkw[i]);
++		b->blk_reads++;
++	} else {
++		for (i = 0; i < isz / 4u; i++) {
++			if (swg_hrd(x, x->in.ring[ring_id] + (uint64_t)idx * isz + 4ull * i, &v)) {
++				en0l_dead(b, "WIFI GAP: EN-L D2H item read failed, ring", ring_id);
++				return NULL;
++			}
++			swdp_p32(o + 4u * i, v);
++		}
++	}
++	if (ring_id == SWDP_RING_RXCPL) {       /* remember how much of that rx buffer rxbuf() has to read: data_offset (+16, 0 = shared offset) + data_len (+14) */
++		const uint32_t off = swdp_g16(o + 16) != 0u ? swdp_g16(o + 16) : b->rx_dataoffset;
++
++		b->last_slot = swdp_g32(o + 4) - SWDP_RX_RID;
++		b->last_need = off + swdp_g16(o + 14);
++	}
++	return o;
++}
++
++/* the rx buffer of `slot`: [0, need) read from the DATA block (need = the last rx completion's end for that slot, else the whole buffer). On a failed read: a GAP and a zeroed
++ * buffer (wlan_en0.h en0_rx_one does not test for NULL; an all-zero frame has ethertype 0 and is dropped by any stack) */
++static inline const uint8_t *en0l_rxbuf(void *ctx, uint32_t slot)
++{
++	struct en0_live *b = ctx;
++	struct swg_wx *x = b->x;
++	const struct swdp_env *e = b->env;
++	uint32_t need = SWL25_BUF_SZ, k, v, base;
++
++	memset(b->rxb, 0, sizeof b->rxb);
++	if (b->dead || slot >= swdp_env_rxn(e) || e->buf_sz > SWL25_BUF_SZ) {
++		en0l_gap("WIFI GAP: EN-L rx buffer unavailable (bus dead or slot out of range), a zeroed frame is returned, slot", slot);
++		return b->rxb;
++	}
++	if (slot == b->last_slot && b->last_need != 0u && b->last_need <= e->buf_sz)
++		need = b->last_need;
++	base = (uint32_t)(e->rxbuf.pa - e->data.pa) + slot * e->buf_sz;
++	if (x->b->rd_blk != NULL) {             /* Part A: the frame in one cache pass (= one flushing rd per word) */
++		if (x->b->rd_blk(x->b->ctx, SWG_SP_DATA, base, b->blkw, (need + 3u) / 4u)) {
++			en0l_dead(b, "WIFI GAP: EN-L rx buffer read failed, zeroed frame returned, slot", slot);
++			memset(b->rxb, 0, sizeof b->rxb);
++			return b->rxb;
++		}
++		for (k = 0; k < (need + 3u) / 4u; k++)
++			swdp_p32(b->rxb + 4u * k, b->blkw[k]);
++		b->blk_reads++;
++		return b->rxb;
++	}
++	for (k = 0; k < (need + 3u) / 4u; k++) {
++		if (x->b->rd(x->b->ctx, SWG_SP_DATA, base + 4u * k, &v)) {
++			en0l_dead(b, "WIFI GAP: EN-L rx buffer read failed, zeroed frame returned, slot", slot);
++			memset(b->rxb, 0, sizeof b->rxb);
++			return b->rxb;
++		}
++		swdp_p32(b->rxb + 4u * k, v);
++	}
++	return b->rxb;
++}
++
++/* ---- hand-over from the L25 hook ---- */
++
++static inline int en0l_precheck(struct swg_wx *x, const struct swl25h *h)
++{
++	if (x->stopped || x->d4dstop) {
++		SWDP_GAP("WIFI GAP: EN-L hand-over refused: the engine is stopped");
++		return -1;
++	}
++	if (!h->hs_done) {
++		SWDP_GAP("WIFI GAP: EN-L hand-over refused: the 4-way handshake keys are not installed");
++		return -1;
++	}
++	if (!h->l.env.flow_open || h->l.flow.st != SWDP_FLOW_OPEN) {
++		SWDP_GAP("WIFI GAP: EN-L hand-over refused: the flow ring is not open");
++		return -1;
++	}
++	if (h->l.env.depth1 > EN0L_R1_MAX || h->l.env.depth_flow > EN0L_FLOW_MAX || h->l.env.flow_isz > SWDP_ISZ_TX_EXT) {
++		SWDP_GAP("WIFI GAP: EN-L hand-over refused: ring 1 or the flow ring is deeper than the bus shadow arrays");
++		return -1;
++	}
++	return 0;
++}
++
++/* take over the books of L25 (copies: L25 never runs again), install the full-ring shadows, release the tx slots whose status L25 consumed */
++static inline void en0l_take(struct en0 *e, struct en0_live *b, struct swg_wx *x, struct swl25h *h)
++{
++	const struct swdp_env *v = &h->l.env;
++	uint32_t i;
++
++	e->env = h->l.env;
++	e->flow = h->l.flow;
++	e->rxpost = h->l.r1;
++	e->txcpl = h->r3;
++	e->rxcpl = h->r4;
++	e->rxb = h->l.rxb;
++	e->txb = h->txb;
++	e->rx_dataoffset = x->rxoff;
++	for (i = 0; i < SWDP_NSLOT; i++)       /* tx slots whose status L25 already read are free; the others stay in flight until en0_poll_tx sees their status */
++		if (e->txb.used[i] && (h->txdone & (1u << i)) != 0u)
++			(void)swdp_book_done(&e->txb, SWDP_TX_RID + i, NULL);
++	memcpy(b->sh_r1, h->l.sh_r1, sizeof h->l.sh_r1);
++	memcpy(b->sh_fl, h->l.sh_fl, sizeof h->l.sh_fl);
++	x->dpsh[0] = (struct swg_dp_sh){ v->ring1.pa, v->depth1 * SWDP_ISZ_RXPOST / 4u, b->sh_r1 };
++	x->dpsh[1] = (struct swg_dp_sh){ v->flow.pa, v->depth_flow * v->flow_isz / 4u, b->sh_fl };
++}
++
++/* L25 has finished (keys installed, flow ring open) in `h` on engine `x`: build en0 on the live state. Order: books and shadows, the bus, ifnet attach (wlan_en0.h en0_attach), link up
++ * (+ the optional boot address), rx pool top-up. 0 = en0 is up, -1 = refused (a GAP says why; nothing was stored) */
++static inline int en0_live_up(struct en0 *e, struct en0_live *b, struct swg_wx *x, struct swl25h *h,
++    const uint8_t mac[6], const char *bootarg, en0_apply_fn apply)
++{
++	char lb[160];
++
++	if (en0l_precheck(x, h))
++		return -1;
++	memset(b, 0, sizeof *b);
++	memset(e, 0, sizeof *e);
++	b->x = x;
++	b->h = h;
++	b->en = e;
++	b->env = &e->env;
++	b->rx_dataoffset = x->rxoff;
++	b->last_slot = ~0u;
++#ifdef SWG_DP_SHADOW_ONES_OK
++	b->ff_guard = 0u;
++#else
++	b->ff_guard = 1u;
++	SWDP_GAP("WIFI GAP: EN-L ff_guard on: sweet_wlan_g2.h lacks SWG_DP_SHADOW_ONES_OK, broadcast frames stop at the first lap of their ring slot");
++#endif
++	en0l_take(e, b, x, h);
++	e->bus = (struct en0_bus){ b, en0l_exec, en0l_d2h_wr, en0l_d2h_item, en0l_rxbuf };
++	e->bootarg = bootarg;
++	e->apply = apply;
++	if (en0_attach(e, mac))
++		return -1;
++	EN0_LOCK();
++	en0l_h2d_sync(b);                       /* the dongle's read indexes as of now, before the first post */
++	EN0_UNLOCK();
++	en0_set_link(e, 1u);                    /* outside the lock: the boot address (SIOCAIFADDR) may make the stack transmit (ARP) through en0_output, which takes the lock itself */
++	EN0_LOCK();
++	en0_rx_fill(e);
++	EN0_UNLOCK();
++	snprintf(lb, sizeof lb, "SWEET WLAN: en0 live bus up: rx in flight %u of pool %u, tx in flight %u, ring-1 wr %u, flow wr %u",
++	    (unsigned)e->rxb.inflight, (unsigned)swdp_env_rxn(&e->env), (unsigned)e->txb.inflight, (unsigned)e->rxpost.wr, (unsigned)e->flow.ring.wr);
++	SWDP_LOG(lb);
++	return 0;
++}
++
++/* one poll pass with the engine watched: when the engine or the bus has died the link goes down once (GAP) and the flow ring is marked failed so en0_output drops loudly without
++ * touching the bus. Returns the D2H items handled. */
++static inline uint32_t en0_live_poll(struct en0 *e, struct en0_live *b)
++{
++	uint32_t n = 0u;
++
++	if (!b->dead && !b->x->d4dstop && !b->x->stopped)
++		n = en0_poll(e);
++	if ((b->dead || b->x->d4dstop || b->x->stopped || e->cons_fail) && e->flow.st == SWDP_FLOW_OPEN) {
++		SWDP_GAP("WIFI GAP: EN-L the engine or the bus stopped: en0 link down, tx refused from now on");
++		e->flow.st = SWDP_FLOW_FAILED;
++		EN0_IFSTART(e->ifp);                    /* Part A: en0_start sees the flow down and drops what the stack queued (counted, GAP) */
++		en0_set_link(e, 0u);
++	}
++	return n;
++}
++
++#endif /* WLAN_EN0_BUS_H */

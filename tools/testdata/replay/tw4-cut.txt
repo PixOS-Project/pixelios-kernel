@@ -1,0 +1,19 @@
+              sh-7048    [004] .....    77.415624: tracing_mark_write: MARK wifi-on4
+   binder:5749_1-5766    [006] .....    80.055082: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x12345678 addr=0xffffffc01fc32144
+ .BOOT_COMPLETED-7418    [000] d.h..    80.056007: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x1 addr=0xffffffc01fc32c30
+ .BOOT_COMPLETED-7418    [000] d.h..    80.056016: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x0 addr=0xffffffc01fc32c34
+ .BOOT_COMPLETED-7418    [000] b.s3.    80.056058: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xff000001 addr=0xffffffc01fc32140
+ .BOOT_COMPLETED-7418    [000] b.s1.    80.056065: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xdd020001 addr=0xffffffc01fc32140
+ .BOOT_COMPLETED-7418    [000] ..s..    80.056085: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xffff addr=0xffffffc01fc32c34
+   binder:5749_1-5766    [006] b..3.    80.072388: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xff000002 addr=0xffffffc01fc32140
+         sugov:4-547     [004] d.h..    80.072824: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x1 addr=0xffffffc01fc32c30
+         sugov:4-547     [004] d.h..    80.072831: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x0 addr=0xffffffc01fc32c34
+         rcuop/5-59      [004] b.s4.    80.072874: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xff000003 addr=0xffffffc01fc32140
+         rcuop/5-59      [004] b.s2.    80.072877: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xdd020002 addr=0xffffffc01fc32140
+         rcuop/5-59      [004] .Ns1.    80.072895: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xffff addr=0xffffffc01fc32c34
+         rcuop/5-59      [004] D.h..    80.073129: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x1 addr=0xffffffc01fc32c30
+         rcuop/5-59      [004] D.h..    80.073135: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0x0 addr=0xffffffc01fc32c34
+         rcuop/5-59      [004] b.s2.    80.073145: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xdd020003 addr=0xffffffc01fc32140
+         rcuop/5-59      [004] ..s1.    80.073154: rwmmio_write: ai_corereg+0x2d0/0x3c8 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xffff addr=0xffffffc01fc32c34
+   binder:5749_1-5766    [006] b..2.    80.073401: rwmmio_write: dhdpcie_bus_ringbell_fast+0x328/0x344 [bcmdhd4389] -> writel+0x18/0x8c [bcmdhd4389] width=32 val=0xff000004 addr=0xffffffc01fc32140
+     sh-8153    [005] .....    89.656423: tracing_mark_write: MARK wifi-on4 done

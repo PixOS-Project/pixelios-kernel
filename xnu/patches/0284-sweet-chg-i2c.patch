@@ -1,0 +1,745 @@
+SWEET CHG P2 (patch 0284, charger bring-up phase 2, docs/research/charger-max77759-gs101.md section 8 steps 4-5, section 5.4): default-OFF (boot-arg sweetchgi2c=1) READ pass over the MAX77759 chips through HSI2C12 exactly as the bootloader left it (phase 1, patch 0283, observed SW_CONF=0x4, pads func 2 pull 3, CTL=0x48, CONF=0x980110ff auto mode, FS3 DIV 62, gates open: no bring-up writes). chg_i2c_read(slave, reg, n<=16) = two auto-mode messages (register address without STOP, then read n with STOP). HSI2C12 STORES (HW-WRITE, unreviewed, for the Opus reviewer): only CTL direction bits, FIFO_CTL, INT_ENABLE, INT_STATUS clear, AUTO_CONF, TIMEOUT_EN clear, ADDR slave field and TX_DATA, through one store function behind an independent write allowlist (bsd/dev/sweet_chg_i2c.c i2c_wr_allow[]); never CONF, TIMING_FS1-3, TRAILIG_CTL, USI_CON, SW_RST, SW_CONF, clocks or pads. No chip register is written: the only byte sent to a chip is the register address of a read. Pass: PMIC 0x66 regs 0x00/0x01/0x60, TCPC 0x25 regs 0x00-0x05 and 0x87, FG 0x36 reg 0x21 (+VCell/Current/RepSOC), charger 0x69 regs 0xB0-0xCC; stops if PMIC_ID != 0x3B or the FG DEVNAME high byte is not 0x62/0x63. Any timeout/NACK/error logs a SWEET CHG GAP line with the controller registers and stops ALL further transfers (no controller reset: its re-init is bring-up). Before every group the phase-1 gate state is re-read (sweet_chg_gate_still_open, new in sweet_chg.c) and must equal the open pattern, and the controller must still look as phase 1 saw it. ADT: soc.json chg_i2c -> /sweet-chg i-* properties. Applies after 0283. Host test: tools/test_chg_i2c.py.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_stall.c			standard
+ bsd/dev/sweet_chg.c			standard
++bsd/dev/sweet_chg_i2c.c		standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+diff --git a/bsd/dev/sweet_chg.c b/bsd/dev/sweet_chg.c
+--- a/bsd/dev/sweet_chg.c
++++ b/bsd/dev/sweet_chg.c
+@@ -469,6 +469,46 @@ chg_load(void)
+ }
+ #endif /* !SWEET_CHG_HOST */
+ 
++/*
++ * Patch 0284 (phase 2): is the phase-1 gate state still exactly the open pattern? Re-reads the nine CMU words and SW_CONF (reads only) and requires
++ * them equal to the stage A snapshot, chg_gate_open() true and SW_CONF mode I2C (4). Phase 2 calls it before every group of transfers; any difference
++ * = it does nothing (GAP printed here).
++ */
++int
++sweet_chg_gate_still_open(void)
++{
++	struct chg_snap n;
++	const char *why = "";
++	int r;
++
++	if (!chg_gate || chg_stage < 2) {
++		chg_log("SWEET CHG GAP: P2 phase 1 did not establish an open gate (gate=%d stage=%d), no transfer\n", chg_gate, chg_stage);
++		return 0;
++	}
++	for (r = 0; r < CHG_R_N; r++) {
++		n.w[r] = 0;
++		n.ok[r] = 0;
++	}
++	chg_snap_read(&n, CHG_R_MUX, CHG_R_TGATE);
++	chg_snap_read(&n, CHG_R_SW, CHG_R_SW);
++	chg_snap_read(&n, CHG_R_PCON, CHG_R_PPUD);     /* review chg-0284 F1: the gpp23 pads too (DAT: only pins 4/5 = SCL/SDA, pins 0-3 belong to SPI11 and may move) */
++	for (r = CHG_R_MUX; r <= CHG_R_PPUD; r++) {
++		uint32_t m = r == CHG_R_PDAT ? 0x30u : 0xffffffffu;
++
++		if (!n.ok[r] || (n.w[r] & m) != (chg_s.w[r] & m)) {
++			chg_log("SWEET CHG GAP: P2 gate recheck: %s[0x%x] now 0x%x (read=%d), phase 1 saw 0x%x (mask 0x%x)\n", chg_words[r].name, chg_off[r], n.w[r], n.ok[r], chg_s.w[r], m);
++			return 0;
++		}
++	}
++	if (!chg_gate_open(&n, &why) || (n.w[CHG_R_SW] & 7u) != 4u) {
++		chg_log("SWEET CHG GAP: P2 gate recheck: not open any more (%s, SW_CONF mode %u)\n", why, n.w[CHG_R_SW] & 7u);
++		return 0;
++	}
++	return 1;
++}
++
++extern void sweet_chg_i2c_tick(int log_pending);        /* bsd/dev/sweet_chg_i2c.c (patch 0284) */
++
+ #define CHG_FORCE_MS    10000u  /* stage B runs anyway when the stage A lines are still unsent after this long */
+ 
+ /*
+@@ -480,6 +520,7 @@ void
+ sweet_chg_tick(int log_pending)
+ {
+ 	if (chg_stage >= 2) {
++		sweet_chg_i2c_tick(log_pending);        /* patch 0284: phase 2 (bsd/dev/sweet_chg_i2c.c), default off, one-shot */
+ 		return;
+ 	}
+ 	if (chg_stage == 0) {
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -0,0 +1,669 @@
++/*
++ * SWEET CHG P2 (xnu patch 0284): charger bring-up phase 2 = READ-ONLY identity/value pass over the MAX77759 chips through the HSI2C12 controller
++ * exactly as ABL left it. Spec: docs/research/charger-max77759-gs101.md ("the note") section 8 steps 4-5 and section 5.4. Default OFF: boot-arg
++ * sweetchgi2c=1 enables it, because it WRITES HSI2C12 transfer registers (rule 8: this write path is for the reviewer; nothing here was reviewed).
++ *
++ * Phase 1 (patch 0283) booted on hardware and showed the bootloader leaves the bus configured [obs run chg-p1: SW_CONF=0x4, gpp23 func 2 pull 3,
++ * CTL=0x48 (MASTER), CONF=0x980110ff (AUTO_MODE), TIMING_FS3 DIV 62, FIFO idle, clock gates open]. So this file does NOT write SW_CONF, clocks,
++ * pads, CONF, TIMING_FS1-3, TRAILIG_CTL, USI_CON or the SW_RST bit: no bring-up. It writes only the per-transfer registers listed in i2c_wr_allow[]
++ * (CTL direction bits, FIFO_CTL, INT_ENABLE, INT_STATUS clear, AUTO_CONF, TIMEOUT_EN clear, ADDR slave field, TX_DATA) and reads the rest.
++ *
++ * Chips are never written: the only byte sent to a chip is the register address of a read (TX_DATA of message 1). A transfer error stops ALL
++ * further transfers (no controller reset: the note's reset sequence (CTL.SW_RST, note 5.2 step 4) is followed by timing/CONF re-init, which is
++ * bring-up and not allowed here). Before every group of transfers sweet_chg_gate_still_open() (patch 0284 hunk in sweet_chg.c) re-reads the phase-1
++ * gate state and must find it identical to the open pattern, and the controller must still look like phase 1 saw it (checked here).
++ *
++ * Tags: [note X] = note section X (it carries the downstream i2c-exynos5.c line numbers); [obs] observed on hardware; [guess] not backed by a source.
++ * Portable C: tools/test_chg_i2c.py compiles this file on the host (SWEET_CHG_I2C_HOST) with a fake HSI2C12 + chip model.
++ */
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef SWEET_CHG_I2C_HOST
++#include "chg_i2c_host_env.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++#define i2c_printf(...) printf(__VA_ARGS__)
++#endif
++
++extern int sweet_chg_gate_still_open(void);             /* bsd/dev/sweet_chg.c (patch 0284 hunk): phase-1 gate state unchanged? */
++
++#define i2c_log(...)    i2c_printf(__VA_ARGS__)
++
++/* ---- HSI2C12 transfer registers [note 5.1], offsets from the ADT (soc.json chg_probe words + chg_i2c words); allowlists below are the independent check ---- */
++enum {
++	I_CTL, I_INTST, I_FIFOST, I_CONF, I_TRANS,                              /* phase-1 words (w- properties) */
++	I_FIFOCTL, I_INTEN, I_TXD, I_RXD, I_AUTO, I_TOUT, I_ADDR,               /* transfer-only words (i- properties) */
++	I_N
++};
++
++static const char * const i2c_prop[I_N] = {
++	[I_CTL] = "w-hsi2c12-ctl", [I_INTST] = "w-hsi2c12-int-status", [I_FIFOST] = "w-hsi2c12-fifo-status", [I_CONF] = "w-hsi2c12-conf",
++	[I_TRANS] = "w-hsi2c12-trans-status", [I_FIFOCTL] = "i-hsi2c12-fifo-ctl", [I_INTEN] = "i-hsi2c12-int-enable", [I_TXD] = "i-hsi2c12-tx-data",
++	[I_RXD] = "i-hsi2c12-rx-data", [I_AUTO] = "i-hsi2c12-auto-conf", [I_TOUT] = "i-hsi2c12-timeout", [I_ADDR] = "i-hsi2c12-addr",
++};
++static const char * const i2c_label[I_N] = {
++	[I_CTL] = "CTL", [I_INTST] = "INT_STATUS", [I_FIFOST] = "FIFO_STATUS", [I_CONF] = "CONF", [I_TRANS] = "TRANS_STATUS",
++	[I_FIFOCTL] = "FIFO_CTL", [I_INTEN] = "INT_ENABLE", [I_TXD] = "TX_DATA", [I_RXD] = "RX_DATA", [I_AUTO] = "AUTO_CONF",
++	[I_TOUT] = "TIMEOUT", [I_ADDR] = "ADDR",
++};
++
++/*
++ * Independent allowlists (offsets in the HSI2C12 window, note 5.1 table). WRITE: CTL 0x00, FIFO_CTL 0x04, INT_ENABLE 0x20, INT_STATUS 0x24 (write-1-to-clear),
++ * TX_DATA 0x34, AUTO_CONF 0x44, TIMEOUT 0x48 (TIMEOUT_EN cleared), ADDR 0x70. NEVER written: TRAILIG_CTL 0x08, CONF 0x40, TIMING_FS1/2/3 0x60-0x68,
++ * USI_CON/USI_OPTION 0xC4/0xC8, and CTL bit 31 (SW_RST). READ: CTL, INT_STATUS, FIFO_STATUS, RX_DATA 0x38 (only in the read message: a read pops the
++ * FIFO), CONF, AUTO_CONF, TIMEOUT, TRANS_STATUS 0x50, ADDR.
++ */
++static const uint32_t i2c_wr_allow[] = { 0x00, 0x04, 0x20, 0x24, 0x34, 0x44, 0x48, 0x70 };
++static const uint32_t i2c_rd_allow[] = { 0x00, 0x24, 0x30, 0x38, 0x40, 0x44, 0x48, 0x50, 0x70 };
++
++/* bit fields [note 5.1] */
++#define CTL_MASTER      (1u << 3)
++#define CTL_RXCHON      (1u << 6)
++#define CTL_TXCHON      (1u << 7)
++#define CTL_SW_RST      (1u << 31)
++#define FIFOCTL_RXEN    (1u << 0)
++#define FIFOCTL_TXEN    (1u << 1)
++#define INT_DONE        (1u << 7)       /* TRANSFER_DONE */
++#define INT_ERR_MASK    (0xfu << 8)     /* 8 TRANS_ABORT, 9 NO_DEV_ACK, 10 NO_DEV, 11 TIMEOUT [note 5.5, mainline numbering] */
++#define INT_NACK_MASK   ((1u << 9) | (1u << 10))
++#define FIFOST_TX_EMPTY (1u << 8)
++#define FIFOST_RX_EMPTY (1u << 24)
++#define CONF_AUTO       (1u << 31)
++#define AUTO_RW         (1u << 16)      /* 1 = read */
++#define AUTO_STOP       (1u << 17)
++#define AUTO_RUN        (1u << 31)
++#define TOUT_EN         (1u << 31)
++#define SW_CONF_I2C     4u
++#define TRANS_BUSY      (1u << 17)      /* TRANS_STATUS MASTER_BUSY [review F1/F2: ML exynos5_i2c_wait_bus_idle]; low nibble = master state, 0xC = LOSE (SDA stuck) [note 5.1] */
++
++#define I2C_TIMEOUT_US  100000u         /* 100 ms per message [brief; note 5.4 step 6 says max(100 ms, 2 x 9 bits x len / f_scl)] */
++#define I2C_FORCE_MS    10000u
++
++static uint32_t i2c_off[I_N];
++
++/* F4 (review chg-0284): the write allowlist checks the SET of offsets, so an ADT that swapped two roles would still pass it. Every role must have exactly this offset
++ * (enum order, note 5.1: CTL 0x00, INT_STATUS 0x24, FIFO_STATUS 0x30, CONF 0x40, TRANS_STATUS 0x50, FIFO_CTL 0x04, INT_ENABLE 0x20, TX_DATA 0x34, RX_DATA 0x38,
++ * AUTO_CONF 0x44, TIMEOUT 0x48, ADDR 0x70). */
++static const uint32_t i2c_expect[I_N] = { 0x00, 0x24, 0x30, 0x40, 0x50, 0x04, 0x20, 0x34, 0x38, 0x44, 0x48, 0x70 };
++static uint32_t i2c_size;               /* window size from the ADT */
++
++static uint32_t i2c_hw_rd32(uint32_t off);
++static uint64_t i2c_now_us(void);
++static void i2c_hw_wr32(uint32_t off, uint32_t v);      /* the ONLY store in this file */
++
++static uint32_t i2c_xfers, i2c_errors, i2c_nwr;
++static int i2c_dead;                    /* set on the first error: no further transfer */
++
++static int
++i2c_offsets_ok(void)
++{
++	int r;
++
++	for (r = 0; r < I_N; r++) {
++		if (i2c_off[r] != i2c_expect[r]) {
++			i2c_log("SWEET CHG GAP: P2 /sweet-chg %s = 0x%x, expected 0x%x (role/offset table of the note 5.1), no transfer done\n", i2c_prop[r], i2c_off[r], i2c_expect[r]);
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static int
++i2c_in(const uint32_t *l, unsigned n, uint32_t off)
++{
++	unsigned i;
++
++	for (i = 0; i < n; i++) {
++		if (l[i] == off) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int
++i2c_rd(int role, uint32_t *v)
++{
++	uint32_t off = i2c_off[role];
++
++	if ((off & 3u) != 0 || off + 4u > i2c_size || !i2c_in(i2c_rd_allow, sizeof(i2c_rd_allow) / sizeof(i2c_rd_allow[0]), off)) {
++		i2c_log("SWEET CHG GAP: hsi2c12.%s offset 0x%x not on the read allowlist, not read\n", i2c_label[role], off);
++		return -1;
++	}
++	*v = i2c_hw_rd32(off);
++	return 0;
++}
++
++/* Allowlisted store. Refuses (GAP, nothing written) any offset off the list and the two forbidden bit patterns. */
++static int
++i2c_wr(int role, uint32_t v)
++{
++	uint32_t off = i2c_off[role];
++
++	if ((off & 3u) != 0 || off + 4u > i2c_size || !i2c_in(i2c_wr_allow, sizeof(i2c_wr_allow) / sizeof(i2c_wr_allow[0]), off)) {
++		i2c_log("SWEET CHG GAP: hsi2c12.%s offset 0x%x not on the WRITE allowlist, not written\n", i2c_label[role], off);
++		return -1;
++	}
++	if ((role == I_CTL && (v & CTL_SW_RST) != 0) || (role == I_TOUT && (v & TOUT_EN) != 0)) {
++		i2c_log("SWEET CHG GAP: hsi2c12.%s value 0x%x has a forbidden bit (SW_RST / TIMEOUT_EN), not written\n", i2c_label[role], v);
++		return -1;
++	}
++	i2c_hw_wr32(off, v);
++	i2c_nwr++;
++	return 0;
++}
++
++/* Registers for a GAP line, read-only. */
++static void
++i2c_dump(const char *what, uint32_t slave, uint32_t reg)
++{
++	uint32_t a = 0, b = 0, c = 0, d = 0, e = 0, f = 0;
++
++	(void)i2c_rd(I_INTST, &a);
++	(void)i2c_rd(I_TRANS, &b);
++	(void)i2c_rd(I_FIFOST, &c);
++	(void)i2c_rd(I_AUTO, &d);
++	(void)i2c_rd(I_CTL, &e);
++	(void)i2c_rd(I_ADDR, &f);
++	i2c_log("SWEET CHG GAP: i2c %s slave 0x%x reg 0x%x: INT_STATUS=0x%x TRANS_STATUS=0x%x FIFO_STATUS=0x%x AUTO_CONF=0x%x CTL=0x%x ADDR=0x%x; no controller reset "
++	    "(its re-init is bring-up, not in phase 2), all further transfers stopped\n", what, slave, reg, a, b, c, d, e, f);
++}
++
++/*
++ * One auto-mode message [note 5.4]. rd=0: message 1 (write `len` = 1 byte, the register address, no STOP); rd=1: message 2 (read len bytes, STOP).
++ * Write sequence (the table the reviewer gets), each line with its note citation:
++ *   1 TIMEOUT   RMW   clear TIMEOUT_EN (bit 31)                                  [5.4 step 1; 5.1 0x48]
++ *   2 FIFO_CTL  :=    RXFIFO_EN | TXFIFO_EN | (trig << 4) | (trig << 16), trig = min(len, 8)   [5.4 step 1, step 7; 5.1 0x04]
++ *   3 INT_STATUS := value just read (write-1-to-clear)                           [5.4 step 3; 5.1 0x24]
++ *   4 ADDR      RMW   clear [19:10] and [9:0], set (slave & 0x7f) << 10, [31:24] := 0x7   [5.4 step 3; 5.1 0x70]
++ *   5 CTL       RMW   clear RXCHON|TXCHON, then set TXCHON (msg 1) or RXCHON (msg 2)      [5.4 step 2, step 7; 5.1 0x00]
++ *   6 INT_ENABLE :=   TRANSFER_DONE | bits 8-11                                  [5.4 step 4, 5.5; 5.1 0x20]
++ *   7 AUTO_CONF :=    len (msg 1) | READ_WRITE | STOP | len (msg 2)              [5.4 step 5, step 8; 5.1 0x44]
++ *   8 AUTO_CONF :=    (value of 7) | MASTER_RUN (bit 31)                         [5.4 step 5, step 8]
++ *   9 TX_DATA   :=    register address (msg 1 only, after 8)                     [5.4 step 6; 5.1 0x34]
++ *  10 INT_STATUS :=   value read when done (write-1-to-clear)                    [5.4 step 6 / step 9]
++ * Poll: msg 1 INT_STATUS.TRANSFER_DONE and FIFO_STATUS.TX_EMPTY; msg 2 FIFO_STATUS.RX_EMPTY == 0 then RX_DATA (len times), then TRANSFER_DONE;
++ * INT_STATUS bits 8-11 = error. Timeout I2C_TIMEOUT_US. Returns 0 or -1 (GAP printed, i2c_dead set).
++ */
++static int
++i2c_msg(uint32_t slave, uint32_t reg, int rd, uint32_t len, uint8_t *out)
++{
++	uint32_t v, trig = len > 8u ? 8u : len, got = 0, autov, st = 0, fs = 0;
++	uint64_t t0;
++	const char *what = rd ? "read message" : "register-address message";
++
++	if (i2c_rd(I_TOUT, &v) != 0 || i2c_wr(I_TOUT, v & ~TOUT_EN) != 0) {                                                   /* 1 */
++		goto fail;
++	}
++	if (i2c_wr(I_FIFOCTL, FIFOCTL_RXEN | FIFOCTL_TXEN | (trig << 4) | (trig << 16)) != 0) {                                /* 2 */
++		goto fail;
++	}
++	if (i2c_rd(I_INTST, &v) != 0 || i2c_wr(I_INTST, v) != 0) {                                                             /* 3 */
++		goto fail;
++	}
++	if (i2c_rd(I_ADDR, &v) != 0) {
++		goto fail;
++	}
++	v &= ~((0x3ffu << 10) | 0x3ffu);
++	v |= (slave & 0x7fu) << 10;
++	v = (v & 0x00ffffffu) | (0x7u << 24);
++	if (i2c_wr(I_ADDR, v) != 0) {                                                                                           /* 4 */
++		goto fail;
++	}
++	if (i2c_rd(I_CTL, &v) != 0 || i2c_wr(I_CTL, (v & ~(CTL_RXCHON | CTL_TXCHON)) | (rd ? CTL_RXCHON : CTL_TXCHON)) != 0) {  /* 5 */
++		goto fail;
++	}
++	if (i2c_wr(I_INTEN, INT_DONE | INT_ERR_MASK) != 0) {                                                                    /* 6 */
++		goto fail;
++	}
++	autov = (rd ? (AUTO_RW | AUTO_STOP) : 0u) | (len & 0xffffu);
++	if (i2c_wr(I_AUTO, autov) != 0 || i2c_wr(I_AUTO, autov | AUTO_RUN) != 0) {                                              /* 7, 8 */
++		goto fail;
++	}
++	t0 = i2c_now_us();
++	if (!rd) {
++		if (i2c_wr(I_TXD, reg & 0xffu) != 0) {                                                                              /* 9 */
++			goto fail;
++		}
++		for (;;) {
++			if (i2c_rd(I_INTST, &st) != 0 || i2c_rd(I_FIFOST, &fs) != 0) {
++				goto fail;
++			}
++			if ((st & INT_ERR_MASK) != 0) {
++				what = (st & INT_NACK_MASK) != 0 ? "NACK (NO_DEV_ACK/NO_DEV) in the register-address message" : "bus error in the register-address message";
++				goto fail;
++			}
++			if ((st & INT_DONE) != 0 && (fs & FIFOST_TX_EMPTY) != 0) {
++				break;
++			}
++			if (i2c_now_us() - t0 > I2C_TIMEOUT_US) {
++				what = "TIMEOUT in the register-address message";
++				goto fail;
++			}
++		}
++		return i2c_wr(I_INTST, st);                                                                                         /* 10 */
++	}
++	while (got < len) {
++		if (i2c_rd(I_INTST, &st) != 0 || i2c_rd(I_FIFOST, &fs) != 0) {
++			goto fail;
++		}
++		if ((st & INT_ERR_MASK) != 0) {
++			what = (st & INT_NACK_MASK) != 0 ? "NACK (NO_DEV_ACK/NO_DEV) in the read message" : "bus error in the read message";
++			goto fail;
++		}
++		if ((fs & FIFOST_RX_EMPTY) == 0) {
++			if (i2c_rd(I_RXD, &v) != 0) {
++				goto fail;
++			}
++			out[got++] = (uint8_t)v;
++			continue;
++		}
++		if ((st & INT_DONE) != 0) {
++			what = "short read (TRANSFER_DONE with fewer bytes than asked)";
++			goto fail;
++		}
++		if (i2c_now_us() - t0 > I2C_TIMEOUT_US) {
++			what = "TIMEOUT in the read message";
++			goto fail;
++		}
++	}
++	for (;;) {                                      /* [note 5.4 step 9: optionally poll TRANSFER_DONE and write it back] */
++		if (i2c_rd(I_INTST, &st) != 0) {
++			goto fail;
++		}
++		if ((st & INT_ERR_MASK) != 0) {
++			what = "bus error after the last byte";
++			goto fail;
++		}
++		if ((st & INT_DONE) != 0) {
++			break;
++		}
++		if (i2c_now_us() - t0 > I2C_TIMEOUT_US) {
++			what = "TIMEOUT waiting for TRANSFER_DONE after the last byte";
++			goto fail;
++		}
++	}
++	if (i2c_wr(I_INTST, st) != 0) {                                                                                         /* 10 */
++		goto fail;
++	}
++	t0 = i2c_now_us();              /* F2: wait for MASTER_BUSY (TRANS_STATUS bit 17) to clear after the STOP, as ML does (ML:821, helper ML:623-640) */
++	for (;;) {
++		if (i2c_rd(I_TRANS, &st) != 0) {
++			goto fail;
++		}
++		if ((st & TRANS_BUSY) == 0) {
++			return 0;
++		}
++		if (i2c_now_us() - t0 > I2C_TIMEOUT_US) {
++			what = "TIMEOUT waiting for MASTER_BUSY to clear after the STOP";
++			goto fail;
++		}
++	}
++fail:
++	i2c_dump(what, slave, reg);
++	if (i2c_nwr != 0) {             /* F3: disarm the interrupt enable and drop pending sources (both registers are on the write allowlist) */
++		(void)i2c_wr(I_INTEN, 0);
++		if (i2c_rd(I_INTST, &v) == 0) {
++			(void)i2c_wr(I_INTST, v);
++		}
++	}
++	i2c_dead = 1;
++	return -1;
++}
++
++/* Slave / register allowlist of the read pass (note 2 and 8 step 5). Only these (slave, reg) pairs may be requested. */
++static int
++i2c_target_ok(uint32_t slave, uint32_t reg, uint32_t n)
++{
++	switch (slave) {
++	case 0x66: return n == 1 && (reg == 0x00 || reg == 0x01 || reg == 0x60);                   /* PMIC: ID, REVISION, DeviceID block */
++	case 0x25: return n == 1 && (reg <= 0x05 || reg == 0x87);                                  /* TCPC: VID/PID/BCD_DEV, VENDOR_BC_STATUS1 */
++	case 0x36: return n == 2 && (reg == 0x21 || reg == 0x09 || reg == 0x0a || reg == 0x06);    /* FG: DEVNAME, VCell, Current, RepSOC */
++	case 0x69: return n == 1 && reg >= 0xb0 && reg <= 0xcc;                                    /* charger */
++	default: return 0;
++	}
++}
++
++/* chg_i2c_read(slave, reg, n <= 16) [note 5.4]: message 1 writes the register address without STOP, message 2 reads n bytes with STOP. */
++static int
++chg_i2c_read(uint32_t slave, uint32_t reg, uint32_t n, uint8_t *out)
++{
++	if (i2c_dead) {
++		return -1;
++	}
++	if (n == 0 || n > 16u || !i2c_target_ok(slave, reg, n)) {
++		i2c_log("SWEET CHG GAP: i2c read slave 0x%x reg 0x%x n %u refused (not on the phase-2 read list)\n", slave, reg, n);
++		return -1;
++	}
++	i2c_xfers++;
++	if (i2c_msg(slave, reg, 0, 1, NULL) != 0 || i2c_msg(slave, reg, 1, n, out) != 0) {
++		i2c_errors++;
++		i2c_dead = 1;
++		return -1;
++	}
++	return 0;
++}
++
++/* ---- decoding (pure) ---- */
++static const char *
++chg_dtls_name(uint32_t v)
++{
++	switch (v) {      /* CHG_DTLS [3:0] [note 3, CHG_DETAILS_01] */
++	case 0: return "dead-battery"; case 1: return "fast-CC"; case 2: return "fast-CV"; case 3: return "top-off"; case 4: return "done";
++	case 6: return "timer-fault"; case 7: return "detbat/high-suspend"; case 8: return "off"; case 0xa: return "off-high-temp";
++	case 0xb: return "off-watchdog"; case 0xc: return "off-JEITA"; case 0xd: return "off-temp"; default: return "unknown";
++	}
++}
++
++static uint32_t
++chg_icl_ma(uint32_t code)
++{
++	return code == 0 ? 0 : (code <= 3 ? 100 : 100 + (code - 3) * 25);        /* CNFG_09 getter [note 3] */
++}
++
++static uint32_t
++chg_cc_ma(uint32_t code)
++{
++	return code < 3 ? 0 : (200000u + (code - 3) * 66670u) / 1000u;           /* CNFG_02: driver writes 0x3 + (uA - 200000)/66670 [note 3] */
++}
++
++static int
++i2c_gate(int first)
++{
++	uint32_t ctl = 0, conf = 0, fs = 0, tr = 0, au = 0, is = 0;
++	const char *why = NULL;
++
++	if (!sweet_chg_gate_still_open()) {
++		i2c_log("SWEET CHG GAP: P2 phase-1 gate state is not the open pattern any more, no transfer done\n");
++		return 0;
++	}
++	if (i2c_rd(I_CTL, &ctl) != 0 || i2c_rd(I_CONF, &conf) != 0 || i2c_rd(I_FIFOST, &fs) != 0 || i2c_rd(I_TRANS, &tr) != 0 || i2c_rd(I_AUTO, &au) != 0 ||
++	    i2c_rd(I_INTST, &is) != 0) {
++		return 0;
++	}
++	/* the controller as phase 1 saw it [obs chg-p1: CTL=0x48 CONF=0x980110ff FIFO_STATUS=0x1000100 TRANS_STATUS=0x80001 INT_STATUS=0] and IDLE. Anything else = ABL did not leave
++	 * it usable (or a transfer is still pending that our AUTO_CONF/ADDR stores would retarget) and making it usable would be bring-up: refuse (review chg-0284 F1). */
++	if ((ctl & CTL_MASTER) == 0) {
++		why = "CTL.MASTER clear";
++	} else if ((ctl & (CTL_SW_RST | (1u << 22) | (1u << 29) | (1u << 30))) != 0) {
++		why = "CTL bit 31/30/29/22 set";
++	} else if ((conf & CONF_AUTO) == 0) {
++		why = "CONF.AUTO_MODE clear";
++	} else if ((conf & ((1u << 29) | (1u << 30))) != 0) {
++		why = "CONF bit 29/30 set (HS / 10-bit mode)";
++	} else if ((fs & (FIFOST_TX_EMPTY | FIFOST_RX_EMPTY)) != (FIFOST_TX_EMPTY | FIFOST_RX_EMPTY)) {
++		why = "FIFO not empty";
++	} else if ((tr & TRANS_BUSY) != 0) {
++		why = "TRANS_STATUS MASTER_BUSY (bit 17) set";
++	} else if ((tr & 0xfu) == 0xcu) {
++		why = "TRANS_STATUS master state 0xC (LOSE: SDA stuck)";
++	} else if (first && (au & AUTO_RUN) != 0) {      /* first group only: whether MASTER_RUN clears itself after our own transfers is not in the note */
++		why = "AUTO_CONF.MASTER_RUN set at the first group (a transfer is pending)";
++	} else if (first && is != 0) {
++		why = "INT_STATUS not 0 at the first group";
++	}
++	if (why != NULL) {
++		i2c_log("SWEET CHG GAP: P2 controller not idle / not in the phase-1 state (%s): CTL=0x%x CONF=0x%x FIFO_STATUS=0x%x TRANS_STATUS=0x%x AUTO_CONF=0x%x INT_STATUS=0x%x, no transfer done\n",
++		    why, ctl, conf, fs, tr, au, is);
++		return 0;
++	}
++	return 1;
++}
++
++static uint8_t i2c_pmic[3], i2c_tcpc[7], i2c_fgb[4][2], i2c_chg[0xcd - 0xb0];
++static int i2c_group;                   /* 0 = not started .. 5 = all groups done, 9 = finished */
++static uint64_t i2c_t_ms;
++
++static void
++i2c_finish(void)
++{
++	if (i2c_nwr != 0) {
++		(void)i2c_wr(I_INTEN, 0);       /* F3: GS exynos5_i2c_stop writes INT_ENABLE := 0 when a transfer ends */
++	}
++	i2c_log("SWEET CHG P2: done xfers=%u errors=%u\n", i2c_xfers, i2c_errors);
++	i2c_group = 9;
++}
++
++static void
++i2c_g_pmic(void)
++{
++	static const uint32_t r[3] = { 0x00, 0x01, 0x60 };
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		if (chg_i2c_read(0x66, r[i], 1, &i2c_pmic[i]) != 0) {
++			return;
++		}
++	}
++	i2c_log("SWEET CHG P2: pmic[0x66] ID[0x00]=0x%x (want 0x3b) REVISION[0x01]=0x%x (VER=%u REV=%u) DeviceID[0x60]=0x%x (reset 0x59)\n",
++	    i2c_pmic[0], i2c_pmic[1], i2c_pmic[1] >> 3, i2c_pmic[1] & 7u, i2c_pmic[2]);
++	if (i2c_pmic[0] != 0x3b) {
++		i2c_log("SWEET CHG GAP: PMIC_ID 0x%x != 0x3b, whole pass stopped [note 8 step 5]\n", i2c_pmic[0]);
++		i2c_dead = 1;
++	}
++}
++
++static void
++i2c_g_tcpc(void)
++{
++	static const uint32_t r[7] = { 0, 1, 2, 3, 4, 5, 0x87 };
++	int i;
++
++	for (i = 0; i < 7; i++) {
++		if (chg_i2c_read(0x25, r[i], 1, &i2c_tcpc[i]) != 0) {
++			return;
++		}
++	}
++	i2c_log("SWEET CHG P2: tcpc[0x25] VID=0x%04x PID=0x%04x BCD_DEV=0x%04x (>= 2 is A1)\n", i2c_tcpc[0] | (i2c_tcpc[1] << 8),
++	    i2c_tcpc[2] | (i2c_tcpc[3] << 8), i2c_tcpc[4] | (i2c_tcpc[5] << 8));
++	i2c_log("SWEET CHG P2: tcpc BC_STATUS1[0x87]=0x%x CHGTYP=%u (0 none, 1 SDP, 2 CDP, 3 DCP) DCDTMO=%u CHGTYPRUN=%u\n", i2c_tcpc[6], i2c_tcpc[6] & 3u,
++	    (i2c_tcpc[6] >> 2) & 1u, (i2c_tcpc[6] >> 6) & 1u);
++}
++
++static void
++i2c_g_fg(void)
++{
++	static const uint32_t r[4] = { 0x21, 0x09, 0x0a, 0x06 };
++	int i;
++	uint32_t vc, cu, so;
++	int32_t cs;
++
++	for (i = 0; i < 4; i++) {
++		if (chg_i2c_read(0x36, r[i], 2, i2c_fgb[i]) != 0) {
++			return;
++		}
++		if (i == 0 && i2c_fgb[0][1] != 0x62 && i2c_fgb[0][1] != 0x63) {
++			i2c_log("SWEET CHG GAP: FG DEVNAME 0x%02x%02x high byte not 0x62/0x63, whole pass stopped [note 8 step 5]\n", i2c_fgb[0][1], i2c_fgb[0][0]);
++			i2c_dead = 1;
++			return;
++		}
++	}
++	vc = i2c_fgb[1][0] | ((uint32_t)i2c_fgb[1][1] << 8);
++	cs = (int16_t)(i2c_fgb[2][0] | ((uint32_t)i2c_fgb[2][1] << 8));
++	cu = i2c_fgb[2][0] | ((uint32_t)i2c_fgb[2][1] << 8);
++	so = i2c_fgb[3][0] | ((uint32_t)i2c_fgb[3][1] << 8);
++	/* VCell LSB 78.125 uV (reg 0x09); Current (0x0A) signed, 1.5625 uV / Rsense, DT rsense 5 mOhm -> 312.5 uA per LSB, the driver negates it; RepSOC (0x06) LSB 1/256 % [note 2] */
++	i2c_log("SWEET CHG P2: fg[0x36] DEVNAME[0x21]=0x%04x VCell[0x09]=0x%04x (%u mV) Current[0x0a]=0x%04x (%d uA raw sign, driver negates) RepSOC[0x06]=0x%04x (%u.%02u %%)\n",
++	    i2c_fgb[0][0] | (i2c_fgb[0][1] << 8), vc, (uint32_t)(((uint64_t)vc * 78125u) / 1000000u), cu, (int)((cs * 3125) / 10), so, so >> 8, ((so & 0xffu) * 100u) >> 8);
++}
++
++static void
++i2c_g_chg(int hi)
++{
++	uint32_t a = hi ? 0xbd : 0xb0, b = hi ? 0xcc : 0xbc, r;
++
++	for (r = a; r <= b; r++) {
++		if (chg_i2c_read(0x69, r, 1, &i2c_chg[r - 0xb0]) != 0) {
++			return;
++		}
++	}
++	if (!hi) {
++		return;
++	}
++#define C(x)    i2c_chg[(x) - 0xb0]
++	i2c_log("SWEET CHG P2: chg[0x69] raw B0..CC: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    C(0xb0), C(0xb1), C(0xb2), C(0xb3), C(0xb4), C(0xb5), C(0xb6), C(0xb7), C(0xb8), C(0xb9), C(0xba), C(0xbb), C(0xbc), C(0xbd), C(0xbe), C(0xbf), C(0xc0),
++	    C(0xc1), C(0xc2), C(0xc3), C(0xc4), C(0xc5), C(0xc6), C(0xc7), C(0xc8), C(0xc9), C(0xca), C(0xcb), C(0xcc));
++	i2c_log("SWEET CHG P2: chg CNFG_00[0xb9]=0x%x MODE=0x%x (4 buck, 5 chg+buck) CP_EN=%u WDTCLR=%u | CNFG_02[0xbb]=0x%x CHGCC~%u mA | CNFG_04[0xbd]=0x%x CV_PRM=0x%x %s\n",
++	    C(0xb9), C(0xb9) & 0xfu, (C(0xb9) >> 5) & 1u, C(0xb9) >> 6, C(0xbb), chg_cc_ma(C(0xbb) & 0x3fu), C(0xbd), C(0xbd) & 0x3fu,
++	    (C(0xbd) & 0x3fu) <= 0x32 ? "(4.00 V + 10 mV x code)" : "(code above 0x32: not decoded, note 3)");
++	if ((C(0xbd) & 0x3fu) <= 0x32) {
++		i2c_log("SWEET CHG P2: chg CV = %u mV\n", 4000u + 10u * (C(0xbd) & 0x3fu));
++	}
++	i2c_log("SWEET CHG P2: chg CNFG_09[0xc2]=0x%x NO_AUTOIBUS=%u CHGIN_ILIM=%u (~%u mA) | CNFG_12[0xc5]=0x%x CHG_EN=%u WCINSEL=%u CHGINSEL=%u VCHGIN_REG=%u | CNFG_18[0xcb]=0x%x WDTEN=%u\n",
++	    C(0xc2), C(0xc2) >> 7, C(0xc2) & 0x7fu, chg_icl_ma(C(0xc2) & 0x7fu), C(0xc5), C(0xc5) >> 7, (C(0xc5) >> 6) & 1u, (C(0xc5) >> 5) & 1u, (C(0xc5) >> 3) & 3u,
++	    C(0xcb), C(0xcb) & 1u);
++	/* three rows, each well under 200 characters: the kernel printf of this port cuts a row at about 290 characters (chg-p2: "INT_OK[0xb4]=0x" ended the line) */
++	i2c_log("SWEET CHG P2: chg DETAILS_00[0xb5]=0x%x CHGIN_DTLS=%u WCIN_DTLS=%u SPSN_DTLS=%u TREG=%u (meanings unknown, note 3)\n",
++	    C(0xb5), (C(0xb5) >> 5) & 3u, (C(0xb5) >> 3) & 3u, (C(0xb5) >> 1) & 3u, C(0xb5) & 1u);
++	i2c_log("SWEET CHG P2: chg DETAILS_01[0xb6]=0x%x CHG_DTLS=%u (%s) BAT_DTLS=%u VDROOP2_OK=%u\n",
++	    C(0xb6), C(0xb6) & 0xfu, chg_dtls_name(C(0xb6) & 0xfu), (C(0xb6) >> 4) & 7u, C(0xb6) >> 7);
++	i2c_log("SWEET CHG P2: chg DETAILS_02[0xb7]=0x%x CHGIN_STS=%u WCIN_STS=%u BYP_DTLS=%u | INT_OK[0xb4]=0x%x CHGIN_OK=%u AICL_OK=%u (0 = AICL limiting)\n",
++	    C(0xb7), (C(0xb7) >> 5) & 1u, (C(0xb7) >> 4) & 1u, C(0xb7) & 0xfu, C(0xb4), (C(0xb4) >> 6) & 1u, C(0xb4) >> 7);
++#undef C
++}
++
++#ifdef SWEET_CHG_I2C_HOST
++/* the harness (tools/chg_i2c_host_test.c) defines i2c_hw_rd32/i2c_hw_wr32/i2c_now_us/i2c_load/i2c_arg_on AFTER including this file */
++static int i2c_load(void);
++static int i2c_arg_on(void);
++static uint64_t i2c_now_ms(void);
++#else
++static volatile uint32_t *i2c_va;
++
++/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++static int
++i2c_arg_on(void)
++{
++	uint32_t v = 0;
++
++	return PE_parse_boot_argn("sweetchgi2c", &v, sizeof(v)) && v == 1;
++}
++
++static uint64_t
++i2c_now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000u;
++}
++
++static uint64_t
++i2c_now_ms(void)
++{
++	return i2c_now_us() / 1000u;
++}
++
++static uint32_t
++i2c_hw_rd32(uint32_t off)
++{
++	return i2c_va[off / 4];
++}
++
++/* The ONLY store in this file; reached only through i2c_wr(), which checks the offset against i2c_wr_allow[]. */
++static void
++i2c_hw_wr32(uint32_t off, uint32_t v)
++{
++	i2c_va[off / 4] = v;
++}
++
++static int
++i2c_load(void)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	uint32_t const *off = NULL;
++	unsigned int size = 0;
++	vm_offset_t base, va;
++	int r;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-chg", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "hsi2c12-reg", (void const **)&reg, &size) != kSuccess || size < 16 || reg[0] != 0x10D50000ull || reg[1] != 0x1000ull) {
++		i2c_printf("SWEET CHG GAP: P2 /sweet-chg hsi2c12-reg missing or not 0x10d50000/0x1000, no transfer done\n");
++		return -1;
++	}
++	base = (vm_offset_t)reg[0];
++	va = ml_io_map(base, (vm_size_t)0x4000);        /* whole 16 KiB kernel page, as sweet_chg.c / the touch driver map */
++	if (va == 0) {
++		i2c_printf("SWEET CHG GAP: P2 ml_io_map failed for hsi2c12, no transfer done\n");
++		return -1;
++	}
++	i2c_va = (volatile uint32_t *)va;
++	i2c_size = (uint32_t)reg[1];
++	for (r = 0; r < I_N; r++) {
++		if (SecureDTGetProperty(node, i2c_prop[r], (void const **)&off, &size) != kSuccess || size < 4) {
++			i2c_printf("SWEET CHG GAP: P2 /sweet-chg property %s missing, no transfer done\n", i2c_prop[r]);
++			return -1;
++		}
++		i2c_off[r] = off[0];
++	}
++	return i2c_offsets_ok() ? 0 : -1;
++}
++#endif /* !SWEET_CHG_I2C_HOST */
++
++/*
++ * Called from sweet_chg_tick() once phase 1 is finished (patch 0284 hunk). One group of transfers per call, each only after the previous rows left the log
++ * (log_pending == 0) or I2C_FORCE_MS later with a GAP line (never a silent skip). Default off.
++ */
++void
++sweet_chg_i2c_tick(int log_pending)
++{
++	if (i2c_group >= 9) {
++		return;
++	}
++	if (i2c_group == 0) {
++		i2c_group = 8;                  /* in progress */
++		if (!i2c_arg_on()) {
++			i2c_log("SWEET CHG P2: off (default; sweetchgi2c=1 enables it: it writes HSI2C12 transfer registers, never chip registers)\n");
++			i2c_group = 9;
++			return;
++		}
++		if (i2c_load() != 0) {
++			i2c_group = 9;
++			return;
++		}
++		i2c_log("SWEET CHG P2: start (patch 0284, sweetchgi2c=1): reads only on the chips; HSI2C12 writes are the per-transfer registers only (no SW_CONF/clock/pad/CONF/TIMING/USI_CON)\n");
++		i2c_t_ms = i2c_now_ms();
++		i2c_group = 1;
++		return;
++	}
++	if (i2c_group > 5) {
++		return;
++	}
++	if (log_pending) {
++		if (i2c_now_ms() - i2c_t_ms < I2C_FORCE_MS) {
++			return;
++		}
++		i2c_log("SWEET CHG GAP: P2 log rows still unsent %u ms after the last group, the next group runs anyway\n", I2C_FORCE_MS);
++	}
++	if (!i2c_dead && !i2c_gate(i2c_group == 1)) {
++		i2c_dead = 1;
++		i2c_errors++;
++	}
++	if (!i2c_dead) {
++		switch (i2c_group) {
++		case 1: i2c_g_pmic(); break;
++		case 2: i2c_g_tcpc(); break;
++		case 3: i2c_g_fg(); break;
++		case 4: i2c_g_chg(0); break;
++		default: i2c_g_chg(1); break;
++		}
++	}
++	i2c_t_ms = i2c_now_ms();
++	if (i2c_dead || i2c_group == 5) {
++		i2c_finish();
++		return;
++	}
++	i2c_group++;
++}

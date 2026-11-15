@@ -1,0 +1,107 @@
+SWEET nav16 (patch 0261, T-55ec, G-10b-nav; log only, no register or store to hardware, no change to the create path or its return values): patch 0046 logs `SWEET SURF: <proc> create id ...` only for the first 64 creates (and every failure); nav16 used the 64 lines up on backboardd/SpringBoard 0.4 s after Preferences started, so no Preferences surface create was visible. (1) Every successful create by Preferences is logged too, same format, hard cap 400 such lines (the first-64 lines count toward it). (2) Per-process-name totals (8 names, then `other`), updated on every create, success or failure (bytes = successful creates only), one `SWEET SURF: totals all=N name=creates/MiB ...` line every 100th create overall. Lock free: CAS-claimed name slots, atomic adds.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -879,6 +879,80 @@
+ 	return ret;
+ }
+ 
++/*
++ * Patch 0261 (T-55ec, nav16 follow-up; log only, no behaviour change): which processes allocate the surfaces. Patch 0046 logs the first 64 creates (and every failure), nav16
++ * used them up on backboardd/SpringBoard 0.4 s after Preferences started. (1) every successful create by "Preferences" is logged too (cap 400 such lines, the first-64 lines count
++ * toward it); (2) per-process-name totals (8 names, then `other`), updated on every create, one `SWEET SURF: totals` line every 100th create. Lock free: a name slot is claimed by
++ * compare-and-swap, the counters are atomic adds, the create path and its return values are not touched. `bytes` adds up the size of successful creates only.
++ */
++#define SWEET_SURF_TOT_NAMES    8
++#define SWEET_SURF_PREF_LOG_MAX 400
++#define SWEET_SURF_TOT_EVERY    100
++struct sweet_surf_tot_slot {
++	uint32_t state;         /* 0 free, 1 being named, 2 named (name valid) */
++	char     name[17];      /* p_comm, MAXCOMLEN + 1 */
++	int64_t  creates;
++	int64_t  bytes;
++};
++static struct sweet_surf_tot_slot sweet_surf_tot[SWEET_SURF_TOT_NAMES];
++static int64_t sweet_surf_tot_other_creates, sweet_surf_tot_other_bytes;
++static int64_t sweet_surf_tot_all;
++static int32_t sweet_surf_pref_creates;
++
++static void
++sweet_surf_tot_note(const char *name, uint64_t bytes)
++{
++	struct sweet_surf_tot_slot *slot = NULL;
++	for (int i = 0; i < SWEET_SURF_TOT_NAMES && slot == NULL; i++) {
++		struct sweet_surf_tot_slot *c = &sweet_surf_tot[i];
++		uint32_t st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
++		if (st == 0) {
++			uint32_t zero = 0;
++			if (__atomic_compare_exchange_n(&c->state, &zero, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++				strlcpy(c->name, name, sizeof(c->name));
++				__atomic_store_n(&c->state, 2, __ATOMIC_RELEASE);
++				slot = c;
++				break;
++			}
++			st = zero;      /* lost the race: whoever won is naming it now */
++		}
++		for (int spin = 0; st == 1 && spin < 100000; spin++) {
++			st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
++		}
++		if (st == 2 && strncmp(c->name, name, sizeof(c->name)) == 0) {
++			slot = c;
++		}
++	}
++	if (slot != NULL) {
++		OSAddAtomic64(1, (volatile SInt64 *)&slot->creates);
++		OSAddAtomic64((SInt64)bytes, (volatile SInt64 *)&slot->bytes);
++	} else {
++		OSAddAtomic64(1, (volatile SInt64 *)&sweet_surf_tot_other_creates);
++		OSAddAtomic64((SInt64)bytes, (volatile SInt64 *)&sweet_surf_tot_other_bytes);
++	}
++	int64_t n = OSAddAtomic64(1, (volatile SInt64 *)&sweet_surf_tot_all) + 1;
++	if (n % SWEET_SURF_TOT_EVERY == 0) {
++		char line[SWEET_SURF_TOT_NAMES * 40 + 48];
++		size_t off = 0;
++		for (int i = 0; i < SWEET_SURF_TOT_NAMES && off < sizeof(line); i++) {
++			struct sweet_surf_tot_slot *c = &sweet_surf_tot[i];
++			int64_t cnt = __atomic_load_n(&c->creates, __ATOMIC_RELAXED);
++			uint64_t b = (uint64_t)__atomic_load_n(&c->bytes, __ATOMIC_RELAXED);
++			if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) == 2 && cnt > 0) {
++				off += scnprintf(line + off, sizeof(line) - off, " %s=%lld/%llu.%llu", c->name,
++				    (long long)cnt, (unsigned long long)(b >> 20), (unsigned long long)(((b & 0xfffff) * 10) >> 20));
++			}
++		}
++		int64_t ocnt = __atomic_load_n(&sweet_surf_tot_other_creates, __ATOMIC_RELAXED);
++		uint64_t ob = (uint64_t)__atomic_load_n(&sweet_surf_tot_other_bytes, __ATOMIC_RELAXED);
++		if (ocnt > 0 && off < sizeof(line)) {
++			off += scnprintf(line + off, sizeof(line) - off, " other=%lld/%llu.%llu", (long long)ocnt,
++			    (unsigned long long)(ob >> 20), (unsigned long long)(((ob & 0xfffff) * 10) >> 20));
++		}
++		IOLog("SWEET SURF: totals%s (creates=%lld, name=count/MiB)\n", line, (long long)n);
++	}
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -946,10 +1020,18 @@
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		sweet_surface_creates_logged++;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	bool first_log = (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64);
++	bool pref_log = false;
++	if (ret == kIOReturnSuccess && strncmp(name, "Preferences", sizeof(name)) == 0) {   /* patch 0261 */
++		pref_log = (uint32_t)OSAddAtomic(1, (volatile SInt32 *)&sweet_surf_pref_creates) < SWEET_SURF_PREF_LOG_MAX;
++	}
++	sweet_surf_tot_note(name, ret == kIOReturnSuccess ? s->allocSize : 0);   /* patch 0261: log only */
++	if (first_log || pref_log) {
++		if (first_log) {
++			sweet_surface_creates_logged++;
++		}
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);

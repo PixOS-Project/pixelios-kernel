@@ -1,0 +1,94 @@
+SWEET Bluetooth: boot-arg sweetbtnopadv=1 (patch 0225, ticket T-aea4, W-BTUP): diagnostic rewrite on bluetoothd's rx stream that clears LE feature bit 13 (LE Periodic Advertising; octet 1 bit 5, Core v5.4 Vol 6 Part B s.4.6) in a successful Command Complete for HCI_LE_Read_Local_Supported_Features (0x2003, plen 12; Core v5.4 Vol 4 Part E s.7.7.14 + s.7.8.3), same H4 parser and safety as patches 0217/0223 (rx stream to bluetoothd only; no register store, no controller write; every rewrite prints a BT GAP row; the BT HCI trace keeps the chip's real bytes). Decompile [bin, docs/reviews/T-bf30-proof.md]: bluetoothd sends 0x204a only when that bit is set (tbz w8,#5 at 0x10010b5b4); 0x204a is an extended advertising command and Core Vol 4 Part E s.3.1.1 then makes the controller refuse every legacy command (2007/200b/200c) with 0x0c, as seen in bt-up9 [obs 20261107T083008Z-bt-up9]. Default behaviour unchanged.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index bb1c161..2bfee96 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1298,6 +1298,9 @@ sbu_sweep(const struct sbu_cand *c)
+ static bool sbu_rw200b_on;
+ static bool sbu_rw200c_on;           /* patch 0223 (T-08f7): boot-arg sweetbtrw200c=1, same rewrite for the status of LE Set Scan Enable (0x200c). bt-up8 [obs 20261107T061644Z-bt-up8]: with 0x200b rewritten, bluetoothd's scan enable ON (01 0c 20 02 01 01) is answered 0x0c and bluetoothd exits in the same ms; decompile [bin]: sub_1005798d4 handleScanStoppedEvent(status!=0) -> exit(1). Diagnostic only, no register store, no controller write */
+ static unsigned sbu_rw200c_n;
++static bool sbu_nopadv_on;           /* patch 0225 (T-aea4): boot-arg sweetbtnopadv=1, clear LE feature bit 13 (LE Periodic Advertising, Core v5.4 Vol 6 Part B s.4.6) in the Command Complete of HCI_LE_Read_Local_Supported_Features (0x2003) on the way to bluetoothd. Decompile [bin, docs/reviews/T-bf30-proof.md]: bluetoothd sends 0x204a only if byte 1 bit 5 of that feature set is set (tbz w8,#5 at 0x10010b5b4); 0x204a is an extended advertising command and Core Vol 4 Part E s.3.1.1 makes the controller refuse every later legacy command (2007/200b/200c) with 0x0c. Diagnostic only, rx stream only, no register store, no controller write */
++static unsigned sbu_nopadv_n;
++static uint8_t sbu_rw_st;            /* patch 0225: the Status byte (H4 offset 6) of the event being parsed */
+ static unsigned sbu_rw200b_n, sbu_rw_off, sbu_rw_plen, sbu_rw_other;
+ static uint8_t sbu_rw_evt, sbu_rw_opl;
+ static uint16_t sbu_rw_opc;
+@@ -1314,6 +1317,7 @@ sbu_rw200b(uint8_t *p, size_t n)
+ 			} else if (b == 0x02 || b == 0x03 || b == 0x05) {   /* ACL/SCO/ISO packet: its payload would be scanned for 0x04 and fake an event; the knob stops for the rest of the boot (review T-4c2c #4) */
+ 				sbu_rw200b_on = false;
+ 				sbu_rw200c_on = false;
++				sbu_nopadv_on = false;
+ 				SBU_GAP(SG_OTHER, "sweetbtrw200b: non-event packet type %#x: rewrite disabled for the rest of the boot", b);
+ 				return;
+ 			} else {        /* garbage: pass through, framing resumes at the next 0x04; counted loudly */
+@@ -1326,8 +1330,17 @@ sbu_rw200b(uint8_t *p, size_t n)
+ 		case 1: sbu_rw_evt = b; break;
+ 		case 2: sbu_rw_plen = b; break;
+ 		case 4: sbu_rw_opl = b; break;
+-		case 5: sbu_rw_opc = (uint16_t)(sbu_rw_opl | (b << 8)); break;
++		case 5:
++			sbu_rw_opc = (uint16_t)(sbu_rw_opl | (b << 8));
++			if (sbu_rw_evt == 0x0e && sbu_rw_opc == 0x2003 && sbu_nopadv_on && sbu_rw_plen < 4) {        /* review T-aea4-0225 #1: a skipped 0x2003 is loud too */
++				SBU_GAP(SG_OTHER, "sweetbtnopadv: 0x2003 Command Complete plen %u has no status: nothing rewritten", sbu_rw_plen);
++			}
++			break;
+ 		case 6:
++			sbu_rw_st = b;
++			if (sbu_rw_evt == 0x0e && sbu_rw_opc == 0x2003 && sbu_nopadv_on && (sbu_rw_plen != 12 || b != 0x00)) {     /* review T-aea4-0225 #1 */
++				SBU_GAP(SG_OTHER, "sweetbtnopadv: 0x2003 Command Complete plen %u status %#x (need plen 12, status 0): nothing rewritten", sbu_rw_plen, b);
++			}
+ 			if (sbu_rw_evt == 0x0e && sbu_rw_plen >= 4 && sbu_rw_opc == 0x200c && sbu_rw200c_on && b == 0x0c) {
+ 				p[i] = 0x00;
+ 				sbu_rw200c_n++;
+@@ -1338,6 +1351,17 @@ sbu_rw200b(uint8_t *p, size_t n)
+ 				printf("BT GAP: sweetbtrw200b=1 rewrote the status of the Command Complete for opcode 0x200b from 0x0c (command disallowed, the chip's real answer) to 0x00 for bluetoothd (x%u); diagnostic only, the controller refused the command\n", sbu_rw200b_n);
+ 			}
+ 			break;
++		case 8:         /* patch 0225: LE_Features octet 1 of a successful 0x2003 Command Complete (H4 04 0e 0c | 01 03 20 | 00 | f0 f1 ..f7; Core v5.4 Vol 4 Part E s.7.7.14 + s.7.8.3) */
++			if (sbu_rw_evt == 0x0e && sbu_rw_plen == 12 && sbu_rw_opc == 0x2003 && sbu_nopadv_on && sbu_rw_st == 0x00) {
++				if ((b & 0x20) != 0) {
++					p[i] = (uint8_t)(b & ~0x20);
++					sbu_nopadv_n++;
++					printf("BT GAP: sweetbtnopadv=1 cleared LE feature bit 13 (Periodic Advertising) in the 0x2003 Command Complete for bluetoothd: octet1 %#x -> %#x (x%u); diagnostic only, the controller still supports it\n", b, p[i], sbu_nopadv_n);
++				} else {
++					SBU_GAP(SG_OTHER, "sweetbtnopadv: 0x2003 Command Complete octet1 %#x has bit 13 clear already: nothing rewritten", b);
++				}
++			}
++			break;
+ 		default: break;
+ 		}
+ 		if (sbu_rw_off == 2u + sbu_rw_plen) {
+@@ -1364,7 +1388,7 @@ sbu_rx_poll(void)
+ 	if (err != 0) {
+ 		sbu.rx_err++;
+ 		SBU_GAP(SG_RXERR, "uart16 rx error flags %#x (overrun/frame/break); bytes may be lost", err);
+-		if ((sbu_rw200b_on || sbu_rw200c_on) && sbu_rw_off != 0) {     /* patch 0217: bytes may be lost, the H4 framing of the rewrite parser is no longer known: restart at the next 0x04 */
++		if ((sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on) && sbu_rw_off != 0) {     /* patch 0217: bytes may be lost, the H4 framing of the rewrite parser is no longer known: restart at the next 0x04 */
+ 			sbu_rw_off = 0;
+ 			SBU_GAP(SG_RXERR, "sweetbtrw200b: framing reset after rx error");
+ 		}
+@@ -1376,7 +1400,7 @@ sbu_rx_poll(void)
+ 	if (n != 0) {
+ 		sbu.rx_bytes += (uint32_t)n;
+ 		sbu_trace("rx", buf, n);       /* the trace shows the chip's real bytes, before any sweetbtrw200b rewrite */
+-		if (sbu_rw200b_on || sbu_rw200c_on) {
++		if (sbu_rw200b_on || sbu_rw200c_on || sbu_nopadv_on) {
+ 			sbu_rw200b(buf, n);
+ 		}
+ 		(void)sweet_bt_rx(buf, n);
+@@ -1625,6 +1649,14 @@ sweet_bt_uart_attach(void)
+ 			printf("BT GAP: sweetbtrw200c=1 active: Command Complete status 0x0c for opcode 0x200c is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; the controller is NOT scanning; one BT GAP row per rewrite)\n");
+ 		}
+ 	}
++	{       /* patch 0225 (T-aea4): boot-arg sweetbtnopadv=1, hide LE feature bit 13 from bluetoothd so it skips 0x204a; default off */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtnopadv", &v, sizeof(v)) && v == 1) {
++			sbu_nopadv_on = true;
++			printf("BT GAP: sweetbtnopadv=1 active: LE feature bit 13 (Periodic Advertising) is cleared in the 0x2003 Command Complete on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
++		}
++	}
+ 	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
+ 		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
+ 		(void)sbu_power_off();

@@ -24,4 +24,4 @@ One line per check (`PASS|FAIL|SKIP`), `note:` lines, last line `RESULT: PASS` o
 Read-only, host-only; runs `tools/runs`, `tools/phone-lock status|check`, `git rev-parse`. No adb/fastboot. A false FAIL on bootargs is possible for names parsed outside xnu (fix: bootargs-extra.txt with a citation).
 
 ## amendments
-(none)
+- 2026-10-29 (driver 20j, gap from 21i: el2/b2-report 195eae7 GATE PASS while bootargs-known.txt lacked `sweetel2 patch:0180`, so the run was refused at the slot): `--gen-bootargs --check --patches-only` rechecks the xnu/patches rows without the pristine tree (the `xnu` rows of the committed file stand in for the pinned pristine walk; same output as the full walk, shown on trunk 537d034). Caller: tools/validate-repo.py (gate step validate, <offload-host> container included). Writing still needs the pristine tree. Review bootargs-gate-r1 F1: the file starts with `# xnu-rows-sha256 H` (hash of the pristine xnu rows), so a hand-added or deleted xnu row FAILs --patches-only; F3: --pristine with --patches-only = ERROR.

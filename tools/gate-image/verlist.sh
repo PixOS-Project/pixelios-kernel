@@ -1,0 +1,5 @@
+# shellcheck shell=bash
+# verlist.sh of pixos-gate:trixie-20261111 (mounted at /gate-image, GATE_VERLIST; tools/gate-identity hashes its output into verlist=). Pip wheel hashes: requirements.txt.
+for p in zlib1g zlib1g-dev gcc gcc-14 g++ cpp libc6 libc-bin libc-dev-bin libc6-dev binutils binutils-x86-64-linux-gnu make device-tree-compiler xz-utils openssl libssl3t64 python3 python3.13 python3-lz4 python3-capstone cppcheck clang-tidy-19 shellcheck lz4 liblz4-1 clang clang-19 llvm git coreutils bash dash gawk sed grep findutils diffutils patch perl curl zlib1g libgcc-s1 libstdc++6 libfdt1 cpio bzip2 zstd mawk util-linux gzip tar fakeroot qemu-system-arm ca-certificates m4 autoconf automake rsync android-libsparse 7zip; do dpkg-query -W -f='${Package}=${Version}\n' $p 2>/dev/null; done | LC_ALL=C sort
+echo ---; python3 -c 'import lz4,sys;print(sys.version.split()[0],lz4.__file__,lz4.VERSION)' 2>&1; gcc -dumpmachine
+python3 -c 'import capstone,PIL,numpy,cv2;print("capstone",capstone.__version__,capstone.__file__);print("PIL",PIL.__version__);print("numpy",numpy.__version__);print("cv2",cv2.__version__)' 2>&1

@@ -1,0 +1,128 @@
+SWEET nav11 (patch 0255, T-c87c, G-10b-nav; input injection + log only): witness and one input fix for the rep-0 Settings desync left by T-bf77. (1) Witness: `SWEET EXEC: NAME t NS swaps N` after every exec line (kern_exec.c, same clock as `SWEET NAV: ... now` and `SWEET SWAPT: now`) and `SWEET NAV: EVT t NS down|up X,Y act IDX rep R swaps N pref_exec C` per HID touch edge, so the touch that precedes the `exec Preferences` of the stalled boots is named to the millisecond (nav8/9/10 [obs docs/reviews/T-c87c-proof.md s1]: Preferences exec 7-9 s after the first unlock swipe with the wake tap at 540,1200 and at 540,70 alike, SpringBoard and backboardd CPU react to every swipe so the input is not delivered late at that level). (2) Fix: when Preferences exec'd inside the unlock window (count read at the first attempt vs after the swap-verified retries) the unlock row ends with the calibrated app-home swipe (540,2398 -> 1800 -> 1200, 2 s settle) before rep 0 goes on, so settings-open / general-open / about-open start from the home screen as in nav3/nav5. Logs `SWEET NAV: unlock: Preferences launched inside the unlock window ...` and `... app-home swipe done ...`; the unlock window line now carries the exec counts and the home swipe state. No register, no store to hardware.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 6815130..9bd1bb3 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7084,6 +7084,8 @@ load_return_to_errno(load_return_t lrtn)
+ #include <kern/clock.h>
+ #include <mach/kern_return.h>
+ 
++uint32_t sweet_exec_pref_count;   /* patch 0255: execs of "Preferences" (T-c87c), read by iokit/Kernel/arm/hid/SweetHID.cpp */
++
+ /*
+  * execargs_alloc
+  *
+@@ -7513,6 +7515,17 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			{   /* patch 0255 witness: the exec on the clock of `SWEET NAV: ... now` (T-c87c), and the count the nav session reads (SweetHID.cpp) */
++				extern uint64_t sweet_fb_swap_count;
++				extern uint32_t sweet_exec_pref_count;
++				extern uint64_t mach_absolute_time(void);
++				uint64_t sweet_exec_ns;
++				absolutetime_to_nanoseconds(mach_absolute_time(), &sweet_exec_ns);
++				printf("SWEET EXEC: %s t %llu swaps %llu\n", p->p_name, sweet_exec_ns, sweet_fb_swap_count);
++				if (strncmp(p->p_name, "Preferences", MAXCOMLEN) == 0) {
++					sweet_exec_pref_count++;
++				}
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 745ce39..0d3dd71 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -390,6 +390,7 @@ public:
+ 	UInt32 fNavReps, fNavRep, fNavIdx, fNavStep, fNavRng;
+ 	UInt32 fNavWakeTaps, fNavWakeSt;   /* patch 0254: unlock retries (wake taps sent), 1 = the wake tap finger is down */
+ 	uint64_t fNavSw0;   /* patch 0254: swap count at the start of the unlock attempt */
++	UInt32 fNavHomeSt, fNavPref0;   /* patch 0255: 1-3 = the app-home swipe after a Preferences launch inside the unlock window is running, 4 = done; Preferences exec count at the first unlock attempt */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -437,6 +438,7 @@ static SweetHIDTouch *gSweetTouch;
+ extern "C" uint64_t sweet_touch_down_ns;
+ uint64_t sweet_touch_down_ns;
+ extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: swaps presented so far, written by AppleCLCD::swap */
++extern "C" uint32_t sweet_exec_pref_count;   /* patch 0255: execs of "Preferences" so far, counted in bsd/kern/kern_exec.c */
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -614,6 +616,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	fNavReps = fNavRep = fNavIdx = fNavStep = 0;
+ 	fNavWakeTaps = fNavWakeSt = 0;
+ 	fNavSw0 = 0;
++	fNavHomeSt = fNavPref0 = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
+@@ -671,6 +674,20 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutMS(2000);
+ 		return;
+ 	}
++	if (self->fNavHomeSt >= 1 && self->fNavHomeSt <= 3) {   /* patch 0255: the app-home swipe 2398 -> 1800 -> 1200 (the calibrated app-home gesture), then 2 s of settle */
++		if (self->fNavHomeSt == 1) {
++			self->touch(0, true, 540, 1800);
++			sender->setTimeoutMS(100);
++		} else if (self->fNavHomeSt == 2) {
++			self->touch(0, false, 540, 1200);
++			sender->setTimeoutMS(2000);
++		} else {
++			IOLog("SWEET NAV: unlock: app-home swipe done, rep 0 goes on from the home screen (swaps %llu)\n", sweet_fb_swap_count);
++			sender->setTimeoutMS(10);
++		}
++		self->fNavHomeSt++;
++		return;
++	}
+ 	SweetNavAct act = sweetNavActs[i];
+ 	if (strcmp(act.name, "app-launch") == 0) {
+ 		/* patch 0250 (T-4604): every repetition taps the Clock icon (665,1158) of the home page the session is on after app-home. Patch 0247 tapped icon 0 at 398,300, which on the
+@@ -692,6 +709,9 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+ 	if (st == 0 && i == 0) {
+ 		self->fNavSw0 = sweet_fb_swap_count;   /* patch 0254: swaps before this unlock attempt */
++		if (self->fNavWakeTaps == 0) {
++			self->fNavPref0 = sweet_exec_pref_count;   /* patch 0255 */
++		}
+ 	}
+ 	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+@@ -739,7 +759,22 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 			sender->setTimeoutMS(100);
+ 			return;
+ 		}
+-		IOLog("SWEET NAV: unlock window %llu swaps, wake taps %u\n", d, self->fNavWakeTaps);
++		if (sweet_exec_pref_count != self->fNavPref0 && self->fNavHomeSt == 0) {
++			/*
++			 * Patch 0255 (T-c87c, G-10b-nav): Preferences exec'd inside the unlock window in nav8/nav9/nav10 [obs docs/reviews/T-c87c-proof.md s1: 7-9 s after the first swipe,
++			 * with the wake tap at 540,1200 and at 540,70 alike], so rep 0 ran inside Settings: settings-open / general-open / about-open out of step. Whatever launched it
++			 * [cause not yet known: the witness lines SWEET NAV: EVT and SWEET EXEC of this patch name the touch], the session is inside the app, so the unlock row ends with the
++			 * calibrated app-home swipe and rep 0 then starts from the home screen as in a healthy boot. Input injection only.
++			 */
++			IOLog("SWEET NAV: unlock: Preferences launched inside the unlock window (exec count %u -> %u, swaps %llu): app-home swipe before rep 0 goes on\n",
++			    (unsigned)self->fNavPref0, (unsigned)sweet_exec_pref_count, d);
++			self->fNavHomeSt = 1;
++			self->touch(0, true, 540, 2398);
++			sender->setTimeoutMS(100);
++			return;
++		}
++		IOLog("SWEET NAV: unlock window %llu swaps, wake taps %u, preferences exec count %u -> %u, home swipe %u\n", d, self->fNavWakeTaps,
++		    (unsigned)self->fNavPref0, (unsigned)sweet_exec_pref_count, (unsigned)self->fNavHomeSt);
+ 		if (d < 30) {
+ 			IOLog("SWEET GAP: NAV unlock: %llu swaps after %u wake taps, going on (rep 0 unlock / home-page rows will be no-anim)\n", d, self->fNavWakeTaps);
+ 		}
+@@ -910,6 +945,12 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
++		{   /* patch 0255 witness: the touch on the same clock as `SWEET NAV: ... now`, `SWEET SWAPT: now` and `SWEET EXEC: ... t`, with the swap count and the Preferences exec count */
++			uint64_t evns;
++			absolutetime_to_nanoseconds(now, &evns);
++			IOLog("SWEET NAV: EVT t %llu %s %d,%d act %u rep %u swaps %llu pref_exec %u\n", evns, down ? "down" : "up", x, y, fNavIdx, fNavRep,
++			    sweet_fb_swap_count, (unsigned)sweet_exec_pref_count);
++		}
+ 	}
+ 	dispatchEvent(collection);
+ 	collection->release();

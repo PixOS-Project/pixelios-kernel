@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""allon-score: score ONE boot against the 6 ALL-ON oracles of docs/GOAL-ALL-ON.md (super repo), host only, read-only.
+
+  tools/allon-score BOOT_RUN_DIR [--slice JOB_SLICE_DIR]... [--snap DIR]... [--park-log FILE]
+  --snap DIR: the job's pulled panel snapshots allon-wifi.raw / allon-bt.raw (fcapctl panel); oracle 4/5 is judged by tools/allon-snapcheck
+  ('ALLON SNAP wifi|bluetooth ok|bad: <seen>', pixel rules, ALL-ON T-23) unless a human wrote DIR/<name>.verdict 'ok|bad: <what is seen>' from
+  DIR/<name>.png (tools/panel2png): the human verdict then overrides and the output line says which was used; raw nobody could judge = UNMEASURED
+  tools/allon-score --self-test
+
+BOOT_RUN_DIR = the boot's run dir (run.json + usbnet.log of the WHOLE boot, e.g. logs/runs/<ts>-resident-<id>-b1); --slice = a job slice dir
+whose usbnet.log holds the nav bench (default: the boot dir itself). The park result comes from the phone-lock run log that names the boot
+label (~/pixelios-artifacts/phone.lock.runs/*/run.log, or --park-log).
+Output: one line per oracle `ORACLE n PASS|FAIL|UNMEASURED <evidence>`, then `RESULT: PASS allon-score boot=<label> pass=P fail=F unmeasured=U`.
+UNMEASURED always names the missing witness (rule 7: never a silent "partial"); a stress oracle scored on a calm nav is UNMEASURED, not PASS.
+Exit 0 when the scoring ran (any verdicts), 2 when the run dir is unusable.
+Oracles (user 2026-11-11, docs/GOAL-ALL-ON.md; stress rule: oracle 3 needs 'SWEET NAV: STRESS on'):
+ 1 fastboot boot -> lock screen <= 240 s (witness: '|SpringBoard| ... SBCoverSheet' or the boot nav 'unlock window ... accepted' as an upper bound),
+   no panic/trap/stall reset, park=fastboot in the phone-lock log
+ 2 finger contact 'SWEET TOUCH: ev ... kind [1-4] ... raw <nonzero>' + the user's unlock/app-open (user-observed: UNMEASURED until a witness exists)
+ 3 T-54 heavy bench (pixnav -B >= 600 s, 'SWEET NAV: HEAVY done'), tools/fps-wholerun over the whole bench: pooled >= 55, slowest step >= 50
+   (worst 1 s window + gaps > 100 ms reported), Wi-Fi joined + BT on in the same boot; the old nav is best case = UNMEASURED
+ 4 pixping 10/10, no 'keep link DOWN', pixopen WIFI rc=1, panel snapshot of Settings > Wi-Fi (list + checkmark)
+ 5 'BT VSC: adapter ON', bt-mgr scan discovered >= 1, bt-mgrd reconnect=1, no BTApp in front ('BT APP:' lines), Settings > Bluetooth snapshot
+ 6 battery rows ('SWEET CHG P3: t=..' samples, then 'SWEET CHG MON') from <= 200 s after the first USB line to the end of the log (no gap > 90 s),
+   no 'P2 gate recheck'
+Job step output (pixopen lines) is read from the resident job's steps.log of each --slice (~/pixelios-artifacts/resident/jobs/<id>/steps.log)."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOCK_RUNS = os.path.expanduser("~/pixelios-artifacts/phone.lock.runs")
+
+
+def read_log(d):
+    """[(host_ts, text)] of d/usbnet.log; lines without a host stamp keep the previous one."""
+    out, ts = [], None
+    p = os.path.join(d, "usbnet.log")
+    if not os.path.isfile(p):
+        return out
+    for raw in open(p, "rb").read().decode("latin1").splitlines():
+        head, sep, rest = raw.partition("\t")
+        try:
+            ts = float(head)
+            out.append((ts, rest if sep else ""))
+        except ValueError:
+            out.append((ts, raw))
+    return out
+
+
+def first(lines, rx):
+    r = re.compile(rx)
+    for t, s in lines:
+        if r.search(s):
+            return t, s.strip()
+    return None, None
+
+
+def count(lines, rx):
+    r = re.compile(rx)
+    return sum(1 for _, s in lines if r.search(s))
+
+
+def o1(lines, t_boot, label, park_log):
+    if t_boot is None:
+        return "UNMEASURED", "no t_boot in run.json"
+    bad = first(lines, r"panic\(cpu|Kernel trap at|SWEET STALL: the usb-log drain thread did not run")
+    if bad[0]:
+        return "FAIL", "panic/trap/stall: %s" % bad[1][:120]
+    t, s = first(lines, r"\|SpringBoard\|.*SBCoverSheet")
+    src = "SBCoverSheet"
+    if t is None:
+        t, s = first(lines, r"SWEET NAV: unlock window .* accepted")
+        src = "boot-nav unlock accepted (upper bound)"
+    if t is None:
+        return "UNMEASURED", "no lock-screen witness (SpringBoard not mirrored and no boot nav): add SpringBoard to sweetnull or a lock-screen witness"
+    dt = t - t_boot
+    park = park_result(label, park_log)
+    if dt > 240:
+        return "FAIL", "lock screen at +%.0f s (> 240 s) [%s]" % (dt, src)
+    if park is None:
+        return "UNMEASURED", "lock screen at +%.0f s [%s] but no phone-lock run log names %s (park unknown)" % (dt, src, label)
+    if park != "fastboot":
+        return "FAIL", "lock screen at +%.0f s [%s], park=%s" % (dt, src, park)
+    return "PASS", "lock screen at +%.0f s [%s], no panic, park=fastboot" % (dt, src)
+
+
+def park_result(label, park_log):
+    logs = [park_log] if park_log else glob.glob(os.path.join(LOCK_RUNS, "*", "run.log"))
+    for p in logs:
+        try:
+            txt = open(p, errors="replace").read()
+        except OSError as e:
+            print("ALLON GAP: phone-lock run log %s unreadable (%s), park not read from it" % (p, type(e).__name__), file=sys.stderr)
+            continue
+        if label and label in txt:
+            m = re.findall(r"park=(\w+)", txt)
+            if m:
+                return m[-1]
+    return None
+
+
+def o2(lines):
+    t, s = first(lines, r"SWEET TOUCH: ev .*kind [1-4] .*raw (?!0,0\b)\d+,\d+")
+    if t is None:
+        n = count(lines, r"SWEET TOUCH: ev ")
+        return "UNMEASURED", "no finger contact line (%d touch events, none kind 1-4 with nonzero raw); the user's unlock/app-open needs a run with the user" % n
+    return "UNMEASURED", "finger contact seen (%s); the user's unlock + app-open by tap is not witnessed in the log" % s[:90]
+
+
+HEAVY_MIN_S = 600   # T-54 (user 2026-11-12 ~22:2xZ): O3 counts only on the heavy bench, >= 10 min of continuous input
+
+
+def wholerun(d, span=None):
+    """tools/fps-wholerun on a run/slice dir: (RESULT line, parsed dict or None)"""
+    cmd = [sys.executable, "-I", os.path.join(HERE, "fps-wholerun"), d]
+    if span:
+        cmd += ["--span-from", span[0], "--span-to", span[1]]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    last = (r.stdout.strip().splitlines() or ["RESULT: FAIL fps-wholerun no output"])[-1]
+    m = re.search(r"pooled=([\d.]+) slowest=([\d.]+)\(([^)]*)\) worst_1s=(\S+) gaps100=(\d+) longest_gap_ms=(\d+) frames=(\d+) span_s=([\d.]+) source=(\S+)", last)
+    return last, (dict(pooled=float(m.group(1)), slowest=float(m.group(2)), step=m.group(3), worst=m.group(4), gaps=int(m.group(5)),
+                       longest=int(m.group(6)), span=float(m.group(8)), source=m.group(9)) if m else None)
+
+
+def o3(lines, slices, have_wifi, have_bt):
+    """T-54: the heavy bench ('SWEET NAV: HEAVY start' .. 'SWEET NAV: HEAVY done secs N', N >= HEAVY_MIN_S) scored over the whole run by
+    tools/fps-wholerun (pooled >= 55, slowest step >= 50; worst 1 s window + gaps > 100 ms reported). The old nav (pixnav -r / kernel nav) is
+    best case (settled-screen waits, idle steps): it is UNMEASURED for O3, its whole-run numbers are shown so nobody reads the old ones as real."""
+    heavy = None
+    for d in slices:
+        t = read_log(d) or lines
+        m = [re.search(r"SWEET NAV: HEAVY done secs (\d+)", l[1] if isinstance(l, tuple) else l) for l in t]
+        m = [x for x in m if x]
+        if m:
+            heavy = (d, int(m[-1].group(1)))
+    if heavy is None:
+        d = slices[0]
+        last, w = wholerun(d)
+        nums = ("whole-run pooled %.1f slowest %.1f (%s) worst_1s %s gaps100 %d" % (w["pooled"], w["slowest"], w["step"], w["worst"], w["gaps"])
+                if w else last[len("RESULT: "):][:160])
+        return "UNMEASURED", "no heavy bench (T-54: O3 counts only on 'pixnav -B'; the old nav is best case): %s [%s]" % (nums, os.path.basename(d))
+    d, secs = heavy
+    last, w = wholerun(d, ("SWEET NAV: HEAVY start", "SWEET NAV: HEAVY done"))
+    if w is None:
+        return "UNMEASURED", "heavy bench ran %d s but fps-wholerun gave no numbers: %s [%s]" % (secs, last[len("RESULT: "):][:200], os.path.basename(d))
+    nums = ("heavy %d s: pooled %.1f slowest %.1f (%s) worst_1s %s gaps100 %d longest_gap_ms %d source %s [%s]"
+            % (secs, w["pooled"], w["slowest"], w["step"], w["worst"], w["gaps"], w["longest"], w["source"], os.path.basename(d)))
+    if "capped_at_s=" in last:
+        return "UNMEASURED", "SWAPT rows capped before the bench end (tracker L-14; fps-wholerun scored only the rows): %s %s" % (nums, last[last.index("capped_at_s="):])
+    if secs < HEAVY_MIN_S:
+        return "UNMEASURED", "heavy bench shorter than %d s (thermal park or job limit? a finding): %s" % (HEAVY_MIN_S, nums)
+    if not (have_wifi and have_bt):
+        return "UNMEASURED", "heavy bench but Wi-Fi joined=%s BT on=%s in this boot: %s" % (have_wifi, have_bt, nums)
+    ok = w["pooled"] >= 55 and w["slowest"] >= 50
+    return ("PASS" if ok else "FAIL"), nums
+
+
+SNAP_DIRS = []   # --snap DIR: panel snapshots allon-wifi.raw / allon-bt.raw pulled by the job (fcapctl panel, patch 0276) + their read verdicts
+
+
+def snap_check(kind, raw):
+    """(verdict, text) of tools/allon-snapcheck KIND RAW: its 'ALLON SNAP <kind> ok|bad: <text>' line (T-23 pixel rules, no human); None when the checker gave no such line."""
+    try:
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "allon-snapcheck"), kind, raw],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "allon-snapcheck did not run: %s" % e
+    m = re.search(r"^ALLON SNAP %s (ok|bad): (.*)$" % kind, r.stdout, re.M)
+    if not m:
+        return None, "allon-snapcheck gave no 'ALLON SNAP %s' line (rc=%d): %s" % (kind, r.returncode, ((r.stdout + r.stderr).strip().splitlines() or ["no output"])[-1][:160])
+    return ("PASS" if m.group(1) == "ok" else "FAIL"), m.group(2)
+
+
+def snap_verdict(name, what, kind):
+    """(verdict, text) for one Settings screen proof. Source, in order: a human NAME.verdict ('ok: <seen>' / 'bad: <seen>', written by the reader of
+    NAME.png, tools/panel2png) OVERRIDES everything and the line says 'snapshot read by a human'; without it tools/allon-snapcheck KIND (pixel rules,
+    ALL-ON T-23) decides and the line says 'allon-snapcheck'. Raw that neither could judge = UNMEASURED with the png path."""
+    for d in SNAP_DIRS:
+        raw = os.path.join(d, name + ".raw")
+        if not os.path.isfile(raw):
+            continue
+        png = os.path.join(d, name + ".png")
+        if not os.path.isfile(png):   # convert once with tools/panel2png so a reader has a picture
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel2png"), raw, png],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                return "UNMEASURED", "snapshot %s not convertible: %s" % (raw, (r.stdout.strip().splitlines() or ["no output"])[-1][:160])
+        vf = os.path.join(d, name + ".verdict")
+        if os.path.isfile(vf):
+            v = open(vf, errors="replace").read().strip()
+            if v.startswith("ok:"):
+                return "PASS", "snapshot read by a human (.verdict overrides allon-snapcheck): " + v[3:].strip()[:120]
+            return "FAIL", "snapshot read by a human (.verdict overrides allon-snapcheck): " + v[:120]
+        v, t = snap_check(kind, raw)
+        if v is None:
+            return "UNMEASURED", "snapshot %s not judged: %s; view %s and write %s 'ok|bad: <seen>' (%s)" % (raw, t, png, vf, what)
+        return v, "allon-snapcheck (no human .verdict): " + t[:400]
+    return "UNMEASURED", "no panel snapshot %s.raw in --snap dirs (%s)" % (name, what)
+
+
+def o4(lines):
+    ping = count(lines, r"pixping: summary sent=10 got=10")
+    down = count(lines, r"keep link DOWN")
+    wopen = count(lines, r"pixopen: open prefs:root=WIFI rc=1")
+    ev = "pixping 10/10 x%d, keep link DOWN x%d, Settings>Wi-Fi opened x%d" % (ping, down, wopen)
+    if down or not ping:
+        return "FAIL", ev
+    if not wopen:
+        return "UNMEASURED", ev + "; Settings > Wi-Fi never opened (pixopen WIFI rc=1 missing)"
+    v, t = snap_verdict("allon-wifi", "Settings > Wi-Fi list + checkmark", "wifi")
+    return v, ev + "; " + t
+
+
+def o5(lines):
+    on = count(lines, r"BT VSC: adapter ON")
+    scan = first(lines, r"BT MGR: RESULT: PASS .*discovered=([1-9]\d*)")[1]
+    rec = count(lines, r"BT MGRD: RESULT: PASS .*reconnect=1")
+    front = count(lines, r"\|BTApp\| BT APP:")
+    ev = "adapter ON x%d, scan %s, bt-mgrd reconnect x%d, BTApp in front x%d" % (on, "yes" if scan else "no", rec, front)
+    if not on or front:
+        return "FAIL", ev
+    if not scan or not rec:
+        return "UNMEASURED", ev + "; scan/reconnect result missing (bt-mgrd not run in this boot?)"
+    v, t = snap_verdict("allon-bt", "Settings > Bluetooth on", "bluetooth")
+    return v, ev + "; " + t
+
+
+def o6(lines, t_boot):
+    rows = [t for t, s in lines if "SWEET CHG MON:" in s or re.search(r"SWEET CHG P3: t=\d+s current=", s)]
+    rech = count(lines, r"P2 gate recheck")
+    end = max((t for t, _ in lines if t), default=None)
+    if rech:
+        return "FAIL", "P2 gate recheck x%d" % rech
+    if not rows or t_boot is None or end is None:
+        return "FAIL", "no SWEET CHG MON rows" if not rows else "no timestamps"
+    gaps = [b - a for a, b in zip(rows, rows[1:])] + [end - rows[-1]]
+    usb0 = min((t for t, _ in lines if t), default=t_boot)
+    first_dt = rows[0] - usb0
+    ev = "%d battery rows (P3 + MON), first %.0f s after the first USB line, largest gap %.0f s (to log end incl.)" % (len(rows), first_dt, max(gaps))
+    if first_dt > 200 or max(gaps) > 90:
+        return "FAIL", ev
+    return "PASS", ev
+
+
+def score(boot_dir, slices, park_log):
+    try:
+        rj = json.load(open(os.path.join(boot_dir, "run.json")))
+    except (OSError, ValueError) as e:
+        print("RESULT: ERROR allon-score %s: run.json unreadable (%s)" % (boot_dir, type(e).__name__))
+        return 2
+    lines = read_log(boot_dir)
+    for d in slices:   # job step output (pixopen, bt-client runs) lives in the resident job's steps.log, not in the USB log
+        m = re.search(r"rj-(\d{8}T\d{6}Z-[a-z]+-[0-9a-f]+)", os.path.basename(d.rstrip("/")))
+        sp = os.path.expanduser("~/pixelios-artifacts/resident/jobs/%s/steps.log" % m.group(1)) if m else None
+        if sp and os.path.isfile(sp):
+            lines = lines + [(None, x) for x in open(sp, errors="replace").read().splitlines()]
+    if not lines:
+        print("RESULT: ERROR allon-score %s: no usbnet.log lines" % boot_dir)
+        return 2
+    t_boot = float(rj["t_boot"]) if rj.get("t_boot") else None
+    label = rj.get("label", "")
+    have_wifi = count(lines, r"pixping: summary sent=10 got=10") > 0
+    have_bt = count(lines, r"BT VSC: adapter ON") > 0
+    res = [o1(lines, t_boot, label, park_log), o2(lines), o3(lines, slices or [boot_dir], have_wifi, have_bt), o4(lines), o5(lines), o6(lines, t_boot)]
+    for i, (v, ev) in enumerate(res, 1):
+        print("ORACLE %d %s %s" % (i, v, ev))
+    n = {k: sum(1 for v, _ in res if v == k) for k in ("PASS", "FAIL", "UNMEASURED")}
+    print("RESULT: PASS allon-score boot=%s pass=%d fail=%d unmeasured=%d" % (label, n["PASS"], n["FAIL"], n["UNMEASURED"]))
+    return 0
+
+
+def self_test():
+    L = [(100.0, "x"), (110.0, "|SpringBoard| begin/end for <SBCoverSheetPrimarySlidingViewController: 0x1>"), (150.0, "SWEET CHG MON: t=1"),
+         (200.0, "SWEET CHG MON: t=2"), (220.0, "pixping: summary sent=10 got=10 lost=0"), (230.0, "BT VSC: adapter ON: x")]
+    cases = [
+        ("o1 park unknown", o1(L, 0.0, "lbl-none", "/nonexistent")[0], "UNMEASURED"),
+        ("o1 late", o1([(300.0, "|SpringBoard| SBCoverSheet")], 0.0, "x", None)[0], "FAIL"),
+        ("o1 panic", o1([(10.0, "panic(cpu 0 caller")], 0.0, "x", None)[0], "FAIL"),
+        ("o2 status only", o2([(1.0, "SWEET TOUCH: ev 43 05 -> kind 5 id 0 raw 0,0")])[0], "UNMEASURED"),
+        ("o4 no snapshot", o4(L)[0], "UNMEASURED"),
+        ("o4 link down", o4(L + [(240.0, "keep link DOWN")])[0], "FAIL"),
+        ("o4 opened, no snapshot", o4(L + [(None, "pixopen: open prefs:root=WIFI rc=1")])[0], "UNMEASURED"),
+        ("o5 no bt-mgrd", o5(L)[0], "UNMEASURED"),
+        ("o5 btapp front", o5(L + [(250.0, "|BTApp| BT APP: start")])[0], "FAIL"),
+        ("o6 rows ok", o6(L, 0.0)[0], "PASS"),
+        ("o6 recheck", o6(L + [(260.0, "P2 gate recheck")], 0.0)[0], "FAIL"),
+        ("o6 gap", o6([(150.0, "SWEET CHG MON: a"), (400.0, "SWEET CHG MON: b")], 0.0)[0], "FAIL"),
+    ]
+    fails = 0
+    for name, got, want in cases:
+        ok = got == want
+        fails += not ok
+        print("%s %s (got %s want %s)" % ("ok  " if ok else "FAIL", name, got, want))
+    print("RESULT: %s allon-score self-test cases=%d failed=%d" % ("PASS" if not fails else "FAIL", len(cases), fails))
+    return 1 if fails else 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    slices, park, rest, i = [], None, [], 0
+    while i < len(argv):
+        if argv[i] == "--slice" and i + 1 < len(argv):
+            slices.append(argv[i + 1]); i += 2
+        elif argv[i] == "--snap" and i + 1 < len(argv):
+            SNAP_DIRS.append(argv[i + 1]); i += 2
+        elif argv[i] == "--park-log" and i + 1 < len(argv):
+            park = argv[i + 1]; i += 2
+        else:
+            rest.append(argv[i]); i += 1
+    if len(rest) != 1:
+        print("usage: allon-score BOOT_RUN_DIR [--slice DIR]... [--snap DIR]... [--park-log FILE] | --self-test")
+        print("RESULT: ERROR allon-score bad arguments")
+        return 2
+    return score(rest[0], slices, park)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

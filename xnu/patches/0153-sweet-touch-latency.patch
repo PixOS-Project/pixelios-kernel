@@ -1,0 +1,91 @@
+SWEET touch-to-glass latency probe (patch 0153, boot-arg sweetlat=1, default off; G-10 / research 60): per finger-down (sweet_touch_down_ns from patch 0152) logs `SWEET LAT: down->swap X ms down->panel Y ms (swap->panel Z ms)` = time to the first swap whose layer-0 content changed and to the panel copy that shows it (10 Hz by default, sweetfb_hz), or `down->no visible change in 1500 ms`. Read-only, no hardware access. Needs 0152.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -443,6 +443,17 @@
+ static uint32_t sweet_fb_present_count;
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * Touch-to-glass latency probe (patch 0153, boot-arg sweetlat=1, default off; G-10 / research 60): for every finger-down (host time
++ * sweet_touch_down_ns from patch 0152's touch path, real or synthetic) log how long until (1) the first swap whose layer-0 content differs
++ * from the last swap before the touch and (2) the panel copy that shows it (AppleCLCD::present, <= 10 Hz by default):
++ * `SWEET LAT: down->swap X ms down->panel Y ms (swap->panel Z ms)` or `down->no visible change in 1500 ms`. Read-only, no hardware access.
++ */
++extern "C" uint64_t sweet_touch_down_ns;
++static uint64_t sweet_lat_td, sweet_lat_swap_ns;
++static int sweet_lat_state;   /* 0 idle, 1 waiting for the first changed swap, 2 waiting for the panel copy */
++
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -501,6 +512,55 @@
+ 			sec_start_ns = pn;
+ 		}
+ 	}
++	static int lat_on = -1;
++	if (lat_on < 0) {
++		int v = 0;
++		lat_on = (PE_parse_boot_argn("sweetlat", &v, sizeof(v)) && v != 0) ? 1 : 0;
++	}
++	if (lat_on) {
++		static uint64_t armed_td;
++		static uint32_t prev_hash, base_hash;
++		uint64_t ln;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ln);
++		uint32_t lid = get32(rec, 0x54);
++		SweetSurface *ls = lid ? sweet_surface_copy(lid) : NULL;
++		bool have = false;
++		uint32_t h = 2166136261u;
++		if (ls != NULL && ls != fSurface && ls->kernelAddress() != 0 && ls->memory != NULL && ls->elementWidth == 1 &&
++		    ls->elementHeight == 1 && ls->width >= 16 && ls->height >= 16 &&
++		    (uint64_t)ls->offset + (uint64_t)ls->height * ls->bytesPerRow <= ls->memory->getLength()) {
++			for (uint32_t gy = 0; gy < 16; gy++) {
++				const uint8_t *row = (const uint8_t *)(ls->kernelAddress() + ls->offset +
++				    (uint64_t)((uint64_t)gy * (ls->height - 1) / 15) * ls->bytesPerRow);
++				for (uint32_t gx = 0; gx < 16; gx++) {
++					uint32_t px;
++					memcpy(&px, row + (uint64_t)((uint64_t)gx * (ls->width - 1) / 15) * 4, 4);
++					h = (h ^ px) * 16777619u;
++				}
++			}
++			have = true;
++		}
++		OSSafeReleaseNULL(ls);
++		uint64_t td = sweet_touch_down_ns;
++		if (td != 0 && td != armed_td) {
++			armed_td = td;
++			sweet_lat_td = td;
++			base_hash = prev_hash;
++			sweet_lat_state = 1;
++		}
++		if (sweet_lat_state == 1) {
++			if (have && h != base_hash && ln >= sweet_lat_td) {
++				sweet_lat_swap_ns = ln;
++				sweet_lat_state = 2;
++			} else if (ln > sweet_lat_td && ln - sweet_lat_td > 1500000000ull) {
++				IOLog("SWEET LAT: down->no visible change in 1500 ms\n");
++				sweet_lat_state = 0;
++			}
++		}
++		if (have) {
++			prev_hash = h;
++		}
++	}
+ 	/*
+ 	 * Frame statistics (patch 0141, boot-arg sweetfps=1, default off; G-10): CoreAnimation swaps every vsync even when nothing
+ 	 * changes, so the swap rate is not a render rate. Sample a 32x32 grid of layer 0's surface at every swap, count the swaps whose
+@@ -692,6 +752,13 @@
+ 		}
+ 		s->release();
+ 	}
++	if (sweet_lat_state == 2) {
++		uint64_t pn;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &pn);
++		IOLog("SWEET LAT: down->swap %u ms down->panel %u ms (swap->panel %u ms)\n", (uint32_t)((sweet_lat_swap_ns - sweet_lat_td) / 1000000),
++		    (uint32_t)((pn - sweet_lat_td) / 1000000), (uint32_t)((pn - sweet_lat_swap_ns) / 1000000));
++		sweet_lat_state = 0;
++	}
+ }
+ 
+ bool

@@ -1,0 +1,369 @@
+SWEET Mali overlap of tiler(N+1) with FS(N) (patch 0240, T-34eb, G-F55; boot-arg sweetmaliovl=1, DEFAULT OFF = behaviour unchanged, the new OVL submit bit is then ignored and counted). A JS1 (vertex/tiler/compute) job that Mesa flagged with SWEET_MALI_REQ_OVL (Mesa patch 0008, SWEETGL_OVERLAP=1 on SWEETGL_SPLITHEAP=1: the batch touches nothing the fragment job submitted just before it may read or write, and uses the other tiler heap half) may start on JS1 while that JS0 job runs: K1 only when exactly one job runs, it is on JS0, J.seq == F.seq + 1, no stop/fault in progress, nothing parked ahead, JS1 clean (COMMAND_NEXT 0, JS1 bits of JOB_RAW clear, MMU_RAW 0), same register writes as sm_start_locked on slot 1; K2 every other job still starts only on an idle GPU (FS(N+1) after tiler(N+1) and FS(N)); K3 seq_done stays an in-order watermark; K4 an MMU fault or a job that does not stop hard-stops both slots and ends in the existing soft reset, both jobs and the ring reported failed. Started from the submit path or from the patch 0227 ring in finish(). Log lines: `SWEET MALI: overlap ON (sweetmaliovl)`, `SWEET MALI GAP: OVL submit bit ignored`, `SWEET MALI GAP: overlap start refused`, per second (sweetperf=1) `SWEET PERF: ovl on N started N ring_started N refused N ignored N jfirst N ffirst N hidden_ms N` and `SWEET PERF: slothist js0 jobs N busy_us N h ... js1 ...` (H3 witness, also with the knob off). SweetMali.cpp passes the OVL bit through. Rule source: docs/reviews/T-34eb-proof.md (super). Code: bsd/dev/sweet_mali.c, bsd/dev/sweet_mali.h, iokit/Kernel/arm/SweetMali.cpp. Needs patch 0227.
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index c4c051c..ab7d5ab 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -5,7 +5,8 @@
+  * Every register, value and sequence is from docs/research/31-kbase-port-checklist.md (kbase 696fc02, file:line there) or observed in runs job1/gpujob1
+  * (docs/research/28 s.11, 30 s.8); deviations are marked "ponytail:". Boot-arg sweetmali=1 brings it up (service for the user client), sweetmali=2 additionally
+  * runs a self-test through the public API (one WRITE_VALUE job in a BO). Not implemented (documented ceilings): interrupts (the thread polls JOB_IRQ_RAWSTAT every
+- * 200 us while a job runs), more than one job in flight, power-off, DVFS. A hung job or an MMU fault ends in a soft reset (sm_reset), the device is dead only if that fails.
++ * 200 us while a job runs), more than one job in flight (exception, patch 0240: boot-arg sweetmaliovl=1 lets a Mesa-flagged JS1 job run beside the JS0 job before it, K1-K4
++ * at the `ov` state), power-off, DVFS. A hung job or an MMU fault ends in a soft reset (sm_reset), the device is dead only if that fails.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -279,11 +280,19 @@ static uint64_t perf_fine[PERF_FINE_N], perf_last_done_us, ho_n, ho_sum, ho_max,
+  */
+ static uint64_t swt_busy_cum, swt_wait_cum, swt_call1, swt_calll, swt_done;
+ 
++/* patch 0240 (T-34eb, log only): per-slot busy time, job count and the 7-bucket job-time histogram of perf_hist, per second (H3 witness: tiler/compute on JS1 vs
++ * fragment on JS0). With overlap the per-slot sums add up to more than the wall time. */
++static uint64_t slot_busy_us[2], slot_jobs[2], slot_hist[2][7];
++
+ static void
+-perf_job_done(void)
++perf_job_done_at(uint64_t start_us, uint64_t seq, unsigned slot)
+ {
+-	/* lock held, from finish(): perf_start_us is the submit time (sm.busy_start_us is re-armed after a hard stop, review 0145 F1) */
+-	uint64_t d = now_us() - perf_start_us;
++	/* lock held, from finish() or (patch 0240) check_job() for the overlapped job: start_us is the submit time (sm.busy_start_us is re-armed after a hard stop, review 0145 F1) */
++	uint64_t d = now_us() - start_us;
++	unsigned hb = d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6;
++	slot_busy_us[slot & 1] += d;
++	slot_jobs[slot & 1]++;
++	slot_hist[slot & 1][hb]++;
+ 	perf_jobs++;
+ 	perf_busy_us += d;
+ 	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
+@@ -293,9 +302,9 @@ perf_job_done(void)
+ 	__atomic_store_n(&swt_done, perf_last_done_us, __ATOMIC_RELEASE);
+ 	if (d >= PERF_LONG_US) {   /* patch 0210, lock held */
+ 		if (perf_long_n < PERF_LONG_N) {
+-			perf_long[perf_long_n].seq = sm.busy_seq;
++			perf_long[perf_long_n].seq = seq;
+ 			perf_long[perf_long_n].us = d;
+-			perf_long[perf_long_n].t = perf_start_us;
++			perf_long[perf_long_n].t = start_us;
+ 			perf_long_n++;
+ 		} else {
+ 			perf_long_drop++;
+@@ -306,6 +315,12 @@ perf_job_done(void)
+ 	}
+ }
+ 
++static void
++perf_job_done(void)
++{
++	perf_job_done_at(perf_start_us, sm.busy_seq, sm.busy_slot);
++}
++
+ /*
+  * Software job queue, a ring of 1..PEND_MAX parked jobs (patch 0227, T-e395 one slot, T-b1c0 ring; boot-arg sweetmalipend=N, 0 = default OFF = behaviour unchanged). Today
+  * sweet_mali_submit blocks its caller until the previous job is done (strictly one job in flight), so backboardd's GL thread sleeps 5.1-5.9 ms per frame (SWAPT wait_us p50) and cannot
+@@ -318,11 +333,61 @@ perf_job_done(void)
+  */
+ #define PEND_MAX 4
+ static unsigned pend_on;                             /* boot-arg sweetmalipend=N, ring depth (0 off) */
+-static struct { uint64_t jc, seq; unsigned slot; } pend[PEND_MAX];
++static struct { uint64_t jc, seq; unsigned slot, ovl; } pend[PEND_MAX];
+ static unsigned pend_head, pend_n, pend_maxn;      /* oldest slot, parked now, high-water mark */
+ static uint64_t pend_queued, pend_started, pend_dropped;
+ static int sm_start_locked(uint64_t jc, unsigned slot, uint64_t seq);
+ 
++/*
++ * Overlap of tiler(N+1) with FS(N) (patch 0240, T-34eb, G-F55; boot-arg sweetmaliovl=1, DEFAULT OFF = behaviour unchanged, the OVL bit is then ignored and counted).
++ * Mesa (patch 0008, SWEETGL_OVERLAP=1, on top of SWEETGL_SPLITHEAP=1) sets SWEET_MALI_REQ_OVL on a vertex/tiler/compute chain only when its batch touches nothing the fragment
++ * job submitted just before it may write or read, and uses the other tiler heap half (rule R0-R4, docs/reviews/T-34eb-proof.md). This file only decides WHEN (rule K1-K4):
++ *  K1 a flagged JS1 job J starts while exactly one job F runs only if F is on JS0, J.seq == F.seq + 1, no stop or fault is in progress, nothing is parked ahead of J, and JS1 is
++ *     clean (COMMAND_NEXT 0, JS1 bits of JOB_RAW clear, MMU_RAW 0); the register writes are those of sm_start_locked() on slot 1.
++ *  K2 every other job starts only on an idle GPU, as before: at most two jobs in flight, at most one per slot, FS(N+1) after tiler(N+1) AND FS(N).
++ *  K3 completion stays an in-order watermark: J done first leaves seq_done at F.seq - 1 until F completes; F done first sets seq_done = F.seq and J becomes the busy job.
++ *  K4 an MMU fault or a job that does not stop hard-stops both slots and ends in the existing soft reset; both jobs and every parked job are reported failed. A plain failure of
++ *     either job marks that job failed and drops the ring behind them (patch 0227 rule).
++ * State: ov holds J while F is the busy job (sm.busy_*); there is never an ov without a busy F on JS0.
++ */
++static unsigned ovl_on;                              /* boot-arg sweetmaliovl=1 */
++static struct { int on, done, failed, stopped; uint64_t seq, t0, start_us; } ov;   /* t0: start stamp for perf, start_us: timeout clock (re-armed by a hard stop) */
++static uint64_t ovl_started, ovl_ring_started, ovl_refused, ovl_ignored, ovl_jfirst, ovl_ffirst, ovl_hidden_us, ovl_drop_next;
++
++/* lock held: the overlap check of K1 for a job about to get seqno sm.seq_next + 1 from the submit path (nothing parked) */
++static int
++sm_ov_ok(void)
++{
++	return ovl_on && sm.busy && !sm.dead && sm.busy_slot == 0 && !ov.on && pend_n == 0 && sm.busy_seq == sm.seq_next && !sm.stopped && !sm.faulted;
++}
++
++/* lock held, sm_ov_ok() or the ring variant in finish() held: start J on JS1 beside the busy JS0 job. 0 started, EBUSY JS1 not clean (nothing written). */
++static int
++sm_start_ov_locked(uint64_t jc, uint64_t seq)
++{
++	uint32_t raw = rr(R_JOB_RAW), mmu = rr(R_MMU_RAW), next = rr(R_JS_BASE(1) + JS_COMMAND_NEXT);
++
++	if (next != 0 || (raw & 0x20002u) != 0 || mmu != 0) {
++		printf("SWEET MALI GAP: overlap start refused seq=%llu, JS1 not clean (CMD_NEXT=%#x JOB_RAW=%#x MMU_RAW=%#x), job waits for the idle GPU\n", seq, next, raw, mmu);
++		ovl_refused++;
++		return EBUSY;
++	}
++	ov.on = 1;
++	ov.done = 0;
++	ov.failed = 0;
++	ov.stopped = 0;
++	ov.seq = seq;
++	ov.t0 = ov.start_us = now_us();
++	wr(R_JS_BASE(1) + JS_HEAD_NEXT, (uint32_t)jc);
++	wr(R_JS_BASE(1) + JS_HEAD_NEXT + 4, (uint32_t)(jc >> 32));
++	wr(R_JS_BASE(1) + JS_AFFINITY_NEXT, SHADERS);
++	wr(R_JS_BASE(1) + JS_AFFINITY_NEXT + 4, 0);
++	wr(R_JS_BASE(1) + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr(R_JS_BASE(1) + JS_COMMAND_NEXT, JS_CMD_START);
++	ovl_started++;
++	return 0;
++}
++
+ static void
+ finish(int failed)
+ {
+@@ -339,10 +404,45 @@ finish(int failed)
+ 			sm.dead = 1;
+ 		}
+ 	}
+-	sm.seq_done = sm.busy_seq;
++	uint64_t done_to = sm.busy_seq;
++	int ovbad = 0;
++	if (ov.on) {   /* patch 0240: F (the busy JS0 job) ended while J was in flight beside it */
++		if ((sm.faulted || sm.dead) && !ov.done) {
++			/* K4: the reset (or the dead device) took the JS1 job with it */
++			printf("SWEET MALI: overlapped job seq=%llu killed by the reset after seq=%llu, reported failed\n", ov.seq, sm.busy_seq);
++			ov.done = 1;
++			ov.failed = 1;
++		}
++		if (ov.done) {
++			/* K3: J finished first (or was killed): both are complete now */
++			if (ov.failed) {
++				sm.fail_seq[ov.seq % 32] = ov.seq;
++				ovbad = 1;
++			}
++			done_to = ov.seq;
++			ov.on = 0;
++		} else {
++			/* K3: F finished first: seq_done = F.seq, J becomes the busy job; the ring waits for J (K2) */
++			ovl_ffirst++;
++			ovl_hidden_us += now_us() - ov.t0;
++			if (failed) {
++				ovl_drop_next = 1;   /* patch 0227 rule: nothing parked behind a failed job runs; applied when J ends */
++			}
++			sm.seq_done = sm.busy_seq;
++			sm.busy_seq = ov.seq;
++			sm.busy_slot = 1;
++			sm.busy_start_us = ov.start_us;
++			sm.stopped = ov.stopped;
++			perf_start_us = ov.t0;
++			ov.on = 0;
++			thread_wakeup((event_t)&sm.seq_done);
++			return;
++		}
++	}
++	sm.seq_done = done_to;
+ 	sm.busy = 0;
+ 	if (pend_n != 0) {   /* patch 0227 */
+-		int bad = failed || sm.faulted || sm.dead;
++		int bad = failed || sm.faulted || sm.dead || ovbad || ovl_drop_next;
+ 		while (pend_n != 0) {
+ 			uint64_t pseq = pend[pend_head].seq;
+ 			unsigned pslot = pend[pend_head].slot;
+@@ -351,6 +451,14 @@ finish(int failed)
+ 			pend_n--;
+ 			if (!bad && sm_start_locked(pjc, pslot, pseq) == 0) {
+ 				pend_started++;
++				/* patch 0240 K1, ring variant: the next parked job is a flagged JS1 job right behind the JS0 job just started */
++				if (ovl_on && pslot == 0 && pend_n != 0 && pend[pend_head].ovl && pend[pend_head].slot == 1 && pend[pend_head].seq == pseq + 1 &&
++				    sm_start_ov_locked(pend[pend_head].jc, pend[pend_head].seq) == 0) {
++					pend_head = (pend_head + 1) % PEND_MAX;
++					pend_n--;
++					pend_started++;
++					ovl_ring_started++;
++				}
+ 				break;
+ 			}
+ 			printf("SWEET MALI GAP: queued job seq=%llu dropped (previous seq=%llu failed=%d faulted=%d dead=%d bad=%d; bad=0 means the clean-slot check refused it), reported failed\n", pseq,
+@@ -361,6 +469,7 @@ finish(int failed)
+ 			bad = 1;   /* every parked job behind a dropped job is dropped too, in order */
+ 		}
+ 	}
++	ovl_drop_next = 0;
+ 	thread_wakeup((event_t)&sm.seq_done);
+ }
+ 
+@@ -381,6 +490,37 @@ check_job(void)
+ 			sm.stopped = 1;
+ 			sm.busy_start_us = now_us();      /* the stop grace period starts now (review M4) */
+ 		}
++		if (ov.on && !ov.done && !ov.stopped) {   /* patch 0240 K4: one AS for both slots, so stop the overlapped job too */
++			printf("SWEET MALI: MMU fault with overlapped job seq=%llu on JS1, hard stop\n", ov.seq);
++			wr(R_JS_BASE(1) + JS_COMMAND, JS_CMD_HARD_STOP1);
++			ov.stopped = 1;
++			ov.start_us = now_us();
++		}
++	}
++	if (ov.on && !ov.done) {   /* patch 0240: the overlapped JS1 job (F is on JS0, so bit/fbit above are JS0's) */
++		uint64_t oel = now_us() - ov.start_us;
++		if (raw & 0x20002u) {
++			uint32_t st = rr(R_JS_BASE(1) + JS_STATUS);
++			wr(R_JOB_CLEAR, raw & 0x20002u);
++			ov.done = 1;
++			ov.failed = (raw & 0x20000u) != 0 || sm.faulted;   /* K4: done in the same poll as an MMU fault (one AS) counts as failed, T-06ad harness S14 */
++			if (ov.failed) {
++				printf("SWEET MALI: job seq=%llu slot=1 (overlapped) failed JS_STATUS=%#x\n", ov.seq, st);
++			}
++			perf_job_done_at(ov.t0, ov.seq, 1);
++			ovl_hidden_us += now_us() - ov.t0;
++			ovl_jfirst++;
++		} else if (!ov.stopped && oel > JOB_TIMEOUT_US) {
++			printf("SWEET MALI: job seq=%llu slot=1 (overlapped) timed out after %llu us, hard stop\n", ov.seq, oel);
++			wr(R_JS_BASE(1) + JS_COMMAND, JS_CMD_HARD_STOP1);
++			ov.stopped = 1;
++			ov.start_us = now_us();
++		} else if (ov.stopped && oel > STOP_GRACE_US) {
++			printf("SWEET MALI: overlapped job seq=%llu did not stop, resetting the GPU (job seq=%llu on JS0 is reported failed too)\n", ov.seq, sm.busy_seq);
++			sm.faulted = 1;                 /* finish() resets; K4 */
++			finish(1);
++			return;
++		}
+ 	}
+ 	if (raw & (bit | fbit)) {
+ 		uint32_t st = rr(R_JS_BASE(sm.busy_slot) + JS_STATUS);
+@@ -646,6 +786,12 @@ sm_perf_tick(void)
+ 	ho_n = ho_sum = ho_max = ho_far = 0;
+ 	uint64_t pq = pend_queued, ps = pend_started, pd = pend_dropped;   /* patch 0227, cumulative */
+ 	unsigned pon = pend_on, pmx = pend_maxn;
++	uint64_t ost = ovl_started, ors = ovl_ring_started, orf = ovl_refused, oig = ovl_ignored, ojf = ovl_jfirst, off = ovl_ffirst, ohid = ovl_hidden_us;   /* patch 0240, cumulative */
++	uint64_t sb[2] = { slot_busy_us[0], slot_busy_us[1] }, sj[2] = { slot_jobs[0], slot_jobs[1] }, sh[2][7];   /* patch 0240, this second */
++	memcpy(sh, slot_hist, sizeof(sh));
++	bzero(slot_hist, sizeof(slot_hist));
++	slot_busy_us[0] = slot_busy_us[1] = slot_jobs[0] = slot_jobs[1] = 0;
++	unsigned oon = ovl_on;
+ 	lck_mtx_unlock(&sm_lock);
+ 	if (jobs != 0) {
+ 		printf("SWEET PERF: jobfine b50 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7:%llu 8:%llu 9:%llu 10:%llu 11:%llu 12:%llu 13:%llu 14:%llu 15:%llu 16:%llu 17:%llu 18:%llu 19:%llu ge1000:%llu\n",
+@@ -655,6 +801,10 @@ sm_perf_tick(void)
+ 		if (pon) {
+ 			printf("SWEET PERF: pend queued %llu started %llu dropped %llu depth %u maxparked %u\n", pq, ps, pd, pon, pmx);
+ 		}
++		/* patch 0240: started = direct + ring (ring_started of them), jfirst/ffirst = which of the pair ended first, hidden_ms = JS1 time spent beside a JS0 job */
++		printf("SWEET PERF: ovl on %u started %llu ring_started %llu refused %llu ignored %llu jfirst %llu ffirst %llu hidden_ms %llu\n", oon, ost, ors, orf, oig, ojf, off, ohid / 1000);
++		printf("SWEET PERF: slothist js0 jobs %llu busy_us %llu h %llu:%llu:%llu:%llu:%llu:%llu:%llu js1 jobs %llu busy_us %llu h %llu:%llu:%llu:%llu:%llu:%llu:%llu\n", sj[0], sb[0],
++		    sh[0][0], sh[0][1], sh[0][2], sh[0][3], sh[0][4], sh[0][5], sh[0][6], sj[1], sb[1], sh[1][0], sh[1][1], sh[1][2], sh[1][3], sh[1][4], sh[1][5], sh[1][6]);
+ 	}
+ 	for (unsigned i = 0; i < ljn; i++) {
+ 		printf("SWEET PERF: longjob seq %llu us %llu t %llu\n", lj[i].seq, lj[i].us, lj[i].t);
+@@ -762,6 +912,16 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 			printf("SWEET MALI GAP: sweetmalipend=%u is not 0..%d, ignored, the submit queue stays off\n", pv, PEND_MAX);
+ 		}
+ 	}
++	if (PE_parse_boot_argn("sweetmaliovl", &pv, sizeof(pv))) {   /* patch 0240 */
++		if (pv <= 1) {
++			lck_mtx_lock(&sm_lock);
++			ovl_on = pv;
++			lck_mtx_unlock(&sm_lock);
++			printf("SWEET MALI: overlap %s (sweetmaliovl): a Mesa-flagged JS1 job %s beside the JS0 job submitted just before it\n", pv ? "ON" : "off", pv ? "may run" : "never runs");
++		} else {
++			printf("SWEET MALI GAP: sweetmaliovl=%u is not 0 or 1, ignored, overlap stays off\n", pv);
++		}
++	}
+ 	for (;;) {
+ 		uint64_t dl;
+ 		lck_mtx_lock(&sm_lock);
+@@ -1166,7 +1326,7 @@ sm_start_locked(uint64_t jc, unsigned slot, uint64_t seq)
+ static int
+ sm_can_queue(void)
+ {
+-	return pend_on && sm.busy && !sm.dead && pend_n < pend_on && !sm.stopped && !sm.faulted;
++	return pend_on && sm.busy && !sm.dead && pend_n < pend_on && !sm.stopped && !sm.faulted && !(ov.on && ov.stopped);
+ }
+ 
+ /* Submit one job chain (jc = GPU VA of the first job descriptor). req: SWEET_MALI_REQ_FS runs it on JS0, otherwise JS1 (research 31 s.2: fragment on JS0, the rest
+@@ -1182,6 +1342,8 @@ int
+ sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali_submit_tm *tm)
+ {
+ 	unsigned slot = (req & SWEET_MALI_REQ_FS) ? 0u : 1u;
++	unsigned want_ov = (req & SWEET_MALI_REQ_OVL) && slot == 1;   /* patch 0240: an OVL bit on a JS0 job is meaningless and counted as ignored below */
++	int try_ov;
+ 	uint64_t t0 = now_us();
+ 	int tmon = tm != NULL && tm->on;                       /* patch 0197: log-only stamps, see tm_ticks() */
+ 	uint64_t s_ent = 0, s_lk = 0, s_lp = 0, s_cmd = 0, s_wk = 0, c_lk = 0, c_lp = 0, n_sleep = 0, was_busy = 0;
+@@ -1196,12 +1358,19 @@ sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sm_lock);
++	if ((req & SWEET_MALI_REQ_OVL) && (!ovl_on || !want_ov)) {
++		if (ovl_ignored++ == 0) {   /* R8: never silent; the count is in SWEET PERF: ovl */
++			printf("SWEET MALI GAP: OVL submit bit ignored (sweetmaliovl=%u, slot=%u), job runs serially; counted as ignored\n", ovl_on, slot);
++		}
++	}
++	try_ov = ovl_on && want_ov;
+ 	if (tmon) {
+ 		s_lk = tm_ticks();
+ 		c_lk = thread_get_runtime_self();
+ 		was_busy = sm.busy && !sm.dead;
+ 	}
+-	while (sm.busy && !sm.dead && !sm_can_queue()) {   /* patch 0227: with sweetmalipend a submit stops waiting once it can park its job */
++retry:
++	while (sm.busy && !sm.dead && !sm_can_queue() && !(try_ov && sm_ov_ok())) {   /* patch 0227: with sweetmalipend a submit stops waiting once it can park its job; 0240: or start beside F */
+ 		uint64_t dl;
+ 		if (now_us() - t0 > 2 * JOB_TIMEOUT_US) {
+ 			lck_mtx_unlock(&sm_lock);
+@@ -1225,10 +1394,19 @@ sweet_mali_submit_tm(uint64_t jc, uint32_t req, uint64_t *seq, struct sweet_mali
+ 		lck_mtx_unlock(&sm_lock);
+ 		return ENXIO;
+ 	}
+-	if (sm.busy) {   /* patch 0227: only reachable when sm_can_queue() held at the loop exit */
++	if (sm.busy && try_ov && sm_ov_ok()) {   /* patch 0240 K1 */
++		if (sm_start_ov_locked(jc, sm.seq_next + 1) != 0) {
++			try_ov = 0;   /* JS1 not clean (logged): wait or park like any job */
++			goto retry;
++		}
++		sm.seq_next++;
++		*seq = sm.seq_next;
++		thread_wakeup((event_t)&sm.thread);
++	} else if (sm.busy) {   /* patch 0227: only reachable when sm_can_queue() held at the loop exit */
+ 		unsigned t = (pend_head + pend_n) % PEND_MAX;
+ 		pend[t].jc = jc;
+ 		pend[t].slot = slot;
++		pend[t].ovl = (unsigned)try_ov;
+ 		pend[t].seq = ++sm.seq_next;
+ 		pend_n++;
+ 		if (pend_n > pend_maxn) {
+diff --git a/bsd/dev/sweet_mali.h b/bsd/dev/sweet_mali.h
+index 90abb79..9192922 100644
+--- a/bsd/dev/sweet_mali.h
++++ b/bsd/dev/sweet_mali.h
+@@ -5,6 +5,7 @@
+ 
+ #define SWEET_MALI_EXEC    1u            /* map: the GPU may execute (shader code) */
+ #define SWEET_MALI_REQ_FS  1u            /* submit: fragment job chain, runs on JS0 */
++#define SWEET_MALI_REQ_OVL 2u            /* submit (patch 0240, boot-arg sweetmaliovl=1): a JS1 chain that Mesa proved free of hazards against the JS0 job submitted just before it; may run beside it */
+ 
+ struct sweet_mali_info {
+ 	uint32_t gpu_id, l2_features, tiler_features, mem_features, mmu_features, as_present, js_present;
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index 4b6f78e..13e1803 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -6,6 +6,7 @@
+  *                The BO is wired kernel memory, mapped into the GPU address space; the CPU side is mapped with IOConnectMapMemory64(handle) (use kIOMapWriteCombineCache).
+  *   2 boClose    in: handle
+  *   3 submit     in: job chain GPU VA, requirements (1 = fragment, JS0)   out: seqno. The VA must lie inside a BO of this client.
++ *                (patch 0240: requirement bit 2 = OVL, see sweet_mali.h; any other bit is dropped as before)
+  *   4 wait       in: seqno, relative timeout in microseconds
+  *   5 importSurface in: IOSurface id   out: handle, GPU VA, size, bytesPerRow, width, height, pixelFormat. The surface's wired memory is mapped into the GPU VA window like a BO
+  *                (its length must be a multiple of the 16 KB page size and page aligned, else kIOReturnUnsupported). CPU caches are cleaned+invalidated at import.
+@@ -470,7 +471,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 				ret = kIOReturnNotPermitted;
+ 			} else {
+ 				SM_UC_LOG("SWEET MALI: uc submit va=%#llx\n", args->scalarInput[0]);
+-				ret = errno_to_ioreturn(sweet_mali_submit_tm(args->scalarInput[0], (uint32_t)args->scalarInput[1] & SWEET_MALI_REQ_FS, &seq, &tm));
++				ret = errno_to_ioreturn(sweet_mali_submit_tm(args->scalarInput[0], (uint32_t)args->scalarInput[1] & (SWEET_MALI_REQ_FS | SWEET_MALI_REQ_OVL), &seq, &tm));
+ 				if (ret != 0) { SM_UC_ERR("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); } else { SM_UC_LOG("SWEET MALI: uc submit -> %#x seq=%llu\n", ret, seq); }
+ 				if (ret == kIOReturnSuccess) {
+ 					fLastSeq = seq;

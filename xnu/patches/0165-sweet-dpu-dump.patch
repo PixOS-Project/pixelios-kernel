@@ -1,0 +1,167 @@
+SWEET DPU register dump (patch 0165, boot-arg sweetdpudump=MASK, default 0 = off; research 79, review docs/reviews/0165-sweet-dpu-dump.md): READ-ONLY, one shot at the 30th AppleCLCD::present(). Reads PMU DPU_STATUS (0x17462204) AND DISP_STATUS (0x17462284) first (pure gate sweet_dpu_gate, host test tools/test_dpu_gate.py) and reads nothing else unless both bit 0 are set; one mask bit per run (lowest kept, rest a SWEET GAP); per block a 'reading X' line + IOSleep(500) before the read so a hang names its block; MASK 1 DECON0 (GLOBAL_CON video/command bit 8), 2 WINCON word0 x6, 4 RDMA L0-L5 (also logs the CMU_DISP / CMU_DPU clock words raw before the block, flexpmu_local_full.h:688,710,732,766,771,777); bits 8/16/32 loud SWEET GAP not implemented.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -449,6 +449,138 @@
+ static uint64_t sweet_fb_swap_count;
+ 
+ /*
++ * DPU register dump (patch 0165, boot-arg sweetdpudump=MASK, default 0 = off; docs/research/79, research 78 item "DPU read-only dump").
++ * READ ONLY. One-shot, at the 30th present() (the display is on and scanning). Before ANY DPU block is read, PMU DPU_STATUS
++ * (0x17462204) and DISP_STATUS (0x17462284), bit 0 = domain on, are read and logged; DECON0/WINCON live in pd_disp, DPU_DMA in pd_dpu, a child of
++ * pd_disp (review 0165 finding 1); if either is clear NOTHING else is read (sweet_dpu_gate(), "SWEET GAP: DPU/DISP off, dump skipped").
++ * Every block is announced with a "reading X" line and followed by IOSleep(500) (the USB log copies the console ring every 100 ms), so a hang
++ * shows which block caused it. ONE mask bit per run is enforced (the lowest block bit is kept, the rest is a SWEET GAP); first run: mask 1.
++ * The CMU_DISP (and for mask 4 CMU_DPU) clock words are logged raw before the block (review finding 7); masks 2/4 run only after mask 1 was seen. MASK bits: 1 DECON0 (GLOBAL_CON 0x20, TRIG_CON 0x30, SHD_REG_UP_REQ 0x50, shadows
++ * 0x820/0x830; GLOBAL_CON bit 8 = command(1)/video(0) mode), 2 WINCON window 0..5 word 0 (0x1C330000 + 0x1000*w), 4 DPU DMA RDMA L0-L5
++ * (0x1C0B0000 + 0x1000*n: +0x0 bit 2 = busy, +0x8 IN_CTRL_0, +0x10 SRC_SIZE, +0x14 SRC_OFFSET, +0x18 IMG_SIZE, +0x40 BASEADDR_Y8, shadow +0x440).
++ * Bits 8 (SysMMU), 16 (SysMMU VM), 32 (S2MPU CTRL0) are NOT implemented: "SWEET GAP: dpudump mask bit N not implemented".
++ * Offsets/bases: Google display 3373c1b8 regs-decon.h / regs-dpp.h and gs101-drm-dpu.dtsi, flexpmu_local_full.h:681-683 (research 79 sec. 1-3).
++ * Nothing is written, no register of any other block is touched.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private (patch 0102 uses it the same way) */
++
++static volatile uint32_t *
++sweet_dpu_map(uint64_t pa, uint64_t len)
++{
++	const uint64_t page = 0x4000;
++	uint64_t base = pa & ~(page - 1), end = (pa + len + page - 1) & ~(page - 1);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++
++	if (va == 0) {
++		IOLog("SWEET GAP: dpudump ml_io_map(%#llx) failed, block skipped\n", pa);
++		return NULL;
++	}
++	return (volatile uint32_t *)(va + (vm_offset_t)(pa - base));
++}
++
++/* SWEET_DPU_GATE_BEGIN (extracted by tools/test_dpu_gate.py): which blocks may be read. Pure function of the two PMU words and the mask. */
++static uint32_t
++sweet_dpu_gate(uint32_t dpu_status, uint32_t disp_status, uint32_t mask)
++{
++	uint32_t m = mask & 7u;
++
++	if (!(dpu_status & 1u) || !(disp_status & 1u)) {
++		return 0;
++	}
++	if (m & (m - 1u)) {
++		m &= (0u - m);   /* one block bit per run: keep the lowest */
++	}
++	return m;
++}
++/* SWEET_DPU_GATE_END */
++
++/*
++ * Clock / Q-channel words (review 0165 finding 7), log-only, raw, never used as a gate (their bit meanings are not in any source we hold, rule 7).
++ * The PMU firmware itself reads these under the same STATUS bit: flexpmu_local_full.h:688,710,732 (CMU_DPU 0x1C000000: +0x600
++ * PLL_CON0_MUX_CLKCMU_DPU_BUS_USER, +0x7010 DBG_NFO_QCH_CON_DPUF_QCH_DPU_DMA, +0x3010 QCH_CON_DPUF_QCH_DPU_DMA; gate DPU_STATUS 0x2204 bit 0) and
++ * :766,771,777 (CMU_DISP 0x1C200000: +0x600 PLL_CON0_MUX_CLKCMU_DISP_BUS_USER, +0x7008 DBG_NFO_QCH_CON_DPUB_QCH, +0x3008 QCH_CON_DPUB_QCH; gate DISP_STATUS 0x2284 bit 0).
++ */
++static void
++sweet_dpu_clk(const char *name, uint64_t base, uint32_t o0, uint32_t o1, uint32_t o2)
++{
++	IOLog("SWEET DPU: reading %s %#llx words +%#x +%#x +%#x\n", name, base, o0, o1, o2);
++	IOSleep(500);
++	volatile uint32_t *c = sweet_dpu_map(base, 0x8000);
++	if (c != NULL) {
++		/* one line per word: a stall on the 2nd/3rd read still leaves the earlier words in the log (r3 review F2) */
++		IOLog("SWEET DPU: %s +%#x = %#x\n", name, o0, c[o0 / 4]);
++		IOLog("SWEET DPU: %s +%#x = %#x\n", name, o1, c[o1 / 4]);
++		IOLog("SWEET DPU: %s +%#x = %#x\n", name, o2, c[o2 / 4]);
++	}
++}
++
++static void
++sweet_dpu_dump(uint32_t mask)
++{
++	IOLog("SWEET DPU: dump start, mask %#x\n", mask);
++	if (mask & ~7u) {
++		IOLog("SWEET GAP: dpudump mask bits %#x not implemented (8 SysMMU, 16 SysMMU VM, 32 S2MPU)\n", mask & ~7u);
++	}
++	volatile uint32_t *pmu = sweet_dpu_map(0x17462200ull, 0x100);
++	if (pmu == NULL) {
++		IOLog("SWEET GAP: dpudump PMU not mapped, dump skipped\n");
++		return;
++	}
++	uint32_t st = pmu[0x4 / 4], ds = pmu[0x84 / 4];
++	IOLog("SWEET DPU: DPU_STATUS (0x17462204) = %#x DISP_STATUS (0x17462284) = %#x\n", st, ds);
++	uint32_t m = sweet_dpu_gate(st, ds, mask);
++	if (m == 0) {
++		IOLog("SWEET GAP: DPU/DISP off (DPU_STATUS %#x DISP_STATUS %#x), dump skipped\n", st, ds);
++		return;
++	}
++	if ((mask & 7u) != m) {
++		IOLog("SWEET GAP: dpudump mask %#x has more than one block bit, only bit %#x read\n", mask & 7u, m);
++	}
++	mask = m;
++	/* clock words first, so a stall in the register block that follows still leaves the clock state in the log */
++	sweet_dpu_clk("CMU_DISP", 0x1C200000ull, 0x600, 0x3008, 0x7008);
++	if (mask & 4u) {
++		sweet_dpu_clk("CMU_DPU", 0x1C000000ull, 0x600, 0x3010, 0x7010);
++	}
++	if (mask & 1u) {
++		IOLog("SWEET DPU: reading DECON0 0x1C300000\n");
++		IOSleep(500);
++		volatile uint32_t *d = sweet_dpu_map(0x1C300000ull, 0x1000);
++		if (d != NULL) {
++			uint32_t gc = d[0x20 / 4], tc = d[0x30 / 4], su = d[0x50 / 4];
++			uint32_t gcs = d[0x820 / 4], tcs = d[0x830 / 4];
++			IOLog("SWEET DPU: DECON GLOBAL_CON %#x (%s mode) TRIG_CON %#x SHD_REG_UP_REQ %#x shadow GLOBAL_CON %#x shadow TRIG_CON %#x\n",
++			    gc, (gc & 0x100u) ? "command" : "video", tc, su, gcs, tcs);
++		}
++	}
++	if (mask & 2u) {
++		IOLog("SWEET DPU: reading WINCON 0x1C330000\n");
++		IOSleep(500);
++		volatile uint32_t *w = sweet_dpu_map(0x1C330000ull, 0x6000);
++		if (w != NULL) {
++			for (uint32_t i = 0; i < 6; i++) {
++				uint32_t v = w[(0x1000u * i) / 4];
++				IOLog("SWEET DPU: WINCON[%u] word0 %#x (en %u chmap %u)\n", i, v, v & 1u, (v >> 4) & 7u);
++			}
++		}
++	}
++	if (mask & 4u) {
++		volatile uint32_t *rb = sweet_dpu_map(0x1C0B0000ull, 0x6000);   /* one map for L0-L5 (review finding 9) */
++		for (uint32_t i = 0; rb != NULL && i < 6; i++) {
++			IOLog("SWEET DPU: reading RDMA L%u %#llx\n", i, 0x1C0B0000ull + 0x1000ull * i);
++			IOSleep(500);
++			volatile uint32_t *r = rb + (0x1000u * i) / 4;
++			{
++				uint32_t en = r[0], ic = r[0x8 / 4], sz = r[0x10 / 4], off = r[0x14 / 4], img = r[0x18 / 4], ba = r[0x40 / 4], bas = r[0x440 / 4];
++				IOLog("SWEET DPU: RDMA L%u en %#x (busy %u) IN_CTRL_0 %#x SRC_SIZE %ux%u (W x H) SRC_OFFSET %#x IMG_SIZE %#x BASEADDR_Y8 %#x shadow %#x\n",
++				    i, en, (en >> 2) & 1u, ic, sz & 0xFFFFu, sz >> 16, off, img, ba, bas);
++			}
++		}
++	}
++	IOLog("SWEET DPU: dump done, mask %#x\n", mask);
++}
++
++/*
+  * Touch-to-glass latency probe (patch 0153, boot-arg sweetlat=1, default off; G-10 / research 60): for every finger-down (host time
+  * sweet_touch_down_ns from patch 0152's touch path, real or synthetic) log how long until (1) the first swap whose layer-0 content differs
+  * from the last swap before the touch and (2) the panel copy that shows it (AppleCLCD::present, <= 10 Hz by default):
+@@ -642,6 +774,24 @@
+ 	if (ct_on) {
+ 		ct_t0 = mach_absolute_time();
+ 	}
++	{
++		static int dd_mask = -1;
++		static uint32_t dd_calls;
++		if (dd_mask < 0) {
++			int v = 0;
++			dd_mask = (PE_parse_boot_argn("sweetdpudump", &v, sizeof(v)) && v > 0) ? v : 0;
++			IOLog("SWEET DPU: sweetdpudump %s\n", dd_mask ? "armed: one read-only dump at the 30th present (no dump/GAP line later = never reached)" : "off");
++		}
++		if (dd_mask && dd_calls < 31) {
++			dd_calls++;
++			if (dd_calls == 10 || dd_calls == 20) {
++				IOLog("SWEET DPU: present %u of 30 before the dump\n", dd_calls);
++			}
++			if (dd_calls == 30) {
++				sweet_dpu_dump((uint32_t)dd_mask);
++			}
++		}
++	}
+ 
+ 
+ 	if (!fConsolePaused) {

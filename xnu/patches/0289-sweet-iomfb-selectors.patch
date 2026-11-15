@@ -1,0 +1,125 @@
+SWEET IOMFB selectors (patch 0289, rule 7 sweep, user 2026-11-10): the AppleCLCD IOMobileFramebuffer user client answered every selector it did not implement with success + zeroed outputs. Selector map from IOMobileFramebuffer.framework _kern_* wrappers (research 133 section D). Now: SwapWait success (SwapEnd is synchronous); SetDebugFlags(15) -> previous flags 0; SetDisplayDevice(22) and EnableDisableVideoPowerSavings(33) accepted (one display, no power-saving mode); GetColorRemapMode(57) -> 0; GetDisplayArea(29) -> 62.39 x 135.10 mm as floats; GetMatrix(54) -> Q32.32 identity (zeros would make CA multiply by 0); GetDotPitch(28) -> float bits of 0.05546 mm (was the integer 458, which the framework reads as float bits); GetGammaTable(27), SupportedFrameInfo(74), SetBlock(78), GetBlock(79) and every other unknown selector -> kIOReturnUnsupported with a 'SWEET GAP: FB ... sel N' line (once per selector). No hardware access, log + reply only.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -71,9 +71,19 @@
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
+ 	kSweetFBRequestPowerChange      = 12,
++	kSweetFBSetDebugFlags           = 15,   /* patch 0289: selector map from IOMobileFramebuffer.framework _kern_* wrappers, research 133 section D */
+ 	kSweetFBIsMainDisplay           = 18,
++	kSweetFBSetDisplayDevice        = 22,
++	kSweetFBGetGammaTable           = 27,
+ 	kSweetFBGetDotPitch             = 28,
++	kSweetFBGetDisplayArea          = 29,
++	kSweetFBVideoPowerSavings       = 33,
++	kSweetFBGetMatrix               = 54,
++	kSweetFBGetColorRemapMode       = 57,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBSupportedFrameInfo      = 74,
++	kSweetFBSetBlock                = 78,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -82,6 +92,12 @@
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++/* patch 0289: selector 28 returns a float in the low 32 bits (research 133 D: GetDotPitch scalar = float bits); mm per dot at 458 ppi =
++ * 25.4 / 458 = 0.05546 = 0x3d632878 [computed]. Selector 29 (GetDisplayArea, two floats, mm [guess: unit by analogy]) for the presented
++ * 1125x2436 @ 458 ppi: 62.39 x 135.10 mm = 0x42798f5c, 0x4307199a [computed]; CA stores both and never reads them back (research 133 D). */
++#define SWEET_FB_DOT_PITCH_MM_BITS      0x3d632878u
++#define SWEET_FB_AREA_W_MM_BITS         0x42798f5cu
++#define SWEET_FB_AREA_H_MM_BITS         0x4307199au
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -1305,6 +1321,7 @@
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
++	bool gap = false, structDone = false;
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+@@ -1342,7 +1359,7 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = SWEET_FB_DOT_PITCH_MM_BITS;   /* patch 0289: float bits, was the integer 458 */
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
+@@ -1413,15 +1430,55 @@
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-	case kSweetFBSwapWait:
++	case kSweetFBSwapWait:   /* SwapEnd copies synchronously, so the swap is complete when SwapWait is called: success is the real answer */
++		break;
++	/* patch 0289 (rule 7 sweep): selectors CA/backboardd call that used to fall into "default: success with zeroed outputs" */
++	case kSweetFBSetDebugFlags:       /* in: mask, value; out: previous flags. No debug flags exist here: 0 */
++		outCount = 1;
++		break;
++	case kSweetFBSetDisplayDevice:    /* one display, nothing to select */
++	case kSweetFBVideoPowerSavings:   /* no video power-saving mode: accepted, nothing changes (logged once below) */
++		break;
++	case kSweetFBGetColorRemapMode:   /* no colour remap (accessibility inversion / grey) is applied: mode 0 */
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetDisplayArea:
++		if (args->structureOutputDescriptor != NULL || args->structureOutput == NULL || args->structureOutputSize < 8) {
++			ret = kIOReturnBadArgument;
++			break;
++		} else {
++			uint32_t area[2] = { SWEET_FB_AREA_W_MM_BITS, SWEET_FB_AREA_H_MM_BITS };
++			bzero(args->structureOutput, args->structureOutputSize);
++			memcpy(args->structureOutput, area, sizeof(area));
++			structDone = true;
++		}
++		break;
++	case kSweetFBGetMatrix:           /* Q32.32 3x3, 72 bytes; identity (no colour matrix): research 133 D, zeros would make CA multiply by 0 */
++		if (args->structureOutputDescriptor != NULL || args->structureOutput == NULL || args->structureOutputSize < 72) {
++			ret = kIOReturnBadArgument;
++			break;
++		} else {
++			int64_t m[9] = { 0x100000000LL, 0, 0, 0, 0x100000000LL, 0, 0, 0, 0x100000000LL };
++			bzero(args->structureOutput, args->structureOutputSize);
++			memcpy(args->structureOutput, m, sizeof(m));
++			structDone = true;
++		}
++		break;
++	case kSweetFBGetGammaTable:       /* no gamma table on this panel path (the CPU copy writes pixels unchanged) */
++	case kSweetFBSupportedFrameInfo:
++	case kSweetFBSetBlock:
++	case kSweetFBGetBlock:            /* no display data blocks (gamut etc.): "absent", not "present and zero" */
+ 	default:
++		ret = kIOReturnUnsupported;
++		gap = true;
+ 		break;
+ 	}
+ 
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+ 	}
+-	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++	if (!structDone && args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+@@ -1430,9 +1487,9 @@
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		IOLog("%s: %s sel %u in %u/%u out %u/%u -> 0x%x%s\n", gap ? "SWEET GAP: FB" : "SWEET FB", name, selector,
+ 		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
++		    args->scalarOutputCount, args->structureOutputSize, ret, gap ? " (unsupported selector, patch 0289)" : "");
+ 	}
+ 	return ret;
+ }

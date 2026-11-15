@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""nav-classify: which nav screen does a panel snapshot show (ALL-ON T-31: closed-loop nav, coordinator 2026-11-11 'check the state before every step').
+
+  tools/nav-classify refs OUT.json CAPDIR...      build the reference set from labelled panel captures (snap-NN.raw ring slots of patch 0275/0276)
+  tools/nav-classify classify REFS.json|REFS.bin RAW...    one line per snapshot: `NAV STATE <state>|unknown d=<coarse> band=<title band> file=<raw>`
+  tools/nav-classify eval CAPDIR... [--unknown RAW...]   leave-one-run-out accuracy over labelled captures + rejection of known-unknown screens
+  tools/nav-classify refs-bin OUT.bin CAPDIR... [--as STATE PATH...]...   the same references for the on-phone pixnav (tools/pixnav.c): 'NAVR' u32
+                                                 version 3, u32 n, u32 nstates, nstates x 16 B state names, nstates x f32 coarse ceiling, nstates x (24*52 B
+                                                 cell mask, 4 x f32 band rect), then n x (u32 state, 24*52 B thumbnail, 135*18 B band of the state's rect)
+  tools/nav-classify split-dump FILE DIR     the unknown panels of pixnav -U FILE -> DIR/unk-NN.raw
+  --as STATE PATH...: panels (files, or every *.raw of a directory) that carry no capture label, given a state (lock screen, alert-loc)
+  tools/nav-classify --self-test
+
+Method [obs on host 2026-11-11, 5 capture runs; v3 lane-nav 2026-11-12]: stage 1 = grey 24x52 thumbnail; per state the nearest reference under that
+state's cell mask (GEOM: homeA ignores its widget row, spotlight its suggestions row, alert-loc compares only its box); the states are tried in order
+of that distance and the first within its ceiling whose stage-2 band (centred nav-bar title band x 25-75 %, y 4.5-7.5 %, or the state's own rect)
+is within BAND_MAX wins, else 'unknown' (a pushed Settings page that is not General/About, the Today View). Known states had band <= 2.5, the six
+Wi-Fi/Bluetooth pages of allon-stress1..3 >= 8.9. States come from the capture label (c00..c22, rt-applib) through STATE or from --as; an
+unlisted label is a GAP line, never a guess.
+Panel format: tools/panel2png (32 B live header or 80 B ring slot with a 48 B label, then BGRA rows)."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import glob, json, os, struct, sys
+
+STATE = {"c00": "homeB", "c01": "homeA", "c02": "settings", "c03": "general", "c04": "about", "c05": "about", "c06": "about", "c07": "general",
+         "c08": "settings", "c09": "settings", "c10": "settings", "c11": "homeA", "c12": "clock", "c13": "homeA", "c14": "spotlight",
+         "c15": "homeA", "c20": "applib", "c22": "homeA", "rt-": "applib"}
+BAND_MAX = 5.0
+COARSE_MAX = 40.0   # known screens <= 25.3 over 5 capture runs; farther = no reference screen (pixnav.c COARSE_MAX)
+MAGIC = struct.unpack("<I", b"SPNL")[0]
+MAGICS = (MAGIC, struct.unpack("<I", b"SPNH")[0])   # live readback / half-resolution ring slot [obs fcap captures]
+GW, GH, BW, BH = 24, 52, 135, 18
+BAND = (.25, .045, .75, .075)   # nav-bar title band (x0, y0, x1, y1 as panel fractions)
+# Per-state geometry (refs v3, T-31 lane-nav 2026-11-12). 'ignore': thumbnail cells whose centre lies in these rects do not count (content that
+# changes by itself); 'only': only those cells count (an overlay whose background varies); 'band': the stage-2 rect instead of BAND.
+#  homeA ignore = the widget row [obs]: job 47f9 (resident-065457-b1) camera frames nav-r00-app-home vs nav-r01-app-close: the Smart Stack turned
+#    from Calendar (white) to News 'No Stories' (black) and every later homeA look was 'unknown coarse homeA d 18.3-18.7' (ceiling 6.1) = 30 x
+#    'SWEET GAP: NAV'; the same panel synthesised from t28-A-3-home.raw with the stack painted black gives d 18.3, the Weather widget changed d 10.9
+#    (b457 cluster d 10). Widgets on panel t28-A-3-home: y 8.5-27.5 %.
+#  spotlight ignore = the Siri Suggestions icon row (ref-screens snap-14: y 5-25 %), app suggestions follow usage [read: the row lists recent apps].
+#  alert-loc only/band = the SpringBoard alert 'Turn On Location Services to Allow "Weather" ...' (T-27) [obs allon-stress1 panels allon-bt/allon-wifi:
+#    box x 13-87 %, y 41-60 %, title text y 43-53 %); the dimmed page behind it varies, the box does not.
+GEOM = {"homeA": {"ignore": [(0.0, .07, 1.0, .30)]},
+        "spotlight": {"ignore": [(0.0, .05, 1.0, .25)]},
+        "alert-loc": {"only": [(.13, .415, .87, .595)], "band": (.17, .43, .83, .53)}}
+
+
+def read_panel(path):
+    """(label or None, PIL grey image) of one panel readback."""
+    from PIL import Image
+    d = open(path, "rb").read()
+    mg, w, h = struct.unpack_from("<3I", d, 0)
+    hdr = len(d) - w * h * 4
+    if mg not in MAGICS or hdr not in (32, 80):
+        raise ValueError("%s: not a panel readback (magic 0x%08x, header %d B)" % (path, mg, hdr))
+    lab = d[32:80].split(b"\0")[0].decode("ascii", "replace") if hdr == 80 else None
+    return lab, Image.frombuffer("RGBA", (w, h), d[hdr:], "raw", "BGRA", 0, 1).convert("L")
+
+
+def f32(v):
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+def band_rect(state):
+    """the state's stage-2 rect, rounded through f32 as stored in refs v3 (pixnav.c crops with int(w * (double)f32): same pixels)"""
+    return tuple(f32(v) for v in GEOM.get(state, {}).get("band", BAND))
+
+
+def band_of(im, rect):
+    from PIL import Image
+    w, h = im.size
+    return list(im.crop((int(w * rect[0]), int(h * rect[1]), int(w * rect[2]), int(h * rect[3]))).resize((BW, BH), Image.BOX).tobytes())
+
+
+def mask_of(state):
+    """1248 bytes, 1 = the cell counts (cell centre ((cx + .5) / GW, (cy + .5) / GH) against the state's ignore / only rects)."""
+    g = GEOM.get(state, {})
+    out = []
+    for cy in range(GH):
+        for cx in range(GW):
+            x, y = (cx + .5) / GW, (cy + .5) / GH
+            inside = lambda rs: any(r[0] <= x < r[2] and r[1] <= y < r[3] for r in rs)
+            if "only" in g:
+                out.append(1 if inside(g["only"]) else 0)
+            else:
+                out.append(0 if inside(g.get("ignore", [])) else 1)
+    return out
+
+
+class Feat:
+    """thumbnail + the grey image (stage-2 bands are cut per candidate state's rect, cached)"""
+    def __init__(self, im):
+        from PIL import Image
+        self.im = im
+        self.g = list(im.resize((GW, GH), Image.BOX).tobytes())   # box (area mean) resize: the on-phone C port computes the same means
+        self._b = {}
+
+    def band(self, rect):
+        if rect not in self._b:
+            self._b[rect] = band_of(self.im, rect)
+        return self._b[rect]
+
+
+def features(im):
+    return Feat(im)
+
+
+def l1(a, b, m=None):
+    if m is None:
+        return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+    s = n = 0
+    for x, y, k in zip(a, b, m):
+        if k:
+            s += abs(x - y)
+            n += 1
+    return s / n if n else 1e9
+
+
+_MASKS = {}
+
+
+def smask(state):
+    if state not in _MASKS:
+        _MASKS[state] = mask_of(state)
+    return _MASKS[state]
+
+
+def all_rects():
+    return sorted({band_rect(None)} | {band_rect(st) for st in GEOM})
+
+
+def mkref(state, label, run, f):
+    """a reference; 'bands' keeps the panel's band for every rect in use (leave-one-run-out eval classifies references again)"""
+    return {"state": state, "label": label, "run": run, "g": f.g, "band": f.band(band_rect(state)), "bands": {r: f.band(r) for r in all_rects()}}
+
+
+def feat_of_ref(r):
+    fe = Feat.__new__(Feat)
+    fe.im, fe.g, fe._b = None, r["g"], dict(r["bands"])
+    return fe
+
+
+def load_capture(cap):
+    out = []
+    for p in sorted(glob.glob(os.path.join(cap, "snap-*.raw"))):
+        lab, im = read_panel(p)
+        st = STATE.get((lab or "")[:3])
+        if st is None:
+            print("NAV GAP: %s label %r has no state in STATE, skipped" % (p, lab), file=sys.stderr)
+            continue
+        out.append(mkref(st, lab, os.path.basename(cap.rstrip("/")), features(im)))
+    return out
+
+
+def load_as(state, paths):
+    """panels given an explicit state (--as STATE PATH...): a directory adds its *.raw; the run label is the panel's directory name"""
+    out = []
+    for p in paths:
+        files = sorted(glob.glob(os.path.join(p, "*.raw"))) if os.path.isdir(p) else [p]
+        if not files:
+            print("NAV GAP: --as %s %s has no .raw panel" % (state, p), file=sys.stderr)
+        for f in files:
+            lab, im = read_panel(f)
+            out.append(mkref(state, lab or os.path.basename(f), os.path.basename(os.path.dirname(os.path.abspath(f))), features(im)))
+    return out
+
+
+def ceilings(refs):
+    """Per-state coarse ceiling from leave-one-run-out (masked) distances of the references: max(2 x known max, known max + 6). allon-stress6b [obs]:
+    the lock screen (not a reference) sat at 26.6 from homeB, whose known max is 0.0 -> one global ceiling (40) accepted it as homeB."""
+    runs = sorted({r["run"] for r in refs})
+    mx = {}
+    for run in runs:
+        train = [r for r in refs if r["run"] != run]
+        if not train:
+            continue
+        for r in refs:
+            if r["run"] == run:
+                same = [t for t in train if t["state"] == r["state"]]
+                if same:
+                    d = min(l1(r["g"], t["g"], smask(r["state"])) for t in same)
+                    mx[r["state"]] = max(mx.get(r["state"], 0.0), d)
+    out = {}
+    for st in {r["state"] for r in refs}:
+        own = [r for r in refs if r["state"] == st]
+        if st not in mx and len(own) >= 2:   # one run only (alert-loc: the two allon-stress1 panels): leave-one-out inside that run, said loudly
+            mx[st] = max(min(l1(r["g"], t["g"], smask(st)) for t in own if t is not r) for r in own)
+            print("NAV GAP: state %s has references from one run only: ceiling from leave-one-out inside it (max %.2f)" % (st, mx[st]), file=sys.stderr)
+        if st not in mx:
+            print("NAV GAP: state %s has one reference only: ceiling falls back to COARSE_MAX %.0f" % (st, COARSE_MAX), file=sys.stderr)
+            out[st] = COARSE_MAX
+        else:
+            out[st] = min(COARSE_MAX * 2, max(2 * mx[st], mx[st] + 6.0))
+    return out
+
+
+def classify(f, refs, ceil=None):
+    """v3: per state the nearest reference under that state's mask; states in order of that distance (ties by name); the first state within its
+    ceiling whose band (its own rect) is within BAND_MAX wins. -> (state|'unknown', d of the winner or of the nearest state, its band, that state)"""
+    if not isinstance(f, Feat):
+        raise TypeError("classify wants features(im)")
+    best = {}
+    for r in refs:
+        d = l1(f.g, r["g"], smask(r["state"]))
+        if r["state"] not in best or d < best[r["state"]]:
+            best[r["state"]] = d
+    order = sorted(best, key=lambda s: (best[s], s))
+    first = None
+    for st in order:
+        cmax = ceil.get(st, COARSE_MAX) if ceil else COARSE_MAX
+        bd = min(l1(f.band(band_rect(st)), r["band"]) for r in refs if r["state"] == st)
+        if first is None:
+            first = (best[st], bd, st)
+        if best[st] <= cmax and bd <= BAND_MAX:
+            return st, best[st], bd, st
+        if best[st] > COARSE_MAX * 2:
+            break
+    return "unknown", first[0], first[1], first[2]
+
+
+def load_bin(path):
+    """(refs, ceilings) of a refs-bin file (v2: no geometry, as written then; v3: GEOM must match the file's masks and bands)"""
+    d = open(path, "rb").read()
+    if d[:4] != b"NAVR":
+        raise ValueError("%s: not NAVR" % path)
+    v, n, ns = struct.unpack_from("<3I", d, 4)
+    names = [d[16 + 16 * i:32 + 16 * i].split(b"\0")[0].decode() for i in range(ns)]
+    o = 16 + 16 * ns
+    ceil = dict(zip(names, struct.unpack_from("<%df" % ns, d, o)))
+    o += 4 * ns
+    if v == 3:
+        for nm in names:
+            m = list(d[o:o + GW * GH]); o += GW * GH
+            br = struct.unpack_from("<4f", d, o); o += 16
+            if m != smask(nm) or any(abs(a - b) > 1e-6 for a, b in zip(br, band_rect(nm))):
+                raise ValueError("%s: state %s geometry differs from this nav-classify GEOM (rebuild the refs)" % (path, nm))
+    elif v != 2:
+        raise ValueError("%s: version %d" % (path, v))
+    refs = []
+    for _ in range(n):
+        st, = struct.unpack_from("<I", d, o); o += 4
+        g = list(d[o:o + GW * GH]); o += GW * GH
+        b = list(d[o:o + BW * BH]); o += BW * BH
+        refs.append({"state": names[st], "g": g, "band": b, "run": "?", "label": None})
+    return refs, ceil
+
+
+def write_bin(path, refs):
+    names = sorted({r["state"] for r in refs})
+    ceil = ceilings(refs)
+    out = bytearray(b"NAVR" + struct.pack("<3I", 3, len(refs), len(names)))
+    for nm in names:
+        out += nm.encode().ljust(16, b"\0")[:16]
+    for nm in names:
+        out += struct.pack("<f", ceil[nm])
+    for nm in names:
+        out += bytes(smask(nm)) + struct.pack("<4f", *band_rect(nm))
+    for r in refs:
+        out += struct.pack("<I", names.index(r["state"])) + bytes(r["g"]) + bytes(r["band"])
+    open(path, "wb").write(out)
+    return names, ceil, len(out)
+
+
+def evaluate(caps, unknown, extra=()):
+    runs = {c: load_capture(c) for c in caps}
+    for r in extra:
+        runs.setdefault("as:" + r["run"], []).append(r)
+    tot = ok = 0
+    for c, items in runs.items():
+        refs = [r for cc, its in runs.items() if cc != c for r in its]
+        ceil = ceilings(refs) if len(runs) > 2 else None
+        for it in items:
+            if not any(r["state"] == it["state"] for r in refs):
+                continue   # the only run of that state: nothing to leave out against
+            st, d0, bd, cand = classify(feat_of_ref(it), refs, ceil)
+            tot += 1
+            ok += st == it["state"]
+            if st != it["state"]:
+                print("NAV EVAL WRONG %s:%s want %s got %s d=%.1f band=%.1f" % (it["run"], it["label"], it["state"], st, d0, bd))
+    allrefs = [r for its in runs.values() for r in its]
+    aceil = ceilings(allrefs) if len(runs) > 1 else None
+    rej = 0
+    for p in unknown:
+        st, d0, bd, cand = classify(features(read_panel(p)[1]), allrefs, aceil)
+        rej += st == "unknown"
+        print("NAV EVAL UNKNOWN %s -> %s (coarse %s d=%.1f band=%.1f)" % (p, st, cand, d0, bd))
+    good = tot > 0 and ok == tot and rej == len(unknown)
+    print("RESULT: %s nav-classify eval known=%d/%d unknown_rejected=%d/%d" % ("PASS" if good else "FAIL", ok, tot, rej, len(unknown)))
+    return 0 if good else 1
+
+
+def self_test():
+    from PIL import Image, ImageDraw
+    import tempfile
+    W, H = 216, 480
+    def panel(path, label, kind, title):
+        im = Image.new("RGB", (W, H), "white")
+        dr = ImageDraw.Draw(im)
+        if kind == "home":
+            dr.rectangle((0, 0, W, H), fill=(40, 90, 160))
+            for i in range(12):
+                dr.rectangle((20 + (i % 4) * 48, 60 + (i // 4) * 60, 50 + (i % 4) * 48, 90 + (i // 4) * 60), fill=(230, 200, 60))
+        else:
+            for i in range(10):
+                dr.rectangle((10, 60 + i * 40, W - 10, 90 + i * 40), fill=(235, 235, 240))
+            dr.rectangle((W // 2 - title * 6, int(H * .05), W // 2 + title * 6, int(H * .07)), fill=(0, 0, 0))
+        raw = im.convert("RGBA").tobytes("raw", "BGRA")
+        hdr = struct.pack("<8I", MAGIC, W, H, W * 4, 0, 0, 1, 1) + label.encode().ljust(48, b"\0")
+        open(path, "wb").write(hdr + raw)
+    fails = 0
+    with tempfile.TemporaryDirectory() as t:
+        caps = []
+        for r in range(3):
+            c = os.path.join(t, "cap%d" % r)
+            os.mkdir(c)
+            panel(os.path.join(c, "snap-00.raw"), "c01-home-page-prev", "home", 0)
+            panel(os.path.join(c, "snap-01.raw"), "c03-general-open", "list", 3)
+            panel(os.path.join(c, "snap-02.raw"), "c04-about-open", "list", 6)
+            caps.append(c)
+        u = os.path.join(t, "wifi.raw")
+        panel(u, "x", "list", 9)   # same list page, other title: must be 'unknown'
+        rc = evaluate(caps, [u])
+        fails += rc != 0
+        refs = [r for c in caps for r in load_capture(c)]
+        st = classify(features(read_panel(os.path.join(caps[0], "snap-01.raw"))[1]), refs)[0]
+        fails += st != "general"
+        print("%s general page classified %s" % ("ok  " if st == "general" else "FAIL", st))
+    print("RESULT: %s nav-classify self-test failed=%d" % ("PASS" if not fails else "FAIL", fails))
+    return 1 if fails else 0
+
+
+def split_args(a):
+    """CAPDIR... [--as STATE PATH...]... [--unknown RAW...] -> (caps, [(state, paths)], unknown)"""
+    caps, groups, unk, cur = [], [], [], None
+    it = iter(a)
+    for x in it:
+        if x == "--as":
+            st = next(it, None)
+            if not st:
+                raise SystemExit("RESULT: FAIL nav-classify --as needs a STATE")
+            groups.append((st, []))
+            cur = groups[-1][1]
+        elif x == "--unknown":
+            cur = unk
+        else:
+            (cur if cur is not None else caps).append(x)
+    return caps, groups, unk
+
+
+def gather(a):
+    caps, groups, unk = split_args(a)
+    refs = [r for c in caps for r in load_capture(c)]
+    extra = [r for st, ps in groups for r in load_as(st, ps)]
+    return caps, refs, extra, unk
+
+
+def split_dump(path, out):
+    """pixnav -U FILE -> OUT/unk-NN.raw (records 'PNVU', u32 length, panel bytes)"""
+    d = open(path, "rb").read()
+    os.makedirs(out, exist_ok=True)
+    o = n = 0
+    while o + 8 <= len(d):
+        if d[o:o + 4] != b"PNVU":
+            print("NAV GAP: %s: bad record at %d" % (path, o))
+            return 1
+        ln, = struct.unpack_from("<I", d, o + 4)
+        if o + 8 + ln > len(d):
+            print("NAV GAP: %s: record %d cut short" % (path, n))
+            return 1
+        open(os.path.join(out, "unk-%02d.raw" % n), "wb").write(d[o + 8:o + 8 + ln])
+        o += 8 + ln
+        n += 1
+    print("RESULT: PASS nav-classify split-dump %d panel(s) -> %s" % (n, out))
+    return 0
+
+
+def main(a):
+    if a[:2] and a[0] == "split-dump" and len(a) == 3:
+        return split_dump(a[1], a[2])
+    if a[:1] == ["--self-test"]:
+        return self_test()
+    if len(a) >= 3 and a[0] == "refs":
+        caps, refs, extra, _ = gather(a[2:])
+        refs += extra
+        json.dump({"band_max": BAND_MAX, "refs": [{k: v for k, v in r.items() if k != "bands"} for r in refs]}, open(a[1], "w"))
+        print("RESULT: PASS nav-classify refs %d snapshots, states %s -> %s" % (len(refs), sorted({r["state"] for r in refs}), a[1]))
+        return 0 if refs else 1
+    if len(a) >= 3 and a[0] == "refs-bin":
+        caps, refs, extra, _ = gather(a[2:])
+        refs += extra
+        if not refs:
+            print("RESULT: FAIL nav-classify refs-bin: no references")
+            return 1
+        names, ceil, size = write_bin(a[1], refs)
+        print("NAV CEILINGS " + " ".join("%s=%.1f" % (nm, ceil[nm]) for nm in names))
+        print("RESULT: PASS nav-classify refs-bin v3 %d snapshots, %d states %s -> %s (%d B)" % (len(refs), len(names), names, a[1], size))
+        return 0
+    if len(a) >= 3 and a[0] == "classify":
+        if a[1].endswith(".bin"):
+            refs, ceil = load_bin(a[1])
+        else:
+            refs, ceil = json.load(open(a[1]))["refs"], None
+        for p in a[2:]:
+            st, d0, bd, cand = classify(features(read_panel(p)[1]), refs, ceil)
+            print("NAV STATE %s d=%.1f band=%.1f coarse=%s file=%s" % (st, d0, bd, cand, p))
+        return 0
+    if len(a) >= 2 and a[0] == "eval":
+        caps, refs, extra, unk = gather(a[1:])
+        return evaluate(caps, unk, extra)
+    print("RESULT: FAIL nav-classify bad arguments (see --help)")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

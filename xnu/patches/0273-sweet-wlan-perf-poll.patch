@@ -1,0 +1,395 @@
+SWEET WLAN perf (patch 0273, sprint-wifi Part A 2026-11-09): (1) the keep poll thread is event-driven (100 us after a pass that handled items or with frames queued, 5 ms when idle, woken at once by en0_output through EN0_KICK) instead of a fixed 5 ms delay_for_interval; its alive line prints every 10 s with the rx/tx drop, tx-queue and batch counters; (2) data-path GAP lines (SWDP_GAP) print the 1st, 2nd, 4th ... occurrence of each text with its count (all counted, every one in the gap summary) instead of one printf per dropped frame; (3) the block accessors of struct swg_bus (sweet_wlan_g2.h rd_blk / wr_blk), used only by DP15 item/payload words in quiet (keep) mode: one cache pass per range instead of one per word; the batched store keeps every per-word check (engine: row kinds, old words vs shadows, read-back; glue: G2 + live L25 judge, link check before AND after the batch, swl25w_ok_blk = the per-word verdict for every word, swl25w_done per word). (4) every 5 s the keep thread reads the firmware RSSI (the read-only, judged WLC_GET_RSSI of swl25_live) and hands it to the kept Apple80211 link (sweet_wlan_a80211_kept_rssi, outside the en0 lock); review perf-c F1: the refresh runs only with ring 2 idle, never starts a DS round, and a soft stop inside it turns the refresh off with a GAP instead of ending the data path (a hard stop still ends it). (5) read-only timing counters (poll pass, link checks, judge, cache passes) printed per 10 s window. (6) perf-d: one link check per audited DP15 plan that ends in its doorbell (struct swg_bus plan): its host/DATA stores skip their own check, the doorbell keeps it (the argument of the batch: a link lost inside the plan fails it before its doorbell). No new hardware register, no new store kind, no new address: the same host/DATA words the per-word path stores.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -44,7 +44,64 @@
+ /* T-d84f (W-JOIN L25, docs/research/T-3e93-l25-wiring-design.md s.2 item 1): include order data, join, g2, l25, l25_rsne, l25_hs, cred, l25_wl, l25_glue. sweet_wlan_g2.h compiles its L24/L25 path (swl25_run) and the DP15
+  * transport only when SWEET_WLAN_DATA_H and SWEET_WLAN_JOIN_H are defined BEFORE it, so data.h and join.h come first. Lines the headers print go through printf; every GAP line also lands in the gap summary (rule 8). */
+ #define SWDP_LOG(str) printf("%s\n", (str))
+-#define SWDP_GAP(str) do { printf("%s\n", (str)); swl_gap("data", "data path gap (text printed above)", "low"); } while (0)
++/* patch 0273 (sprint-wifi Part A): a data-path GAP prints the 1st, 2nd, 4th, 8th ... time its text occurs (the trailing number of an en0_gapf text is not part of the key), with
++ * the count; every occurrence is counted here and in the gap summary. Before, every dropped or refused frame printed one line, and at line rate the USB log back-pressure (patch 0267)
++ * stalled the data path itself. A full table prints every occurrence (never silent). */
++#define SWL_DPG_N   64u
++#define SWL_DPG_KEY 112u
++static struct { char k[SWL_DPG_KEY]; uint32_t n; } swl_dpg[SWL_DPG_N];
++static uint32_t swl_dpg_nd, swl_dpg_tot;
++static void
++swl_dp_gap(const char *s)
++{
++	size_t l = strlen(s), kl = l;
++	uint32_t i;
++
++	while (kl > 0 && s[kl - 1] >= '0' && s[kl - 1] <= '9') {
++		kl--;
++	}
++	if (kl < l && kl > 0 && s[kl - 1] == ' ') {
++		kl--;                           /* "text 123": key "text" */
++	} else {
++		kl = l;
++	}
++	if (kl >= SWL_DPG_KEY) {
++		kl = SWL_DPG_KEY - 1u;
++	}
++	swl_dpg_tot++;
++	swl_gap("data", "data path gap (text printed above)", "low");
++	for (i = 0; i < swl_dpg_nd; i++) {
++		if (strncmp(swl_dpg[i].k, s, kl) == 0 && swl_dpg[i].k[kl] == '\0') {
++			break;
++		}
++	}
++	if (i == swl_dpg_nd) {
++		if (i == SWL_DPG_N) {
++			printf("%s (data gap table full: printed every time)\n", s);
++			return;
++		}
++		memcpy(swl_dpg[i].k, s, kl);
++		swl_dpg[i].k[kl] = '\0';
++		swl_dpg[i].n = 0;
++		swl_dpg_nd++;
++	}
++	swl_dpg[i].n++;
++	if ((swl_dpg[i].n & (swl_dpg[i].n - 1u)) == 0u) {
++		if (swl_dpg[i].n == 1u) {
++			printf("%s\n", s);
++		} else {
++			printf("%s (x%u)\n", s, swl_dpg[i].n);
++		}
++	}
++}
++#define SWDP_GAP(str) swl_dp_gap(str)
++/* patch 0273 (Part A): where the keep poll thread's time goes, mach_absolute_time units, printed as ms per 10 s window on the alive line (read-only bookkeeping) */
++static uint64_t swp_t_link, swp_t_judge, swp_t_cache, swp_n_link;
++/* patch 0273 perf-d: 1 while an audited DP15 plan that ends in its doorbell runs and its opening link check passed (sw_g2_plan): its host/DATA stores skip their own link check, the doorbell keeps it */
++static int sw_plan_link;
++static uint32_t sw_plan_n, sw_plan_nolink;
++#define SWP_T0() uint64_t swp_t0_ = mach_absolute_time()
++#define SWP_ADD(acc) ((acc) += mach_absolute_time() - swp_t0_)
+ #include "sweet_wlan_data.h"
+ /* T-48a0 (W-JOIN L24, SPEC-WIFI Part E): the join payloads (swj_join_cmds) and the credential reader (swc_load). */
+ #define SWJ_LOG(str) printf("%s\n", (str))
+@@ -64,6 +121,7 @@
+  * wlan_en0_live_host_test.c). They live in THIS translation unit because the bus implementation is a set of static inline functions over struct swg_wx / struct swl25h and the static engine functions (swg_hrd, swg_dp_exec, swl25_H), which exist only here
+  * (a second copy in sweet_wlan_en0.c would be a second engine and a second swl25_H). sweet_wlan_en0.c keeps its own copy of the en0 code (never called, its bus refuses every exec) and exports sweet_wlan_en0_apply for the boot address. */
+ #include <kern/locks.h>
++#include <kern/sched_prim.h>   /* patch 0273: assert_wait_timeout, thread_block, thread_wakeup (the event-driven keep poll) */
+ #include <sys/errno.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -85,6 +143,8 @@
+ static void sw_en0_unlock(void);
+ #define EN0_LOCK() sw_en0_lock()                  /* the recursive lock of the keep poll thread vs the stack's transmit (en0_output), defined with sw_keep below */
+ #define EN0_UNLOCK() sw_en0_unlock()
++static void sw_en0_kick(void);
++#define EN0_KICK() sw_en0_kick()                  /* patch 0273: a frame was posted or queued, wake the keep poll thread now */
+ #define EN0_XFLAGS(ifp) ((ifp)->if_xflags)
+ #define EN0_XF_NOAUTO IFXF_NX_NOAUTO
+ #define EN0_EFLAGS(ifp) ifnet_eflags(ifp)
+@@ -702,11 +762,14 @@
+ 		swl_gap("g2", "glue: store outside the G2 state refused", "high");     /* review 0174-g2-hwwrite-r1 F4: the window is checked before the old-value read below. r2 F2: h->cfg is EP config 0x80, so this is a non-posted CfgRd before each BAR0 store, C1 and W doorbells included, possibly in DEV_SLEEP; stock rings without reads (dhd_pcie.c:12562-12600); kept on purpose (window validation), tracked as U3 */
+ 		return -1;
+ 	}
+-	if (space != SW3_DBI) {         /* review r1 F1: every store but the RC-local DBI one only while the link is up (the 0124 link preconditions, RC-local reads, no TLP: swl_wpre checks 1..4) */
++	if (space != SW3_DBI && !(sw_plan_link && (space == SW3_HOST || space == SW3_DATA))) {         /* review r1 F1: every store but the RC-local DBI one only while the link is up (the 0124 link preconditions, RC-local reads, no TLP: swl_wpre checks 1..4); perf-d: a host/DATA store inside an open plan was covered by the plan's opening check, its doorbell is checked here again */
++		SWP_T0();
+ 		bad |= sw3_rd(h, SWW_ISO, 0, 0, &iso) != 0 || sw3_rd(h, SWW_ELBI, 0, 0x2C8u, &ltssm) != 0;
+ 		for (i = 0; i < 7u; i++) {
+ 			bad |= sw3_rd(h, SWW_ATU, 0, 4u * i, &a0[i]) != 0 || sw3_rd(h, SWW_ATU, 0, 0x200u + 4u * i, &a1[i]) != 0;
+ 		}
++		SWP_ADD(swp_t_link);
++		swp_n_link++;
+ 		if (bad || swl_pre_link(iso, ltssm, a0, a1) != 0) {
+ 			swl_gap("g2", "glue: store refused, the link is not known up", "high");
+ 			printf("SWEET WLAN: G2 glue: store space %d off %#x refused: link check failed (iso %#x ltssm %#x)\n", space, off, iso, ltssm);
+@@ -719,7 +782,14 @@
+ 		return -1;
+ 	}
+ 	if (!w16 && sw_l25w_live(h) && (space == SW3_HOST || space == SW3_DATA || (space == SWW_BAR0 && win == SWW_WIN_PCIE && off == SWL25W_DB0_OFF))) {
+-		return sw_l25w_judge(h, space, off, v);      /* T-43af: L25 is live: the judge alone decides these stores (its refusal is final: no fall-through to the wide entries of g2l[]) */
++		{
++		int jr;
++		SWP_T0();
++		jr = sw_l25w_judge(h, space, off, v);
++		SWP_ADD(swp_t_judge);
++		return jr;
++	}
++	return sw_l25w_judge(h, space, off, v);      /* T-43af: L25 is live: the judge alone decides these stores (its refusal is final: no fall-through to the wide entries of g2l[]) */
+ 	}
+ 	/* review 0174-w-d4b-hwwrite-r1 F6: the entry is matched on space/window/offset/width/once/need first; the old value is read (once) only for an entry that needs it (a condition on the old value, a partial value mask, or a 16-bit store that keeps the upper half), so a doorbell (omask 0, whole word) is never read here */
+ 	for (i = 0; i < h->g2n; i++) {
+@@ -2011,6 +2081,145 @@
+ 	return sw3_wr16(h, SWW_BAR2, win, a - win, v);
+ }
+ 
++/* patch 0273 (sprint-wifi Part A): the block accessors of struct swg_bus (sweet_wlan_g2.h rd_blk / wr_blk). Host (G1) and DATA blocks only; both are one linear kernel mapping (sw3_ptr: h->g2va / h->dva + off),
++ * so [a, a + 4 nw) is checked at both ends and is then one run. */
++static int
++sw_g2_blk_map(struct sw_hw *h, int sp, uint32_t a, uint32_t nw, volatile uint32_t **p, uint64_t *pa)
++{
++	const int space = sp == SWG_SP_HOST ? SW3_HOST : sp == SWG_SP_DATA ? SW3_DATA : -1;
++	volatile uint32_t *p0, *pn;
++
++	if (space < 0 || nw == 0u || nw > 1024u || (p0 = sw3_ptr(h, space, a)) == NULL || (pn = sw3_ptr(h, space, a + 4u * (nw - 1u))) == NULL || pn != p0 + (nw - 1u)) {
++		return -1;
++	}
++	*p = p0;
++	*pa = (space == SW3_HOST ? h->g2pa : h->dpa) + a;
++	return space;
++}
++
++/* nw words: ONE clean+invalidate pass over the range (flush_dcache64 = dc civac per line + dsb sy, the rule of sw_g2_rd for every host/DATA word), then the words. = nw sw_g2_rd calls */
++static int
++sw_g2_rd_blk(void *ctx, int sp, uint32_t a, uint32_t *v, uint32_t nw)
++{
++	struct sw_hw *h = ctx;
++	volatile uint32_t *p;
++	uint64_t pa;
++	uint32_t k;
++
++	if (sw_g2_blk_map(h, sp, a, nw, &p, &pa) < 0) {
++		swl_gap("g2", "glue: batched host/DATA read outside the block refused", "high");
++		return -1;
++	}
++	{
++		SWP_T0();
++		flush_dcache64((addr64_t)pa, 4u * nw, TRUE);
++		SWP_ADD(swp_t_cache);
++	}
++	for (k = 0; k < nw; k++) {
++		v[k] = p[k];
++	}
++	return 0;
++}
++
++/* the link precondition of sw3_g2_ok (review r1 F1) for a host/DATA store, read the same way: ISO, LTSSM, ATU regions 0 and 1. 0 = known up */
++static int
++sw3_g2_link(struct sw_hw *h)
++{
++	uint32_t iso = 0, ltssm = 0, a0[7] = { 0 }, a1[7] = { 0 };
++	unsigned i;
++	int bad;
++	SWP_T0();
++
++	bad = sw3_rd(h, SWW_ISO, 0, 0, &iso) != 0 || sw3_rd(h, SWW_ELBI, 0, 0x2C8u, &ltssm) != 0;
++	for (i = 0; i < 7u; i++) {
++		bad |= sw3_rd(h, SWW_ATU, 0, 4u * i, &a0[i]) != 0 || sw3_rd(h, SWW_ATU, 0, 0x200u + 4u * i, &a1[i]) != 0;
++	}
++	SWP_ADD(swp_t_link);
++	swp_n_link++;
++	if (bad || swl_pre_link(iso, ltssm, a0, a1) != 0) {
++		swl_gap("g2", "glue: store refused, the link is not known up", "high");
++		printf("SWEET WLAN: G2 glue: batched store refused: link check failed (iso %#x ltssm %#x)\n", iso, ltssm);
++		return -1;
++	}
++	return 0;
++}
++
++/* THE batched store (sweet_wlan_g2.h swg_put_blk only). Accepted only where the per-word path (sw3_wr -> sw3_g2_ok -> sw_l25w_judge) would accept each word: while G2 runs (h->g2, level and g2ok
++ * as sw3_g2_ok), with the L25 judge live, the link known up BEFORE the first word and again AFTER the last (the per-word path checks before each word; a link lost inside the batch fails the
++ * plan before its doorbell, as a refused word would), and swl25w_ok_blk's verdict for every word (sweet_wlan_l25_wl.h: the per-word rules of L3/L4/L5, nothing else is batched). Then the
++ * words, dsb, swl25w_done for each word (a no-op for these classes, kept so the bookkeeping is literally the per-word one), one clean+invalidate pass (sw_g2_wr civacs each word after its store). */
++static uint32_t sw_g2_blk_oldw[1024];
++static uint32_t sw_g2_blk_n, sw_g2_blk_words;
++static int
++sw_g2_wr_blk(void *ctx, int sp, uint32_t a, const uint32_t *v, uint32_t nw)
++{
++	struct sw_hw *h = ctx;
++	volatile uint32_t *p;
++	uint64_t pa;
++	const char *why = "";
++	uint32_t k;
++	int space, cls;
++
++	space = sw_g2_blk_map(h, sp, a, nw, &p, &pa);
++	if (space < 0) {
++		swl_gap("g2", "glue: batched host/DATA store outside the block refused", "high");
++		return -1;
++	}
++	if (!h->g2 || h->l3 < SWW_F3_LEVEL || !h->g2ok || !sw_l25w_live(h)) {
++		swl_gap("g2", "glue: batched store outside the live L25 judge refused", "high");
++		printf("SWEET WLAN: G2 glue: batched store space %d off %#x x%u refused: not G2 with the L25 judge live\n", sp, a, nw);
++		return -1;
++	}
++	if (!sw_plan_link && sw3_g2_link(h) != 0) {     /* perf-d: inside an open plan the opening check covers it */
++		return -1;
++	}
++	if (sw_g2_rd_blk(h, sp, a, sw_g2_blk_oldw, nw) != 0) {     /* the old words the judge sees (sw_l25w_judge reads each through sw_g2_rd) */
++		swl_gap("l25", "glue: L25 store refused, the old word is unreadable", "high");
++		return -1;
++	}
++	{
++		SWP_T0();
++		cls = swl25w_ok_blk(&h->l25w, space == SW3_HOST ? SWL25W_SP_HOST : SWL25W_SP_DATA, a, v, sw_g2_blk_oldw, nw, &why);
++		SWP_ADD(swp_t_judge);
++	}
++	if (cls < 0) {
++		swl_gap("l25", "glue: L25 store refused by the whitelist", "high");
++		printf("SWEET WLAN: L25 glue: batched store space %d off %#x x%u refused (values withheld): %s\n", sp, a, nw, why);
++		return -1;
++	}
++	for (k = 0; k < nw; k++) {
++		p[k] = v[k];
++	}
++	__builtin_arm_dsb(0xf);
++	for (k = 0; k < nw; k++) {
++		swl25w_done(&h->l25w, space == SW3_HOST ? SWL25W_SP_HOST : SWL25W_SP_DATA, a + 4u * k, v[k], sw_g2_blk_oldw[k], cls);
++	}
++	flush_dcache64((addr64_t)pa, 4u * nw, TRUE);
++	if (!sw_plan_link && sw3_g2_link(h) != 0) {     /* perf-d: inside a plan the doorbell's own check comes next */
++		return -1;
++	}
++	sw_g2_blk_n++;
++	sw_g2_blk_words += nw;
++	return 0;
++}
++
++/* perf-d (struct swg_bus plan): open = the link check ONCE for the plan; a failed check leaves every store to its own per-store check (which refuses), close = back to per-store checks */
++static void
++sw_g2_plan(void *ctx, int open)
++{
++	struct sw_hw *h = ctx;
++
++	sw_plan_link = 0;
++	if (open && h->g2 && sw_l25w_live(h)) {
++		if (sw3_g2_link(h) == 0) {
++			sw_plan_link = 1;
++			sw_plan_n++;
++		} else {
++			sw_plan_nolink++;
++		}
++	}
++}
++
+ static void
+ sw_g2_delay(void *ctx, unsigned ms)
+ {
+@@ -2064,6 +2273,7 @@
+ 	int32_t rssi;
+ } sw_keep_join;
+ extern int sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t ssid_len, const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok);   /* bsd/dev/sweet_wlan_a80211.c (patch 0201) */
++extern int sweet_wlan_a80211_kept_rssi(int32_t rssi);                                                                          /* bsd/dev/sweet_wlan_a80211.c (patch 0201, Part A) */
+ extern int sweet_wlan_registry_set_bsd_name(const char *name);                                                                 /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
+ 
+ static struct {
+@@ -2072,9 +2282,21 @@
+ 	uint32_t depth;
+ 	volatile uint32_t armed;        /* the thread exists */
+ 	volatile uint32_t go;           /* sweet_wlan_init has returned: the hand-over may start */
++	uint32_t kick;                  /* patch 0273: the event the poll thread sleeps on (EN0_KICK wakes it) */
++	uint32_t kicks;
+ 	char bootarg[64];
+ } sw_keep;
+ 
++/* patch 0273: en0_output posted or queued a frame: the poll thread looks at the rings now instead of at the end of its sleep */
++static void
++sw_en0_kick(void)
++{
++	if (sw_keep.armed) {
++		sw_keep.kicks++;
++		thread_wakeup((event_t)&sw_keep.kick);
++	}
++}
++
+ /* recursive: the owner is only ever set by the thread that holds the mutex, so `owner == current_thread()` is true only for the holder */
+ static void
+ sw_en0_lock(void)
+@@ -2187,9 +2409,15 @@
+ 	struct swg_wx *x = &sw_gx;
+ 	struct en0 *e = &sw_keep_en;
+ 	struct en0_live *b = &sw_keep_live;
+-	uint32_t polls = 0, items = 0;
+-	int rc, found;
++	uint32_t polls = 0, items = 0, got, busy, nrssi = 0, rssi_off = 0;
++	uint64_t t_pass = 0, t_p0, l_link = 0, l_judge = 0, l_cache = 0, l_nlink = 0, l_pass = 0, ns_[5];
++	uint64_t pass_max = 0, gap_max = 0, t_end_busy = 0, d_;
++	uint64_t t_alive = 0, iv_alive = 0, t_rssi = 0, iv_rssi = 0;
++	int32_t rssi_now = 0;
++	int rc, found, rr;
+ 
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &iv_alive);
++	nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &iv_rssi);
+ 	while (!sw_keep.go) {
+ 		delay_for_interval(10, 1000 * 1000);
+ 	}
+@@ -2228,20 +2456,64 @@
+ 	}
+ 	for (;;) {
+ 		sw_en0_lock();
++		t_p0 = mach_absolute_time();
+ 		if (!x->stopped && !x->d4dstop) {
+ 			(void)swg_keep_r2(x);
+ 		}
+-		items += en0_live_poll(e, b);
++		got = en0_live_poll(e, b);
++		items += got;
++		busy = got != 0u || e->tx_blocked != 0u;
++		rr = 1;
++		if (!rssi_off && !x->stopped && !x->d4dstop && !b->dead && mach_absolute_time() - t_rssi >= iv_rssi) {    /* patch 0273 (Part A): the firmware's RSSI every 5 s (read-only WLC_GET_RSSI, judged, under the lock) */
++			t_rssi = mach_absolute_time();
++			rr = swl25_live_rssi(x, &swl25_H, &rssi_now);
++			if (x->d4dstop && !x->stopped) {        /* review perf-c F1: a SOFT stop inside the optional refresh (no store failed, no undo ran): the data path is kept, the refresh is off for this boot */
++				x->d4dstop = 0u;
++				rssi_off = 1u;
++				swl_gap("keep", "RSSI refresh aborted by a soft stop inside the ioctl (see the STOP line above): data path kept, refresh off", "high");
++				printf("WIFI GAP: keep: RSSI refresh aborted (soft stop inside WLC_GET_RSSI, line above): the en0 data path continues, no further refresh this boot\n");
++				rr = 1;
++			}
++		}
++		d_ = mach_absolute_time() - t_p0;
++		t_pass += d_;
++		if (d_ > pass_max) pass_max = d_;
++		if (t_end_busy != 0u && t_p0 - t_end_busy > gap_max) gap_max = t_p0 - t_end_busy;     /* read-only: the time from the end of a busy pass to the start of the next pass */
++		t_end_busy = busy ? mach_absolute_time() : 0u;
+ 		sw_en0_unlock();
++		if (rr == 0) {          /* outside the en0 lock: the Apple80211 radio takes its own lock (the ioctl path holds it), so no lock order is formed */
++			nrssi++;
++			if (sweet_wlan_a80211_kept_rssi(rssi_now) == 0) {
++				printf("SWEET WLAN: keep: firmware RSSI %d dBm (refresh %u), handed to the kept Apple80211 link\n", (int)rssi_now, nrssi);
++			} else {
++				swl_gap("keep", "firmware RSSI not taken by the Apple80211 kept link (see the line above)", "medium");
++			}
++		}
+ 		polls++;
+-		if (x->stopped || x->d4dstop || b->dead) {
++		if (x->stopped || x->d4dstop || b->dead || e->cons_fail) {     /* review perf-d F1: a refused consume commit ends the data path too */
+ 			break;
+ 		}
+-		if (polls % 2000u == 0u) {
+-			printf("SWEET WLAN: en0 poll alive polls=%u rx=%u tx=%u nquiet=%u gaps=%u r2=%u ev=%u ds=%u items=%u\n", polls, e->rx_frames, e->tx_frames, x->nquiet,
+-			       swl_gap_tot + swl_gap_over, x->kr2n, x->kr2ev, x->kr2ds, items);
+-		}
+-		delay_for_interval(5, 1000 * 1000);
++		if (mach_absolute_time() - t_alive >= iv_alive) {      /* patch 0273: every 10 s (the pass rate now follows the traffic) */
++			t_alive = mach_absolute_time();
++			absolutetime_to_nanoseconds(t_pass - l_pass, &ns_[0]);
++			absolutetime_to_nanoseconds(swp_t_link - l_link, &ns_[1]);
++			absolutetime_to_nanoseconds(swp_t_judge - l_judge, &ns_[2]);
++			absolutetime_to_nanoseconds(swp_t_cache - l_cache, &ns_[3]);
++			absolutetime_to_nanoseconds(pass_max, &ns_[4]);
++			absolutetime_to_nanoseconds(gap_max, &d_);
++			printf("SWEET WLAN: en0 poll time (last window, ms): pass %llu link %llu (%llu checks) judge %llu cache %llu; longest pass %llu us, longest gap after a busy pass %llu us, rx starved polls %u, fewest empty rx buffers %u\n",
++			    ns_[0] / 1000000ull, ns_[1] / 1000000ull, swp_n_link - l_nlink, ns_[2] / 1000000ull, ns_[3] / 1000000ull, ns_[4] / 1000ull, d_ / 1000ull, e->rx_starve,
++			    e->rx_avail_min > 0u ? e->rx_avail_min - 1u : 0u);
++			pass_max = gap_max = 0;
++			e->rx_avail_min = 0;
++			l_pass = t_pass; l_link = swp_t_link; l_judge = swp_t_judge; l_cache = swp_t_cache; l_nlink = swp_n_link;
++			printf("SWEET WLAN: en0 poll alive polls=%u rx=%u tx=%u nquiet=%u gaps=%u r2=%u ev=%u ds=%u items=%u rx_drop=%u tx_drop=%u tx_blocked=%u tx_waits=%u kicks=%u dgaps=%u blk=%u blkw=%u plans=%u\n", polls, e->rx_frames,
++			       e->tx_frames, x->nquiet, swl_gap_tot + swl_gap_over, x->kr2n, x->kr2ev, x->kr2ds, items, e->rx_drop, e->tx_drop, e->tx_blocked, e->tx_waits, sw_keep.kicks, swl_dpg_tot, sw_g2_blk_n, sw_g2_blk_words, sw_plan_n);
++		}
++		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
++		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */
++		assert_wait_timeout((event_t)&sw_keep.kick, THREAD_UNINT, busy ? 100u : 5000u, NSEC_PER_USEC);
++		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ 	printf("SWEET WLAN: en0 poll thread ends after %u polls: stopped=%d code=%d d4dstop=%u bus_dead=%u rx=%u tx=%u nquiet=%u gaps=%u: no further poll\n", polls, x->stopped, x->code, (unsigned)x->d4dstop,
+ 	       (unsigned)b->dead, e->rx_frames, e->tx_frames, x->nquiet, swl_gap_tot + swl_gap_over);
+@@ -2295,6 +2567,9 @@
+ 	sw_gb.delay_ms = sw_g2_delay;
+ 	sw_gb.ctx = h;
+ 	sw_gb.stack_room = sw_g2_stack_room;
++	sw_gb.rd_blk = sw_g2_rd_blk;      /* patch 0273: used only by DP15 plans in quiet (keep) mode, see sweet_wlan_g2d.h swg_dp_words */
++	sw_gb.wr_blk = sw_g2_wr_blk;
++	sw_gb.plan = sw_g2_plan;          /* patch 0273 perf-d: one link check per audited DP15 plan (its doorbell keeps its own) */
+ 	memset(&sw_gx, 0, sizeof sw_gx);
+ 	if (!h->g2ok) {
+ 		swl_gap("g2", "not run: glue list refused or G2 not armed", "high");

@@ -1,0 +1,212 @@
+SWEET vsync timer idles when nothing needs it (patch 0190, X-G7, own code; rebased onto 0149 sweet_fb_rearm and 0148 by T-2b87). The 60 Hz AppleCLCD vsync timer (0046, 0056, 0101) re-armed unconditionally, also with no IOMobileFramebufferUserClient registered, so it kept waking 60 times a second while no client is open (read from source; wakeup cost unmeasured). Now vsyncFired re-arms only while AppleCLCD::needsVsync(): a registered client (vsync notifications), a frame waiting (fDirty && !fPowerOff), a blank pass still to do (fPowerOff && fFadeStep == 0) or the QR log holding the panel (sweet_qr_hold); otherwise it parks (fVsyncIdle, fLock) and logs `SWEET FB: vsync timer idle (...)` once. addClient restarts a parked timer and logs `SWEET FB: vsync timer resumed (client)`. fDirty and fPowerOff are only ever set from a client call (swap, selector 72 power path), so a client always exists, hence a running timer, whenever they change. Behaviour with a client is unchanged. Host test tools/test_0190_vsync_idle.py (patch text + mutants). Not run on hardware.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ef946e5..0dd8ab5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -103,51 +103,53 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fVsyncIdle;     /* patch 0190: vsync timer parked, no client and nothing to show (fLock) */
+ 
++	bool needsVsync(void);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ /*
+  * configd's InterfaceNamer (the "network stack" part of SCNetworkInterfaceCopyAll, which Settings -> About calls on the main
+  * thread) matches IOServiceMatching("IONetworkStack"), IOServiceOpen()s it and keeps the connection in a flag (configd
+  * disassembly: first-match callback 0x100018894, flag 0x100071b38). When IOKit goes quiet and the flag is 0 it only logs
+  * "No network stack object" and publishes nothing (callback 0x100018468 -> 0x100018634), so the waiters in Preferences run
+  * into InterfaceNamer's 300 s timer. The class lives in the IONetworkingFamily kext, which this kernel does not have. This
+  * stand-in only has to match and open; its user client refuses every call (no interface needs naming: there is no network
+  * hardware behind it yet).
+  */
+ class IONetworkStack : public IOService {
+ 	OSDeclareDefaultStructors(IONetworkStack);
+ };
+ 
+ OSDefineMetaClassAndStructors(IONetworkStack, IOService);
+ 
+ class IONetworkStackUserClient : public IOUserClient {
+@@ -336,117 +338,149 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			static uint64_t last_v, sec_v, max_v;
+ 			static uint32_t vb[5], vn;
+ 			if (last_v != 0) {
+ 				uint64_t g = (vns - last_v) / 1000000;
+ 				vb[g < 12 ? 0 : g < 20 ? 1 : g < 25 ? 2 : g < 40 ? 3 : 4]++;
+ 				vn++;
+ 				if (g > max_v) {
+ 					max_v = g;
+ 				}
+ 			}
+ 			last_v = vns;
+ 			if (sec_v == 0) {
+ 				sec_v = vns;
+ 			}
+ 			if (vns - sec_v >= 1000000000ull) {
+ 				IOLog("SWEET VSYNC: n %u <12:%u <20:%u <25:%u <40:%u >=40:%u max_ms %u\n", vn, vb[0], vb[1], vb[2], vb[3], vb[4], (uint32_t)max_v);
+ 				memset(vb, 0, sizeof vb);
+ 				vn = 0;
+ 				max_v = 0;
+ 				sec_v = vns;
+ 			}
+ 		}
+ 		sweet_fb_last_vsync_ns = vns;
+ 	}
+ 	uint64_t count = ++fb->fVsyncCount;
++	bool again;
+ 	sweet_fb_vsync_count_mirror = count;
+ 	/*
+ 	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a2 is the vsync's host time and
+ 	 * a2 + a3 the next one (a3 = the refresh period). a3 was 0, so CA saw every frame deadline as already past
+ 	 * (ios-flame 0121: 15.8 -> 21 fps on their swipe benchmark; read from their source, unmeasured here).
+ 	 */
+ 	uint64_t period;
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+ 		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (sweet_qr_hold) {
+ 		/* the QR log owns the panel: no present(), no fade (vsync notifications keep flowing) */
+ 		IOLockUnlock(fb->fLock);
+ 		sweet_fb_rearm(sender, now);
+ 		return;
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/* Blank: one write-only pass (WC reads are slow), then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step == 0) {
+ 			fb->fFadeStep = 1;
+ 		}
++		again = fb->needsVsync();
++		fb->fVsyncIdle = !again;
+ 		IOLockUnlock(fb->fLock);
+ 		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = 0;
+ 				}
+ 			}
+ 		}
+-		sweet_fb_rearm(sender, now);
++		if (again) {
++			sweet_fb_rearm(sender, now);
++		} else {
++			IOLog("SWEET FB: vsync timer idle (no client, panel blanked)\n");
++		}
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
+ 		}
+ 	}
++	again = fb->needsVsync();
++	fb->fVsyncIdle = !again;
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sweet_fb_rearm(sender, now);
++	if (again) {
++		sweet_fb_rearm(sender, now);
++	} else {
++		IOLog("SWEET FB: vsync timer idle (no client, nothing to show)\n");
++	}
++}
++
++/*
++ * Patch 0190 (X-G7): the timer re-arms only while something needs it: a registered client (vsync
++ * notifications), a frame waiting to be shown, a blank pass still to do, or the QR log holding the panel.
++ * Called with fLock held. Every way back to "needed" goes through a client (swap, power change, notify
++ * port), and addClient() restarts a parked timer.
++ */
++bool
++AppleCLCD::needsVsync(void)
++{
++	return fClients->getCount() != 0 || (fDirty && !fPowerOff) || (fPowerOff && fFadeStep == 0) || sweet_qr_hold;
+ }
+ 
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+ 	IOLockLock(fLock);
+ 	fClients->setObject(client);
++	bool kick = fVsyncIdle;
++	fVsyncIdle = false;
+ 	IOLockUnlock(fLock);
++	if (kick) {
++		/* patch 0190: restart the parked vsync timer for the new client */
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++		IOLog("SWEET FB: vsync timer resumed (client)\n");
++	}
+ }
+ 
+ void
+ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ {
+ 	IOLockLock(fLock);
+ 	unsigned int i = fClients->getNextIndexOfObject(client, 0);
+ 	if (i != (unsigned int)-1) {
+ 		fClients->removeObject(i);
+ 	}
+ 	IOLockUnlock(fLock);
+ }
+ 
+ static uint32_t
+ get32(const uint8_t *p, uint32_t off)
+ {
+ 	uint32_t v;
+ 	memcpy(&v, p + off, 4);
+ 	return v;
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ extern "C" void flush_dcache64(addr64_t, unsigned, int);   /* osfmk/arm/caches_internal.h, virtual address with phys = 0 */
+ static uint32_t sweet_fb_present_count;
+ static uint64_t sweet_fb_swap_count;

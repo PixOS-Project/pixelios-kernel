@@ -3,12 +3,12 @@
 
   tools/patch-numbers status            every number in use on any branch (local + remote) or reserved, and the CONFLICTS (same number, different file name)
   tools/patch-numbers next [--owner NAME] [--name SLUG]   reserve and print the next free number (above every branch and every reservation)
-  tools/patch-numbers release NNNN      drop a reservation (the patch was never written)
+  tools/patch-numbers release NNNN      drop a reservation (the patch was never written); below a higher number it stays as an unnamed 'skipped' placeholder
   tools/patch-numbers check             exit 1 if the CURRENT tree uses a number that another branch or a reservation has under a different name
   tools/patch-numbers claim NNNN --owner NAME --name SLUG   reserve a SPECIFIC number if it is free (a patch already written without `next`)
   tools/patch-numbers precommit         git pre-commit hook: refuses a staged NEW xnu/patches/NNNN-*.patch whose number another branch/reservation holds under a different name;
                                         reserves the number of a clean new patch so nobody else picks it (installed by `tools/patch-numbers install-hook`)
-  tools/patch-numbers install-hook      write .git/hooks/pre-commit (shared by every worktree) that runs `precommit` from the common-tools worktree
+  tools/patch-numbers install-hook      write .git/hooks/pre-commit (shared by every worktree) that runs `precommit` from the committing worktree (its tools/patch-numbers; loud skip when absent)
 
 Why: GPU, Wi-Fi and tooling worktrees all add patches after 0101 and merge later; "contiguous, applied in order" breaks the moment two of them pick 0102.
 Reservations are git refs (refs/patch-numbers/NNNN -> a blob with owner, name, date): every worktree of the repo shares them, creating one is atomic,
@@ -97,7 +97,7 @@ def cmd_next(owner, name):
     for _ in range(50):  # another agent may take the number between survey and update-ref
         used, res = survey(), reservations()
         n = max(list(used) + list(res) + [0]) + 1
-        body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+        body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"))
         sha = git("hash-object", "-w", "--stdin", inp=body).stdout.strip()
         r = git("update-ref", "%s%04d" % (PREFIX, n), sha, "0" * 40)  # creates only if absent: atomic
         if r.returncode == 0:
@@ -109,8 +109,16 @@ def cmd_next(owner, name):
 
 
 def cmd_release(num):
-    r = git("update-ref", "-d", "%s%04d" % (PREFIX, int(num)))
-    print("RESULT: %s" % ("PASS released %04d" % int(num) if r.returncode == 0 else "ERROR " + r.stderr.strip()))
+    n = int(num)
+    above = [x for x in list(survey()) + list(reservations()) if x > n]
+    if above:  # deleting it would leave an unheld hole below a used number: validate-repo's gap check then fails every branch above it (T-8ad1)
+        body = "skipped\n?\n%s\n" % datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        r = git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip())
+        print("RESULT: %s" % ("PASS released %04d as an unnamed 'skipped' placeholder (%04d is above it; a delete would leave a series gap)" % (n, max(above))
+                              if r.returncode == 0 else "ERROR " + r.stderr.strip()))
+        return r.returncode and 2
+    r = git("update-ref", "-d", "%s%04d" % (PREFIX, n))
+    print("RESULT: %s" % ("PASS released %04d" % n if r.returncode == 0 else "ERROR " + r.stderr.strip()))
     return r.returncode and 2
 
 
@@ -136,7 +144,7 @@ def cmd_claim(num, owner, name):
     if n in used and any(not name or not PAT.match(k) or PAT.match(k).group(2) != name for k in used[n]):
         print("RESULT: FAIL %04d is committed on a branch as %s" % (n, "; ".join(used[n])))
         return 1
-    body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+    body = "%s\n%s\n%s\n" % (owner, name or "?", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"))
     sha = git("hash-object", "-w", "--stdin", inp=body).stdout.strip()
     r = git("update-ref", "%s%04d" % (PREFIX, n), sha, "0" * 40)
     if r.returncode:
@@ -166,6 +174,10 @@ def cmd_precommit():
             bad.append("%04d: %s is staged here, but %s on %s" % (n, f, "; ".join(others), ",".join(sum(others.values(), []))))
         elif n in res and res[n]["name"] not in ("?", "") and res[n]["name"] != slug:
             bad.append("%04d: %s is staged here, but the number is reserved by %s as '%s'" % (n, f, res[n]["owner"], res[n]["name"]))
+        elif n not in res and n not in used:
+            top = max([x for x in list(used) + list(res) if x != n] + [0])
+            if n > top + 1:  # a hand-picked number past the top leaves top+1..n-1 unheld: validate-repo's gap check fails (0233-0239, T-8ad1)
+                bad.append("%04d: %s skips %04d..%04d (highest used or reserved is %04d); take `next` or claim the skipped numbers" % (n, f, top + 1, n - 1, top))
     if bad:
         print("patch-numbers: commit refused, overlapping xnu patch number(s):")
         for x in bad:
@@ -177,7 +189,7 @@ def cmd_precommit():
         n = int(m.group(1))
         if n in res:
             continue
-        body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", m.group(2), datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"))
+        body = "%s\n%s\n%s\n" % (os.environ.get("PHONE_OWNER") or "commit", m.group(2), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"))
         r = git("update-ref", "%s%04d" % (PREFIX, n), git("hash-object", "-w", "--stdin", inp=body).stdout.strip(), "0" * 40)
         if r.returncode:  # somebody reserved it between our read and now: refuse if for a different slug
             cur_r = reservations().get(n, {})
@@ -189,9 +201,10 @@ def cmd_precommit():
 
 HOOK = """#!/bin/sh
 # installed by tools/patch-numbers install-hook (TP-022): xnu patch numbers must not overlap across worktrees
-T=$HOME/.t3/worktrees/common-tools/kernel/tools/patch-numbers
-[ -f "$T" ] || exit 0
-command -v python3 >/dev/null 2>&1 || exit 0
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+T=$TOP/tools/patch-numbers   # the committing worktree's own copy: it reads that worktree's index (the old shared worktree is gone, AP-241)
+[ -n "$TOP" ] && [ -f "$T" ] || { echo "patch-numbers: ${TOP:+$T }${TOP:-not inside a work tree: }not found, patch numbers NOT checked for this commit (merge trunk into this branch)" >&2; exit 0; }
+command -v python3 >/dev/null 2>&1 || { echo "patch-numbers: python3 not found, patch numbers NOT checked for this commit" >&2; exit 0; }
 python3 "$T" precommit
 rc=$?
 [ $rc = 3 ] && exit 1

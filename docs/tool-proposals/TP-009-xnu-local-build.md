@@ -19,7 +19,7 @@ needs an Apple clang), tools/stack-apply (patch apply check only). None builds a
 CI round trip ~4 min per kernel. Local Linux build, measured 2026-10-22: cold 71 s, no-op 3 s, one changed patch 16 s.
 
 ## output
-Short report, last line `RESULT: PASS|FAIL|ERROR ...`; exit 0/1/2; kernel copied to ~/pixelios-artifacts/localbuild/out/kernel.development.sweet;
+Short report, last line `RESULT: PASS|FAIL|ERROR ...`; exit 0/1/2; kernel copied to ~/pixelios-artifacts/localbuild/out/<label>/kernel.development.sweet (per label since 2026-10-28);
 logs in ~/pixelios-artifacts/scratch/xnu-local-build.log and <work tree>/build.log.
 
 ## risks

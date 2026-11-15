@@ -1,0 +1,215 @@
+SWEET STALL (patch 0279, user 2026-11-09 "auto panic recovery is a must and it must provide all the info needed"): a timer_call checks once per second that the USB-log drain thread still runs and panics with a SWEET STALL cause line after sweetstall=<s> (default 20, 0 = off) seconds without it, so the existing panic path (0242 USB panic log with slide + other CPUs' pc/lr + backtrace, 0224 hold, reset) reports the hang and resets without a button. sweetstalltest=<s> = test spin of the drain thread (refused unless sweetrestart is armed). One max-gap line per 60 s. No hardware register, no allocation after start. Backstop for a stall the timer cannot see: patch 0278 SoC watchdog.
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_devoverlay.c		standard
+ bsd/dev/sweet_qr.c			standard
+ bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_wdt.c			standard
++bsd/dev/sweet_stall.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -44,6 +44,8 @@ static uint64_t sweet_pmu_pa, sweet_mode_off, sweet_swreset_off;
+ extern void sweet_wdt_parse(void);
+ extern void sweet_wdt_missing(const char *what);
+ extern void sweet_wdt_setup(uint64_t pmu_pa, uint32_t sysip_off);
++extern void sweet_stall_start(void);   /* bsd/dev/sweet_stall.c (patch 0279) */
++extern void sweet_stall_tick(int src);
+ extern void sweet_wdt_poll(int may_arm);
+ 
+ static uint64_t
+@@ -118,6 +120,7 @@ void
+ sweet_restart_poll(void)
+ {
+ 	sweet_wdt_poll(0);      /* pet only; the USB-log drain thread is the arming caller (SPEC-WDT SQ5) */
++	sweet_stall_tick(1);    /* patch 0279: reported in a SWEET STALL panic (not a trigger) */
+ 	if (sweet_restart_deadline != 0 && mach_absolute_time() >= sweet_restart_deadline) {
+ 		sweet_restart_deadline = 0;
+ 		printf("SWEET RESTART: resetting now (bootloader=%d)\n", sweet_restart_bl);
+@@ -234,6 +237,7 @@ sweet_restart_start(void)
+ 	}
+ 	started = 1;
+ 	sweet_wdt_parse();      /* FIRST, before the early returns below (SPEC-WDT SQ1) */
++	sweet_stall_start();    /* patch 0279: stall detector, needs no ADT node */
+ 	if (SecureDTLookupEntry(NULL, "/sweet-reset", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 8) {
+ 		printf("SWEET RESTART: no /sweet-reset node\n");
+--- /dev/null
++++ b/bsd/dev/sweet_stall.c
+@@ -0,0 +1,156 @@
++/*
++ * SWEET STALL (patch 0279, user 2026-11-09: "auto panic recovery is a must and it must provide all the info needed"):
++ * a kernel stall becomes a panic with a cause line instead of a silent hang, so the panic path that already exists
++ * (patch 0242: panic text, kernel slide, the other CPUs' last pc/lr and the panicking thread's backtrace over USB;
++ * patch 0224: on-screen hold; patches 0140/0182: reset) reports it and the phone resets without a button.
++ *
++ * Watched: the USB-log drain thread (bsd/dev/sweet_usb.c ud_log_thread). It wakes every 2-100 ms on every boot, so a
++ * gap of sweetstall seconds means the kernel can no longer run it (scheduler stall, a lock it waits on, a CPU spinning
++ * at a higher priority). A timer_call (timer interrupt context, osfmk/kern/timer_call.h, same use as
++ * bsd/kern/kern_ntptime.c ntp_loop_update) checks once per second; it does not depend on any thread running.
++ * Also reported (not a trigger): the restart poll (sweet_restart_poll, called from the persistent-log and QR threads).
++ * Backstop for a stall the timer cannot see (interrupts masked on the CPU that holds the timer): the SoC watchdog
++ * (patch 0278, sweetwdt=<s>), which resets without a cause line.
++ *
++ * Boot-args: sweetstall=<s> (default 20, 0 = off; values below 5 or above 600 are cut with a SWEET STALL GAP line).
++ * sweetstalltest=<s> (test only): s seconds after the detector starts, the drain thread spins forever (yield, interrupts on), which
++ * must end in `panic(... SWEET STALL: ...)`; refused (logged) unless the sweetrestart timer is armed (its pollers are
++ * other threads, so a detector failure still ends in a reset). No register, no allocation after start, no lock.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/timer_call.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++
++extern int sweet_restart_armed(void);   /* bsd/dev/sweet_restart.c (patch 0191) */
++
++#define STALL_SRC_USBLOG        0
++#define STALL_SRC_POLL          1
++#define STALL_NSRC              2
++#define STALL_DEFAULT_S         20u
++#define STALL_MIN_S             5u
++#define STALL_MAX_S             600u
++#define STALL_PERIOD_MS         1000u
++
++static uint64_t stall_last[STALL_NSRC];         /* mach_absolute_time of the newest tick, 0 = never ticked */
++static uint64_t stall_ticks[STALL_NSRC];
++static uint32_t stall_limit_s = STALL_DEFAULT_S;
++static uint32_t stall_test_s;
++static uint64_t stall_limit_abs, stall_period_abs, stall_test_abs, stall_start_abs;   /* stall_start_abs: mach_absolute_time at sweet_stall_start (the counter does not start at 0 at boot) */
++static uint64_t stall_max_gap_abs, stall_report_abs, stall_report_every_abs;   /* one max-gap line per 60 s (thread context, never from the timer) */
++static timer_call_data_t stall_timer;
++static int stall_on, stall_test_said;
++
++static uint64_t
++stall_ms(uint64_t abs)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000000ull;
++}
++
++/* one tick per loop of a watched thread: two atomic stores, nothing else (the test hook aside) */
++void
++sweet_stall_tick(int src)
++{
++	uint64_t now;
++
++	if (src < 0 || src >= STALL_NSRC) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (src == STALL_SRC_USBLOG && stall_on) {      /* the drain thread is the only caller with src 0: plain statics */
++		uint64_t prev = __atomic_load_n(&stall_last[src], __ATOMIC_RELAXED);
++
++		if (prev != 0 && now > prev && now - prev > stall_max_gap_abs) {
++			stall_max_gap_abs = now - prev;
++		}
++		if (stall_report_abs == 0) {
++			stall_report_abs = now;
++		} else if (now - stall_report_abs >= stall_report_every_abs) {
++			printf("SWEET STALL: usb-log drain max gap %llu ms in the last 60 s (limit %u s, %llu ticks)\n",
++			    stall_ms(stall_max_gap_abs), stall_limit_s, __atomic_load_n(&stall_ticks[src], __ATOMIC_RELAXED));
++			stall_max_gap_abs = 0;
++			stall_report_abs = now;
++		}
++	}
++	__atomic_store_n(&stall_last[src], now, __ATOMIC_RELEASE);
++	(void)__atomic_fetch_add(&stall_ticks[src], 1, __ATOMIC_RELAXED);
++	if (src == STALL_SRC_USBLOG && stall_test_abs != 0 && now >= stall_test_abs) {
++		if (!sweet_restart_armed()) {   /* checked now, not at start: sweet_restart_start arms the timer after it starts this detector (ar-b2) */
++			printf("SWEET STALL GAP: sweetstalltest=%u refused: the sweetrestart timer is not armed, a detector failure would never reset the phone\n",
++			    stall_test_s);
++			stall_test_abs = 0;
++			return;
++		}
++		if (!stall_test_said) {
++			stall_test_said = 1;
++			printf("SWEET STALL TEST: the usb-log drain thread spins now (sweetstalltest=%u, test only); expect the SWEET STALL fault within %u s\n",
++			    stall_test_s, stall_limit_s + 1);
++		}
++		for (;;) {
++			__asm__ volatile ("yield");
++		}
++	}
++}
++
++static void
++stall_check(timer_call_param_t p0 __unused, timer_call_param_t p1 __unused)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t last = __atomic_load_n(&stall_last[STALL_SRC_USBLOG], __ATOMIC_ACQUIRE);
++	uint64_t plast = __atomic_load_n(&stall_last[STALL_SRC_POLL], __ATOMIC_ACQUIRE);
++
++	if (last != 0 && now > last && now - last > stall_limit_abs) {
++		panic("SWEET STALL: the usb-log drain thread did not run for %llu ms (limit %u s, %llu ticks before); "
++		    "restart poll %s%llu ms ago (%llu ticks); %llu s after the detector started. The other CPUs' pc/lr follow (patch 0242). patch 0279",
++		    stall_ms(now - last), stall_limit_s, __atomic_load_n(&stall_ticks[STALL_SRC_USBLOG], __ATOMIC_RELAXED),
++		    plast == 0 ? "never ran, " : "last ran ", plast == 0 ? 0ull : stall_ms(now - plast),
++		    __atomic_load_n(&stall_ticks[STALL_SRC_POLL], __ATOMIC_RELAXED), stall_ms(now - stall_start_abs) / 1000ull);
++	}
++	(void)timer_call_enter(&stall_timer, now + stall_period_abs, TIMER_CALL_SYS_CRITICAL);
++}
++
++void
++sweet_stall_start(void)
++{
++	uint32_t v = 0;
++	uint64_t test_abs;
++
++	if (stall_on) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweetstall", &v, sizeof(v))) {
++		stall_limit_s = v;
++	}
++	if (stall_limit_s == 0) {
++		printf("SWEET STALL GAP: detector off (sweetstall=0): a kernel stall hangs until the SoC watchdog (sweetwdt) or a button\n");
++		return;
++	}
++	if (stall_limit_s < STALL_MIN_S || stall_limit_s > STALL_MAX_S) {
++		printf("SWEET STALL GAP: sweetstall=%u outside %u..%u, using %u\n", stall_limit_s, STALL_MIN_S, STALL_MAX_S,
++		    stall_limit_s < STALL_MIN_S ? STALL_MIN_S : STALL_MAX_S);
++		stall_limit_s = stall_limit_s < STALL_MIN_S ? STALL_MIN_S : STALL_MAX_S;
++	}
++	nanoseconds_to_absolutetime((uint64_t)stall_limit_s * NSEC_PER_SEC, &stall_limit_abs);
++	nanoseconds_to_absolutetime((uint64_t)STALL_PERIOD_MS * NSEC_PER_MSEC, &stall_period_abs);
++	nanoseconds_to_absolutetime(60ull * NSEC_PER_SEC, &stall_report_every_abs);
++	if (PE_parse_boot_argn("sweetstalltest", &stall_test_s, sizeof(stall_test_s)) && stall_test_s != 0) {
++		nanoseconds_to_absolutetime((uint64_t)stall_test_s * NSEC_PER_SEC, &test_abs);
++		stall_test_abs = mach_absolute_time() + test_abs;     /* the sweetrestart guard is checked when the spin is due (tick) */
++	}
++	stall_on = 1;
++	stall_start_abs = mach_absolute_time();
++	timer_call_setup(&stall_timer, stall_check, NULL);
++	(void)timer_call_enter(&stall_timer, mach_absolute_time() + stall_period_abs, TIMER_CALL_SYS_CRITICAL);
++	printf("SWEET STALL: armed: fault + reset when the usb-log drain thread does not run for %u s (timer interrupt check every %u ms)%s (patch 0279)\n",
++	    stall_limit_s, STALL_PERIOD_MS, stall_test_s ? ", TEST spin armed" : "");
++	if (stall_test_s) {
++		printf("SWEET STALL TEST: sweetstalltest=%u: the drain thread will spin %u s after this line\n", stall_test_s, stall_test_s);
++	}
++}
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1293,6 +1293,7 @@ ud_log_note(socket_t so, struct sockaddr_in *to, char *msg, int len, size_t max)
+ }
+ 
+ extern void sweet_wdt_poll(int may_arm);       /* bsd/dev/sweet_wdt.c */
++extern void sweet_stall_tick(int src);         /* bsd/dev/sweet_stall.c (patch 0279) */
+ 
+ static void
+ ud_log_round(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, struct ud_log_arp *a,
+@@ -1345,6 +1346,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	for (;;) {
+ 		/* patch 0267: 2 ms while console bytes are pending (back-pressure from ud_log_drain), else 100 ms as before */
+ 		ud_sleep_ms((so != NULL && sweet_log_position() > pos) ? 2 : 100);
++		sweet_stall_tick(0);    /* patch 0279: the stall detector watches this loop (bsd/dev/sweet_stall.c) */
+ 		sweet_wdt_poll(1);      /* patch 0193 (SPEC-WDT SQ5): BEFORE the configured check, so a missing host does not stop the pets; the only arming caller (0278: also called on the 2 ms 0267 path; sweet_wdt_poll pets at most once per WDT_PET_MS) */
+ 		if (!ud.configured) {
+ 			continue;

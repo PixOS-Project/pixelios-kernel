@@ -105,7 +105,84 @@ int try_read32(uintptr_t address, uint32_t *value);
 int try_write32(uintptr_t address, uint32_t value);
 uint64_t touch_ticks(void);	/* CNTPCT (shim.c) */
 
+/* L-28 / xnu patch 0367: the CPU DVFS result as XNU boot-arg tokens. TOUCH_DVFS_WRITE images only; the loader appends the string after the other shim tokens.
+ * " sweetdvfsk0..2=" asked kHz, " sweetdvfsb0..2=" read before, " sweetdvfsa0..2=" read back after, " sweetdvfsrc=" 0 ok, 1 refused/failed, 2 differs, 3 unread, 4 step not reached.
+ * At most 221 characters; TOUCH_DVFS_TOK_MAX is the room the host guards reserve. NULL = this build cannot produce them (not gs101). */
+#define TOUCH_DVFS_TOK_MAX 224
+struct touch_dvfs_res {	/* caller-owned (touchprobe.o carries no writable static state): shim.c defines the one, loader.c reads it */
+	uint32_t on;		/* 1 once touch_probe_dvfs ran on a build that can produce the result (0 = tokens NULL, a GAP in loader.c) */
+	uint32_t asked[3];	/* DVFS_KHZ0..2 */
+	uint32_t before[3];	/* step 1 FREQ_GET per cluster */
+	uint32_t after[3];	/* step 2 read-back (0 = not read) */
+	uint32_t rc;		/* 0 every asked cluster read back at the asked rate, 1 request refused or failed, 2 a read-back differs, 3 a read-back failed, 4 step 2 not reached */
+};
+static inline void touch_dvfs_res_init(struct touch_dvfs_res *r)
+{
+	uint32_t i;
+
+	r->on = 0;
+	for (i = 0; i < 3; i++)
+		r->asked[i] = r->before[i] = r->after[i] = 0;
+	r->rc = 4;
+}
+/* One decimal number or literal into buf (cap), position *p; a header function, so the formatting is NOT in the audited touchprobe.o (no register-offset store there). */
+static inline void touch_dvfs_put(char *buf, unsigned cap, unsigned *p, const char *lit, uint32_t v, int num)
+{
+	char d[10];
+	unsigned n = 0;
+
+	while (*lit && *p + 1u < cap)
+		buf[(*p)++] = *lit++;
+	if (!num)
+		return;
+	do {
+		d[n++] = (char)('0' + v % 10u);
+		v /= 10u;
+	} while (v && n < sizeof(d));
+	while (n && *p + 1u < cap)
+		buf[(*p)++] = d[--n];
+}
+extern struct touch_dvfs_res touch_dvfs_res_g;	/* defined in shim.c (TOUCH_DVFS_WRITE builds), read by loader.c */
+/* Format the tokens of *res into buf (capacity cap >= TOUCH_DVFS_TOK_MAX; a short cap truncates, the loader never appends a truncated line: it needs the room first). Returns buf, or NULL if this build cannot produce them (probe never ran). */
+static inline const char *touch_dvfs_tokens(const struct touch_dvfs_res *res, char *buf, unsigned cap)
+{
+	static const char kk[3][16] = { " sweetdvfsk0=", " sweetdvfsk1=", " sweetdvfsk2=" };
+	static const char kb[3][16] = { " sweetdvfsb0=", " sweetdvfsb1=", " sweetdvfsb2=" };
+	static const char ka[3][16] = { " sweetdvfsa0=", " sweetdvfsa1=", " sweetdvfsa2=" };
+	unsigned p = 0, i;
+
+	if (!res->on || cap == 0u)
+		return 0;
+	for (i = 0; i < 3; i++)
+		touch_dvfs_put(buf, cap, &p, kk[i], res->asked[i], 1);
+	for (i = 0; i < 3; i++)
+		touch_dvfs_put(buf, cap, &p, kb[i], res->before[i], 1);
+	for (i = 0; i < 3; i++)
+		touch_dvfs_put(buf, cap, &p, ka[i], res->after[i], 1);
+	touch_dvfs_put(buf, cap, &p, " sweetdvfsrc=", res->rc, 1);
+	buf[p] = 0;
+	return buf;
+}
+/* Append tok to the NUL-terminated command line cmd (capacity cap) after its current text. Never truncates. 0 appended, 1 no room (nothing appended), 2 no tokens.
+ * A header function so the host test (dvfs_probe_host_test.c) runs the loader's own code. */
+static inline int touch_dvfs_append(volatile char *cmd, uint32_t cap, const char *tok)
+{
+	uint32_t n = 0, len = 0, i;
+
+	if (!tok)
+		return 2;
+	while (len < TOUCH_DVFS_TOK_MAX && tok[len])
+		len++;
+	while (n + 1 < cap && cmd[n])
+		n++;
+	if (n + len >= cap)
+		return 1;
+	for (i = 0; i < len; i++)
+		cmd[n++] = tok[i];
+	cmd[n] = 0;
+	return 0;
+}
 void touch_probe_dump(void);	/* phase 1, read-only */
-int touch_probe_dvfs(unsigned step);	/* ACPM DVFS (TOUCH_DVFS): 0 describe channel 1 (reads), 1 FREQ_GET all domains, 2 FREQ_REQ DVFS_KHZ0..2 + read back; 0 = ok */
+int touch_probe_dvfs(unsigned step, struct touch_dvfs_res *res);	/* ACPM DVFS (TOUCH_DVFS): 0 describe channel 1 (reads), 1 FREQ_GET all domains, 2 FREQ_REQ DVFS_KHZ0..2 + read back; 0 = ok */
 int touch_probe_rails(unsigned step);	/* ACPM rails (TOUCH_RAILS): 0 describe (reads), 1 read both regs, 2 update + read back; 0 = ok */
 void touch_probe_run(unsigned opts);	/* phase 2: the sweettouchclk=3 sweettouchvar=1 writes + the TP_O_* experiments */

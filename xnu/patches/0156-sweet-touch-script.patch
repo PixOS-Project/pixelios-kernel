@@ -1,0 +1,116 @@
+SWEET touch script (patch 0156, boot-arg sweetscript=T,x,y;T,x0,y0,x1,y1;..., default off; G-11b Settings test): taps (3 numbers) and swipes (5 numbers) injected through SweetHIDTouch::touch at T seconds after the touch service started, up to 24 steps, 256 bytes (T capped at 3600 s; the first step T s after the touch service started, later steps (T2-T1) s after the previous one finished; replaces sweetswipe when both are set); logs 'SWEET SCRIPT: step N tap/swipe ...' per step and 'SWEET SCRIPT: done' 6 s after the last one (the host stops on it). Boot-arg parsed with PE_parse_boot_arg_str (AP-71). No hardware access.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -378,6 +378,11 @@
+ 	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fSwipe;
+ 	UInt32 fSwipeSecs, fSwipeStep, fSwipeCount, fSwipeLimit;
++	/* patch 0156: scripted taps / swipes (boot-arg sweetscript=T,x,y;T,x0,y0,x1,y1;...): the first step runs T seconds after the touch service started, each later step (T2 - T1) seconds after the previous one finished (so it drifts by the gesture time; equal or decreasing T gives 1 s) */
++	static void scriptFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fScript;
++	UInt32 fScriptIdx, fScriptStep, fScriptN;
++	struct { UInt32 t; SInt32 x0, y0, x1, y1; bool swipe; } fScriptEnt[24];
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -486,9 +491,100 @@
+ 			IOLog("SWEET HID: synthetic swipes every %u s\n", sw);
+ 		}
+ 	}
++	/* Patch 0156: boot-arg sweetscript="T,x,y;T,x0,y0,x1,y1;..." (tap = 3 numbers, swipe = 5): a scripted touch sequence for UI tests (launch an
++	 * app, navigate a menu) without a person. PE_parse_boot_arg_str: PE_parse_boot_argn into a char[] is a trap (AP-71). */
++	char script[256];
++	fScriptN = fScriptIdx = fScriptStep = 0;
++	script[0] = '\0';
++	if (PE_parse_boot_arg_str("sweetscript", script, sizeof(script)) && script[0]) {
++		const char *p = script;
++		while (*p && fScriptN < 24) {
++			SInt32 v[5];
++			unsigned nv = 0;
++			while (*p && *p != ';' && nv < 5) {
++				SInt32 acc = 0;
++				while (*p >= '0' && *p <= '9') {
++					if (acc < 100000) {   /* saturate: no signed overflow, T is capped below */
++						acc = acc * 10 + (*p - '0');
++					}
++					p++;
++				}
++				v[nv++] = acc;
++				if (*p == ',') {
++					p++;
++				} else {
++					break;
++				}
++			}
++			while (*p && *p != ';') {
++				p++;
++			}
++			if (*p == ';') {
++				p++;
++			}
++			if (nv == 3 || nv == 5) {
++				fScriptEnt[fScriptN].t = (UInt32)(v[0] > 3600 ? 3600 : v[0]);   /* seconds, capped: t * 1000 cannot wrap */
++				fScriptEnt[fScriptN].x0 = v[1];
++				fScriptEnt[fScriptN].y0 = v[2];
++				fScriptEnt[fScriptN].swipe = (nv == 5);
++				fScriptEnt[fScriptN].x1 = (nv == 5) ? v[3] : v[1];
++				fScriptEnt[fScriptN].y1 = (nv == 5) ? v[4] : v[2];
++				fScriptN++;
++			} else {
++				IOLog("SWEET HID: touch script: entry with %u numbers dropped (3 = tap, 5 = swipe)\n", nv);
++			}
++		}
++		fScript = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::scriptFired);
++		if (fScriptN && fScript && _hidWorkLoop && _hidWorkLoop->addEventSource(fScript) == kIOReturnSuccess) {
++			fScript->setTimeoutMS(fScriptEnt[0].t * 1000);
++			IOLog("SWEET HID: touch script, %u steps, first at %u s\n", fScriptN, fScriptEnt[0].t);
++			if (fSwipe) {   /* sweetswipe and sweetscript would both drive finger 0: the script wins */
++				fSwipe->cancelTimeout();
++				IOLog("SWEET HID: touch script replaces the synthetic swipes\n");
++			}
++		} else if (fScript) {
++			fScript->release();
++			fScript = NULL;
++		}
++	}
+ 	return true;
+ }
+ 
++#define SWEET_SCRIPT_STEPS 20
++void
++SweetHIDTouch::scriptFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	if (self->fScriptIdx >= self->fScriptN) {
++		IOLog("SWEET SCRIPT: done (%u steps)\n", self->fScriptN);
++		return;
++	}
++	unsigned i = self->fScriptIdx, st = self->fScriptStep;
++	bool swipe = self->fScriptEnt[i].swipe;
++	unsigned steps = swipe ? SWEET_SCRIPT_STEPS : 10;   /* a tap: finger down for 10 x 10 ms */
++	unsigned ms = swipe ? 8 : 10;
++	if (st == 0) {
++		IOLog("SWEET SCRIPT: step %u %s %d,%d -> %d,%d\n", i, swipe ? "swipe" : "tap", (int)self->fScriptEnt[i].x0, (int)self->fScriptEnt[i].y0, (int)self->fScriptEnt[i].x1, (int)self->fScriptEnt[i].y1);
++	}
++	if (st <= steps) {
++		int x = self->fScriptEnt[i].x0 + (self->fScriptEnt[i].x1 - self->fScriptEnt[i].x0) * (int)st / (int)steps;
++		int y = self->fScriptEnt[i].y0 + (self->fScriptEnt[i].y1 - self->fScriptEnt[i].y0) * (int)st / (int)steps;
++		self->touch(0, true, x, y);
++		self->fScriptStep = st + 1;
++		sender->setTimeoutMS(ms);
++	} else {
++		self->touch(0, false, self->fScriptEnt[i].x1, self->fScriptEnt[i].y1);
++		self->fScriptStep = 0;
++		self->fScriptIdx = i + 1;
++		if (self->fScriptIdx < self->fScriptN) {
++			UInt32 dt = self->fScriptEnt[i + 1].t > self->fScriptEnt[i].t ? self->fScriptEnt[i + 1].t - self->fScriptEnt[i].t : 1;
++			sender->setTimeoutMS(dt * 1000);
++		} else {
++			sender->setTimeoutMS(6000);   /* 6 s of settle time, then the done marker (the host stops on it) */
++		}
++	}
++}
++
+ void
+ SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSource *sender)
+ {

@@ -1,0 +1,11 @@
+diff --git a/shim/el2h.c b/shim/el2h.c
+--- a/shim/el2h.c
++++ b/shim/el2h.c
+@@ -106,5 +106,7 @@ unsigned el2_handle(struct el2_frame *f, uint64_t esr64, uint64_t hpfar, uint64_t far)
+ unsigned el2_handle(struct el2_frame *f, uint64_t esr64, uint64_t hpfar, uint64_t far)
+ {
++	extern void ramlog_line(const char *);
++	ramlog_line("el2 trap");
+ 	uint32_t esr = (uint32_t)esr64;
+ 	unsigned ec = (esr >> 26) & 0x3f;
+ 	uint32_t iss = esr & 0x01ffffff;

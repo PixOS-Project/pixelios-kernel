@@ -51,6 +51,11 @@
 /* PMIC command words (MFD protocol), doc 23 section 1.1; GK include/soc/google/acpm_mfd.h, acpm_mfd.c:209-255 [src] */
 #define FUNC_READ	0u	/* cmd[1] FUNC [7:0] */
 #define FUNC_UPDATE	2u
+/* enum mfd_func 0 READ, 1 WRITE, 2 UPDATE; cmd[1] WRITE_VAL [15:8]:
+ * doc 23 section 1.1 [src acpm_mfd.h] */
+#ifdef PMIC_SRC_CLEAR
+#define FUNC_WRITE	1u
+#endif
 #define SEQ_SHIFT	16u	/* cmd[0] seq num [21:16]: acpm_ipc.c:754-759, ACPM_IPC_PROTOCOL_SEQ_NUM = 16 [src] */
 #define RET_SHIFT	24u	/* reply cmd[1] RETURN [31:24], DEST [15:8]: acpm_mfd.c:40-41, :243-248 [src] */
 #define UPD_VAL_MASK	0x80u	/* only bit 7 (enable) of the two rails, set never clear (doc 23 section 5) */
@@ -217,9 +222,20 @@ static int bad(struct acpm_chan *h, uint32_t why)
 	return ACPM_E_DESC;
 }
 
-/* Reads only. Fills *h; returns ACPM_OK when the descriptor validated (the queues may still be busy: acpm_xfer decides). */
-int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
+/*
+ * Reads only. Fills *h; returns ACPM_OK when the descriptor validated (the queues may still be
+ * busy: acpm_xfer decides). eb_mask: the element sizes accepted, bit 0 = 16 bytes (every channel
+ * but the SLC one), bit 1 = 32 bytes (SWEET PROBE, SLC channels only: acpm_slc_describe /
+ * acpm_slc_version; patch 0363, research 161 s.1.5/1.6).
+ */
+#define EB_16 1u
+#define EB_32 2u
+/* style-allow: func-len legacy: acpm_describe was 80 lines, the element-size mask adds 4 */
+static int describe_n(const struct acpm_cfg *c, struct acpm_chan *h, uint32_t eb_mask)
 {
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	/* style-allow: func-len legacy: acpm_describe was 80 lines, the size mask adds some */
 	uintptr_t init = c->sram_base + c->initdata_off, tab, desc;
 	uintptr_t lo[6], len[6];
 	uint32_t i, j, id = 0, off, bytes;
@@ -233,7 +249,7 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 	h->rr = h->rf = h->sr = h->sf = h->intsr0 = 0;
 	h->why = ACPM_W_NONE;
 	for (i = 0; i < 8; i++)
-		if (!r32(init + 4u * i, &h->init[i]))
+		if (!r32(init + (uintptr_t)4u * i, &h->init[i]))
 			return ACPM_E_FAULT;
 	h->n = h->init[INIT_AP_MAX / 4];
 	h->tab = h->init[INIT_CH_TAB / 4];
@@ -244,7 +260,7 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 		return bad(h, ACPM_W_TAB);
 	tab = c->sram_base + h->tab;
 	for (h->idx = 0; h->idx < h->n; h->idx++) {
-		if (!r32(tab + (uintptr_t)h->idx * c->desc_stride + 4u * D_ID, &id))
+		if (!r32(tab + (uintptr_t)h->idx * c->desc_stride + (uintptr_t)4u * D_ID, &id))
 			return ACPM_E_FAULT;
 		if (id == c->ch_id)
 			break;
@@ -253,7 +269,7 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 		return bad(h, ACPM_W_NOCH);
 	desc = tab + (uintptr_t)h->idx * c->desc_stride;
 	for (i = 0; i < ACPM_DESC_WORDS; i++)
-		if (!r32(desc + 4u * i, &h->d[i]))
+		if (!r32(desc + (uintptr_t)4u * i, &h->d[i]))
 			return ACPM_E_FAULT;
 	h->have_desc = 1;	/* d[] is now dumpable, whatever the checks below say */
 	h->ap_poll = h->d[D_AP_POLL];
@@ -268,7 +284,12 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 	if (h->esz <= 64 && c->elem_unit && c->elem_unit <= 4)	/* the bound keeps esz * unit from wrapping */
 		h->esz_b = h->esz * c->elem_unit;
 	h->esz_w = h->esz_b / 4;
-	if (h->esz_b != ACPM_ELEM_BYTES)	/* only the 4-word MFD command; acpm_mfd.c: unsigned int command[4] */
+	/*
+	 * 16 B = the 4-word MFD command (acpm_mfd.c: unsigned int command[4]); 32 B only when the
+	 * caller allows it (the SLC channel)
+	 */
+	if (!((h->esz_b == ACPM_ELEM_BYTES && (eb_mask & EB_16)) ||
+	      (h->esz_b == 2u * ACPM_ELEM_BYTES && (eb_mask & EB_32))))
 		return bad(h, ACPM_W_ESZ);
 	for (i = 0; i < 4; i++) {	/* the four pointer words (rear/front of both queues), SRAM offsets */
 		off = h->d[i < 2 ? D_RX_REAR + i : D_TX_REAR + i - 2];
@@ -303,12 +324,19 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 	return ACPM_OK;
 }
 
+int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: one-line wrapper, refusals are logged by caller */
+	return describe_n(c, h, EB_16);
+}
+
 /* Reads only: the id word of descriptor idx, for the "no descriptor with the PMIC channel id" report (the table was validated). */
 int acpm_chan_id(const struct acpm_cfg *c, const struct acpm_chan *h, uint32_t idx, uint32_t *id)
 {
 	if (h->why != ACPM_W_NOCH || idx >= h->n)
 		return 0;
-	return r32(c->sram_base + h->tab + (uintptr_t)idx * c->desc_stride + 4u * D_ID, id);
+	return r32(c->sram_base + h->tab + (uintptr_t)idx * c->desc_stride + (uintptr_t)4u * D_ID, id);
 }
 
 int acpm_qword(const struct acpm_cfg *c, const struct acpm_chan *h, int rsp, uint32_t i, uint32_t *v)
@@ -320,7 +348,7 @@ int acpm_qword(const struct acpm_cfg *c, const struct acpm_chan *h, int rsp, uin
 	off = h->d[rsp ? D_TX_BASE : D_RX_BASE];
 	if ((off & 3u) || (uint64_t)off + 4u * (uint64_t)i + 4u > c->sram_size)
 		return 0;
-	return r32(c->sram_base + off + 4u * i, v);
+	return r32(c->sram_base + off + (uintptr_t)4u * i, v);
 }
 
 static int fail(struct acpm_xfer *x, int e, uint32_t why)
@@ -330,13 +358,18 @@ static int fail(struct acpm_xfer *x, int e, uint32_t why)
 	return e;
 }
 
-/* The guard of one transaction, from the validated channel and the slot it will use (the host test inspects it). */
-static void acpm_guard(struct wguard *g, const struct acpm_cfg *c, const struct acpm_chan *h, uintptr_t slot)
+/*
+ * The guard of one transaction, from the validated channel and the slot it will use (the host test
+ * inspects it). eb = the element bytes of this channel (16, or 32 on the SLC channel).
+ */
+static void acpm_guard(struct wguard *g, const struct acpm_cfg *c, const struct acpm_chan *h,
+		       uintptr_t slot, uint32_t eb)
 {
+	/* style-allow: assert audited client: guard covered by the host test and object audit */
 	g->armed = 1;
 	g->slot_ok = g->front_ok = 1;
 	g->slot_lo = slot;
-	g->slot_hi = slot + ACPM_ELEM_BYTES;
+	g->slot_hi = slot + eb;
 	g->front_pa = h->req_front_pa;
 	g->front_new = (h->rf + 1) % h->qlen;
 	g->rear_pa = h->rsp_rear_pa;
@@ -367,11 +400,18 @@ static void snap(const struct acpm_chan *h, struct acpm_xfer *x)
  * sequence bit in send_data (acpm_ipc.c:756) and clears it for response=false only when that reply arrives (check_response, :446-448); a
  * firmware that did not reply would hang Linux after 63 requests (:747-750) [src, review dvfs-client-review-1 H2]. So all three wait for
  * the reply, like the PMIC path. cmd[0] = domain index | seq << 16 for both DVFS kinds. */
-enum { XM_PMIC, XM_DGET, XM_DREQ };
+/*
+ * XM_SLCV (SWEET PROBE only): SLC PT_VERSION, value = reply word 1, no error word, reply word 0 seq
+ * checked
+ */
+enum { XM_PMIC, XM_DGET, XM_DREQ, XM_SLCV };
 
-static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, struct acpm_trace *t,
-		struct acpm_xfer *x)
+static int xfer_eb(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, uint32_t w2,
+		   uint32_t w3, struct acpm_trace *t, struct acpm_xfer *x, uint32_t eb)
 {
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	/* style-allow: func-len legacy: xfer was 120 lines */
 	struct acpm_chan h;
 	struct wguard g;
 	uint32_t i, nf, sf, sr, cnt;
@@ -392,9 +432,9 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 	x->t_bell = x->t_end = 0;
 	x->err = ACPM_OK;
 	x->why = ACPM_W_NONE;
-	if (c->ch_id >= 32)
+	if (c->ch_id >= 32 || (eb != ACPM_ELEM_BYTES && eb != 2u * ACPM_ELEM_BYTES))
 		return fail(x, ACPM_E_ARG, ACPM_W_ARG);
-	e = acpm_describe(c, &h);
+	e = describe_n(c, &h, eb == ACPM_ELEM_BYTES ? EB_16 : EB_32);
 	if (e)
 		return fail(x, e, h.why);
 	if (!c->layout_verified)
@@ -408,11 +448,18 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 		return fail(x, ACPM_E_BUSY, ACPM_W_FULL);
 	if (!counter_freq())			/* no clock = no bounded wait: refuse before anything is published */
 		return fail(x, ACPM_E_UNSURE, ACPM_W_TIMER);
-	slot = h.req_base_pa + (uintptr_t)ACPM_ELEM_BYTES * h.rf;	/* acpm_ipc.c:762: base + size * front, size in bytes [src] */
-	acpm_guard(&g, c, &h, slot);
+	/*
+	 * acpm_ipc.c:762: base + size * front, size in bytes [src]
+	 */
+	slot = h.req_base_pa + (uintptr_t)eb * h.rf;
+	acpm_guard(&g, c, &h, slot, eb);
 
-	for (i = 0; i < ACPM_ELEM_WORDS; i++)	/* an unpublished slot: the APM only reads [rear, front), so a failure here needs no undo */
-		if (put(slot + 4u * i, x->req[i], &g, x))
+	/*
+	 * an unpublished slot: the APM only reads [rear, front), so a failure here needs no undo; words
+	 * 4..7 of a 32 B slot are written as 0 (stock leaves them uninitialised, research 161 s.1.1)
+	 */
+	for (i = 0; i < eb / 4u; i++)
+		if (put(slot + (uintptr_t)4u * i, i < 4u ? x->req[i] : 0u, &g, x))
 			return fail(x, ACPM_E_FAULT, ACPM_W_NONE);
 	x->published = 1;			/* from the front write on the APM may run the request: no write ever takes it back */
 	e = put(h.req_front_pa, nf, &g, x);
@@ -429,6 +476,7 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 	}
 	x->published = 2;
 	lim = counter_freq() * c->timeout_us / 1000000u;
+	/* bounded: ACPM_MAX_POLLS or c->timeout_us ends it below (ACPM_E_TIMEOUT) */
 	for (;;) {
 		if (!r32(h.rsp_front_pa, &sf) || !r32(h.rsp_rear_pa, &sr)) {
 			x->t_end = touch_ticks();
@@ -448,9 +496,9 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 		snap(&h, x);
 		return fail(x, ACPM_E_REPLY, ACPM_W_IDX);
 	}
-	ent = h.rsp_base_pa + (uintptr_t)ACPM_ELEM_BYTES * sr;
+	ent = h.rsp_base_pa + (uintptr_t)eb * sr;
 	for (i = 0; i < 4; i++)
-		if (!r32(ent + 4u * i, &x->rep[i])) {
+		if (!r32(ent + (uintptr_t)4u * i, &x->rep[i])) {
 			snap(&h, x);
 			return fail(x, ACPM_E_FAULT, ACPM_W_NONE);
 		}
@@ -462,6 +510,16 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 		return fail(x, ACPM_E_FAULT, ACPM_W_NONE);
 	}
 	x->had_reply = 1;
+	/*
+	 * SLC PT_VERSION: value = reply word 1 ((major << 16) | minor), no error word (word 3 is not
+	 * specified for this command)
+	 */
+	if (mode == XM_SLCV) {
+		x->value = x->rep[1];
+		if (((x->rep[0] >> SEQ_SHIFT) & 0x3fu) != x->seq || cnt != 1)
+			return fail(x, ACPM_E_REPLY, ACPM_W_SEQ);
+		return ACPM_OK;
+	}
 	if (mode != XM_PMIC) {			/* DVFS: value = reply word 1 (kHz), error code = reply word 3 */
 		x->ret = x->rep[3];
 		x->value = x->rep[1];
@@ -478,6 +536,14 @@ static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, ui
 	if (x->ret)
 		return fail(x, ACPM_E_RET, ACPM_W_NONE);
 	return ACPM_OK;
+}
+
+static int xfer(const struct acpm_cfg *c, int mode, uint32_t w0, uint32_t w1, uint32_t w2,
+		uint32_t w3, struct acpm_trace *t, struct acpm_xfer *x)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: a one-line wrapper */
+	return xfer_eb(c, mode, w0, w1, w2, w3, t, x, ACPM_ELEM_BYTES);
 }
 
 static uint32_t pmic_w0(const struct acpm_cfg *c, uint32_t reg)
@@ -573,6 +639,98 @@ int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct 
 {
 	(void)c; (void)reg; (void)val;
 	return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+}
+#endif
+
+/* Reset-source latch READ for --pmic-src (docs/research/139 section 2 + 5 Phase A): S2MPG10 PM
+ * block STATUS1 0xC, STATUS2 0xD, PWRONSRC 0xE, OFFSRC 0xF (S2MPG10_PM_REG,
+ * include/linux/mfd/samsung/s2mpg10-register.h, kernel/gs 6e771b23) and S2MPG11 PM block STATUS1
+ * 0xC, OFFSRC 0xD (s2mpg11-register.h). Both are in the same "PM(0x1)" register enum as the
+ * registers acpm_s10_read / acpm_s11_read already read (S2MPG10_PM_L16M_CTRL, S2MPG11_PM_STATUS1),
+ * so the request words are built exactly as there (S2MPG10: pmic_w0; S2MPG11: ACPM_S11_PMIC_ADDR /
+ * ACPM_S11_SPEEDY). The INT1..INT6 registers (0x0-0x5, clear-on-read, read: mainline sec-acpm.c
+ * s2mpg10_pmic_precious_registers 0x00-0x05, review 0316) are NOT in the table and are refused.
+ * Same xfer(), FUNC_READ only: no PMIC write is expressible here. A (chip, register) pair not in
+ * the table is ACPM_E_ARG. */
+struct src_reg {
+	uint8_t chip;
+	uint8_t reg;
+};
+
+static const struct src_reg src_regs[] = {
+	{ ACPM_SRC_S10, 0x0C }, { ACPM_SRC_S10, 0x0D }, { ACPM_SRC_S10, 0x0E }, { ACPM_SRC_S10, 0x0F },
+	{ ACPM_SRC_S11, 0x0C }, { ACPM_SRC_S11, 0x0D },
+};
+
+int32_t acpm_pmic_src_read(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t *val,
+				 struct acpm_trace *t)
+{
+	/* style-allow: assert audited undefined-symbol set, see STYLE-C.md */
+	uint32_t k;
+	uint32_t w0;
+	int32_t e;
+
+	t->n = 1;
+	for (k = 0; k < sizeof(src_regs) / sizeof(src_regs[0]); k++)
+		if (src_regs[k].chip == chip && src_regs[k].reg == reg)
+			break;
+	if (k == sizeof(src_regs) / sizeof(src_regs[0]))
+		return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+	if (chip == ACPM_SRC_S10) {
+		w0 = pmic_w0(c, reg);
+	} else {
+#if defined(ACPM_S11_KNOWN) && ACPM_S11_KNOWN && defined(ACPM_S11_PMIC_ADDR) \
+	&& defined(ACPM_S11_SPEEDY)
+		w0 = (reg & 0xffu) | ((uint32_t)ACPM_S11_PMIC_ADDR << 8)
+			| ((uint32_t)ACPM_S11_SPEEDY << 12);
+#else
+		return refuse(&t->a, ACPM_E_UNSURE, ACPM_W_ARG);
+#endif
+	}
+	e = xfer(c, XM_PMIC, w0, FUNC_READ, 0, 0, t, &t->a);
+	if (!e)
+		*val = t->a.value;
+	return e;
+}
+
+#ifdef PMIC_SRC_CLEAR
+/* The ONLY write of --pmic-src-clear (docs/research/142 section 1: Google BCL
+ * google_bcl.c:3462-3463 S2MPG10 OFFSRC, PWRONSRC; google_bcl_core.c:1155 S2MPG11 OFFSRC; raw ACPM
+ * write with TYPE 0x01, CHANNEL 0 / 1). Its OWN allowlist, independent of src_regs above and of the
+ * caller's list: exactly (S10, 0x0F), (S10, 0x0E), (S11, 0x0D), VALUE 0. The request words are
+ * built as acpm_pmic_src_read builds them (same w0), cmd[1] = FUNC_WRITE | 0 << 8 = 1. Anything
+ * else is refused before xfer() (zero writes, zero IPC). One request, no retry. */
+static const struct src_reg clr_regs[] = {
+	{ ACPM_SRC_S10, 0x0F }, { ACPM_SRC_S10, 0x0E }, { ACPM_SRC_S11, 0x0D },
+};
+
+int32_t acpm_pmic_src_clear(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t val,
+				  struct acpm_trace *t)
+{
+	/* style-allow: assert audited undefined-symbol set, see STYLE-C.md */
+	uint32_t k;
+	uint32_t w0;
+
+	t->n = 1;
+	if (val != 0)
+		return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+	for (k = 0; k < sizeof(clr_regs) / sizeof(clr_regs[0]); k++)
+		if (clr_regs[k].chip == chip && clr_regs[k].reg == reg)
+			break;
+	if (k == sizeof(clr_regs) / sizeof(clr_regs[0]))
+		return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+	if (chip == ACPM_SRC_S10) {
+		w0 = pmic_w0(c, reg);
+	} else {
+#if defined(ACPM_S11_KNOWN) && ACPM_S11_KNOWN && defined(ACPM_S11_PMIC_ADDR) \
+	&& defined(ACPM_S11_SPEEDY)
+		w0 = (reg & 0xffu) | ((uint32_t)ACPM_S11_PMIC_ADDR << 8)
+			| ((uint32_t)ACPM_S11_SPEEDY << 12);
+#else
+		return refuse(&t->a, ACPM_E_UNSURE, ACPM_W_ARG);
+#endif
+	}
+	return xfer(c, XM_PMIC, w0, FUNC_WRITE, 0, 0, t, &t->a);
 }
 #endif
 
@@ -685,10 +843,12 @@ int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint3
 #ifndef ACPM_DVFS_NALL
 #define ACPM_DVFS_NALL	ACPM_DVFS_N
 #endif
-/* ACPM_DVFS_N = the CPU clusters (what the touch probe iterates, acpm_dvfs_ndom/dom); the tables hold ALL configured domains (CPU + the two GPU
- * clocks G3D = 5 / G3DL2 = 6, whose ceiling is their init level: only --gpu-clk asks them for a rate). */
+/* ACPM_DVFS_N = the CPU clusters (what the touch probe iterates, acpm_dvfs_ndom/dom);
+ * the tables hold ALL configured domains (CPU + the two GPU clocks G3D = 5 /
+ * G3DL2 = 6, whose ceiling is the DT pair row 1, G3D 762000 / G3DL2 996000 kHz =
+ * the stock max, soc.json, sprint-gpu 2026-11-08): only --gpu-clk asks them for a rate. */
 static const uint32_t dvfs_idx[ACPM_DVFS_NALL] = { ACPM_DVFS_IDXS };
-#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* only dvfs_rate_ok() reads these three */
+#ifdef ACPM_DVFS_WRITER	/* only dvfs_rate_ok() reads these three */
 static const uint32_t dvfs_ceil[ACPM_DVFS_NALL] = { ACPM_DVFS_CEILS };
 static const uint32_t dvfs_nr[ACPM_DVFS_NALL] = { ACPM_DVFS_NRS };
 static const uint32_t dvfs_rate[ACPM_DVFS_NALL][ACPM_DVFS_MAXLV] = { ACPM_DVFS_ROWS };
@@ -771,7 +931,64 @@ int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct 
 	return e;
 }
 
-#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* a read-only image must not contain code that can build a FREQ_REQ */
+/*
+ * --sweet-probe images only (xnu patch 0363, docs/research/161 s.1): the SLC channels. Nothing else
+ * in the shim can build an SLC request.
+ */
+#ifdef SWEET_PROBE
+#ifndef ACPM_SLC_CH
+#error "SWEET_PROBE needs the soc.json acpm.slc block (ACPM_SLC_CH)"
+#endif
+/*
+ * Reads only: the descriptor of the SLC channel (ch = ACPM_SLC_CH) or its async notification
+ * channel (ch = ACPM_SLC_ASYNC_CH), element size 16 or 32 B accepted; any other channel is
+ * ACPM_E_ARG.
+ */
+int acpm_slc_describe(const struct acpm_cfg *c, uint32_t ch, struct acpm_chan *h)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	struct acpm_cfg d;
+
+	if (ch != ACPM_SLC_CH && ch != ACPM_SLC_ASYNC_CH) {
+		h->why = ACPM_W_ARG;
+		h->have_desc = 0;
+		return ACPM_E_ARG;
+	}
+	cfg_chan(c, &d, ch);
+	return describe_n(&d, h, EB_16 | EB_32);
+}
+
+/*
+ * ONE fixed PT_VERSION request on the SLC channel: cmd[0] = seq << 16, cmd[1] = 0,
+ * cmd[2] = ACPM_SLC_PT_VERSION (0xd005), cmd[3] = 0, words 4-7 of a 32 B slot 0
+ * [src slc_acpm.c:126-150, :183]. No argument parameter: no other opcode is expressible. The
+ * element size is read from the descriptor (16 or 32 B). Same gates as every other request
+ * (queues empty, not full, layout verified, bounded wait), no retry, no rollback.
+ * *ver = reply word 1 ((major << 16) | minor). t->a holds the transaction.
+ */
+int acpm_slc_version(const struct acpm_cfg *c, uint32_t *ver, struct acpm_trace *t)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	struct acpm_cfg d;
+	struct acpm_chan h;
+	int e;
+
+	t->n = 1;
+	acpm_xfer_zero(&t->a);
+	cfg_chan(c, &d, ACPM_SLC_CH);
+	e = describe_n(&d, &h, EB_16 | EB_32);
+	if (e)
+		return refuse(&t->a, e, h.why);
+	e = xfer_eb(&d, XM_SLCV, 0u, 0u, ACPM_SLC_PT_VERSION, 0u, t, &t->a, h.esz_b);
+	if (!e)
+		*ver = t->a.value;
+	return e;
+}
+#endif
+
+#ifdef ACPM_DVFS_WRITER	/* a read-only image must not contain code that can build a FREQ_REQ */
 static int dvfs_rate_ok(int i, uint32_t khz)
 {
 	uint32_t k;
@@ -784,21 +1001,23 @@ static int dvfs_rate_ok(int i, uint32_t khz)
 	return 0;
 }
 
-/* same_ok: send the request even when the pre-read already shows khz (GPU clocks only: Linux re-sends the init rate at every probe, and the
- * point of --gpu-clk is to make the firmware act on a rate it already reports). Everything else (table row, ceiling, pre-read, channel
- * gates, reply handling) is the same code path for both callers. */
-/* OPEN (review L1): acpm_dvfs_set also finds the GPU domains (dvfs_find loops over NALL); only its caller keeps them out. */
-static int dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t, int same_ok)
+/* cls 1 (GPU, acpm_dvfs_reassert) sends the request even when the pre-read already shows khz
+ * (Linux re-sends the init rate at every probe; --gpu-clk makes the firmware act on a reported
+ * rate). The caller classes: acpm_gpudom.h. The rest is one shared code path. */
+#include "acpm_gpudom.h"	/* dvfs_cls_ok(): a caller reaches only its own domain class (L1) */
+static int dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t,
+		    int cls)
 {
 	struct acpm_cfg d;
 	uint32_t cur = 0;
-	int i, e;
+	int i, e;	/* style-allow: sized-types int is the status type of every acpm_* call */
 
-	t->n = 0;
+	t->n = 0;	/* style-allow: assert audited client, refusals are logged */
 	acpm_xfer_zero(&t->a);
 	acpm_xfer_zero(&t->b);
 	i = dvfs_find(dom);
-	if (!c->dvfs_ch || i < 0 || !dvfs_rate_ok(i, khz)) {	/* before the pre-read: nothing is sent for a rate we do not know */
+	/* before the pre-read: refuse an unknown rate and a domain of another caller class */
+	if (!c->dvfs_ch || i < 0 || !dvfs_rate_ok(i, khz) || !dvfs_cls_ok(dom, khz, cls)) {
 		t->n = 1;
 		return refuse(&t->a, ACPM_E_ARG, ACPM_W_DOM);
 	}
@@ -806,7 +1025,7 @@ static int dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct
 	if (e)
 		return e;
 	t->n++;
-	if (cur == khz && !same_ok)		/* already there: nothing to ask for */
+	if (cur == khz && cls != 1)		/* already there: nothing to ask for */
 		return refuse(&t->b, ACPM_E_ON, ACPM_W_ON);
 	cfg_chan(c, &d, c->dvfs_ch);
 	return xfer(&d, XM_DREQ, dvfs_idx[i], khz, FREQ_REQ, dvfs_ms(), t, &t->b);
@@ -818,26 +1037,40 @@ int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct a
 	return dvfs_set(c, dom, khz, t, 0);
 }
 #endif
-
+#include "acpm_mifdom.h"	/* acpm_dvfs_mif_top() (MIF_CLK images) */
 #ifdef GPU_CLK
 /* --gpu-clk: FREQ_REQ for G3D / G3DL2 only (a CPU domain is refused before anything is sent), the same rate allowed as the current one. */
 int acpm_dvfs_reassert(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t)
 {
-	static const uint32_t gpu[] = { ACPM_DVFS_GPU_IDXS };
-	unsigned k;
-
-	for (k = 0; k < sizeof(gpu) / sizeof(gpu[0]); k++)
-		if (gpu[k] == dom)
-			return dvfs_set(c, dom, khz, t, 1);
-	t->n = 1;
-	acpm_xfer_zero(&t->a);
-	return refuse(&t->a, ACPM_E_ARG, ACPM_W_DOM);
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client, refusals are logged */
+	return dvfs_set(c, dom, khz, t, 1);	/* a non-GPU domain is refused inside dvfs_set */
 }
 #endif
 #endif
 
 #else	/* no DVFS block in soc.json */
 
+#ifdef SWEET_PROBE
+int acpm_slc_describe(const struct acpm_cfg *c, uint32_t ch, struct acpm_chan *h)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	(void)c; (void)ch;
+	h->why = ACPM_W_LAYOUT;
+	h->have_desc = 0;
+	return ACPM_E_UNSURE;
+}
+
+int acpm_slc_version(const struct acpm_cfg *c, uint32_t *ver, struct acpm_trace *t)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	(void)c; (void)ver;
+	t->n = 1;
+	return refuse(&t->a, ACPM_E_UNSURE, ACPM_W_LAYOUT);
+}
+#endif
 int acpm_dvfs_ndom(void) { return 0; }
 int acpm_dvfs_dom(int i, uint32_t *idx) { (void)i; (void)idx; return 0; }
 int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct acpm_trace *t)
@@ -853,6 +1086,8 @@ int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct 
 
 int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h)
 {
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: one-line wrapper, refusals are logged by caller */
 	(void)c;
 	h->why = ACPM_W_LAYOUT;
 	h->have_desc = 0;
@@ -895,6 +1130,24 @@ int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct 
 	return ACPM_E_UNSURE;
 }
 
+int32_t acpm_pmic_src_read(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t *val,
+				 struct acpm_trace *t)
+{
+	/* style-allow: assert audited undefined-symbol set, see STYLE-C.md */
+	(void)c; (void)chip; (void)reg; (void)val; (void)t;
+	return ACPM_E_UNSURE;
+}
+
+#ifdef PMIC_SRC_CLEAR
+int32_t acpm_pmic_src_clear(const struct acpm_cfg *c, uint32_t chip, uint32_t reg, uint32_t val,
+				  struct acpm_trace *t)
+{
+	/* style-allow: assert audited undefined-symbol set, see STYLE-C.md */
+	(void)c; (void)chip; (void)reg; (void)val; (void)t;
+	return ACPM_E_UNSURE;
+}
+#endif
+
 int acpm_dvfs_ndom(void) { return 0; }
 int acpm_dvfs_dom(int i, uint32_t *idx) { (void)i; (void)idx; return 0; }
 int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct acpm_trace *t)
@@ -902,5 +1155,25 @@ int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct 
 	(void)c; (void)dom; (void)khz; (void)t;
 	return ACPM_E_UNSURE;
 }
+
+#ifdef SWEET_PROBE
+int acpm_slc_describe(const struct acpm_cfg *c, uint32_t ch, struct acpm_chan *h)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	(void)c; (void)ch;
+	h->why = ACPM_W_LAYOUT;
+	h->have_desc = 0;
+	return ACPM_E_UNSURE;
+}
+
+int acpm_slc_version(const struct acpm_cfg *c, uint32_t *ver, struct acpm_trace *t)
+{
+	/* style-allow: sized-types int is the status type of every acpm_* call */
+	/* style-allow: assert audited client: refusals are returned reasons, logged by caller */
+	(void)c; (void)ver; (void)t;
+	return ACPM_E_UNSURE;
+}
+#endif
 
 #endif

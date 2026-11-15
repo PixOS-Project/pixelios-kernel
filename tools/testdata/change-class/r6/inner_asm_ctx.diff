@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0151-sweet-asm.patch b/xnu/patches/0151-sweet-asm.patch
+index 1111111..2222222 100644
+--- a/xnu/patches/0151-sweet-asm.patch
++++ b/xnu/patches/0151-sweet-asm.patch
+@@ -20,8 +20,8 @@ Subject: x
+ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+ --- a/osfmk/arm64/start.s
+ +++ b/osfmk/arm64/start.s
+ @@ -100,3 +100,5 @@
+  	isb; /* sync */
+-+#if A
+-+#endif
+++#if B
+++#endif
+  	eret

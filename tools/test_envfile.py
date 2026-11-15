@@ -39,9 +39,9 @@ class T(unittest.TestCase):
             put(envf, "OTHER=1\n")
             put(kern, "x")
             e = {k: v for k, v in os.environ.items() if k != "CAM_HOST"}
-            e.update(PIXOS_ENV_FILE=envf, PHONE_LOCK_DIR=lock)
+            e.update(PIXOS_ENV_FILE=envf, PHONE_LOCK_DIR=lock, XRUN_NO_RUNPLAN="test: exercising CAM_HOST fail-fast")   # subprocess env only (rule 9 bypass)
             before = set(os.listdir(os.path.join(REPO, "logs", "runs"))) if os.path.isdir(os.path.join(REPO, "logs", "runs")) else set()
-            r = subprocess.run([os.path.join(TOOLS, "xrun"), "--kernel", kern], env=e, capture_output=True, text=True, timeout=20)
+            r = subprocess.run([os.path.join(TOOLS, "xrun"), "--kernel", kern, "--restart", "60"], env=e, capture_output=True, text=True, timeout=20)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertRegex(r.stdout.splitlines()[-1], r"^RESULT: ERROR missing CAM_HOST")
             self.assertFalse(os.path.exists(lock))

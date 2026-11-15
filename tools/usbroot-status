@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# usbroot-status: (no root) show the usbroot-host service state and the last log lines.
+# Usage: tools/usbroot-status [N_LINES]   Exit: 0 active, 1 installed but not active, 2 not installed.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+n=${1:-15}
+log=$root/logs/usbroot-host-service.log
+if ! systemctl cat usbroot-host >/dev/null 2>&1; then
+  echo "RESULT: FAIL usbroot-host service not installed (one time: sudo $root/tools/usbroot-service-install)"; exit 2
+fi
+state=$(systemctl is-active usbroot-host 2>&1)
+echo "service: $state ($(systemctl is-enabled usbroot-host 2>&1)); image: $(grep -h '^IMG=' /etc/usbroot-host.env 2>/dev/null)"
+if [ -f "$log" ]; then tail -n "$n" "$log"; else echo "(no $log yet)"; fi
+if [ "$state" = active ]; then
+  echo "RESULT: PASS usbroot-host active ($(tail -n 50 "$log" 2>/dev/null | grep -E 'bound |waiting for|lost the' | tail -n 1))"; exit 0
+fi
+echo "RESULT: FAIL usbroot-host $state"; exit 1

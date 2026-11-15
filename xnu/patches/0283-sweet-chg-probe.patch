@@ -1,0 +1,547 @@
+SWEET CHG P1 (patch 0283, charger bring-up phase 1, docs/research/charger-max77759-gs101.md section 8 steps 1-2): READ-ONLY witness of the state ABL left around the MAX77759 I2C bus (HSI2C12 / USI12 on PERIC1) so the later bring-up (a separate review-gated patch) starts from measured values, not guesses. Default ON, opt-out boot-arg sweetchgprobe=0. NO hardware store anywhere in this patch: every window is mapped `const volatile` and one allowlist-checked function does all loads (bsd/dev/sweet_chg.c). Once, from the USB-log drain thread after the log socket exists, it prints `SWEET CHG P1:` lines: stage A reads the six CMU_PERIC1 words, three CMU_TOP words, sysreg_peric1 SW_CONF, gpp23 CON/DAT/PUD and logs the implied IPCLK; the gate decision chg_gate_open() (IPCLK/PCLK/RSTNSYNC gates CG_VAL=1 auto=0, QCH CLOCK_REQ=1, mux not busy, top IP gate open if selected) then permits or forbids stage B, one log round later, which reads the HSI2C12 USI_CON/CTL/CONF/FIFO_STATUS/TIMING_FS1-3/TRANS_STATUS/INT_STATUS. A gated clock logs `SWEET CHG GAP: hsi2c12 clock gated, block not read (...)` and the 0x10D50000 window is never accessed (AP-113). New ADT node /sweet-chg from tools/mkadt.py add_chg_node <- soc/google/gs101/soc.json chg_probe. Hooked by one call in ud_log_thread (bsd/dev/sweet_usb.c). Applies after 0279. Host test: tools/test_chg_probe.py. Read-only; the first run is the review of what ABL leaves.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_qr.c			standard
+ bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_stall.c			standard
++bsd/dev/sweet_chg.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1294,6 +1294,7 @@ ud_log_note(socket_t so, struct sockaddr_in *to, char *msg, int len, size_t max)
+ 
+ extern void sweet_wdt_poll(int may_arm);       /* bsd/dev/sweet_wdt.c */
+ extern void sweet_stall_tick(int src);         /* bsd/dev/sweet_stall.c (patch 0279) */
++extern void sweet_chg_tick(int log_pending); /* bsd/dev/sweet_chg.c (patch 0283): read-only charger-bus witness, one shot */
+ 
+ static void
+ ud_log_round(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, struct ud_log_arp *a,
+@@ -1364,6 +1365,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			continue;
+ 		}
+ 		ud_log_round(so, &to, &pos, &g, &ua, chunk, sizeof(chunk));
++		sweet_chg_tick(sweet_log_position() > pos);     /* patch 0283: stage A on the first call (log socket exists), stage B once the stage A lines are sent; sweetchgprobe=0 = off */
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_chg.c b/bsd/dev/sweet_chg.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_chg.c
+@@ -0,0 +1,510 @@
++/*
++ * SWEET CHG P1 (xnu patch 0283): charger bring-up phase 1 = READ-ONLY witness of the state ABL left around the MAX77759 I2C bus
++ * (HSI2C12 / USI12 on PERIC1). Spec: docs/research/charger-max77759-gs101.md ("the note") section 8 steps 1-2; answers its open item U1.
++ *
++ * ZERO STORES. This file never writes a hardware register: every window is mapped as `const volatile uint32_t *` (a store through it
++ * does not compile), there is exactly ONE function that dereferences a mapping (chg_hw_rd32), and it is reached only through chg_rd(),
++ * which refuses any (window, offset) outside the independent allowlists below. tools/test_chg_probe.py proves all three on the host.
++ *
++ * Boot-arg sweetchgprobe=0 switches the whole probe off (default ON because it is read-only). Windows and offsets come from the ADT node
++ * /sweet-chg (tools/mkadt.py add_chg_node <- soc/google/gs101/soc.json "chg_probe"); the allowlists here are a second, independent copy.
++ *
++ * Safety property (AP-113): reading a block whose clock is gated can hang the bus. So the CMU / sysreg / pad words are read FIRST (stage A, the same
++ * blocks the touch driver read at handoff on this phone, docs/archive/HANDOFF-s07-s13.md:69,93), the gate decision chg_gate_open() is made from
++ * those words, and ONLY IF it says "open" does stage B read the HSI2C12 registers. Closed = one `SWEET CHG GAP: hsi2c12 clock gated, block not
++ * read (...)` line and no access to the 0x10D50000 window at all. Stage B runs one tick after stage A so the stage A lines have left the log ring
++ * (a hang in stage B then cannot eat them); see sweet_chg_tick().
++ *
++ * Tags: [note X] = the note section X (it carries the source line for each fact); [obs] = observed on hardware; [guess] = not backed by a source.
++ * The logic is portable C: tools/test_chg_probe.py compiles this very file on the host (SWEET_CHG_HOST) with a fake register file.
++ */
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef SWEET_CHG_HOST
++#include "chg_host_env.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
++#define chg_printf(...) printf(__VA_ARGS__)
++#endif
++
++#define chg_log(...)    chg_printf(__VA_ARGS__)
++
++/* ---- windows ---- */
++enum { CHG_W_HSI2C, CHG_W_SYSREG, CHG_W_CMU, CHG_W_TOP, CHG_W_PAD, CHG_W_N };
++
++/* ---- words (roles). Offsets are NOT in this file: they come from the ADT (soc.json); chg_allow[] below is the independent check. ---- */
++enum {
++	CHG_R_MUX, CHG_R_DIV, CHG_R_GIP, CHG_R_GP, CHG_R_GR, CHG_R_QCH,         /* CMU_PERIC1: the six words of note 8 step 2 */
++	CHG_R_TMUX, CHG_R_TDIV, CHG_R_TGATE,                                    /* CMU_TOP: the three words */
++	CHG_R_SW,                                                               /* sysreg_peric1 SW_CONF */
++	CHG_R_PCON, CHG_R_PDAT, CHG_R_PPUD,                                     /* gpp23 */
++	CHG_R_CTL, CHG_R_INTST, CHG_R_FIFOST, CHG_R_CONF, CHG_R_TRANS, CHG_R_FS1, CHG_R_FS2, CHG_R_FS3, CHG_R_USICON,  /* HSI2C12 */
++	CHG_R_N
++};
++
++struct chg_word {
++	int win;
++	const char *prop;       /* ADT property holding the u32 offset */
++	const char *name;       /* log label */
++};
++
++static const struct chg_word chg_words[CHG_R_N] = {
++	[CHG_R_MUX] = { CHG_W_CMU, "w-cmu-usi12-mux", "usi12_mux" },
++	[CHG_R_DIV] = { CHG_W_CMU, "w-cmu-usi12-div", "usi12_div" },
++	[CHG_R_GIP] = { CHG_W_CMU, "w-cmu-usi12-gate-ipclk", "gate_ipclk" },
++	[CHG_R_GP] = { CHG_W_CMU, "w-cmu-usi12-gate-pclk", "gate_pclk" },
++	[CHG_R_GR] = { CHG_W_CMU, "w-cmu-usi12-gate-rstn", "gate_rstn" },
++	[CHG_R_QCH] = { CHG_W_CMU, "w-cmu-usi12-qch", "qch" },
++	[CHG_R_TMUX] = { CHG_W_TOP, "w-top-ip-mux", "top_mux" },
++	[CHG_R_TDIV] = { CHG_W_TOP, "w-top-ip-div", "top_div" },
++	[CHG_R_TGATE] = { CHG_W_TOP, "w-top-ip-gate", "top_gate" },
++	[CHG_R_SW] = { CHG_W_SYSREG, "w-sysreg-usi12-conf", "SW_CONF" },
++	[CHG_R_PCON] = { CHG_W_PAD, "w-gpp23-con", "CON" },
++	[CHG_R_PDAT] = { CHG_W_PAD, "w-gpp23-dat", "DAT" },
++	[CHG_R_PPUD] = { CHG_W_PAD, "w-gpp23-pud", "PUD" },
++	[CHG_R_CTL] = { CHG_W_HSI2C, "w-hsi2c12-ctl", "CTL" },
++	[CHG_R_INTST] = { CHG_W_HSI2C, "w-hsi2c12-int-status", "INT_STATUS" },
++	[CHG_R_FIFOST] = { CHG_W_HSI2C, "w-hsi2c12-fifo-status", "FIFO_STATUS" },
++	[CHG_R_CONF] = { CHG_W_HSI2C, "w-hsi2c12-conf", "CONF" },
++	[CHG_R_TRANS] = { CHG_W_HSI2C, "w-hsi2c12-trans-status", "TRANS_STATUS" },
++	[CHG_R_FS1] = { CHG_W_HSI2C, "w-hsi2c12-timing-fs1", "TIMING_FS1" },
++	[CHG_R_FS2] = { CHG_W_HSI2C, "w-hsi2c12-timing-fs2", "TIMING_FS2" },
++	[CHG_R_FS3] = { CHG_W_HSI2C, "w-hsi2c12-timing-fs3", "TIMING_FS3" },
++	[CHG_R_USICON] = { CHG_W_HSI2C, "w-hsi2c12-usi-con", "USI_CON" },
++};
++
++/*
++ * Independent allowlist: the ONLY (window, offset) pairs chg_rd() will read. Offsets are relative to the window base.
++ * Every entry with its source (note line numbers refer to docs/research/charger-max77759-gs101.md):
++ *   HSI2C12 base 0x10D50000 [note 1.1]: CTL 0x00, INT_STATUS 0x24 (write-1-to-clear: a READ does not clear it), FIFO_STATUS 0x30, CONF 0x40,
++ *     TRANS_STATUS 0x50, TIMING_FS1/2/3 0x60/0x64/0x68 [note 5.1 table]; USI_CON 0xC4 (USI block at +0xC0, CON at +0x04) [note 1.2].
++ *     NOT listed on purpose: RX_DATA 0x38 (a read pops the receive FIFO), TX_DATA 0x34, every other register.
++ *   sysreg_peric1 base 0x10C21000: SW_CONF at +0x10 = 0x10C21010 [note 1.2].
++ *   CMU_PERIC1 base 0x10C00000 [note 1.3]: +0x650 USI12 user mux, +0x1810 divider, +0x2030 IPCLK gate, +0x2050 PCLK gate, +0x206C RSTNSYNC gate,
++ *     +0x3030 QCH.
++ *   CMU_TOP base 0x1E080000 [note 1.3]: +0x10E8 IP mux, +0x18E0 IP divider, +0x2104 IP gate.
++ *   gpp23 pad bank at 0x10C40000 + 0x60 [note 1.4]: CON +0, DAT +4, PUD +8 (DRV +0xC deliberately not read).
++ */
++static const uint32_t chg_allow_hsi2c[] = { 0x00, 0x24, 0x30, 0x40, 0x50, 0x60, 0x64, 0x68, 0xC4 };
++static const uint32_t chg_allow_sysreg[] = { 0x10 };
++static const uint32_t chg_allow_cmu[] = { 0x650, 0x1810, 0x2030, 0x2050, 0x206C, 0x3030 };
++static const uint32_t chg_allow_top[] = { 0x10E8, 0x18E0, 0x2104 };
++static const uint32_t chg_allow_pad[] = { 0x0, 0x4, 0x8 };
++
++static const struct { const uint32_t *v; unsigned n; const char *name; } chg_allow[CHG_W_N] = {
++	[CHG_W_HSI2C] = { chg_allow_hsi2c, sizeof(chg_allow_hsi2c) / sizeof(chg_allow_hsi2c[0]), "hsi2c12" },
++	[CHG_W_SYSREG] = { chg_allow_sysreg, sizeof(chg_allow_sysreg) / sizeof(chg_allow_sysreg[0]), "sysreg_peric1" },
++	[CHG_W_CMU] = { chg_allow_cmu, sizeof(chg_allow_cmu) / sizeof(chg_allow_cmu[0]), "cmu_peric1" },
++	[CHG_W_TOP] = { chg_allow_top, sizeof(chg_allow_top) / sizeof(chg_allow_top[0]), "cmu_top" },
++	[CHG_W_PAD] = { chg_allow_pad, sizeof(chg_allow_pad) / sizeof(chg_allow_pad[0]), "gpp23" },
++};
++
++/* ---- bit fields. All from the note's table of section 1.3 ("same bit layout" for the three gates) unless tagged ---- */
++#define CHG_MUX_SEL     (1u << 4)       /* USI12 user mux: 1 = CLKCMU_PERIC1_IP (CMU_TOP), 0 = OSCCLK_PERIC1 [note 1.3] */
++#define CHG_MUX_BUSY    (1u << 16)      /* mux switching in progress [note 1.3] */
++#define CHG_DIV_MASK    0xfu            /* DIVRATIO [3:0] [note 1.3] */
++#define CHG_GATE_CGVAL  (1u << 21)      /* gate CG_VAL [note 1.3] */
++#define CHG_GATE_AUTO   (1u << 28)      /* gate automatic clock gating [note 1.3] */
++#define CHG_QCH_REQ     (1u << 1)       /* QCH CLOCK_REQ [note 1.3] */
++#define CHG_TMUX_MASK   0x3u            /* CMU_TOP IP mux sel [1:0] [note 1.3] */
++#define CHG_TOP_HZ      400000000u      /* top IP clock 400 MHz at mux param 1, divider 0 [note 1.3 rate rows, GS cmucal-vclk.c:3662-3664] */
++
++static uint32_t chg_off[CHG_R_N];       /* offsets from the ADT, filled by chg_load() */
++static uint32_t chg_wsize[CHG_W_N];     /* window sizes from the ADT */
++static uint32_t chg_nreads;
++
++/*
++ * The only code that touches a mapping. Defined per environment below (kernel: const volatile load; host: fake register file).
++ * Called ONLY from chg_rd().
++ */
++static uint32_t chg_hw_rd32(int win, uint32_t off);
++
++/* Allowlisted read. Returns 0 and fills *v, or -1 (GAP printed, nothing read). */
++static int
++chg_rd(int role, uint32_t *v)
++{
++	int win;
++	uint32_t off;
++	unsigned i;
++
++	if (role < 0 || role >= CHG_R_N) {
++		return -1;
++	}
++	win = chg_words[role].win;
++	off = chg_off[role];
++	if ((off & 3u) != 0 || off + 4u > chg_wsize[win]) {
++		chg_log("SWEET CHG GAP: %s.%s offset 0x%x not inside the %s window (size 0x%x), not read\n",
++		    chg_allow[win].name, chg_words[role].name, off, chg_allow[win].name, chg_wsize[win]);
++		return -1;
++	}
++	for (i = 0; i < chg_allow[win].n; i++) {
++		if (chg_allow[win].v[i] == off) {
++			*v = chg_hw_rd32(win, off);
++			chg_nreads++;
++			return 0;
++		}
++	}
++	chg_log("SWEET CHG GAP: %s.%s offset 0x%x is not on the read allowlist, not read\n",
++	    chg_allow[win].name, chg_words[role].name, off);
++	return -1;
++}
++
++/* ---- decisions (pure functions of the words; the host test drives them with every combination) ---- */
++struct chg_snap {
++	uint32_t w[CHG_R_N];
++	uint8_t ok[CHG_R_N];            /* 1 = the word was read */
++};
++
++#define CHG_HAVE(s, r)  ((s)->ok[r] && (s)->w[r] != 0xffffffffu)       /* all-ones = a dead-bus read, treated as unreadable */
++
++/*
++ * THE SAFETY GATE. Returns 1 only if every condition below holds; otherwise 0 and *why names the first failing one.
++ * Basis: the USI11 chain was in exactly this state at XNU handoff (gates 0x200000, QCH 0x3F0002, mux 0x10, top gate 0x200000) and its SPI block
++ * could be read without a hang [obs docs/archive/HANDOFF-s07-s13.md:69,93,120,126]; USI12 sits in the same CMU with the same bit layout
++ * [note 1.3]. Whether CG_VAL=1 alone opens the clock when MANUAL/auto are 0 is [guess] (the note lists the bits, not their semantics), so the test
++ * is deliberately the conservative "looks like the observed USI11 case":
++ *   1. all of the six CMU_PERIC1 words and the three CMU_TOP words were read and none is 0xFFFFFFFF;
++ *   2. USI12 user mux not busy (bit 16 = 0);
++ *   3. IPCLK, PCLK and RSTNSYNC gates: CG_VAL (bit 21) = 1 and automatic gating (bit 28) = 0;
++ *   4. QCH CLOCK_REQ (bit 1) = 1 (the observed USI11 value 0x3F0002 has it);
++ *   5. if the user mux selects the top IP clock (bit 4 = 1): the CMU_TOP IP gate CG_VAL (bit 21) = 1.
++ * SW_CONF is not part of the test (it was 0 on USI11 at handoff and the SPI block was still readable [obs]); it is logged.
++ */
++static int
++chg_gate_open(const struct chg_snap *s, const char **why)
++{
++	static const int need[] = { CHG_R_MUX, CHG_R_DIV, CHG_R_GIP, CHG_R_GP, CHG_R_GR, CHG_R_QCH, CHG_R_TMUX, CHG_R_TDIV, CHG_R_TGATE };
++	unsigned i;
++
++	for (i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
++		if (!CHG_HAVE(s, need[i])) {
++			*why = "a CMU word was not read or read all-ones";
++			return 0;
++		}
++	}
++	if ((s->w[CHG_R_MUX] & CHG_MUX_BUSY) != 0) {
++		*why = "USI12 user mux busy";
++		return 0;
++	}
++	if ((s->w[CHG_R_GIP] & CHG_GATE_CGVAL) == 0 || (s->w[CHG_R_GIP] & CHG_GATE_AUTO) != 0) {
++		*why = "IPCLK gate not (CG_VAL=1, auto=0)";
++		return 0;
++	}
++	if ((s->w[CHG_R_GP] & CHG_GATE_CGVAL) == 0 || (s->w[CHG_R_GP] & CHG_GATE_AUTO) != 0) {
++		*why = "PCLK (bus) gate not (CG_VAL=1, auto=0)";
++		return 0;
++	}
++	if ((s->w[CHG_R_GR] & CHG_GATE_CGVAL) == 0 || (s->w[CHG_R_GR] & CHG_GATE_AUTO) != 0) {
++		*why = "RSTNSYNC gate not (CG_VAL=1, auto=0)";
++		return 0;
++	}
++	if ((s->w[CHG_R_QCH] & CHG_QCH_REQ) == 0) {
++		*why = "QCH CLOCK_REQ=0";
++		return 0;
++	}
++	if ((s->w[CHG_R_MUX] & CHG_MUX_SEL) != 0 && (s->w[CHG_R_TGATE] & CHG_GATE_CGVAL) == 0) {
++		*why = "user mux selects the top IP clock but the CMU_TOP IP gate CG_VAL=0";
++		return 0;
++	}
++	*why = "open";
++	return 1;
++}
++
++/*
++ * Implied IPCLK in Hz, or 0 with *why (formula from note 1.3 rate table: IPCLK = top IP clock / (DIVRATIO + 1), top IP clock 400 MHz at CMU_TOP
++ * mux 1 / div 0; DIVRATIO 0..3 = 400/200/133/100 MHz are the note's four rows, nothing else is claimed). Decided only when the user mux selects
++ * the top clock; the OSCCLK_PERIC1 rate is not in the note.
++ */
++static uint32_t
++chg_ipclk_hz(const struct chg_snap *s, const char **why)
++{
++	uint32_t div;
++
++	if (!CHG_HAVE(s, CHG_R_MUX) || !CHG_HAVE(s, CHG_R_DIV) || !CHG_HAVE(s, CHG_R_TMUX) || !CHG_HAVE(s, CHG_R_TDIV) || !CHG_HAVE(s, CHG_R_TGATE)) {
++		*why = "a mux/divider word was not read";
++		return 0;
++	}
++	if ((s->w[CHG_R_MUX] & CHG_MUX_BUSY) != 0) {
++		*why = "USI12 user mux busy";
++		return 0;
++	}
++	if ((s->w[CHG_R_MUX] & CHG_MUX_SEL) == 0) {
++		*why = "user mux selects OSCCLK_PERIC1, whose rate is not in the note";
++		return 0;
++	}
++	if ((s->w[CHG_R_TGATE] & CHG_GATE_CGVAL) == 0) {
++		*why = "CMU_TOP IP gate closed, no clock reaches USI12";
++		return 0;
++	}
++	if ((s->w[CHG_R_TMUX] & CHG_TMUX_MASK) != 1u || (s->w[CHG_R_TDIV] & CHG_DIV_MASK) != 0) {
++		*why = "CMU_TOP IP mux/div is not the note's 400 MHz row (mux 1, div 0)";
++		return 0;
++	}
++	div = s->w[CHG_R_DIV] & CHG_DIV_MASK;
++	if (div > 3) {
++		*why = "USI12 DIVRATIO above 3 is outside the note's four rate rows";
++		return 0;
++	}
++	*why = "ok";
++	return CHG_TOP_HZ / (div + 1u);
++}
++
++static void
++chg_snap_read(struct chg_snap *s, int first, int last)
++{
++	int r;
++
++	for (r = first; r <= last; r++) {
++		s->ok[r] = (uint8_t)(chg_rd(r, &s->w[r]) == 0);
++	}
++}
++
++static struct chg_snap chg_s;
++static uint32_t chg_ipclk;
++static int chg_gate;
++static int chg_stage;           /* 0 = not started, 1 = stage A done, 2 = finished */
++static uint64_t chg_a_ms;
++
++/* Stage A: CMU_PERIC1, CMU_TOP, sysreg, the gate decision, gpp23, ipclk. None of these blocks is the gated one. */
++static void
++chg_stage_a(void)
++{
++	const char *why = "";
++	const struct chg_snap *s = &chg_s;
++	uint32_t hz;
++	const char *iw = "";
++
++	chg_log("SWEET CHG P1: start (patch 0283, sweetchgprobe, READ-ONLY: this code has no hardware store; note charger-max77759-gs101 s.8 steps 1-2)\n");
++	chg_snap_read(&chg_s, CHG_R_MUX, CHG_R_TGATE);
++	chg_log("SWEET CHG P1: cmu_peric1 usi12_mux[0x%x]=0x%x usi12_div[0x%x]=0x%x gate_ipclk[0x%x]=0x%x gate_pclk[0x%x]=0x%x gate_rstn[0x%x]=0x%x qch[0x%x]=0x%x\n",
++	    chg_off[CHG_R_MUX], s->w[CHG_R_MUX], chg_off[CHG_R_DIV], s->w[CHG_R_DIV], chg_off[CHG_R_GIP], s->w[CHG_R_GIP],
++	    chg_off[CHG_R_GP], s->w[CHG_R_GP], chg_off[CHG_R_GR], s->w[CHG_R_GR], chg_off[CHG_R_QCH], s->w[CHG_R_QCH]);
++	chg_log("SWEET CHG P1: cmu_top ip_mux[0x%x]=0x%x ip_div[0x%x]=0x%x ip_gate[0x%x]=0x%x\n",
++	    chg_off[CHG_R_TMUX], s->w[CHG_R_TMUX], chg_off[CHG_R_TDIV], s->w[CHG_R_TDIV], chg_off[CHG_R_TGATE], s->w[CHG_R_TGATE]);
++	chg_snap_read(&chg_s, CHG_R_SW, CHG_R_SW);
++	if (s->ok[CHG_R_SW]) {
++		chg_log("SWEET CHG P1: sysreg_peric1 SW_CONF[0x%x]=0x%x (USI mode field [2:0]=%u, I2C = 4; USI11 read 0 at handoff [obs])\n",
++		    chg_off[CHG_R_SW], s->w[CHG_R_SW], s->w[CHG_R_SW] & 7u);
++	} else {
++		chg_log("SWEET CHG GAP: sysreg_peric1 SW_CONF not read\n");
++	}
++
++	chg_gate = chg_gate_open(s, &why);
++	if (chg_gate) {
++		chg_log("SWEET CHG P1: hsi2c12 clock check: open (IPCLK/PCLK/RSTNSYNC CG_VAL=1 auto=0, QCH CLOCK_REQ=1, mux not busy%s)\n",
++		    (s->w[CHG_R_MUX] & CHG_MUX_SEL) != 0 ? ", top IP gate open" : "");
++	} else {
++		chg_log("SWEET CHG GAP: hsi2c12 clock gated, block not read (%s; usi12_mux=0x%x gate_ipclk=0x%x gate_pclk=0x%x gate_rstn=0x%x qch=0x%x top_gate=0x%x)\n",
++		    why, s->w[CHG_R_MUX], s->w[CHG_R_GIP], s->w[CHG_R_GP], s->w[CHG_R_GR], s->w[CHG_R_QCH], s->w[CHG_R_TGATE]);
++	}
++
++	/* step 3: gpp23 (the bank the touch driver already read at handoff [obs docs/archive/HANDOFF-s07-s13.md:69]) */
++	chg_snap_read(&chg_s, CHG_R_PCON, CHG_R_PPUD);
++	if (s->ok[CHG_R_PCON] && s->ok[CHG_R_PDAT] && s->ok[CHG_R_PPUD]) {
++		/* 4 bit/pin CON and PUD, 1 bit/pin DAT [note 1.4]; SCL = pin 4, SDA = pin 5, function 2 and pull-up 3 are what Android sets [note 1.4] */
++		chg_log("SWEET CHG P1: gpp23 CON[0x%x]=0x%x DAT[0x%x]=0x%x PUD[0x%x]=0x%x (pin4 SCL func=%u dat=%u pud=%u; pin5 SDA func=%u dat=%u pud=%u; Android: func 2, pud 3)\n",
++		    chg_off[CHG_R_PCON], s->w[CHG_R_PCON], chg_off[CHG_R_PDAT], s->w[CHG_R_PDAT], chg_off[CHG_R_PPUD], s->w[CHG_R_PPUD],
++		    (s->w[CHG_R_PCON] >> 16) & 0xfu, (s->w[CHG_R_PDAT] >> 4) & 1u, (s->w[CHG_R_PPUD] >> 16) & 0xfu,
++		    (s->w[CHG_R_PCON] >> 20) & 0xfu, (s->w[CHG_R_PDAT] >> 5) & 1u, (s->w[CHG_R_PPUD] >> 20) & 0xfu);
++	} else {
++		chg_log("SWEET CHG GAP: gpp23 pad words not (all) read\n");
++	}
++
++	/* step 4: implied ipclk */
++	hz = chg_ipclk_hz(s, &iw);
++	chg_ipclk = hz;
++	if (hz != 0) {
++		chg_log("SWEET CHG P1: ipclk %u kHz implied (CMU_TOP 400 MHz / (usi12_div[3:0]=%u + 1); stock Android measured 199680 kHz for this block [note 1.3])\n",
++		    hz / 1000u, s->w[CHG_R_DIV] & CHG_DIV_MASK);
++	} else {
++		chg_log("SWEET CHG GAP: ipclk undecided (%s)\n", iw);
++	}
++
++	if (!chg_gate) {
++		chg_log("SWEET CHG P1: done reads=%u (hsi2c12 not touched)\n", chg_nreads);
++		chg_stage = 2;
++		return;
++	}
++	chg_stage = 1;
++}
++
++/* Stage B: only after chg_gate_open() said open in stage A. */
++static void
++chg_stage_b(void)
++{
++	struct chg_snap b;
++	const struct chg_snap *s = &b;
++	uint32_t fs3div;
++	int r;
++
++	if (!chg_gate) {                /* defence in depth: stage B is never reached without the gate */
++		chg_log("SWEET CHG GAP: hsi2c12 stage B entered with a closed gate, block not read\n");
++		chg_stage = 2;
++		return;
++	}
++	for (r = 0; r < CHG_R_N; r++) {
++		b.w[r] = 0;
++		b.ok[r] = 0;
++	}
++	chg_snap_read(&b, CHG_R_CTL, CHG_R_USICON);
++	if (!(s->ok[CHG_R_CTL] && s->ok[CHG_R_INTST] && s->ok[CHG_R_FIFOST] && s->ok[CHG_R_CONF] && s->ok[CHG_R_TRANS] &&
++	    s->ok[CHG_R_FS1] && s->ok[CHG_R_FS2] && s->ok[CHG_R_FS3] && s->ok[CHG_R_USICON])) {
++		chg_log("SWEET CHG GAP: hsi2c12 words not (all) read\n");
++	}
++	chg_log("SWEET CHG P1: hsi2c12 USI_CON[0x%x]=0x%x CTL[0x%x]=0x%x CONF[0x%x]=0x%x FIFO_STATUS[0x%x]=0x%x TIMING_FS1[0x%x]=0x%x TIMING_FS2[0x%x]=0x%x "
++	    "TIMING_FS3[0x%x]=0x%x TRANS_STATUS[0x%x]=0x%x INT_STATUS[0x%x]=0x%x\n",
++	    chg_off[CHG_R_USICON], s->w[CHG_R_USICON], chg_off[CHG_R_CTL], s->w[CHG_R_CTL], chg_off[CHG_R_CONF], s->w[CHG_R_CONF],
++	    chg_off[CHG_R_FIFOST], s->w[CHG_R_FIFOST], chg_off[CHG_R_FS1], s->w[CHG_R_FS1], chg_off[CHG_R_FS2], s->w[CHG_R_FS2],
++	    chg_off[CHG_R_FS3], s->w[CHG_R_FS3], chg_off[CHG_R_TRANS], s->w[CHG_R_TRANS], chg_off[CHG_R_INTST], s->w[CHG_R_INTST]);
++	if (s->ok[CHG_R_FS3]) {
++		fs3div = (s->w[CHG_R_FS3] >> 16) & 0xffu;       /* FS3[23:16] = CLK_DIV [note 5.1]; SCL = IPCLK / ((div + 1) * 16) [note 5.3] */
++		if (chg_ipclk != 0) {
++			chg_log("SWEET CHG P1: hsi2c12 TIMING_FS3 CLK_DIV=%u -> SCL %u Hz at the implied ipclk (stock: DIV 33, 367 kHz [note 5.3])\n",
++			    fs3div, chg_ipclk / ((fs3div + 1u) * 16u));
++		} else {
++			chg_log("SWEET CHG GAP: hsi2c12 TIMING_FS3 CLK_DIV=%u, SCL not computed (ipclk undecided)\n", fs3div);
++		}
++	}
++	chg_log("SWEET CHG P1: done reads=%u\n", chg_nreads);
++	chg_stage = 2;
++}
++
++/* ---- per-environment glue ---- */
++#ifdef SWEET_CHG_HOST
++/* the harness (tools/test_chg_probe.py, tools/chg_host_test.c) defines chg_printf BEFORE including this file and these four AFTER it */
++static int chg_load(void);
++static int chg_arg_off(void);
++static uint64_t chg_now_ms(void);
++#else
++static const volatile uint32_t *chg_va[CHG_W_N];
++
++/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++static int
++chg_arg_off(void)
++{
++	uint32_t v = 1;
++
++	return PE_parse_boot_argn("sweetchgprobe", &v, sizeof(v)) && v == 0;
++}
++
++static uint64_t
++chg_now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++/* The ONLY dereference of a mapping in this file. const volatile: a store here would not compile. */
++static uint32_t
++chg_hw_rd32(int win, uint32_t off)
++{
++	return chg_va[win][off / 4];
++}
++
++static const char * const chg_win_prop[CHG_W_N] = {
++	[CHG_W_HSI2C] = "hsi2c12-reg", [CHG_W_SYSREG] = "sysreg-peric1-reg", [CHG_W_CMU] = "cmu-peric1-reg",
++	[CHG_W_TOP] = "cmu-top-reg", [CHG_W_PAD] = "gpp23-reg",
++};
++
++/* Map the page(s) around [pa, pa+len) and return the virtual address of pa (16 KiB kernel pages: ml_io_map maps whole pages, as the touch driver does). */
++static vm_offset_t
++chg_map(uint64_t pa, uint64_t len)
++{
++	uint64_t base = pa & ~(uint64_t)0x3fffu;
++	uint64_t end = (pa + len + 0x3fffu) & ~(uint64_t)0x3fffu;
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++
++	return va ? va + (vm_offset_t)(pa - base) : 0;
++}
++
++/* ADT /sweet-chg -> windows (mapped read-only) and word offsets. Returns 0 or -1 after printing the GAP. */
++static int
++chg_load(void)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	uint32_t const *off = NULL;
++	unsigned int size = 0;
++	int w, r;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-chg", &node) != kSuccess) {
++		chg_printf("SWEET CHG GAP: no /sweet-chg ADT node, probe not run (build the ADT with tools/mkadt.py for a board with soc.json chg_probe)\n");
++		return -1;
++	}
++	for (w = 0; w < CHG_W_N; w++) {
++		vm_offset_t va;
++
++		if (SecureDTGetProperty(node, chg_win_prop[w], (void const **)&reg, &size) != kSuccess || size < 16 || reg[1] == 0 || reg[1] > 0x10000) {
++			chg_printf("SWEET CHG GAP: /sweet-chg property %s missing or bad, probe not run\n", chg_win_prop[w]);
++			return -1;
++		}
++		va = chg_map(reg[0], reg[1]);
++		if (va == 0) {
++			chg_printf("SWEET CHG GAP: ml_io_map failed for %s, probe not run\n", chg_win_prop[w]);
++			return -1;
++		}
++		chg_va[w] = (const volatile uint32_t *)va;
++		chg_wsize[w] = (uint32_t)reg[1];
++	}
++	for (r = 0; r < CHG_R_N; r++) {
++		if (SecureDTGetProperty(node, chg_words[r].prop, (void const **)&off, &size) != kSuccess || size < 4) {
++			chg_printf("SWEET CHG GAP: /sweet-chg property %s missing, probe not run\n", chg_words[r].prop);
++			return -1;
++		}
++		chg_off[r] = off[0];
++	}
++	return 0;
++}
++#endif /* !SWEET_CHG_HOST */
++
++#define CHG_FORCE_MS    10000u  /* stage B runs anyway when the stage A lines are still unsent after this long */
++
++/*
++ * Called from the USB-log drain thread (bsd/dev/sweet_usb.c ud_log_thread) after each ud_log_round, i.e. once the log socket exists.
++ * log_pending = console bytes not yet sent. Stage A on the first call; stage B on the first later call with nothing pending (so the stage A lines
++ * are on the wire before the gated block is touched), or CHG_FORCE_MS after stage A with a GAP line saying so (never a silent skip, rule 7).
++ */
++void
++sweet_chg_tick(int log_pending)
++{
++	if (chg_stage >= 2) {
++		return;
++	}
++	if (chg_stage == 0) {
++		chg_stage = 3;          /* in progress: no re-entry */
++		if (chg_arg_off()) {
++			chg_log("SWEET CHG P1: disabled by sweetchgprobe=0, nothing read\n");
++			chg_stage = 2;
++			return;
++		}
++		if (chg_load() != 0) {
++			chg_stage = 2;
++			return;
++		}
++		chg_a_ms = chg_now_ms();
++		chg_stage_a();
++		return;
++	}
++	if (chg_stage != 1) {
++		return;
++	}
++	if (log_pending) {
++		if (chg_now_ms() - chg_a_ms < CHG_FORCE_MS) {
++			return;
++		}
++		chg_log("SWEET CHG GAP: stage A log lines still unsent %u ms after stage A, hsi2c12 stage B runs anyway (clock check was open)\n", CHG_FORCE_MS);
++	}
++	chg_stage_b();
++}

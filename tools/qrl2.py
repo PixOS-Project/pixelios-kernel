@@ -79,7 +79,7 @@ def parse_frame(text):
     """Frame, or None when this is not a (valid) QL2 frame."""
     try:
         body = b45decode(text)
-    except ValueError:
+    except ValueError:   # lint-silent: expected a frame whose text is not base45 is camera noise, not a frame: None
         return None
     if len(body) < 12 or body[0] >> 4 != 2 or zlib.crc32(body[:-4]) != int.from_bytes(body[-4:], "little"):
         return None
@@ -92,7 +92,7 @@ def parse_frame(text):
         f.seed = 0
         if f.kind:
             f.seed, pos = varint(body, pos)
-    except ValueError:
+    except ValueError:   # lint-silent: expected a frame with a truncated varint is camera noise: None
         return None
     f.payload = body[pos:-4]
     return f
@@ -236,7 +236,7 @@ class Stream:
         rlen, stored = rl2 >> 1, rl2 & 1
         try:
             raw = body if stored else qrz_codec.inflate(body)
-        except Exception:
+        except (ValueError, zlib.error):   # lint-silent: expected a corrupt or short stream is a bad unit: counted in bad_units on the next line and reported
             raw = None
         if raw is None or len(raw) != rlen or zlib.crc32(raw) != crc:
             self.bad_units += 1

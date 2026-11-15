@@ -1,0 +1,63 @@
+sweet-ufs-ssd (lowclk 2026-11-14, group A item A4; design: docs/research/159-gap-io-network-bt-usb-userland.md storage section, tracker L-24): the UFS disk answers DKIOCISSOLIDSTATE = 1 and DKIOCGETFEATURES = 0 instead of ENOTTY. NO HARDWARE ACCESS: two constant answers in the ioctl, no register, no UFS command.
+Effect [read from source, xnu-8796.141.3 as patched; not run]: vfs_init_io_attributes (bsd/vfs/vfs_subr.c:4313-4316) sets MNTK_SSD on the root mount; the cluster I/O path asks disk_conditioner_mount_is_ssd(mp) (bsd/miscfs/specfs/spec_vnops.c:2617, bsd/vfs/vfs_disk_conditioner.c:310-318) and passes it as isssd to throttle_info_update_internal (spec_vnops.c:2632), which picks the 5/15/25 ms low-priority periods (throttle_io_period_ssd_msecs, spec_vnops.c:192-198) instead of 40/85/200 ms (spec_vnops.c:186-190). Other readers of MNTK_SSD: vnode_isonssd (bsd/vfs/kpi_vfs.c:1763-1770), imageboot (bsd/kern/imageboot.c:346).
+Correction to research 159: the specfs-open path (spec_vnops.c:362-377, si_isssd) asks DKIOCISSOLIDSTATE only when DKIOCGETTHROTTLEMASK succeeds; the driver still answers that with ENOTTY (unchanged), so si_throttleable stays 0 there. The effect above comes through the mount flag, not si_isssd.
+Feature bits (bsd/sys/disk.h:87-89 BARRIER 0x2, PRIORITY 0x4, UNMAP 0x10; disk.h:235 FORCE_UNIT_ACCESS 0x1): all left 0. The driver sends no FUA bit, has no UNMAP command, no barrier and no priority queue, so no bit is claimed. With GETFEATURES answering, vfs_init_io_attributes (vfs_subr.c:4318-4321) now continues and fails one query later at DKIOCGETMAXBYTECOUNTREAD (still ENOTTY, on purpose: answering it would also enable the segment limits at vfs_subr.c:4380-4415); both callers ignore the return value (vfs_subr.c:1306, vfs_syscalls.c:1634), so mount attributes are unchanged except MNTK_SSD.
+Log (rule 7): one line at the first query of each: "SWEET UFS: DKIOCISSOLIDSTATE answered 1 ..." and "SWEET UFS: DKIOCGETFEATURES answered 0 ...".
+Host test: tools/test_ufs_ssd_ioctl.py compiles the added function from this patch text against a fake ioctl number set and checks the answers, the one-line logs, the ENOTTY default and (mutants) that a set feature bit fails it. Not run on hardware.
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -883,6 +883,44 @@
+ 	buf_biodone(bp);
+ }
+ 
++/*
++ * Patch 0358 (lowclk A4): the two disk-attribute queries XNU asks at mount, answered without any hardware access.
++ * DKIOCISSOLIDSTATE = 1: UFS flash is not rotational. XNU reads it in vfs_init_io_attributes (bsd/vfs/vfs_subr.c:4313) and sets MNTK_SSD, which
++ * the cluster I/O throttle then reads through disk_conditioner_mount_is_ssd (bsd/vfs/vfs_disk_conditioner.c:310-318, called at
++ * bsd/miscfs/specfs/spec_vnops.c:2617) to pick the 5/15/25 ms low-priority I/O periods instead of 40/85/200 ms (spec_vnops.c:176-198).
++ * DKIOCGETFEATURES = 0: every bit left clear on purpose. bsd/sys/disk.h:87-89,235 defines BARRIER 0x2, PRIORITY 0x4, UNMAP 0x10 and
++ * FORCE_UNIT_ACCESS 0x1; this driver sends no FUA bit (grep FUA: none), has no UNMAP command, no barrier and no priority queue, so claiming
++ * any of them would be false. Before this patch the ioctl failed with ENOTTY and vfs_init_io_attributes returned there (vfs_subr.c:4318-4321);
++ * the caller ignores the return value (vfs_subr.c:1306), so the only change from a success here is that it now fails one query later, at
++ * DKIOCGETMAXBYTECOUNTREAD (still ENOTTY, not answered on purpose: answering it would also turn on the segment limits of vfs_subr.c:4380-4415).
++ * Not changed: si_isssd in specfs (spec_vnops.c:362-377) is only read when DKIOCGETTHROTTLEMASK succeeds, and it still returns ENOTTY.
++ * One log line at the first query of each (rule 7: the answers are a decision, not a silent default).
++ */
++static int sweet_ufs_ssd_logged, sweet_ufs_feat_logged;
++
++static int
++sweet_ufs_disk_attr(u_long cmd, uint32_t *f)
++{
++	switch (cmd) {
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
++		if (!sweet_ufs_ssd_logged) {
++			sweet_ufs_ssd_logged = 1;
++			printf("SWEET UFS: DKIOCISSOLIDSTATE answered 1 (flash; XNU sets MNTK_SSD, SSD throttle periods)\n");
++		}
++		return 0;
++	case DKIOCGETFEATURES:
++		*f = 0;
++		if (!sweet_ufs_feat_logged) {
++			sweet_ufs_feat_logged = 1;
++			printf("SWEET UFS: DKIOCGETFEATURES answered 0 (no FUA, no unmap, no barrier, no priority: the driver has none)\n");
++		}
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
+ static int
+ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
+@@ -932,6 +970,9 @@
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+ 		*o = 1;
+ 		return 0;
++	case DKIOCISSOLIDSTATE:
++	case DKIOCGETFEATURES:
++		return sweet_ufs_disk_attr(cmd, f);
+ 	default:
+ 		return ENOTTY;
+ 	}

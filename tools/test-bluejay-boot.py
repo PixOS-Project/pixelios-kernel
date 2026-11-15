@@ -54,6 +54,8 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import audit_memo  # noqa: E402
+import audit_pool, gpuclk_audit, mifclk_audit  # noqa: E402
+import audit_wlanh1  # noqa: E402  H1 (docs/research/90) wiring rules + mutants, moved out of this 5k-line file (T-191f)
 
 SCSI_WRITE_OPCODES = {
     0x0A: "WRITE(6)",
@@ -1370,7 +1372,7 @@ def _strip_c_comments(src: str) -> str:
 
 
 def _c_function_span(code: str, name: str) -> tuple[int, int]:
-    m = re.search(r"\b(?:static\s+)?(?:const\s+)?(?:int|void|uint32_t|unsigned|char|uint64_t|uintptr_t)(?:\s+|\s*\*+\s*)" + name + r"\s*\([^)]*\)\s*\{", code)
+    m = re.search(r"\b(?:static\s+)?(?:const\s+)?(?:int|int32_t|void|uint32_t|unsigned|char|uint64_t|uintptr_t)(?:\s+|\s*\*+\s*)" + name + r"\s*\([^)]*\)\s*\{", code)
     assert m, f"usbgadget source audit: function {name} not found"
     depth, i = 1, m.end()
     while depth and i < len(code):
@@ -1427,6 +1429,87 @@ def check_usbgadget_source_text(src: str, name: str = "usbgadget.c",
                 raise AssertionError(f"{name}: 'volatile' outside r32 (a second MMIO writer?)")
         if re.search(r"\(\s*(?:const\s+)?(?:volatile\s+)?[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*\s*\*+\s*\)", code):
             raise AssertionError(f"{name}: explicit pointer cast is banned in the hardware writer")
+
+
+def _braced_body(code: str, name: str) -> tuple[int, str]:
+    """Offset and body of 'name(...) {' (definition: preceded by a type word, not a call)."""
+    m = re.search(r"\b(?:void|int)\b[^;{}()]*(?:\(\([^;{}]*\)\)\s*)?\b" + name + r"\s*\([^)]*\)\s*\{", code)
+    assert m, f"REBOOT_BL source audit: function {name} not found"
+    depth, i = 1, m.end()
+    while depth and i < len(code):
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        i += 1
+    assert depth == 0, f"REBOOT_BL source audit: unbalanced braces in {name}"
+    return m.end(), code[m.end():i - 1]
+
+
+def _under_reboot_bl(code: str, pos: int) -> bool:
+    """True if offset pos is in the 'then' branch of an enclosing '#ifdef REBOOT_BL'."""
+    stack: list[bool] = []
+    off = 0
+    for line in code.splitlines(keepends=True):
+        if off > pos:
+            break
+        d = line.strip()
+        if re.match(r"#\s*ifdef\s+REBOOT_BL\b", d):
+            stack.append(True)
+        elif re.match(r"#\s*(if|ifdef|ifndef)\b", d):
+            stack.append(False)
+        elif re.match(r"#\s*(else|elif)\b", d) and stack:
+            stack[-1] = False
+        elif re.match(r"#\s*endif\b", d) and stack:
+            stack.pop()
+        off += len(line)
+    return any(stack)
+
+
+def check_reboot_bl_source_text(src: str, name: str = "shim.c") -> None:
+    """The REBOOT_BL bootloader-reset arm (a PMU SMC write, docs/research/10) must be compiled only under
+    REBOOT_BL, only reset when the 0xfc readback matches, and run before usb_gadget_finish."""
+    code = _strip_c_comments(src)
+    for fn in ("bluejay_bootloader_arm", "bluejay_reset_bootloader"):
+        for m in re.finditer(r"\b" + fn + r"\b", code):
+            if not _under_reboot_bl(code, m.start()):
+                raise AssertionError(f"{name}: {fn} referenced outside #ifdef REBOOT_BL")
+    base, body = _braced_body(code, "bluejay_reset_bootloader")
+    rd = re.search(r"try_read32\(\s*sysip\s*,\s*&now\s*\)", body)
+    gate = re.search(r"if\s*\(\s*now\s*!=\s*0xfc\s*\)\s*\{[^{}]*\breturn\s*;\s*\}", body)
+    smc = re.search(r"\bsmc\([^;]*\bswreset\b", body)
+    if not (rd and gate and smc):
+        raise AssertionError(f"{name}: bluejay_reset_bootloader lacks readback, 0xfc gate with return, or the SWRESET smc")
+    if not (rd.start() < gate.start() and gate.end() <= smc.start()):
+        raise AssertionError(f"{name}: SWRESET smc is not after the 0xfc readback gate")
+    pbase, pbody = _braced_body(code, "bluejay_probe")
+    arm = re.search(r"\bbluejay_bootloader_arm\s*\(\s*\)\s*;", pbody)
+    fin = re.search(r"\busb_gadget_finish\s*\(\s*\)\s*;", pbody)
+    if not (arm and fin and arm.start() < fin.start()):
+        raise AssertionError(f"{name}: bluejay_bootloader_arm() is not before usb_gadget_finish() in bluejay_probe")
+
+
+def reboot_bl_source_selftest() -> int:
+    good = (pathlib.Path(__file__).resolve().parents[1] / "shim" / "shim.c").read_text()
+    check_reboot_bl_source_text(good)  # control must pass
+    arm_call = "\tbluejay_bootloader_arm();\t/* readback goes out over USB in the remaining gadget window */\n"
+    cases = [
+        ("gate disabled", good.replace("if (now != 0xfc) {", "if (0) {", 1)),
+        ("gate does not return", good.replace('wait_ticks(counter_freq() * 8);\n\t\treturn;', 'wait_ticks(counter_freq() * 8);', 1)),
+        ("swreset before the readback", good.replace("try_read32(sysip, &now);", "smc(0x82000504UL, swreset, 1, 2);\n\ttry_read32(sysip, &now);", 1)),
+        ("arm after usb_gadget_finish", good.replace(arm_call, "", 1).replace("\tusb_gadget_finish();\n\tpstore_save();", "\tusb_gadget_finish();\n#ifdef REBOOT_BL\n\tbluejay_bootloader_arm();\n#endif\n\tpstore_save();", 1)),
+        ("arm call outside REBOOT_BL", good.replace("#ifdef REBOOT_BL\n" + arm_call + "#endif\n", arm_call, 1)),
+        ("arm helper compiled always", good.replace("#ifdef REBOOT_BL\n/* Reset INTO", "/* Reset INTO", 1).replace("\tbluejay_reset_bootloader();", "\tbluejay_reset_bootloader();", 1)),
+    ]
+    caught = 0
+    for label, bad in cases:
+        assert bad != good, f"REBOOT_BL source selftest case did not mutate: {label}"
+        try:
+            check_reboot_bl_source_text(bad, "selftest")
+        except AssertionError as exc:
+            caught += 1
+            print(f"self-test caught: REBOOT_BL source {label} -> {exc}")
+        else:
+            raise AssertionError(f"REBOOT_BL source self-test FAILED to catch: {label}")
+    print(f"PASS REBOOT_BL source self-test: {caught}/{len(cases)} bad sources rejected")
+    return caught
 
 
 def usbgadget_source_selftest() -> int:
@@ -1559,6 +1642,16 @@ _GPUPOWER_ALLOW = ("if(pa==G_SHADER_ON||pa==G_SHADER_OFF)returnv==GPU_SHADER_PRE
                    "if(pa==G_L2_OFF)returnv==GPU_L2_PRESENT;return0;")
 # --gpu-power=stack (-DGPU_POWER_STACK): exactly two more entries, each only with the stack-present mask
 _GPUPOWER_ALLOW_STACK = _GPUPOWER_ALLOW.replace("return0;", "if(pa==G_STACK_ON||pa==G_STACK_OFF)returnv==GPU_STACK_PRESENT;return0;")
+# power_on(): the whole ON sequence, whitespace-free; every write only after the previous step came up (tiler, L2 wait, [stacks, wait], shaders, wait).
+_GPUPOWER_ON_STACK_STEP = ('e=w32(G_STACK_ON,GPU_STACK_PRESENT);if(e)returnuname(e,"refused:stack","fault:stack");'
+                           'if(!wait_for(G_STACK_RDY,GPU_STACK_PRESENT,G_STACK_TR))return"timeout:stack";')
+_GPUPOWER_ON = ('{inte=w32(G_TILER_ON,GPU_TILER_PRESENT);if(e)returnuname(e,"refused:tiler","fault:tiler");'
+                'if(!wait_for(G_TILER_RDY,GPU_TILER_PRESENT,G_TILER_TR))return"timeout:tiler";'
+                'if(!wait_for(G_L2_RDY,GPU_L2_PRESENT,G_L2_TR))return"timeout:l2";@STACK@'
+                'e=w32(G_SHADER_ON,GPU_SHADER_PRESENT);if(e)returnuname(e,"refused:shader","fault:shader");'
+                'if(!wait_for(G_SHADER_RDY,GPU_SHADER_PRESENT,G_SHADER_TR))return"timeout:shader";return"ok";}')
+_GPUPOWER_ON_STACK = _GPUPOWER_ON.replace("@STACK@", _GPUPOWER_ON_STACK_STEP)
+_GPUPOWER_ON = _GPUPOWER_ON.replace("@STACK@", "")
 
 
 def _gpupower_variant(src: str, stack: bool, job: bool = False) -> str:
@@ -1616,16 +1709,16 @@ def _check_gpupower_variant(src: str, name: str, stack: bool) -> None:
     body = re.sub(r"\s+", "", code[a:b][code[a:b].index("{") + 1:-1])
     if body != (_GPUPOWER_ALLOW_STACK if stack else _GPUPOWER_ALLOW):
         raise AssertionError(f"{name}: w32_allowed is not the audited allowlist (plain: four LO words, stack variant: six; each only with its present mask): {body}")
-    # no write before the preconditions were checked: precheck() has no writer, and the first w32( in gpu_power_cycle follows the refusal
+    # no write before the preconditions were checked: precheck() has no writer, gpu_power_cycle() has no w32( of its own, and its power_on() (the ON writes) follows the refusal
     pa_, pb_ = _c_function_span(code, "precheck")
     if re.search(r"\bw32\s*\(", code[pa_:pb_]):
         raise AssertionError(f"{name}: precheck must be read-only")
     ca, cb = _c_function_span(code, "gpu_power_cycle")
     cyc = code[ca:cb]
     refuse = re.search(r"if\s*\(\s*why\s*\)\s*\{[^{}]*return\s+1\s*;\s*\}", cyc)
-    first_w = re.search(r"\bw32\s*\(", cyc)
+    first_w = re.search(r"\bpower_on\s*\(", cyc)
     if "why = precheck()" not in cyc or not refuse or not first_w or first_w.start() < refuse.end():
-        raise AssertionError(f"{name}: gpu_power_cycle must call precheck() and return on a refusal before its first w32()")
+        raise AssertionError(f"{name}: gpu_power_cycle must call precheck() and return on a refusal before its first power_on()")
     # bounded waits only: the single while is put_txt's string copy; no for(;;), do/while or goto
     if re.search(r"\bgoto\b|\bdo\s*\{|for\s*\(\s*;", code):
         raise AssertionError(f"{name}: unbounded loop construct")
@@ -1663,7 +1756,7 @@ def _check_gpupower_variant(src: str, name: str, stack: bool) -> None:
     for fn in names:
         if reaches(fn, fn):
             raise AssertionError(f"{name}: {fn} is (mutually) recursive")
-    # the only writes: the two ON calls in gpu_power_cycle and w32(reg, r) in power_off; power_off is called exactly for shaders then L2
+    # the only writes: the ON calls in power_on and w32(reg, r) in power_off; power_off is called exactly for shaders then L2
     wcalls = [re.sub(r"\s+", "", m.group(0)) for m in re.finditer(r"(?<![\w])w32\s*\([^;]*?\)(?=\))|(?<![\w])w32\s*\([^()]*\)", code)]
     wcalls = [c for c in wcalls if not c.startswith("w32(uintptr_tpa")]
     want_w = ["w32(G_TILER_ON,GPU_TILER_PRESENT)", "w32(G_SHADER_ON,GPU_SHADER_PRESENT)", "w32(reg,r)"]
@@ -1673,25 +1766,25 @@ def _check_gpupower_variant(src: str, name: str, stack: bool) -> None:
         raise AssertionError(f"{name}: the plain build mentions the core-stack registers/mask (they are --gpu-power=stack only)")
     if sorted(wcalls) != sorted(want_w):
         raise AssertionError(f"{name}: unexpected w32() call sites: {wcalls}")
-    for fn, want in (("gpu_power_cycle", 3 if stack else 2), ("power_off", 1)):
+    for fn, want in (("power_on", 3 if stack else 2), ("gpu_power_cycle", 0), ("power_off", 1)):
         fa, fb = _c_function_span(code, fn)
         if len(re.findall(r"\bw32\s*\(", code[fa:fb])) != want:
-            raise AssertionError(f"{name}: w32 call sites are only allowed in gpu_power_cycle (ON) and power_off")
+            raise AssertionError(f"{name}: w32 call sites are only allowed in power_on (ON) and power_off")
     cyc_norm = re.sub(r"\s+", "", cyc)
     offs = ["power_off(G_SHADER_OFF,G_SHADER_RDY,G_SHADER_TR,GPU_SHADER_PRESENT)", "power_off(G_L2_OFF,G_L2_RDY,G_L2_TR,GPU_L2_PRESENT)"]
     if stack:
         offs.insert(1, "power_off(G_STACK_OFF,G_STACK_RDY,G_STACK_TR,GPU_STACK_PRESENT)")
         if not 0 <= cyc_norm.find(offs[0]) < cyc_norm.find(offs[1]) < cyc_norm.find(offs[2]):
             raise AssertionError(f"{name}: OFF order must be shaders, stacks, L2")
-        if not 0 <= cyc_norm.find("w32(G_TILER_ON") < cyc_norm.find("w32(G_STACK_ON") < cyc_norm.find("w32(G_SHADER_ON"):
-            raise AssertionError(f"{name}: ON order must be tiler/L2, stacks, shaders")
-        if "elseif((e=w32(G_STACK_ON" not in cyc_norm or "elseif((e=w32(G_SHADER_ON" not in cyc_norm:
-            raise AssertionError(f"{name}: STACK_PWRON / SHADER_PWRON must stay in the else-if chain behind the tiler/L2 wait")
-        if not 0 <= cyc_norm.find("wait_for(G_STACK_RDY,GPU_STACK_PRESENT,G_STACK_TR)") < cyc_norm.find("w32(G_SHADER_ON"):
-            raise AssertionError(f"{name}: the stacks must be ready before SHADER_PWRON")
+    on_a, on_b = _c_function_span(code, "power_on")
+    on_norm = re.sub(r"\s+", "", code[on_a:on_b])
+    if on_norm[on_norm.index("{"):] != (_GPUPOWER_ON_STACK if stack else _GPUPOWER_ON):
+        raise AssertionError(f"{name}: power_on is not the audited ON sequence (tiler, L2 wait, [stacks, wait], shaders; each write only after the previous step came up): {on_norm}")
     for want in offs:
         if cyc_norm.count(want) != 1:
             raise AssertionError(f"{name}: gpu_power_cycle must call {want} exactly once (the OFF sequence)")
+    if cyc_norm.count("up=power_on();") != 1 or len(re.findall(r"\bpower_on\s*\(", code)) != 2 or not 0 <= cyc_norm.find("up=power_on();") < cyc_norm.find(offs[0]):
+        raise AssertionError(f"{name}: gpu_power_cycle must call power_on() exactly once (its only caller), before the OFF sequence")
     if not 0 <= cyc_norm.find("wait_idle(G_TILER_TR)") < cyc_norm.find("power_off(G_L2_OFF"):
         raise AssertionError(f"{name}: gpu_power_cycle must drain TILER_PWRTRANS (wait_idle(G_TILER_TR)) before power_off(G_L2_OFF, ...)")
     if cyc_norm.find("power_off(G_SHADER_OFF") > cyc_norm.find("power_off(G_L2_OFF"):
@@ -1720,8 +1813,8 @@ def check_gpupower_variant_text(disasm: str, stack: bool, name: str) -> None:
                              f"{n_e20}+{n_e30} STACK_PWRON/PWROFF immediates, expected {want[0]} / {want[1]} and {want[2]}+0")
 
 
-def gpupower_object_variant_selftest(obj_path: pathlib.Path, stack: bool) -> int:
-    disasm = _touch_obj_info(obj_path)[0]
+def gpupower_object_variant_selftest(info, stack: bool) -> int:
+    disasm = info[0]
     check_gpupower_variant_text(disasm, stack, "gpupower variant selftest")  # control
     other = "bl\t0 <w32>\n"
     cases = [("an extra w32 call site", disasm + "0000000000ffff00 <evil>:\n  ffff00:\t94000000 \t" + other),
@@ -1778,15 +1871,15 @@ def gpupower_source_selftest() -> int:
         ("OFF sequence skipped (shaders)", good.replace("d = power_off(G_SHADER_OFF, G_SHADER_RDY, G_SHADER_TR, GPU_SHADER_PRESENT);", "d = 0;", 1)),
         ("stack allowlist leaks into the plain build",
          good.replace("#ifdef GPU_POWER_STACK\n\tif (pa == G_STACK_ON || pa == G_STACK_OFF)\n\t\treturn v == GPU_STACK_PRESENT;\n#endif\n", "\tif (pa == G_STACK_ON || pa == G_STACK_OFF)\n\t\treturn v == GPU_STACK_PRESENT;\n", 1)),
-        ("STACK_PWRON loses its else (runs after a failed tiler/L2 wait)", good.replace("\telse if ((e = w32(G_STACK_ON", "\tif ((e = w32(G_STACK_ON", 1)),
+        ("STACK_PWRON runs after a failed tiler/L2 wait (its early return removed)", good.replace('\t\treturn "timeout:l2";\n', "\t\t(void)0;\n", 1)),
         ("stack allowlist accepts any value", good.replace("return v == GPU_STACK_PRESENT;", "return 1;", 1)),
         ("STACK_PWROFF moved (0xe34)", good.replace("G_STACK_OFF\t(GPU_MALI + 0xe30u)", "G_STACK_OFF\t(GPU_MALI + 0xe34u)", 1)),
         ("STACK_PWRON written in the plain build",
-         good.replace("#ifdef GPU_POWER_STACK\n\telse if ((e = w32(G_STACK_ON", "\telse if ((e = w32(G_STACK_ON", 1).replace("\t\tup = \"timeout:stack\";\n#endif\n", "\t\tup = \"timeout:stack\";\n", 1)),
+         good.replace("#ifdef GPU_POWER_STACK\n\te = w32(G_STACK_ON", "\te = w32(G_STACK_ON", 1).replace("\t\treturn \"timeout:stack\";\n#endif\n", "\t\treturn \"timeout:stack\";\n", 1)),
         ("stacks powered off after the L2",
          good.replace("#ifdef GPU_POWER_STACK\n\tif (!d) {\t/* corestack path", "#ifdef GPU_POWER_STACK\n\tif (d == 99) {\t/* corestack path", 1).replace("d = power_off(G_L2_OFF, G_L2_RDY, G_L2_TR, GPU_L2_PRESENT);", "d = power_off(G_L2_OFF, G_L2_RDY, G_L2_TR, GPU_L2_PRESENT);\n\t\t\td = power_off(G_STACK_OFF, G_STACK_RDY, G_STACK_TR, GPU_STACK_PRESENT);", 1)),
         ("stacks switched on after the shaders",
-         good.replace("	else if ((e = w32(G_STACK_ON, GPU_STACK_PRESENT)))", "	else if ((e = w32(G_STACK_ON, GPU_STACK_PRESENT)) && 0)", 1).replace("	else if (!wait_for(G_STACK_RDY, GPU_STACK_PRESENT, G_STACK_TR))\n\t\tup = \"timeout:stack\";\n#endif\n", "#endif\n", 1)),
+         re.sub(r"(#ifdef GPU_POWER_STACK\n\te = w32\(G_STACK_ON.*?#endif\n)(.*?)(\treturn \"ok\";)", r"\2\1\3", good, count=1, flags=re.S)),
         ("stack variant skips the STACK_PRESENT check", good.replace('return "stack-present-mismatch";', "(void)w;", 1)),
         ("L2 off without draining the tiler", good.replace("if (wait_idle(G_TILER_TR)) {", "if (1) {", 1)),
         ("precheck lost the STACK_PWRTRANS refusal", good.replace('return "stack-busy";', "(void)v;", 1)),
@@ -1813,9 +1906,8 @@ def gpupower_source_selftest() -> int:
 # ---- gpuclk.c (--gpu-clk): no MMIO of its own; asks the audited ACPM DVFS client (acpm.c) for the GPU init rate, G3DL2 then G3D ----
 _GPUCLK_ALLOWED_UNDEF = {
     "con_str", "counter_freq", "wait_ticks",                                  # console
-    "acpm_cfg_init", "acpm_why", "acpm_describe", "acpm_dvfs_get",           # the audited ACPM client (reads; its writes are audited in acpm.o)
-    "acpm_dvfs_reassert",                                                     # GPU_CLK images only: G3D / G3DL2, ceiling rate only (acpm.c)
-    "gpu_probe_cmu",                                                          # gpuprobe.c: read-only CMU_G3D dump
+    "acpm_cfg_init", "acpm_why", "acpm_describe", "acpm_dvfs_get", "acpm_dvfs_reassert",   # the audited ACPM client (reads; reassert: GPU_CLK images, G3D / G3DL2, table rows <= ceiling; its writes are audited in acpm.o)
+    "gpu_probe_cmu", "gpu_probe_pmu_on", "gpu_rails_uv", "pstore_save",       # read-only CMU/PMU dumps (gpuprobe.c), rail uV readback (gpurails.c), pstore checkpoint (gpu_clk_handover)
 }
 
 
@@ -1835,28 +1927,29 @@ def check_gpuclk_source_text(src: str, name: str = "gpuclk.c") -> None:
     for m in re.finditer(r"\bwhile\b", code):
         if not any(a <= m.start() < b for a, b in spans):
             raise AssertionError(f"{name}: 'while' outside the string helpers (retry loops are not allowed: no write is retried)")
-    if len(re.findall(r"\bacpm_dvfs_reassert\s*\(", code)) != 1 or "e=acpm_dvfs_reassert(&c,dom,GPU_CLK_KHZ,&t);" not in norm:
-        raise AssertionError(f"{name}: exactly one request site is allowed: acpm_dvfs_reassert(&c, dom, GPU_CLK_KHZ, &t)")
+    if len(re.findall(r"\bacpm_dvfs_reassert\s*\(", code)) != 1 or "e=acpm_dvfs_reassert(&c,dom,want,&t);" not in norm:
+        raise AssertionError(f"{name}: exactly one request site is allowed: acpm_dvfs_reassert(&c, dom, want, &t)")
     if "#defineIDX_G3DL2GPU_FVMAP_IDX_G3DL2" not in norm:
         raise AssertionError(f"{name}: IDX_G3DL2 must be the soc.json G3DL2 index")
     if "#defineIDX_G3DGPU_FVMAP_IDX_G3D" not in norm:
         raise AssertionError(f"{name}: IDX_G3D must be the soc.json G3D index")
     ga, gb = _c_function_span(code, "gpu_clk")
     body = re.sub(r"\s+", "", code[ga:gb])
-    if body.count("dom=k?IDX_G3D:IDX_G3DL2;") != 3:
-        raise AssertionError(f"{name}: the three loops (GET, request, read-back) must visit k=0 -> G3DL2 first, then G3D (kbase gpu_dvfs_set_initial_level order)")
+    if body.count("dom=k?IDX_G3D:IDX_G3DL2;") != 2:
+        raise AssertionError(f"{name}: the GET loop and the read-back loop must visit k=0 -> G3DL2 first, then G3D")
+    gpuclk_audit.check_level(code, norm, body, name)  # T-a214 (tools/gpuclk_audit.py): DT pair targets, uV table, request order, PMU first, gaps named
     req = body.find("acpm_dvfs_reassert(")
     pre = body[:req]
-    for need in ("if(!c.dvfs_ch)", "if(!c.layout_verified)", "if(!c.elem_unit_verified)", "if(!counter_freq())", "e=acpm_describe(&c,&h);if(e){",
-                 "if(h.rr!=h.rf||h.sr!=h.sf)", "e=get_one(&c,dom,&cur[k],&t);"):
+    for need in ("if(!c.dvfs_ch)", "if(!c.layout_verified)", "if(!c.elem_unit_verified)", "if(!counter_freq())", "if(!gpu_probe_pmu_on()){", "e=acpm_describe(&c,&h);if(e){",
+                 "if(h.rr!=h.rf||h.sr!=h.sf)", "e=get_one(&c,dom,&cur[k],&t);", "if(cur[0]<cur[1]){", "if(!up&&!(TGT_G3DL2<=cur[0]&&TGT_G3D<=cur[1])){"):
         if need not in pre:
             raise AssertionError(f"{name}: '{need}' must come before the first request")
     # every refusal before the request returns without a request; the first GET loop returns on error
-    if pre.count("return1;") < 7:
+    if pre.count("return1;") < 10:
         raise AssertionError(f"{name}: the pre-request refusals must all return")
     if not re.search(r"e=get_one\(&c,dom,&cur\[k\],&t\);if\(e\)\{[^}]*return1;\}", pre):
         raise AssertionError(f"{name}: a failing first GET must stop before any request")
-    if not re.search(r"for\(k=0;k<2&&!bad;k\+\+\)\{dom=k\?IDX_G3D:IDX_G3DL2;t\.n=0;e=acpm_dvfs_reassert\(&c,dom,GPU_CLK_KHZ,&t\);", body):
+    if not re.search(r"for\(k=0;k<2&&!bad;k\+\+\)\{dom=\(k\^ord\)\?IDX_G3D:IDX_G3DL2;want=dom==IDX_G3D\?TGT_G3D:TGT_G3DL2;t\.n=0;e=acpm_dvfs_reassert\(&c,dom,want,&t\);", body):
         raise AssertionError(f"{name}: the request loop must stop at the first failure (no retry, no second domain)")
     if "gpu_probe_cmu();" not in body or body.find("gpu_probe_cmu();") < body.find("wait_ticks("):
         raise AssertionError(f"{name}: the CMU words are printed again after the request and the settle wait")
@@ -1869,11 +1962,11 @@ def gpuclk_source_selftest() -> int:
         ("inline asm", good.replace("static const char *dname", 'static void evil(void) { __asm__ volatile("str wzr, [x0]"); }\nstatic const char *dname', 1)),
         ("a raw MMIO writer", good.replace("static const char *dname", "static void evil(void) { try_write32(0x1c400140UL, 0x80000010u); }\nstatic const char *dname", 1)),
         ("a pointer cast", good.replace("static const char *dname", "static void evil(uintptr_t pa) { *(uint32_t *)pa = 0; }\nstatic const char *dname", 1)),
-        ("the CPU request function", good.replace("e = acpm_dvfs_reassert(&c, dom, GPU_CLK_KHZ, &t);", "e = acpm_dvfs_set(&c, dom, GPU_CLK_KHZ, &t);", 1)),
-        ("another rate", good.replace("e = acpm_dvfs_reassert(&c, dom, GPU_CLK_KHZ, &t);", "e = acpm_dvfs_reassert(&c, dom, 848000, &t);", 1)),
+        ("the CPU request function", good.replace("e = acpm_dvfs_reassert(&c, dom, want, &t);", "e = acpm_dvfs_set(&c, dom, want, &t);", 1)),
+        ("another rate", good.replace("e = acpm_dvfs_reassert(&c, dom, want, &t);", "e = acpm_dvfs_reassert(&c, dom, 848000, &t);", 1)),
         ("G3D before G3DL2 in the request loop",
-         good.replace("for (k = 0; k < 2 && !bad; k++) {\n\t\tdom = k ? IDX_G3D : IDX_G3DL2;", "for (k = 0; k < 2 && !bad; k++) {\n\t\tdom = k ? IDX_G3DL2 : IDX_G3D;", 1)),
-        ("a retry loop", good.replace("\t\tif (e)\n\t\t\tbad = 1;", "\t\twhile (e)\n\t\t\te = acpm_dvfs_reassert(&c, dom, GPU_CLK_KHZ, &t);", 1)),
+         good.replace("for (k = 0; k < 2 && !bad; k++) {\n\t\tdom = (k ^ ord) ? IDX_G3D : IDX_G3DL2;", "for (k = 0; k < 2 && !bad; k++) {\n\t\tdom = (k ^ ord) ? IDX_G3DL2 : IDX_G3D;", 1)),
+        ("a retry loop", good.replace("\t\tif (e)\n\t\t\tbad = 1;", "\t\twhile (e)\n\t\t\te = acpm_dvfs_reassert(&c, dom, want, &t);", 1)),
         ("the second domain is asked after a failure", good.replace("k < 2 && !bad; k++", "k < 2; k++", 1)),
         ("no layout gate", good.replace("if (!c.layout_verified) {", "if (0) {", 1)),
         ("no elem-unit gate", good.replace("if (!c.elem_unit_verified) {", "if (0) {", 1)),
@@ -1881,7 +1974,7 @@ def gpuclk_source_selftest() -> int:
         ("a failing first GET does not stop", good.replace("\t\tif (e) {\n\t\t\tsay_txt(\"result: \", \"REFUSED-or-FAILED at the first GET, nothing written\", \"\");\n\t\t\treturn 1;\n\t\t}", "\t\t(void)e;", 1)),
         ("queues not checked", good.replace("if (h.rr != h.rf || h.sr != h.sf) {", "if (0) {", 1)),
         ("the other index for G3D", good.replace("#define IDX_G3D\t\tGPU_FVMAP_IDX_G3D", "#define IDX_G3D\t\t2", 1)),
-    ]
+    ] + gpuclk_audit.source_cases(good)
     caught = 0
     for label, bad in cases:
         assert bad != good, f"gpuclk source selftest case did not mutate: {label}"
@@ -1921,7 +2014,7 @@ def check_gpurails_source_text(src: str, name: str = "gpurails.c") -> None:
         raise AssertionError(f"{name}: exactly one read site is allowed: acpm_s11_read(&c, regs[k], &v[k], &t) with regs = ACPM_S11_REGS")
     if "staticconstuint32_tregs[ACPM_S11_NREG]={ACPM_S11_REGS};" not in norm or "for(k=0;k<ACPM_S11_NREG;k++){" not in norm:
         raise AssertionError(f"{name}: the register list must be soc.json's ACPM_S11_REGS, read in one bounded loop")
-    ga, gb = _c_function_span(code, "gpu_rails")
+    ga, gb = _c_function_span(code, "gpu_rails_uv")
     body = re.sub(r"\s+", "", code[ga:gb])
     req = body.find("acpm_s11_read(")
     pre = body[:req]
@@ -2099,7 +2192,7 @@ def gpurailon_selftest() -> int:
         ("shim: handover block after loader_boot", check_shim_rail_sequence, shim_src, "con_str(\"SECTION\", \"GPU handover (rail on, left on)\");", "con_str(\"SECTION\", \"GPU handover (rail on, left on)\");\n\tfor (;;) { }"),
         ("shim: handover restore for every result", check_shim_rail_sequence, shim_src, "if (gpu_ho == RAIL_UNVERIFIED || gpu_ho == RAIL_MISMATCH)", "if (1)"),
         ("shim: no restore after loader_boot failed", check_shim_rail_sequence, shim_src, "if (gpu_ho == RAIL_ON_OK)\t/* loader_boot returned", "if (0)\t/* loader_boot returned"),
-        ("shim: handover wrapped in #if 0", check_shim_rail_sequence, shim_src, "int gpu_ho;\n", "int gpu_ho;\n#if 0\n#endif\n"),
+        ("shim: handover wrapped in #if 0", check_shim_rail_sequence, shim_src, "int gpu_ho;", "int gpu_ho;\n#if 0\n#endif"),
         ("on: inline asm", check_gpurailon_source_text, on_src, "static void emit(", 'static void evil(void) { __asm__ volatile("str wzr, [x0]"); }\nstatic void emit('),
         ("on: a raw writer", check_gpurailon_source_text, on_src, "static void emit(", "static void evil(void) { try_write32(0x17610040UL, 1); }\nstatic void emit("),
         ("on: no preflight before the enable", check_gpurailon_source_text, on_src, "if (preflight(&c))\n\t\treturn RAIL_REFUSED;", "if (0)\n\t\treturn RAIL_REFUSED;"),
@@ -2152,8 +2245,8 @@ def check_acpm_rail_set_object_text(disasm: str, name: str, required: bool) -> N
         raise AssertionError(f"{name}: unexpected constants in acpm_s11_rail_set")
 
 
-def gpurailon_object_selftest(obj_path: pathlib.Path) -> int:
-    disasm = _touch_obj_info(obj_path)[0]
+def gpurailon_object_selftest(info) -> int:
+    disasm = info[0]
     check_acpm_rail_set_object_text(disasm, "acpm_railon selftest", True)
     cases = [("a fourth xfer call", disasm.replace("bl\t7e0 <xfer>", "bl\t7e0 <xfer>\n  ffff0:\t97fffd00 \tbl\t7e0 <xfer>", 1) if False else None)]
     cases = [
@@ -2427,8 +2520,8 @@ def _mut_site(disasm: str, old: str, new: str) -> str:
     return disasm[:j] + new + disasm[j + len(old):]
 
 
-def wlanen_w32_object_selftest(obj_path: pathlib.Path) -> int:
-    disasm = _touch_obj_info(obj_path)[0]
+def wlanen_w32_object_selftest(info) -> int:
+    disasm = info[0]
     check_wlanen_w32_object_text(disasm, "wlanen selftest")  # control must pass
     wblk = re.search(r"(?ms)^[0-9a-f]+ <w32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
     specialised = ("0000000000000100 <w32>:\n 100:\ta9bd7bfd \tstp\tx29, x30, [sp, #-48]!\n 104:\t94000000 \tbl\t0 <try_read32>\n"
@@ -2774,8 +2867,8 @@ def check_wlansmc_object(obj_path: pathlib.Path, iso: bool = False) -> int:
     return check_wlansmc_object_text(disasm, undefined, local_text, sections, str(obj_path), iso)
 
 
-def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
-    disasm, undefined, local_text, sections = _touch_obj_info(obj_path)
+def wlansmc_object_selftest(info, iso: bool = False) -> int:
+    disasm, undefined, local_text, sections = info
     check_wlansmc_object_text(disasm, undefined, local_text, sections, "wlansmc selftest", iso)  # control
     cases = [
         ("another function id", re.sub(r"(mov\s+x0, )#0x504", r"\1#0x505", disasm, count=1), undefined),
@@ -3173,7 +3266,7 @@ def wlan_seq_selftest() -> int:
     check_wlan_seq_table(doc, header)  # control must pass
 
     def mut(fn, pin=None):
-        d = copy.deepcopy(doc)
+        d = json.loads(json.dumps(doc))   # doc came from json.loads: a JSON round trip is the same deep copy at ~1/30 of copy.deepcopy's cost (351 mutants)
         fn(d)
         h = boards.wlan_seq_render(d) if pin is not False else header
         return d, h
@@ -3730,7 +3823,7 @@ def wlan_seq_selftest() -> int:
     ]
     caught = 0
     for label, fn, pin, why in cases:
-        d = copy.deepcopy(doc)
+        d = json.loads(json.dumps(doc))   # same deep copy as copy.deepcopy for JSON data, ~30x faster
         fn(d)
         try:
             h = boards.wlan_seq_render(d)
@@ -3858,7 +3951,7 @@ def check_wlanlink_source_text(src: str, name: str = "wlanlink.c", pins: bool = 
     if "if(r.blk!=WLB_PMU||r.off!=0x3EC4u||r.mask!=1u)returnST_REFUSED;" not in norm:
         raise AssertionError(f"{name}: the SMC row must be PMU 0x3EC4 mask 1")
     # pins: constants, probe rule, refusal before the first write, teardown always, bounded loops
-    for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
+    for need in ("_Static_assert(WLAN_ATU==WLAN_DBI+0x300000u,", "_Static_assert(WLAN_CFG==0x60FFE000UL,", "_Static_assert(WLAN_MEM==0x60000000UL,", "#defineDELAY_MAX_US250000ull", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
                  "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
                  "if(r.a==1u)*probed|=need_probe(r.blk);",
                  "if(r.a&2u)step_line('R',r.step,\"\",1,idx,1,v,0,0);if(r.a&4u){if(v==0xFu)*probed|=EOT_SEEN;elseif(r.a&8u)returnST_REFUSED;}if((r.a&16u)&&v!=0xFFFFFFFFu&&(v&0x20200u)==0x20200u)*probed|=SRP_UP;if((r.a&64u)&&v!=0xFFFFFFFFu&&(v&0x3E0u)!=0u)*probed|=BANK_ROM;returnST_OK;",
@@ -3959,7 +4052,7 @@ def wlanlink_source_selftest() -> int:
         ("hold: another hold step", good.replace("#define WLAN_HOLD_STEP\t30u", "#define WLAN_HOLD_STEP\t31u", 1)),
         ("hold: summary says restore=ok when held", good.replace('held ? " restore=held" : tear_bad', 'tear_bad', 1)),
         ("hold: teardown skipped by another route", good.replace("\tif (held)\n\t\tstarted = 0;", "\tif (held)\n\t\thi = 0;", 1)),
-        ("longer delay", good.replace("#define DELAY_MAX_US	250000u", "#define DELAY_MAX_US	2500000u", 1)),
+        ("longer delay", good.replace("#define DELAY_MAX_US	250000ull", "#define DELAY_MAX_US	2500000ull", 1)),
         ("another default N", good.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	WLAN_SEQ_LAST", 1)),
         ("teardown never marked started", good.replace("\t\tstarted = 1;\n", "", 1)),
         ("teardown hi not tracked", good.replace("\t\thi = s;\n", "", 1)),
@@ -4719,6 +4812,7 @@ def check_shim_wlan_sequence(src: str, name: str = "shim.c") -> None:
     ho = norm.rfind("#ifdefWLAN_HOLD", 0, hi)
     if len(re.findall(r"\bwlan_link_hold\s*\(", code)) != 1 or hi < 0 or not 0 <= mk < ho < hi < lb or lowest < 0 or depth < 1 or "#endif" in norm[ho:hi]:
         raise AssertionError(f"{name}: wlan_link_hold() must be called exactly once, as `wlan_hold_rc=wlan_link_hold();` inside #ifdef WLAN_HOLD inside the BOOT_XNU section (after its marker, same #if level), before loader_boot(dtb)")
+    audit_wlanh1.check_call_site(src, name)	# H1: wlan_h1_after_hold(wlan_hold_rc) right after wlan_link_hold(), never wlan_h1_run() itself
     # the #error is at file scope (review 21 F2): equal #if / #endif counts before it
     er = norm.find("#ifdefined(WLAN_HOLD)&&!(defined(WLAN_LINK_RUN)&&defined(BOOT_XNU))#error")
     depth_at = lambda i: len(re.findall(r"#if", norm[:i])) - len(re.findall(r"#endif", norm[:i]))
@@ -4764,6 +4858,7 @@ def wlan_shim_selftest() -> int:
         ("a second wlan_link_run call", shim_src.replace("\t(void)wlan_link_run();\n", "\t(void)wlan_link_run();\n\t(void)wlan_link_run();\n", 1)),
         ("wlan_link_run outside its flag", shim_src.replace("#if defined(WLAN_LINK_RUN) && !defined(WLAN_HOLD)\n\t/* W3a", "#if 1\n\t/* W3a", 1)),
         ("wlan_link_run runs a second time in a hold image", shim_src.replace("#if defined(WLAN_LINK_RUN) && !defined(WLAN_HOLD)\n\t/* W3a", "#ifdef WLAN_LINK_RUN\n\t/* W3a", 1)),
+        *audit_wlanh1.cases(shim_src),
         ("a second wlan_link_hold call", shim_src.replace("\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", "\twlan_hold_rc = wlan_link_hold(&wlan_held);\n\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", 1)),
         ("wlan_link_hold outside its flag", shim_src.replace("#ifdef WLAN_HOLD\n\t/* --boot-xnu --wlan-hold", "#if 1\n\t/* --boot-xnu --wlan-hold", 1)),
         ("wlan_link_hold after loader_boot", shim_src.replace("\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", "", 1).replace("\t\tconst char *why = loader_boot(dtb);\n", "\t\tconst char *why = loader_boot(dtb);\n\t\twlan_hold_rc = wlan_link_hold(&wlan_held);\n", 1)),
@@ -4801,7 +4896,7 @@ _GPUJOB_REGS = {   # every A_* define of gpujob.c: GPU_CONTROL / JOB_CONTROL / M
     "A_AS_COMMAND": "0x2418u", "A_AS_FAULTSTATUS": "0x241cu", "A_AS_FAULTADDR_LO": "0x2420u", "A_AS_STATUS": "0x2428u",
     "A_AS_TRANSCFG_LO": "0x2430u", "A_AS_TRANSCFG_HI": "0x2434u", "A_GPU_FAULT": "0x003cu", "A_SHADER_READY": "0x0140u",
 }
-_GPUJOB_ALLOW = ("if(pa>=j->base&&pa<j->base+NPAGES*PG)return!(pa&3u);"
+_GPUJOB_ALLOW = ("if(pa>=j->base&&pa<j->base+(uintptr_t)NPAGES*PG)return!(pa&3u);"
                  "if(pa==A_AS_TRANSCFG_LO)returnv==GPU_JOB_TRANSCFG_ON||v==GPU_JOB_TRANSCFG_OFF;"
                  "if(pa==A_AS_TRANSCFG_HI)returnv==0;"
                  "if(pa==A_AS_MEMATTR_LO)returnv==GPU_JOB_MEMATTR_LO;"
@@ -4818,7 +4913,7 @@ _GPUJOB_ALLOW = ("if(pa>=j->base&&pa<j->base+NPAGES*PG)return!(pa&3u);"
                  "if(pa==A_JOB_CLEAR||pa==A_MMU_CLEAR)returnv==IRQ_SLOT0_BITS;return0;")
 # the page-table builder is pinned TEXTUALLY: every next-level PA is derived from j->base inside entry(), so the GPU's translation can only lead into the five scratch pages
 _GPUJOB_ENTRY = "{uint64_tpa=(uint64_t)(j->base+next);returnput64(j,at,(uint32_t)pa|flags,(uint32_t)(pa>>32));}"
-_GPUJOB_BUILD = ("{inte=0;for(unsignedi=0;i<NPAGES*PG/4u&&!e;i++)e=w32(j->base+4u*i,0,j);if(e)returne;"
+_GPUJOB_BUILD = ("{inte=0;for(uintptr_ti=0;i<NPAGES*PG/4u&&!e;i++)e=w32(j->base+4u*i,0,j);if(e)returne;"
                  "e=entry(j,0x0000u,0x1000u,GPU_JOB_PTE_TABLE);if(!e)e=entry(j,0x1000u,0x2000u,GPU_JOB_PTE_TABLE);if(!e)e=entry(j,0x2000u,0x3000u,GPU_JOB_PTE_TABLE);"
                  "if(!e)e=entry(j,0x3000u+8u*1u,0x4000u,GPU_JOB_PTE_LEAF);if(!e)e=w32(j->base+0x4000u+0x10u,GPU_JOB_HDR_W4,j);"
                  "if(!e)e=put64(j,0x4000u+0x20u,GPU_JOB_TARGET_VA,0);if(!e)e=w32(j->base+0x4000u+0x28u,GPU_JOB_WV_IMM64,j);"
@@ -4936,7 +5031,7 @@ def gpujob_source_selftest() -> int:
         ("w32_allowed always returns 1", re.sub(r"(static int w32_allowed\(uintptr_t pa, uint32_t v, const struct jctx \*j\)\n\{).*?\n\}\n", r"\1\n\treturn 1;\n}\n", good, count=1, flags=re.S)),
         ("GPU_COMMAND allowed (soft reset)", good.replace("\tif (pa == A_JOB_CLEAR || pa == A_MMU_CLEAR)", "\tif (pa == GPU_MALI + 0x30u)\n\t\treturn v == 1;\n\tif (pa == A_JOB_CLEAR || pa == A_MMU_CLEAR)", 1)),
         ("any TRANSCFG value", good.replace("return v == GPU_JOB_TRANSCFG_ON || v == GPU_JOB_TRANSCFG_OFF;", "return 1;", 1)),
-        ("the scratch window widened", good.replace("pa < j->base + NPAGES * PG", "pa < j->base + 64u * PG", 1)),
+        ("the scratch window widened", good.replace("pa < j->base + (uintptr_t)NPAGES * PG", "pa < j->base + 64u * PG", 1)),
         ("any JS0 command", good.replace("return v == JS_CMD_HARDSTOP_1;", "return v < 8;", 1)),
         ("any IRQ clear value", good.replace("return v == IRQ_SLOT0_BITS;", "return 1;", 1)),
         ("LOCKADDR register defined", good.replace("#define A_GPU_FAULT", "#define A_AS_LOCKADDR\t(GPU_MALI + 0x2410u)\n#define A_GPU_FAULT", 1)),
@@ -5009,10 +5104,10 @@ def check_touchprobe_object(obj_path: pathlib.Path, allowed_undef: set[str] = _T
     return check_touchprobe_object_text(disasm, undefined, local_text, sections, str(obj_path), allowed_undef)
 
 
-def touchprobe_object_selftest(obj_path: pathlib.Path, allowed_undef: set[str] = _TOUCH_ALLOWED_UNDEF,
+def touchprobe_object_selftest(info, allowed_undef: set[str] = _TOUCH_ALLOWED_UNDEF,
                                tag: str = "touchprobe") -> int:
-    """Mutations of the real object's disassembly: each must be rejected."""
-    disasm, undefined, local_text, sections = _touch_obj_info(obj_path)
+    """Mutations of the real object's disassembly (info = _touch_obj_info of it, via _memo_obj): each must be rejected."""
+    disasm, undefined, local_text, sections = info
     check_touchprobe_object_text(disasm, undefined, local_text, sections, f"{tag} selftest", allowed_undef)  # control
     evil = ("0000000000ffff00 <evil>:\n"
             "  ffff00:\td2a22229 \tmovz\tx9, #0x1111, lsl #16\n"
@@ -5184,18 +5279,56 @@ def check_boot_header(path: pathlib.Path) -> tuple:
 
 
 def _memo(fn, arg: bytes = b"", *args):
-    """Run one of the three expensive mutation self-tests through tools/audit_memo.py (never the audit of the real objects)."""
-    return audit_memo.run(lambda: fn(*args), arg, script=__file__, name=fn.__name__)
+    """Run a mutation self-test through tools/audit_memo.py (never the audit of the real objects, which stay outside). fn must be a pure function of
+    its arguments, this script and the files it opens (the open hook keys those); one that starts a process is cold every time and says so in the stats (rule 8)."""
+    return audit_pool.dispatch(lambda: audit_memo.run(lambda: fn(*args), arg, script=__file__, name=fn.__name__), fn.__name__)
+
+
+# K3 (PLAN-GATE-2X): the self-tests below run in a process pool (GATE_AUDIT_JOBS, default 4, 1 = serial; tools/audit_pool.py) and their return value is not read. Only a self-test that is a pure
+# function of its arguments + this script goes through _memo/_memo_obj: all 28 are synthetic-fixture text checks (read from source: none calls subprocess or writes a file); objdump/nm
+# (_touch_obj_info) and the gcc host tests stay in main(), outside the pool. A self-test that starts a process or writes a shared file must NOT be passed to _memo: call it inline
+# (tools/test_audit_memo.py PoolWiring greps every function given to _memo/_memo_obj for subprocess/Popen/file writes; there is no exemption list).
+
+
+_MEMO_CANARIES = ("wlan_seq_selftest", "wlanlink_source_selftest")  # no-arg memo entries of the self-tests that read wlan_seq.json / wlanlink.c: a cold one means an edited input; check-all.sh only logs warm/cold (K3: no serial warm-up build any more)
+
+
+def _obj_text(text: str, obj_path: pathlib.Path) -> str:
+    """objdump/nm print the object's path as given ('out/gate/build-fast-0/wlanlink.o: file format ...'): a key that contains it never hits in another build
+    dir. The self-tests run on the text with that path replaced by the file name, so key and input are the same bytes (the real audits keep the raw text)."""
+    return text.replace(str(obj_path), obj_path.name)
+
+
+def _memo_obj(fn, obj_path: pathlib.Path, *extra):
+    """fn(info, *extra) memoized, info = _touch_obj_info(obj_path) with the path removed. objdump/nm run here, outside the memo (a process is never storable);
+    the key is every byte fn sees: disasm, undefined and local symbols, section table, the extra args (sets sorted) and fn's name."""
+    info = _touch_obj_info(obj_path)
+    info = (_obj_text(info[0], obj_path), info[1], info[2], _obj_text(info[3], obj_path))
+    arg = json.dumps([info[0], sorted(info[1]), sorted(info[2]), info[3], extra], default=sorted).encode()
+    return audit_pool.dispatch(lambda: audit_memo.run(lambda: fn(info, *extra), arg, script=__file__, name=fn.__name__), fn.__name__)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("boot_image", type=pathlib.Path, nargs="*", help="one or more boot images: header checks per image, the tree audit once")
     parser.add_argument("--out", type=pathlib.Path, help="the build output dir to audit (shim/build.sh --out); default shim/out")
+    parser.add_argument("--memo-warm", action="store_true", help="check-all.sh: exit 0 if the audit memo holds the entries of the two expensive self-tests for this script and their inputs (warm), 1 if not (empty or stale; check-all.sh only logs it), then exit")
     parser.add_argument("--no-memo", action="store_true", help="run the three expensive self-tests every time (also PIXELIOS_AUDIT_NO_MEMO=1); see tools/audit_memo.py")
     parser.add_argument("--wlan-link-effective", type=int, help="build.sh: the effective WLAN_LINK_N of the wlanlink.o it just built (checked against --wlan-link-explicit, then exit)")
     parser.add_argument("--wlan-link-explicit", default="", help="build.sh: the N typed as --wlan-link=N ('' = none)")
+    parser.add_argument("--el2-objects", action="store_true", help="build.sh --el2-trap: audit the EL2 objects of --out (tools/el2_audit.py, spec 3.8/B4) and run its mutation self-test, then exit")
     args = parser.parse_args()
+    if args.memo_warm:
+        w = all(audit_memo.warm(__file__, n) for n in _MEMO_CANARIES)
+        print(f"RESULT: {'WARM' if w else 'COLD'} audit memo {audit_memo.cache_dir()}")
+        sys.exit(0 if w else 1)
+    if args.el2_objects:
+        import el2_audit  # the rules and their mutants live in tools/el2_audit.py (this file is already 5k lines); sys.path has tools/
+        try:
+            el2_audit.audit(args.out or pathlib.Path(__file__).resolve().parent.parent / "shim" / "out")
+        except el2_audit.AuditError as e:
+            sys.exit(f"FAIL el2 object audit: {e}")
+        return
     if args.wlan_link_effective is not None:
         check_wlan_link_n(args.wlan_link_effective, args.wlan_link_explicit)
         print(f"PASS wlan-link N: effective N={args.wlan_link_effective} (explicit {args.wlan_link_explicit or 'none: default'})")
@@ -5203,22 +5336,19 @@ def main() -> None:
     assert args.boot_image, "boot_image required"
     if args.no_memo:
         audit_memo.disable()
-    headers = [check_boot_header(path) for path in args.boot_image]
+    audit_pool.run(lambda: _audit_main(args), audit_pool.jobs_from_env())
 
+
+def _audit_main(args) -> None:
+    headers = [check_boot_header(path) for path in args.boot_image]
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     out_dir = args.out or repo_root / "shim" / "out"
     check_ufs_safety(repo_root / "shim" / "ufs.c")
-    ufs_safety_selftest()
-    check_usb_safety(repo_root / "shim" / "usbprobe.c")
-    check_usb_safety(repo_root / "shim" / "usbprobe.h")
-    check_usb_safety(repo_root / "shim" / "wlanprobe.c")
-    check_usb_safety(repo_root / "shim" / "wlanprobe.h")
-    check_usb_safety(repo_root / "shim" / "gpuprobe.c")
-    check_usb_safety(repo_root / "shim" / "gpuprobe.h")
-    check_usb_safety(repo_root / "shim" / "gpus2mpu.c")
-    check_usb_safety(repo_root / "shim" / "gpus2mpu.h")
-    usb_safety_selftest()
-    usb_object_selftest()
+    _memo(ufs_safety_selftest)
+    for src_name in ("usbprobe.c", "usbprobe.h", "wlanprobe.c", "wlanprobe.h", "gpuprobe.c", "gpuprobe.h", "gpus2mpu.c", "gpus2mpu.h", "wlanh1.c", "wlanh1.h"):
+        check_usb_safety(repo_root / "shim" / src_name)
+    _memo(usb_safety_selftest)
+    _memo(usb_object_selftest)
     n_stores = check_usb_object(out_dir / "usbprobe.o")
     print(f"PASS usb object audit: {n_stores} stores, all stack-based; "
           "undef/.data/.bss/instruction bans clean")
@@ -5231,102 +5361,108 @@ def main() -> None:
     n_stores = check_usb_object(out_dir / "gpus2mpu.o")
     print(f"PASS gpus2mpu object audit: {n_stores} stores, all stack-based "
           "(same read-only policy as gpuprobe.o: the S2MPU is never written)")
-    usbproto_object_selftest()
+    print(audit_wlanh1.object_audit(out_dir, check_usb_object))
+    _memo(usbproto_object_selftest)
     n_stores = check_usbproto_object(out_dir / "usbproto.o")
     print(f"PASS usbproto object audit: {n_stores} stores, all stack/arg/"
           "adrp-image based; undef empty; bans clean")
     n_stores = check_usbproto_object(out_dir / "usbpool.o")
     print(f"PASS usbpool object audit: {n_stores} stores, all stack/arg/"
           "adrp-image based; undef empty; bans clean (same no-MMIO audit as usbproto.o)")
-    usbgadget_source_selftest()
+    _memo(usbgadget_source_selftest)
     check_usbgadget_source_text((repo_root / "shim" / "usbgadget.c").read_text())
     print("PASS usbgadget source audit: no asm; try_write32 and the DWC3 base only in w32/r32; "
           "no literal pointer casts; w32 consults its exact allowlist")
-    usbgadget_object_selftest()
+    _memo(reboot_bl_source_selftest)
+    check_reboot_bl_source_text((repo_root / "shim" / "shim.c").read_text())
+    print("PASS REBOOT_BL source audit: arm/reset only under #ifdef REBOOT_BL; SWRESET smc only after the 0xfc "
+          "readback gate; arm before usb_gadget_finish")
+    _memo(usbgadget_object_selftest)
     check_usbgadget_object(out_dir / "usbgadget.o")
     print("PASS usbgadget writer audit: try_write32 referenced only by a "
           "bl inside w32; undef subset; no banned instructions")
-    touchprobe_source_selftest()
+    _memo(touchprobe_source_selftest)
     check_usbgadget_source_text((repo_root / "shim" / "touchprobe.c").read_text(), "touchprobe.c", **_TOUCH_KW)
     print("PASS touchprobe source audit: no asm / volatile / pointer casts; try_write32 only in w32; w32 checks "
           "w32_allowed before writing; allowlist depends on the address")
-    touchprobe_object_selftest(out_dir / "touchprobe.o")
+    _memo_obj(touchprobe_object_selftest, out_dir / "touchprobe.o")
     n_stores = check_touchprobe_object(out_dir / "touchprobe.o")
     print(f"PASS touchprobe object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, "
           "all stack/argument based; undef subset; no banned instructions")
-    acpm_source_selftest()
+    _memo(acpm_source_selftest)
     check_usbgadget_source_text((repo_root / "shim" / "acpm.c").read_text(), "acpm.c", **_ACPM_KW)
     print("PASS acpm source audit: no asm / volatile / pointer casts; try_write32 only in w32; w32 checks "
           "w32_allowed before writing; allowlist depends on the address (this proves the write PATH; the ADDRESSES come from SRAM "
           "words checked by acpm_describe and by shim/acpm_host_test.c test_guard, not by this audit)")
-    gpupower_source_selftest()
+    _memo(gpupower_source_selftest)
     check_gpupower_source_text((repo_root / "shim" / "gpupower.c").read_text())
     print("PASS gpupower source audit: no asm / volatile / pointer casts; try_write32 only in w32; w32 checks w32_allowed before "
           "writing; the allowlist is exactly SHADER_PWRON/TILER_PWRON/SHADER_PWROFF/L2_PWROFF (LO words) with the present masks; "
           "precheck() before the first write; waits bounded by GP_POLLS (cap 200000) and CNTPCT; no recursion / loop-variable writes; w32 call sites pinned")
     for stack, objname in ((False, "gpupower.o"), (True, "gpupower_stack.o")):
         obj = out_dir / objname
-        gpupower_object_variant_selftest(obj, stack)
+        _memo_obj(gpupower_object_variant_selftest, obj, stack)
         check_gpupower_variant_text(_touch_obj_info(obj)[0], stack, objname)
         print(f"PASS {objname} variant audit: {'4 + 2 (STACK_PWRON/STACK_PWROFF)' if stack else '4'} audited write sites, STACK_PWRON offset {'present once' if stack else 'absent'}")
         if stack:
-            touchprobe_object_selftest(obj, _GPUPOWER_ALLOWED_UNDEF, "gpupower_stack")
+            _memo_obj(touchprobe_object_selftest, obj, _GPUPOWER_ALLOWED_UNDEF, "gpupower_stack")
             n_stores = check_touchprobe_object(obj, _GPUPOWER_ALLOWED_UNDEF)
             print(f"PASS gpupower_stack object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based")
-    touchprobe_object_selftest(out_dir / "gpupower.o", _GPUPOWER_ALLOWED_UNDEF, "gpupower")
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpupower.o", _GPUPOWER_ALLOWED_UNDEF, "gpupower")
     n_stores = check_touchprobe_object(out_dir / "gpupower.o", _GPUPOWER_ALLOWED_UNDEF)
     print(f"PASS gpupower object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, "
           "all stack/argument based; undef subset {try_read32,try_write32,con_str,touch_ticks,counter_freq}; no banned instructions")
-    gpuclk_source_selftest()
+    _memo(gpuclk_source_selftest)
     check_gpuclk_source_text((repo_root / "shim" / "gpuclk.c").read_text())
-    print("PASS gpuclk source audit: no asm / volatile / pointer casts / MMIO accessors; no acpm_dvfs_set; one request site "
-          "acpm_dvfs_reassert(GPU_CLK_KHZ) in the order G3DL2 then G3D, after every ACPM gate and a clean first GET; no retry loops")
-    touchprobe_object_selftest(out_dir / "gpuclk.o", _GPUCLK_ALLOWED_UNDEF, "gpuclk")
+    print("PASS gpuclk source audit: no asm / volatile / pointer casts / MMIO accessors; no acpm_dvfs_set; one request site acpm_dvfs_reassert(want), per-domain target = init rate or one DT pair, order from the GET values, after the PMU read and every ACPM gate; no retry loops")
+    gpuclk_audit.audit(repo_root, out_dir, _memo_obj, touchprobe_object_selftest, check_touchprobe_object, _GPUCLK_ALLOWED_UNDEF, _strip_c_comments, _c_function_span)
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpuclk.o", _GPUCLK_ALLOWED_UNDEF, "gpuclk")
     n_stores = check_touchprobe_object(out_dir / "gpuclk.o", _GPUCLK_ALLOWED_UNDEF)
     print(f"PASS gpuclk object audit: no try_write32/try_read32 reference; {n_stores} stores, all stack/argument based; undef subset (the audited ACPM client, console, gpu_probe_cmu)")
-    gpurails_source_selftest()
+    mifclk_audit.audit(repo_root, out_dir, _memo_obj, touchprobe_object_selftest, check_touchprobe_object, _touch_obj_info, _strip_c_comments, _c_function_span)
+    _memo(gpurails_source_selftest)
     check_gpurails_source_text((repo_root / "shim" / "gpurails.c").read_text())
     print("PASS gpurails source audit: read-only; no asm / volatile / pointer casts / MMIO accessors; the only ACPM call is acpm_s11_read over soc.json's register list, "
           "after every ACPM gate; the first failure stops the loop")
-    touchprobe_object_selftest(out_dir / "gpurails.o", _GPURAILS_ALLOWED_UNDEF, "gpurails")
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpurails.o", _GPURAILS_ALLOWED_UNDEF, "gpurails")
     n_stores = check_touchprobe_object(out_dir / "gpurails.o", _GPURAILS_ALLOWED_UNDEF)
     print(f"PASS gpurails object audit: no try_write32/try_read32 reference; {n_stores} stores, all stack/argument based; undef subset (the audited ACPM client, console)")
-    gpurailon_selftest()
+    _memo(gpurailon_selftest)
     print("PASS gpu-rail-on source audit: acpm_s11_rail_set = one UPDATE of S2MPG11 0x15 under mask 0xC0 with value 0x40/0x00 behind the 'must be off' and OUT1-window guards; "
           "gpurailon.c has no MMIO, two rail-set sites (enable once, restore once); shim.c skips the power cycle unless the rail is verified on and restores after it, always")
-    touchprobe_object_selftest(out_dir / "gpurailon.o", _GPURAILON_ALLOWED_UNDEF, "gpurailon")
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpurailon.o", _GPURAILON_ALLOWED_UNDEF, "gpurailon")
     n_stores = check_touchprobe_object(out_dir / "gpurailon.o", _GPURAILON_ALLOWED_UNDEF)
     print(f"PASS gpurailon object audit: no try_write32/try_read32 reference; {n_stores} stores, all stack/argument based; undef subset (the audited ACPM client)")
-    gpurailon_object_selftest(out_dir / "acpm_railon.o")
+    _memo_obj(gpurailon_object_selftest, out_dir / "acpm_railon.o")
     check_acpm_rail_set_object_text(_touch_obj_info(out_dir / "acpm_railon.o")[0], "acpm_railon.o", True)
     check_acpm_rail_set_object_text(_touch_obj_info(out_dir / "acpm.o")[0], "acpm.o", False)
-    touchprobe_object_selftest(out_dir / "acpm_railon.o", _ACPM_ALLOWED_UNDEF, "acpm_railon")
+    _memo_obj(touchprobe_object_selftest, out_dir / "acpm_railon.o", _ACPM_ALLOWED_UNDEF, "acpm_railon")
     n_stores = check_touchprobe_object(out_dir / "acpm_railon.o", _ACPM_ALLOWED_UNDEF)
     print(f"PASS acpm_railon.o object audit: try_write32 only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; acpm_s11_rail_set pinned to reg 0x15 / mask 0xC0 / value 0x40|0 and three xfer calls")
-    wlanrails_source_selftest()
+    _memo(wlanrails_source_selftest)
     check_wlanrails_source_text((repo_root / "shim" / "wlanrails.c").read_text())
     print("PASS wlanrails source audit: read-only; no asm / volatile / pointer casts / try_write32; MMIO only the eight cited words (CMU_HSI2 behind the UFS VER gate, PMU+0x3C10); "
           "the only ACPM call is acpm_s10_read over the four LDO control registers, after every ACPM gate; the first failure stops the loop")
-    touchprobe_object_selftest(out_dir / "wlanrails.o", _WLANRAILS_ALLOWED_UNDEF, "wlanrails")
+    _memo_obj(touchprobe_object_selftest, out_dir / "wlanrails.o", _WLANRAILS_ALLOWED_UNDEF, "wlanrails")
     n_stores = check_touchprobe_object(out_dir / "wlanrails.o", _WLANRAILS_ALLOWED_UNDEF)
     print(f"PASS wlanrails object audit: no try_write32 reference; {n_stores} stores, all stack/argument based; undef subset (try_read32, the audited ACPM client, console)")
-    wlanen_source_selftest()
+    _memo(wlanen_source_selftest)
     check_wlanen_source_text((repo_root / "shim" / "wlanen.c").read_text())
     print("PASS wlanen source audit: strict writer audit; the allowlist is exactly GPP14.CON field [11:8] (value 0 or 1) and GPP14.DAT bit 2; four w32 sites (enable DAT, CON; restore DAT, CON); "
           "every refusal before the first write; restore unconditional and loud; one 200 ms wait after a verified enable")
-    touchprobe_object_selftest(out_dir / "wlanen.o", _WLANEN_ALLOWED_UNDEF, "wlanen")
+    _memo_obj(touchprobe_object_selftest, out_dir / "wlanen.o", _WLANEN_ALLOWED_UNDEF, "wlanen")
     n_stores = check_touchprobe_object(out_dir / "wlanen.o", _WLANEN_ALLOWED_UNDEF)
     print(f"PASS wlanen object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; undef subset")
-    wlanen_w32_object_selftest(out_dir / "wlanen.o")
+    _memo_obj(wlanen_w32_object_selftest, out_dir / "wlanen.o")
     check_wlanen_w32_object_text(_touch_obj_info(out_dir / "wlanen.o")[0], "wlanen.o")
     print("PASS wlanen w32 object audit: the compiled w32 keeps its address compare (0x108401C0 / +4), masks 0xF00 / 0x4 and the -2 refusal; its four call sites pass exactly 0x108401C0 / 0x108401C4")
-    wlansmc_source_selftest()
+    _memo(wlansmc_source_selftest)
     check_wlansmc_source_text((repo_root / "shim" / "wlansmc.c").read_text())
     print("PASS wlansmc source audit: one `smc #0`, function id 0x82000504, option READ (0) a constant, address guard = exactly PMU 0x17463EC4 / 0x17463EC0, two calls, no loops, no writer")
-    wlansmc_object_selftest(out_dir / "wlansmc.o")
+    _memo_obj(wlansmc_object_selftest, out_dir / "wlansmc.o")
     n_stores = check_wlansmc_object(out_dir / "wlansmc.o")
     print(f"PASS wlansmc object audit: exactly one smc, in smc_priv_read; x0 = 0x82000504, x2 = 0 (READ), x3 = 0; address compare against 0x17463EC0/+4 with a refusal that skips it; {n_stores} stores, all stack/argument based")
-    wlansmc_object_selftest(out_dir / "wlansmc_iso.o", True)
+    _memo_obj(wlansmc_object_selftest, out_dir / "wlansmc_iso.o", True)
     n_stores = check_wlansmc_object(out_dir / "wlansmc_iso.o", True)
     print(f"PASS wlansmc_iso object audit: exactly three smc (read, rmw set, rmw clear); the RMW pair is constants only: x0 = 0x82000504, x1 = 0x17463EC4, x2 = 2, x3 = 1, x4 = 1 / 0; {n_stores} stores, all stack/argument based")
     _memo(wlan_seq_selftest)
@@ -5336,41 +5472,42 @@ def main() -> None:
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 9 blocks (BAR0: 4 registers, written only by the exact S34-S36 tuples), all inside the allowlist; every write row has a restore or is a BAR0 write dropped with the module power (research 40 s.5)")
     _memo(wlanlink_source_selftest)
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())
-    wlan_link_n_selftest()
+    _memo(wlan_link_n_selftest)
     print("PASS wlan-link N audit: build.sh sets WLAN_LINK_N only from an explicit --wlan-link=N, the default is WLAN_SEQ_DEFAULT_N (19), the first LINK line prints N")
     print("PASS wlanlink source audit: strict writer audit; the single writer w32(idx, tear) reads the row from the const table and re-checks pa/mask/value against the pinned allowlist; "
           "probe-before-touch, UNKNOWN-step refusal before the first write, unconditional teardown, bounded loops, SMC only through wlan_link_iso_set/clear")
-    touchprobe_object_selftest(out_dir / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF, "wlanlink")
+    _memo_obj(touchprobe_object_selftest, out_dir / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF, "wlanlink")
     n_stores = check_touchprobe_object(out_dir / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF)
     print(f"PASS wlanlink object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; undef subset")
-    _wl_disasm = _touch_obj_info(out_dir / "wlanlink.o")[0]  # objdump stays outside the memo: other text = other key
+    _wl_disasm = _obj_text(_touch_obj_info(out_dir / "wlanlink.o")[0], out_dir / "wlanlink.o")  # objdump stays outside the memo: other text = other key (path-free: see _obj_text)
     _memo(wlanlink_object_selftest, _wl_disasm.encode(), _wl_disasm)
     check_wlanlink_w32_object_text(_touch_obj_info(out_dir / "wlanlink.o")[0], "wlanlink.o")
     print("PASS wlanlink w32 object audit: the compiled w32 keeps its window / offset compares, one try_write32, one caller (run_row)")
-    wlansmc_object_selftest(out_dir / "wlansmc_link.o", True)
+    _memo_obj(wlansmc_object_selftest, out_dir / "wlansmc_link.o", True)
     n_stores = check_wlansmc_object(out_dir / "wlansmc_link.o", True)
     print(f"PASS wlansmc_link object audit: exactly three smc (read, rmw set, rmw clear), constants only; {n_stores} stores, all stack/argument based")
-    wlan_shim_selftest()
+    _memo(wlan_shim_selftest)
     print("PASS wlan shim sequence audit: wlan_rails(), wlan_smc_read(), wlan_iso_run() and wlan_en_run() called once each, in their own flags (+ wlan_iso_run), the read-only parts before the writers")
-    gpujob_source_selftest()
+    _memo(gpujob_source_selftest)
     check_gpujob_source_text((repo_root / "shim" / "gpujob.c").read_text())
     print("PASS gpujob source audit: strict writer audit; the allowlist is the scratch window plus exactly the audited AS0 / JS0 / IRQ-clear register-value pairs "
           "(no GPU_COMMAND, no LOCKADDR, no IRQ mask, no S2MPU/PMU); 21 pinned write sites; precheck before the first write; bounded waits; AS0 always disabled")
-    touchprobe_object_selftest(out_dir / "gpujob.o", _GPUJOB_ALLOWED_UNDEF, "gpujob")
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpujob.o", _GPUJOB_ALLOWED_UNDEF, "gpujob")
     n_stores = check_touchprobe_object(out_dir / "gpujob.o", _GPUJOB_ALLOWED_UNDEF)
     print(f"PASS gpujob object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; undef subset")
-    touchprobe_object_selftest(out_dir / "gpupower_job.o", _GPUPOWER_ALLOWED_UNDEF | {"gpu_job_run"}, "gpupower_job")
+    _memo_obj(touchprobe_object_selftest, out_dir / "gpupower_job.o", _GPUPOWER_ALLOWED_UNDEF | {"gpu_job_run"}, "gpupower_job")
     n_stores = check_touchprobe_object(out_dir / "gpupower_job.o", _GPUPOWER_ALLOWED_UNDEF | {"gpu_job_run"})
     check_gpupower_variant_text(_touch_obj_info(out_dir / "gpupower_job.o")[0], False, "gpupower_job.o")
     print(f"PASS gpupower_job.o object audit: same writes as gpupower.o ({n_stores} stores outside w32, all stack/argument based); the only addition is the call to gpu_job_run")
-    touchprobe_object_selftest(out_dir / "acpm.o", _ACPM_ALLOWED_UNDEF, "acpm")
+    _memo_obj(touchprobe_object_selftest, out_dir / "acpm.o", _ACPM_ALLOWED_UNDEF, "acpm")
     n_stores = check_touchprobe_object(out_dir / "acpm.o", _ACPM_ALLOWED_UNDEF)
     print(f"PASS acpm object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, "
           "all stack/argument based; undef subset; no banned instructions")
-    udump_object_selftest()
+    _memo(udump_object_selftest)
     n_stores = check_udump_object(out_dir / "udump.o")
     print(f"PASS udump object audit: {n_stores} stores, all stack/argument-"
           "based; .data/.bss empty; undef subset (no SCSI surface, no MMIO)")
+    audit_pool.drain()  # the self-tests above are written in order and finished; the host tests below write to fd 1 themselves
     with tempfile.TemporaryDirectory() as temp:
         host_test = pathlib.Path(temp) / "loader_host_test"
         fdt_test = pathlib.Path(temp) / "fdt_host_test"

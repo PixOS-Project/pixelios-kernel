@@ -67,7 +67,7 @@ class Image:
                 if not 32 <= b[0] < 127:
                     return None
                 out += b
-        except (KeyError, UnicodeDecodeError):
+        except (KeyError, UnicodeDecodeError):   # lint-silent: expected a string at an unmapped address or non-UTF-8 bytes is not a string: None, the caller treats it as no match
             return None
 
 
@@ -158,7 +158,7 @@ def _exec_lookup(ins):
                 if isinstance(a, tuple) and a[0] == "sum" and isinstance(sz, int) and isinstance(tb, int) and bound is not None:
                     out = {"terms": sorted(a[1]), "const": a[2], "bound": bound, "stride": sz, "table": tb}
                     break
-        except (AttributeError, TypeError, KeyError):
+        except (AttributeError, TypeError, KeyError):   # lint-silent: expected a disassembly that does not fit the dispatch pattern is not a candidate: next one
             continue
     if out and len(out["terms"]) == 3 and len({t[0] for t in out["terms"]}) == 3:
         return out
@@ -197,7 +197,7 @@ def analyse_fn(img, md, fn, limit=300):
                 if s is None:  # CFString constant: {isa, flags, char *bytes, length}
                     try:
                         s = img.cstr(img.u64(a + 16))
-                    except KeyError:
+                    except KeyError:   # lint-silent: expected a pointer into an unmapped address has no string: None
                         s = None
                 if s and len(s) >= 3 and s not in strs:
                     strs.append(s)
@@ -216,7 +216,7 @@ def analyse_fn(img, md, fn, limit=300):
                 calls.append((tgt, regs.get(2)))
                 for k in range(18):  # caller-saved registers are dead after a call
                     regs.pop(k, None)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):   # lint-silent: expected an operand that is not a numeric immediate is skipped by the register tracker
             pass
     return strs, fcc, calls
 
@@ -229,7 +229,7 @@ def resolve(img, md, params, name):
     try:
         kp = img.u64(ent + ENT_KEY)
         found = img.cstr(kp) if kp else None
-    except KeyError:
+    except KeyError:   # lint-silent: expected an entry key at an unmapped address is no match, reported by the key != found mismatch right below
         found = None
     if found != key:
         return {"name": name, "key": key, "ok": False, "idx": idx, "entry": ent, "why": "entry key string %r != %s: not in the table (or layout differs)" % (found, key)}

@@ -1,0 +1,15 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,8 +10,12 @@ void f(int a, int dbg)
+ {
+ 	if (a) {
+ 		foo();
++		printf("a\n");
+ 	}
++	if (dbg) {
++		printf("dbg\n");
++	}
+ 	else {
+ 		off();
+ 	}

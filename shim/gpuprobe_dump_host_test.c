@@ -13,7 +13,7 @@
 
 static char lines[512][RAMLOG_LINE_MAX + 8];
 static unsigned nl;
-static uint32_t top_stat, sram[0x2000 / 4];
+static uint32_t top_stat, emb_stat = 1, sram[0x2000 / 4];
 static uintptr_t bad_pa;
 static unsigned reads_outside;
 
@@ -28,7 +28,7 @@ int try_read32(uintptr_t pa, uint32_t *v)
 	if (pa == bad_pa)
 		return 0;
 	if (pa == GPU_PMU_G3D_STAT) { *v = top_stat; return 1; }
-	if (pa == GPU_PMU_EMB_STAT) { *v = 1; return 1; }
+	if (pa == GPU_PMU_EMB_STAT) { *v = emb_stat; return 1; }
 	if (pa == GPU_PMU_G3D_CFG || pa == GPU_PMU_EMB_CFG) { *v = 1; return 1; }
 	if (pa >= GPU_CMU_G3D && pa < GPU_CMU_G3D + 0x2000) {
 		*v = (pa - GPU_CMU_G3D) == 0x600 || (pa - GPU_CMU_G3D) == 0x610 || (pa - GPU_CMU_G3D) == 0x620 ? 0x10 : (uint32_t)(0xC0000000u + (pa - GPU_CMU_G3D));
@@ -114,6 +114,24 @@ int main(void)
 	put_hdr(GPU_FVMAP_IDX_G3DL2, 6, 2, 1, 0, 0x502);	/* misaligned */
 	gpu_probe();
 	assert(!has("FVMAP5 lv=") && !has("FVMAP6 lv="));
+	/* gpu_probe_pmu_on (T-50eb review F3, the M1 safety predicate of gpu_clk): 1 only when BOTH words read and BOTH have bit 0 set; every other case is 0 */
+	bad_pa = 0; top_stat = 1; emb_stat = 1;
+	assert(gpu_probe_pmu_on() == 1);
+	top_stat = 0; emb_stat = 1;
+	assert(gpu_probe_pmu_on() == 0);
+	top_stat = 1; emb_stat = 0;
+	assert(gpu_probe_pmu_on() == 0);
+	top_stat = 0; emb_stat = 0;
+	assert(gpu_probe_pmu_on() == 0);
+	top_stat = 0xFFFFFFFEu; emb_stat = 1;	/* only bit 0 counts */
+	assert(gpu_probe_pmu_on() == 0);
+	top_stat = 1; emb_stat = 0xFFFFFFFEu;
+	assert(gpu_probe_pmu_on() == 0);
+	top_stat = 1; emb_stat = 1; bad_pa = GPU_PMU_G3D_STAT;	/* top unreadable */
+	assert(gpu_probe_pmu_on() == 0);
+	bad_pa = GPU_PMU_EMB_STAT;				/* emb unreadable */
+	assert(gpu_probe_pmu_on() == 0);
+	bad_pa = 0; top_stat = 1; emb_stat = 1;
 	/* gpu_probe_shaders (printed before the --gpu-rail-on restore): only with both PMU domains on */
 	nl = 0; top_stat = 1; bad_pa = 0;
 	gpu_probe_shaders();

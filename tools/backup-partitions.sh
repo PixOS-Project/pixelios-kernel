@@ -1,6 +1,8 @@
 #!/bin/bash
 # Root-based backup of per-device partitions (PLAN.md Phase 2). Needs `su` over adb (Magisk).
 # Read-only on the phone; output stays outside git. Usage: tools/backup-partitions.sh [outdir]
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -euo pipefail
 out=${1:-$HOME/pixelios-backups/$(date -u +%Y%m%dT%H%M%SZ)}
 parts="persist efs efs_backup modem_userdata devinfo"

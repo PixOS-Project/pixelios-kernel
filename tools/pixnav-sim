@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""pixnav-sim: closed-loop phone model for the host build of tools/pixnav.c (-X), ALL-ON T-31 lane-nav 2026-11-12.
+
+  pixnav -R refs.bin -X "tools/pixnav-sim --panels MAP.json --scenario NAME [--report OUT.json]" ...
+
+pixnav asks for the current panel ('P <ms>'), sends every gesture ('G <ms> x0 y0 x1 y1 dur') and intent ('I <ms> url'); this model answers with the
+panel file of the screen it is on, so a recovery changes what the next look sees. Every transition below cites the run where it was observed
+([obs]) or says [guess]. MAP.json: {"<screen>[:<variant>]": "panel.raw", ...} with screens homeA homeB settings general about clock spotlight lock
+today sub alert (alert = the location alert over any page: the classifier only reads its box) and homeA:news / homeA:weather variants.
+
+Scenarios = the situations of the recorded pixnav runs (tools/test_pixnav_sim.py replays each):
+  calm        nothing injected
+  r47f9       job 47f9 / f428 / b457: the homeA widget changes during rep 0 (Smart Stack Calendar -> News, 'unknown coarse homeA d 18.7' x67 [obs])
+              + launches take 2.3 s (8a63 [obs])
+  r8a63       job 8a63: starts on the lock screen after a respring; a bottom swipe does not unlock (lock stays) [obs]; launch 2.3 s
+  r758e       job 758e: lock screen at start (pre lock-ref) [obs] -- same model as r8a63, separate name for the record
+  rstress1    allon-stress1: the Weather location alert appears over the page (T-27) [obs panel]; only its Cancel removes it [obs: stayed on top
+              through home swipes in stress1]
+  rstress2    allon-stress2: Settings opens on a sub-page it was left on (Focus, T-30) [obs frame f220711]
+  rtap        allon-stress1 T-26: the first settings-open tap is eaten by the moving home page [obs]
+  rtoday      47f9: an edge back-swipe on the home page opens the Today View [obs camera f080048]; the home swipe leaves it [obs 3681.6 -> 3683.0]
+  rall        every injection above in one run
+Report (--report): inputs per true screen, taps on the widget row (must be 0), gestures sent while the screen was unknown to pixnav cannot be
+seen here (pixnav's own log is checked by the test)."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import json, sys
+
+APPS = ("settings", "general", "about", "clock", "spotlight", "sub", "today")
+LAUNCH_MS = {"calm": 600}   # launch delay per scenario (default 2300: 8a63 settings-open inputend 192.08 -> settings by 194.34 [obs])
+
+
+class World:
+    def __init__(self, panels, scen):
+        self.p, self.scen = panels, scen
+        self.screen = "lock" if scen in ("r8a63", "r758e", "rall") else "homeA"
+        self.variant = ""
+        self.alert = False
+        self.pending = None   # (t_ms, screen): an animation in flight shows the old screen until t_ms
+        self.launch = LAUNCH_MS.get(scen, 2300)
+        self.settings_left_on = "sub" if scen in ("rstress2", "rall") else None
+        self.eat_taps = 1 if scen in ("rtap", "rall") else 0
+        self.widget_at = 25000 if scen in ("r47f9", "rall") else None
+        self.alert_at = 60000 if scen in ("rstress1", "rall") else None
+        self.today_at = 45000 if scen in ("rtoday", "rall") else None   # a stray swipe puts the phone on the Today View (47f9 [obs])
+        self.log = []
+        self.widget_taps = 0
+
+    def tick(self, t):
+        if self.pending and t >= self.pending[0]:
+            self.screen = self.pending[1]
+            self.pending = None
+        if self.widget_at is not None and t >= self.widget_at:
+            self.variant, self.widget_at = "news", None
+            self.log.append((t, "event", "homeA widget -> News (47f9)"))
+        if self.alert_at is not None and t >= self.alert_at:
+            self.alert, self.alert_at = True, None
+            self.log.append((t, "event", "location alert on top (stress1)"))
+        if self.today_at is not None and t >= self.today_at and self.screen in ("homeA", "homeB") and not self.pending:
+            self.screen, self.today_at = "today", None
+            self.log.append((t, "event", "Today View (47f9)"))
+
+    def go(self, t, screen, delay):
+        self.pending = (t + delay, screen)
+
+    def panel(self):
+        if self.alert:
+            return self.p["alert"]
+        key = self.screen + (":" + self.variant if self.screen == "homeA" and self.variant else "")
+        return self.p.get(key) or self.p[self.screen]
+
+    def gesture(self, t, x0, y0, x1, y1):
+        s = self.pending[1] if self.pending else self.screen   # input during an animation acts on where it goes [guess]
+        dx, dy = x1 - x0, y1 - y0
+        tap = abs(dx) < 30 and abs(dy) < 30
+        self.log.append((t, "input", "%s %s %d,%d->%d,%d" % (s + ("+alert" if self.alert else ""), "tap" if tap else "drag", x0, y0, x1, y1)))
+        if self.alert:   # modal: only Cancel/Settings buttons react [obs stress1: home swipes left it on top]
+            if tap and 665 - 40 <= x0 <= 821 + 40 and 1353 - 40 <= y0 <= 1391 + 40:
+                self.alert = False
+            return
+        if tap:
+            if s in ("homeA",) and y0 < 0.30 * 2400:
+                self.widget_taps += 1   # the widget row: Weather -> the location alert (T-27 cause in stress1 [obs])
+                self.alert = True
+                return
+            if s == "homeA" and abs(x0 - 676) < 90 and abs(y0 - 1720) < 90:
+                if self.eat_taps:
+                    self.eat_taps -= 1
+                    return
+                self.go(t, self.settings_left_on or "settings", self.launch)
+                self.settings_left_on = None
+            elif s == "homeA" and abs(x0 - 665) < 90 and abs(y0 - 1158) < 90:
+                self.go(t, "clock", self.launch)
+            elif s == "settings" and 400 < y0 < 2300:
+                self.go(t, "general", 600)
+            elif s == "general" and abs(y0 - 370) < 120:
+                self.go(t, "about", 600)
+            return
+        if y0 >= 2390 and dy < -600:   # bottom-edge home swipe
+            if s == "lock":
+                return   # does not unlock after a respring (T-28 run3, 8a63 'have lock' x4) [obs]
+            if s in APPS:
+                self.go(t, "homeA", 600)
+            return
+        if x0 <= 10 and dx > 400:   # edge back-swipe
+            nxt = {"about": "general", "general": "settings", "sub": "settings", "homeA": "today", "homeB": "homeA"}.get(s)
+            if nxt:
+                self.go(t, nxt, 500)   # homeA -> today [obs 47f9 f080048]
+            return
+        if abs(dx) > 400 and abs(dy) < 200:   # page swipes
+            nxt = {("homeA", -1): "homeB", ("homeB", 1): "homeA", ("homeA", 1): "today", ("today", -1): "homeA"}.get((s, 1 if dx > 0 else -1))
+            if nxt:
+                self.go(t, nxt, 500)
+            return
+        if dy > 600 and y0 < 1300 and s in ("homeA", "homeB"):
+            self.go(t, "spotlight", 500)
+
+    def intent(self, t, url):
+        self.log.append((t, "intent", url))
+        tgt = {"prefs:root=General": "general", "prefs:root=General&path=About": "about", "clock-worldclock:": "clock",
+               "prefs:root=WIFI": "sub", "prefs:root=Bluetooth": "sub"}.get(url)   # Wi-Fi / Bluetooth pages: no reference = a sub-page
+        if not tgt:
+            return "refused"
+        self.go(t, tgt, self.launch)   # SBSOpenSensitiveURLAndUnlock unlocks first (T-28 run4 [obs]); the alert stays on top [guess]
+        return "ok"
+
+
+def main(a):
+    panels = scen = report = None
+    it = iter(a)
+    for x in it:
+        if x == "--panels":
+            panels = json.load(open(next(it)))
+        elif x == "--scenario":
+            scen = next(it)
+        elif x == "--report":
+            report = next(it)
+    if panels is None or scen is None:
+        print("SIM GAP: --panels and --scenario are required", file=sys.stderr)
+        return 2
+    w = World(panels, scen)
+    for line in sys.stdin:
+        f = line.split()
+        if not f:
+            continue
+        t = int(f[1])
+        w.tick(t)
+        if f[0] == "P":
+            print(w.panel(), flush=True)
+        elif f[0] == "G":
+            w.gesture(t, *map(int, f[2:6]))
+            print("ok", flush=True)
+        elif f[0] == "I":
+            print(w.intent(t, f[2]), flush=True)
+        else:
+            print("SIM GAP: line %r" % line, file=sys.stderr)
+            print("err", flush=True)
+    if report:
+        json.dump({"scenario": scen, "widget_taps": w.widget_taps, "final": w.screen, "alert": w.alert, "log": w.log}, open(report, "w"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

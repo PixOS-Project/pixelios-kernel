@@ -1,0 +1,318 @@
+SWEET nav capture repetition + scanout tap (patch 0275, sprint GPU 2026-11-09; boot-arg sweetnav bit 0x100 = capture repetition, bit 0x200 = scanout tap; both default off): after the measured repetitions one capture repetition walks the same screens plus the App Library with doubled settle and, at each settled screen, raises a capture request for libsweetgl's frame capture through two read-only sysctls (kern.sweetnavcap = seq<<16 | bit 1 tap | bit 0 recording, kern.sweetnavcaplbl = label); the tap bit is set from spotlight-open begin to spotlight-close end of the last measured repetition. Markers 'SWEET NAV: CAPACT name begin|end cap N', 'CAPREQ seq N label L', 'CAPREP start|done', 'TAP on|off' kern.sweetnavrun (write, root) starts a new session on the running system for the hot-reload loop; kernel panel snapshot (patch 0276 sweet_panel_snapshot) at every capture request and at the end of the real-timing App Library pass; (never ACTION: the scorers do not see the capture repetition). Input injection only: no register, no store, no hardware access.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -28,6 +28,17 @@
+ #include "IOHIDKeys.h"
+ #include "IOHIDPrivateKeys.h"
+ #include "IOHIDUsageTables.h"
++#include <sys/sysctl.h>
++
++/* Patch 0275 (sprint GPU 2026-11-09, frame capture): after the measured repetitions of sweetnav, a CAPTURE repetition (sweetnav bit 0x100) walks the
++ * same screens plus the App Library and asks libsweetgl's frame capture (fcap) for one capture per settled screen through two read-only sysctls:
++ * kern.sweetnavcap = (request seq << 16) | (1 while the capture repetition runs = libsweetgl records every frame), kern.sweetnavcaplbl = label of the
++ * latest request. Its markers are `SWEET NAV: CAPACT <name> begin|end cap <n>`, not ACTION, so the scorers never count it. Input injection only. */
++static uint32_t gSweetNavCap;
++extern "C" void sweet_panel_snapshot(const char *label);   /* patch 0276 (SweetFramebuffer.cpp) */
++static char gSweetNavCapLbl[48] = "none";
++SYSCTL_UINT(_kern, OID_AUTO, sweetnavcap, CTLFLAG_RD | CTLFLAG_LOCKED, &gSweetNavCap, 0, "sweet nav capture: request seq << 16 | recording");
++SYSCTL_STRING(_kern, OID_AUTO, sweetnavcaplbl, CTLFLAG_RD | CTLFLAG_LOCKED, gSweetNavCapLbl, sizeof(gSweetNavCapLbl), "sweet nav capture label");
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
+@@ -397,6 +408,14 @@
+ 	int fNavGenY;   /* patch 0269: touch y of the General tap of this repetition (probe or 1900) */
+ 	uint64_t fNavGateT0, fNavGateCnt, fNavGateFlatT;   /* patch 0258: about-open gate: start (0 = idle), last seen swap count, time that count last changed (ns) */
+ 	uint64_t fNavDs0;   /* patch 0260: distinct-frame count at the start of this unlock attempt */
++	UInt32 fNavCap, fNavCapIdx, fNavCapSeq;   /* patch 0275: capture repetition 0 off, 1 pending, 2 running, 3 done; action index; request seq */
++	uint64_t fNavQuietT0, fNavQuietSw, fNavQuietFlat;   /* patch 0275: quiet-display gate before a capture request */
++	UInt32 fNavApplibOnly;   /* patch 0275: kern.sweetnavrun 0x400 */
++	UInt32 fNavTap;   /* patch 0275: sweetnav bit 0x200 = scanout tap (kern.sweetnavcap bit 1) from spotlight-open begin to spotlight-close end of the last measured repetition */
++	static void navCapFired(SweetHIDTouch *self, IOTimerEventSource *sender);
++public:
++	int navRestart(unsigned v);   /* patch 0275: kern.sweetnavrun (hot loop: a new session on the running system) */
++private:
+ 	UInt32 fNavHomeSt, fNavPref0;   /* patch 0255: 1-3 = the app-home swipe after a Preferences launch inside the unlock window is running, 4 = done; Preferences exec count at the first unlock attempt */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+@@ -650,11 +669,27 @@
+ 	fNavAboutSw0 = 0;
+ 	fNavAboutDs0 = fNavGenSw0 = 0;
+ 	fNavGenY = 0;   /* patch 0269 */
++	fNavCap = fNavCapIdx = fNavCapSeq = fNavTap = 0;   /* patch 0275 */
++	fNavQuietT0 = fNavQuietSw = fNavQuietFlat = 0;
++	fNavApplibOnly = 0;
+ 	fNavDs0 = 0;
+ 	fNavGateT0 = fNavGateCnt = fNavGateFlatT = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
++		if (nav & 0x200) {   /* patch 0275: bit 9 = scanout tap around Spotlight in the last measured repetition */
++			fNavTap = 1;
++			IOLog("SWEET HID: nav scanout tap armed (sweetnav bit 0x200): spotlight-open begin .. spotlight-close end of the last measured repetition\n");
++		}
++		if (nav & 0x100) {   /* patch 0275: bit 8 = one capture repetition after the measured ones */
++			fNavCap = 1;
++			IOLog("SWEET HID: nav capture repetition armed (sweetnav bit 0x100), %u measured repetition(s) first\n", nav);
++			if (nav == 0) {
++				IOLog("SWEET GAP: HID sweetnav=0x100 without measured repetitions: 1 assumed\n");
++				nav = 1;
++			}
++		}
++		nav &= 0xff;   /* patch 0275: bits 8-9 are flags */
+ 		if (nav > 5) {
+ 			IOLog("SWEET GAP: HID sweetnav=%u clamped to 5 repetitions\n", nav);
+ 			nav = 5;
+@@ -700,6 +735,10 @@
+ 	unsigned i = self->fNavIdx, st = self->fNavStep;
+ 
+ 	if (self->fNavRep >= self->fNavReps) {
++		if (self->fNavCap == 1 || self->fNavCap == 2) {   /* patch 0275 */
++			navCapFired(self, sender);
++			return;
++		}
+ 		IOLog("SWEET NAV: done reps %u\n", self->fNavReps);   /* the host stops on this line */
+ 		return;
+ 	}
+@@ -805,6 +844,10 @@
+ 	}
+ 	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++		if (self->fNavTap && self->fNavRep + 1 == self->fNavReps && strcmp(a->name, "spotlight-open") == 0) {   /* patch 0275 */
++			gSweetNavCap |= 2;
++			IOLog("SWEET NAV: TAP on rep %u now %llu\n", self->fNavRep, sweetNavNs());
++		}
+ 		if (a == &act && strcmp(a->name, "app-launch") == 0) {
+ 			IOLog("SWEET NAV: app-launch icon Clock at %d,%d (rep %u)\n", (int)a->x0, (int)a->y0, self->fNavRep);
+ 		}
+@@ -908,6 +951,10 @@
+ 		self->fNavAboutTaps = 0;
+ 	}
+ 	IOLog("SWEET NAV: ACTION %s end rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++	if ((gSweetNavCap & 2) && strcmp(a->name, "spotlight-close") == 0) {   /* patch 0275 */
++		gSweetNavCap &= ~2u;
++		IOLog("SWEET NAV: TAP off rep %u now %llu\n", self->fNavRep, sweetNavNs());
++	}
+ 	self->fNavStep = 0;
+ 	self->fNavIdx = i + 1;
+ 	if (self->fNavIdx >= SWEET_NAV_N) {
+@@ -922,6 +969,220 @@
+ 	sender->setTimeoutMS(150 + (self->fNavRng >> 16) % 451);   /* think time 150..600 ms */
+ }
+ 
++/* Patch 0275: the capture repetition. Same gestures as the measured table (the calibrated ones and the General probe of patch 0269), settle doubled
++ * (libsweetgl snapshots every frame while it records, so frames are slow; CA animations end on wall-clock time), then a capture request and a
++ * 5 s hold for the writer. App Library: two home swipes (out of the app switcher, to page 1), three left swipes (page 2, App Library, stays), back with two right swipes. */
++struct SweetCapAct { const char *name; unsigned char kind; short x0, y0, x1, y1; unsigned short ms, settle; unsigned char cap; };
++static const SweetCapAct sweetCapActs[] = {
++	{ "home-page-next",    1, 900, 1200, 200, 1200, 250,  700, 1 },
++	{ "home-page-prev",    1, 200, 1200, 900, 1200, 250,  700, 1 },
++	{ "settings-open",     0, 676, 1720,   0,    0, 100, 3000, 1 },
++	{ "general-open",      0, 500, 1900,   0,    0, 100, 1500, 1 },
++	{ "about-open",        0, 500,  370,   0,    0, 100, 1800, 1 },
++	{ "about-scroll-up",   1, 540, 1800, 540,  700, 350,  900, 1 },
++	{ "about-scroll-down", 1, 540,  700, 540, 1800, 350,  900, 1 },
++	{ "about-back",        1,   5, 1200, 700, 1200, 250, 1200, 1 },
++	{ "general-back",      1,   5, 1200, 700, 1200, 250, 1200, 1 },
++	{ "settings-scroll-up", 1, 540, 1800, 540, 700, 350,  900, 1 },
++	{ "settings-scroll-down", 1, 540, 700, 540, 1800, 350, 900, 1 },
++	{ "app-home",          1, 540, 2398, 540, 1200, 200, 1500, 1 },
++	{ "app-launch",        0, 665, 1158,   0,    0, 100, 3000, 1 },
++	{ "app-close",         1, 540, 2398, 540, 1200, 200, 1500, 1 },
++	{ "spotlight-open",    1, 540,  500, 540, 1500, 300, 1500, 1 },
++	{ "spotlight-close",   1, 540, 2398, 540, 1200, 250, 1500, 1 },
++	{ "applib-home1",      1, 540, 2398, 540, 1200, 200, 1500, 0 },   /* gputest-fcap7: after spotlight-close the app switcher was up and the swipes below never reached the App Library: home first */
++	{ "applib-home2",      1, 540, 2398, 540, 1200, 200, 1500, 0 },   /* on the home screen a home swipe goes to page 1 */
++	{ "applib-swipe1",     1, 900, 1200, 200, 1200, 250,  900, 0 },
++	{ "applib-swipe2",     1, 900, 1200, 200, 1200, 250,  900, 0 },
++	{ "applib-open",       1, 900, 1200, 200, 1200, 250, 1500, 1 },
++	{ "applib-back1",      1, 200, 1200, 900, 1200, 250,  900, 0 },
++	{ "applib-back2",      1, 200, 1200, 900, 1200, 250, 1500, 1 },
++	/* cap 2 = real-timing pass: recording OFF, scanout tap ON (kern.sweetnavcap bit 1) for the action; App Library once more without the
++	 * capture's snapshot flushes (they split render passes), so a tile-reload class bug cannot hide behind the recorder */
++	/* no home swipe here: in gputest-cache2 a home swipe from page 1 opened the app switcher; applib-back2 leaves the phone on a home page */
++	{ "rt-applib-swipe1",  1, 900, 1200, 200, 1200, 250,  900, 2 },
++	{ "rt-applib-swipe2",  1, 900, 1200, 200, 1200, 250,  900, 2 },
++	{ "rt-applib-swipe3",  1, 900, 1200, 200, 1200, 250, 1500, 3 },   /* cap 3 = tap on + a kernel panel snapshot (patch 0276) at the end */
++	{ "rt-applib-back1",   1, 200, 1200, 900, 1200, 250,  900, 0 },
++	{ "rt-applib-back2",   1, 200, 1200, 900, 1200, 250, 1500, 0 },
++};
++#define SWEET_CAP_N ((unsigned)(sizeof(sweetCapActs) / sizeof(sweetCapActs[0])))
++/* kern.sweetnavrun flag 0x400 (hot-reload loop, sprint GPU 2026-11-10): ONLY the real-timing App Library pass, recorder off (two right swipes first so
++ * a previous iteration's App Library is left; three left swipes reach it from page 1 or from the Today view), tap on, kernel panel snapshot at the end */
++static const SweetCapAct sweetApplibActs[] = {
++	{ "al-unlock",         1, 540, 2350, 540,  900, 200, 2500, 0 },   /* gputest-alhot: after a backboardd restart iOS is on the lock screen (the calibrated unlock swipe) */
++	{ "al-back1",          1, 200, 1200, 900, 1200, 250,  900, 0 },
++	{ "al-back2",          1, 200, 1200, 900, 1200, 250,  900, 0 },
++	{ "al-swipe1",         1, 900, 1200, 200, 1200, 250,  900, 2 },
++	{ "al-swipe2",         1, 900, 1200, 200, 1200, 250,  900, 2 },
++	{ "al-swipe3",         1, 900, 1200, 200, 1200, 250, 1500, 3 },
++};
++#define SWEET_AL_N ((unsigned)(sizeof(sweetApplibActs) / sizeof(sweetApplibActs[0])))
++
++void
++SweetHIDTouch::navCapFired(SweetHIDTouch *self, IOTimerEventSource *sender)
++{
++	const SweetCapAct *tbl = self->fNavApplibOnly ? sweetApplibActs : sweetCapActs;
++	unsigned tbln = self->fNavApplibOnly ? SWEET_AL_N : SWEET_CAP_N;
++	if (self->fNavCap == 1) {
++		self->fNavCap = 2;
++		self->fNavCapIdx = 0;
++		self->fNavStep = 0;
++		gSweetNavCap = (self->fNavCapSeq << 16) | (self->fNavApplibOnly ? 0 : 1);   /* applib-only: recorder stays off */
++		IOLog("SWEET NAV: CAPREP start %u actions now %llu\n", SWEET_CAP_N, sweetNavNs());
++		sender->setTimeoutMS(3000);   /* libsweetgl polls every 50 ms and needs a full frame cycle recorded */
++		return;
++	}
++	if (self->fNavCapIdx >= tbln) {
++		gSweetNavCap = self->fNavCapSeq << 16;   /* recording and tap off */
++		self->fNavCap = 3;
++		IOLog("SWEET NAV: CAPREP done %u requests now %llu\n", self->fNavCapSeq, sweetNavNs());
++		sender->setTimeoutMS(self->fNavApplibOnly ? 3000 : 420000);   /* the host pulls the capture files (devd) before the done line ends the run */
++		return;
++	}
++	SweetCapAct act = tbl[self->fNavCapIdx];
++	unsigned st = self->fNavStep;
++	unsigned ticks = act.ms >= 10 ? act.ms / 10 : 1;
++	if (st == 0) {
++		if (act.cap == 2 || act.cap == 3) {
++			gSweetNavCap = (self->fNavCapSeq << 16) | 2;   /* recording off, tap on */
++			IOLog("SWEET NAV: TAP on (real-timing pass) now %llu\n", sweetNavNs());
++		} else if (gSweetNavCap & 2) {
++			gSweetNavCap = (self->fNavCapSeq << 16);   /* tap off, recording stays off for the rest */
++			IOLog("SWEET NAV: TAP off (real-timing pass) now %llu\n", sweetNavNs());
++		}
++		if (strcmp(act.name, "general-open") == 0) {   /* the patch 0269 probe, as in the measured repetitions */
++			int gy = 0, gruns = 0, gpur = -1;
++			int grc = sweet_fb_probe_general(&gy, &gruns, &gpur);
++			self->fNavGenY = (grc == 0 && gy >= 700 && gy <= 2340) ? gy : 1900;
++			IOLog("SWEET NAV: CAPACT general probe rc %d y %d -> tap 500,%d\n", grc, gy, self->fNavGenY);
++		}
++		IOLog("SWEET NAV: CAPACT %s begin cap %u now %llu\n", act.name, self->fNavCapIdx, sweetNavNs());
++	}
++	if (strcmp(act.name, "general-open") == 0 && self->fNavGenY > 0) {
++		act.y0 = self->fNavGenY;
++	}
++	if (act.kind == 0) {   /* a tap holds the finger (patch 0249) */
++		act.x1 = act.x0;
++		act.y1 = act.y0;
++	}
++	if (st <= ticks) {
++		int x = act.x0 + (act.x1 - act.x0) * (int)st / (int)ticks;
++		int y = act.y0 + (act.y1 - act.y0) * (int)st / (int)ticks;
++		self->touch(0, true, x, y);
++		self->fNavStep = st + 1;
++		sender->setTimeoutMS(10);
++		return;
++	}
++	if (st == ticks + 1) {
++		self->touch(0, false, act.x1, act.y1);
++		self->fNavStep = ticks + 2;
++		sender->setTimeoutMS(act.settle * 2);
++		return;
++	}
++	if (st == ticks + 2 && (act.cap == 1 || act.cap == 3)) {
++		/* gputest-count1: in capture mode frames are slow, the scroll was still settling at the request, and the 30 Hz panel copy showed an older
++		 * frame than the capture (c09/c10). Wait until no swap for 500 ms (polled every 50 ms, at most 6 s) so capture, panel snapshot and camera
++		 * see the same settled frame. */
++		uint64_t now = sweetNavNs(), sw = sweet_fb_swap_count;
++		if (self->fNavQuietT0 == 0) {
++			self->fNavQuietT0 = now; self->fNavQuietSw = sw; self->fNavQuietFlat = now;
++		} else if (sw != self->fNavQuietSw) {
++			self->fNavQuietSw = sw; self->fNavQuietFlat = now;
++		}
++		uint64_t flat = (now - self->fNavQuietFlat) / 1000000, waited = (now - self->fNavQuietT0) / 1000000;
++		if (flat < 500 && waited < 6000) {
++			sender->setTimeoutMS(50);
++			return;
++		}
++		IOLog("SWEET NAV: CAPQUIET %s flat %llu ms waited %llu ms%s\n", act.name, flat, waited, flat < 500 ? " (CAP: display never quiet)" : "");
++		self->fNavQuietT0 = 0;
++	}
++	if (st == ticks + 2) {
++		if (act.cap == 3) {
++			sweet_panel_snapshot("rt-applib");   /* patch 0276: what the panel shows at real timing, recorder off */
++		}
++		if (act.cap == 1) {
++			self->fNavCapSeq++;
++			snprintf(gSweetNavCapLbl, sizeof(gSweetNavCapLbl), "c%02u-%s", self->fNavCapIdx, act.name);
++			gSweetNavCap = (self->fNavCapSeq << 16) | 1;
++			IOLog("SWEET NAV: CAPREQ seq %u label %s now %llu\n", self->fNavCapSeq, gSweetNavCapLbl, sweetNavNs());
++			sweet_panel_snapshot(gSweetNavCapLbl);   /* patch 0276: the panel at the same moment as the capture request */
++		}
++		self->fNavStep = ticks + 3;
++		sender->setTimeoutMS(act.cap == 1 ? 5000 : 10);
++		return;
++	}
++	IOLog("SWEET NAV: CAPACT %s end cap %u now %llu\n", act.name, self->fNavCapIdx, sweetNavNs());
++	self->fNavStep = 0;
++	self->fNavCapIdx++;
++	sender->setTimeoutMS(400);
++}
++
++/* Patch 0275: kern.sweetnavrun = R | 0x100 (capture repetition) | 0x200 (tap) starts a new nav session on the running system (hot-reload loop,
++ * user 2026-11-09: no reboot per experiment). Same tables and markers as the boot-arg session; no unlock (the phone is unlocked), first action
++ * 1 s after the write; refused (EBUSY) while a session runs. Write as root: `fcapctl nav N` through devd. Input injection only. */
++int
++SweetHIDTouch::navRestart(unsigned v)
++{
++	unsigned reps = v & 0xff;
++	if (reps == 0 || reps > 5) {
++		return EINVAL;
++	}
++	if (fNav && (fNavRep < fNavReps || fNavCap == 1 || fNavCap == 2 || fNavStep != 0)) {
++		IOLog("SWEET NAV: RESTART refused (busy): rep %u of %u capture %u step %u idx %u\n", fNavRep, fNavReps, fNavCap, fNavStep, fNavIdx);
++		return EBUSY;
++	}
++	if (!fNav) {
++		fNav = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::navFired);
++		if (!fNav || !_hidWorkLoop || _hidWorkLoop->addEventSource(fNav) != kIOReturnSuccess) {
++			IOLog("SWEET GAP: HID sweetnavrun: timer or work loop unavailable\n");
++			if (fNav) {
++				fNav->release();
++				fNav = NULL;
++			}
++			return ENODEV;
++		}
++	}
++	fNavReps = reps;
++	fNavRep = 0;
++	fNavIdx = 1;   /* no unlock */
++	fNavStep = 0;
++	fNavRng = 0x5eed1234;
++	fNavCap = (v & 0x100) ? 1 : 0;
++	fNavCapIdx = 0;
++	fNavTap = (v & 0x200) ? 1 : 0;
++	fNavApplibOnly = (v & 0x400) ? 1 : 0;
++	if (fNavApplibOnly) {   /* no measured repetition: straight to the App Library pass */
++		fNavCap = 1;
++		fNavRep = fNavReps;
++	}
++	fNavAboutTaps = 0;
++	fNavGateT0 = 0;
++	gSweetNavCap = fNavCapSeq << 16;
++	IOLog("SWEET NAV: RESTART reps %u capture %u tap %u applib-only %u (kern.sweetnavrun 0x%x) now %llu\n", reps, fNavCap, fNavTap, fNavApplibOnly, v,
++	    sweetNavNs());
++	fNav->setTimeoutMS(1000);
++	return 0;
++}
++
++static int
++sweet_navrun_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = 0;
++	int err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (!gSweetTouch) {
++		return ENODEV;
++	}
++	return gSweetTouch->navRestart((unsigned)v);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetnavrun, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_navrun_sysctl, "I",
++    "sweet nav: write R|0x100|0x200 to start a session on the running system");
++
+ #define SWEET_SCRIPT_STEPS 20
+ void
+ SweetHIDTouch::scriptFired(OSObject *owner, IOTimerEventSource *sender)

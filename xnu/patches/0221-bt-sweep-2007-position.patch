@@ -1,0 +1,188 @@
+SWEET Bluetooth: injection-position sweep (patch 0221, ticket T-2ed7, W-BTUP; boot-arg sweetbtleprobe=4, default behaviour unchanged, =1/2/3 unchanged). bt-up7 [obs 20261107T043123Z-bt-up7]: bluetoothd's 48 commands back to back leave 0x2007/0x200b/0x200c refused by the ROM (0x0c, sticky); a 0x2007 after EVERY step keeps them open but makes 0x204a (position 19) refuse. Question: does ONE 0x2007 after step k keep all of them open and 0x204a at 0x00, and for which k? The sweep runs 25 power-cycled passes of the byte-exact 48-command sequence of patch 0219 (k in 0,1,2,3,5,7,9,11,13,15,17,18,19,20,22,25,30,36,37,38,39,43,45,47,48; k=0 = no injection, the control that must reproduce bt-up7 pass A), each with ONE read-only 0x2007 after step k, then the final 0x2007, 0x200b (bluetoothd's random scan parameters) and 0x200c scan-enable OFF as in 0219 pass A, and prints one row per pass: `BT PROBE: sweep inj=K inj2007=.. 204a=.. final2007=.. 200b=.. 200c=.. diverged=N ... verdict=OPEN-ALL|OPEN-BUT-DIVERGED|REFUSED` plus a done row listing the OPEN-ALL positions. Same opcodes as 0219 (all sent by bluetoothd byte-exact), nothing that enables scan or advertising, no patchram, no flash, no baud change; volatile controller RAM state, cleared by the REG_ON power-cycle between the passes and after the sweep (as 0216/0217/0219). The per-transfer HCI byte trace is suppressed during the sweep (counted in the done row) so the 3000-transfer cap is left for bluetoothd. Applies after 0189, 0213, 0215, 0216, 0217 and 0219. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index b0e2033..c0e1c37 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -466,12 +466,19 @@ sbu_power_off(void)
+ #define SBU_TRACE_MAX   3000u
+ static uint32_t sbu_trace_n;
+ 
++static bool sbu_trace_quiet;         /* patch 0221 (T-2ed7): set only while the sweetbtleprobe=4 sweep runs; the sweep prints one summary row per pass instead of ~100 trace rows, so the 3000-transfer cap is kept for bluetoothd */
++static uint32_t sbu_trace_quiet_n;   /* transfers not logged while sbu_trace_quiet; printed in the sweep's done row */
++
+ static void
+ sbu_trace(const char *dir, const uint8_t *p, size_t len)
+ {
+ 	char hex[24 * 3 + 1];
+ 	size_t k = len < 24 ? len : 24;
+ 
++	if (sbu_trace_quiet) {
++		sbu_trace_quiet_n++;
++		return;
++	}
+ 	if (sbu_trace_n >= SBU_TRACE_MAX) {
+ 		if (sbu_trace_n == SBU_TRACE_MAX) {
+ 			sbu_trace_n++;
+@@ -1153,6 +1160,135 @@ sbu_replay3(bool probed)
+ 	}
+ }
+ 
++/*
++ * patch 0221 (T-2ed7, W-BTUP), boot-arg sweetbtleprobe=4: injection-position sweep. bt-up7 [obs 20261107T043123Z-bt-up7]: the 48 commands back to back with NO 0x2007 leave 0x2007/0x200b/0x200c refused (0x0c, sticky 5 s);
++ * with a 0x2007 after EVERY step 0x2007 stays fine but 0x204a (position 19) is refused. Each pass here is pass A of patch 0219 (48 byte-exact commands back to back, same payload tables, every answer awaited) with exactly ONE
++ * 0x2007 injected right after step k (k = 0: none, the control that must reproduce bt-up7 pass A; k = 48: right after fd48), then the final 0x2007, 0x200b (bluetoothd's random scan parameters) and 0x200c (scan enable OFF)
++ * as in pass A. One summary row per pass: the injected 0x2007's status, the status of 0x204a, the three final statuses, every answer that differs from bluetoothd's, and a verdict. Controller power-cycled (REG_ON + HCI Reset,
++ * as 0216/0217/0219) between the passes. Same opcodes as 0219, nothing that enables scan or advertising, no flash, no patchram, no baud change; the HCI byte trace is suppressed during the sweep (counted, printed in the done row).
++ */
++static const uint8_t sbu_sweep_k[] = { 0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 17, 18, 19, 20, 22, 25, 30, 36, 37, 38, 39, 43, 45, 47, 48 };
++#define SBU_SWEEP_N     (sizeof(sbu_sweep_k) / sizeof(sbu_sweep_k[0]))
++
++/* verdict: 1 = all of 2007/200b/200c final and 204a and the injected 2007 are 0x00 and no answer differs from bluetoothd's; 2 = the three final ones are open but something else differs; 0 = at least one of the final three refused; 3 = INCOMPLETE: a step got no answer or a malformed row (not a ROM refusal; the sweep stops after it) */
++static int
++sbu_sweep_pass(unsigned k)
++{
++	static const uint8_t par_rnd[7] = { 0x00, 0xe0, 0x01, 0x30, 0x00, 0x01, 0x00 };    /* bluetoothd's LE Set Scan Parameters, as patch 0219 */
++	static const uint8_t par_off[2] = { 0x00, 0x00 };                                    /* LE Set Scan Enable: off (witness only, never enable) */
++	uint8_t par[255], rp[SBU_PM_SUPP], none[1] = { 0 }, st, s_inj = 0xff, s_204a = 0xff, s_fin = 0xff, s_b = 0xff, s_c = 0xff;
++	size_t rpn;
++	unsigned timeouts = 0, diverged = 0, first_div = 0;
++	uint16_t div_op = 0;
++	char injs[16];
++	int e, verdict;
++
++	for (size_t i = 0; i < SBU_RM_N; i++) {
++		const struct sbu_rstep *r = &sbu_rm[i];
++		unsigned pos = (unsigned)i + 1;
++		const char *hex = r->op == 0x0c52 ? sbu_eir_hex : r->op == 0xfd48 ? sbu_fd48_bd_hex : r->hex;
++		uint8_t want = r->op == 0xfd48 ? 0x01 : 0x00;      /* bluetoothd instance 1, bt-up6 [obs]: every one of the 48 answered 0x00, fd48 0x01 */
++		size_t known;
++
++		memset(par, 0, sizeof(par));
++		known = sbu_hexparse(hex, par, sizeof(par));
++		if (known == (size_t)-1 || known > r->plen) {
++			SBU_GAP(SG_OTHER, "sweep inj=%u pos=%u op=0x%04x: payload table row malformed (known %ld of %u); step skipped, the pass is incomplete", k, pos, r->op, (long)known, r->plen);
++			timeouts++;
++		} else {
++			st = 0xff;
++			if ((e = sbu_cmd(r->op, par, r->plen, &st, rp, sizeof(rp), &rpn)) != 0) {
++				timeouts++;
++				printf("BT PROBE: sweep inj=%u pos=%u op=0x%04x plen=%u NO ANSWER (error %d)\n", k, pos, r->op, r->plen, e);
++			} else {
++				if (r->op == 0x204a) {
++					s_204a = st;
++				}
++				if (st != want) {
++					if (diverged++ == 0) {
++						first_div = pos;
++						div_op = r->op;
++					}
++					printf("BT PROBE: sweep inj=%u pos=%u op=0x%04x plen=%u status=%#04x (%s) bluetoothd=%#04x DIVERGES-FROM-BLUETOOTHD\n", k, pos, r->op, r->plen, st, sbu_pstatus(st), want);
++				}
++			}
++		}
++		if (pos == k && sbu_cmd(0x2007, none, 0, &s_inj, rp, sizeof(rp), &rpn) != 0) {      /* the injected probe; read-only */
++			timeouts++;
++			s_inj = 0xff;
++			printf("BT PROBE: sweep inj=%u injected 2007 after pos=%u NO ANSWER\n", k, pos);
++		}
++	}
++	if (sbu_cmd(0x2007, none, 0, &s_fin, rp, sizeof(rp), &rpn) != 0) {
++		timeouts++;
++		s_fin = 0xff;
++	}
++	if (sbu_cmd(0x200b, par_rnd, 7, &s_b, rp, sizeof(rp), &rpn) != 0) {
++		timeouts++;
++		s_b = 0xff;
++	}
++	if (sbu_cmd(0x200c, par_off, 2, &s_c, rp, sizeof(rp), &rpn) != 0) {
++		timeouts++;
++		s_c = 0xff;
++	}
++	if (k == 0) {
++		snprintf(injs, sizeof(injs), "none");
++	} else {
++		snprintf(injs, sizeof(injs), "%#04x", s_inj);
++	}
++	verdict = timeouts != 0 ? 3 : (s_fin == 0 && s_b == 0 && s_c == 0) ? ((s_204a == 0 && diverged == 0 && (k == 0 || s_inj == 0)) ? 1 : 2) : 0;
++	printf("BT PROBE: sweep inj=%u inj2007=%s 204a=%#04x final2007=%#04x 200b=%#04x 200c=%#04x diverged=%u first-diverged=%u op=0x%04x no-answer=%u verdict=%s\n", k, injs, s_204a, s_fin, s_b, s_c,
++	    diverged, first_div, div_op, timeouts, verdict == 1 ? "OPEN-ALL" : verdict == 2 ? "OPEN-BUT-DIVERGED" : verdict == 3 ? "INCOMPLETE" : "REFUSED");
++	if (timeouts != 0) {
++		SBU_GAP(SG_OTHER, "sweep inj=%u: %u steps got no answer or a malformed row; this pass is incomplete", k, timeouts);
++	}
++	return verdict;
++}
++
++/* 0 = every pass ran and the controller answered after each power-cycle; else the errno of the failed re-probe (controller powered off; the caller returns). The last pass is followed by the caller's own power-cycle. */
++static int
++sbu_sweep(const struct sbu_cand *c)
++{
++	unsigned open_all = 0, open_div = 0, refused = 0;
++	char list[SBU_SWEEP_N * 4 + 1];
++	size_t ll = 0;
++	int e = 0;
++
++	list[0] = 0;
++	printf("BT PROBE: sweep start (sweetbtleprobe=4, patch 0221): %zu passes of the 48-command sequence, ONE 0x2007 injected after step k (k=0: none), power-cycle between the passes; per-transfer HCI trace suppressed during the sweep\n", SBU_SWEEP_N);
++	sbu_trace_quiet = true;
++	for (size_t j = 0; j < SBU_SWEEP_N; j++) {
++		int v = sbu_sweep_pass(sbu_sweep_k[j]);
++
++		if (v == 3) {       /* a missed answer: the controller state is unknown, a chip that answers Reset but nothing else would hold the boot for minutes (review T-2ed7 finding 5): stop, power off, loud */
++			(void)sbu_power_off();
++			sbu_trace_quiet = false;
++			printf("BT PROBE: sweep stops after the incomplete pass inj=%u (passes done %zu of %zu, suppressed-hci-transfers=%u); controller powered off\n", sbu_sweep_k[j], j + 1, SBU_SWEEP_N, sbu_trace_quiet_n);
++			return EIO;
++		}
++		if (v == 1) {
++			open_all++;
++			ll += (size_t)snprintf(list + ll, sizeof(list) - ll, "%s%u", ll ? "," : "", sbu_sweep_k[j]);
++		} else if (v == 2) {
++			open_div++;
++		} else {
++			refused++;
++		}
++		if (j + 1 < SBU_SWEEP_N) {
++			(void)sbu_power_off();
++			e = sbu_probe_one(c);
++			if (e != 0) {
++				sbu_trace_quiet = false;
++				printf("BT UART: controller power-cycled after sweep pass inj=%u: NO ANSWER (error %d); the sweep stops here (passes done %zu of %zu, suppressed-hci-transfers=%u)\n", sbu_sweep_k[j], e, j + 1, SBU_SWEEP_N, sbu_trace_quiet_n);
++				return e;
++			}
++		}
++	}
++	sbu_trace_quiet = false;
++	printf("BT PROBE: sweep done: passes=%zu open-all=%u open-but-diverged=%u refused=%u open-all-at-inj=[%s] suppressed-hci-transfers=%u\n", SBU_SWEEP_N, open_all, open_div, refused, list, sbu_trace_quiet_n);
++	return 0;
++}
++
+ /*
+  * patch 0217, boot-arg sweetbtrw200b=1 (diagnostic knob, not a fix): the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b
+  * is rewritten from 0x0c (Command Disallowed) to 0x00. bt-up4/5 [obs]: bluetoothd exits right after that status [read from source: scan completion 0x1005798d4]. The rewrite scores
+@@ -1425,8 +1561,14 @@ sweet_bt_uart_attach(void)
+ 			{       /* patch 0216 (T-0c77): boot-arg sweetbtleprobe=1; default behaviour unchanged. The rx thread is not running yet, so the probe owns the FIFO. */
+ 				int v = 0;
+ 
+-				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3)) {
+-					if (v == 3) {       /* patch 0219: replay v3, pass A (no probes between steps), power-cycle, pass B (control with a probe after every step) */
++				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
++					if (v == 4) {       /* patch 0221: injection-position sweep, power-cycles between the passes */
++						e = sbu_sweep(&use[win]);
++						if (e != 0) {
++							printf("BT GAP: backend not started after a sweep power-cycle; controller powered off\n");
++							return;
++						}
++					} else if (v == 3) {       /* patch 0219: replay v3, pass A (no probes between steps), power-cycle, pass B (control with a probe after every step) */
+ 						sbu_replay3(false);
+ 						(void)sbu_power_off();
+ 						e = sbu_probe_one(&use[win]);
+@@ -1456,7 +1598,7 @@ sweet_bt_uart_attach(void)
+ 	if (!settled) {
+ 		int v = 0;
+ 
+-		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3)) {
++		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
+ 			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
+ 		}
+ 	}

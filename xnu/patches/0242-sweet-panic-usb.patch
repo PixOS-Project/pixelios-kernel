@@ -1,0 +1,562 @@
+SWEET panic log over USB (patch 0242, T-9d99, rule 8): with no panic region debug_buf_size is 0 and debug_putc drops the panic log, and paniclog_append_noflush never reaches the console ring the USB log streams, so the panic cause only existed as screen text (baseline run 20261107T145123Z-panic-self-recover: merged.log ends at 610.7 s). From the panic(cpu line of debugger_collect_diagnostics, debug_putc keeps the first 8 KiB of the panic log in a static buffer (capture half of the T-da01 WIP; its QR half dropped). At the start of the 0224 hold (also with sweetpanichold=0) sweet_panic_usb sends it plus the raw console-ring tail (sweetpanicusb_tail, default 4096) from the panicking CPU: bsd/dev/sweet_usb.c sweet_usb_panic_send builds one Ethernet+IPv4+UDP frame by hand (192.168.7.2:5140 -> 192.168.7.1:5140, host MAC learned from received frames, else broadcast) into the same UD_TX DMA slot and starts it with the same TRB and StartTransfer as ud_tx_kick_locked, polls the TRB HWO bit (200 ms per frame) and acks GEVNTCOUNT; no lock, allocation, thread, sleep or printf. Refused, with a SWEET PANIC USB GAP line on the hold screen, when: sweetpanicusb=0, a CPU did not stop (debugger_sync != 0), immediate_NMI (force_immediate_debug_halt skips the halt IPI), no gadget, not configured, the panic is on ud_thread, a thread was inside ud_tx_kick_locked, or a TX/command wait times out; a nested panic sends nothing again. Frames: PXPANIC usb begin / frame i/n [cont] / end lines (tools/panic_capture.py reassembles them into PANIC: lines; tools/xrun_report.py). Boot line: SWEET FAULT USB. Backtrace (T-15e0): SavePanicInfo returns at panic_info == NULL (0182) before print_all_backtraces, so osfmk/arm/model_dep.c sweet_noregion_backtrace prints its region-free part there (slide, task, panicked-thread lr/fp lines) before the hold sends.
+
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -335,6 +335,22 @@
+ #define SWEET_PANIC_HOLD_DEFAULT_S 20
+ #define SWEET_PANIC_HOLD_MAX_S     120
+ static TUNABLE(unsigned int, sweet_panic_hold_s, "sweetpanichold", SWEET_PANIC_HOLD_DEFAULT_S);
++
++/*
++ * PixOS patch 0242 (T-9d99, capture taken from the T-da01 WIP): with no panic region debug_buf_size is 0 and debug_putc
++ * drops every panic-log byte (paniclog_append_noflush never reaches the console ring that the USB log streams), so the
++ * panic cause only existed as screen text. From the panic(cpu line of debugger_collect_diagnostics on, debug_putc keeps
++ * the first SWEET_PANIC_CAP bytes in a static buffer; at the start of the hold, sweet_panic_usb() sends that capture and
++ * the console-ring tail over the USB gadget from the panicking CPU (bsd/dev/sweet_usb.c sweet_usb_panic_send) to the
++ * live-log receiver, where tools/panic_capture.py turns them into PANIC: lines. Static buffers, no lock, no allocation.
++ * Boot-args: sweetpanicusb=0 off (default 1), sweetpanicusb_tail=<bytes of the console-ring tail> (default 4096, max 8192).
++ */
++#define SWEET_PANIC_CAP            8192
++static char sweet_panic_cap[SWEET_PANIC_CAP];
++static unsigned int sweet_panic_cap_len, sweet_panic_cap_lost;
++static int sweet_panic_cap_state;        /* 0 not armed, 1 recording, 2 frozen (the hold's own text is not captured) */
++static TUNABLE(unsigned int, sweet_panicusb_on, "sweetpanicusb", 1);
++static TUNABLE(unsigned int, sweet_panicusb_tail, "sweetpanicusb_tail", 4096);
+ #endif
+ 
+ char kernel_uuid_string[37]; /* uuid_string_t */
+@@ -496,6 +512,9 @@
+ 			}
+ 			printf("SWEET FAULT HOLD: %u s on screen before the reset (patch 0224)%s\n",
+ 			    MIN(sweet_panic_hold_s, SWEET_PANIC_HOLD_MAX_S), panicDebugging ? ", not used: debug= has DB_NMI 0x4" : "");
++			printf("SWEET FAULT USB: %s (patch 0242: first %u bytes of the fault log + %u bytes of console tail sent over the USB gadget at the start of the hold)%s\n",
++			    sweet_panicusb_on ? "on" : "off (boot-arg = 0)", SWEET_PANIC_CAP, MIN(sweet_panicusb_tail, 8192u),
++			    panicDebugging ? ", not used: debug= has DB_NMI 0x4" : "");
+ 		}
+ #endif
+ 		return;
+@@ -1237,6 +1256,151 @@
+ }
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++/* PixOS patch 0242: USB side of the panic hold (bsd/dev/sweet_usb.c, bsd/dev/sweet_ufs.c, osfmk/arm/model_dep.c). */
++extern int sweet_usb_panic_check(void);
++extern int sweet_usb_panic_send(const char *payload, uint32_t len);
++extern const char *sweet_usb_panic_why(int code);
++extern bool sweet_usb_panic_host_mac_learned(void);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++extern volatile unsigned int debugger_sync;
++extern boolean_t force_immediate_debug_halt;
++
++#define SWEET_PANICUSB_TAIL_MAX 8192
++#define SWEET_PANICUSB_CHUNK    1200    /* + the 40-byte frame line: one UDP datagram below 1472 bytes */
++static char sweet_panicusb_full[SWEET_PANIC_CAP + SWEET_PANICUSB_TAIL_MAX + 256];
++static char sweet_panicusb_dgram[SWEET_PANICUSB_CHUNK + 96];
++static int sweet_panicusb_tried;
++
++static unsigned int
++sweet_panicusb_put(char *dst, unsigned int at, unsigned int max, const char *src, unsigned int n)
++{
++	if (at >= max) {
++		return at;
++	}
++	if (n > max - at) {
++		n = max - at;
++	}
++	memcpy(dst + at, src, n);
++	return at + n;
++}
++
++/* Next frame of s[at..len): the rest when it fits, else up to max bytes ending at the last newline in them; no newline: max bytes, *cont. */
++static unsigned int
++sweet_panicusb_chunk(const char *s, unsigned int len, unsigned int at, unsigned int max, int *cont)
++{
++	unsigned int n = len - at;
++
++	if (n <= max) {
++		*cont = n > 0 && s[len - 1] != '\n';
++		return n;
++	}
++	for (n = max; n > 0 && s[at + n - 1] != '\n'; n--) {
++	}
++	*cont = (n == 0);
++	return n ? n : max;
++}
++
++static int
++sweet_panicusb_note(const char *fmt, unsigned int a, unsigned int b, unsigned int c, unsigned int d)
++{
++	int n = snprintf(sweet_panicusb_dgram, sizeof(sweet_panicusb_dgram), fmt, a, b, c, d);
++
++	n = n < 0 ? 0 : MIN(n, (int)sizeof(sweet_panicusb_dgram) - 1);
++	return sweet_usb_panic_send(sweet_panicusb_dgram, (uint32_t)n);
++}
++
++static void
++sweet_panic_usb(void)
++{
++	unsigned int tail = sweet_panicusb_tail, flen = 0, tl = 0, nf = 0, at, k, sent = 0, sid;
++	uint64_t pos, total;
++	int rc, cont, n;
++	char line[128];
++
++	sweet_panic_cap_state = 2;      /* freeze: the text printed from here on is the hold's own */
++	if (sweet_panicusb_tried++) {
++		panic_debugger_log("SWEET PANIC USB GAP: nested fault in the hold, the fault log was already sent or refused once\n");
++		return;
++	}
++	if (!sweet_panicusb_on) {
++		panic_debugger_log("SWEET PANIC USB GAP: sweetpanicusb=0, nothing sent over USB\n");
++		return;
++	}
++	if (tail > SWEET_PANICUSB_TAIL_MAX) {
++		panic_debugger_log("SWEET PANIC USB GAP: sweetpanicusb_tail=%u above %u, using %u\n", tail, SWEET_PANICUSB_TAIL_MAX, SWEET_PANICUSB_TAIL_MAX);
++		tail = SWEET_PANICUSB_TAIL_MAX;
++	}
++	if (force_immediate_debug_halt) {
++		panic_debugger_log("SWEET PANIC USB GAP: immediate_NMI halt skips the debugger IPI, other CPUs may still run and use the gadget: nothing sent\n");
++		return;
++	}
++	if (debugger_sync != 0) {
++		panic_debugger_log("SWEET PANIC USB GAP: %u CPU(s) did not stop for the debugger, a running CPU could use the gadget: nothing sent\n", debugger_sync);
++		return;
++	}
++	rc = sweet_usb_panic_check();
++	if (rc != 0) {
++		panic_debugger_log("SWEET PANIC USB GAP: not sent: %s\n", sweet_usb_panic_why(rc));
++		return;
++	}
++	/* the raw console-ring tail (exact kernel text), from its first line start */
++	total = sweet_log_position();
++	pos = total > tail ? total - tail : 0;
++	sid = (unsigned int)mach_absolute_time();
++	n = snprintf(line, sizeof(line), "PXPANIC full sid=%08x cap=%u lost=%u tail=", sid, sweet_panic_cap_len, sweet_panic_cap_lost);
++	/* the tail goes after the capture: copy it to its place first, then trim to a line start, then write the header */
++	{
++		static char tailbuf[SWEET_PANICUSB_TAIL_MAX];
++		unsigned int got = tail ? sweet_log_copy(&pos, tailbuf, tail) : 0, skip = 0;
++
++		if (pos > 0 && got == tail) {   /* started inside a line: drop up to its end */
++			while (skip < got && tailbuf[skip] != '\n') {
++				skip++;
++			}
++			skip = skip < got ? skip + 1 : 0;
++		}
++		tl = got - skip;
++		n += snprintf(line + n, sizeof(line) - (size_t)n, "%u\n", tl);
++		flen = sweet_panicusb_put(sweet_panicusb_full, 0, sizeof(sweet_panicusb_full), line, (unsigned int)n);
++		flen = sweet_panicusb_put(sweet_panicusb_full, flen, sizeof(sweet_panicusb_full), sweet_panic_cap, sweet_panic_cap_len);
++		n = snprintf(line, sizeof(line), "\n--- PXPANIC console-log tail (%u bytes) ---\n", tl);
++		flen = sweet_panicusb_put(sweet_panicusb_full, flen, sizeof(sweet_panicusb_full), line, (unsigned int)n);
++		flen = sweet_panicusb_put(sweet_panicusb_full, flen, sizeof(sweet_panicusb_full), tailbuf + skip, tl);
++	}
++	for (at = 0; at < flen; nf++) {
++		at += sweet_panicusb_chunk(sweet_panicusb_full, flen, at, SWEET_PANICUSB_CHUNK, &cont);
++	}
++	rc = sweet_panicusb_note("\nPXPANIC usb begin sid=%08x frames=%u bytes=%u\n", sid, nf, flen, 0);
++	for (at = 0, k = 0; rc == 0 && at < flen; k++) {
++		unsigned int c = sweet_panicusb_chunk(sweet_panicusb_full, flen, at, SWEET_PANICUSB_CHUNK, &cont);
++		int h = snprintf(sweet_panicusb_dgram, sizeof(sweet_panicusb_dgram), "PXPANIC frame %u/%u sid=%08x%s\n", k, nf, sid, cont ? " cont" : "");
++
++		h = h < 0 ? 0 : h;
++		memcpy(sweet_panicusb_dgram + h, sweet_panicusb_full + at, c);
++		if (cont) {
++			sweet_panicusb_dgram[h + c++] = '\n';
++		}
++		rc = sweet_usb_panic_send(sweet_panicusb_dgram, (uint32_t)h + c);
++		if (rc == 0) {
++			sent++;
++		}
++		at += cont ? c - 1 : c;
++	}
++	if (rc == 0) {
++		rc = sweet_panicusb_note("PXPANIC usb end sid=%08x sent=%u/%u\n", sid, sent, nf, 0);
++	}
++	if (rc != 0) {
++		panic_debugger_log("SWEET PANIC USB GAP: stopped after %u of %u frames: %s\n", sent, nf, sweet_usb_panic_why(rc));
++	}
++	panic_debugger_log("SWEET PANIC USB: sid %08x, %u of %u frames sent (%u bytes: fault log %u, %u lost, console tail %u), to %s\n",
++	    sid, sent, nf, flen, sweet_panic_cap_len, sweet_panic_cap_lost, tl,
++	    sweet_usb_panic_host_mac_learned() ? "the host MAC" : "Ethernet broadcast (no frame received from the host yet)");
++	if (sweet_panic_cap_len == 0) {
++		panic_debugger_log("SWEET PANIC USB GAP: nothing captured (not armed by a DBOP_PANIC entry); only the console tail was sent\n");
++	}
++}
++
+ /*
+  * PixOS patch 0224: debug=0x8 resets at once and the panic text would be gone. Print it with the calls of the DB_NMI block
+  * of debugger_collect_diagnostics, then spin on the timebase so the camera can read it. No hardware write, no lock.
+@@ -1247,6 +1411,7 @@
+ 	unsigned int secs = MIN(sweet_panic_hold_s, SWEET_PANIC_HOLD_MAX_S);
+ 	uint64_t interval, end;
+ 
++	sweet_panic_usb();              /* patch 0242: before the hold, also with sweetpanichold=0; says on screen what it sent */
+ 	if (secs == 0) {
+ 		return;
+ 	}
+@@ -1350,6 +1515,11 @@
+ 	 * TODO: Consider moving to SavePanicInfo as this is part of the panic log.
+ 	 */
+ 	if (debugger_current_op == DBOP_PANIC) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_panic_cap_state == 0) {
++			sweet_panic_cap_state = 1;      /* patch 0242: record the panic log from here; a nested panic keeps appending */
++		}
++#endif
+ 		paniclog_append_noflush("panic(cpu %u caller 0x%lx): ", (unsigned) cpu_number(), debugger_panic_caller);
+ 		if (debugger_panic_str) {
+ #pragma clang diagnostic push
+@@ -1733,6 +1903,18 @@
+ void
+ debug_putc(char c)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* patch 0242: no panic region, keep the panic log for the USB send of the hold (bounded, single writer: the panicking CPU) */
++	if (debug_buf_size == 0 && sweet_panic_cap_state == 1) {
++		unsigned int at = sweet_panic_cap_len;  /* one read: a CPU not yet halted can race, never past the end */
++		if (at < SWEET_PANIC_CAP) {
++			sweet_panic_cap[at] = c;
++			sweet_panic_cap_len = at + 1;
++		} else {
++			sweet_panic_cap_lost++;
++		}
++	}
++#endif
+ 	if ((debug_buf_size != 0) &&
+ 	    ((debug_buf_ptr - debug_buf_base) < (int)debug_buf_size)) {
+ 		*debug_buf_ptr = c;
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -298,6 +298,12 @@
+ 	uint64_t    ss_deadline;    /* mach absolute time: RUN at SuperSpeed + UD_SS_WAIT_MS */
+ } ud;
+ 
++/* PixOS patch 0242 (T-9d99): state read by sweet_usb_panic_send() on the panicking CPU (below ud_log_thread) */
++static thread_t volatile ud_thread_self;                /* ud_thread: a panic on this thread is inside the event loop */
++static thread_t volatile ud_tx_owner;                   /* thread inside ud_tx_kick_locked (TX DMA slot, EP_TX TRB) */
++static uint8_t ud_host_mac[ETHER_ADDR_LEN];             /* source MAC of the last received frame: the host side of ue0 */
++static bool volatile ud_host_mac_ok;
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -647,6 +653,11 @@
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (len >= ETHER_HDR_LEN && len <= UD_FRAME_MAX) {
++		/* patch 0242: every frame on this point-to-point link comes from the host; its source MAC is the panic send's destination */
++		memcpy(ud_host_mac, (const void *)(ud.dma + UD_RX + ETHER_ADDR_LEN), ETHER_ADDR_LEN);
++		ud_host_mac_ok = true;
++	}
+ 	/* USB root disk frames (EtherType 0x88B6, bsd/dev/sweet_usbroot.c) never reach the IP stack; no-op unless rd=usbroot0. */
+ 	if (len >= ETHER_HDR_LEN && len <= UD_FRAME_MAX && sweet_usbroot_rx((const uint8_t *)(ud.dma + UD_RX), len)) {
+ 		ud_rx_arm();
+@@ -686,6 +697,7 @@
+ static void
+ ud_tx_kick_locked(void)
+ {
++	ud_tx_owner = current_thread();         /* patch 0242: a panic send refuses while this is set */
+ 	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+@@ -706,6 +718,7 @@
+ 		ud.tx_frames++;
+ 		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+ 	}
++	ud_tx_owner = NULL;
+ }
+ 
+ static errno_t
+@@ -1093,6 +1106,7 @@
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
++	ud_thread_self = current_thread();      /* patch 0242 */
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+@@ -1315,6 +1329,198 @@
+ }
+ 
+ /*
++ * PixOS patch 0242 (T-9d99): panic log over USB. The panic hold (osfmk/kern/debug.c sweet_panic_usb, patch 0224's
++ * sweet_panic_hold) runs on the panicking CPU after DebuggerHaltOtherCores, where the normal TX path (ud_if_output:
++ * ud.lock, mbufs, the IP stack, ud_log_thread's socket) cannot run. sweet_usb_panic_send() builds ONE Ethernet + IPv4
++ * + UDP frame by hand (192.168.7.2:5140 -> 192.168.7.1:5140, ud_log_thread's destination), copies it into the same
++ * UD_TX DMA slot and starts it with the same TRB fields and StartTransfer as ud_tx_kick_locked/ud_start_trb, then
++ * polls the TRB's HWO bit (the controller clears it at the end of the transfer) and acks the event buffer the way
++ * ud_thread does (GEVNTCOUNT, the events are not dispatched). No lock, allocation, thread, sleep or printf; the
++ * caller prints every refusal (rule 8). Registers written: DEPCMDPAR0-2/DEPCMD of EP_TX and GEVNTCOUNT only, the
++ * same registers with the same values as a normal TX.
++ */
++#define UD_PANIC_WAIT_US        200000  /* per frame: the host reads a bulk IN within ~1 ms when its receiver runs */
++#define UD_PANIC_PAYLOAD_MAX    1472    /* 1500 - 20 (IPv4) - 8 (UDP): one frame, no IP fragments */
++
++int sweet_usb_panic_check(void);
++int sweet_usb_panic_send(const char *payload, uint32_t len);
++const char *sweet_usb_panic_why(int code);
++bool sweet_usb_panic_host_mac_learned(void);
++
++static uint16_t ud_panic_ip_id;
++static uint8_t ud_panic_frame[ETHER_HDR_LEN + 28 + UD_PANIC_PAYLOAD_MAX + 1];
++
++/* Busy-wait us microseconds on the timebase (delay() is not used: it may block when interrupts are on). */
++static void
++ud_panic_spin_us(uint32_t us)
++{
++	uint64_t step, end;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &step);
++	end = mach_absolute_time() + step;
++	while (mach_absolute_time() < end) {
++		__asm__ volatile ("yield");
++	}
++}
++
++/* EP_TX TRB still owned by the controller? (a cacheable DMA area is cleaned + invalidated first, as ud_rx_done does) */
++static bool
++ud_panic_tx_trb_hwo(void)
++{
++	ud_sync(UD_TRB_TX, 16);
++	return (((volatile uint32_t *)(ud.dma + UD_TRB_TX))[3] & TRB_HWO) != 0;
++}
++
++/* Ack whatever the controller logged (ud_thread is halted): only the count write, no dispatch, as ud_restart's stop loop. */
++static void
++ud_panic_ack_events(void)
++{
++	uint32_t c = dwc_rd(GEVNTCOUNT) & 0xffff;
++
++	if (c) {
++		dwc_wr(GEVNTCOUNT, c);
++		ud.evt_pos = (ud.evt_pos + c) % UD_EVT_SIZE;
++	}
++}
++
++static const char *const ud_panic_why[] = {
++	"sent",
++	"no USB gadget (sweet_usb not started on this boot)",
++	"gadget not configured by the host (or data alternate 0)",
++	"the panic happened on ud_thread (inside the USB event loop)",
++	"a thread was inside the USB TX path (ud_tx_kick_locked) when the CPUs stopped",
++	"payload empty or longer than 1472 bytes",
++	"EP_TX command still active (DEPCMD.CMDACT) after 200 ms",
++	"the previous EP_TX transfer did not finish in 200 ms (TRB HWO set)",
++	"StartTransfer on EP_TX returned an error status",
++	"frame not read by the host in 200 ms (TRB HWO still set; receiver stopped or cable out?)",
++};
++
++const char *
++sweet_usb_panic_why(int code)
++{
++	return code >= 0 && code < (int)(sizeof(ud_panic_why) / sizeof(ud_panic_why[0])) ? ud_panic_why[code] : "unknown";
++}
++
++bool
++sweet_usb_panic_host_mac_learned(void)
++{
++	return ud_host_mac_ok;
++}
++
++int
++sweet_usb_panic_check(void)
++{
++	if (ud.dwc == 0 || ud.dma == 0) {
++		return 1;
++	}
++	if (!ud.configured || ud.data_alt != 1) {
++		return 2;
++	}
++	if (ud_thread_self != NULL && ud_thread_self == current_thread()) {
++		return 3;
++	}
++	if (ud_tx_owner != NULL) {
++		return 4;
++	}
++	return 0;
++}
++
++int
++sweet_usb_panic_send(const char *payload, uint32_t len)
++{
++	uint8_t *f = ud_panic_frame;
++	uint32_t i, sum = 0, flen, ctl;
++	uint16_t ipl = (uint16_t)(20 + 8 + len), udl = (uint16_t)(8 + len);
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++	int rc = sweet_usb_panic_check();
++
++	if (rc != 0) {
++		return rc;
++	}
++	if (len == 0 || len > UD_PANIC_PAYLOAD_MAX) {
++		return 5;
++	}
++	/* the controller must be done with the EP_TX command and the last TX TRB (a halted CPU may have left one in flight) */
++	for (i = 0; (dwc_rd(DEPCMD(EP_TX)) & DEPCMD_CMDACT) && i < UD_PANIC_WAIT_US / 10; i++) {
++		ud_panic_spin_us(10);
++	}
++	if (dwc_rd(DEPCMD(EP_TX)) & DEPCMD_CMDACT) {
++		return 6;
++	}
++	for (i = 0; ud_panic_tx_trb_hwo() && i < UD_PANIC_WAIT_US / 10; i++) {
++		ud_panic_ack_events();
++		ud_panic_spin_us(10);
++	}
++	if (ud_panic_tx_trb_hwo()) {
++		return 7;
++	}
++	/* Ethernet: host MAC learned from received frames (else broadcast; Linux takes a unicast IP in an L2 broadcast) */
++	for (i = 0; i < ETHER_ADDR_LEN; i++) {
++		f[i] = ud_host_mac_ok ? ud_host_mac[i] : 0xff;
++		f[ETHER_ADDR_LEN + i] = ud_phone_mac[i];
++	}
++	f[12] = 0x08; f[13] = 0x00;
++	/* IPv4 (RFC 791): no options, DF, TTL 64, UDP; header checksum below */
++	f += ETHER_HDR_LEN;
++	f[0] = 0x45; f[1] = 0; f[2] = (uint8_t)(ipl >> 8); f[3] = (uint8_t)ipl;
++	ud_panic_ip_id++;
++	f[4] = (uint8_t)(ud_panic_ip_id >> 8); f[5] = (uint8_t)ud_panic_ip_id; f[6] = 0x40; f[7] = 0;
++	f[8] = 64; f[9] = 17; f[10] = 0; f[11] = 0;
++	f[12] = 192; f[13] = 168; f[14] = 7; f[15] = 2;
++	f[16] = 192; f[17] = 168; f[18] = 7; f[19] = 1;
++	for (i = 0; i < 20; i += 2) {
++		sum += ((uint32_t)f[i] << 8) | f[i + 1];
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	sum = ~sum & 0xffff;
++	f[10] = (uint8_t)(sum >> 8); f[11] = (uint8_t)sum;
++	/* UDP (RFC 768): 5140 -> 5140, checksum 0 = none (allowed over IPv4) */
++	f[20] = 0x14; f[21] = 0x14; f[22] = 0x14; f[23] = 0x14;
++	f[24] = (uint8_t)(udl >> 8); f[25] = (uint8_t)udl; f[26] = 0; f[27] = 0;
++	memcpy(f + 28, payload, len);
++	flen = ETHER_HDR_LEN + 28 + len;
++	memcpy((void *)(ud.dma + UD_TX), ud_panic_frame, flen);
++	if ((flen % 512) == 0) {         /* as ud_tx_kick_locked: a pad byte instead of a zero-length packet */
++		((uint8_t *)(ud.dma + UD_TX))[flen++] = 0;
++	}
++	/* ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, flen, TRBCTL_NORMAL) without its printf/delay in the command wait */
++	ctl = TRBCTL_NORMAL | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	t[0] = (uint32_t)(ud.dma_pa + UD_TX);
++	t[1] = (uint32_t)((ud.dma_pa + UD_TX) >> 32);
++	t[2] = flen;
++	t[3] = ctl;
++	ud_sync(UD_TRB_TX, 16);
++	ud_sync(UD_TX, flen);
++	ud.tx_busy = true;              /* the TX state is ud_thread's, which never runs again before the reset */
++	dwc_wr(DEPCMDPAR0(EP_TX), (uint32_t)((ud.dma_pa + UD_TRB_TX) >> 32));
++	dwc_wr(DEPCMDPAR1(EP_TX), (uint32_t)(ud.dma_pa + UD_TRB_TX));
++	dwc_wr(DEPCMDPAR2(EP_TX), 0);
++	dwc_wr(DEPCMD(EP_TX), DEPCMD_STARTTRANSFER | DEPCMD_CMDACT);
++	for (i = 0; (dwc_rd(DEPCMD(EP_TX)) & DEPCMD_CMDACT) && i < UD_PANIC_WAIT_US / 10; i++) {
++		ud_panic_spin_us(10);
++	}
++	if (dwc_rd(DEPCMD(EP_TX)) & DEPCMD_CMDACT) {
++		return 6;
++	}
++	if ((dwc_rd(DEPCMD(EP_TX)) >> 12) & 0xf) {
++		return 8;
++	}
++	for (i = 0; ud_panic_tx_trb_hwo() && i < UD_PANIC_WAIT_US / 10; i++) {
++		ud_panic_ack_events();
++		ud_panic_spin_us(10);
++	}
++	ud_panic_ack_events();
++	if (ud_panic_tx_trb_hwo()) {
++		return 9;
++	}
++	ud.tx_frames++;
++	return 0;
++}
++
++/*
+  * Test panic (patch 0195, T-118f, PR-2 rerun): boot-arg sweetpanic=<S> (1..SWEET_PANIC_MAX seconds; absent or 0 = off, the default)
+  * makes this kernel thread wait until the USB gadget is configured (the log can flow; at most SWEET_PANIC_CFG_WAIT_S s), sleep S s
+  * more, print "SWEET PANIC TEST: firing now" (the log thread sends it within its 100 ms rounds; this thread waits 1 s for that)
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -800,6 +800,73 @@ panic_print_symbol_name(vm_address_t search)
+ 	return;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * PixOS patch 0242 (T-15e0): with no panic region SavePanicInfo returns before print_all_backtraces (patch 0182 for
++ * panic_info == NULL, stock for debug_buf_size == 0), so the panic log held only the panic(cpu line (run
++ * 20261107T172408Z-panic-usb-forced: cap=98, no backtrace). This prints the part of do_print_all_backtraces that needs
++ * no panic region, in its own format: message, kernel version / UUID / slide, the other CPUs' last pc/lr (cpu_data
++ * reads), the panicked task and the panicked thread's backtrace (print_one_backtrace: pmap_find_phys + physical reads
++ * with not_in_kdp = 0, as print_all_backtraces sets it). Left out, said in the GAP line: the panic_info header and the
++ * stackshot (both need the region), panic_display_hung_cpus_help (UTTDBG PC-sample MMIO reads), zone / compressor
++ * stats, boot args / ECID, kext lists. No MMIO and no lock of its own: paniclog_append_noflush takes the same path as
++ * the panic(cpu line printed just before it (screen console + debug_putc, observed in run 20261107T172408Z-panic-usb-
++ * forced), and debug_putc's 0242 capture keeps it for the USB send at the start of the 0224 hold, which runs after this.
++ */
++static boolean_t sweet_noregion_bt_done;
++
++static void __attribute__((noinline))
++sweet_noregion_backtrace(const char *message)
++{
++	cpu_data_t *cpu_data_ptr = getCpuDatap();
++	unsigned int initial_not_in_kdp = not_in_kdp;
++	thread_t cur_thread = current_thread();
++	uintptr_t cur_fp;
++	task_t task;
++	struct proc *proc;
++
++	if (sweet_noregion_bt_done || panic_bt_depth != 0 || cpu_data_ptr->PAB_active) {
++		paniclog_append_noflush("SWEET PANIC GAP: nested panic, the backtrace is not printed again (patch 0242)\n");
++		return;
++	}
++	sweet_noregion_bt_done = TRUE;
++	panic_bt_depth++;
++	cpu_data_ptr->PAB_active = TRUE;
++	not_in_kdp = 0;         /* print_all_backtraces: pmap routines without pmap locks */
++
++	__asm__ volatile ("add %0, xzr, fp":"=r"(cur_fp));
++	paniclog_append_noflush("Debugger message: %.1200s\n", message ? message : "(none)");
++	paniclog_append_noflush("Kernel version: %.512s\n", version);
++	panic_display_kernel_uuid();
++	panic_display_kernel_aslr();
++	panic_display_last_pc_lr();
++	if (panic_get_thread_proc_task(cur_thread, &task, &proc)) {
++		paniclog_append_noflush("Panicked task %p: %d threads: ", task, task->thread_count);
++		if (proc) {
++			char name[MAXCOMLEN + 1];
++			proc_name_kdp(proc, name, sizeof(name));
++			paniclog_append_noflush("pid %d: %s\n", proc_pid(proc), name);
++		} else {
++			paniclog_append_noflush("unknown task\n");
++		}
++	}
++	if (cur_fp < VM_MAX_KERNEL_ADDRESS) {
++		paniclog_append_noflush("Panicked thread: %p, backtrace: 0x%llx, tid: %llu\n",
++		    cur_thread, (addr64_t)cur_fp, thread_tid(cur_thread));
++		print_one_backtrace(kernel_pmap, cur_fp, "\t", TRUE, FALSE);
++	} else {
++		paniclog_append_noflush("Could not print panicked thread backtrace:"
++		    "frame pointer outside kernel vm.\n");
++	}
++	paniclog_append_noflush("SWEET PANIC GAP: no panic region: no panic header, stackshot, UTTDBG PC samples, zone/compressor "
++	    "stats, boot args or kext lists in this log (patch 0242; real fix PR-3)\n");
++
++	not_in_kdp = initial_not_in_kdp;
++	cpu_data_ptr->PAB_active = FALSE;
++	panic_bt_depth--;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ void
+ SavePanicInfo(
+ 	const char *message, __unused void *panic_data, uint64_t panic_options)
+@@ -821,6 +888,7 @@ SavePanicInfo(
+ 	 * keeps the stock loop. No print here: kprintf spins on kprintf_lock without bound.
+ 	 */
+ 	if (panic_info == NULL) {
++		sweet_noregion_backtrace(message);    /* patch 0242 (T-15e0): the backtrace, for the USB send of the hold */
+ 		return;
+ 	}
+ #endif

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Static analysis over the shim C (TP-014): cppcheck + clang-tidy-19 with the shim/build.sh flags. Read-only, no device.
   tools/lint-c [--files shim/a.c ...] [--strict] [--out DIR]
+  tools/lint-c --style [--base REF]   C style ratchet (docs/STYLE-C.md, tools/lint_c_style.py): only functions new/changed against `git diff --merge-base REF`
+                                      (default trunk, else origin/trunk, main, ...) must comply; `RESULT: PASS|FAIL|ERROR style new=N baseline=N`, baseline is reported, not failing.
+  tools/lint-c --style --all          also list EVERY unbounded loop (rule 1) in shim/ + soc/, changed or not, and fail while any remains: `RESULT: PASS|FAIL style new=N baseline=N unbounded=N`
 Default files: shim/*.c except *_host_test.c (host builds, hosted libc). Logs: shim/out/lint-c/.
 --out DIR (relative to the repo root, default shim/out): where board_config.h / wlan_seq.h come from. The gate no longer refreshes shim/out, so after a gate
 run use --out shim/out/gate/build-0 (a header from an old build is silently stale otherwise).
@@ -14,6 +17,10 @@ ROOT = os.environ.get("LINT_ROOT") or os.path.dirname(os.path.dirname(os.path.ab
 # per-file -D from shim/build.sh (the code is compiled out without them)
 EXTRA = {"wlansmc.c": ["-DWLAN_SMC_READ", "-DWLAN_ISO_RUN"], "wlanen.c": ["-DWLAN_EN_RUN"], "wlanlink.c": ["-DWLAN_LINK_RUN"],
          "gpurailon.c": ["-DGPU_RAIL_ON"], "gpujob.c": ["-DGPU_JOB"]}
+# cppcheck 2.17 cannot parse a GCC register-asm label (`register uint64_t x0 __asm__("x0") = fn;`, shim.c smc()): it stops with syntaxError and checks
+# nothing in the file. This function-like macro matches `__asm__(` followed by a string, so it drops the register-asm label AND any `__asm__("...")` statement written
+# without `volatile` (shim/udump.c:54-55 crc32 asm; cppcheck output for udump.c/wlansmc.c is identical with and without it, review lint-c-20t-r1 F1). `__asm__ volatile (` stays.
+CPP_ASM_LABEL = "-D__asm__(x)="
 TIDY_CHECKS = "-*,clang-analyzer-*,bugprone-*,-bugprone-easily-swappable-parameters"
 DIAG = re.compile(r"^\S+?:\d+:(?:\d+:)? (error|warning)\b")
 CPP = re.compile(r"^(\S+?):(\d+): (\w+): (.*)")
@@ -30,12 +37,64 @@ def run(cmd, log, timeout):
     return out, rc
 
 
+def style_main(a):
+    """--style: lint_c_style findings in new/changed functions fail; baseline is reported. misc-no-recursion (rule 2) runs on files with changed functions."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import lint_c_style
+    try:
+        r = lint_c_style.run_style(ROOT, a.base, a.files)
+    except RuntimeError as e:
+        print("RESULT: ERROR style cannot diff against %s: %s new=0 baseline=0" % (a.base, e))
+        return 2
+    new = list(r["new"])
+    tidy = os.environ.get("LINT_TIDY") or shutil.which("clang-tidy-19") or shutil.which("clang-tidy")
+    if r["changed_files"] and not tidy:
+        print("RESULT: ERROR style clang-tidy missing (misc-no-recursion needs it) new=0 baseline=%d" % r["baseline"])
+        return 2
+    ld = os.path.join(ROOT, "shim/out/lint-c")
+    os.makedirs(ld, exist_ok=True)
+    for f in r["changed_files"]:
+        bc = os.path.join(ROOT, a.out, "board_config.h")
+        inc = ["-I" + os.path.dirname(os.path.abspath(os.path.join(ROOT, f))), "-Ishim", "-I" + a.out]
+        pre = ["-include", a.out + "/board_config.h"] if os.path.exists(bc) else []
+        d = EXTRA.get(os.path.basename(f), [])
+        out, rc = run([tidy, "--checks=-*,misc-no-recursion", "--quiet", f, "--", "--target=aarch64-none-elf", "-ffreestanding", "-nostdlib", "-DSOC_GS101=1"] + pre + d + inc,
+                      os.path.join(ld, os.path.basename(f) + ".style.log"), int(os.environ.get("LINT_TIMEOUT", "180")))
+        for l in out.splitlines():
+            m = re.match(r"^(\S+?):(\d+):\d+: warning: (.*)\[misc-no-recursion\]", l)
+            if m:
+                new.append((f, int(m.group(2)), "recursion", m.group(3).strip()))
+        if rc == 124:
+            new.append((f, 0, "recursion", "clang-tidy timeout"))
+    for path, ln, rule, msg in new[:8]:
+        print("%s:%d: style %s: %s" % (path, ln, rule, msg))
+    if len(new) > 8:
+        print("... %d more" % (len(new) - 8))
+    print("style: %d new/changed functions, %d SHIM_ASSERT, allowed (style-allow) %d, baseline %d (not failing; rule 4 and 2 are not counted in it)" % (
+        r["functions"], r["asserts"], r["allowed"], r["baseline"]))
+    if a.all:
+        ub = r["unbounded"]
+        for path, ln, msg in ub:
+            print("%s:%d: unbounded: %s" % (path, ln, msg))
+        print("RESULT: %s style new=%d baseline=%d unbounded=%d" % ("PASS" if not new and not ub else "FAIL", len(new), r["baseline"], len(ub)))
+        return 0 if not new and not ub else 1
+    print("RESULT: %s style new=%d baseline=%d" % ("PASS" if not new else "FAIL", len(new), r["baseline"]))
+    return 0 if not new else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--files", nargs="+")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--out", default="shim/out")
+    ap.add_argument("--style", action="store_true", help="C style ratchet on new/changed functions (docs/STYLE-C.md); no cppcheck needed")
+    ap.add_argument("--all", action="store_true", help="with --style: list and count every unbounded loop (rule 1) in all of shim/ + soc/; fails while any remains")
+    ap.add_argument("--base", default=os.environ.get("LINT_STYLE_BASE", ""), help="ref the ratchet diffs against (merge base); default: trunk, else origin/trunk, main, origin/main, master")
     a = ap.parse_args()
+    if a.all and not a.style:
+        ap.error("--all needs --style")
+    if a.style:
+        return style_main(a)
     cpp = os.environ.get("LINT_CPPCHECK") or shutil.which("cppcheck")
     tidy = os.environ.get("LINT_TIDY") or shutil.which("clang-tidy-19") or shutil.which("clang-tidy")
     bc = os.path.join(ROOT, a.out, "board_config.h")
@@ -58,7 +117,7 @@ def main():
         log = os.path.join(ld, os.path.basename(f) + ".log")
         open(log, "w").close()
         out, rc = run([cpp, "--enable=warning,portability,style", "--quiet", "--template={file}:{line}: {severity}: {id}: {message}",
-                       "--include=" + a.out + "/board_config.h"] + common + d + inc + [f], log, to)
+                       "--include=" + a.out + "/board_config.h", CPP_ASM_LABEL] + common + d + inc + [f], log, to)
         for l in out.splitlines():
             m = CPP.match(l)
             if not m:

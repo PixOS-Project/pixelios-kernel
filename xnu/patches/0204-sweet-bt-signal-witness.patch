@@ -1,0 +1,35 @@
+SWEET signal/exit witness for bluetoothd (patch 0204, ticket T-652c, BT-S4c; docs/reviews/T-920b-proof.md s.7.3). psignal_internal prints 'SWEET SIG: <name>[pid] sig=N from pid=P comm=C' for every signal whose target process name starts with 'bluetoothd', and exit_with_reason prints 'SWEET EXIT: <name>[pid] rv=0x..' for the same processes. Log only: no state change, no hardware access, no boot-arg. Not run on hardware yet.
+
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2052,6 +2052,14 @@
+ 	mask = sigmask(signum);
+ 	prop = sigprop[signum];
+ 
++	/* SWEET SIG (T-652c, BT-S4c): witness who signals bluetoothd (T-920b s.7.3); log only, no behaviour change */
++	if (p != PROC_NULL && strncmp(p->p_name, "bluetoothd", 10) == 0) {
++		proc_t sweet_sender = current_proc();
++		printf("SWEET SIG: %s[%d] sig=%d from pid=%d comm=%s\n", p->p_name, proc_getpid(p), signum,
++		    sweet_sender != PROC_NULL ? proc_getpid(sweet_sender) : -1,
++		    sweet_sender != PROC_NULL ? sweet_sender->p_name : "none");
++	}
++
+ #if SIGNAL_DEBUG
+ 	if (rdebug_proc && (p != PROC_NULL) && (p == rdebug_proc)) {
+ 		ram_printf(3);
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1474,6 +1474,11 @@
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++	/* SWEET EXIT (T-652c, BT-S4c): witness how bluetoothd exits (status word rv: 0x7f = signal in low bits, exit code in bits 8..15); log only */
++	if (strncmp(p->p_name, "bluetoothd", 10) == 0) {
++		printf("SWEET EXIT: %s[%d] rv=0x%x\n", p->p_name, proc_getpid(p), rv);
++	}
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.

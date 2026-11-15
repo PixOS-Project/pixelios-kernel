@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""tools/gate-manifest: generate and check tools/gate-manifest.json, the step table of the quick gate (PLAN-GATE-2X D2/G2/G3).
+
+  tools/gate-manifest --write     render the manifest from the repo (check-all.sh ALL, shim/build.sh, the wlan/el2 mutant tests, the patch stack) and write it
+  tools/gate-manifest --check     exit 1 when the committed file differs from a fresh render, or when the table is incomplete (a step, a build-* variant or a
+                                  *_MUTANTS table without a row); wired into the unit step through tools/test_gate_select.py
+  tools/gate-manifest --print     the fresh render on stdout
+
+Ceilings (T-cfb7, docs/recipes/port-new-block.md step 8; file tools/gate-manifest-ceilings.json, same "ceiling only lowers" model as tools/doc-ratchet): a block adds at most
+ONE shim build variant and ONE mutant table. --check/--write refuse (1) more `build`/`build-*` rows than `build_variants` (a 13th row is a FAIL; fewer than the ceiling is a
+FAIL too: lower the number in the same commit, so it can only go down), (2) a `*_MUTANTS` table that is neither in `legacy_mutant_tables` (the 16 that existed before the rule; a
+name leaves the list when its table goes, never joins it) nor tagged `# mutant-block: <name>` on the line above it, (3) two tables tagged with the same block name.
+
+One row per step of check-all.sh ALL: lane (A/B/C as in check-all.sh), class, inputs (fnmatch globs of repo files the step reads; an entry may be
+{"glob": G, "except": [..]}), budget_s, and where it applies follows / predicate / only. The runtime selector (tools/gate_select.py) only READS the JSON.
+class: always = never narrowed by `--quick` and never skipped in any kind: runs whenever one of its inputs changed (validate/rules/public-split: every change);
+       quick = runs in `--quick` when an input changed since the base, always in a formal/full gate; formal = full/formal gate only: NEVER selected by its inputs in
+       a `--quick` run (the 11 build-* variants after `build`, lint-c; PLAN-GATE-LAYERS s.2 L1: one shim build in the quick lane), added only when a quick run selected every other step.
+selector_inputs: a changed file matching one of these globs is the selector's own input: the quick gate runs the FULL set (PLAN-GATE-LAYERS s.3 last row).
+run-path tools (RUN_PATH_GLOBS): the only inputs of probe-run / phone-state / hang-recover (PLAN-GATE-LAYERS s.3 row 3), not every tools/* file.
+patch_edits (wlan-mutants, mutant-needles): a patch file under xnu/patches that edits a file under one of these prefixes is an input too, judged by its CONTENT at select time
+(a patch added after `--write` is not in the static globs; review gate-runfast-1 C2).
+`inert` lists the paths no step reads (documentation): a changed file that matches no row input and no inert glob is UNRESOLVED and selects FULL (rule 8).
+Last line: RESULT: PASS|FAIL gate-manifest ...  Exit 0/1/2.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import fnmatch, json, os, pathlib, re, subprocess, sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+MANIFEST = "tools/gate-manifest.json"
+CEILINGS = "tools/gate-manifest-ceilings.json"
+SCHEMA = 1
+
+# ---- what the shim builds read (shim/build.sh) -------------------------------------------------------------------------------------------------------------
+# build.sh compiles EVERY shim object in every build (the audits see them all) but LINKS a family only with its flag, and runs the host tests only in the
+# gate's first build (PIXELIOS_HOST_TESTS=always, the other builds skip on the stamp). So: a family file selects `build`/`host-tests`/`boot-safety` and the
+# variants that link it; a host-test file selects only the first three. [src shim/build.sh:359-420, 459-464]
+BUILD_TOOL_PREFIX = ("tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py", "tools/check-all.sh", "tools/gate_select.py", "tools/gate-manifest", "tools/audit_memo.py", "tools/audit_pool.py", "tools/gpuclk_audit.py", "tools/mifclk_audit.py", "tools/pmicsrc_audit.py")
+# HOST_ONLY = files only the first build's host tests read. `shim/wlan_*` is NOT host-only (review gate-2x-s2-r1 F1): a new non-test shim/wlan_x.c falls through to the common `shim/*` row = every variant.
+# The two sweet_wlan_*.h headers are included by *_host_test.c only (pinned by tools/test_gate_select.py).
+HOST_ONLY = ["shim/*_host_test.c", "shim/sweet_wlan_*.h"]
+FAMILIES = {   # family -> globs of its shim files (host tests excepted by the caller)
+    "gpu": ["shim/gpu*"], "wlan": ["shim/wlan[!_]*"], "touch": ["shim/touch*"], "udump": ["shim/udump*"],
+    "usbgadget": ["shim/usbproto*", "shim/usbgadget*"], "acpm": ["shim/acpm*"],
+}
+COMMON_EXCEPT = ["shim/*.md"] + HOST_ONLY + [g for gl in FAMILIES.values() for g in gl]
+VARIANTS = {   # step -> families linked ([src shim/build.sh:373-420; check-all.sh laneA flags])
+    "build-fast": [],
+    "build-usb": ["usbgadget"],
+    "build-wlan": ["usbgadget", "wlan", "acpm"],            # --wlan-rails links acpm
+    "build-gpu": ["usbgadget", "gpu"],
+    "build-gpupower": ["usbgadget", "gpu"],
+    "build-gpuclk": ["usbgadget", "gpu", "acpm"],
+    "build-gpurails": ["usbgadget", "gpu", "acpm"],
+    "build-gpurailon": ["usbgadget", "gpu", "acpm"],
+    "build-gpujob": ["usbgadget", "gpu", "acpm"],
+    "build-touch": ["usbgadget", "touch", "acpm"],
+    "build-udump": ["usbgadget", "udump"],
+}
+HOST_STEPS = ("build", "host-tests", "boot-safety")      # run on the first build's tree: every shim file, host tests included
+STEP_FILE_RE = re.compile(r"\bstep ([ABC]) ([\w-]+)")
+ALL_RE = re.compile(r'^ALL="([^"]*)"', re.M)
+
+XNU_BUILD_TOOLS = ["tools/gate-xnu-build", "tools/xnu-local-build", "tools/xnu-remote-build", "tools/xnub-line.sh", "tools/xnu-src-mirror", "tools/check-all.sh"]
+UNIT_GLOBS = ["tools/*", "soc/*", "device/*", "qrlog/*", "xnu/qr/*", "shim/wlan_*"]      # what the self-tests of the tools read; NOT xnu/patches (only `unit` reads the stack)
+INERT = ["docs/*", "*.md", "LICENSE*", "LICENSES/*", ".gitignore", ".github/*", "xnu/patches-archive/*"]   # read by no step except the always-steps (validate, rules, public-split)
+
+# what the three phone-path self-tests (phone-state, hang-recover, probe-run) read: the run-path tools, the scripts they name and their own tests [src: grep of the three scripts, 2026-10-31]
+RUN_PATH_GLOBS = ["tools/probe-run*", "tools/xrun*", "tools/fboot*", "tools/phone*", "tools/plock.sh", "tools/fflash-userdata.sh", "tools/hang-recover*", "tools/to-fastboot.sh",
+                  "tools/usb-log.py", "tools/usb-port", "tools/runs*", "tools/simseams.py", "shim/build.sh", "tools/test_probe*", "tools/test_phone*", "tools/test_xrun*",
+                  "tools/test_fflash*", "tools/test_hang*", "tools/test_plock*"]
+# the selector's own inputs: a change here is judged by running everything (PLAN-GATE-LAYERS s.3 last row)
+SELECTOR_INPUTS = ["tools/check-all.sh", "tools/gate_select.py", "tools/gate-manifest", "tools/gate-manifest.json", "tools/gate-manifest-ceilings.json", "tools/unit_select.py", "tools/gate-unit-shards"]
+
+CONSUMED_TOOLS = ("tools/pack_wlanfw.py", "tools/mkpayload.py", "tools/mkdevoverlay.py", "tools/lint-consumed", "tools/lint-consumed-allow.txt")   # packers lint-consumed parses + the lint + its allowlist
+WLAN_SRC_PREFIXES = ("bsd/dev/sweet_wlan",)      # a patch (new ones too, read at select time) editing these is an input of wlan-mutants and mutant-needles
+WLAN_MUT_TEST = "tools/test_wlan_wr_mutants.py"
+WLAN_MUT_EXTRA = ["tools/test_wlan_wr_mutants.py", "tools/wlan_glue_harness_a.py", "tools/wlan_glue_harness_b.py", "tools/wlan_mutant_cache.py", "tools/wlan_mutant_pool.py"]   # T-70d5: the glue-limit harness C text (R29 split of T-4adb) is imported by test_wlan_wr_mutants.py; the cache decides what is reused (review mutants-fast A1); the pool (S1) runs it. wlan_mutant_pool.py does not exist until S1 merges: harmless (an input glob naming no file selects nothing, `--check` passes; review gate-2x-s2-r1 F8), and --write keeps it because it is listed here, not scanned
+WLAN_MUT_JOIN_RE = re.compile(r"os\.path\.join\(ROOT,\s*((?:\"[^\"]*\"\s*,?\s*)+)\)")
+TABLE_RE = re.compile(r"^([A-Z][A-Z0-9_]*_MUTANTS)\s*(?::[^=\n]*)?=", re.M)
+
+# step -> (class, budget_s, note). budget_s: PLAN-GATE-2X section 5; the observed number it was derived from is in the note (a breach never fails a gate)
+SPEC = {
+    "build": ("quick", 60, "first build: cold audit memo 120-190 s observed, 60 s is the S3 warm target"),
+    "build-fast": ("formal", 60, ""), "build-usb": ("formal", 60, ""), "build-wlan": ("formal", 60, "obs 378-598 s cold, 59 s warm (S3 target 60)"),
+    "build-gpu": ("formal", 60, ""), "build-gpupower": ("formal", 60, ""), "build-gpuclk": ("formal", 60, ""), "build-gpurails": ("formal", 60, ""),
+    "build-gpurailon": ("formal", 60, ""), "build-gpujob": ("formal", 60, ""), "build-touch": ("formal", 60, ""), "build-udump": ("formal", 60, ""),
+    "host-tests": ("quick", 30, "obs 16 s"),
+    "boot-safety": ("always", 90, "audit of every built image; obs 82-83 s"),
+    "unit": ("quick", 180, "obs 155-173 s"),
+    "wlan-tbl": ("quick", 10, "T-8b3c: header-check of the committed msgbuf table against its TSV (tools/wlan-tbl-gen); seconds"),
+    "wlan-mutants": ("quick", 300, "formal budget 300 s (obs 1402-1755 s before the S1 pooled runner)"),
+    "phone-state": ("quick", 30, ""), "hang-recover": ("quick", 30, ""), "probe-run": ("quick", 75, "obs 73-74 s"),
+    "phone-converge": ("always", 20, "R38 lint: a readiness check in a run path; reads the run-path tools"), "rootless": ("quick", 30, ""),
+    "public-split": ("always", 10, "secret/firmware placement, ~1 s"), "public-guard": ("always", 15, "T-6070: tip tree vs tools/public-push-guard-baseline.tsv; obs ~2 s"), "validate": ("always", 60, ""), "rules": ("always", 30, ""),
+    "shellcheck": ("always", 30, "every changed shell file"), "lint-c": ("formal", 75, "WARN-only, full gate only; obs 47-68 s"),
+    "xnu-build": ("quick", 90, "AP-257; obs 63 s cold, 8 s warm (stack tree hash)"), "stack-apply": ("quick", 60, "AP-258"),
+    "mutant-needles": ("always", 20, "AP-281; seconds"), "boot-markers": ("quick", 20, "AP-229; seconds"), "lint-silent": ("quick", 20, "rule 8 / AP-102; obs ~4 s"), "consumed": ("quick", 20, "R48 row 2; seconds"), "inputs": ("always", 10, "AP-11/144; ms"),
+}
+LANE_BUDGETS = {"quick": 360, "formal": 600, "cold": 1100}      # G2: total gate seconds; cold = a tools/gate --cold run (empty caches, fresh worktree; PLAN-GATE-2X section 8)
+
+
+def pre(*p):
+    return [x + "*" for x in p]
+
+
+def shim_build_inputs(repo):
+    """build.sh reads xnu patches (`../xnu/patches/NNNN-...`, host-test headers) and runs repo tools (`../tools/boards.py` ...): read both from build.sh itself."""
+    try:
+        text = (repo / "shim" / "build.sh").read_text()
+    except OSError:
+        return [], []
+    found = set(re.findall(r"\.\./(tools/[\w.-]+|xnu/patches/\d{4})", text))
+    return sorted(f for f in found if f.startswith("tools/")), sorted(f + "*" for f in found if f.startswith("xnu/patches/"))
+
+
+def wlan_mut_inputs(repo):
+    """Every repo file the wlan mutant test reads: the ROOT-relative `os.path.join(ROOT, "a", "b", ...)` literals, plus the test, its cache and pool."""
+    paths = set(WLAN_MUT_EXTRA)
+    try:
+        text = (repo / WLAN_MUT_TEST).read_text()
+    except OSError:
+        return sorted(paths)
+    for args in WLAN_MUT_JOIN_RE.findall(text):
+        paths.add("/".join(re.findall(r'"([^"]*)"', args)))
+    return sorted(p for p in paths if p != "shim/out")
+
+
+def patch_edits_wlan(path):
+    """A patch that edits the chip-writer sources the mutant test rebuilds (bsd/dev/sweet_wlan*): review gate-runfast-1 C2."""
+    try:
+        text = pathlib.Path(path).read_text(errors="replace")
+    except OSError:   # lint-silent: expected a patch file that vanished or is unreadable has no wlan hunk: False
+        return False
+    return any(re.search(r"^(\+\+\+|---) [ab]/%s" % re.escape(x), text, re.M) for x in WLAN_SRC_PREFIXES)
+
+
+def wlan_patch_globs(repo, inputs):
+    """Patch numbers (AP-98: a renamed patch still selects) of the patches the mutant test names, plus every patch that edits bsd/dev/sweet_wlan*."""
+    nums = {p[12:16] for p in inputs if p.startswith("xnu/patches/")}
+    for p in sorted((repo / "xnu" / "patches").glob("*.patch")):
+        if patch_edits_wlan(p):
+            nums.add(p.name[:4])
+    return ["xnu/patches/%s-*" % n for n in sorted(nums)]
+
+
+def el2_mut_inputs(repo):
+    """Repo files the el2 mutant table targets: the second field of each `("id", "path", ...)` row of tools/test_el2_mutants.py (lint-mutant-needles checks their needles)."""
+    try:
+        text = (repo / "tools" / "test_el2_mutants.py").read_text()
+    except OSError:   # lint-silent: expected a clone without test_el2_mutants.py has no mutant sources: []
+        return []
+    return sorted(set(re.findall(r'^\s+\("[\w-]+", "((?:shim|tools|soc|device)/[^"]+)"', text, re.M)))
+
+
+def mutant_tables(repo):
+    """Every `*_MUTANTS = ...` table of a tools/test_*.py: {table: file}. Each must be reached by the mutant-needles row (G3)."""
+    out = {}
+    for f in sorted((repo / "tools").glob("test_*.py")):
+        try:
+            for t in TABLE_RE.findall(f.read_text(errors="replace")):
+                out[f.name + ":" + t] = "tools/" + f.name
+        except OSError:   # lint-silent: expected a test file that vanished while listing has no mutant table
+            pass
+    return out
+
+
+def mutant_blocks(repo):
+    """{table key: block name} for every `*_MUTANTS` table tagged `# mutant-block: <name>` on the line above it (the tag the ceiling rule reads)."""
+    out = {}
+    for f in sorted((repo / "tools").glob("test_*.py")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:   # lint-silent: expected a test file that vanished while listing has no mutant block tag
+            continue
+        for m in re.finditer(r"^[ \t]*#[ \t]*mutant-block:[ \t]*([a-z][a-z0-9-]*)[ \t]*\n[ \t]*([A-Z][A-Z0-9_]*_MUTANTS)\s*(?::[^=\n]*)?=", text, re.M):
+            out[f.name + ":" + m.group(2)] = m.group(1)
+    return out
+
+
+def baseline_problems(c, repo):
+    """The ceilings only lower: build_variants and legacy_mutant_tables must not exceed the copy on `trunk` (git show trunk:CEILINGS). No trunk ref / no file there = NOTE on
+    stderr, no check (a first commit, or a clone without trunk). Raising needs PIXOS_CEILING_RAISE="reason >= 20 chars" for that one run (printed, never silent)."""
+    r = subprocess.run(["git", "-C", str(repo), "show", "trunk:" + CEILINGS], capture_output=True, text=True)
+    if r.returncode:
+        print("gate-manifest: NOTE ceilings baseline skipped: no trunk:%s in %s" % (CEILINGS, repo), file=sys.stderr)
+        return []
+    try:
+        base = json.loads(r.stdout)
+    except ValueError as e:
+        return ["trunk:%s is not valid JSON (%s): cannot compare the ceilings" % (CEILINGS, e)]
+    out = []
+    if isinstance(c.get("build_variants"), int) and isinstance(base.get("build_variants"), int) and c["build_variants"] > base["build_variants"]:
+        out.append("build_variants %d > %d on trunk: the ceiling does not rise" % (c["build_variants"], base["build_variants"]))
+    grown = sorted(set(c.get("legacy_mutant_tables", [])) - set(base.get("legacy_mutant_tables", [])))
+    if grown:
+        out.append("legacy_mutant_tables grew vs trunk (%s): the list only shrinks; a new table takes a `# mutant-block:` tag instead" % ", ".join(grown))
+    why = os.environ.get("PIXOS_CEILING_RAISE", "")
+    if out and len(why) >= 20:
+        print("gate-manifest: CEILING RAISE ALLOWED (PIXOS_CEILING_RAISE=%r): %s" % (why, "; ".join(out)), file=sys.stderr)
+        return []
+    return out
+
+
+def ceiling_problems(m, repo, allsteps):
+    """Port-new-block step 8 as a refusal (T-cfb7): build-variant ceiling (only lowers) and one mutant table per block. Reads tools/gate-manifest-ceilings.json."""
+    path = repo / CEILINGS
+    try:
+        c = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return ["%s unreadable (%s): the build-variant ceiling and the mutant-table rule cannot be checked" % (CEILINGS, e)]
+    out = []
+    names = {s for s in list(allsteps) + [r.get("step") for r in m.get("steps", [])] if s and (s == "build" or s.startswith("build-"))}
+    cap = c.get("build_variants")
+    if not isinstance(cap, int):
+        out.append("%s: build_variants is not an integer" % CEILINGS)
+    elif len(names) > cap:
+        out.append("build variants: %d rows (%s) exceed the ceiling %d in %s: a block adds at most ONE shim build variant, and the ceiling does not rise (docs/recipes/port-new-block.md step 8; use a boot-arg or a table entry instead of a build flag)" % (len(names), ", ".join(sorted(names)), cap, CEILINGS))
+    elif len(names) < cap:
+        out.append("build variants: %d rows, ceiling %d in %s: lower the ceiling to %d in the same commit (it only lowers)" % (len(names), cap, CEILINGS, len(names)))
+    out.extend(baseline_problems(c, repo))
+    legacy = set(c.get("legacy_mutant_tables", []))
+    tables = mutant_tables(repo)
+    blocks = mutant_blocks(repo)
+    for key in sorted(legacy - set(tables)):
+        out.append("legacy mutant table %s no longer exists: remove it from legacy_mutant_tables in %s (the list only shrinks)" % (key, CEILINGS))
+    for key in sorted(set(blocks) & legacy):
+        out.append("mutant table %s is tagged `# mutant-block:` but is also in legacy_mutant_tables: remove it from the legacy list" % key)
+    by_block = {}
+    for key in sorted(tables):
+        if key in legacy:
+            continue
+        if key not in blocks:
+            out.append("mutant table %s has no `# mutant-block: <name>` tag on the line above it and is not a legacy table: a new table belongs to ONE block (port-new-block step 8)" % key)
+        else:
+            by_block.setdefault(blocks[key], []).append(key)
+    for b, keys in sorted(by_block.items()):
+        if len(keys) > 1:
+            out.append("block %s has %d mutant tables (%s): a block has ONE mutant table scoped to its own writer (port-new-block step 8)" % (b, len(keys), ", ".join(keys)))
+    return out
+
+
+def parse_check_all(text):
+    """(ALL list, {step: lane}) from tools/check-all.sh."""
+    m = ALL_RE.search(text)
+    allsteps = m.group(1).split() if m else []
+    lanes = {}
+    for lane, name in STEP_FILE_RE.findall(text):
+        lanes.setdefault(name, lane)
+    return allsteps, lanes
+
+
+def variant_inputs(repo, step):
+    tools, patches = shim_build_inputs(repo)
+    base = pre(*BUILD_TOOL_PREFIX) + tools
+    if step in HOST_STEPS:
+        return base + patches + ["soc/*", "device/*", {"glob": "shim/*", "except": ["shim/*.md"]}]
+    fams = VARIANTS[step]
+    out = base + [{"glob": "soc/*", "except": [] if "wlan" in fams else ["soc/*/wlan_seq*"]}, "device/*", {"glob": "shim/*", "except": COMMON_EXCEPT}]
+    for fam in fams:
+        out += [{"glob": g, "except": ["shim/*_host_test.c"]} for g in FAMILIES[fam]]
+    if "wlan" in fams:
+        out.append("soc/*/wlan_seq*")
+    return out
+
+
+def step_inputs(repo, step, wlan):
+    """Return the row fragment (inputs and optional keys) for one step."""
+    if step in HOST_STEPS or step in VARIANTS:
+        return {"inputs": variant_inputs(repo, step)}
+    if step in ("validate", "rules", "public-split", "public-guard"):
+        return {"inputs": ["*"]}      # every change
+    if step == "shellcheck":
+        return {"inputs": [], "predicate": "shell"}      # a changed *.sh or a file with an sh/bash/dash shebang (tools/shell-files)
+    if step == "inputs":
+        return {"inputs": [], "follows": [s for s in ("build",) + tuple(VARIANTS) + ("host-tests", "boot-safety", "unit", "xnu-build")]}
+    if step == "lint-c":
+        return {"inputs": []}      # full gate only: a quick run adds it only when it selected every other step
+    if step == "unit":
+        return {"inputs": UNIT_GLOBS + ["xnu/patches/*"]}
+    if step in ("phone-state", "hang-recover", "probe-run"):
+        return {"inputs": list(RUN_PATH_GLOBS)}
+    if step in ("phone-converge", "rootless"):
+        return {"inputs": list(UNIT_GLOBS)}
+    if step == "wlan-tbl":
+        return {"inputs": ["soc/google/gs101/wlan_msgbuf_l22.tsv", "shim/sweet_wlan_tbl_data.h", "tools/wlan-tbl-gen"]}
+    if step == "wlan-mutants":
+        r = {"inputs": wlan["inputs"] + wlan["patches"], "patch_edits": list(WLAN_SRC_PREFIXES)}
+        text = ""
+        try:
+            text = (repo / WLAN_MUT_TEST).read_text()
+        except OSError:   # lint-silent: expected an absent WLAN_MUT_TEST is handled right below by the only_note text
+            pass
+        r["only"] = None
+        r["only_note"] = ("GATE_MUT_ONLY exists in %s but no header|glue subset is derivable from a changed file: all mutants run" if "GATE_MUT_ONLY" in text
+                          else "GATE_MUT_ONLY is not implemented in %s (S1 slice): all mutants run") % WLAN_MUT_TEST
+        return r
+    if step == "xnu-build":
+        return {"inputs": [{"glob": "xnu/patches/*", "except": ["*.md"]}] + XNU_BUILD_TOOLS}
+    if step == "stack-apply":
+        return {"inputs": [{"glob": "xnu/patches/*", "except": ["*.md"]}, "tools/stack-apply"]}
+    if step == "boot-markers":
+        return {"inputs": ["xnu/patches/*.patch", "tools/lint-boot-markers", "tools/xrun_report.py"]}
+    if step == "lint-silent":         # rule 8: the lint, its allowlist, shim/**, the added lines of xnu/patches/**, the python/shell files of tools/**
+        return {"inputs": ["tools/lint-silent", "tools/lint-silent-allow.txt", {"glob": "shim/*", "except": ["*.md"]}, {"glob": "xnu/patches/*", "except": ["*.md"]}, {"glob": "tools/*", "except": ["*.md"]}]}
+    if step == "consumed":            # R48 row 2: the lint, its allowlist, the packers it parses (tools/test_lint_consumed.py keeps them equal to its PACKERS table); consumers: shim/*.c|h|cpp, xnu/patches/*.patch
+        return {"inputs": list(CONSUMED_TOOLS) + ["shim/*.c", "shim/*.h", "shim/*.cpp", "xnu/patches/*.patch"]}
+    if step == "mutant-needles":      # AP-281: a mutant table, the lint, a patch the wlan tables are built from, a file an el2 row targets
+        return {"inputs": ["tools/test_*mutant*", "tools/lint-mutant-needles"] + wlan["inputs"] + wlan["patches"] + el2_mut_inputs(repo), "patch_edits": list(WLAN_SRC_PREFIXES)}
+    return {"inputs": []}
+
+
+def render(repo=REPO, check_all_text=None):
+    repo = pathlib.Path(repo)
+    text = check_all_text if check_all_text is not None else (repo / "tools" / "check-all.sh").read_text()
+    allsteps, lanes = parse_check_all(text)
+    w = wlan_mut_inputs(repo)
+    wlan = {"inputs": w, "patches": wlan_patch_globs(repo, w)}
+    rows = []
+    for s in allsteps:
+        cls, budget, note = SPEC.get(s, (None, None, "NO SPEC for this step: add it to tools/gate-manifest SPEC"))
+        row = {"step": s, "lane": lanes.get(s), "class": cls, "budget_s": budget}
+        row.update(step_inputs(repo, s, wlan))
+        if note:
+            row["note"] = note
+        rows.append(row)
+    return {"schema": SCHEMA, "generated_by": "tools/gate-manifest --write", "totals_s": LANE_BUDGETS, "inert": INERT,
+            "completes_full": ["lint-c", "xnu-build", "stack-apply", "mutant-needles", "boot-markers"], "selector_inputs": SELECTOR_INPUTS,
+            "mutant_tables": mutant_tables(repo), "steps": rows}
+
+
+def dumps(m):
+    return json.dumps(m, indent=1) + "\n"
+
+
+def problems(m, repo=REPO, check_all_text=None):
+    """Completeness (G3): every ALL step has lane/class/inputs/budget; every step used by a lane is in ALL; every *_MUTANTS table is reached by the mutant-needles row."""
+    repo = pathlib.Path(repo)
+    text = check_all_text if check_all_text is not None else (repo / "tools" / "check-all.sh").read_text()
+    allsteps, lanes = parse_check_all(text)
+    out = []
+    rows = {r["step"]: r for r in m.get("steps", [])}
+    for s in allsteps:
+        r = rows.get(s)
+        if r is None:
+            out.append("step %s of check-all.sh ALL has no manifest row" % s)
+            continue
+        if r.get("lane") not in ("A", "B", "C"):
+            out.append("step %s: no lane (not run through `step LANE NAME` in check-all.sh)" % s)
+        if r.get("class") not in ("quick", "formal", "always"):
+            out.append("step %s: no class (quick|formal|always)" % s)
+        if not isinstance(r.get("budget_s"), int) or r["budget_s"] <= 0:
+            out.append("step %s: no budget_s" % s)
+        if "inputs" not in r or (not r["inputs"] and not r.get("predicate") and not r.get("follows") and s != "lint-c"):
+            out.append("step %s: no inputs" % s)
+    for s in lanes:
+        if s not in allsteps:
+            out.append("step %s runs in a lane of check-all.sh but is not in ALL" % s)
+    for s in rows:
+        if s not in allsteps:
+            out.append("manifest row %s is not a step of check-all.sh ALL" % s)
+    needles = rows.get("mutant-needles", {}).get("inputs", [])
+    for key, f in sorted(mutant_tables(repo).items()):
+        if not any(match_entry(e, f) for e in needles):
+            out.append("mutant table %s (%s) is not reached by the mutant-needles row" % (key, f))
+        if key not in m.get("mutant_tables", {}):
+            out.append("mutant table %s has no manifest entry (run tools/gate-manifest --write)" % key)
+    out.extend(ceiling_problems(m, repo, allsteps))
+    return out
+
+
+def match_entry(e, f):
+    """Does input entry E (a glob or {"glob","except"}) match path F."""
+    if isinstance(e, dict):
+        return fnmatch.fnmatchcase(f, e["glob"]) and not any(fnmatch.fnmatchcase(f, x) for x in e.get("except", []))
+    return e == "*" or fnmatch.fnmatchcase(f, e)
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ("--write", "--check", "--print"):
+        print("usage: tools/gate-manifest --write | --check | --print")
+        print("RESULT: ERROR gate-manifest usage")
+        return 2
+    try:
+        m = render()
+    except OSError as e:
+        print("RESULT: ERROR gate-manifest cannot render: %s" % e)
+        return 2
+    text = dumps(m)
+    path = REPO / MANIFEST
+    if argv[0] == "--print":
+        sys.stdout.write(text)
+        return 0
+    probs = problems(m)
+    if argv[0] == "--write":
+        if probs:
+            print("\n".join("INCOMPLETE: " + p for p in probs))
+            print("RESULT: FAIL gate-manifest incomplete=%d (not written)" % len(probs))
+            return 1
+        path.write_text(text)
+        print("RESULT: PASS gate-manifest written steps=%d" % len(m["steps"]))
+        return 0
+    old = path.read_text() if path.exists() else ""
+    if probs:
+        print("\n".join("INCOMPLETE: " + p for p in probs))
+    if old != text:
+        print("STALE: %s differs from a fresh render: run tools/gate-manifest --write and commit it" % MANIFEST)
+    if probs or old != text:
+        print("RESULT: FAIL gate-manifest incomplete=%d stale=%d" % (len(probs), int(old != text)))
+        return 1
+    print("RESULT: PASS gate-manifest steps=%d tables=%d" % (len(m["steps"]), len(m["mutant_tables"])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

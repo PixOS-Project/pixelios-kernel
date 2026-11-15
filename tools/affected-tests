@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""affected-tests: run only the unit test files that the change since trunk can break (fail-fast before a gate; R28, R29).
+
+  tools/affected-tests [--base REF] [--list] [--max N]    changed files = git diff against BASE (default: merge-base of HEAD and `trunk`, else HEAD~1) + uncommitted + untracked;
+                                                the selection is tools/unit_select.py's (same one the quick gate uses, conservative: a wrong skip is worse than a slow run);
+                                                --list prints the selection and runs nothing; --max N (the pre-commit hook uses 12) runs only when at most N test files are selected, otherwise it prints
+                                                `affected-tests: NOTE ... left to the gate pre-check` and passes (a big selection takes minutes: tools/gate runs it before every gate).
+Runs them through tools/gate-unit-shards --selected (the gate's own runner, parallel shards). Why it exists: a gate costs 8+ minutes and found six unit failures in files the
+author never ran (2026-11-02: a new module next to tools/agent-guard broke under `python3 -I` and in the mutant copy; a new gate step broke the pinned selection tests).
+tools/gate runs this first and refuses to start a full gate while it fails (escape GATE_AFFECTED_SKIP="why", logged).
+Last line: RESULT: PASS|FAIL affected-tests selected=N of M failed=K base=SHORTREF ; exit 0 / 1 / 2."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def git(*a):
+    r = subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, timeout=120)
+    return r.returncode, r.stdout
+
+
+def base_ref(arg):
+    if arg:
+        return arg
+    for cmd in (("merge-base", "HEAD", "trunk"), ("rev-parse", "--verify", "-q", "HEAD~1")):
+        rc, out = git(*cmd)
+        if rc == 0 and out.strip():
+            return out.strip()
+    return ""
+
+
+def changed_files(base):
+    files = set()
+    if base:
+        files |= set(git("diff", "--name-only", "--diff-filter=ACMRD", base)[1].split("\n"))
+    files |= set(git("ls-files", "--others", "--exclude-standard")[1].split("\n"))
+    return sorted(f for f in files if f)
+
+
+def main(argv):
+    base = argv[argv.index("--base") + 1] if "--base" in argv else None
+    base = base_ref(base)
+    changed = changed_files(base)
+    sys.path.insert(0, HERE)
+    import unit_select
+    tests, lines, total = unit_select.select_tests(changed)
+    for l in lines:
+        print(l)
+    print("affected-tests: %d changed file(s), %d of %d test files selected" % (len(changed), len(tests), total))
+    mx = int(argv[argv.index("--max") + 1]) if "--max" in argv else 0
+    if mx and len(tests) > mx:
+        print("affected-tests: NOTE %d test files selected (> --max %d): not run here, left to the gate pre-check (tools/gate runs tools/affected-tests before every gate)" % (len(tests), mx))
+        print("RESULT: PASS affected-tests selected=%d of %d failed=0 base=%s (over --max, not run)" % (len(tests), total, base[:10] or "none"))
+        return 0
+    if "--list" in argv or not tests:
+        print("RESULT: PASS affected-tests selected=%d of %d failed=0 base=%s%s" % (len(tests), total, base[:10] or "none", " (nothing run)" if tests else " (no test file depends on the change)"))
+        return 0
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("\n".join(tests) + "\n")
+        sel = f.name
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}   # never hand a hook's GIT_DIR/GIT_INDEX_FILE to test fixtures (they wrote into the real repo, 2026-11-02)
+    env.update(GATE_UNIT_ONLY=sel, GATE_AFFECTED_CHECKED="1")   # a test that runs tools/gate must not start another affected-tests
+    r = subprocess.run([os.path.join(HERE, "gate-unit-shards"), "--selected"], cwd=ROOT, env=env, capture_output=True, text=True)
+    os.unlink(sel)
+    out = (r.stdout + r.stderr).splitlines()
+    failed = [l for l in out if l.startswith("SHARD FAIL")]
+    for l in failed:
+        print(l)
+    if r.returncode != 0 and not failed:
+        print("\n".join(out[-15:]))
+    print("RESULT: %s affected-tests selected=%d of %d failed=%d base=%s" % ("PASS" if r.returncode == 0 else "FAIL", len(tests), total, len(failed), base[:10] or "none"))
+    return 0 if r.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

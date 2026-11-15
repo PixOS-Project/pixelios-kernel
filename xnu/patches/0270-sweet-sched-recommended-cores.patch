@@ -1,0 +1,43 @@
+SWEET scheduler core recommendation (patch 0270, sprint-gpu 2026-11-09; scheduler hint only, no register or memory write outside the scheduler's own state): boot-arg sweetrecores=MASK calls sched_perfcontrol_update_recommended_cores(MASK) once in AppleCLCD::start, so cores outside MASK take interrupts and bound threads only. Logs 'SWEET SCHED: recommended cores M of O' or 'SWEET GAP: SCHED sweetrecores=... refused'. Reason [obs nav31 kdebug]: the homogeneous ADT lets the scheduler run UI threads on cpu0 (Cortex-A55 1.8 GHz): Preferences main thread 36 %, backboardd render threads 8-35 % of their time; sweetrecores=0x1e keeps cpu0 for interrupts and bound kernel threads.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 02e6f6a..e9b52db 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -199,6 +199,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* patch 0270: osfmk/kern/sched_prim.c */
++extern "C" unsigned int ml_get_cpu_count(void);   /* patch 0270 */
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -207,6 +209,28 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	/*
++	 * Patch 0270 (sprint-gpu 2026-11-09; scheduler hint only, no register or memory write outside the scheduler's own state): boot-arg sweetrecores=MASK
++	 * hands MASK to sched_perfcontrol_update_recommended_cores() (osfmk/kern/sched_prim.c, the hook CLPC uses): cores outside MASK stay online for
++	 * interrupts and threads bound to them, but the scheduler places no other thread there. Why [obs run 20261108T211340Z-gputest-nav31 kdebug]: the ADT is
++	 * one homogeneous cluster, so the scheduler puts UI threads on cpu0 (Cortex-A55, 1.8 GHz) as readily as on the X1/A76 cores: Preferences' main thread
++	 * ran 36 % of its time there, backboardd's render threads 8-35 %. sweetrecores=0x1e keeps cpu0 (the boot core, the A55) for interrupts and bound
++	 * kernel threads. A mask with no online core, or a bit above the CPU count, is refused with a GAP line; the kernel's own failsafe (sched_consider_recommended_cores)
++	 * may still bring cpu0 back for a starving realtime thread.
++	 */
++	{
++		uint32_t rc = 0;
++		if (PE_parse_boot_argn("sweetrecores", &rc, sizeof(rc))) {
++			unsigned int ncpu = ml_get_cpu_count();
++			uint32_t online = ncpu >= 32 ? 0xffffffffu : ((1u << ncpu) - 1);
++			if ((rc & online) == 0 || (rc & ~online) != 0) {
++				IOLog("SWEET GAP: SCHED sweetrecores=0x%x refused: online cores 0x%x (every core stays recommended)\n", rc, online);
++			} else {
++				sched_perfcontrol_update_recommended_cores(rc);
++				IOLog("SWEET SCHED: recommended cores 0x%x of 0x%x (sweetrecores, patch 0270): other cores take interrupts and bound threads only\n", rc, online);
++			}
++		}
++	}
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;

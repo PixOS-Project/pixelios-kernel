@@ -1,0 +1,1138 @@
+SWEET THERMAL (patch 0336, ALL-ON safety, user 2026-11-12: battery 51.6-53 C under stress with no throttle; facts: docs/research/150-thermal-path.md). A kernel thread on every boot (boot-arg sweetthermal=0 turns it off, default on) samples the MAX77759 fuel-gauge battery temperature (FG 0x36 reg 0x08, the read patch 0307 added to the SWEET CHG MON rows, no new register) and FG Current (0x0a) every 10 s through the existing HSI2C12 engine of sweet_chg_i2c.c, independent of USB and of every job (the engine is loaded for it even without sweetchgi2c=1; charger phase 1 is driven from the thread after 60 s when the USB log thread never did; a try-lock serialises the two callers). Prints `SWEET THERMAL: batt T C state S` on every state change and once per 60 s. Feeds iOS: IOPMPowerSource Temperature = the real value (centi-C, Estimated flag cleared; stale/no sample keeps the old flag + GAP) and SweetHIDTemperature (Product TG0B, ProductID 0x54473042, usage page 0xff00 usage 5, IOHIDEvent temperature events) for thermalmonitord. Kernel backstop (does not depend on iOS), table in bsd/dev/sweet_thermal.h: >= 48.0 C drop the X1 cores (sched_perfcontrol_update_recommended_cores 0x18, the patch 0270 call) [DEPENDENCY: mask 0x18 = logical cpu3,4 = the physical A76 pair only under tools/xrun's /cpus order 0,6,7,4,5,1,2,3 (applied when no --adt is given) with cpus=5, the order patch 0270's sweetrecores=0x1e assumes; the start of the thread reads the physical core of every logical cpu from the topology and prints one SWEET THERMAL line when it holds, else a GAP (cpus != 5, /cpus order differs, topology unavailable); the backstop stays active, the mask can never be empty], restore the boot mask at <= 44.0 C; >= 45.0 C while charging (FG current > 0) CNFG_09 back to its original value (the 0287 restore: same register, same value) until <= 42.0 C, then 875 mA again (only while the 0287 raise stands; the raise-again direction is bounded to THERM_MAX_WRITES = 16 per boot and then refused with a GAP while the bus stays alive, a hold (the lowering) is never refused by that bound so the final state is 500 mA; release only with the SuperSpeed link + CHGTYP; a hold that failed is asked again at the next sample, at most 4 times, a closed charger gate counts as busy); >= 55.0 C on two samples in a row: `SWEET THERMAL CRIT` and the orderly clean-stop + reset-to-bootloader (sweet_restart.c, the remote-reset path). A failed or implausible read (outside -20..90 C) is a GAP and takes NO action. GAP lines at boot for what note 150 says stays unknown (sensor->hotspot mapping, iOS CPU/GPU clamps have no backend, no ACPM client). Rule-8 items: (1) CNFG_09 hold/release on temperature = NEW trigger of the existing 0287 write (sweet_chg_icl_thermal -> i2c_cnfg09_write); (2) the HSI2C12 transfer-register writes and FG reads now happen on every boot (were: only sweetchgi2c=1); (3) CRIT = a new trigger of the existing PMU SMC mode write + software reset. The cores mask, the IOPMPowerSource value and the HID service are not hardware writes. Tests: tools/test_sweet_thermal.py. ORDER: applies AFTER patch 0333 (fix/wdt-early): the sweet_restart.c hunk 1 has 0333's `extern void sweet_wdt_stop_pets(void);` line in its context; tools/xnu-local-build skips a patch that does not git-apply, tools/test_sweet_thermal.py test_applies_after_0333 checks the order. Rule-8 review fixes (docs/reviews/0336-thermal-review.md): F1 bound on the raise direction only + refusal keeps the bus; F2 the first thermal transfer runs the pending-transfer checks of the P2 first group (i2c_gate(first)); F3 closed gate = busy (retried), failed hold retried bounded; F5 phase 1 never opened the gate = NOENGINE (sweet_chg_gate_established), no GAP per sample; F6 sweet_chg_tick(1); F7 cpu-order check; F8 release/acquire publish. TEST ONLY boot-arg sweetthermalramp=<deciC per sample> (1..100, user 2026-11-13): from the 3rd good sample on the state machine sees the real FG temperature + ramp * (good samples since the start), so a proof boot shows the X1 drop, the charge hold and the CRIT park without heating the battery; the value published to iOS (IOPMPowerSource Temperature, HID TG0B) stays the REAL sensor value; refused (GAP) outside 1..100, with sweetthermal=0, and per sample while the sensor read fails; every sample line prints "real T C, test bias +B C". A hot battery that is not charging says "not charging, nothing to hold".
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_stall.c			standard
+ bsd/dev/sweet_chg.c			standard
+ bsd/dev/sweet_chg_i2c.c		standard
++bsd/dev/sweet_thermal.c		standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+diff --git a/bsd/dev/sweet_chg.c b/bsd/dev/sweet_chg.c
+--- a/bsd/dev/sweet_chg.c
++++ b/bsd/dev/sweet_chg.c
+@@ -469,6 +469,16 @@ chg_load(void)
+ }
+ #endif /* !SWEET_CHG_HOST */
+ 
++/*
++ * Patch 0336 (review 0336 F5): did phase 1 ever establish an open gate (gate open and stage 2)? A pure flag read, no register access, no log line. The thermal sampler asks it
++ * first: when phase 1 never opened (sweetchgprobe=0, gate closed at boot) every sample would otherwise print two GAP lines (this file's and the i2c gate's) for the whole boot.
++ */
++int
++sweet_chg_gate_established(void)
++{
++	return chg_gate && chg_stage >= 2;
++}
++
+ /*
+  * Patch 0284 (phase 2): is the phase-1 gate state still exactly the open pattern? Re-reads the nine CMU words and SW_CONF (reads only) and requires
+  * them equal to the stage A snapshot, chg_gate_open() true and SW_CONF mode I2C (4). Phase 2 calls it before every group of transfers; any difference
+@@ -519,8 +529,8 @@ extern void sweet_chg_i2c_tick(int log_pending);        /* bsd/dev/sweet_chg_i2c
+  * log_pending = console bytes not yet sent. Stage A on the first call; stage B on the first later call with nothing pending (so the stage A lines
+  * are on the wire before the gated block is touched), or CHG_FORCE_MS after stage A with a GAP line saying so (never a silent skip, rule 7).
+  */
+-void
+-sweet_chg_tick(int log_pending)
++static void
++sweet_chg_tick_locked(int log_pending)
+ {
+ 	if (chg_stage >= 2) {
+ 		sweet_chg_i2c_tick(log_pending);        /* patch 0284: phase 2 (bsd/dev/sweet_chg_i2c.c), default off, one-shot */
+@@ -552,3 +562,32 @@ sweet_chg_tick(int log_pending)
+ 	}
+ 	chg_stage_b();
+ }
++
++/*
++ * Patch 0336: the charger engine (phase 1, the phase 2/3 state machine, the fuel-gauge temperature sampler of bsd/dev/sweet_thermal.c) now has two callers, the USB log thread
++ * and the thermal thread. One try-lock serialises them: a caller that does not get it skips this call (every caller is periodic and re-entrant by design), so neither ever
++ * blocks on the other and the I2C controller never sees two transfers.
++ */
++static volatile int chg_busy;
++
++int
++sweet_chg_enter(void)
++{
++	return __sync_lock_test_and_set(&chg_busy, 1) == 0;
++}
++
++void
++sweet_chg_leave(void)
++{
++	__sync_lock_release(&chg_busy);
++}
++
++void
++sweet_chg_tick(int log_pending)
++{
++	if (!sweet_chg_enter()) {
++		return;
++	}
++	sweet_chg_tick_locked(log_pending);
++	sweet_chg_leave();
++}
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -39,6 +39,10 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_rou
+ #endif
+ 
+ extern int sweet_chg_gate_still_open(void);             /* bsd/dev/sweet_chg.c (patch 0284 hunk): phase-1 gate state unchanged? */
++extern int sweet_chg_gate_established(void);            /* bsd/dev/sweet_chg.c (patch 0336, review F5): did phase 1 ever open the gate? flag read only */
++extern int sweet_thermal_enabled(void);                 /* bsd/dev/sweet_thermal.c (patch 0336) */
++extern int sweet_chg_enter(void);                       /* bsd/dev/sweet_chg.c (patch 0336): try-lock shared by the USB log thread's tick and the thermal thread */
++extern void sweet_chg_leave(void);
+ 
+ #define i2c_log(...)    i2c_printf(__VA_ARGS__)
+ 
+@@ -106,6 +110,8 @@ static void i2c_hw_wr32(uint32_t off, uint32_t v);      /* the ONLY store in thi
+ 
+ static uint32_t i2c_xfers, i2c_errors, i2c_nwr;
+ static int i2c_dead;                    /* set on the first error: no further transfer */
++static int i2c_xfer_seen;               /* patch 0336 (review F2): one of our own transfer groups / thermal samples has completed, so the first-transfer idle checks of i2c_gate(1) are done */
++static int i2c_loaded;                  /* patch 0336: i2c_load() succeeded (the HSI2C12 window is mapped and the ADT offsets are the expected ones) */
+ 
+ static int
+ i2c_offsets_ok(void)
+@@ -706,6 +712,9 @@ extern uint32_t sweet_usb_ss_configured(void);          /* bsd/dev/sweet_usb.c (
+ 
+ static int i2c_p2_ok, p3_stage, p3_nwrites, p3_orig_valid, p3_mode;
+ static uint8_t p3_orig, p3_intended;
++static int p3_therm_arm, p3_therm_hold;         /* patch 0336: set only inside sweet_chg_icl_thermal around its write / while a temperature hold is active */
++static uint32_t p3_twrites;                     /* patch 0336: thermal chip writes this boot (not in p3_nwrites, so 0287's own one-restore rule is unchanged) */
++#define THERM_MAX_WRITES 16u                    /* patch 0336: a hold/release flap is bounded (3 C hysteresis at 0.63 C/min is ~5 min per edge; 16 is far above any real run) */
+ static uint32_t p3_samples;
+ static uint64_t p3_t0_ms, p3_next_ms, p3_w0_ms;
+ 
+@@ -721,13 +730,19 @@ i2c_cnfg09_write(uint8_t cur, uint8_t val)
+ 	uint8_t b[2];
+ 	uint32_t code = cur & 0x7fu;
+ 	int first = p3_mode == ICL_ARG_UP && p3_nwrites == 0 && (cur & 0x80u) != 0 && val == (uint8_t)((cur & 0x80u) | ICL_CODE) && code >= 4u && code < ICL_CODE;
+-	int restore = p3_mode == ICL_ARG_UP && p3_nwrites == 1 && p3_orig_valid && val == p3_orig && cur == p3_intended;
++	int restore = !p3_therm_arm && p3_mode == ICL_ARG_UP && p3_nwrites == 1 && p3_orig_valid && val == p3_orig && cur == p3_intended;
++	/* patch 0336 (NEW TRIGGER of the same write): temperature hold = restore of the original value, release = the 875 mA value again; same register, same two values as (a)/(b),
++	 * only while the 0287 raise stands (p3_nwrites == 1), only inside sweet_chg_icl_thermal() (p3_therm_arm). Review 0336 F1: the THERM_MAX_WRITES bound applies to the RAISE direction only
++	 * (the release, cur == p3_orig): a hold (cur == p3_intended, val == p3_orig) is a lowering back to the 500 mA value the stock boot has and is never refused by the bound; the holds
++	 * stay bounded because each one needs a release before it, so at most THERM_MAX_WRITES + 1 thermal writes happen per boot */
++	int therm = p3_therm_arm && p3_mode == ICL_ARG_UP && p3_nwrites == 1 && p3_orig_valid &&
++	    ((val == p3_orig && cur == p3_intended) || (p3_twrites < THERM_MAX_WRITES && val == p3_intended && cur == p3_orig));
+ 	int down = p3_mode == ICL_ARG_DOWN && p3_nwrites == 0 && code == ICL_CODE && val == (uint8_t)((cur & 0x80u) | ICL500_CODE);
+ 
+ 	if (i2c_dead) {
+ 		return -1;
+ 	}
+-	if (!first && !restore && !down) {
++	if (!first && !restore && !down && !therm) {
+ 		i2c_log("SWEET CHG GAP: P3 chip write 0x%x <- 0x%x refused (cur 0x%x, writes so far %d, mode %d): only the 875 mA step, one restore, or (mode 500) the step to 500 mA\n", ICL_REG,
+ 		    val, cur, p3_nwrites, p3_mode);
+ 		return -1;
+@@ -739,7 +754,11 @@ i2c_cnfg09_write(uint8_t cur, uint8_t val)
+ 	}
+ 	b[0] = (uint8_t)ICL_REG;
+ 	b[1] = val;
+-	p3_nwrites++;
++	if (therm) {
++		p3_twrites++;
++	} else {
++		p3_nwrites++;
++	}
+ 	i2c_xfers++;
+ 	if (i2c_msg(0x69, ICL_REG, 0, 1, 2, b, NULL) != 0) {
+ 		i2c_errors++;
+@@ -788,6 +807,9 @@ p3_step(void)
+ 	uint32_t spd = sweet_usb_ss_configured();
+ 	int v;
+ 
++	if (p3_therm_hold) {
++		return p3_refuse("thermal hold active (patch 0336): the battery is >= 45.0 C and charging, the limit is not raised");
++	}
+ 	if (spd == 0) {
+ 		return p3_refuse("the USB gadget is not a configured SuperSpeed link that declared 896 mA (speed unknown, high speed, or the 62 descriptor): 875 mA is the USB 3 value");
+ 	}
+@@ -1325,6 +1347,15 @@ sweet_chg_i2c_tick(int log_pending)
+ 	if (i2c_group == 0) {
+ 		i2c_group = 8;                  /* in progress */
+ 		if (!i2c_arg_on()) {
++			if (sweet_thermal_enabled()) {
++				/* patch 0336: the thermal sampler (bsd/dev/sweet_thermal.c) reads the fuel-gauge temperature on every boot; P2's identity pass stays off, so i2c_p2_ok stays 0 and phase 3 cannot start */
++				if (i2c_load() == 0) {
++					i2c_loaded = 1;
++					i2c_log("SWEET CHG P2: off (sweetchgi2c=1 enables it); the HSI2C12 engine is loaded for the thermal sampler (patch 0336): FG Temp 0x08 and Current 0x0a reads only, same transfer registers as P2\n");
++				}
++				i2c_group = 9;
++				return;
++			}
+ 			i2c_log("SWEET CHG P2: off (default; sweetchgi2c=1 enables it: it writes HSI2C12 transfer registers, never chip registers)\n");
+ 			i2c_group = 9;
+ 			return;
+@@ -1333,6 +1364,7 @@ sweet_chg_i2c_tick(int log_pending)
+ 			i2c_group = 9;
+ 			return;
+ 		}
++		i2c_loaded = 1;
+ 		i2c_log("SWEET CHG P2: start (patch 0284, sweetchgi2c=1): reads only on the chips; HSI2C12 writes are the per-transfer registers only (no SW_CONF/clock/pad/CONF/TIMING/USI_CON)\n");
+ 		i2c_t_ms = i2c_now_ms();
+ 		i2c_group = 1;
+@@ -1359,6 +1391,9 @@ sweet_chg_i2c_tick(int log_pending)
+ 		case 4: i2c_g_chg(0); break;
+ 		default: i2c_g_chg(1); break;
+ 		}
++		if (!i2c_dead) {
++			i2c_xfer_seen = 1;      /* patch 0336 F2: the first-transfer checks of i2c_gate(1) have been passed once */
++		}
+ 	}
+ 	i2c_t_ms = i2c_now_ms();
+ 	if (i2c_dead || i2c_group == 5) {
+@@ -1368,3 +1403,111 @@ sweet_chg_i2c_tick(int log_pending)
+ 	}
+ 	i2c_group++;
+ }
++
++/* ==================================================================================================================================================
++ * patch 0336 (SWEET THERMAL, bsd/dev/sweet_thermal.c, policy bsd/dev/sweet_thermal.h)
++ * ================================================================================================================================================== */
++
++/*
++ * One fuel-gauge sample for the thermal thread: FG 0x36 reg 0x08 (Temp, signed, 1/256 C, battery thermistor: the read patch 0307 added to mon_row) and reg 0x0a (Current,
++ * 312.5 uA/LSB, positive = charging: the read p3_sample / mon_row already do). Reads only, through chg_i2c_read and the same i2c_gate(0) check as p3_sample. Returns the
++ * TH_RD_* codes of sweet_thermal.h: 0 ok, 1 engine not up yet, 2 engine in use by the other caller, -1 gate/read failed this time, -2 bus stopped by an earlier error,
++ * -3 no engine on this boot. A failed read stops the bus (chg_i2c_read sets i2c_dead) exactly as for mon_row.
++ */
++int
++sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA)
++{
++	uint8_t cu[2], tc[2];
++	int rc = 0;
++
++	if (!sweet_chg_enter()) {
++		return 2;
++	}
++	if (i2c_group < 9) {
++		rc = 1;
++	} else if (!i2c_loaded || !sweet_chg_gate_established()) {
++		rc = -3;        /* patch 0336 F5: phase 1 never opened the gate (sweetchgprobe=0 / closed at boot): NOENGINE, rate-limited by the policy, no gate GAP lines every 10 s */
++	} else if (i2c_dead) {
++		rc = -2;
++	} else if (!i2c_gate(!i2c_xfer_seen)) {
++		rc = -1;        /* GAP printed by i2c_gate; transient (the touch driver moves pads of the shared bank), tried again at the next sample. Patch 0336 F2: the very first transfer of the boot
++		                 * also runs the pending-transfer checks (AUTO_CONF.MASTER_RUN / INT_STATUS) that the P2 path runs at its first group */
++	} else if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x08, 2, tc) != 0) {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_log("SWEET CHG GAP: THERMAL fuel-gauge read failed: bus stopped, no more battery temperature this boot\n");
++		rc = -1;
++	} else {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_xfer_seen = 1;
++		*cur_uA = ((int32_t)(int16_t)(cu[0] | ((uint32_t)cu[1] << 8)) * 3125) / 10;
++		*deci_c = ((int32_t)(int16_t)(tc[0] | ((uint32_t)tc[1] << 8)) * 10) / 256;
++	}
++	sweet_chg_leave();
++	return rc;
++}
++
++/*
++ * The charge lever of the thermal backstop. hold=1: put CNFG_09 back to its original value (the restore 0287 performs when the link is lost: same register, same value);
++ * hold=0: write the 875 mA value again. Returns 0 = done and read back, 1 = nothing to do (the 0287 raise is not in place: sweetchgicl=900 not given, refused, or already
++ * restored; or already in the wanted state; or, for the release, the P3 watcher has ended), 2 = engine busy (the caller asks again), -1 = refused or failed (GAP printed). A hold requested before the raise happened is
++ * remembered (p3_therm_hold): p3_step then refuses to raise. The release re-raises only while the SuperSpeed link and CHGTYP SDP/CDP still hold (the 0287 raise preconditions).
++ */
++int
++sweet_chg_icl_thermal(int hold)
++{
++	uint8_t c9 = 0, r9 = 0, want;
++	int rc = 0;
++
++	if (!sweet_chg_enter()) {
++		return 2;
++	}
++	p3_therm_hold = hold;
++	if (p3_mode != (int)ICL_ARG_UP || !p3_orig_valid || p3_nwrites != 1) {
++		i2c_log("SWEET CHG P3: thermal %s: nothing to do (CNFG_09 is not raised by sweetchgicl=900 now: mode %d stage %d writes %d)%s\n", hold ? "hold" : "release", p3_mode, p3_stage, p3_nwrites,
++		    hold && p3_stage < 9 && p3_nwrites == 0 ? "; the raise will be refused while the hold lasts" : "");
++		rc = 1;
++	} else if (i2c_group < 9 || !i2c_loaded || i2c_dead) {
++		i2c_log("SWEET CHG GAP: P3 thermal %s: charger bus not usable (group %d loaded %d dead %d): CNFG_09 left as it is\n", hold ? "hold" : "release", i2c_group, i2c_loaded, i2c_dead);
++		rc = -1;
++	} else if (!i2c_gate(!i2c_xfer_seen)) {
++		i2c_log("SWEET CHG GAP: P3 thermal %s: charger gate closed for now (GAP above): CNFG_09 left as it is, asked again at the next sample\n", hold ? "hold" : "release");
++		rc = 2;         /* patch 0336 F3: transient (the touch driver moves pads of the shared bank), same as the busy engine: the policy asks again */
++	} else if (chg_i2c_read(0x69, 0xc2, 1, &c9) != 0) {
++		i2c_log("SWEET CHG GAP: P3 thermal %s: CNFG_09 read failed (bus stopped): CNFG_09 left as it is\n", hold ? "hold" : "release");
++		rc = -1;
++	} else if (c9 == (hold ? p3_orig : p3_intended)) {
++		i2c_log("SWEET CHG P3: thermal %s: CNFG_09 already 0x%x\n", hold ? "hold" : "release", c9);
++		rc = 1;
++	} else if (c9 != (hold ? p3_intended : p3_orig)) {
++		i2c_log("SWEET CHG GAP: P3 thermal %s: CNFG_09 is 0x%x, not the 0x%x / 0x%x we know: not touched\n", hold ? "hold" : "release", c9, p3_orig, p3_intended);
++		rc = -1;
++	} else if (!hold && p3_twrites >= THERM_MAX_WRITES) {
++		/* patch 0336 F1: the release (raise) bound of this boot is used up. Refused here, BEFORE the write guard, so the bus is not stopped by a plain refusal; CNFG_09 stays at the original */
++		i2c_log("SWEET CHG GAP: P3 thermal release refused: %u thermal writes this boot (bound %u): CNFG_09 stays at the original 0x%x (500 mA), bus kept\n", p3_twrites, THERM_MAX_WRITES, p3_orig);
++		rc = 1;
++	} else if (!hold && (p3_stage >= 9 || sweet_usb_ss_configured() == 0 || p3_chgtyp_ok() != 1)) {
++		i2c_log("SWEET CHG GAP: P3 thermal release: the SuperSpeed link or CHGTYP SDP/CDP is gone, or the P3 watcher has ended (stage %d): CNFG_09 stays at the original 0x%x (500 mA)\n", p3_stage, p3_orig);
++		rc = 1;
++	} else {
++		want = hold ? p3_orig : p3_intended;
++		p3_therm_arm = 1;
++		rc = i2c_cnfg09_write(c9, want);
++		p3_therm_arm = 0;
++		if (rc != 0 && !i2c_dead) {
++			/* patch 0336 F1: the write guard refused and nothing was sent (a transfer failure sets i2c_dead inside i2c_cnfg09_write): the bus stays usable */
++			i2c_log("SWEET CHG GAP: P3 thermal %s: CNFG_09 write 0x%x refused by the write guard, nothing sent, bus kept: CNFG_09 stays 0x%x\n", hold ? "hold" : "release", want, c9);
++			rc = -1;
++		} else if (rc == 0 && chg_i2c_read(0x69, 0xc2, 1, &r9) == 0 && r9 == want) {
++			i2c_xfer_seen = 1;
++			i2c_log("SWEET CHG P3: thermal %s: CNFG_09 before=0x%x (%u mA) wrote=0x%x read back=0x%x (%u mA)\n", hold ? "hold" : "release", c9, chg_icl_ma(c9 & 0x7fu), want, r9,
++			    chg_icl_ma(r9 & 0x7fu));
++		} else {
++			i2c_log("SWEET CHG GAP: P3 thermal %s: CNFG_09 write 0x%x or read-back failed (read back 0x%x): all further transfers stopped\n", hold ? "hold" : "release", want, r9);
++			i2c_dead = 1;
++			rc = -1;
++		}
++		(void)i2c_wr(I_INTEN, 0);
++	}
++	sweet_chg_leave();
++	return rc;
++}
+diff --git a/bsd/dev/sweet_restart.c b/bsd/dev/sweet_restart.c
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -45,6 +45,7 @@ extern void sweet_wdt_parse(void);
+ extern void sweet_wdt_missing(const char *what);
+ extern void sweet_wdt_setup(uint64_t pmu_pa, uint32_t sysip_off);
+ extern void sweet_stall_start(void);   /* bsd/dev/sweet_stall.c (patch 0279) */
++extern void sweet_thermal_start(void); /* bsd/dev/sweet_thermal.c (patch 0336) */
+ extern void sweet_stall_tick(int src);
+ extern void sweet_wdt_poll(int may_arm);
+ extern void sweet_wdt_stop_pets(void);   /* patch 0333: one atomic store, stops every pet/arm/timer tick for good */
+@@ -193,6 +194,25 @@ sweet_clean_stop(void)
+ 	printf("SWEET RESTART: sync %s after %d ms\n", sweet_sync_done ? "done" : "TIMED OUT", i * 100);
+ }
+ 
++static int sweet_reset_ready;       /* patch 0336: /sweet-reset node and both offsets parsed (sweet_restart_start) */
++
++/*
++ * Patch 0336 (SWEET THERMAL CRIT, bsd/dev/sweet_thermal.c): the same orderly path as the remote reset to the bootloader (sweet_remote_thread): filesystem sync (bounded to 15 s),
++ * then sweet_machine_reset(1), so the phone cools in fastboot. No new register: the PMU SMC mode write and software reset are the ones every reset already makes. Returns -1 (GAP)
++ * instead of resetting when the reset node was never parsed, because then the offsets are 0 and the SMC store would go to the wrong address. Does not return on success.
++ */
++int
++sweet_thermal_reboot_bootloader(void)
++{
++	if (!sweet_reset_ready) {
++		printf("SWEET RESTART GAP: thermal CRIT reboot refused: no /sweet-reset node parsed on this boot, the PMU reset registers are unknown\n");
++		return -1;
++	}
++	printf("SWEET RESTART: thermal CRIT: clean stop, then reset to the bootloader (patch 0336)\n");
++	sweet_clean_stop();
++	sweet_machine_reset(1);
++}
++
+ /* sweetremote=1: block on a UDP socket, reset on the magic payload (see the header). */
+ static void
+ sweet_remote_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -273,6 +293,7 @@ sweet_restart_start(void)
+ 	started = 1;
+ 	sweet_wdt_parse();      /* FIRST, before the early returns below (SPEC-WDT SQ1) */
+ 	sweet_stall_start();    /* patch 0279: stall detector, needs no ADT node */
++	sweet_thermal_start();  /* patch 0336: thermal sampler + backstop, needs no ADT node (sweetthermal=0 turns it off) */
+ 	/* patch 0309 (audit finding 5): patch 0265 takes the x86 kmsg-signature stub on this board for speed, with no line saying so */
+ 	printf("SWEET GAP: Mach kmsg signatures are OFF (patch 0265, perf: 11.5%% of backboardd render-thread samples): corrupted IPC messages are not caught by the signature check\n");
+ 	if (SecureDTLookupEntry(NULL, "/sweet-reset", &node) != kSuccess ||
+@@ -293,6 +314,7 @@ sweet_restart_start(void)
+ 		return;
+ 	}
+ 	sweet_swreset_off = off[0];
++	sweet_reset_ready = 1;
+ 	sweet_wdt_setup(sweet_pmu_pa, (uint32_t)sweet_mode_off);       /* read-only SQ2; arming waits for the drain thread */
+ 	PE_halt_restart = sweet_halt_restart;
+ 
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,232 @@
++/*
++ * SWEET THERMAL (xnu patch 0336, ALL-ON safety, user 2026-11-12: battery 51.6-53 C under stress with no throttle). Facts: docs/research/150-thermal-path.md.
++ *
++ * A kernel thread (every boot; boot-arg sweetthermal=0 turns it off, default on) samples the battery temperature of the MAX77759 fuel gauge (FG 0x36 reg 0x08, the read
++ * patch 0307 already does for the SWEET CHG MON rows; no new register) and the FG Current (0x0a, sign: positive = charging) every 10 s through
++ * sweet_chg_fg_sample() (bsd/dev/sweet_chg_i2c.c), independent of the USB link and of every job. The policy (thresholds, hysteresis, what each state does) is
++ * bsd/dev/sweet_thermal.h, which the host test compiles unchanged. This file holds the three actuators and the value iOS reads:
++ *   - X1 cores: sched_perfcontrol_update_recommended_cores(), the call patch 0270 makes once at boot (a scheduler hint, no register);
++ *   - charge limit: sweet_chg_icl_thermal() (CNFG_09 back to the original value / back to 875 mA, the only chip register this series ever writes);
++ *   - CRIT: sweet_thermal_reboot_bootloader() (bsd/dev/sweet_restart.c: the orderly clean-stop + reset-to-bootloader the remote reset already uses);
++ *   - sweet_thermal_get(): the latest good value, read by SweetBattery (IOPMPowerSource Temperature) and SweetHIDTemperature (HID type 0xF events).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++
++#define TH_LOG(...) printf(__VA_ARGS__)
++#include "sweet_thermal.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);   /* osfmk/kern/sched_prim.c; the call of patch 0270 */
++extern unsigned int ml_get_cpu_count(void);                                          /* patch 0270 */
++extern int sweet_chg_fg_sample(int32_t *deci_c, int32_t *cur_uA);                    /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
++extern int sweet_chg_icl_thermal(int hold);                                          /* bsd/dev/sweet_chg_i2c.c (patch 0336) */
++extern void sweet_chg_tick(int log_pending);                                         /* bsd/dev/sweet_chg.c */
++extern int sweet_thermal_reboot_bootloader(void);                                    /* bsd/dev/sweet_restart.c (patch 0336) */
++
++#define TH_KICK_MS 60000u       /* drive charger phase 1 from this thread when the USB log thread has not by this uptime (60 s: on a USB boot its first tick comes within seconds) */
++
++static int th_on = -1;                  /* -1 = boot-arg not read yet */
++static struct th_ctl th_c;
++static uint32_t th_boot_mask;
++static volatile int32_t th_g_cc;        /* latest good value, centi-C (published before th_g_ms with a release store; read after an acquire load of th_g_ms: review 0336 F8) */
++static volatile uint32_t th_g_state;
++static volatile uint64_t th_g_ms;       /* when th_g_cc was read; 0 = never */
++
++static uint64_t
++th_now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++/* literal name in the call: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++int
++sweet_thermal_enabled(void)
++{
++	uint32_t v = 1;
++
++	if (th_on < 0) {
++		th_on = !(PE_parse_boot_argn("sweetthermal", &v, sizeof(v)) && v == 0);
++	}
++	return th_on;
++}
++
++/*
++ * TEST ONLY boot-arg sweetthermalramp=<deciC per sample> (1..100): the backstop's state machine sees real + ramp * samples-since-start (sweet_thermal.h th_tick); what sweet_thermal_get() publishes
++ * (IOPMPowerSource Temperature, HID TG0B) stays the real value. Returns 1 and the value when the arg is present. Literal name here: tools/run-preflight --gen-bootargs scans for it.
++ */
++static int
++th_ramp_arg(uint32_t *v)
++{
++	*v = 0;
++	return PE_parse_boot_argn("sweetthermalramp", v, sizeof(*v)) ? 1 : 0;
++}
++
++/* 1 = a good sample exists (age in ms, may be stale: the caller decides, TH_STALE_MS), 0 = none yet or the thread is off. */
++int
++sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *age_ms)
++{
++	uint64_t t = __atomic_load_n(&th_g_ms, __ATOMIC_ACQUIRE);
++
++	if (t == 0) {
++		return 0;
++	}
++	*centi_c = th_g_cc;
++	*state = th_g_state;
++	*age_ms = (uint32_t)(th_now_ms() - t);
++	return 1;
++}
++
++static void
++th_op_x1(int drop, int32_t dC)
++{
++	uint32_t m = drop ? (th_boot_mask & TH_X1_DROP_MASK) : th_boot_mask;
++
++	(void)dC;
++	if (m == 0) {
++		printf("SWEET THERMAL GAP: X1 drop mask 0x%x & boot mask 0x%x is empty: cores left as they are\n", TH_X1_DROP_MASK, th_boot_mask);
++		return;
++	}
++	sched_perfcontrol_update_recommended_cores(m);
++	printf("SWEET THERMAL: recommended cores now 0x%x (%s; boot value 0x%x, patch 0270 call)\n", m, drop ? "X1 dropped" : "restored", th_boot_mask);
++}
++
++static int
++th_op_chg(int hold, int32_t dC)
++{
++	(void)dC;
++	return sweet_chg_icl_thermal(hold);
++}
++
++static int
++th_op_crit(int32_t dC)
++{
++	(void)dC;
++	return sweet_thermal_reboot_bootloader();
++}
++
++static const struct th_ops th_ops_k = { th_op_x1, th_op_chg, th_op_crit };
++
++static void
++sweet_thermal_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t t0 = th_now_ms();
++	uint32_t i;
++
++	for (i = 0; i < 20; i++) {      /* let the charger phase 1 (USB log thread) and the rest of early boot go first; the first sample is at ~20 s */
++		delay_for_interval(1000, 1000 * 1000);
++	}
++	for (;;) {
++		int32_t dC = 0, cur = 0;
++		int rd = sweet_chg_fg_sample(&dC, &cur);
++		uint64_t now = th_now_ms();
++
++		if (rd == TH_RD_NOTREADY && now - t0 >= TH_KICK_MS) {
++			sweet_chg_tick(1);      /* the USB log thread never drove charger phase 1 (no USB link): drive it from here, reads only (patch 0283 stage A/B). log_pending=1 (review 0336 F6): the stage A -> B
++					 * and P2 group pacing (CHG_FORCE_MS / I2C_FORCE_MS, 10 s, with their GAP line) is kept instead of running stage B / the next group at once */
++		}
++		th_tick(&th_c, &th_ops_k, rd, dC, cur, now);
++		if (rd == TH_RD_OK && th_c.last_ok_ms == now) {
++			/* the REAL sensor value, never the test-ramp one (th_c.last_dC) */
++			th_g_cc = th_c.last_real_dC * 10;
++			th_g_state = (uint32_t)th_state(&th_c);
++			__atomic_store_n(&th_g_ms, now ? now : 1, __ATOMIC_RELEASE);     /* last: a reader that sees this time sees the value stored before it (review 0336 F8) */
++		}
++		for (i = 0; i < TH_PERIOD_MS / 1000u; i++) {
++			delay_for_interval(1000, 1000 * 1000);
++		}
++	}
++}
++
++/*
++ * Review 0336 F7: the X1-drop mask 0x18 is the A76 pair only under tools/xrun's cpu order (cpus=5, /cpus order 0,6,7,4,5, the one patch 0270's sweetrecores=0x1e assumes).
++ * Read the physical core of every logical cpu from the topology (the MPIDR 'reg' of the ADT cpu node, Aff1) and say loudly when the assumption does not hold. The backstop stays active
++ * (a different mask still lowers the load and can never be empty, th_op_x1); only what the line claims changes.
++ */
++static void
++th_check_cpu_order(unsigned int cpus)
++{
++	const ml_topology_info_t *ti = ml_get_topology_info();
++	uint32_t phys[32] = { 0 };
++	unsigned n = 0, i, g;
++
++	if (ti != NULL && ti->cpus != NULL) {
++		for (i = 0; i < ti->num_cpus && i < 32u; i++) {
++			phys[i] = (ti->cpus[i].phys_id >> 8) & 0xffu;
++			n++;
++		}
++	}
++	g = th_order_gaps(cpus, n ? phys : NULL, n, th_boot_mask);
++	if (g == 0) {
++		printf("SWEET THERMAL: X1 drop mask 0x%x = logical cpu3,4 = physical A76 pair 4,5 (cpus=%u, tools/xrun /cpus order 0,6,7,4,5: the order patch 0270 sweetrecores=0x1e assumes)\n", TH_X1_DROP_MASK, cpus);
++		return;
++	}
++	if (g & 4u) {
++		printf("SWEET THERMAL GAP: cpu topology unavailable: cannot tell which physical cores the X1 drop mask 0x%x keeps (it assumes logical cpu3,4 = the A76 pair, tools/xrun cpus=5 /cpus order 0,6,7,4,5)\n", TH_X1_DROP_MASK);
++	}
++	if (g & 1u) {
++		printf("SWEET THERMAL GAP: cpus=%u, the X1 drop mask 0x%x is made for cpus=%u (logical cpu0 = A55, cpu1/2 = X1, cpu3/4 = A76): a drop also takes the other cores outside the mask\n", cpus, TH_X1_DROP_MASK,
++		    TH_X1_DROP_NCPU);
++	}
++	if (g & 2u) {
++		printf("SWEET THERMAL GAP: /cpus order differs from tools/xrun's 0,6,7,4,5: X1 drop mask 0x%x keeps logical cpus whose physical cores are NOT the A76 pair 4,5 (physical cores by logical cpu:", TH_X1_DROP_MASK);
++		for (i = 0; i < n; i++) {
++			printf(" %u", phys[i]);
++		}
++		printf("): the line \"X1 dropped\" does not describe the cores that stay\n");
++	}
++}
++
++/* Called once from sweet_restart_start() (patch 0336). */
++void
++sweet_thermal_start(void)
++{
++	thread_t th;
++	uint32_t rc = 0, rv;
++	unsigned int ncpu = ml_get_cpu_count();
++	uint32_t online = ncpu >= 32 ? 0xffffffffu : ((1u << ncpu) - 1);
++
++	if (!sweet_thermal_enabled()) {
++		if (th_ramp_arg(&rv)) {
++			printf("SWEET THERMAL GAP: sweetthermalramp=%u (test only) refused: sweetthermal=0, no thermal backstop is running to test: no ramp\n", rv);
++		}
++		printf("SWEET THERMAL GAP: disabled by sweetthermal=0: no thermal backstop (no X1 drop, no charge hold, no CRIT reboot), IOPMPowerSource Temperature stays the constant 25.00 C (estimated), no HID temperature service\n");
++		return;
++	}
++	/* the boot-time mask patch 0270 set (sweetrecores) is what a restore goes back to */
++	th_boot_mask = online;
++	if (PE_parse_boot_argn("sweetrecores", &rc, sizeof(rc)) && (rc & online) != 0 && (rc & ~online) == 0) {
++		th_boot_mask = rc;
++	}
++	th_init(&th_c);
++	if (th_ramp_arg(&rv)) {
++		if (th_ramp_set(&th_c, rv) == 0) {
++			printf("SWEET THERMAL GAP: sweetthermalramp=%u (test only): the backstop sees real + %u.%u C per sample; a CRIT park is expected\n", rv, rv / 10u, rv % 10u);
++		} else {
++			printf("SWEET THERMAL GAP: sweetthermalramp=%u (test only) refused: outside %d..%d (deci-C per sample): no ramp, the backstop sees the real temperature\n", rv, TH_RAMP_MIN_DC, TH_RAMP_MAX_DC);
++		}
++	}
++	th_check_cpu_order(ncpu);
++	printf("SWEET THERMAL: on (patch 0336, sweetthermal=0 disables): sample %u s | X1 drop >= %d.%d C restore <= %d.%d C (mask 0x%x of boot 0x%x) | charge hold >= %d.%d C while charging, release <= %d.%d C | CRIT >= %d.%d C x%u samples -> reboot to bootloader\n",
++	    TH_PERIOD_MS / 1000u, TH_X1_DROP_DC / 10, TH_X1_DROP_DC % 10, TH_X1_RESTORE_DC / 10, TH_X1_RESTORE_DC % 10, TH_X1_DROP_MASK, th_boot_mask, TH_CHG_HOLD_DC / 10, TH_CHG_HOLD_DC % 10,
++	    TH_CHG_RELEASE_DC / 10, TH_CHG_RELEASE_DC % 10, TH_CRIT_DC / 10, TH_CRIT_DC % 10, TH_CRIT_CONFIRM);
++	/* what note 150 says stays unknown or has no backend (rule 7: say it on every boot) */
++	printf("SWEET THERMAL GAP: sensor->hotspot mapping of thermalmonitord (D22AP plist) is unresolved (note 150 A4): the TG0B battery value may feed analytics and the pressure level only, not every hotspot\n");
++	printf("SWEET THERMAL GAP: iOS CPU/GPU load clamps (CPUPowerTarget, GPUMaxPerf, pkg-low-power-target on AppleCLPC/ApplePPM/AGXAccelerator) have no kernel backend: only this backstop reduces compute\n");
++	printf("SWEET THERMAL GAP: no ACPM client in XNU (patch 0103): no clock step-down; AppleChargeRateLimitIndex (thermalmonitord's charger write) has no handler\n");
++	if (kernel_thread_start(sweet_thermal_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("SWEET THERMAL GAP: kernel_thread_start failed: no thermal sampling on this boot\n");
++	}
++}
+diff --git a/bsd/dev/sweet_thermal.h b/bsd/dev/sweet_thermal.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.h
+@@ -0,0 +1,307 @@
++/*
++ * SWEET THERMAL policy (xnu patch 0336, ALL-ON safety, user 2026-11-12: battery 51.6-53 C under stress with no throttle).
++ * Facts: docs/research/150-thermal-path.md ("the note"; was 146). Pure C, no kernel calls: the includer defines TH_LOG(...) (printf-like) BEFORE
++ * including this file; bsd/dev/sweet_thermal.c is the kernel glue and tools/sweet_thermal_host_test.c is the host harness (tools/test_sweet_thermal.py).
++ *
++ * Temperature unit everywhere here: deci-degrees C (dC), the unit mon_row() of patch 0307 already computes from the fuel gauge (MAX77759 FG 0x36 reg 0x08).
++ */
++#ifndef SWEET_THERMAL_H
++#define SWEET_THERMAL_H
++
++#include <stdint.h>
++#ifdef SWEET_THERMAL_HOST
++#include <stdio.h>      /* snprintf; the kernel gets it from libkern/libkern.h via the includer */
++#endif
++
++#ifndef TH_LOG
++#error "define TH_LOG(...) before including sweet_thermal.h"
++#endif
++
++/* ==================================================================================================================================
++ * THE THRESHOLD TABLE. One place; every value with the reason it has this number. dC = deci-degrees C.
++ * User 2026-11-12 = the task text of this patch (thresholds and hysteresis were chosen by the user, not derived here).
++ * ================================================================================================================================== */
++#define TH_PERIOD_MS        10000u   /* sample every 10 s: user 2026-11-12. Observed rise 0.63 C/min (note 150 C3) = 0.1 C per sample; the 30 s MON cadence gave 0.3 C. */
++#define TH_LOG_EVERY_MS     60000u   /* periodic state line once per 60 s: user 2026-11-12 */
++#define TH_X1_DROP_DC       480      /* >= 48.0 C: drop the X1 cores. User 2026-11-12; the note's D(ii) "compute" row uses the same 48 C ("user target"). */
++#define TH_X1_RESTORE_DC    440      /* <= 44.0 C: restore. User 2026-11-12 (4.0 C hysteresis; the D22AP plist ReleaseHysteresis is 2.0, note A4: 4.0 is stricter). */
++#define TH_CHG_HOLD_DC      450      /* >= 45.0 C AND charging: CNFG_09 back to its original value. User 2026-11-12; note D(ii) "charge" row: 45 C = the plist MLBLowHS target, note A4. */
++#define TH_CHG_RELEASE_DC   420      /* <= 42.0 C: back to 875 mA. User 2026-11-12 (3.0 C hysteresis). */
++#define TH_CRIT_DC          550      /* >= 55.0 C: CRIT + orderly reboot to the bootloader. User 2026-11-12; plist THERMAL_TRAP_LOAD is 53-58 C, THERMAL_TRAP_SLEEP 55-60 C (note A4). */
++#define TH_CRIT_CONFIRM     2u       /* consecutive samples >= TH_CRIT_DC before the reboot is requested (20 s). DESIGN CHOICE, not from the user: a single bad I2C word must not
++                                      * reboot the phone; cost 10 s at 0.63 C/min = 0.1 C. */
++#define TH_X1_DROP_MASK     0x18u    /* cores 3,4 (A76) stay recommended, cores 0..2 do not: user 2026-11-12 "mask 0x18"; note C2 (cpu1/2 = X1 at 2801 MHz, cpu3/4 = A76 2252 MHz, cpu0 = A55) */
++#define TH_X1_DROP_NCPU     5u       /* the cpu count the mask is made for: cpus=5 with tools/xrun's /cpus order 0,6,7,4,5 (rule-8 review 0336 F7) */
++#define TH_SANE_MIN_DC      (-200)   /* a reading outside [-20.0, 90.0] C is a failed read (GAP, no action). DESIGN CHOICE [guess]: outside any Li-ion cell state worth acting on */
++#define TH_SANE_MAX_DC      900
++#define TH_STALE_MS         60000u   /* no good sample for 60 s: the value is stale (GAP once, consumers stop trusting it). DESIGN CHOICE */
++#define TH_GAP_EVERY_MS     60000u   /* a repeating failure GAPs on the first occurrence and then once per 60 s (rule 7: never silent, never a flood) */
++#define TH_CHG_RETRY_MAX    4u       /* a charge HOLD that failed (-1) is asked again at the next sample (rule-8 review 0336 F3), at most this many times per hot period; DESIGN CHOICE: a permanent
++                                      * cause (foreign CNFG_09 value, stopped bus) repeats its callee GAP lines, so the retry is bounded; a busy engine / closed gate (2) is not counted */
++#define TH_RAMP_MIN_DC      1        /* boot-arg sweetthermalramp=<deciC per sample>, TEST ONLY (user 2026-11-13: prove every backstop action without heating the battery): accepted range 1..100 */
++#define TH_RAMP_MAX_DC      100      /* (100 = 10 C per sample). 1 C per 10 s sample (=10) walks 35 C real to X1 drop 48 C in ~2 min and to the CRIT park 55 C (x2) in ~3.5 min */
++#define TH_RAMP_START_N     3u       /* the ramp starts at the 3rd good sample: bias = ramp * (good samples - 2), so the 3rd sample is the first biased one */
++#define TH_RAMP_BIAS_CAP_DC 1000     /* bias never above 100.0 C (int overflow guard; a CRIT park is long past) */
++
++/*
++ * Rule-8 review 0336 F7: TH_X1_DROP_MASK (0x18) is "the A76 pair" only under ONE logical cpu order. Logical ids are assigned by /cpus DT order (xnu), and the order
++ * 0,6,7,4,5,... (logical cpu0 = A55, cpu1/2 = the X1 pair, cpu3/4 = the A76 pair) comes from tools/xrun --adt-cpu-order (applied when no --adt is given) together with cpus=5, the order
++ * patch 0270's sweetrecores=0x1e assumes. Under the plain DT order 0x18 = physical cpu3 (A55) + cpu4 (A76) and the "X1 dropped" line would be wrong.
++ * phys[i] = physical core number (gs101 MPIDR Aff1: A55 0-3, A76 4-5, X1 6-7) of logical cpu i, nphys entries (NULL / 0 = topology unknown).
++ * Returns a bit set: 1 = ncpu != TH_X1_DROP_NCPU, 2 = a logical cpu of the kept mask (boot_mask & 0x18) is not a physical A76 (4, 5), 4 = physical ids unknown.
++ */
++static inline unsigned
++th_order_gaps(unsigned ncpu, const uint32_t *phys, unsigned nphys, uint32_t boot_mask)
++{
++	unsigned g = 0, i;
++	uint32_t m = boot_mask & TH_X1_DROP_MASK;
++
++	if (ncpu != TH_X1_DROP_NCPU) {
++		g |= 1u;
++	}
++	if (phys == 0 || nphys == 0) {
++		return g | 4u;
++	}
++	for (i = 0; i < 32u; i++) {
++		if (((m >> i) & 1u) != 0 && (i >= nphys || (phys[i] != 4u && phys[i] != 5u))) {
++			g |= 2u;
++		}
++	}
++	return g;
++}
++
++enum { TH_RD_OK = 0, TH_RD_NOTREADY = 1, TH_RD_BUSY = 2, TH_RD_FAIL = -1, TH_RD_DEAD = -2, TH_RD_NOENGINE = -3 };
++
++/* The three actuators. chg() returns 0 = done, 1 = nothing to do (lever not engaged), 2 = engine busy (asked again at the next sample), -1 = refused/failed (GAP already printed by the callee). */
++struct th_ops {
++	void (*x1)(int drop, int32_t dC);
++	int (*chg)(int hold, int32_t dC);
++	int (*crit)(int32_t dC);                /* 0 = reboot path entered (does not return on hardware), -1 = refused (GAP printed by the callee; CRIT is requested again at the next sample) */
++};
++
++struct th_ctl {
++	uint8_t x1_dropped, chg_held, crit_n, crit_req, have_temp, stale_said, chg_retry;
++	int32_t last_dC, last_cur_uA;   /* last_dC = the value the state machine used (real + test bias); last_real_dC = the sensor value: ONLY this one is ever published to iOS */
++	int32_t last_real_dC, bias_dC;
++	int last_state;
++	uint32_t fail_n, samples;
++	uint64_t last_ok_ms, last_log_ms, last_gap_ms, last_nochg_ms;
++	uint8_t gap_said, nochg_said, ramp_gap_said;
++	uint16_t ramp_dC;               /* test ramp, deci-C per good sample from sample TH_RAMP_START_N on; 0 = off (the normal boot) */
++};
++
++static inline void
++th_fmt(char *b, unsigned n, int32_t dC)
++{
++	int32_t a = dC < 0 ? -dC : dC;
++
++	snprintf(b, n, "%s%d.%d", dC < 0 ? "-" : "", (int)(a / 10), (int)(a % 10));
++}
++
++/* state number printed as `state S`: 0 normal, 1 charge-hold, 2 X1-drop, 3 X1-drop + charge-hold, 4 CRIT */
++static inline int
++th_state(const struct th_ctl *c)
++{
++	return c->crit_req ? 4 : (c->x1_dropped ? 2 : 0) + (c->chg_held ? 1 : 0);
++}
++
++static inline const char *
++th_state_name(int s)
++{
++	static const char *const n[] = { "NORMAL", "CHG-HOLD", "X1-DROP", "X1-DROP+CHG-HOLD", "CRIT" };
++
++	return s >= 0 && s <= 4 ? n[s] : "?";
++}
++
++static inline void
++th_init(struct th_ctl *c)
++{
++	*c = (struct th_ctl){ .last_state = -1 };
++}
++
++/* TEST ONLY (boot-arg sweetthermalramp): 0 = armed, -1 = refused (outside 1..100: no ramp, the backstop keeps seeing the real temperature). The bias is added inside th_tick() to the value the
++ * STATE MACHINE uses; the value published to iOS (last_real_dC) is never biased. */
++static inline int
++th_ramp_set(struct th_ctl *c, uint32_t dC_per_sample)
++{
++	if (dC_per_sample < TH_RAMP_MIN_DC || dC_per_sample > TH_RAMP_MAX_DC) {
++		c->ramp_dC = 0;
++		return -1;
++	}
++	c->ramp_dC = (uint16_t)dC_per_sample;
++	return 0;
++}
++
++static inline void
++th_gap(struct th_ctl *c, uint64_t now_ms, const char *what, int rc)
++{
++	if (c->gap_said && now_ms - c->last_gap_ms < TH_GAP_EVERY_MS) {
++		return;
++	}
++	c->gap_said = 1;
++	c->last_gap_ms = now_ms;
++	TH_LOG("SWEET THERMAL GAP: %s (read rc %d, %u in a row): no thermal action taken on this sample, state %s kept\n", what, rc, (unsigned)c->fail_n,
++	    th_state_name(th_state(c)));
++}
++
++/*
++ * One sample. rd = the read result (TH_RD_*), dC/cur_uA valid only for TH_RD_OK. A failed or implausible read changes NOTHING (GAP only): neither a mitigation nor
++ * its release (user 2026-11-12 "sensor read failure -> GAP and no action").
++ */
++static inline void
++th_tick(struct th_ctl *c, const struct th_ops *ops, int rd, int32_t dC, int32_t cur_uA, uint64_t now_ms)
++{
++	char t[16], lim[16], extra[96], tag[80], rb[16], bb[16];
++	int st;
++	int32_t real = dC;
++
++	if (rd == TH_RD_OK && (dC < TH_SANE_MIN_DC || dC > TH_SANE_MAX_DC)) {
++		c->fail_n++;
++		if (c->ramp_dC && !c->ramp_gap_said) {
++			c->ramp_gap_said = 1;
++			TH_LOG("SWEET THERMAL GAP: sweetthermalramp (test only) refused on this sample: the sensor value is implausible: no bias is added and the ramp does not advance until a good read\n");
++		}
++		th_gap(c, now_ms, "fuel-gauge temperature outside the plausible range -20.0..90.0 C", rd);
++		return;
++	}
++	if (rd != TH_RD_OK) {
++		if (rd == TH_RD_BUSY) {
++			return;                 /* the charger engine was in use by its own tick: not a failure, try again at the next sample */
++		}
++		c->fail_n++;
++		if (c->ramp_dC && !c->ramp_gap_said) {
++			c->ramp_gap_said = 1;
++			TH_LOG("SWEET THERMAL GAP: sweetthermalramp (test only) refused on this sample: the sensor read is failing (rc %d): no bias is added and the ramp does not advance until a good read\n", rd);
++		}
++		th_gap(c, now_ms,
++		    rd == TH_RD_NOTREADY ? "no fuel-gauge temperature yet (charger I2C engine not up)" :
++		    rd == TH_RD_NOENGINE ? "no fuel-gauge temperature source on this boot (charger I2C engine unavailable)" :
++		    rd == TH_RD_DEAD ? "fuel-gauge temperature unavailable: the charger I2C bus was stopped by an earlier transfer error" :
++		    "fuel-gauge temperature read failed", rd);
++		if (c->have_temp && !c->stale_said && now_ms - c->last_ok_ms > TH_STALE_MS) {
++			c->stale_said = 1;
++			th_fmt(t, sizeof(t), c->last_real_dC);
++			TH_LOG("SWEET THERMAL GAP: battery temperature STALE, last good %s C %u s ago (state %s kept; consumers must not trust it)\n", t,
++			    (unsigned)((now_ms - c->last_ok_ms) / 1000u), th_state_name(th_state(c)));
++		}
++		return;
++	}
++	c->fail_n = 0;
++	c->gap_said = 0;
++	c->stale_said = 0;
++	c->ramp_gap_said = 0;
++	c->have_temp = 1;
++	c->last_real_dC = real;
++	c->last_cur_uA = cur_uA;
++	c->last_ok_ms = now_ms;
++	c->samples++;
++	tag[0] = 0;
++	c->bias_dC = 0;
++	if (c->ramp_dC) {
++		/* TEST ONLY: the state machine below sees real + ramp * (good samples since the ramp started); only reached for a GOOD read (a failed one returned above) */
++		if (c->samples >= TH_RAMP_START_N) {
++			int32_t b = (int32_t)c->ramp_dC * (int32_t)(c->samples - (TH_RAMP_START_N - 1u));
++
++			c->bias_dC = b > TH_RAMP_BIAS_CAP_DC ? TH_RAMP_BIAS_CAP_DC : b;
++			dC = real + c->bias_dC;
++			if (c->samples == TH_RAMP_START_N) {
++				th_fmt(rb, sizeof(rb), real);
++				TH_LOG("SWEET THERMAL GAP: sweetthermalramp (test only) starts at good sample %u (real %s C): from now the backstop sees real + %u.%u C per sample, iOS keeps the real value\n",
++				    (unsigned)c->samples, rb, (unsigned)(c->ramp_dC / 10u), (unsigned)(c->ramp_dC % 10u));
++			}
++		}
++		th_fmt(rb, sizeof(rb), real);
++		th_fmt(bb, sizeof(bb), c->bias_dC);
++		snprintf(tag, sizeof(tag), " (real %s C, test bias +%s C)", rb, bb);
++	}
++	c->last_dC = dC;
++	th_fmt(t, sizeof(t), dC);
++
++	if (dC >= TH_CRIT_DC) {
++		if (c->crit_n < 255) {
++			c->crit_n++;
++		}
++	} else {
++		c->crit_n = 0;
++	}
++	if (!c->x1_dropped && dC >= TH_X1_DROP_DC) {
++		c->x1_dropped = 1;
++		th_fmt(lim, sizeof(lim), TH_X1_DROP_DC);
++		TH_LOG("SWEET THERMAL ACTION: batt %s C%s >= %s C: drop the X1 cores (recommended mask 0x%x)\n", t, tag, lim, TH_X1_DROP_MASK);
++		ops->x1(1, dC);
++	} else if (c->x1_dropped && dC <= TH_X1_RESTORE_DC) {
++		c->x1_dropped = 0;
++		th_fmt(lim, sizeof(lim), TH_X1_RESTORE_DC);
++		TH_LOG("SWEET THERMAL ACTION: batt %s C%s <= %s C: restore the recommended cores\n", t, tag, lim);
++		ops->x1(0, dC);
++	}
++	if (dC < TH_CHG_HOLD_DC) {
++		c->nochg_said = 0;
++	}
++	if (!c->chg_held && dC >= TH_CHG_HOLD_DC && cur_uA > 0) {
++		int r;
++
++		c->nochg_said = 0;
++		c->chg_held = 1;
++		th_fmt(lim, sizeof(lim), TH_CHG_HOLD_DC);
++		TH_LOG("SWEET THERMAL ACTION: batt %s C%s >= %s C and charging (%d uA): charge input limit back to the original value (CNFG_09)\n", t, tag, lim, (int)cur_uA);
++		r = ops->chg(1, dC);
++		if (r == 2) {
++			c->chg_held = 0;        /* engine busy / gate closed for now: the condition still holds, ask again at the next sample */
++		} else if (r < 0 && c->chg_retry < TH_CHG_RETRY_MAX) {
++			c->chg_retry++;         /* review 0336 F3: a failed hold leaves CNFG_09 at 875 mA on a hot, charging battery: ask again at the next sample, bounded */
++			c->chg_held = 0;
++		} else if (r >= 0) {
++			c->chg_retry = 0;
++		}
++		extra[0] = 0;
++		if (r < 0) {
++			if (c->chg_held == 0) {
++				snprintf(extra, sizeof(extra), ", asked again at the next sample (retry %u of %u)", (unsigned)c->chg_retry, TH_CHG_RETRY_MAX);
++			} else {
++				snprintf(extra, sizeof(extra), ", %u retries used: not asked again until <= %d.%d C", (unsigned)c->chg_retry, TH_CHG_RELEASE_DC / 10, TH_CHG_RELEASE_DC % 10);
++			}
++		}
++		TH_LOG("SWEET THERMAL ACTION: charge-hold request at %s C%s -> %s%s\n", t, tag, r == 0 ? "done" : r == 2 ? "engine busy, retried at the next sample" : r > 0 ? "nothing to do (CNFG_09 is not raised on this boot)" :
++		    "FAILED (see the GAP above)", extra);
++	} else if (!c->chg_held && dC >= TH_CHG_HOLD_DC) {
++		/* hot but NOT charging (current <= 0): there is no input current to hold. Said once per hot period and again every TH_LOG_EVERY_MS (never a silent skip; the hold is taken at the
++		 * first sample that is hot AND charging) */
++		if (!c->nochg_said || now_ms - c->last_nochg_ms >= TH_LOG_EVERY_MS) {
++			c->nochg_said = 1;
++			c->last_nochg_ms = now_ms;
++			th_fmt(lim, sizeof(lim), TH_CHG_HOLD_DC);
++			TH_LOG("SWEET THERMAL ACTION: batt %s C%s >= %s C but not charging (current %d uA): not charging, nothing to hold\n", t, tag, lim, (int)cur_uA);
++		}
++	} else if (c->chg_held && dC <= TH_CHG_RELEASE_DC) {
++		int r;
++
++		c->chg_held = 0;
++		c->chg_retry = 0;
++		th_fmt(lim, sizeof(lim), TH_CHG_RELEASE_DC);
++		TH_LOG("SWEET THERMAL ACTION: batt %s C%s <= %s C: charge input limit back to 875 mA\n", t, tag, lim);
++		r = ops->chg(0, dC);
++		if (r == 2) {
++			c->chg_held = 1;
++		}
++		TH_LOG("SWEET THERMAL ACTION: charge-release request at %s C%s -> %s\n", t, tag, r == 0 ? "done" : r == 2 ? "engine busy, retried at the next sample" : r > 0 ? "nothing to do" : "FAILED (see the GAP above)");
++	}
++	if (!c->crit_req && c->crit_n >= TH_CRIT_CONFIRM) {
++		c->crit_req = 1;
++		th_fmt(lim, sizeof(lim), TH_CRIT_DC);
++		TH_LOG("SWEET THERMAL CRIT: batt %s C%s >= %s C on %u samples in a row: requesting the orderly reboot to the bootloader so the phone cools in fastboot\n", t, tag, lim,
++		    (unsigned)c->crit_n);
++		if (ops->crit(dC) != 0) {
++			c->crit_req = 0;        /* refused: stay loud, ask again at the next sample */
++		}
++	}
++
++	st = th_state(c);
++	if (st != c->last_state || c->last_log_ms == 0 || c->ramp_dC || now_ms - c->last_log_ms >= TH_LOG_EVERY_MS) {
++		c->last_state = st;
++		c->last_log_ms = now_ms ? now_ms : 1;
++		TH_LOG("SWEET THERMAL: batt %s C%s state %s (%d) current %d uA samples %u\n", t, tag, th_state_name(st), st, (int)cur_uA, (unsigned)c->samples);
++	}
++}
++
++#endif /* SWEET_THERMAL_H */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,10 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_thermal.c (patch 0336) */
++extern "C" int sweet_thermal_enabled(void);
++extern "C" int sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *age_ms);
++#define SWEET_TEMP_STALE_MS 60000u      /* = TH_STALE_MS of bsd/dev/sweet_thermal.h */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -28,6 +32,7 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	int fTempGapSaid;       /* patch 0336 */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -72,6 +77,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fTempGapSaid = 0;
+ 	return true;
+ }
+ 
+@@ -122,12 +128,27 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("AppleRawMaxCapacity", 5020);
+ 	putNumber("DesignCapacity", 5020);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C. Patch 0336: the fuel gauge's battery temperature (MAX77759 FG 0x36 reg 0x08, bsd/dev/sweet_thermal.c, every 10 s) when the thermal
++	 * thread has one; before the first sample, with sweetthermal=0, or when no good sample exists, the old constant 25.00 C flagged Estimated. A STALE value (no good sample for
++	 * 60 s) is still published (the last one: a hot battery must not turn into 25 C) and flagged Estimated, with a GAP once. */
++	{
++		int32_t cc = 2500;
++		uint32_t st = 0, age = 0;
++		bool on = sweet_thermal_enabled();
++		bool have = on && sweet_thermal_get(&cc, &st, &age);
++		bool live = have && age <= SWEET_TEMP_STALE_MS;
++		int said = !on ? 0 : !have ? 1 : live ? 0 : 2;
++		if (said != 0 && said != fTempGapSaid) {
++			IOLog("SWEET THERMAL GAP: IOPMPowerSource Temperature is %s (%d centi-C, flagged SweetBatteryTemperatureEstimated)\n",
++			    said == 2 ? "the last fuel-gauge value, STALE" : "the constant 25.00 C: no fuel-gauge sample yet", (int)cc);
++		}
++		fTempGapSaid = said;
++		putNumber("Temperature", (UInt32)cc);
++		putBool("SweetBatteryTemperatureEstimated", !live);
++	}
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -252,7 +273,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(self->fReal ? 30000 : 10000);      /* patch 0336: the static fallback re-publishes every 10 s only to refresh the temperature */
+ 	}
+ }
+ 
+@@ -267,17 +288,17 @@ SweetBattery::start(IOService *provider)
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || sweet_thermal_enabled()) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fReal ? 30000 : 10000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
+-			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
++			IOLog("SWEET BATTERY: timer unavailable; static fallback%s\n", sweet_thermal_enabled() ? " (the temperature is not refreshed: SWEET THERMAL GAP)" : "");
+ 		}
+ 	}
+ 	registerService();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -470,6 +470,38 @@ sweetNavNs(void)
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/*
++ * Patch 0336 (SWEET THERMAL, docs/research/150-thermal-path.md D(i).2): the HID temperature service thermalmonitord polls. Its discovery keeps services with PrimaryUsagePage
++ * 0xff00 and PrimaryUsage 5 (filter at 0x100007754 of the 20H392 binary), matches a plist sensor by the `Product` string (TG0B, which isBatterySensor: accepts) or by LocationID
++ * (= the 4-char key packed big-endian = ProductID here, 0x54473042), and reads event type 0xF (temperature) field 0xF0000 as float degrees C [read note 150 A2, binary
++ * addresses there]. The value is the fuel-gauge battery temperature of bsd/dev/sweet_thermal.c, in IOFixed degrees C (IOHIDEvent::temperatureEvent, patch 0058). Event on
++ * every 10 s sample that changed, plus copyEvent(). No sample yet or a STALE sample (> 60 s) = no event and a GAP once, never an old value presented as live.
++ * Whether thermalmonitord's D22AP hotspot controllers consume TG0B is NOT resolved (note 150 A4): the SWEET THERMAL GAP line at boot says so.
++ */
++extern "C" int sweet_thermal_enabled(void);
++extern "C" int sweet_thermal_get(int32_t *centi_c, uint32_t *state, uint32_t *age_ms);
++#define SWEET_HIDTEMP_PERIOD_MS 10000
++#define SWEET_HIDTEMP_STALE_MS  60000u
++class SweetHIDTemperature : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDTemperature);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = 0, IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 5; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x54473042; }   /* 'TG0B' */
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("TG0B"); }
++private:
++	static void tickFired(OSObject *owner, IOTimerEventSource *sender);
++	bool sample(IOFixed *out, int32_t *cc);
++	IOTimerEventSource *fTick;
++	int32_t fLastCC;
++	bool fSent;
++	int fGapSaid;
++};
++OSDefineMetaClassAndStructors(SweetHIDTemperature, IOHIDEventService);
++
+ /* patch 0306: xorshift32 draw in [lo, hi] and a symmetric jitter in [-r, r] (stress nav; the calm table keeps its own LCG fNavRng) */
+ static UInt32
+ sweetNavSR(UInt32 *st, UInt32 lo, UInt32 hi)
+@@ -579,6 +611,87 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++bool
++SweetHIDTemperature::start(IOService *provider)
++{
++	if (!sweet_thermal_enabled()) {
++		IOLog("SWEET THERMAL GAP: sweetthermal=0: no HID temperature service (thermalmonitord gets no temperature)\n");
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	fLastCC = 0;
++	fSent = false;
++	fGapSaid = 0;
++	fTick = IOTimerEventSource::timerEventSource(this, &SweetHIDTemperature::tickFired);
++	if (fTick && _hidWorkLoop->addEventSource(fTick) == kIOReturnSuccess) {
++		fTick->setTimeoutMS(SWEET_HIDTEMP_PERIOD_MS);
++	} else {
++		OSSafeReleaseNULL(fTick);
++		IOLog("SWEET THERMAL GAP: HID temperature timer unavailable: events only on copyEvent(), none pushed\n");
++	}
++	registerService();
++	IOLog("SWEET HID: temperature registered (Product TG0B, ProductID 0x54473042, page 0xff00 usage 5, every %d s)\n", SWEET_HIDTEMP_PERIOD_MS / 1000);
++	return true;
++}
++
++/* true = a fresh good sample (<= 60 s old); otherwise false with a GAP once per kind (none yet / stale). */
++bool
++SweetHIDTemperature::sample(IOFixed *out, int32_t *cc)
++{
++	uint32_t st = 0, age = 0;
++	int32_t v = 0;
++	int said;
++
++	if (!sweet_thermal_get(&v, &st, &age)) {
++		said = 1;
++	} else if (age > SWEET_HIDTEMP_STALE_MS) {
++		said = 2;
++	} else {
++		fGapSaid = 0;
++		*cc = v;
++		*out = (IOFixed)(((int64_t)v * 65536) / 100);
++		return true;
++	}
++	if (said != fGapSaid) {
++		fGapSaid = said;
++		IOLog("SWEET THERMAL GAP: HID temperature event withheld: %s\n", said == 1 ? "no fuel-gauge sample yet" : "the latest fuel-gauge sample is STALE (> 60 s)");
++	}
++	return false;
++}
++
++IOHIDEvent *
++SweetHIDTemperature::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	IOFixed f;
++	int32_t cc;
++
++	if (type != kIOHIDEventTypeTemperature || !sample(&f, &cc)) {
++		return NULL;
++	}
++	return IOHIDEvent::temperatureEvent(mach_absolute_time(), f);
++}
++
++void
++SweetHIDTemperature::tickFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTemperature *self = (SweetHIDTemperature *)owner;
++	IOFixed f;
++	int32_t cc;
++
++	if (self->sample(&f, &cc) && (!self->fSent || cc != self->fLastCC)) {
++		IOHIDEvent *event = IOHIDEvent::temperatureEvent(mach_absolute_time(), f);
++		if (event) {
++			self->fSent = true;
++			self->fLastCC = cc;
++			self->dispatchEvent(event);
++			event->release();
++		}
++	}
++	sender->setTimeoutMS(SWEET_HIDTEMP_PERIOD_MS);
++}
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDTemperature;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDTemperature;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"

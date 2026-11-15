@@ -1,0 +1,271 @@
+SWEET loud failures (patch 0309, ALL-ON, user 2026-11-11 "errors must scream, not fail silently"; audit findings 2/3/4/5/15, each checked against the patched tree): (3) /dev/null tee: a process NOT named in sweetnull no longer vanishes: its first 2 writes are mirrored as '|name| (not in sweetnull) text' (160 bytes), later ones counted ('SWEET NULL: name xN writes, B bytes not mirrored') at 10/100/1000..., 64-name table, full table says so; (2) IOWatchdog measures watchdogd's check-in interval (1st/10th/100th... check-in lines) and a 30 s timer logs 'WDT GAP: no watchdogd check-in for N s' past max(30 s, 3x the largest interval), doubling; detection only, nothing reset; (15) IOWatchdog::setProperties names the keys it drops (first 3 calls, then counts); (4) the PMU SMC results of the bootloader-mode and software-reset writes are checked: a refused reset prints 'SWEET RESTART GAP' instead of freezing silently; (5) one boot line says Mach kmsg signatures are off (patch 0265). No new register, no new hardware write: logs, counters and a timer only.
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -87,6 +87,9 @@
+ #include <libkern/section_keywords.h>
+ 
+ #include <pexpert/pexpert.h>    /* for PE_parse_boot_argn */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/locks.h>         /* patch 0309: the unlisted-writer table lock */
++#endif
+ 
+ boolean_t iskmemdev(dev_t dev);
+ 
+@@ -189,6 +192,60 @@
+ 	}
+ 	return false;
+ }
++
++/*
++ * Patch 0309 (ALL-ON, user 2026-11-11: "errors must scream, not fail silently"; audit finding 3): what a process NOT named in sweetnull
++ * writes to /dev/null was thrown away with no trace, so a daemon that prints its error and exits left nothing. Now its first 2 writes
++ * per process name are mirrored (first 160 bytes) as "|name| (not in sweetnull) text", and the rest are counted:
++ * "SWEET NULL: name xN writes, B bytes not mirrored (add it to sweetnull)" at 10, 100, 1000, ... writes. 64 names; a full table says so
++ * once per name it could not track. Decisions under a spin lock, printing after it. sweetnull=- still turns the whole tee off.
++ */
++#define SWEET_NULL_SEEN 64
++#define SWEET_NULL_MIRROR 2
++static LCK_GRP_DECLARE(sweet_null_grp, "sweet_null");
++static LCK_SPIN_DECLARE(sweet_null_lck, &sweet_null_grp);
++static struct {
++	char name[17];
++	uint32_t writes;
++	uint64_t bytes;
++} sweet_null_seen[SWEET_NULL_SEEN];
++static uint32_t sweet_null_full_drops;
++
++/* 1 = mirror this write, 0 = counted only; *report = write count to print as a summary (0 = none), *full = table full (print once per drop power of 2) */
++static int
++sweet_null_unlisted(const char *name, user_size_t c, uint32_t *report, uint64_t *bytes, uint32_t *full)
++{
++	int i, mirror = 0;
++
++	*report = 0;
++	*full = 0;
++	lck_spin_lock(&sweet_null_lck);
++	for (i = 0; i < SWEET_NULL_SEEN; i++) {
++		if (sweet_null_seen[i].name[0] == 0 || strncmp(sweet_null_seen[i].name, name, sizeof(sweet_null_seen[i].name)) == 0) {
++			break;
++		}
++	}
++	if (i == SWEET_NULL_SEEN) {
++		sweet_null_full_drops++;
++		if ((sweet_null_full_drops & (sweet_null_full_drops - 1)) == 0) {
++			*full = sweet_null_full_drops;
++		}
++	} else {
++		if (sweet_null_seen[i].name[0] == 0) {
++			strlcpy(sweet_null_seen[i].name, name, sizeof(sweet_null_seen[i].name));
++		}
++		sweet_null_seen[i].writes++;
++		sweet_null_seen[i].bytes += c;
++		mirror = sweet_null_seen[i].writes <= SWEET_NULL_MIRROR;
++		uint32_t w = sweet_null_seen[i].writes;
++		if (w >= 10 && (w == 10 || w == 100 || w == 1000 || w == 10000 || w == 100000 || w == 1000000)) {
++			*report = w;
++			*bytes = sweet_null_seen[i].bytes;
++		}
++	}
++	lck_spin_unlock(&sweet_null_lck);
++	return mirror;
++}
+ #endif
+ 
+ int
+@@ -268,6 +325,33 @@
+ 					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
+ 					continue;
+ 				}
++				if (strcmp(sweet_null_names, "-") != 0) {   /* patch 0309: unlisted writer (the tee is on) */
++					uint32_t rep = 0, full = 0;
++					uint64_t bytes = 0;
++					user_size_t cw = uio_curriovlen(uio);
++					if (sweet_null_unlisted(name, cw, &rep, &bytes, &full)) {
++						char buf[160];
++						c = MIN(cw, sizeof(buf));
++						error = uiomove(buf, (int)c, uio);
++						if (error) {
++							break;
++						}
++						printf("|%s| (not in sweetnull) %.*s%s", name, (int)c, buf,
++						    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
++						if (c < cw) {   /* the rest of this write is consumed below, counted in the summary */
++							c = uio_curriovlen(uio);
++							error = 0;
++							break;
++						}
++						continue;
++					}
++					if (rep) {
++						printf("SWEET NULL: %s x%u writes, %llu bytes not mirrored (add it to sweetnull)\n", name, rep, bytes);
++					}
++					if (full) {
++						printf("SWEET NULL GAP: unlisted-writer table full (%d names): %s not tracked (drop %u)\n", SWEET_NULL_SEEN, name, full);
++					}
++				}
+ 			}
+ #endif
+ 			c = uio_curriovlen(uio);
+--- a/iokit/Kernel/arm/SweetWatchdog.cpp
++++ b/iokit/Kernel/arm/SweetWatchdog.cpp
+@@ -23,6 +23,43 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <sys/proc.h>
++#include <kern/thread_call.h>
++#include <libkern/OSAtomic.h>
++
++/*
++ * Patch 0309 (ALL-ON, user 2026-11-11 "errors must scream"; audit finding 2): wdt=-1 + this stub meant a userspace hang (watchdogd stops
++ * checking in: a deadlocked SpringBoard/backboardd or watchdogd itself) was noticed by nobody. The check-in interval of watchdogd on PixOS is
++ * not known (rule 6), so it is MEASURED: the 1st/10th/100th/... check-in logs the mean and the largest interval seen; a 30 s timer logs
++ * 'WDT GAP: no watchdogd check-in for N s' when the gap exceeds 3x the largest interval seen (at least 30 s), again each time the gap
++ * doubles. Detection only: nothing is reset (the SoC watchdog of patch 0278 is the kernel's own).
++ */
++static volatile uint64_t sweet_wdt_ci_n, sweet_wdt_ci_last, sweet_wdt_ci_first, sweet_wdt_ci_maxgap_ns;
++static uint64_t sweet_wdt_ci_reported_ns;
++static thread_call_t sweet_wdt_ci_call;
++
++static uint64_t
++sweet_wdt_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static void
++sweet_wdt_ci_check(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t now = sweet_wdt_now_ns(), last = sweet_wdt_ci_last, mx = sweet_wdt_ci_maxgap_ns;
++	uint64_t lim = 3 * mx > 30000000000ULL ? 3 * mx : 30000000000ULL;
++
++	if (sweet_wdt_ci_n > 0 && now - last > lim && now - last > 2 * sweet_wdt_ci_reported_ns) {
++		sweet_wdt_ci_reported_ns = now - last;
++		IOLog("WDT GAP: no watchdogd check-in for %llu s (largest interval seen %llu ms, %llu check-ins): userspace hang? nothing resets it (wdt=-1, stub)\n",
++		    (now - last) / 1000000000ULL, mx / 1000000ULL, (unsigned long long)sweet_wdt_ci_n);
++	}
++	uint64_t dl;
++	clock_interval_to_deadline(30, NSEC_PER_SEC, &dl);
++	thread_call_enter_delayed(sweet_wdt_ci_call, dl);   /* every 30 s */
++}
+ 
+ class IOWatchdog : public IOService {
+ 	OSDeclareDefaultStructors(IOWatchdog);
+@@ -35,8 +72,33 @@
+ OSDefineMetaClassAndStructors(IOWatchdog, IOService);
+ 
+ IOReturn
+-IOWatchdog::setProperties(__unused OSObject *properties)
++IOWatchdog::setProperties(OSObject *properties)
+ {
++	/* patch 0309 (audit finding 15): the boot-stage writes were dropped and answered with success, unlogged. Still accepted (no Apple PMU),
++	 * now said: the first 3 calls name their keys, later ones are counted at 10/100/1000 calls. */
++	static uint32_t calls;
++	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&calls) + 1;
++	if (n <= 3) {
++		OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++		char keys[160];
++		keys[0] = 0;
++		if (d) {
++			OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++			if (it) {
++				OSSymbol const *k;
++				while ((k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++					if (keys[0]) {
++						strlcat(keys, ",", sizeof(keys));
++					}
++					strlcat(keys, k->getCStringNoCopy(), sizeof(keys));
++				}
++				it->release();
++			}
++		}
++		IOLog("WDT GAP: IOWatchdog setProperties call %u (%s) not applied (no Apple PMU), answered success\n", n, d ? keys : "not a dictionary");
++	} else if (n == 10 || n == 100 || n == 1000 || n == 10000) {
++		IOLog("WDT GAP: IOWatchdog setProperties x%u not applied\n", n);
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -50,6 +112,15 @@
+ 	setProperty("IOPMUPrimary", 1ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET WDT: IOWatchdog registered (accepts check-ins, stub; SoC watchdog is petted by the kernel poll)\n");
++	sweet_wdt_ci_call = thread_call_allocate(sweet_wdt_ci_check, NULL);   /* patch 0309 */
++	if (sweet_wdt_ci_call == NULL) {
++		IOLog("WDT GAP: check-in monitor not started (thread_call_allocate failed): a watchdogd stall stays unseen\n");
++	} else {
++		uint64_t dl;
++		clock_interval_to_deadline(30, NSEC_PER_SEC, &dl);
++		thread_call_enter_delayed(sweet_wdt_ci_call, dl);
++		IOLog("SWEET WDT: check-in monitor on (30 s timer, gap limit max(30 s, 3x largest interval))\n");
++	}
+ 	return true;
+ }
+ 
+@@ -107,6 +178,21 @@
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+ 
++	if (selector == 1) {   /* patch 0309: Checkin interval measurement */
++		uint64_t now = sweet_wdt_now_ns(), last = sweet_wdt_ci_last;
++		uint64_t n = OSIncrementAtomic64((volatile SInt64 *)&sweet_wdt_ci_n) + 1;
++		if (n == 1) {
++			sweet_wdt_ci_first = now;
++		} else if (now - last > sweet_wdt_ci_maxgap_ns) {
++			sweet_wdt_ci_maxgap_ns = now - last;
++		}
++		sweet_wdt_ci_last = now;
++		sweet_wdt_ci_reported_ns = 0;
++		if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
++			IOLog("SWEET WDT: check-in %llu, mean interval %llu ms, largest %llu ms\n", n, n > 1 ? (now - sweet_wdt_ci_first) / (n - 1) / 1000000ULL : 0ULL,
++			    sweet_wdt_ci_maxgap_ns / 1000000ULL);
++		}
++	}
+ 	if (selector >= 64 || !(sweet_wdt_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_wdt_logged |= 1ULL << selector;
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -65,17 +65,29 @@
+ void
+ sweet_set_bootloader_mode(void)
+ {
+-	(void)sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++	uint64_t rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++	if (rc != 0) {   /* patch 0309 (audit finding 4): a refused write was invisible */
++		printf("SWEET RESTART GAP: PMU SMC bootloader-mode write refused x0=0x%llx: the next reset may not land in fastboot\n", rc);
++	}
+ }
+ 
+ /* No locks, no allocation: usable from the panic path. Does not return. */
+ static void __attribute__((noreturn))
+ sweet_machine_reset(int to_bootloader)
+ {
++	uint64_t rc;
++
+ 	if (to_bootloader) {
+-		(void)sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++		rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++		if (rc != 0) {   /* patch 0309 (audit finding 4) */
++			printf("SWEET RESTART GAP: PMU SMC bootloader-mode write refused x0=0x%llx\n", rc);
++		}
+ 	}
+-	(void)sweet_pmu_write(sweet_pmu_pa + sweet_swreset_off, SWEET_SWRESET);
++	rc = sweet_pmu_write(sweet_pmu_pa + sweet_swreset_off, SWEET_SWRESET);
++	/* patch 0309 (audit finding 4): returning here means the reset did not happen; the result was discarded and the phone froze in the
++	 * wfe loop with no line. Say so (console = USB log / pstore / panic screen); then the same wait as before (the SoC watchdog of
++	 * patch 0278, when armed, is the backstop). No new register is written. */
++	printf("SWEET RESTART GAP: PMU SMC software reset returned x0=0x%llx instead of resetting: phone frozen until the SoC watchdog fires (if armed)\n", rc);
+ 	for (;;) {
+ 		__asm__ volatile ("wfe");
+ 	}
+@@ -238,6 +250,8 @@
+ 	started = 1;
+ 	sweet_wdt_parse();      /* FIRST, before the early returns below (SPEC-WDT SQ1) */
+ 	sweet_stall_start();    /* patch 0279: stall detector, needs no ADT node */
++	/* patch 0309 (audit finding 5): patch 0265 takes the x86 kmsg-signature stub on this board for speed, with no line saying so */
++	printf("SWEET GAP: Mach kmsg signatures are OFF (patch 0265, perf: 11.5%% of backboardd render-thread samples): corrupted IPC messages are not caught by the signature check\n");
+ 	if (SecureDTLookupEntry(NULL, "/sweet-reset", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 8) {
+ 		printf("SWEET RESTART: no /sweet-reset node\n");

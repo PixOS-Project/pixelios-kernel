@@ -1,0 +1,25 @@
+SWEET EXIT call site for bluetoothd (patch 0205, ticket T-e3a9, BT-S4f; docs/reviews/T-0e22-proof.md s.5-6). In the SWEET EXIT branch of patch 0204 (exit_with_reason), when the exit code is non-zero ((rv & 0xff) == 0 && (rv >> 8) != 0) and the exiting thread is current (p == current_proc()), print one 'SWEET EXIT: ... exit code N, call site follows' line and call sweet_crash_log (patch 0043, osfmk/kern/exception.c) with sig 0, code = rv: it prints 'CRASH name[pid] sig 0 code 0x100 sub 0x0 slide .. mh ..', 'CRASH name pc .. lr .. sp .. fp .. far ..' and 'CRASH name bt <ret addrs of the fp chain, max 10>'. Printf only (plus a bounded copyin of the user frame chain); no state change, no hardware access, no boot-arg. Guarded by ARM64_BOARD_CONFIG_SWEET like 0043. Applies after 0043 and 0204. Not run on hardware yet.
+
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1477,6 +1477,19 @@
+ 	/* SWEET EXIT (T-652c, BT-S4c): witness how bluetoothd exits (status word rv: 0x7f = signal in low bits, exit code in bits 8..15); log only */
+ 	if (strncmp(p->p_name, "bluetoothd", 10) == 0) {
+ 		printf("SWEET EXIT: %s[%d] rv=0x%x\n", p->p_name, proc_getpid(p), rv);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET EXIT call site (T-e3a9, BT-S4f): exit(N) with N != 0 reaches here on the
++		 * exiting thread; its user registers are the exit svc, so pc/lr/fp chain name the caller.
++		 * Printf only (sweet_crash_log, patch 0043, copyin of up to 10 frames); no state change.
++		 */
++		if ((rv & 0xff) == 0 && (rv >> 8) != 0 && p == current_proc()) {
++			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++			printf("SWEET EXIT: %s[%d] exit code %d, call site follows (CRASH lines: sig 0, code=rv, pc lr sp fp of the exit svc, bt = fp-chain return addresses, slide, mh)\n",
++			    p->p_name, proc_getpid(p), (rv >> 8) & 0xff);
++			sweet_crash_log(p->p_name, proc_getpid(p), 0, (uint64_t)(uint32_t)rv, 0);
++		}
++#endif
+ 	}
+ 
+ #if DEVELOPMENT || DEBUG

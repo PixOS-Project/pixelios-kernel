@@ -1,0 +1,202 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b8ca076..a2c01f2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
++bsd/dev/sweet_mmio_log.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu_job.c b/bsd/dev/sweet_gpu_job.c
+index d3c36b9..291f1ae 100644
+--- a/bsd/dev/sweet_gpu_job.c
++++ b/bsd/dev/sweet_gpu_job.c
+@@ -16,6 +16,7 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+ #include <stdint.h>
++#include "sweet_mmio_log.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void flush_dcache64(addr64_t, unsigned, int);
+@@ -71,8 +72,9 @@ extern vm_offset_t kvtophys(vm_offset_t);
+ 
+ static volatile uint32_t *sg;          /* GPU block */
+ 
+-static uint32_t rr(uint32_t off) { return sg[off / 4]; }
+-static void wr(uint32_t off, uint32_t v) { sg[off / 4] = v; }
++/* Logged like sweet_mali.c (patch 0170, sweetmmio); thread context only, no spinlock / interrupts-disabled section here (checked at 0170). */
++static uint32_t rr(uint32_t off) { uint32_t v = sg[off / 4]; sweet_mmio_log(SWEET_MMIO_GPU, 'R', SWEET_MMIO_GPU_BASE + off, 32, v); return v; }
++static void wr(uint32_t off, uint32_t v) { sweet_mmio_log(SWEET_MMIO_GPU, 'W', SWEET_MMIO_GPU_BASE + off, 32, v); sg[off / 4] = v; }
+ 
+ /* poll cond for up to 100 ms; 0 = timed out */
+ #define WAIT(cond) ({ int ok_ = 0; for (unsigned i_ = 0; i_ < 5000; i_++) { if (cond) { ok_ = 1; break; } delay(20); } ok_; })
+@@ -244,6 +246,7 @@ sweet_gpu_job_run(volatile uint32_t *gpu, int s2mpu_open)
+ 	printf("SWEET GPUJOB: submit=%s wait=%s JOB_RAW=%#x MMU_RAW=%#x JS0_STATUS=%#x AS0_FAULT=%#x header_exc=%#x target=%#llx (%s) as0_off=%s\n",
+ 	    sub ? "ok" : "no", waited ? ((jraw & 0x10000u) ? "failed" : (mraw ? "mmu-fault" : "done")) : "timeout", jraw, mraw, jst, fst, hexc, target,
+ 	    target == MAGIC ? "MAGIC" : target == 0xa5a5a5a5a5a5a5a5ull ? "unchanged" : "other", off ? "FAILED" : "ok");
++	sweet_mmio_log_summary(SWEET_MMIO_GPU, "gpujob");   /* end of the sweetgpujob=1 one-shot path (patch 0170); early refusals/failures above return without it */
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 2fbd94d..a124058 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -22,6 +22,7 @@
+ #include <stdint.h>
+ #include "sweet_mali_pt.h"
+ #include "sweet_mali.h"
++#include "sweet_mmio_log.h"
+ 
+ extern void flush_dcache64(addr64_t, unsigned, int);
+ extern vm_offset_t kvtophys(vm_offset_t);
+@@ -118,8 +119,10 @@ static struct {
+ 	thread_t thread;
+ } sm;
+ 
+-static uint32_t rr(uint32_t off) { return sm.g[off / 4]; }
+-static void wr(uint32_t off, uint32_t v) { sm.g[off / 4] = v; }
++/* Every Mali access of this file goes through rr()/wr() and is logged (patch 0170, sweetmmio). The log printf()s: rr()/wr() must stay out of spinlock and
++ * interrupts-disabled sections (checked at 0170: no lck_spin / ml_set_interrupts_enabled in 0103/0104). */
++static uint32_t rr(uint32_t off) { uint32_t v = sm.g[off / 4]; sweet_mmio_log(SWEET_MMIO_GPU, 'R', SWEET_MMIO_GPU_BASE + off, 32, v); return v; }
++static void wr(uint32_t off, uint32_t v) { sweet_mmio_log(SWEET_MMIO_GPU, 'W', SWEET_MMIO_GPU_BASE + off, 32, v); sm.g[off / 4] = v; }
+ 
+ static uint64_t
+ now_us(void)
+@@ -728,11 +731,14 @@ sweet_mali_init(volatile uint32_t *g, int s2mpu_open)
+ 	}
+ 	started = 1;
+ 	sm_selftest_reset = (mode & 0x20u) != 0;      /* sweetmali=0x22: selftest + an explicit GPU reset and one more job */
+-	if (sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0)) {
++	int bad = sm_bringup(g, s2mpu_open, (mode & 0x10u) != 0);
++	sweet_mmio_log_summary(SWEET_MMIO_GPU, "bringup");   /* after sm_hw_config_and_power() and AS0 enable (patch 0170) */
++	if (bad) {
+ 		return;
+ 	}
+ 	if ((mode & 3u) == 2) {
+ 		sm_selftest();
++		sweet_mmio_log_summary(SWEET_MMIO_GPU, "selftest");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_mmio_log.c b/bsd/dev/sweet_mmio_log.c
+new file mode 100644
+index 0000000..486db40
+--- /dev/null
++++ b/bsd/dev/sweet_mmio_log.c
+@@ -0,0 +1,86 @@
++/* SWEET MMIO run-side log: see sweet_mmio_log.h. Counters are per block; printing stops at SML_CAP lines per block, loudly (rule 8). */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++#include "sweet_mmio_log.h"
++
++#define SML_CAP         20000u
++#define SML_BLKS        2u
++#define SML_B_READS     0x8u
++#define SML_B_KNOWN     (0x1u | 0x2u | 0x8u)
++
++static const char *const sml_name[SML_BLKS] = { "gpu", "wifi" };
++
++/* Separate counters and caps for writes (index 0) and reads (index 1): reads can never use up the write cap (review mmio-log-r1 F1). */
++static int sml_state;                       /* 0 = not parsed, 1 = off, 2 = on; parsed once. Published with release AFTER sml_mask, read with acquire (F5) */
++static uint32_t sml_mask;
++static volatile SInt32 sml_total[SML_BLKS][2], sml_lines[SML_BLKS][2];
++static volatile UInt32 sml_capped[SML_BLKS][2];      /* OSCompareAndSwap: volatile UInt32 * (libkern/OSAtomic.h:246-251) */
++
++/* A racing double parse can at most print a GAP line twice: both threads read the same boot-arg and store the same mask and state. */
++static void
++sml_parse(void)
++{
++	uint32_t m = 0;
++
++	if (!PE_parse_boot_argn("sweetmmio", &m, sizeof(m))) {
++		m = 0;
++	}
++	sml_mask = m;
++	if (m & 0x2u) {
++		printf("SWEET MMLOG: GAP wifi not hooked yet (M-1 step 2)\n");
++	}
++	if (m & ~SML_B_KNOWN) {
++		printf("SWEET MMLOG: GAP unknown sweetmmio bits %#x\n", m & ~SML_B_KNOWN);
++	}
++	if (m && !(m & 0x3u)) {
++		printf("SWEET MMLOG: GAP sweetmmio=%#x enables no block\n", m);
++	}
++	if (m & SML_B_READS) {
++		printf("SWEET MMLOG: reads on: WAIT() poll loops print per read, timeouts stretch (diagnostic only)\n");
++	}
++	__atomic_store_n(&sml_state, m ? 2 : 1, __ATOMIC_RELEASE);
++}
++
++void
++sweet_mmio_log(unsigned blk, char op, uint64_t pa, uint32_t width, uint32_t val)
++{
++	int st = __atomic_load_n(&sml_state, __ATOMIC_ACQUIRE);
++
++	if (st == 1) {
++		return;
++	}
++	if (st == 0) {
++		sml_parse();
++		if (__atomic_load_n(&sml_state, __ATOMIC_ACQUIRE) == 1) {
++			return;
++		}
++	}
++	if (blk >= SML_BLKS || !(sml_mask & (1u << blk)) || (op == 'R' && !(sml_mask & SML_B_READS))) {
++		return;
++	}
++	unsigned k = op == 'R';
++	(void)OSIncrementAtomic(&sml_total[blk][k]);
++	if ((uint32_t)OSIncrementAtomic(&sml_lines[blk][k]) < SML_CAP) {
++		printf("SWEET MMIO %c %s mmio - 0x%llx %u 0x%x\n", op, sml_name[blk], pa, width, val);
++	} else if (OSCompareAndSwap(0, 1, &sml_capped[blk][k])) {
++		printf("SWEET MMLOG: cap hit blk=%s op=%c printed=%u, further accesses counted not printed\n", sml_name[blk], op, SML_CAP);
++	}
++}
++
++void
++sweet_mmio_log_summary(unsigned blk, const char *where)
++{
++	if (__atomic_load_n(&sml_state, __ATOMIC_ACQUIRE) != 2 || blk >= SML_BLKS || !(sml_mask & (1u << blk))) {
++		return;
++	}
++	uint32_t lw = (uint32_t)sml_lines[blk][0], lr = (uint32_t)sml_lines[blk][1];
++	printf("SWEET MMLOG: blk=%s where=%s W total=%u printed=%u capped=%d R total=%u printed=%u capped=%d\n", sml_name[blk], where,
++	    (uint32_t)sml_total[blk][0], lw < SML_CAP ? lw : SML_CAP, (int)sml_capped[blk][0],
++	    (uint32_t)sml_total[blk][1], lr < SML_CAP ? lr : SML_CAP, (int)sml_capped[blk][1]);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_mmio_log.h b/bsd/dev/sweet_mmio_log.h
+new file mode 100644
+index 0000000..8a96ce5
+--- /dev/null
++++ b/bsd/dev/sweet_mmio_log.h
+@@ -0,0 +1,19 @@
++/*
++ * SWEET MMIO run-side log (goal M-1, docs/research/96): one console line per MMIO access of the XNU driver, in the format tools/trace-diff diff reads
++ * (RE_RUN, tools/trace-diff:67), to compare against a golden CSV. Boot-arg sweetmmio=<mask>: bit0 gpu writes, bit1 wifi (NOT hooked yet: GAP line),
++ * bit3 also reads. Absent or 0 = off. Meta lines use "SWEET MMLOG:" and never the text of the register prefix (AP-138).
++ * Callers must run in thread context (printf may take the console lock): no spinlock held, interrupts enabled.
++ */
++#ifndef SWEET_MMIO_LOG_H
++#define SWEET_MMIO_LOG_H
++#include <stdint.h>
++
++/* SG_MALI_BASE, xnu/patches/0102-sweet-gpu-probe-xnu.patch:40 (file-local there); callers pass base + offset */
++#define SWEET_MMIO_GPU_BASE 0x1C500000ull
++#define SWEET_MMIO_GPU  0u
++#define SWEET_MMIO_WIFI 1u
++
++void sweet_mmio_log(unsigned blk, char op, uint64_t pa, uint32_t width, uint32_t val);
++void sweet_mmio_log_summary(unsigned blk, const char *where);
++
++#endif

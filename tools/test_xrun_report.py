@@ -8,7 +8,7 @@ import xrun_report
 T0 = 1_800_000_000.0        # fixed "boot command" time of the synthetic run
 try:
     from PIL import Image
-except ImportError:
+except ImportError:   # lint-silent: expected optional dependency: the PIL tests are skipIf(Image is None) and gate-unit-shards names the skip
     Image = None
 
 
@@ -52,6 +52,10 @@ class Report(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="xrun-test-")
         self.addCleanup(shutil.rmtree, self.tmp)
+        # hermetic UCRASH block (2026-11-11: 39 lines here with the host's ipsw + a2s cache, 42 on the offload host without them): every host renders the no-symbols worst case
+        for k in ("PIXOS_IPSW", "PIXOS_DSC", "PIXOS_UCRASH_CACHE"):
+            self.addCleanup(lambda k=k, v=os.environ.get(k): os.environ.__setitem__(k, v) if v is not None else os.environ.pop(k, None))
+            os.environ[k] = os.path.join(self.tmp, "none-" + k.lower())
 
     def run_dir(self, name="20260101T000000Z-t", **kw):
         return make_run(pathlib.Path(self.tmp) / "runs" / name, **kw)
@@ -109,7 +113,7 @@ class Report(unittest.TestCase):
         r = xrun_report.build(str(d))
         self.assertEqual(r["result"], "FAIL")
         self.assertNotIn("the phone reset", r["reason"])
-        self.assertIn("phone-state", r["reason"])
+        self.assertIn("tools/phone state", r["reason"])
 
     def test_waitusb_grace_only_when_reset_due(self):
         import io, contextlib
@@ -164,6 +168,48 @@ class Report(unittest.TestCase):
         r = xrun_report.build(str(d))
         self.assertEqual(r["result"], "PASS", r["reason"])
         self.assertIn("ended by the host", r["run"]["early"])
+        self.assertIn("ran the full 120s (--duration), ended by the host", r["reason"])   # dk-0181: a host end is not "stopped early"
+        self.assertNotIn("stopped early", r["reason"])
+
+    def _waitusb_end(self, name, run, present):
+        # run waitusb on a fake clock; the phone left the bus at +2 s; returns (stdout, run.json)
+        t = {"v": T0}
+        d = self.run_dir(name, snaps=[(30, LOG1)], run=dict(run, t_boot=str(T0), t_start=str(T0)))
+        xrun_report.mark(str(d), ["usb_gone=%f" % (T0 + 2)])
+        old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+        xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = (lambda: t["v"]), (lambda x: t.__setitem__("v", t["v"] + x)), (lambda: present)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                xrun_report.waitusb(str(d))
+        finally:
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+        return out.getvalue().strip(), xrun_report.load(os.path.join(str(d), "run.json"), {})
+
+    def test_host_end_before_sweetrestart_is_not_reported_as_unobserved(self):
+        # 21k el2-3-f7: --duration 1500 < sweetrestart 1650, the host reset pre-empts the backstop; "reset NOT observed ... hung" was misleading
+        d = self.run_dir("20260101T000900Z-he", snaps=[(30, LOG1)], run={"remote": "1", "duration": "120", "restart": "1650", "host_end": "1", "early": str(T0 + 120), "t_boot": str(T0)})
+        r = xrun_report.build(str(d))
+        txt = json.dumps(r)
+        self.assertIn("reset sent by the host at the end of --duration", txt)
+        self.assertNotIn("reset NOT observed", txt)
+        d = self.run_dir("20260101T000902Z-hl", snaps=[(30, LOG1)], run={"remote": "1", "duration": "300", "restart": "100", "host_end": "1", "early": str(T0 + 300), "t_boot": str(T0)})
+        txt = json.dumps(xrun_report.build(str(d)))      # review r1 F1: restart <= duration, the backstop WAS due: keep the old (suspicious) wording
+        self.assertIn("reset NOT observed", txt)
+        self.assertNotIn("was not due", txt)
+        d = self.run_dir("20260101T000901Z-nh", snaps=[(30, LOG1)], run={"remote": "1", "duration": "120", "restart": "1650", "t_boot": str(T0)})
+        self.assertIn("reset NOT observed", json.dumps(xrun_report.build(str(d))))     # without host_end the wording stays
+
+    def test_host_end_needs_remote_no_timeout_and_phone_off_the_bus(self):
+        # review boot-dev-0121 F5: each condition of the host_end branch (xrun_report.py:152) is pinned
+        how, rj = self._waitusb_end("20260101T000900Z-n", {"duration": "120", "hard_timeout": "150"}, False)
+        self.assertNotIn("host_end", rj)            # no remote: the host never ends the run itself
+        how, rj = self._waitusb_end("20260101T001000Z-o", {"remote": "1", "duration": "120", "hard_timeout": "60"}, False)
+        self.assertEqual(how, "TIMEOUT")            # hard timeout first: not a host end
+        self.assertNotIn("host_end", rj)
+        how, rj = self._waitusb_end("20260101T001100Z-p", {"remote": "1", "duration": "120", "hard_timeout": "200"}, True)
+        self.assertNotEqual(how, "EARLY")           # the phone is back on 18d1 already: nothing to reset
+        self.assertNotIn("host_end", rj)
 
     def test_reset_text_names_what_the_phone_came_back_as(self):
         d = self.run_dir("20260101T000600Z-r", snaps=[(30, LOG1)], run={"restart": "60,bootloader", "expect": ["SWEET CPU"]})
@@ -189,6 +235,47 @@ class Report(unittest.TestCase):
         r = xrun_report.build(str(d))
         self.assertEqual(r["result"], "FAIL")
         self.assertIn("failure pattern", r["reason"])
+
+    def _waitusb_clock(self, name, run, present=True):
+        # fast-loop: waitusb on a fake clock; returns (stdout, seconds waited, run.json, report)
+        t = {"v": T0}
+        d = self.run_dir(name, snaps=[(30, LOG1)], run=dict(run, t_boot=str(T0), t_start=str(T0)))
+        old = (xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present)
+        xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = (lambda: t["v"]), (lambda x: t.__setitem__("v", t["v"] + x)), (lambda: present)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                xrun_report.waitusb(str(d))
+        finally:
+            xrun_report.now, xrun_report.time.sleep, xrun_report.usb_present = old
+        return out.getvalue().strip(), t["v"] - T0, xrun_report.load(os.path.join(str(d), "run.json"), {}), xrun_report.build(str(d))
+
+    def test_absent_patterns_no_longer_force_the_full_duration(self):
+        # fast-loop 2026-11-09: every --expect seen -> stop after stop_grace, even with --expect-absent; the report names the absent window
+        how, waited, rj, r = self._waitusb_clock("20260101T001200Z-ag", {"restart": "1150,bootloader", "duration": "1100", "stop_on": ["SWEET CPU"],
+                                                 "expect": ["SWEET CPU"], "expect_absent": ["NEVER PRINTED"], "stop_grace": "30"})
+        self.assertEqual(how, "EARLY")
+        self.assertLess(waited, 60)                       # not the 1100 s window
+        self.assertGreaterEqual(waited, 30)               # but the grace window ran
+        self.assertIn("stop_all_seen", rj)
+        self.assertIn("absent_window", rj)
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertIn("--expect-absent checked to +", r["reason"])
+
+    def test_absent_line_ends_the_run_at_once_as_fail(self):
+        how, waited, rj, r = self._waitusb_clock("20260101T001300Z-av", {"restart": "1150,bootloader", "duration": "1100", "stop_on": ["NOT YET"],
+                                                 "expect": ["NOT YET"], "expect_absent": ["SWEET CPU: cpu=0 mpidr"], "stop_grace": "30"})
+        self.assertEqual(how, "EARLY")
+        self.assertLess(waited, 20)
+        self.assertIn("absent-violated", rj.get("early_fail", ""))
+        self.assertEqual(r["result"], "FAIL")
+
+    def test_no_grace_without_absent_patterns(self):
+        how, waited, rj, r = self._waitusb_clock("20260101T001400Z-ng", {"restart": "1150,bootloader", "duration": "1100", "stop_on": ["SWEET CPU"], "expect": ["SWEET CPU"]})
+        self.assertEqual(how, "EARLY")
+        self.assertLess(waited, 5)
+        self.assertNotIn("absent_window", rj)
+        self.assertNotIn("checked to", r["reason"])
 
     def test_kernel_timestamp_prefix_does_not_hide_lines(self):
         # kernel patch 0115 (sweetlogts=1): every console line starts with "[SSSSS.mmm] "; the anchored regexes must still match and the stamp is reported
@@ -229,6 +316,51 @@ class Report(unittest.TestCase):
         self.assertEqual(mod.build(str(d))["result"], "PASS")
         self.assertEqual(xrun_report.build(str(d))["result"], "FAIL")
 
+    def test_panic_usb_boot_line_is_not_a_panic(self):
+        # T-9d99 review r1 F1 (AP-229): patch 0242's boot line, both branches (xnu/patches/0242-sweet-panic-usb.patch:33), raises no panic marker
+        tmpl = "[   12.345] SWEET FAULT USB: %s (patch 0242: first 8192 bytes of the fault log + 4096 bytes of console tail sent over the USB gadget at the start of the hold)\n"
+        for i, v in enumerate(("on", "off (boot-arg = 0)")):
+            d = self.run_dir("20260101T00120%dZ-pu" % i, snaps=[(30, LOG1 + tmpl % v)], run={"expect": ["SWEET CPU: cpu=0"]})
+            r = xrun_report.build(str(d))
+            self.assertEqual(r["result"], "PASS", r["reason"])
+            self.assertEqual(r["markers"]["panic/hang/watchdog"]["count"], 0, v)
+
+    def test_sweetpanic_bootarg_token_is_not_a_panic(self):
+        # T-15e0 (AP-229 class): run 20261107T172408Z-panic-usb-forced FAILed on its SWEET BOOTARGS line, which names the
+        # sweetpanic= boot-arg; a "sweetpanic*" token is never a panic event, a real panic( line still FAILs
+        ba = "[    1.234] SWEET BOOTARGS: kern.bootargs view hides 2 tokens (sweetpanic=20 sweetpanichold=30 sweetpanicusb=1)\n"
+        d = self.run_dir("20260101T001400Z-b", snaps=[(30, LOG1 + ba)], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertEqual(r["markers"]["panic/hang/watchdog"]["count"], 0)
+        real = "[    2.000] panic(cpu 3 caller 0xfffffe000754ef7c): SWEET PANIC TEST: sweetpanic=20 elapsed @sweet_usb.c:1568\n"
+        d = self.run_dir("20260101T001500Z-b", snaps=[(30, LOG1 + ba + real)], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertEqual(r["markers"]["panic/hang/watchdog"]["count"], 1)
+
+    def test_gap_line_is_not_a_panic(self):
+        # patch 0182's boot line (xnu/patches/0182-sweet-panic-noregion-reset.patch:65) stays a counted gap, not a panic; a real panic( line still FAILs
+        gap = "[   12.345] SWEET GAP: no panic region (no pram / embedded-panic-log-size in ADT); panic log not saved, panics spin (patch 0182; real fix PR-3)\n"
+        d = self.run_dir("20260101T001200Z-g", snaps=[(30, LOG1 + gap)], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "PASS", r["reason"])
+        self.assertEqual(r["markers"]["panic/hang/watchdog"]["count"], 0)
+        self.assertEqual(r["gaps"]["distinct"], 1)
+        real = "[   13.000] panic(cpu 0 caller 0xfffffe0007a1b2c4): Kernel data abort. at pc 0x1\n"
+        d = self.run_dir("20260101T001300Z-g", snaps=[(30, LOG1 + gap + real)], run={"expect": ["SWEET CPU: cpu=0"]})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["result"], "FAIL")
+        self.assertEqual(r["markers"]["panic/hang/watchdog"]["count"], 1)
+        self.assertIn("panic(cpu 0", r["markers"]["panic/hang/watchdog"]["first"])
+        self.assertEqual(r["gaps"]["distinct"], 1)
+        # r1 F1: leading blanks (gap counter strips) still not a panic; r1 F2: a panic( glued after a GAP prefix still FAILs
+        d = self.run_dir("20260101T001400Z-g", snaps=[(30, LOG1 + "  " + gap)], run={"expect": ["SWEET CPU: cpu=0"]})
+        self.assertEqual(xrun_report.build(str(d))["result"], "PASS")
+        glued = "SWEET GAP: foo x1 (A)panic(cpu 1 caller 0xfffffe0007a1b2c4): Kernel trap at 0x1\n"
+        d = self.run_dir("20260101T001500Z-g", snaps=[(30, LOG1 + glued)], run={"expect": ["SWEET CPU: cpu=0"]})
+        self.assertEqual(xrun_report.build(str(d))["result"], "FAIL")
+
     def test_tail_only_log_makes_a_missing_expect_partial(self):
         d = self.run_dir(snaps=[(30, "x\n" * 6500)], run={"expect": ["NOPE"]})
         self.assertEqual(xrun_report.build(str(d))["result"], "PARTIAL")
@@ -267,6 +399,197 @@ class Report(unittest.TestCase):
         self.assertEqual(json.loads((d / "report.json").read_text())["exit"], 2)
         again = subprocess.run([str(HERE / "xrun"), "--dry-run", "--from-dir", str(d)], capture_output=True, text=True)
         self.assertEqual(again.returncode, 2)
+
+
+
+class AllGaps(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gaps-test-")
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.kn = pathlib.Path(self.tmp, "k.md")
+        self.kn.write_text("| gap | first seen | count | effect |\n|---|---|---|---|\n| surface sel 9 (accepted and ignored) | g95 | 1 | x |\n")
+        self.wk = pathlib.Path(self.tmp, "w.md")
+        self.wk.write_text("| gap | first seen | effect | severity |\n|---|---|---|---|\n| f1 console pointer outside the RAM window, console not read | F1 | obs | medium |\n| stop W<row> STOP: <error name> | F2 | obs | high |\n")
+        for n, v in (("GAPS_FILE_ALL", self.kn), ("GAPS_FILE", self.wk)):
+            self.addCleanup(setattr, xrun_report, n, getattr(xrun_report, n))
+            setattr(xrun_report, n, str(v))
+
+    def gaps(self, lines):
+        return xrun_report.all_gaps(lines, xrun_report.wifi_gaps(lines))
+
+    def test_generic_keys_and_wifi(self):
+        lines = ["SWEET GAP: surface sel 9 x1 (WeatherPoster)", "SWEET GAP: surface sel 9 x10 (WeatherPoster)",
+                 "SWEET GAP: gpu fmt 0x4c unknown x1 (pid 123)",
+                 "WIFI GAP: f1 console pointer outside the RAM window, console not read x1 [medium]",
+                 "WIFI GAP: f1 console pointer outside the RAM window, console not read x4 [medium]",
+                 "WIFI GAPS: 1 distinct, 4 total", "[ 12.345] qux"]
+        g = self.gaps(lines)
+        self.assertEqual((g["distinct"], g["total"]), (3, 15))      # sel 9 (largest x10) + gpu fmt (1) + WIFI f1 (largest x4)
+        self.assertEqual(g["by_area"], {"SWEET": {"distinct": 2, "total": 11}, "WIFI": {"distinct": 1, "total": 4}})
+        new = {e["gap"]: e["new"] for e in g["top"]}
+        self.assertFalse(new["surface sel 9"])
+        self.assertTrue(new["gpu fmt 0xN unknown"])
+        self.assertFalse(new["f1 console pointer outside the RAM window, console not read"])
+        self.assertLessEqual(len(g["top"][0]["example"]), 200)
+
+    def test_n_wildcard_matches_digits_only(self):      # 21k el2-3-f7: kern.bootargs ENOMEM rows were NEW although registered
+        self.kn.write_text("| gap | f | c | e |\n|---|---|---|---|\n| kern.bootargs ENOMEM to 256-byte buffer, line <N> chars, error <N> / kern.bootargs truncated to 608-byte buffer, line <N> chars, error <N> (log line x) | a | b | c |\n")
+        g = self.gaps(["SWEET GAP: kern.bootargs ENOMEM to 256-byte buffer, line 277 chars, error 12 x4 (thermalmonitord pid 54)",
+                       "SWEET GAP: kern.bootargs truncated to 608-byte buffer, line 926 chars, error 0 x1 (watchdogd pid 9)",
+                       "SWEET GAP: kern.bootargs truncated to 127-byte buffer, line 926 chars, error 0 x1 (launchd pid 1)",     # the closed 0177 v1 regression stays NEW (review r1 F4)
+                       "SWEET GAP: kern.bootargs ENOMEM to big-byte buffer, line 277 chars, error 12 x1 (a pid 2)",
+                       "SWEET GAP: kern.bootargs ENOMEM to 256-byte buffer, line 277 chars, error 12 and more x1 (a pid 3)"])
+        new = {e["gap"]: e["new"] for e in g["top"]}
+        self.assertFalse(new["kern.bootargs ENOMEM to 256-byte buffer, line 277 chars, error 12"])
+        self.assertFalse(new["kern.bootargs truncated to 608-byte buffer, line 926 chars, error 0"])
+        self.assertTrue(new["kern.bootargs truncated to 127-byte buffer, line 926 chars, error 0"])
+        self.assertTrue(new["kern.bootargs ENOMEM to big-byte buffer, line 277 chars, error 12"])
+        self.assertTrue(new["kern.bootargs ENOMEM to 256-byte buffer, line 277 chars, error 12 and more"])     # a further word is NEW (rule 8)
+
+    def test_f1_largest_counter(self):          # F1
+        g = self.gaps(["SWEET GAP: a b c x1 (P)", "SWEET GAP: a b c x10 (P)", "SWEET GAP: a b c x100 (P)"])
+        self.assertEqual((g["distinct"], g["total"]), (1, 100))
+        g = self.gaps(["SWEET GAP: a b c x1000 (P)", "SWEET GAP: a b c x10 (Q)", "SWEET GAP: a b c x1 (R)", "SWEET GAP: no counter here", "SWEET GAP: no counter here"])
+        self.assertEqual({e["gap"]: e["count"] for e in g["top"]}, {"a b c": 1011, "no counter here": 2})
+
+    def test_f2_keep_identifiers(self):         # F2
+        g = self.gaps(["SWEET GAP: surface sel 9 x1 (A)", "SWEET GAP: surface sel 27 x1 (A)", "SWEET GAP: ioservice AppleM2ScalerCSCDriver lookup x1 (backboardd) found 0",
+                       "SWEET GAP: ioservice AppleM2ScalerCSCDriver lookup x1 (backboardd) found 3", "SWEET GAP: gpu fmt 0x4c x1 (pid 7)", "SWEET GAP: gpu fmt 0xff x1 (pid 8)",
+                       "[   12.345] SWEET GAP: ts test x1 (A)"])
+        self.assertEqual(sorted(e["gap"] for e in g["top"]), ["gpu fmt 0xN", "ioservice AppleM2ScalerCSCDriver lookup found N", "surface sel 27", "surface sel 9", "ts test"])
+
+    def test_f3_new_marking(self):              # F3
+        self.kn.write_text("| gap | a | b | c |\n|---|---|---|---|\n| surface sel 9 (accepted and ignored, reply zeroed) | g | 1 | x |\n"
+                           "| surface sel 20 / sel 21 | g | 1 | x |\n| surface create key IOSurfaceNonPurgeable / IOSurfacePurgeWhenNotInUse | g | 1 | x |\n| two words | g | 1 | x |\n")
+        g = self.gaps(["SWEET GAP: surface sel 9 (accepted and ignored, reply zeroed) x1 (A)", "SWEET GAP: surface sel 9 x1 (A)", "SWEET GAP: surface sel 27 SetValue key IOSurfaceName x1 (A)",
+                       "SWEET GAP: surface sel 99 x1 (A)", "SWEET GAP: surface sel 21 x1 (A)", "SWEET GAP: surface create key IOSurfacePurgeWhenNotInUse x1 (A)", "SWEET GAP: two words extra x1 (A)",
+                       "SWEET GAP: surface sel 9 SetValue key IOSurfaceName x1 (A)", "SWEET GAP: surface sel 90 x1 (A)"])
+        new = {e["gap"]: e["new"] for e in g["top"]}
+        self.assertFalse(new["surface sel 9 (accepted and ignored, reply zeroed)"])
+        self.assertFalse(new["surface sel 9"])
+        self.assertFalse(new["surface sel 21"])
+        self.assertFalse(new["surface create key IOSurfacePurgeWhenNotInUse"])
+        self.assertTrue(new["surface sel 27 SetValue key IOSurfaceName"])
+        self.assertTrue(new["surface sel 99"])
+        self.assertTrue(new["surface sel 90"])                       # digit boundary: "sel 9" must not match "sel 90"
+        self.assertTrue(new["two words extra"])                      # cell shorter than 3 words never matches
+        self.assertTrue(new["surface sel 9 SetValue key IOSurfaceName"])
+
+    def test_f4_procs(self):                    # F4
+        g = self.gaps(["SWEET GAP: a b c x1 (SpringBoard)", "SWEET GAP: a b c x1 (backboardd pid 5)", "SWEET GAP: a b c x1 (WeatherPoster)"])
+        self.assertEqual(g["distinct"], 1)
+        self.assertEqual(g["top"][0]["procs"], ["SpringBoard", "WeatherPoster", "backboardd"])
+        self.assertEqual(len(self.gaps(["SWEET GAP: a b c x1 (P%d)" % i for i in range(8)])["top"][0]["procs"]), 5)
+
+    def test_f5_usbport(self):                  # F5
+        d = pathlib.Path(self.tmp, "usb")
+        make_run(d, [(5, LOG1)], run={"usb_port": "USBPORT GAP: UNCHECKED (--no-flash-check, phone off the bus)"})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["gaps"]["by_area"], {"USBPORT": {"distinct": 1, "total": 1}})
+        self.assertTrue(xrun_report.render(r).splitlines()[0].endswith(" gaps=1"))
+
+    def test_xnu_build_mark(self):              # R26: the ledger line from tools/xrun is shown in the run summary and report.json
+        d = pathlib.Path(self.tmp, "xnub")
+        make_run(d, [(5, LOG1)], run={"xnu_build": "XNU BUILD: build-slot (label gate-x)"})
+        r = xrun_report.build(str(d))
+        self.assertEqual(r["run"]["xnu_build"], "XNU BUILD: build-slot (label gate-x)")
+        self.assertIn("\nXNU BUILD: build-slot (label gate-x)\n", xrun_report.render(r))
+        d2 = pathlib.Path(self.tmp, "xnub2")
+        make_run(d2, [(5, LOG1)])
+        self.assertNotIn("XNU BUILD", xrun_report.render(xrun_report.build(str(d2))))
+
+    def test_f6_anchor(self):                   # F6
+        g = self.gaps(["[ 12.345] SWEET GAP: real one x1 (A)", "[cpu1] [ 1.0] SWEET GAP: second x1 (A)", "SWEET GAP: third x1 (A)",
+                       "--expect 'SWEET GAP: quoted' foo", "garbage SWEET GAP: mid line x1", "SWEET GAPS: 3 distinct", "lower GAP: x"])
+        self.assertEqual(sorted(e["gap"] for e in g["top"]), ["real one", "second", "third"])
+
+    def test_mutant_killers(self):
+        lines = ["SWEET GAP: gap number %s x%d (A)" % (chr(97 + i), 100 - i) for i in range(12)]
+        d = pathlib.Path(self.tmp, "twelve")
+        make_run(d, [(5, LOG1 + "\n".join(lines) + "\n")])
+        r = xrun_report.build(str(d))
+        txt = xrun_report.render(r)
+        self.assertEqual(txt.count("\n  SWEET GAP: gap number "), 10)        # top-10 cap
+        self.assertIn("+2 more gap(s) in report.json", txt)
+        self.assertEqual(len(r["gaps"]["top"]), 12)
+        self.assertIn("wifi_gaps", r)                               # legacy key
+        # missing KNOWN-GAPS.md: message and no NEW
+        self.addCleanup(setattr, xrun_report, "GAPS_FILE_ALL", xrun_report.GAPS_FILE_ALL)
+        xrun_report.GAPS_FILE_ALL = str(pathlib.Path(self.tmp, "absent.md"))
+        r = xrun_report.build(str(d))
+        self.assertIn("docs/KNOWN-GAPS.md not found", xrun_report.render(r))
+        self.assertFalse(any(e["new"] for e in r["gaps"]["top"]))
+        # trailing whitespace after the severity still parses as the patch-0137 format (GAP_RX \s*$)
+        w = xrun_report.wifi_gaps(["WIFI GAP: f1 q x2 [low]  \t"])
+        self.assertEqual((w["distinct"], w["top"][0]["count"]), (1, 2))
+        self.assertEqual(xrun_report.wifi_gaps(["WIFI GAP: f1 q x2 [low] trailing junk"])["distinct"], 0)    # `$` anchor: not the 0137 format
+        g = self.gaps(["WIFI GAP: f1 q x2 [low]  \t"])
+        self.assertEqual(g["total"], 2)
+
+    def test_run_dir_result_line(self):
+        for extra, want in (("", " gaps=0"), ("SWEET GAP: surface sel 9 x1 (A)\nSWEET GAP: surface sel 9 x10 (A)\nSWEET GAP: other thing x1 (A)\nWIFI GAP: f1 q x2 [low]\n", " gaps=3")):
+            d = pathlib.Path(self.tmp, "run" + str(len(extra)))
+            make_run(d, [(5, LOG1 + extra)])
+            r = xrun_report.build(str(d))
+            self.assertTrue(xrun_report.render(r).splitlines()[0].endswith(want), xrun_report.render(r).splitlines()[0])
+            self.assertIn("GAPS: %s distinct" % want[-1], xrun_report.render(r))
+            self.assertEqual(r["gaps"]["distinct"], int(want[-1]))
+
+
+class ReadUsbnet(unittest.TestCase):
+    def test_trailing_newline_is_no_gap_but_garbage_still_is(self):   # T-3e5e: 304 GAP lines per boot came from the trailing "" of split("\n")
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "u.log"
+            f.write_text("1.5\tone\n2.5\ttwo\n\n", encoding="latin-1")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(xrun_report.read_usbnet(str(f)), (["one", "two"], [1.5, 2.5]))
+            self.assertEqual(err.getvalue(), "")
+            f.write_text("1.5\tone\ngarbage\n", encoding="latin-1")
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(xrun_report.read_usbnet(str(f)), (["one"], [1.5]))
+            self.assertIn("xrun_report GAP: ValueError", err.getvalue())
+
+
+
+class PanicOverUsb(unittest.TestCase):      # T-9d99, patch 0242: PXPANIC datagrams in usbnet.log -> PANIC: lines, frames out of the run log
+    def make(self, d, dgrams, live="SWEET FAULT USB: on (patch 0242)\nSWEET FAULT TEST: firing now (test fault after 20 s, test only)\n"):
+        import panic_capture
+        make_run(d, [], run={"usbnet": "1"})
+        text = live + "".join(dgrams)
+        rows = ["%.3f\t%s" % (T0 + 30 + i * 0.001, ln) for i, ln in enumerate(text.split("\n")[:-1])]     # as tools/usbnet-log.py writes it
+        (pathlib.Path(d) / "usbnet.log").write_text("\n".join(rows) + "\n", encoding="latin-1")
+        return panic_capture
+
+    def test_panic_lines_and_clean_log(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t) / "r"
+            import panic_capture as pc
+            self.make(d, pc.datagrams(pc.full_text(pc.FIX_CAP, pc.FIX_TAIL), mx=150))
+            r = xrun_report.build(str(d))
+            out = xrun_report.render(r)
+            self.assertIn("PANIC: string panic(cpu 0 caller 0xfffffe0012345678): Invalid kernel stack pointer", out)
+            self.assertIn("PANIC: regs pc=0xfffffe0011112222 lr=0xfffffe0011113333", out)
+            self.assertIn("PANIC: backtrace 2 frames (lr): 0xfffffe0010000100 0xfffffe0010000200", out)
+            self.assertIn("PANIC: tail [  610.701] DP15 ring 3 full", out)
+            self.assertEqual(r["result"], "FAIL")       # a panic stays a FAIL: the capture explains it, it does not excuse it
+            merged = (d / "merged.log").read_text(encoding="latin-1")
+            self.assertNotIn("PXPANIC", merged)
+            self.assertNotIn("DP15 ring 3 full", merged)       # the tail repeats live lines: not in the run log
+            self.assertIn("\t  pc:  0xfffffe0011112222 cpsr", merged)   # the panic log itself is, as whole lines
+
+    def test_panic_seen_nothing_received_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t) / "r"
+            self.make(d, [])
+            out = xrun_report.render(xrun_report.build(str(d)))
+            self.assertIn("PANIC GAP: panic seen but no panic capture: the kernel has patch 0242", out)
+
+    def test_no_panic_no_lines(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t) / "r"
+            self.make(d, [], live="SWEET FAULT USB: on (patch 0242)\nboot fine\n")
+            self.assertNotIn("PANIC", xrun_report.render(xrun_report.build(str(d))))
 
 
 if __name__ == "__main__":

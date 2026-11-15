@@ -1,0 +1,145 @@
+sweet-spi-defer-unmask (lowclk 2026-11-13, design notes: lowclk irq study-check W3 + s.4; shared SPI glue for the Wi-Fi INTx doorbell of patch 0347, no behaviour change for the GPU): pexpert/arm/pe_fiq.c, on top of patch 0272.
+(1) SWEET_SPI_SLOTS 4 -> 8 [the GPU attaches 2: INTID 452, 453]. (2) A handler may return SWEET_SPI_DEFER (2) = "handled, mask me until my thread calls sweet_spi_unmask": the dispatcher writes the same GICD_ICENABLER bit as the safety net but counts it in sweet_spi_deferred, not in
+sweet_spi_unhandled; 0 and every other non-zero value behave exactly as before [read 0272 sm_isr returns 0 or 1 only]. (3) sweet_spi_attach_off(): attach + configure (disable, clear pending/active, Group 1, priority 0xA0, level, route to the boot CPU) and leave the SPI DISABLED
+(no ISENABLER write); sweet_spi_attach() is now sweet_spi_attach_x(..., enable = 1), the same GICD accesses in the same order as in 0272 (the only change is the wrapper). (4) sweet_spi_enable() (first enable) and sweet_spi_unmask() (re-enable after a mask): one ISENABLER write of the INTID's own bit,
+RWP wait, read-back; both refuse an INTID with no attached handler (22). Hardware access of this patch: none by itself (no caller in this patch); the callers are 0347 (INTID 541, boot-arg sweetwifiirq=1) and the GPU, whose accesses are unchanged. Host test: tools/test_spi_glue.py compiles the table logic.
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6e6cc96..66828b1 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -244,7 +244,7 @@ pe_init_fiq()
+ #define SWEET_GICD_ICFGR      0x0C00u
+ #define SWEET_GICD_IGRPMODR   0x0D00u
+ #define SWEET_GICD_IROUTER    0x6000u
+-#define SWEET_SPI_SLOTS       4
++#define SWEET_SPI_SLOTS       8   /* patch 0346: 4 -> 8 (GPU uses 2; Wi-Fi INTID 541 is the third; USB, BT UART, touch are the next candidates) */
+ 
+ typedef int (*sweet_spi_fn_t)(void *arg, uint32_t intid);
+ static struct {
+@@ -255,6 +255,9 @@ static struct {
+ } sweet_spi_tab[SWEET_SPI_SLOTS];
+ uint64_t sweet_spi_unhandled;          /* SPIs masked by the safety net */
+ uint32_t sweet_spi_unhandled_last;     /* INTID of the last one */
++uint64_t sweet_spi_deferred;           /* patch 0346: handler returned SWEET_SPI_DEFER: handled, masked until sweet_spi_unmask (NOT counted as unhandled) */
++uint64_t sweet_spi_unmasked;           /* patch 0346: sweet_spi_unmask calls that re-enabled an attached SPI */
++#define SWEET_SPI_DEFER       2        /* patch 0346: handler return value 2 = "handled; mask me at the distributor, my thread re-enables me with sweet_spi_unmask" (threaded-IRQ model). 0 = handled, any other non-zero = safety net as before. The GPU handlers return 0 or 1 only [read patch 0272 sm_isr], so they are unchanged. */
+ 
+ static void
+ sweet_gicd_rwp_wait(void)
+@@ -274,7 +277,16 @@ sweet_spi_dispatch(uint32_t intid)
+ 		sweet_spi_fn_t fn = os_atomic_load(&sweet_spi_tab[i].fn, acquire);
+ 		if (fn != NULL && sweet_spi_tab[i].intid == intid) {
+ 			sweet_spi_tab[i].count++;
+-			if (fn(sweet_spi_tab[i].arg, intid) == 0) {
++			int r = fn(sweet_spi_tab[i].arg, intid);
++			if (r == 0) {
++				return;
++			}
++			if (r == SWEET_SPI_DEFER) {
++				/* patch 0346: the same distributor mask as the safety net below, but a deliberate one: counted apart, the owner thread unmasks */
++				if (gicd_base != 0 && intid >= 32 && intid < 1020) {
++					gicd_write32(SWEET_GICD_ICENABLER + 4 * (intid / 32), 1u << (intid % 32));
++				}
++				sweet_spi_deferred++;
+ 				return;
+ 			}
+ 			break;   /* the handler asked for the line to be masked */
+@@ -287,10 +299,11 @@ sweet_spi_dispatch(uint32_t intid)
+ 	sweet_spi_unhandled_last = intid;
+ }
+ 
+-/* rb[0] IGROUPR bit, rb[1] ISENABLER bit, rb[2] ICFGR word, rb[3] IROUTER low word. Returns 0 ok, 22 EINVAL, 28 ENOSPC (no free slot), 19 ENODEV (no GICD). */
+-int sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4]);
+-int
+-sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
++/* rb[0] IGROUPR bit, rb[1] ISENABLER bit, rb[2] ICFGR word, rb[3] IROUTER low word. Returns 0 ok, 22 EINVAL, 28 ENOSPC (no free slot), 19 ENODEV (no GICD).
++ * patch 0346: sweet_spi_attach_x(..., enable) is the old body; enable = 1 is exactly the old sequence (sweet_spi_attach below), enable = 0 attaches the handler and
++ * configures the SPI but leaves it DISABLED (no ISENABLER write, no RWP wait after it): the caller enables it with sweet_spi_enable once its own source is armed. */
++static int
++sweet_spi_attach_x(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4], int enable)
+ {
+ 	if (gicd_base == 0) {
+ 		return 19;
+@@ -325,8 +338,10 @@ sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
+ 	sweet_spi_tab[slot].arg = arg;
+ 	sweet_spi_tab[slot].count = 0;
+ 	os_atomic_store(&sweet_spi_tab[slot].fn, fn, release);
+-	gicd_write32(SWEET_GICD_ISENABLER + w, b);
+-	sweet_gicd_rwp_wait();
++	if (enable) {
++		gicd_write32(SWEET_GICD_ISENABLER + w, b);
++		sweet_gicd_rwp_wait();
++	}
+ 	rb[0] = (gicd_read32(SWEET_GICD_IGROUPR + w) & b) != 0;
+ 	rb[1] = (gicd_read32(SWEET_GICD_ISENABLER + w) & b) != 0;
+ 	rb[2] = gicd_read32(cw);
+@@ -334,6 +349,69 @@ sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
+ 	return 0;
+ }
+ 
++int sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4]);
++int
++sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
++{
++	return sweet_spi_attach_x(intid, fn, arg, rb, 1);
++}
++
++/* patch 0346: attach with the SPI left disabled (see sweet_spi_attach_x). rb as for sweet_spi_attach; rb[1] reads the enable bit back (0 expected). */
++int sweet_spi_attach_off(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4]);
++int
++sweet_spi_attach_off(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
++{
++	return sweet_spi_attach_x(intid, fn, arg, rb, 0);
++}
++
++/* patch 0346: ISENABLER write for an ATTACHED SPI (only the INTID's own bit; the register is write-1-to-set), then RWP wait and a read-back of the enable bit into *en.
++ * sweet_spi_enable = the first enable after sweet_spi_attach_off; sweet_spi_unmask = re-enable an SPI that the dispatcher masked (handler returned SWEET_SPI_DEFER or the safety net).
++ * Both refuse an INTID with no attached handler (22), so a detached or never attached SPI is never enabled here. 0 ok, 22 EINVAL, 19 ENODEV. */
++static int
++sweet_spi_set_enable(uint32_t intid, uint32_t *en)
++{
++	if (gicd_base == 0) {
++		return 19;
++	}
++	if (intid < 32 || intid >= 1020) {
++		return 22;
++	}
++	int found = 0;
++	for (int i = 0; i < SWEET_SPI_SLOTS; i++) {
++		if (os_atomic_load(&sweet_spi_tab[i].fn, acquire) != NULL && sweet_spi_tab[i].intid == intid) {
++			found = 1;
++		}
++	}
++	if (!found) {
++		return 22;
++	}
++	uint32_t w = 4 * (intid / 32), b = 1u << (intid % 32);
++	gicd_write32(SWEET_GICD_ISENABLER + w, b);
++	sweet_gicd_rwp_wait();
++	if (en != NULL) {
++		*en = (gicd_read32(SWEET_GICD_ISENABLER + w) & b) != 0;
++	}
++	return 0;
++}
++
++int sweet_spi_enable(uint32_t intid, uint32_t *en);
++int
++sweet_spi_enable(uint32_t intid, uint32_t *en)
++{
++	return sweet_spi_set_enable(intid, en);
++}
++
++int sweet_spi_unmask(uint32_t intid);
++int
++sweet_spi_unmask(uint32_t intid)
++{
++	int rc = sweet_spi_set_enable(intid, NULL);
++	if (rc == 0) {
++		sweet_spi_unmasked++;
++	}
++	return rc;
++}
++
+ int sweet_spi_detach(uint32_t intid);
+ int
+ sweet_spi_detach(uint32_t intid)

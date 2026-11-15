@@ -1,0 +1,95 @@
+SWEET T-289d log-only witnesses (patch 0209, PLAN-60FPS G-F20 climb 6): (1) with boot-arg sweetperf=1 one extra line per second with jobs: `SWEET PERF: jobhist jobs N lt100 .. lt250 .. lt500 .. lt1000 .. lt2000 .. lt4000 .. ge4000 ..` = histogram of submit -> completion seen per job (the duration of 0145, so it includes the <= 200 us poll latency); (2) every 30 s from the same tick the CMU_G3D PLL_G3D and PLL_G3D_L2 words are re-read (reads only, the window the boot print of 0203 mapped) and printed as `SWEET GPU: PLL g3d-t<sec> ...` / `g3dl2-t<sec>`. No register write, no behaviour change, no new boot-arg. Decides H2 (fixed cost per job: one narrow bucket) and H1 (PLL fallback after probe) of T-289d.
+--- a/bsd/dev/sweet_gpu_gs101.c
++++ b/bsd/dev/sweet_gpu_gs101.c
+@@ -48,6 +48,33 @@
+ 	printf("SWEET GPU: %s +%#x = %#x\n", name, off, base[off / 4]);
+ }
+ 
++
++/*
++ * patch 0209 (T-289d, log only): re-read PLL_G3D / PLL_G3D_L2 CON0..CON4 (reads only, the window mapped above) and print them like the boot print, under
++ * the names g3d-t<sec> / g3dl2-t<sec>. Called every 30 s from the Mali poll thread (sweet_mali.c sm_perf_tick, boot-arg sweetperf=1). A clock that
++ * fell back after the probe shows as another khz; a pdiv == 0 prints the counted `GPU GAP: PLL` line (sg_pll_print). No-op before the mux gate passed.
++ */
++static volatile uint32_t *sg_cmu_keep;
++void sweet_gpu_pll_reprint(unsigned sec);
++void
++sweet_gpu_pll_reprint(unsigned sec)
++{
++	uint32_t pg[5], pl[5];
++	char ng[24], nl[24];
++
++	if (sg_cmu_keep == NULL) {
++		return;
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		pg[i] = sg_cmu_keep[(0x140 + 4 * i) / 4];
++		pl[i] = sg_cmu_keep[(0x180 + 4 * i) / 4];
++	}
++	snprintf(ng, sizeof(ng), "g3d-t%u", sec);
++	snprintf(nl, sizeof(nl), "g3dl2-t%u", sec);
++	sg_pll_print(ng, pg, printf);
++	sg_pll_print(nl, pl, printf);
++}
++
+ void
+ sweet_gpu_gs101_init(void)
+ {
+@@ -95,6 +122,7 @@
+ 		}
+ 		sg_pll_print("g3d", pg, printf);
+ 		sg_pll_print("g3dl2", pl, printf);
++		sg_cmu_keep = cmu;   /* patch 0209: the same read-only window, for sweet_gpu_pll_reprint() */
+ 	}
+ 	volatile uint32_t *g = sg_map(mali, 0x5000);
+ 	if (g == NULL) {
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -240,6 +240,10 @@
+ extern unsigned int ml_get_cpu_count(void);
+ static uint64_t perf_jobs, perf_busy_us, perf_max_us, perf_subwait_us, perf_start_us;
+ static int perf_on = -1;
++/* patch 0209 (T-289d, log only): per-second histogram of submit -> completion seen (includes <= 200 us poll latency), buckets <100 <250 <500 <1000 <2000 <4000 >=4000 us */
++#define PERF_NH 7
++static uint64_t perf_hist[PERF_NH];
++extern void sweet_gpu_pll_reprint(unsigned sec);   /* bsd/dev/sweet_gpu_gs101.c, patch 0209: read-only PLL re-print */
+ 
+ static void
+ perf_job_done(void)
+@@ -248,6 +252,7 @@
+ 	uint64_t d = now_us() - perf_start_us;
+ 	perf_jobs++;
+ 	perf_busy_us += d;
++	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
+ 	if (d > perf_max_us) {
+ 		perf_max_us = d;
+ 	}
+@@ -521,6 +526,9 @@
+ 	}
+ 	lck_mtx_lock(&sm_lock);
+ 	uint64_t jobs = perf_jobs, busy = perf_busy_us, mx = perf_max_us, sw = perf_subwait_us;
++	uint64_t hist[PERF_NH];
++	memcpy(hist, perf_hist, sizeof(hist));
++	bzero(perf_hist, sizeof(perf_hist));
+ 	perf_jobs = perf_busy_us = perf_max_us = perf_subwait_us = 0;
+ 	lck_mtx_unlock(&sm_lock);
+ 
+@@ -565,6 +573,18 @@
+ 		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d cpus %d %d %d %d %d %d %d %d\n", jobs, busy / 1000, mx, sw / 1000, pct,
+ 		    cpct[0], cpct[1], cpct[2], cpct[3], cpct[4], cpct[5], cpct[6], cpct[7]);
+ 	}
++	if (jobs > 0) {
++		printf("SWEET PERF: jobhist jobs %llu lt100 %llu lt250 %llu lt500 %llu lt1000 %llu lt2000 %llu lt4000 %llu ge4000 %llu\n", jobs, hist[0], hist[1], hist[2], hist[3],
++		    hist[4], hist[5], hist[6]);
++	}
++	{
++		/* patch 0209: every 30 s re-read the G3D PLLs (reads only) */
++		static uint64_t last_pll_us;
++		if (last_pll_us == 0 || now - last_pll_us >= 30000000) {
++			last_pll_us = now;
++			sweet_gpu_pll_reprint((unsigned)(now / 1000000));
++		}
++	}
+ 	sm_proccpu_line();
+ }
+ 

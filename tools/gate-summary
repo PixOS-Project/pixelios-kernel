@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""tools/gate-summary: the gate's own timing line, built from shim/out/gate.progress + gate.result (PLAN-GATE-2X D6, G1, G2).
+
+  tools/gate-summary [--progress F] [--result F] [--manifest F]        print  RESULT: PASS|FAIL gate kind=quick|formal [cold=1] elapsed=NNNs ran=N skipped=M slow=<step:obs/budget,..|-> base=<sha|->
+  tools/gate-summary --slow  [--progress F] [--manifest F] --kind K [--elapsed S] [--cold]    print only the slow= list (empty when nothing is over budget); check-all.sh puts it on the GATE line
+                                                                       a COLD run (GATE_COLD=1: the GATE line says ` cold=1`) is judged against totals_s.cold (1100 s) only: the per-step budgets are warm numbers
+                                                                       (a cold wlan-mutants/build-wlan is 2-10x its warm budget by design), cold per-step budgets arrive with the K2-K4 slices
+  tools/gate-summary --append [--progress F] [--manifest F] --line "GATE PASS .." --elapsed S --label L --host H [--ledger F]    one row to the ledger (G1)
+
+progress lines read (written by tools/check-all.sh): `START <step> <epoch>`, `END <step> PASS|FAIL[ (timeout)]|STOPPED <secs>`, `BASE <sha|->`.
+kind: quick when the GATE line says `quick: ran N of M` (a quick that fell back to full says `ran full` and is formal). budgets: tools/gate-manifest.json
+(budget_s per step, totals_s per kind). A breach never fails a gate; it is only reported (G2). Ledger default: <main clone>/logs/gate-times.tsv (gitignored),
+env GATE_TIMES_FILE. Columns: epoch label kind host base ran skipped elapsed per-step-seconds (name:secs,..) cold (0|1; the last column, absent = 0 in rows written before 2026-10-31).
+Exit 0 (PASS or FAIL line printed from a readable gate), 1 (the gate FAILed and --exit-code was given), 2 usage/unreadable input.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+TOTALS = {"quick": 360, "formal": 600, "cold": 1100}
+COLUMNS = "epoch label kind host base ran skipped elapsed steps cold".split()
+
+
+def load_manifest(path):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):   # lint-silent: expected a missing or half-written JSON file means no data: None, the summary prints the step as unknown
+        return None
+
+
+def parse_progress(text):
+    """-> (steps {name: {"start": epoch, "secs": n|None, "status": PASS|FAIL|STOPPED|None}}, base)"""
+    steps, base = {}, "-"
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[0] == "START" and f[2].isdigit():
+            steps[f[1]] = {"start": int(f[2]), "secs": None, "status": None}
+        elif len(f) >= 3 and f[0] == "END" and f[1] in steps:
+            s = steps[f[1]]
+            s["status"] = f[2]
+            if f[-1].isdigit() and f[2] != "STOPPED":
+                s["secs"] = int(f[-1])
+        elif len(f) == 2 and f[0] == "BASE":
+            base = f[1]
+    return steps, base
+
+
+def result_line(text):
+    """-> (verdict PASS|FAIL|None, kind, epoch|None) from the first line of gate.result."""
+    line = (text.splitlines() or [""])[0]
+    m = re.match(r"GATE (PASS|FAIL)\b(.*?)(?: (\d+))?$", line)
+    if not m:
+        return None, None, None
+    kind = "quick" if re.search(r"\bquick: ran \d+ of \d+", line) or (" quick: " in line and "ran full" not in line) else "formal"
+    return m.group(1), kind, int(m.group(3)) if m.group(3) else None
+
+
+def is_cold(line):
+    """True when the GATE line carries the token `cold=1` (check-all.sh adds it under GATE_COLD=1)."""
+    return re.search(r"(?:^|\s)cold=1(?:\s|$)", line) is not None
+
+
+def budgets(manifest):
+    return {r["step"]: r["budget_s"] for r in (manifest or {}).get("steps", []) if isinstance(r.get("budget_s"), int)}, \
+        (manifest or {}).get("totals_s") or TOTALS
+
+
+def slow_list(steps, elapsed, kind, manifest, cold=False):
+    b, totals = budgets(manifest)
+    out = [] if cold else ["%s:%d/%d" % (n, s["secs"], b[n]) for n, s in steps.items() if s["secs"] is not None and n in b and s["secs"] > b[n]]
+    tk = "cold" if cold else kind
+    if elapsed is not None and tk in totals and elapsed > totals[tk]:
+        out.append("total:%d/%d" % (elapsed, totals[tk]))
+    return out
+
+
+def elapsed_of(steps, res_epoch):
+    starts = [s["start"] for s in steps.values()]
+    if not starts:
+        return None
+    ends = [s["start"] + s["secs"] for s in steps.values() if s["secs"] is not None]
+    last = res_epoch if res_epoch else (max(ends) if ends else None)
+    return None if last is None else max(0, last - min(starts))
+
+
+def ran_count(steps):
+    return sum(1 for s in steps.values() if s["status"] != "STOPPED")
+
+
+def skipped_count(ran, manifest):
+    return max(0, len((manifest or {}).get("steps", [])) - ran)
+
+
+def ledger_path():
+    if os.environ.get("GATE_TIMES_FILE"):
+        return pathlib.Path(os.environ["GATE_TIMES_FILE"])
+    r = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    root = pathlib.Path(r.stdout.strip()).parent if r.returncode == 0 and r.stdout.strip() else REPO
+    return root / "logs" / "gate-times.tsv"
+
+
+def summary(progress_text, result_text, manifest):
+    steps, base = parse_progress(progress_text)
+    verdict, kind, epoch = result_line(result_text)
+    if verdict is None:
+        return None
+    el = elapsed_of(steps, epoch)
+    ran = ran_count(steps)
+    cold = is_cold((result_text.splitlines() or [""])[0])
+    slow = slow_list(steps, el, kind, manifest, cold)
+    return "RESULT: %s gate kind=%s%s elapsed=%ss ran=%d skipped=%d slow=%s base=%s" % (
+        verdict, kind, " cold=1" if cold else "", "?" if el is None else el, ran, skipped_count(ran, manifest), ",".join(slow) or "-", base), verdict
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="gate-summary", add_help=True)
+    ap.add_argument("--progress", default="shim/out/gate.progress")
+    ap.add_argument("--result", default="shim/out/gate.result")
+    ap.add_argument("--manifest", default=str(REPO / "tools" / "gate-manifest.json"))
+    ap.add_argument("--slow", action="store_true")
+    ap.add_argument("--append", action="store_true")
+    ap.add_argument("--cold", action="store_true", help="with --slow: judge the elapsed time against the cold total budget")
+    ap.add_argument("--kind")
+    ap.add_argument("--elapsed", type=int)
+    ap.add_argument("--line", default="")
+    ap.add_argument("--label", default="-")
+    ap.add_argument("--host", default="-")
+    ap.add_argument("--ledger")
+    ap.add_argument("--exit-code", action="store_true", help="exit 1 when the gate FAILed")
+    a = ap.parse_args(argv)
+    manifest = load_manifest(a.manifest)
+    try:
+        ptext = open(a.progress).read()
+    except OSError as e:
+        print("RESULT: ERROR gate-summary cannot read %s: %s" % (a.progress, e))
+        return 2
+    steps, base = parse_progress(ptext)
+    if a.slow:
+        print(",".join(slow_list(steps, a.elapsed, a.kind or "quick", manifest, a.cold)))
+        return 0
+    if a.append:
+        _, kind, _ = result_line(a.line)
+        verdict = "PASS" if a.line.startswith("GATE PASS") else "FAIL"
+        ran = ran_count(steps)
+        per = ",".join("%s:%d" % (n, s["secs"]) for n, s in steps.items() if s["secs"] is not None)
+        row = [str(int(time.time())), a.label, kind or a.kind or "formal", a.host, base, str(ran), str(skipped_count(ran, manifest)),
+               str(a.elapsed if a.elapsed is not None else (elapsed_of(steps, None) or 0)), per or "-", "1" if is_cold(a.line) else "0"]
+        p = pathlib.Path(a.ledger) if a.ledger else ledger_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a") as fh:
+                fh.write("\t".join(row) + "\n")
+        except OSError as e:
+            print("gate-summary: cannot append %s: %s (the ledger is best effort)" % (p, e), file=sys.stderr)
+            return 0
+        print("RESULT: PASS gate-summary appended %s verdict=%s" % (p, verdict))
+        return 0
+    try:
+        rtext = open(a.result).read()
+    except OSError as e:
+        print("RESULT: ERROR gate-summary cannot read %s: %s" % (a.result, e))
+        return 2
+    got = summary(ptext, rtext, manifest)
+    if got is None:
+        print("RESULT: ERROR gate-summary: %s is not a finished GATE line (%r)" % (a.result, rtext.splitlines()[:1]))
+        return 2
+    print(got[0])
+    return 1 if (a.exit_code and got[1] == "FAIL") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

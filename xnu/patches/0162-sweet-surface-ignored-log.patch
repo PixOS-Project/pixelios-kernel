@@ -1,0 +1,120 @@
+SWEET IOSurface GAP log (patch 0162, AP-102, KNOWN-GAPS): every create-dictionary key we do not read and every selector we accept-and-ignore (default branch, reply zeroed), answer Unsupported or refuse (WrapClientImage) is logged as ONE loud line 'SWEET GAP: surface <what> xCOUNT (process)' on first sight and at counts 10/100/1000/10000, so the next silently missing feature shows in the log. Read-only, always on, bounded table (48 + overflow slot). Review 0162: selector note moved into the default branch, overflow slot, lock init.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -36,6 +36,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+@@ -497,6 +498,62 @@
+ 	return true;
+ }
+ 
++/* Patch 0162 (AP-102, silent-success stubs; loud format 'SWEET GAP: <area> <what> xCOUNT (process)'): every IOSurface create key we do not read, and every selector we accept-and-ignore (default branch) or answer
++ * Unsupported, is logged ONCE per boot with its name, then again when its count reaches 10 / 100 / 1000 / 10000, so the next missing feature shows in the log
++ * (IOSurfaceAddress was ignored for two days and every call "succeeded"). Entries: "key <name>" or "sel <n> (<why>)". */
++#define SWEET_IGN_MAX 48
++static struct { char name[64]; uint32_t n; } sweet_ign[SWEET_IGN_MAX + 1];   /* [SWEET_IGN_MAX] collects the overflow */
++static uint32_t sweet_ign_count;
++
++static void
++sweet_note_ignored(const char *kind, const char *what, uint32_t sel)
++{
++	char name[64];
++	if (sel != 0xffffffffu) {
++		snprintf(name, sizeof(name), "%s %u (%s)", kind, sel, what);
++	} else {
++		snprintf(name, sizeof(name), "%s %s", kind, what);
++	}
++	uint32_t i, n = 0;
++	sweet_surface_init_lock();   /* review 0162: the lock may not exist yet */
++	IOLockLock(sweet_surface_lock);
++	for (i = 0; i < sweet_ign_count; i++) {
++		if (strncmp(sweet_ign[i].name, name, sizeof(name)) == 0) {
++			break;
++		}
++	}
++	if (i == sweet_ign_count) {
++		if (sweet_ign_count < SWEET_IGN_MAX) {
++			strlcpy(sweet_ign[i].name, name, sizeof(sweet_ign[i].name));
++			sweet_ign[i].n = 0;
++			sweet_ign_count++;
++		} else {
++			i = SWEET_IGN_MAX;   /* table full */
++			strlcpy(sweet_ign[i].name, "(table full)", sizeof(sweet_ign[i].name));
++		}
++	}
++	n = ++sweet_ign[i].n;
++	IOLockUnlock(sweet_surface_lock);
++	if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
++		char proc[32];
++		proc_selfname(proc, sizeof(proc));
++		IOLog("SWEET GAP: surface %s x%u (%s)\n", name, n, proc);
++	}
++}
++
++static bool
++sweet_known_create_key(const char *k)
++{
++	static const char *const known[] = { "IOSurfaceWidth", "IOSurfaceHeight", "IOSurfaceBytesPerElement", "IOSurfaceElementWidth", "IOSurfaceElementHeight",
++		"IOSurfacePixelFormat", "IOSurfaceCacheMode", "IOSurfaceOffset", "IOSurfaceBytesPerRow", "IOSurfaceAllocSize", "IOSurfacePlaneInfo", "IOSurfaceAddress" };
++	for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
++		if (strcmp(k, known[i]) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* Patch 0161 (G-11 icons): QuartzCore's GL renderer wraps its CPU images into IOSurfaces whose pixels live in the CLIENT's memory: IOSurfaceCreate with the key
+  * IOSurfaceAddress (20 of 35 image formats) or selector 6 (WrapClientImage). Our create ignored the address and handed out zeroed memory, so every icon image
+  * reached the GPU empty (g92: 19 backboardd 180x180 surfaces, locks 2 / wunlocks 1 by backboardd, 0 nonzero words, never written by anyone). The surface now
+@@ -868,6 +925,21 @@
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	{   /* patch 0162: keys of the create dictionary we do not read */
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++		if (it != NULL) {
++			OSObject *k;
++			while ((k = it->getNextObject()) != NULL) {
++				const OSSymbol *sym = OSDynamicCast(OSSymbol, k);
++				const OSString *str = OSDynamicCast(OSString, k);
++				const char *cs = sym != NULL ? sym->getCStringNoCopy() : (str != NULL ? str->getCStringNoCopy() : NULL);
++				if (cs != NULL && !sweet_known_create_key(cs)) {
++					sweet_note_ignored("create key", cs, 0xffffffffu);
++				}
++			}
++			it->release();
++		}
++	}
+ 	if (ret == kIOReturnSuccess) {   /* patch 0161: pixels that live in the creating process */
+ 		OSNumber *addr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+ 		if (addr != NULL && addr->unsigned64BitValue() != 0 && sweet_surface_clientaddr_enabled()) {
+@@ -906,6 +978,7 @@
+ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ {
+ 	if (args->structureInput == NULL || args->structureInputSize < 0x20 || !sweet_surface_clientaddr_enabled()) {
++		sweet_note_ignored("sel", "WrapClientImage refused", kSweetSurfaceWrapClientImage);
+ 		return kIOReturnUnsupported;
+ 	}
+ 	uint64_t addr;
+@@ -986,6 +1059,7 @@
+ 	case kSweetSurfaceWrapClientMemory: /* wrap client memory (selector 7: no caller seen) */
+ 		/* A fake success makes the framework build a client with a NULL state page. */
+ 		sweet_surf_log_once("sel", selector);
++		sweet_note_ignored("sel", "answered Unsupported", selector);
+ 		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+@@ -996,6 +1070,7 @@
+ 			bzero(args->structureOutput, args->structureOutputSize);
+ 		}
+ 		sweet_surf_log_once("sel", selector);
++		sweet_note_ignored("sel", "accepted and ignored, reply zeroed", selector);
+ 		return kIOReturnSuccess;
+ 	}
+ }

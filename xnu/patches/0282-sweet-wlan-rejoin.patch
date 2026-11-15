@@ -1,0 +1,131 @@
+SWEET WLAN re-join after an AP loss (patch 0282, W-D6 boot B, branch wlan/rejoin; docs/research/W-D6-rejoin-dhcp.md s.3 and 6 steps 5-7). Builds on 0281 (live event decode, link-down detector, DOWN to iOS). (1) KEPT SECRETS (user decision 2026-11-10): the hook copies the PMK, the join payload (and the four security values wpa_auth, wsec, auth, mfp) and the boot RSNEs into one RAM struct sw_rj (struct swl25_rj, sweet_wlan_l25_hs.h) before the L25 disarm and the init scrub wipe them; it is never printed or written anywhere else and is zeroed when the engine dies (sw_keep_end: poll thread ends, hand-over refused; sw_keep_abort). If it is missing when the link is lost, `WIFI GAP: keep rejoin: the link is DOWN but the join payload and PMK are not kept`. (2) STATE MACHINE in the keep thread (swl25_rj_step, one call per pass under the en0 lock; the only user of the engine): UP -> DOWN (the 0281 detector) -> JOINING -> KEYING -> UP. First attempt when DOWN is entered, then 2, 4, 8, 16, 30 s (cap) for ever (swg_rj_backoff_ms); one line per attempt `SWEET WLAN: keep rejoin attempt N`, `SWEET WLAN: keep rejoin UP after N attempts, T ms` when done. An attempt reads back wpa_auth, wsec, auth, mfp (GET_VAR) and re-sends only what differs from the boot join, then sends the kept `join` (SET_VAR, the same 76 B v1 payload with the wildcard BSSID) and waits at most SWG_J_BUDGET_MS (10 s) for SET_SSID 0 + LINK up (the events are noted by swg_ke_note), then reads WLC_GET_BSSID and the association-request RSNE, sets up the supplicant with the kept PMK and switches the EAPOL divert on. (3) LIVE 4-WAY: wlan_en0.h en0_rx_deliver hands ethertype 0x888E frames to the hook en0->eapol (swl25_rj_eapol -> swj_rx, the boot code); the M2/M4 reply is posted on the flow ring by en0_tx_frame; outside KEYING EAPOL is dropped with a counted GAP (`WIFI GAP: EN4 EAPOL frame dropped`). After M4 has left (tx completion or 200 ms) wsec_key pairwise + group and the wsec merge are sent (a refusal fails the attempt, it does not stop the engine), BSSID/chanspec/RSSI are read (swl25_live), then the thread tells iOS outside the lock: sweet_wlan_a80211_kept_up (new BSSID/channel/RSSI, kept.joined, ASSOC_DONE result 0 = kev 9, 2, 3, 4 with isLinkDown 0) and en0_link_only(e, 1) (IFF_RUNNING, KEV_DL_LINK_ON, so configd re-runs DHCP). The RSSI refresh is skipped while an attempt is JOINING or KEYING. The 0281 `link UP event ignored` GAP now fires only outside an attempt. (4) The store judge (sweet_wlan_l25_wl.h, 17 rows) gets seven rows: SET join (content bound: SSID_len 1..32, reserved fields exact, BSSID the wildcard or the known AP), SET wpa_auth / auth / mfp (one allowed value each), GET wpa_auth / auth / mfp (read-only). The headers (sweet_wlan_g2.h, sweet_wlan_l25_hs.h, sweet_wlan_l25_wl.h, sweet_wlan_radio.h, sweet_wlan_en0.h, sweet_wlan_a80211.c) are regenerated in place in patches 0174, 0206, 0201 and 0199 from shim/ (tools/gen-wlan-hunks, tools/gen-wlan-en0-patch, tools/gen-wlan-a80211-patch); this patch holds the hand-written glue hunks of sweet_wlan.c. NEW firmware-facing commands: SET_VAR join (live), SET_VAR wpa_auth / auth / mfp / wsec (only when the read-back differs), GET_VAR wpa_auth / auth / mfp, and the existing wsec_key x2 + wsec GET/SET + GET_BSSID/chanspec/RSSI/assoc_info/assoc_req_ies in a new use after the hand-over. Not run on hardware. Review 0282 fixes (Opus, rule 8): a SOFT stop inside any re-join ioctl is cleared by swl25_rj_step itself (re-join off for the boot, sw_rj and the supplicant wiped, one `WIFI GAP: keep rejoin disabled: soft stop in <step>`), a loss event during JOINING/KEYING fails the attempt, an M1 after an accepted M3 is dropped, the M4 counts as sent only when en0 posted it (the thread passes e->eapol_last_ok), secret leftovers are wiped (payload shadow, swj_rx stack). Round 2: the glue passes SWL25_RJ_BUSY_ARG(&sw_rj, en0_tx_busy(...)) (not gated on m4_seen: the 200 ms M4 wait is back), a stop raised by the re-join's ring-2 drain is not cleared (the keep loop ends on it), a stop before the ioctl completion is noted with a GAP.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2272,8 +2272,10 @@
+ 	uint32_t live, chan;            /* W-UI: swl25_H.live_ok (1 ssid, 2 bssid, 4 channel, 8 rssi) and the 20 MHz primary channel the firmware reported */
+ 	int32_t rssi;
+ } sw_keep_join;
++static struct swl25_rj sw_rj;           /* patch 0282 (W-D6 boot B): the kept PMK + join payload for the re-join after an AP loss. USER DECISION 2026-11-10: kept in RAM for this purpose only, never printed or written anywhere else, wiped when the engine dies (sw_keep_end, sw_keep_abort) */
+ extern int sweet_wlan_a80211_radio_attach_kept(ifnet_t ifp, const uint8_t *ssid, uint32_t ssid_len, const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok);   /* bsd/dev/sweet_wlan_a80211.c (patch 0201) */
+ extern int sweet_wlan_a80211_kept_rssi(int32_t rssi);                                                                          /* bsd/dev/sweet_wlan_a80211.c (patch 0201, Part A) */
++extern int sweet_wlan_a80211_kept_up(const uint8_t *bssid, uint32_t channel, int32_t rssi, uint32_t ok);                        /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0282): the re-join is done, tell wifid */
+ extern int sweet_wlan_a80211_kept_link(int up);                                                                              /* bsd/dev/sweet_wlan_a80211.c (patch 0201, 0281): the AP link is lost; up != 0 not built */
+ extern int sweet_wlan_registry_set_bsd_name(const char *name);                                                                 /* iokit/Kernel/arm/SweetWlanRegistry.cpp (patch 0200) */
+ 
+@@ -2374,12 +2376,21 @@
+ 	    (unsigned)sw_keep_join.chan, (int)sw_keep_join.rssi, (unsigned)sw_keep_join.live);
+ }
+ 
++/* patch 0282: copy the PMK, the join payload (and the four security values) and the boot RSNEs out of the tables the hook is about to wipe (the L25 cfg by swl25g_disarm, sw_jc by the init scrub) into sw_rj, once, in the kept case. A GAP is printed by swl25_rj_arm when
++ * something is missing: the link then stays DOWN after an AP loss, loudly. Nothing is printed of the values. */
++static void
++sw_rj_capture(struct sw_hw *h)
++{
++	(void)swl25_rj_arm(&sw_rj, &swl25_H, sw_l25g.cfg.pmk, h->jc, h->njc, sw_l25g.cfg.rsne_beacon, sw_l25g.cfg.rsne_beacon_len, sw_l25g.cfg.rsne_assoc, sw_l25g.cfg.rsne_assoc_len);
++}
++
+ /* the keep run cannot go on: run the undo the engine skipped (EP/RC command, 0xC34, cfg 0x84) now, loudly; the hook continues as a normal run */
+ static void
+ sw_keep_abort(const char *why)
+ {
+ 	sw_gx.kept = 0;
+ 	swc_wipe(&sw_keep_join, (uint32_t)sizeof sw_keep_join);
++	swl25_rj_wipe(&sw_rj, "keep aborted");
+ 	printf("SWEET WLAN: G2 keep ABORTED (%s): the normal undo runs now\n", why);
+ 	swl_gap("g2", "keep aborted, the normal undo ran after the engine", "high");
+ 	(void)swg_undo(&sw_gx);
+@@ -2394,6 +2405,7 @@
+ sw_keep_end(struct swg_wx *x, const char *why)
+ {
+ 	sw_en0_lock();
++	swl25_rj_wipe(&sw_rj, why);     /* patch 0282: the engine is going away, the kept PMK and join payload with it */
+ 	if (!x->stopped) {
+ 		x->fail = why;
+ 		printf("SWEET WLAN: keep ends (%s): the normal undo runs now\n", why);
+@@ -2410,13 +2422,17 @@
+ 	struct swg_wx *x = &sw_gx;
+ 	struct en0 *e = &sw_keep_en;
+ 	struct en0_live *b = &sw_keep_live;
+-	uint32_t polls = 0, items = 0, got, busy, nrssi = 0, rssi_off = 0, kdown = 0;
++	uint32_t polls = 0, items = 0, got, busy, nrssi = 0, rssi_off = 0, kdown = 0, rjup = 0, uchan = 0, uok = 0;
++	uint8_t ubssid[6];
++	int32_t urssi = 0;
++	uint64_t ns_now;
+ 	uint64_t t_pass = 0, t_p0, l_link = 0, l_judge = 0, l_cache = 0, l_nlink = 0, l_pass = 0, ns_[5];
+ 	uint64_t pass_max = 0, gap_max = 0, t_end_busy = 0, d_;
+ 	uint64_t t_alive = 0, iv_alive = 0, t_rssi = 0, iv_rssi = 0;
+ 	int32_t rssi_now = 0;
+-	int rc, found, rr;
++	int rc, found, rr, rjx;
+ 
++	memset(ubssid, 0, sizeof ubssid);
+ 	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &iv_alive);
+ 	nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &iv_rssi);
+ 	while (!sw_keep.go) {
+@@ -2437,6 +2453,10 @@
+ 		thread_terminate_self();
+ 		return;
+ 	}
++	if (sw_rj.armed) {      /* patch 0282: EAPOL frames reach the host supplicant while a re-join is KEYING; otherwise en0 drops them with a counted GAP */
++		e->eapol = swl25_rj_eapol;
++		e->eapol_ctx = &sw_rj;
++	}
+ 	/* W-UI: en0 exists and has its address. The Apple80211 handler goes in front of en0's ioctl exactly as patch 0199's sweet_wlan_en0_init does (sweet_wlan_a80211_radio_attach), but with the kept radio backend
+ 	 * that answers "joined" with the captured join; its own install line is printed by the glue. A failure is a GAP, never silent. Then the registry interface object gets its BSD Name (patch 0200). */
+ 	{
+@@ -2465,7 +2485,7 @@
+ 		items += got;
+ 		busy = got != 0u || e->tx_blocked != 0u;
+ 		rr = 1;
+-		if (!rssi_off && !x->stopped && !x->d4dstop && !b->dead && mach_absolute_time() - t_rssi >= iv_rssi) {    /* patch 0273 (Part A): the firmware's RSSI every 5 s (read-only WLC_GET_RSSI, judged, under the lock) */
++		if (!rssi_off && !x->stopped && !x->d4dstop && !b->dead && (x->rj_state == SWG_RJ_UP || x->rj_state == SWG_RJ_DOWN) && mach_absolute_time() - t_rssi >= iv_rssi) {    /* patch 0273 (Part A): the firmware's RSSI every 5 s (read-only WLC_GET_RSSI, judged, under the lock) */
+ 			t_rssi = mach_absolute_time();
+ 			if (swl25_rssi_drain(x) == 0) {         /* patch 0281: ring 2 carries events now; drain it (decode, consume, re-post) so the idle check of the refresh is not failed for ever. A stop in the drain is the data path's stop, not the refresh's: the loop below ends on it */
+ 				rr = swl25_live_rssi(x, &swl25_H, &rssi_now);
+@@ -2478,6 +2498,14 @@
+ 				}
+ 			}
+ 		}
++		if (x->klink != 0u && !x->stopped && !x->d4dstop && !b->dead) {        /* patch 0282: the re-join machine (DOWN -> JOINING -> KEYING -> UP), only this thread uses the engine; blocks like the RSSI refresh for the few ioctls of one step */
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns_now);
++			rjx = swl25_rj_step(x, &sw_rj, ns_now / 1000000ull, SWL25_RJ_BUSY_ARG(&sw_rj, en0_tx_busy(e, e->eapol_slot)), (int)e->eapol_last_ok);
++			(void)rjx;      /* a negative value is a stopped bus: x->stopped ends the loop below. A SOFT stop inside the re-join is cleared by swl25_rj_step itself (re-join off, secrets wiped, one GAP; review 0282 F1): the keep loop goes on */
++		}
++		if (swl25_rj_take_up(&sw_rj, ubssid, &uchan, &urssi, &uok)) {
++			rjup = 1u;
++		}
+ 		if (x->kl_new) {        /* patch 0281: the link-loss detector (swg_ke_note, ring-2 events) went UP -> DOWN in this pass: tell iOS below, outside the lock, once */
+ 			x->kl_new = 0u;
+ 			kdown = 1u;
+@@ -2495,6 +2523,14 @@
+ 			en0_link_only(e, 0u);
+ 			printf("SWEET WLAN: keep link DOWN told to iOS: radio rc %d, en0 link off (flow ring kept open, no firmware command)\n", rc);
+ 		}
++		if (rjup) {             /* patch 0282 (W-D6 boot B): the re-join is done (new 4-way, keys installed). iOS is told outside the lock: the radio answers joined again and posts ASSOC_DONE (LINK_CHANGED isLinkDown 0), en0 gets IFF_RUNNING + KEV_DL_LINK_ON (configd re-reads the media status and IPConfiguration runs DHCP again) */
++			rjup = 0u;
++			rc = sweet_wlan_a80211_kept_up(ubssid, uchan, urssi, uok);
++			if (rc != 0) swl_gap("keep", "link UP not delivered to Apple80211 (see the GAP line above)", "high");
++			en0_link_only(e, 1u);
++			memset(ubssid, 0, sizeof ubssid);
++			printf("SWEET WLAN: keep rejoin UP told to iOS: radio rc %d, en0 link on (KEV_DL_LINK_ON)\n", rc);
++		}
+ 		if (rr == 0) {          /* outside the en0 lock: the Apple80211 radio takes its own lock (the ioctl path holds it), so no lock order is formed */
+ 			nrssi++;
+ 			if (sweet_wlan_a80211_kept_rssi(rssi_now) == 0) {
+@@ -2524,6 +2560,7 @@
+ 			printf("SWEET WLAN: en0 poll alive polls=%u rx=%u tx=%u nquiet=%u gaps=%u r2=%u ev=%u ds=%u items=%u rx_drop=%u tx_drop=%u tx_blocked=%u tx_waits=%u kicks=%u dgaps=%u blk=%u blkw=%u plans=%u\n", polls, e->rx_frames,
+ 			       e->tx_frames, x->nquiet, swl_gap_tot + swl_gap_over, x->kr2n, x->kr2ev, x->kr2ds, items, e->rx_drop, e->tx_drop, e->tx_blocked, e->tx_waits, sw_keep.kicks, swl_dpg_tot, sw_g2_blk_n, sw_g2_blk_words, sw_plan_n);
+ 			printf("SWEET WLAN: keep events decoded=%u undecoded=%u reposted=%u link=%s up_events_while_down=%u\n", x->kev_n, x->kev_gap, x->kev_rp, x->klink ? "DOWN" : "UP", x->kl_up_n);
++			printf("SWEET WLAN: keep rejoin state=%u armed=%u attempts=%u up=%u failed=%u eapol rx=%u tx=%u dropped=%u tx_failed=%u\n", (unsigned)x->rj_state, (unsigned)sw_rj.armed, sw_rj.n, sw_rj.n_up, sw_rj.n_fail, e->eapol_rx, e->eapol_tx, e->eapol_drop, e->eapol_txfail);
+ 		}
+ 		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
+ 		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */
+@@ -2639,6 +2676,7 @@
+ 		h->g2x = NULL;
+ 		if (sw_gx.kept) {
+ 			sw_keep_capture();      /* W-UI: before the disarm wipes the cfg */
++			sw_rj_capture(h);       /* patch 0282: the PMK and the join payload for the re-join, before the disarm and the init scrub wipe them */
+ 		}
+ 		if (h->d4b >= 12) {
+ 			swl25g_disarm(&sw_gx, &sw_l25g);      /* the PMK copy is wiped in the keep case too: the data path needs no key (the dongle holds the PTK/GTK) */

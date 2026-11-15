@@ -1,0 +1,66 @@
+sweet-cpu-dvfs-witness (lowclk 2026-11-15, tracker L-28): LOG ONLY, prints the CPU cluster DVFS result that the shim only showed on its screen. NO HARDWARE ACCESS: no register, no firmware command, no bus store; it only parses boot-args. Absent tokens = nothing printed (byte-identical boot: one block of never-taken branches).
+Why [obs resident-061148-b1, profile lowclk_std_nobd_cl_cpumid]: with `xrun --dvfs K0,K1,K2` the shim's `dvfs set: ok N/N read back` / `DVFS readback CLn` lines (shim/touchprobe.c) are screen-only; patch 0214 echoes only MIF/INT (dom 0/1), so a CPU-row boot could not be proven from the USB log (rule 7).
+What [read from source]: the shim (touch_dvfs_cmdline, touchprobe.c, TOUCH_DVFS_WRITE images only) appends sweetdvfsk0..2 (asked kHz, 0 = left alone), sweetdvfsb0..2 (FREQ_GET kHz before the request), sweetdvfsa0..2 (kHz read back after it) and sweetdvfsrc (0 all asked clusters read back at the asked rate, 1 request refused or failed, 2 a read-back differs, 3 a read-back failed, 4 request step not reached) to the XNU command line; this patch prints
+  SWEET DVFS: dom 2|3|4 get khz=K when=before (CPUCL0|1|2, read by the shim)   and   ... when=after (CPUCL0|1|2, after the request)
+  SWEET DVFS: cpu-dvfs asked=K0,K1,K2 rc=R
+dom 2/3/4 = the ACPM DVFS indices of the CPU clusters (soc.json acpm.dvfs, tools/boards.py ACPM_DVFS_IDXS 2,3,4). GAP rows: some but not all of the 10 tokens present, rc outside 0..4, rc 1..4 with its meaning, rc 0 but a read-back different from the ask. No --dvfs and no tokens = no row. If the shim found no room on the command line it appends nothing and says so only on its screen, so XNU cannot tell that case from "no --dvfs" (the build refuses boot-args that leave no room, tools/build-xnu-image.sh).
+Host test: tools/test_sweet_cpudvfs367.py (patch text + mutants); shim side shim/dvfs_probe_host_test.c. Not run on hardware. The new write path (none) is unreviewed; this patch writes nothing to hardware.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -301,6 +301,56 @@
+ 			IOLog("SWEET DVFS: no sweetmif* boot-arg (shim not built with --mif-clk, or no room on the command line: see the shim GAP line): MIF/INT not read\n");
+ 		}
+ 	}
++	{
++		/*
++		 * Patch 0367 (lowclk, L-28, LOG ONLY): the CPU cluster DVFS witness. With --dvfs K0,K1,K2 the shim (touchprobe.c, TOUCH_DVFS_WRITE) read ACPM FREQ_GET of
++		 * dom 2/3/4 (CPUCL0/1/2) before and after its FREQ_REQ and appended the asked rate, the two readings and the result as boot-arg tokens (0 = not asked / not read).
++		 * sweetdvfsrc: 0 every asked cluster read back at the asked rate, 1 a request refused or failed, 2 a read-back differs from the ask,
++		 * 3 a read-back failed (unverified), 4 the request step was not reached (describe or read failed). Nothing is written here; no token and no --dvfs = nothing printed.
++		 */
++		static const char *const nk[3] = { "sweetdvfsk0", "sweetdvfsk1", "sweetdvfsk2" };
++		static const char *const nb[3] = { "sweetdvfsb0", "sweetdvfsb1", "sweetdvfsb2" };
++		static const char *const na[3] = { "sweetdvfsa0", "sweetdvfsa1", "sweetdvfsa2" };
++		uint32_t dk[3] = { 0, 0, 0 }, db[3] = { 0, 0, 0 }, da[3] = { 0, 0, 0 }, drc = 0;
++		unsigned int dn = 0;
++
++		for (unsigned int k = 0; k < 3; k++) {
++			if (PE_parse_boot_argn(nk[k], &dk[k], sizeof(dk[k]))) {
++				dn++;
++			}
++			if (PE_parse_boot_argn(nb[k], &db[k], sizeof(db[k]))) {
++				dn++;
++			}
++			if (PE_parse_boot_argn(na[k], &da[k], sizeof(da[k]))) {
++				dn++;
++			}
++		}
++		if (PE_parse_boot_argn("sweetdvfsrc", &drc, sizeof(drc))) {
++			dn++;
++		}
++		if (dn != 0) {
++			for (unsigned int k = 0; k < 3; k++) {
++				IOLog("SWEET DVFS: dom %u get khz=%u when=before (CPUCL%u, read by the shim)\n", 2 + k, db[k], k);
++			}
++			for (unsigned int k = 0; k < 3; k++) {
++				IOLog("SWEET DVFS: dom %u get khz=%u when=after (CPUCL%u, after the request)\n", 2 + k, da[k], k);
++			}
++			IOLog("SWEET DVFS: cpu-dvfs asked=%u,%u,%u rc=%u\n", dk[0], dk[1], dk[2], drc);
++			if (dn != 10) {
++				IOLog("SWEET GAP: DVFS cpu-dvfs tokens incomplete (%u of 10 sweetdvfs* boot-args): the rows above are partly zero\n", dn);
++			} else if (drc > 4) {
++				IOLog("SWEET GAP: DVFS cpu-dvfs rc=%u is not a known result (0..4)\n", drc);
++			} else if (drc != 0) {
++				IOLog("SWEET GAP: DVFS cpu-dvfs rc=%u (1 request refused or failed, 2 read-back differs, 3 read-back failed, 4 request step not reached): see the shim console / pstore\n", drc);
++			} else {
++				for (unsigned int k = 0; k < 3; k++) {
++					if (dk[k] != 0 && da[k] != dk[k]) {
++						IOLog("SWEET GAP: DVFS cpu-dvfs rc=0 but CPUCL%u read back %u kHz, asked %u\n", k, da[k], dk[k]);
++					}
++				}
++			}
++		}
++	}
+ 	sweet_probe_tokens();   /* patch 0363 (lowclk B1/B2): the PSCI + SLC probe results the shim appended (sweetprobe_*), only with boot-arg sweetprobe=1 */
+ 	{
+ 		unsigned int busy_s = 0;

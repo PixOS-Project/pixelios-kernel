@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""change-class: classify a diff as log-only, log-read, hw-write or tools for the ceremony split (T-8fe9 M2, user 2026-11-03, RULES R31).
+Caller: tools/gate_select.py (a quick gate drops the wlan-mutants lane for log-only and log-read); docs/recipes/review.md (log-only = no Opus review).
+
+  tools/change-class [--base REF] [--head REF]   diff BASE (default: merge-base HEAD trunk) against HEAD REF, or the work tree when --head is omitted
+  tools/change-class --diff FILE                 classify a saved `git diff` text (fixtures)
+  tools/change-class --self-test                 fixtures + mutants (also run by tools/test_change_class.py)
+
+Classes (fail closed: whatever the rules below cannot prove is a log/witness line is hw-write):
+  log-only  every changed code line in port code (shim/ soc/ device/ *.c *.h, and the inner code lines of xnu/patches/*.patch) is a comment, blank,
+            brace, a balanced #if/#endif or `if (COND) {` block, an `extern` prototype, a call of a LOG function (printf, kprintf, IOLog, os_log*,
+            puts, lg, ramlog_line, sweet_crash_log, sweet_mmio_log*, sweet_surf_log_once, sweet_log_append) or a local
+            declaration (one declarator, inside an if block the change adds) whose value comes from PURE functions; no assignment, ++/--,
+            volatile, asm, smc/hvc/msr, digraph/trigraph, call through a pointer, read through a computed pointer (`*(T *)(a)`, `(x)[i]`,
+            `(x)->f`), bare ALL-CAPS, Capitalised or _name identifier (an object-like macro can hide a store) or call of anything else.
+            Only *.md files are ignored (a docs/ script can flash the phone; r6 f7). C and H inner targets only, seen in the diff (C++ has operators
+            and delete); no control character (a CR ends a line for the compiler), no `\\` line inside an inner hunk (r6 f3), no new or deleted port
+            source, inner or outer, in any header form (it can shadow an -I header). An empty diff is hw-write: nothing was classified (r6 f6). Inline asm or a register variable in view (git mode diffs with -U3 -W: the whole function; r8 f2, f3): hw-write, a call next to them clobbers the operands under gcc (r7 f1). The same for lock, IRQ, MMU, early-boot, section, exclusive or poll-loop code in view, the logger's own files (r8 f4-f7), a removed loop body, %n. A run right after a context #if/#else/#endif or a label with
+            unknown code above it is hw-write. Residuals (RULES R31): `*p`, `p[i]`, `p->f`, `%s` of a named pointer or typedef cast, a named pointer
+            passed to a function that reads through it; lowercase object-like macros.
+            The removed lines and the added lines of a run are classed apart (each must be log-only on its own); a removed `if` guard is
+            hw-write; a run after a context line that does not end a statement (`if (x)`, `else`, a `\\` macro line), or before an `else`
+            (blank, comment and # lines between are skipped), is hw-write.
+            sweet_crash_log with sig 6 also scans the malloc heap (patch 0051): logging, but heavy.
+  log-read  log-only, except that added lines call READ helpers (try_read32, read32, readl, readq, ioread32, ml_io_read*): a read can clear
+            status, pop a FIFO or hang on a gated block; so does a REMOVED read. One `CHANGE-CLASS read <where>` line each. Skips the mutant lane, KEEPS the Opus
+            review unless the driver confirms every listed register is side-effect free. try_read32's out-argument must be `&local`.
+  hw-write  anything else in port code, any other port input (tables, json, tsv, build scripts, .S, .ld, patch series), an edit of an inner
+            header or inner context line of an existing xnu patch (git apply would move the code), any file of the boot-safety audit or of
+            this classifier, an unclassified path, port reads mixed with tools changes. Needs the Opus review + mutants (AGENTS hard rule 6).
+  tools     only tools/ (non-safety) and docs changed, or tools plus log-only port lines: ceremony unchanged.
+The boot-safety audit (tools/test-bluejay-boot.py) still runs in every gate for every class; this tool never replaces it.
+Output: `CHANGE-CLASS hw-write <path>:<n>: <why>` (first 20), `CHANGE-CLASS read <path>:<n>: <call>`, then
+RESULT: PASS change-class class=C files=N port_lines=M base=B
+Exit 0 classified / 2 usage, git or non-UTF-8 error (callers treat an error as hw-write)."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + __doc__.strip()); raise SystemExit(0)
+import os, re, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG = {"printf", "kprintf", "IOLog", "os_log", "os_log_error", "os_log_info", "os_log_debug", "os_log_fault", "kdb_printf", "puts", "lg",
+       "ramlog_line", "sweet_crash_log", "sweet_mmio_log", "sweet_mmio_log_summary",
+       "sweet_surf_log_once", "sweet_log_append"}
+# not LOG: log_put_txt/log_put_hex8 store through their dst argument (shim/console.c:216-228, Opus r3 f2), sweet_iolog (r2 f4)
+READ = {"try_read32", "read32", "readl", "readq", "ioread32", "ml_io_read", "ml_io_read32", "ml_io_read64"}
+OUT_ARG_READ = {"try_read32"}   # writes the value through its 2nd argument (shim/acpm_host_test.c, shim/touch_host_test.c)
+PURE = {"strncmp", "strcmp", "strlen", "current_proc", "proc_getpid", "proc_pid", "sizeof", "defined", "__builtin_expect"}
+KEYWORDS = {"if", "while", "for", "switch", "return", "sizeof", "defined"}
+SAFE_CAPS = {"NULL", "TRUE", "FALSE", "UINT8_MAX", "UINT16_MAX", "UINT32_MAX", "UINT64_MAX", "INT32_MAX", "INT64_MAX", "SIZE_MAX", "__func__", "__FUNCTION__", "__LINE__"}   # the last three: names the compiler defines, no store (r7 f4)
+CAPS = re.compile(r"^_*[A-Z][A-Z0-9_]*$|^[A-Z][A-Z0-9]+_")   # macro-like names: KK, _KICK, REG_kick (Opus r2 f12)
+FLOW = re.compile(r"\b(if|return|goto|break|continue|while|for|do|else|switch|case|default)\b|[;{}]")
+SAFETY = re.compile(r"^tools/(test-bluejay-boot\.py|audit_[^/]*\.py|gpuclk_audit\.py|change-class|change_class_selftest_lib\.py|test_change_class\.py|unit_select\.py|phone-guard|fflash[^/]*|"
+                    r"run-preflight|run_preflight[^/]*\.py|mkpayload\.py|xrun|probe-run|gate_select\.py|gate-manifest\.json|"
+                    r"boards\.py|wlan-tbl-gen|gen-wlan-[^/]*-patch|third_party/.*)$")   # the last four generate port input or the boot image (shim/build.sh; r6 f11)
+PORT_CODE = re.compile(r"^(shim|soc|device)/.*\.(c|h)$")
+PORT_ANY = re.compile(r"^(shim|soc|device|xnu)/")
+TYPE = r"(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:u?int(?:8|16|32|64)_t|u8|u16|u32|u64|int|long|long\s+long|unsigned|char|bool|size_t|proc_t|pid_t|thread_t|task_t)"
+DECL = re.compile(r"^%s\s+(?P<n>\w+)(\s*=\s*(?P<v>.+))?;$" % TYPE)
+EXTERN = re.compile(r"^extern\s+[\w\s\*]+\(\s*[\w\s\*,]*\)\s*;$")
+EXTERN_FN = re.compile(r"^extern\s+[\w\s\*]*\w[\s\*]+(?P<n>\w+)\s*\((?P<a>[^()]*)\)\s*;$")   # a return type, a name, then parameters
+COND = re.compile(r"^(?:\}\s*else\s+)?if\s*\((?P<c>.*)\)\s*\{$")
+PP_OPEN, PP_CLOSE = re.compile(r"^#\s*if(n?def)?\b"), re.compile(r"^#\s*endif\b")
+BAD = re.compile(r"\b(volatile|asm|__asm__?|smc|hvc|msr|memcpy|memset|memmove|__atomic\w*|__sync\w*)\b|(?<![=!<>])=(?!=)|\+\+|--|[-+*/%&|^]=|<<=|>>="
+                 r"|\]\s*\(|#|\$|\b(?:new|delete|throw|operator|\w+_cast)\b")   # the last: a call through an indexed callee (tbl[i](a)); a parenthesised callee: paren_call()
+CAST = re.compile(r"^\s*%s(\s*\*)*\s*$" % TYPE)
+VOID_CAST = re.compile(r"\(\s*void\s*\*\s*\)")
+RISK = re.compile(r"\b(spin_lock|lck_spin_\w+|simple_lock|hw_lock_\w+|ml_set_interrupts_enabled|disable_preemption|__builtin_arm_\w+|load_exclusive|store_exclusive|wsr|isb|dsb|dmb|naked|"
+                  r"noreturn|constructor|section|__startup_func|__init|\w*irq_handler|exc_handler|el2_handle|arm_init\w*|start_\w+|early_\w+|mmu_\w+|_cnputs|cnputc\w*|console_write)\b")   # r8 f4, f6, f7
+ASM = re.compile(r"\b(asm|__asm|__asm__|__volatile__|register)\b|^(:|\"\")|\"\"\s*\(")   # an asm statement, operand or clobber line, or a register variable (r7 f1, r8 f1)
+LOOP, POLL = re.compile(r"\b(while|do|for)\b"), re.compile(r"\b(rd\d+|read\w*|\w*delay\w*|mach_absolute_time|deadline|timeout)\b")
+LOGGER = {"shim/ramlog.c", "shim/console.c"}   # a log here recurses (r8 f7)
+INNER_C = re.compile(r"^(?!osfmk/console/|iokit/|libkern/c\+\+/).*\.(c|h)$|^(?:iokit|libkern/c\+\+)/.*\.c$")   # an iokit or libkern/c++ .h can be C++ (r8 f8); osfmk/console is the logger (r8 f7)
+STR_LOG = {"ramlog_line", "sweet_log_append", "puts"}   # these read their argument as a string (r5 f6)
+DIGRAPHS = ("<%", "%>", "<:", ":>", "%:", "??")
+INNER_BAD = ("GIT binary patch", "Binary files", "literal ", "delta ", "rename ", "copy ", "similarity", "dissimilarity", "deleted file")
+INNER_HDR = ("diff --git", "+++ ", "--- ", "@@", "index ", "new file", "deleted file", "old mode", "new mode", "similarity", "rename ")
+
+
+TYPE_WORDS = {"int", "char", "long", "short", "unsigned", "signed", "void", "bool", "size_t", "pid_t", "proc_t", "thread_t", "task_t", "u8", "u16", "u32", "u64", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t"}
+
+
+def lex(t, in_comment):
+    """One line -> (code, in_comment after it, problem or None). Literals become "" / '', comments one space (a char lexer, so a quote in a
+    comment or a `/*` in a string cannot hide code). A `*/` outside a comment this change opened, or an unterminated literal, is a problem."""
+    out, i, n, prob = [], 0, len(t), None
+    while i < n:
+        if in_comment:
+            j = t.find("*/", i)
+            if j < 0:
+                return "".join(out).strip(), True, prob
+            out.append(" "); i, in_comment = j + 2, False
+            continue
+        if t.startswith("/*", i):
+            in_comment, i = True, i + 2
+            continue
+        if t.startswith("//", i):
+            break
+        if t.startswith("*/", i):
+            prob = "`*/` closes a comment the change did not open (code around it is hidden)"; i += 2
+            continue
+        if t.startswith(DIGRAPHS, i):   # <% %> <: :> %: mean { } [ ] # to the compiler; ??x trigraphs (Opus r3 f1, f4)
+            prob = "digraph or trigraph %r (the compiler reads it as a brace, bracket or #)" % t[i:i + 2]; i += 2
+            continue
+        c = t[i]
+        if ord(c) > 127:
+            prob = "non-ASCII character in code (an identifier the name rules cannot read; r5 f5)"; i += 1
+            continue
+        if c in "\"'" and out and (out[-1].isalnum() or out[-1] == "_"):
+            prob = "quote right after an identifier or digit: raw string, prefix or digit separator (r5 f5)"; i += 1
+            continue
+        if c in "\"'":
+            j = i + 1
+            while j < n and t[j] != c:
+                j += 2 if t[j] == "\\" else 1
+            if j >= n:
+                return "".join(out).strip(), in_comment, "unterminated string or char literal"
+            out.append(c + c); i = j + 1
+            continue
+        out.append(c); i += 1
+    return "".join(out).strip(), in_comment, prob
+
+
+def extern_name(s):
+    """The function name of a plain `extern <type> <name>(void or known types);`, else None: `extern foo_t (name);` declares an object (r6 f9)."""
+    m = EXTERN_FN.match(s)
+    if not m:
+        return None
+    for a in m.group("a").split(","):
+        w = re.sub(r"^\s*const\s+", "", a).split()
+        if not w or w[0].rstrip("*") not in TYPE_WORDS:
+            return None
+    return m.group("n")
+
+
+def calls(expr):
+    return [m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", expr) if m.group(1) not in KEYWORDS or m.group(1) in ("sizeof", "defined")]
+
+
+def call_args(expr, pos):
+    """Top-level arguments of the call whose `(` ends at POS, or None when it does not close in EXPR."""
+    args, depth, cur = [], 1, ""
+    for ch in expr[pos:]:
+        depth += (ch in "([{") - (ch in ")]}")
+        if depth == 0:
+            return args + [cur]
+        if ch == "," and depth == 1:
+            args.append(cur); cur = ""
+        else:
+            cur += ch
+    return None
+
+
+def top_comma(expr):
+    """True when EXPR has a `,` outside every ( [ {."""
+    depth = 0
+    for ch in expr:
+        depth += (ch in "([{") - (ch in ")]}")
+        if ch == "," and depth == 0:
+            return True
+    return False
+
+
+def paren_call(expr):
+    """The first `(X)(` in EXPR whose X is not a type cast (a call through a pointer: (*fp)(a), (int)(fp)(a)), else None."""
+    for m in re.finditer(r"\)\s*\(", expr):
+        depth, i = 0, m.start()
+        while i >= 0:
+            depth += (expr[i] == ")") - (expr[i] == "(")
+            if depth == 0:
+                break
+            i -= 1
+        if i < 0 or not CAST.match(expr[i + 1:m.start()]):
+            return expr[max(i, 0):m.end()]
+    return None
+
+
+def expr_ok(expr, allowed, decl):
+    """None when EXPR has no assignment/side-effect token, no call through a pointer, no bare ALL-CAPS name, and calls only ALLOWED names, else why."""
+    b = BAD.search(expr) or FLOW.search(expr)
+    if b:
+        return "side effect, control flow or banned token %r" % b.group(0)
+    if re.search(r"(->|\.)\s*[A-Za-z_]\w*\s*\(", expr):
+        return "call through a member pointer"
+    dr = re.search(r"(?:^|[(\[,=!&|<>?:+\-*/%~^])\s*\*\s*\(|\)\s*\*\s*\(|\)\s*(\[|->|\.)", expr)
+    if dr:   # *(T *)(base + off), ((T *)base)[i], (expr)->x: a memory read through a computed address (MMIO; Opus r3 f7)
+        return "read through a computed pointer %r (use a READ helper or a named local)" % dr.group(0).strip()
+    pcast = re.search(r"\(\s*(?!void\s*\*\s*\))[\w\s]*\*[\s\*\w]*\)", expr)
+    if pcast:
+        return "pointer cast %r: the reader or callee reads through a computed pointer" % pcast.group(0)
+    vc = re.search(r"\(\s*void\s*\*\s*\)\s*(?![A-Za-z_])", expr)
+    if vc or VOID_CAST.search(expr) and re.search(r"\b(strlen|strcmp|strncmp)\b", expr):   # (void *) only prints a named pointer with %p (r5 f6)
+        return "(void *) of a non-name or into a reader: reads through a computed pointer"
+    pc = paren_call(expr)
+    if pc:
+        return "call through a pointer %r" % pc[:40]
+    bad = [c for c in calls(expr) if c not in allowed]
+    if bad:
+        return "calls %s (not a log/read/pure function)" % ",".join(sorted(set(bad)))
+    caps = [c for c in re.findall(r"\b[A-Za-z_]\w*\b", expr) if c not in SAFE_CAPS and c not in PURE and (CAPS.match(c) or c[0].isupper() or c.startswith("_"))]
+    if caps:
+        return "bare ALL-CAPS, capitalised or _name %s (an object-like macro can hide a store)" % ",".join(sorted(set(caps)))
+    for m in re.finditer(r"\b(%s)\s*\(" % "|".join(sorted(OUT_ARG_READ)), expr):
+        args = call_args(expr, m.end())
+        if args is None:
+            return "%s call does not close" % m.group(1)
+        for a in args[1:]:
+            v = re.match(r"^&\s*(\w+)$", a.strip())
+            if not v or v.group(1) not in decl:
+                return "%s out-argument %r is not &local declared earlier in the change" % (m.group(1), a.strip()[:40])
+    return None
+
+
+def prev_ok(prev):
+    """PREV: the context line just before a run (None = unknown). True when it ends a statement, so the run cannot become its body."""
+    if prev is None:
+        return False
+    code, open_comment, prob = lex(prev.strip(), False)
+    if prob or prev.rstrip().endswith("\\"):
+        return False
+    if open_comment and not code:
+        return True
+    if code.endswith(":"):
+        return bool(re.match(r"^(case\b[^?:]*|default\s*|[A-Za-z_]\w*):$", code))   # ctx() already dropped an indented label
+    return code == "" or code.startswith("#") or code[-1] in ";{}"
+
+
+def decl_problems(d, decl, depth_br, ctx_names):
+    """D: a DECL match of one added or removed local. -> [why]."""
+    out = []
+    why = expr_ok(d.group("v") or "", READ | PURE, decl)
+    if why:
+        out.append("declaration: " + why)
+    if top_comma(d.group("v") or ""):
+        out.append("declaration with a second declarator (only the first name is checked; Opus r3 f5a)")
+    if depth_br == 0:
+        out.append("declaration in the existing scope: code outside the hunk may use %s (declare it inside the added if block; r3 f5b)" % d.group("n"))
+    if d.group("n") in ctx_names:
+        out.append("declaration of %s shadows a name the existing code uses" % d.group("n"))
+    return out
+
+
+def classify_frag(lines, removed, ctx_names=frozenset()):
+    """LINES: the removed (REMOVED) or the added lines of one run [(where, text)]; CTX_NAMES: identifiers of the file's context lines.
+    -> ([(where, why)], [(where, read call)])."""
+    out, reads, decl, pp_stack = [], [], set(), []
+    depth_pp, depth_br, pend, in_comment = 0, 0, None, False   # pend: open log-call statement (where, code so far)
+    for where, raw in lines:
+        if raw.rstrip().endswith("\\"):
+            out.append((where, "line continuation `\\` (splices the next line into this one)"))
+            continue
+        s, in_comment, prob = lex(raw.strip(), in_comment)
+        if prob:
+            out.append((where, prob))
+            continue
+        if re.search(r"%[-+ #0-9.*]*[hlzjt]*n", raw):   # the lexer drops the format string: %n would store through its argument (r8 f9)
+            out.append((where, "%n in a format string"))
+            continue
+        lone = s in ("{", "}", "};")
+        if ";" in s[:-1] or not lone and re.search(r"[{}]", s[1:] if s.startswith("}") else s[:-1] if s.endswith("{") else s):
+            out.append((where, "more than one statement or block on one line: %s" % raw.strip()[:80]))
+            continue
+        if pend is not None:
+            pend = (pend[0], pend[1] + " " + s)
+            if pend[1].count("(") <= pend[1].count(")"):
+                why = log_stmt(pend[1], decl)
+                if why:
+                    out.append((pend[0], why))
+                reads += [(pend[0], t) for t in [c + (" (removed)" if removed else "") for c in calls(pend[1]) if c in READ] if (pend[0], t) not in reads]   # r5 f7
+                pend = None
+            reads += [(where, c + (" (removed)" if removed else "")) for c in calls(s) if c in READ]
+            continue
+        if not s:
+            continue
+        reads += [(where, c + (" (removed)" if removed else "")) for c in calls(s) if c in READ]   # removing a read-to-clear changes HW (r3 f6)
+        if PP_OPEN.match(s):
+            depth_pp += 1
+            pp_stack.append(depth_br)
+            if re.match(r"^#\s*if\s+0\b", s):
+                out.append((where, "#if 0 disables code"))
+            continue
+        if PP_CLOSE.match(s):
+            depth_pp -= 1
+            if depth_pp < 0:
+                out.append((where, "#endif closes a block this change did not open"))
+                depth_pp = 0
+            elif pp_stack.pop() != depth_br:
+                out.append((where, "braces do not balance inside the #if block (the other branch may not compile them)"))
+            continue
+        if s.startswith("#"):
+            out.append((where, "preprocessor line %r (only #if/#endif pairs are log-only)" % s[:40]))
+            continue
+        if s in ("{", "}", "};") or s.startswith("}") and s.rstrip("; ") == "}":
+            depth_br += s.count("{") - s.count("}")
+            decl.clear()   # a closed block's names are out of scope: `(void)x` or `&x` after it means an outer x (r5 f4)
+            if depth_br < 0:
+                out.append((where, "`}` closes a block this change did not open"))
+                depth_br = 0
+            continue
+        m = COND.match(s)
+        if m:
+            if s.startswith("}"):
+                out.append((where, "else-if joins a block this change did not open"))
+                continue
+            if removed:
+                out.append((where, "removed if guard (changes control flow)"))
+            why = expr_ok(m.group("c"), READ | PURE, decl)
+            if why:
+                out.append((where, "if condition: " + why))
+            depth_br += 1
+            continue
+        if EXTERN.match(s):
+            en = extern_name(s)
+            if not en or en in TYPE_WORDS or en in ctx_names:
+                out.append((where, "extern shadows a name or has a parenthesised declarator: %s" % s[:60]))
+            continue
+        d = DECL.match(s)
+        if d:
+            out += [(where, w) for w in decl_problems(d, decl, depth_br, ctx_names)]
+            decl.add(d.group("n"))
+            continue
+        v = re.match(r"^\(void\)\s*(\w+)\s*;$", s)
+        if v and v.group(1) in decl:
+            continue   # (void)x; silences an unused witness variable (only one this change declares: a volatile name would be a read, r4)
+        name = re.match(r"^([A-Za-z_]\w*)\s*\(", s)
+        if name and name.group(1) in LOG:
+            if s.count("(") > s.count(")"):
+                pend = (where, s)
+                continue
+            why = log_stmt(s, decl)
+            if why:
+                out.append((where, why))
+            continue
+        out.append((where, "not a log/witness line: %s" % raw.strip()[:80]))
+    if in_comment:
+        out.append((lines[-1][0], "block comment does not close inside the change (it would comment out existing code)"))
+    if pend is not None:
+        out.append((pend[0], "log call does not close inside the change"))
+    if depth_pp or depth_br:
+        out.append((lines[-1][0], "unbalanced %s in the change (it would wrap existing code)" % ("#if/#endif" if depth_pp else "{ }")))
+    return out, reads
+
+
+def classify_run(run, ctx_names=frozenset()):
+    """RUN: (prev context line, [(where, text, sign)], next context line). -> ([(where, why)], reads). Removed and added lines are classed
+    apart (pre- and post-image)."""
+    prev, lines, nxt = run
+    out, reads = [], []
+    nxt_code = lex(nxt.strip(), False)[0] if nxt is not None else None
+    if nxt_code is not None and re.match(r"^(\}\s*)?else\b", nxt_code):
+        out.append((lines[-1][0], "change is followed by `else` (an added or removed if would capture it)"))
+    elif nxt_code is not None and re.match(r"^\}\s*\)", nxt_code):
+        out.append((lines[-1][0], "change is the last statement of a statement expression: it changes the value"))
+    elif nxt is None and any(COND.match(lex(t.strip(), False)[0]) for _, t, _ in lines):
+        out.append((lines[-1][0], "if block at the end of a hunk: the next line is unknown (could be an else it captures)"))
+    if all(s == "-" for _, _, s in lines) and prev is not None and re.match(r"^(while|for|do)\b.*\{$", lex(prev.strip(), False)[0]) and (nxt_code or "").startswith("}"):
+        out.append((lines[0][0], "removes the whole body of a loop: a log call was its only compiler barrier (r8 f5)"))
+    if not prev_ok(prev):
+        out.append((lines[0][0], "change follows a line that does not end a statement (%s): it could become that line's body" %
+                    ("no context line" if prev is None else repr(prev.strip()[:40]))))
+    for sign in "-+":
+        frag = [(w, t) for w, t, s in lines if s == sign]
+        if frag:
+            o, r = classify_frag(frag, sign == "-", ctx_names)
+            out += o; reads += r
+    return out, reads
+
+
+def log_stmt(s, decl):
+    """S: one whole log statement (literals stripped). None when it is `LOGFN(args);` with log/read/pure calls only."""
+    m = re.match(r"^([A-Za-z_]\w*)\s*\((?P<a>.*)\)\s*;$", s)
+    if not m or m.group(1) not in LOG:
+        return "not a single log statement: %s" % s[:80]
+    if m.group(1) in STR_LOG and VOID_CAST.search(m.group("a")):
+        return "(void *) into %s, which reads it as a string" % m.group(1)
+    depth = 1
+    for ch in m.group("a"):
+        depth += (ch in "([{") - (ch in ")]}")
+        if depth == 0:
+            return "text after the log call's closing paren: %s" % s[:80]   # r5 f12
+    why = expr_ok(m.group("a"), LOG | READ | PURE, decl)
+    return "log arguments: " + why if why else None
+
+
+def parse(diff):
+    """-> [{path, runs: [(prev, [(where, text, sign)])], binary, why}] from a `git diff` text. For an xnu patch the sign is the effective one
+    (outer and inner sign equal = the code is added, else removed) and prev is the last inner post-image line."""
+    files, cur = [], None
+    for line in diff.split("\n"):
+        if line.startswith("diff --"):
+            m = re.fullmatch(r"diff --git a/(\S+) b/(\S+)", line)   # anything else (--cc, a path with a space) is an unclassified path: hw-write
+            cur = {"path": m.group(2) if m else line, "apath": m.group(1) if m else line, "runs": [], "run": [], "start": None, "prev": None,
+                   "binary": False, "why": [], "n": 0, "hunk": False, "inner": False, "new": False, "patch": False, "await": None,
+                   "names": set(), "renamed": False}
+            cur["patch"] = cur["path"].startswith("xnu/patches/") and cur["path"].endswith(".patch")
+            files.append(cur)
+            continue
+        if cur is None:
+            continue
+        if line.startswith(("Binary files", "GIT binary patch")):
+            cur["binary"] = True
+            continue
+        if line.startswith(("rename from", "copy from")) and not cur["hunk"]:   # --diff mode only (git mode uses --no-renames)
+            cur["renamed"] = True
+            continue
+        if line.startswith(("new file", "deleted file")) and not cur["hunk"]:
+            cur["newdel"] = True
+        if line.startswith(("+++ ", "--- ", "index ", "new file", "deleted file", "similarity", "rename ", "old mode", "new mode")) and not cur["hunk"]:
+            continue
+        if line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)", line)
+            close(cur); end_hunk(cur)
+            cur["hunk"] = True
+            if cur["patch"] and cur["inner"]:
+                inner_counts(cur, cur["path"])   # per outer hunk: +1 here and -1 there is two stale inner counts, not none (r7 f3)
+            scan_risk(cur, re.sub(r"^@@.*?@@", "", line))   # the hunk heading names the function
+            cur["cc"], cur["pd"], cur["left"], cur["target"] = False, 0, None, None   # one outer hunk is continuous: its inner header is in view or unknown (r7 f2)
+            cur["n"] = int(m.group(3)) if m else 0
+            cur["new"] = bool(m) and m.group(1) == "0" and m.group(2) == "0"
+            cur["prev"], cur["await"] = ("" if cur["new"] else None), None
+            cur["inner"] = cur["inner"] or cur["n"] > 1   # fail closed: a hunk that does not start at the patch's line 1 is inside its inner diff
+            continue
+        if not line or line[0] not in "+- ":
+            close(cur); end_hunk(cur); cur["prev"] = None
+            continue
+        sign, body = line[0], line[1:]
+        if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", body):
+            cur["why"].append(("%s:%d" % (cur["path"], cur["n"]), "control character in a diff line (CR ends a line for the compiler, not for this parser)"))
+        where = "%s:%d" % (cur["path"], cur["n"])
+        if sign != "-":
+            cur["n"] += 1
+        if cur["patch"]:
+            parse_patch_line(cur, sign, body, where)
+            continue
+        if sign == " ":
+            close(cur); ctx(cur, body)
+            continue
+        add(cur, where, body, sign)
+    for f in files:
+        close(f); end_hunk(f)
+        if f["patch"] and f["inner"]:
+            inner_counts(f, f["path"])
+    return files
+
+
+def end_hunk(cur):
+    """The hunk ends: in a new plain file that is the end of the file (nothing follows the last run), else the next line is unknown."""
+    if cur["await"] is not None and cur["new"] and not cur["patch"]:
+        cur["await"][2] = ""
+    cur["await"] = None
+
+
+def scan_risk(cur, code):
+    """Code in view (a context line, a hunk heading) that a call next to it can break: inline asm operands; lock, IRQ, MMU, early-boot or section context; a poll loop."""
+    cur["asm"] = cur.get("asm") or bool(ASM.search(code))
+    cur["risk"] = cur.get("risk") or bool(RISK.search(code))
+    cur["loop"], cur["poll"] = cur.get("loop") or bool(LOOP.search(code)), cur.get("poll") or bool(POLL.search(code))
+
+
+def inner_counts(cur, where):
+    """An inner hunk of an existing patch ends: an outer change that alters its line counts left its `@@` header stale (an edited header is
+    hw-write already), so xnu-local-build would skip the whole patch (Opus r2 f9a)."""
+    if not cur["new"] and any(cur.get("delta", (0, 0))):
+        cur["why"].append((where, "inner hunk line counts changed but its @@ header did not: xnu-local-build would skip the whole patch"))
+    cur["delta"] = (0, 0)
+
+
+def parse_patch_line(cur, sign, body, where):
+    """One outer line of an xnu/patches/*.patch diff."""
+    hdr = body.startswith(INNER_HDR) or body.startswith(INNER_BAD)
+    last, cur["lastbody"] = cur.get("lastbody", ""), body
+    left = cur.get("left") or (0, 0)   # lines the inner @@ still promises: until they are used up, a ---/+++ line is code (r6 f5)
+    in_body = left[0] > 0 or left[1] > 0
+    if cur.get("lead") is not None and in_body and body[:1] in (" ", "+", "-"):   # a new patch cut short hides what is above it (r8 f3)
+        if body[0] == " ":
+            cur["lead"] += 1
+        else:
+            if cur["lead"] < 3:
+                cur["why"].append((where, "inner hunk with fewer than 3 context lines above its first change, not at line 1: the code above is out of view (r8 f3)"))
+            cur["lead"] = None
+    if in_body and body[:1] in (" ", "+", "-"):
+        cur["left"] = (left[0] - (body[0] in " -"), left[1] - (body[0] in " +"))
+    if hdr and sign != " " and (in_body and body.startswith(("+++ ", "--- ")) or
+                                cur.get("inner_hunk") and (body.startswith("+++ ") and not last.startswith("--- ") or
+                                                           body.startswith("--- ") and not last.startswith(INNER_HDR))):
+        cur["why"].append((where, "inner line that looks like a ---/+++ header inside a hunk: it is code to git apply (r5 f10)"))
+    if hdr and body.startswith("@@"):
+        cur["inner_hunk"] = True
+        c = re.match(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@", body)
+        cur["left"] = (int(c.group(2) or 1), int(c.group(3) or 1)) if c else None
+        cur["lead"] = 0 if c and cur["new"] and int(c.group(1)) > 1 else None
+        scan_risk(cur, re.sub(r"^@@.*?@@", "", body))
+    elif hdr and body.startswith("diff --git"):
+        cur["inner_hunk"] = False
+    if sign != " " and (body.startswith("new file") or re.match(r"^@@ -0(,0)? ", body)):
+        cur["why"].append((where, "inner new file: it can shadow a header found through -I (r5 f9, r6 f4)"))
+    if not hdr and sign != " " and cur["inner"] and body[:1] in (" ", "+", "-"):   # per inner hunk: (old side, new side) line count change
+        d = 1 if sign == "+" else -1
+        o, n = cur.get("delta", (0, 0))
+        cur["delta"] = (o + d * (body[0] in " -"), n + d * (body[0] in " +"))
+    if hdr:
+        if body.startswith("@@") or body.startswith("diff --git"):
+            inner_counts(cur, where)
+        close(cur)
+        if sign != " " and not cur["new"]:
+            cur["why"].append((where, "inner header edited: git apply would move the patch's code to another site or file"))
+        if sign != " " and body.startswith(INNER_BAD):
+            cur["why"].append((where, "inner binary/rename/copy/delete: git apply replaces or moves a whole file"))
+        t = re.match(r"diff --git a/(\S+) b/(\S+)", body)
+        if sign != " " and t and not all(re.search(r"\.(c|h)$", x) for x in t.groups()):
+            cur["why"].append((where, "inner target is not a C/C++ source file: %s" % t.group(2)))
+        q = re.match(r"^(?:\+\+\+|---) (?:[ab]/)?(\S+)", body)
+        if sign != " " and q and not re.search(r"\.(c|h)$", q.group(1)):   # /dev/null too: a traditional header creates or deletes the file (r6 f4)
+            cur["why"].append((where, "inner target is not a C source file: %s" % q.group(1)))
+        if t or q:
+            cur["target"] = t.group(2) if t else q.group(1)
+        cur["inner"] = True
+        cur["cc"], cur["pd"] = False, 0
+        cur["prev"], cur["await"] = ("" if re.match(r"^@@ -0,0 ", body) else None), None   # inner hunk start: the line before it is unknown
+        return
+    if sign == " ":
+        if cur["inner"] and body[:1] in " +":
+            close(cur); ctx(cur, body[1:])
+        elif cur["inner"] and body[:1] == "-":
+            close(cur)
+        return
+    if not cur["inner"]:
+        return   # free text (patch description) before the first inner header
+    if not cur["new"] and body[:1] in " ":
+        close(cur)
+        cur["why"].append((where, "inner context line edited: git apply would move the patch's code to another site or file"))
+        return
+    if body[:1] and body[0] in "+-":
+        if not INNER_C.match(cur.get("target") or ""):   # the language decides what the log rules mean (r6 f8)
+            cur["why"].append((where, "inner code line whose target file is not a C or H file seen in this diff: %s" % cur.get("target")))
+        add(cur, where, body[1:], "+" if body[0] == sign else "-")
+    elif body[:1] == " ":   # a new patch: its inner context lines are not code the outer change adds
+        close(cur)
+        if sign == "+" and body[:1] == " ":
+            ctx(cur, body[1:])
+    else:
+        close(cur)
+        cur["why"].append((where, "inner line that is neither code nor context (a `\\` line makes git apply join lines; r6 f3): %r" % body[:40]))
+
+
+def ctx(cur, text):
+    """A context (unchanged post-image) line: the prev of the next run, the next of the last run, and its names may not be shadowed."""
+    code, cc, p = lex(text.strip(), cur.get("cc", False))
+    pp = re.match(r"^#\s*(if|else|elif|endif)", code)
+    if p or pp:   # a `*/` or digraph: the code before is unknown. #if #else #endif: another path, whose last line this is not (r5 f1)
+        cur["prev"] = None
+    elif text.rstrip().endswith("\\"):
+        cur["prev"] = text
+    elif code and not code.startswith("#"):
+        label = re.match(r"^(case\b.*|default\s*|[A-Za-z_]\w*\s*):$", code)
+        if not label:
+            cur["prev"] = code
+        elif not prev_ok(cur["prev"]) or not (re.match(r"^(case\b|default\b)", code) or re.match(r"^[A-Za-z_]\w*:\s*$", text)):
+            cur["prev"] = None   # a label proves nothing about the line before it; an indented or spaced ident: may be a ternary arm (r5 f3, r4 f4)
+        else:
+            cur["prev"] = code
+    if cur["await"] is not None and pp:
+        cur["await"] = None
+    elif cur["await"] is not None and code and not code.startswith("#"):
+        await_next(cur, code)
+    if not code.startswith("#"):   # open ( across context lines: a run there is inside a call or a for header (r4 f9)
+        cur["pd"] = max(0, cur.get("pd", 0) + code.count("(") - code.count(")"))
+    cur["cc"] = cc
+    cur["names"].update(re.findall(r"\b[A-Za-z_]\w*\b", code))
+    scan_risk(cur, code)
+
+
+def await_next(cur, code):
+    """CODE: the first code line after a run is its next; after a lone `}` also look one further for a split `})` (r5 f8)."""
+    if cur.get("await_brace"):
+        cur["await"][2] = "})" if code.startswith(")") else "}"
+    else:
+        cur["await"][2] = code
+    cur["await_brace"] = code == "}" and not cur.get("await_brace")
+    if not cur["await_brace"]:
+        cur["await"] = None
+
+
+def add(cur, where, text, sign):
+    if not cur["run"]:
+        cur["start"] = cur["prev"]
+        if cur.get("pd"):
+            cur["why"].append((where, "change sits inside an open ( of the context: a for header or call argument, not a statement (r4 f9)"))
+    cur["run"].append((where, text, sign))
+
+
+def close(cur):
+    if cur and cur["run"]:
+        cur["runs"].append([cur["start"], cur["run"], None])
+        cur["await_brace"] = False   # the look-past-`}` state belongs to one run: stale, it hid the next run's `else` (r6 f1)
+        cur["await"] = cur["runs"][-1]
+        cur["run"] = []
+
+
+def classify(diff):
+    """-> (class, [(where, why)], files, port_lines, [(where, read call)])."""
+    why, reads, tools, port_lines = [], [], False, 0
+    files = parse(diff)
+    if not files:   # empty: a landed branch, a wrong checkout (r6 f6); else an external diff driver
+        why.append(("-", "diff with no `diff --git` file header: nothing was classified"))
+    if re.search(r"^Submodule ", diff, re.M):   # a changed line starts with + - or space, so this is a submodule summary (r6 f10)
+        why.append(("-", "submodule change"))
+    for f in files:
+        path = f["path"]
+        if f["path"] != f["apath"] and not f["renamed"]:
+            why.append((path, "a/ and b/ paths differ with no rename line"))
+            continue
+        if f["renamed"] and (PORT_ANY.match(path) or PORT_ANY.match(f["apath"]) or SAFETY.match(f["apath"])):
+            why.append((path, "renamed or copied from %s (a rename can drop port code or change the patch apply order)" % f["apath"]))
+            continue
+        if path.endswith(".md"):
+            continue
+        if path.startswith("tools/"):
+            if SAFETY.match(path):
+                why.append((path, "boot-safety audit, gate class split or classifier file changed"))
+            tools = True
+            continue
+        if f["binary"]:
+            why.append((path, "binary file"))
+            continue
+        if PORT_CODE.match(path) and f.get("newdel"):
+            why.append((path, "new or deleted port source: it can shadow or unshadow a header found through -I, and only a build input builds it (r5 f9)"))
+            continue
+        if PORT_CODE.match(path) or re.match(r"^xnu/patches/\d{4}-[^/]*\.patch$", path):
+            why += f["why"]
+            if f.get("asm"):
+                why.append((path, "inline asm or a register variable in view: a call between them clobbers the operands (gcc; r7 f1)"))
+            if f.get("risk") or f.get("loop") and f.get("poll"):
+                why.append((path, "lock, IRQ, MMU, early-boot, section, exclusive or poll-loop code in view: a call there can deadlock, recurse or change timing (r8 f4)"))
+            if path in LOGGER:
+                why.append((path, "the logger itself: a log here recurses (r8 f7)"))
+            for run in f["runs"]:
+                port_lines += len(run[1])
+                o, r = classify_run(run, frozenset(f["names"]))
+                why += o; reads += r
+            continue
+        why.append((path, "port input that is not C code (table, build script, series)" if PORT_ANY.match(path) else "unclassified path"))
+    if not why and reads and tools:
+        why.append(("-", "port reads mixed with tools changes (log-read needs Opus, tools keeps mutants): split the change"))
+    cls = "hw-write" if why else "log-read" if reads else "tools" if tools else "log-only"
+    return cls, why, len(files), port_lines, reads
+
+
+def self_test():
+    """The cases live in change_class_selftest_lib.py, loaded by path only here: a classifying run (`python3 -I`) imports nothing from the branch."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("change_class_selftest_lib", os.path.join(ROOT, "tools", "change_class_selftest_lib.py"))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod.self_test(classify)
+
+
+def git(*a):
+    r = subprocess.run(["git", "-C", ROOT, *a], capture_output=True, timeout=120)
+    r.stdout, r.stderr = r.stdout.decode("utf-8"), r.stderr.decode("utf-8", "replace")
+    if r.returncode:
+        print("CHANGE-CLASS ERROR git %s: %s\nRESULT: FAIL change-class git" % (" ".join(a), r.stderr.strip()[:200]))
+        raise SystemExit(2)
+    return r.stdout
+
+
+def say(line):
+    """One output line. Diff text is quoted in it: a raw CR would start a forged RESULT line for the gate (r6 f2)."""
+    print(re.sub(r"[\x00-\x1f\x7f]", "?", line))
+
+
+def report(diff, base):
+    cls, why, nf, pl, reads = classify(diff)
+    for w, y in why[:20]:
+        say("CHANGE-CLASS hw-write %s: %s" % (w, y))
+    if len(why) > 20:
+        say("CHANGE-CLASS ... +%d more" % (len(why) - 20))
+    for p in sorted({w.split(":", 1)[0] for w, _ in why}):
+        say("CHANGE-CLASS hw-write-file %s" % p)
+    for w, c in reads:
+        say("CHANGE-CLASS read %s: %s" % (w, c))
+    print("RESULT: PASS change-class class=%s files=%d port_lines=%d base=%s" % (cls, nf, pl, base))
+    return 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    opts = dict(zip(argv[::2], argv[1::2]))
+    if len(argv) % 2 or set(opts) - {"--base", "--head", "--diff"}:
+        print(__doc__.splitlines()[2]); return 2
+    if "--diff" in opts:
+        with open(opts["--diff"], newline="") as f:
+            return report(f.read(), "file")
+    base = opts.get("--base") or git("merge-base", "HEAD", "trunk").strip()
+    diff = git("diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", "-W", "--submodule=short", "--ignore-submodules=none", base, *([opts["--head"]] if "--head" in opts else []))
+    if "--head" not in opts:   # untracked files are changes too (as the quick gate sees them)
+        for p in filter(None, git("ls-files", "-z", "--others", "--exclude-standard").split("\0")):
+            diff += "\ndiff --git a/%s b/%s\nnew file mode 100644\n@@ -0,0 +1 @@\n" % (p, p) + "".join("+" + l for l in open(os.path.join(ROOT, p), encoding="utf-8", newline="").readlines())
+    return report(diff, base[:12])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except UnicodeDecodeError as e:   # a non-UTF-8 diff (patch 0058 carries binary bytes): fail closed, never a bare traceback
+        print("CHANGE-CLASS ERROR non-UTF-8 diff text: %s\nRESULT: FAIL change-class decode" % e); sys.exit(2)

@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 
 /*
  * gpurails.h - READ-ONLY dump of the S2MPG11 registers of the GPU rails (build.sh --gpu-rails, implies --gpu-probe, gs101 only).
@@ -11,3 +12,7 @@
  * doorbell, the reply rear, INTCR0); no PMIC register is ever written. gpurails.c has no MMIO access of its own (audited).
  */
 int gpu_rails(void);
+
+/* Same read, and on return 0 the decoded OUT1 voltage in uV of BUCK2S (shaders, VDD_G3D) and BUCK8S (L2, VDD_G3D_L2) through the pointers (either may be 0 = not wanted);
+ * on any non-zero return they are left untouched. gpu_rails() is gpu_rails_uv(0, 0). No extra ACPM traffic. */
+int gpu_rails_uv(uint32_t *b2s_uv, uint32_t *b8s_uv);

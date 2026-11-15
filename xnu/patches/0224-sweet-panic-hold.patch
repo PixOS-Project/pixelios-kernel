@@ -1,0 +1,81 @@
+SWEET panic hold (patch 0224, T-35ba, rule 8): boot-arg sweetpanichold=<S> (default 20, 0 = none, above 120 cut with a SWEET GAP line). With the default debug=0x8 a panic resets by itself (patches 0140, 0182) and the panic text must still reach the camera: before the reset this prints the same `Original panic string` block as the DB_NMI path, then spins on the timebase for S s. No hardware write, no lock. Host test tools/test_0224_panic_hold.py.
+
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -330,6 +330,13 @@
+ 
+ TUNABLE(int, verbose_panic_flow_logging, "verbose_panic_flow_logging", 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* PixOS patch 0224: seconds the panic text stays on the screen before the reset (sweetpanichold=<S>, 0 = none). */
++#define SWEET_PANIC_HOLD_DEFAULT_S 20
++#define SWEET_PANIC_HOLD_MAX_S     120
++static TUNABLE(unsigned int, sweet_panic_hold_s, "sweetpanichold", SWEET_PANIC_HOLD_DEFAULT_S);
++#endif
++
+ char kernel_uuid_string[37]; /* uuid_string_t */
+ char kernelcache_uuid_string[37]; /* uuid_string_t */
+ char   panic_disk_error_description[512];
+@@ -482,6 +489,13 @@
+ 			sweet_noregion_gap_printed = TRUE;
+ 			printf("SWEET GAP: no panic region (no pram / embedded-panic-log-size in ADT); panic log not saved, panics %s (patch 0182; real fix PR-3)\n",
+ 			    panicDebugging ? "spin (debug= has DB_NMI 0x4)" : "reset once /sweet-reset is set up");
++			/* PixOS patch 0224 (rule 8): what a panic will do on this boot, and a value that was cut. */
++			if (sweet_panic_hold_s > SWEET_PANIC_HOLD_MAX_S) {
++				printf("SWEET GAP: sweetpanichold=%u above %u, using %u (patch 0224)\n", sweet_panic_hold_s,
++				    SWEET_PANIC_HOLD_MAX_S, SWEET_PANIC_HOLD_MAX_S);
++			}
++			printf("SWEET FAULT HOLD: %u s on screen before the reset (patch 0224)%s\n",
++			    MIN(sweet_panic_hold_s, SWEET_PANIC_HOLD_MAX_S), panicDebugging ? ", not used: debug= has DB_NMI 0x4" : "");
+ 		}
+ #endif
+ 		return;
+@@ -1222,6 +1236,38 @@
+ #endif
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * PixOS patch 0224: debug=0x8 resets at once and the panic text would be gone. Print it with the calls of the DB_NMI block
++ * of debugger_collect_diagnostics, then spin on the timebase so the camera can read it. No hardware write, no lock.
++ */
++static void
++sweet_panic_hold(void)
++{
++	unsigned int secs = MIN(sweet_panic_hold_s, SWEET_PANIC_HOLD_MAX_S);
++	uint64_t interval, end;
++
++	if (secs == 0) {
++		return;
++	}
++	if (debugger_panic_str) {
++		panic_debugger_log("Original panic string:\n");
++		panic_debugger_log("panic(cpu %u caller 0x%lx): ", (unsigned) cpu_number(), debugger_panic_caller);
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wformat-nonliteral"
++		_doprnt(debugger_panic_str, debugger_panic_args, consdebug_putc, 0);
++#pragma clang diagnostic pop
++		panic_debugger_log("\n");
++	}
++	panic_debugger_log("SWEET PANIC HOLD: reset in %u s\n", secs);
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &interval);
++	end = mach_absolute_time() + interval;
++	while (mach_absolute_time() < end) {
++		__asm__ volatile ("yield");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * Gather and save diagnostic information about a panic (or Debugger call).
+  *
+@@ -1486,6 +1532,9 @@
+ #endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+ 
+ 	if (!panicDebugging) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_panic_hold();
++#endif
+ 		kdp_machine_reboot_type(kPEPanicRestartCPU, debugger_panic_options);
+ 	}
+ 

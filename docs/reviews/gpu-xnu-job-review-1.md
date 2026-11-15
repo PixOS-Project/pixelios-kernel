@@ -132,7 +132,7 @@ Reviewer did not touch the phone, adb or fastboot. Nothing edited except this fi
 
 - Kernel built from this patch stack, checked by sha256 against what `tools/xrun` boots. `tools/fboot.sh` / `fastboot boot` only; nothing flashed except userdata, if needed.
 - Shim with `--boot-xnu --gpu-handover`. Before reading the XNU result, check the shim's pstore line `GPU handover rail (0=on)` = 0. If it is not 0, expect "shaders did not come up"; that is a safe, expected outcome.
-- Command: `tools/xrun --kernel K --gpu-handover --args "sweetgpujob=1" --label gpujob1 --expect 'SWEET GPUJOB: '`. Run it as one background job with the USB UDP log on, `--cpus 1` (default), no `--dvfs`, `--qr off`.
+- Command: `tools/xrun --kernel K --gpu-handover --args "sweetgpujob=1" --label gpujob1 --expect 'SWEET GPUJOB: '`. Run it as one background job with the USB UDP log on, `--cpus 1` (explicit; the xrun default is now 8), no `--dvfs`, `--qr off`.
   `--gpu-handover` already adds `sweetgpu=0x1C500000` (build-xnu-image.sh:33). Do not add it twice, and use no other GPU boot-arg.
 - Before relying on the result, check that the same boot's 0102 lines match u1: PMU 0x1/0x1, muxes 0x10, GPU_ID 0x92020010, all READY and PWRTRANS 0, JOB/MMU RAW 0, GPU_FAULTSTATUS 0, S2MPU CTRL0=0. If any differs, treat the run as void (M1/M2 would have refused) and fix M1/M2 before re-running.
 - Pass criterion: `SWEET GPUJOB: submit=ok wait=done ... target=... (MAGIC) as0_off=ok`. Afterwards the phone must reach `tools/phone goto fastboot` / android normally; a cold reboot is enough to clear the GPU.

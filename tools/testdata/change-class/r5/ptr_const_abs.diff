@@ -1,0 +1,7 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,2 +1,3 @@
+ {
++	printf("%s", (char *const)0x1c500000);
+ }

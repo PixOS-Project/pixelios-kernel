@@ -1,0 +1,264 @@
+SWEET USB root fast receive (patch 0172), opt-in: boot-arg sweetusbrootfast=1 (absent or 0 = off: byte-identical behaviour, nothing new printed; read as a string: exactly "1" = on, exactly "0" = off; any other value, including empty, = loud GAP line quoting it, stays off). Needs rd=usbroot0 (0157). Reader: woken by thread_wakeup from sweet_usbroot_rx when the last fragment lands instead of polling ur.state every 1 ms; one lck_spin_sleep_deadline with the old 2000 ms deadline. USB event thread (sweet_usb.c ud_thread): own sleep event, 1 ms when idle, polls every 100 us (SYS_CRITICAL, no leeway) only while a usbroot request waits, woken when a request starts. No register, field or command is added: the event loop body is unchanged, only the sleep between loops is shorter while a reply is due. Wire protocol v1, retries, timeouts, fail-fast unchanged. Log: 'SWEET USBROOT: fast stats' every 256 answers (request->answer microseconds, short polls); the per-request 'answered after W ms' trace gives elapsed ms in fast mode. Spec: docs/specs/SPEC-USBROOT-FAST.md section 4 P2 + 6. Not run on hardware.
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -674,6 +674,75 @@
+ 	return true;
+ }
+ 
++/*
++ * USB root fast receive (patch 0172; boot-arg sweetusbrootfast=1, switched on by bsd/dev/sweet_usbroot.c only
++ * with rd=usbroot0, before sweet_usb_probe()). Off (the default) nothing below runs and ud_thread sleeps 1 ms per
++ * loop on ud.sleep_chan exactly as before. On: ud_thread sleeps on its own event ud_rx_chan (ud_log_thread keeps
++ * ud.sleep_chan), still 1 ms when idle, but while a usbroot request waits for its reply (ud_rx_hurry) it polls
++ * every UD_RX_HURRY_US with no timer leeway, so a received fragment is handled and the single RX TRB re-armed
++ * sooner. No register, field or command is added: the loop body (GEVNTCOUNT read, events, GEVNTCOUNT ack only
++ * when count != 0) is unchanged; only the sleep between two loops is shorter, and only while a request waits
++ * (at most UR_TRIES x (UR_WAIT_MS send retries + UR_WAIT_MS wait), ~17 s per request; ~60% duty with the host gone).
++ */
++#define UD_RX_HURRY_US  100             /* our poll interval while a usbroot reply is due; a software choice, not a hardware value */
++static volatile bool ud_rx_fast;        /* set once, before the USB device starts */
++static volatile bool ud_rx_hurry;       /* a usbroot request is waiting for its reply */
++static int ud_rx_chan;                  /* ud_thread's sleep event in fast mode */
++static volatile uint64_t ud_rx_short_polls;     /* short polls taken (written by ud_thread only) */
++
++void sweet_usb_rx_fast_enable(void);
++void sweet_usb_rx_hurry(bool on);
++uint64_t sweet_usb_rx_short_polls(void);
++
++void
++sweet_usb_rx_fast_enable(void)
++{
++	ud_rx_fast = true;
++	printf("SWEET USB: usbroot fast receive on: event thread polls every %u us while a reply is due (patch 0172)\n",
++	    UD_RX_HURRY_US);
++}
++
++/* Called by the usbroot reader around one request; on = wake ud_thread now so it starts polling fast. */
++void
++sweet_usb_rx_hurry(bool on)
++{
++	ud_rx_hurry = on;
++	if (on && ud_rx_fast) {
++		thread_wakeup(&ud_rx_chan);     /* never blocks (osfmk/kern/sched_prim.c thread_wakeup_prim) */
++	}
++}
++
++uint64_t
++sweet_usb_rx_short_polls(void)
++{
++	return ud_rx_short_polls;
++}
++
++/* ud_thread, fast mode: sleep until the deadline or a sweet_usb_rx_hurry(true) wake-up. */
++static void
++ud_rx_fast_wait(void)
++{
++	uint64_t deadline;
++
++	if (ud_rx_hurry) {
++		clock_interval_to_deadline(UD_RX_HURRY_US, NSEC_PER_USEC, &deadline);
++		/* SYS_CRITICAL: timer_call_slop() adds no coalescing leeway (osfmk/kern/timer_call.c timer_call_slop) */
++		(void)assert_wait_deadline_with_leeway(&ud_rx_chan, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL, deadline, 0);
++		thread_block(THREAD_CONTINUE_NULL);
++		ud_rx_short_polls++;
++		return;
++	}
++	clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
++	if (assert_wait_deadline(&ud_rx_chan, THREAD_UNINT, deadline) == THREAD_WAITING) {
++		/* a request that started between the check above and the assert must not wait out the 1 ms */
++		if (ud_rx_hurry) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
+ /*
+  * Link state for configd (KernelEventMonitor reads SIOCGIFMEDIA and the
+  * KEV_DL_LINK_ON/OFF events; IPMonitor does not route through a service
+@@ -891,10 +960,18 @@
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		if (ud_rx_fast && ud_rx_hurry) {
++			ud_rx_fast_wait();      /* short poll: not a 1 ms tick, so the 30 s counter line keeps its rate */
++			continue;
++		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+-		ud_sleep_ms(1);
++		if (ud_rx_fast) {
++			ud_rx_fast_wait();
++		} else {
++			ud_sleep_ms(1);
++		}
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_usbroot.c b/bsd/dev/sweet_usbroot.c
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -37,6 +37,9 @@
+ extern bool sweet_usb_board_is_gs101(void);
+ extern bool sweet_usb_raw_tx(const void *frame, uint32_t len);
+ extern bool sweet_ufs_active(void);
++extern void sweet_usb_rx_fast_enable(void);
++extern void sweet_usb_rx_hurry(bool on);
++extern uint64_t sweet_usb_rx_short_polls(void);
+ 
+ #define UR_ETHERTYPE    0x88b6          /* IEEE 802 local experimental EtherType 2 */
+ #define UR_VERSION      1
+@@ -88,7 +91,7 @@
+ 
+ static LCK_GRP_DECLARE(ur_grp, "sweet_usbroot");
+ static LCK_MTX_DECLARE(ur_lock, &ur_grp);       /* one block request at a time */
+-static LCK_SPIN_DECLARE(ur_spin, &ur_grp);      /* exchange state shared with the USB thread; never held across a sleep */
++static LCK_SPIN_DECLARE(ur_spin, &ur_grp);      /* exchange state shared with the USB thread; dropped by lck_spin_sleep_deadline before blocking (0172) */
+ 
+ static struct {
+ 	bool active;                    /* rd=usbroot0 chose this device: the UFS root must not start */
+@@ -178,6 +181,62 @@
+ 	return ur.active;
+ }
+ 
++/*
++ * Fast receive (patch 0172), boot-arg sweetusbrootfast=1, default off. Off: the reader polls ur.state every 1 ms
++ * (ur_sleep_ms) as before and nothing below prints. On: sweet_usbroot_rx wakes the reader with thread_wakeup the
++ * moment the exchange is complete, the reader sleeps once on ur_done_chan with the UR_WAIT_MS deadline, and the
++ * USB event thread polls fast while the reply is due (sweet_usb_rx_hurry, bsd/dev/sweet_usb.c). Wire protocol v1,
++ * retries, timeouts and the fail-fast rule are unchanged. Every UR_FAST_STATS_N answered requests one
++ * "SWEET USBROOT: fast stats" line gives the request -> answer time in microseconds.
++ */
++#define UR_FAST_STATS_N 256             /* answered requests per stats line (log volume), not a hardware value */
++#define UR_FAST_SLOW_US 8000            /* "slow" bucket of the stats line: still more than a quarter of the old 32 ms */
++static bool ur_fast;                    /* set once in ur_rootdev before the USB device starts */
++static int ur_done_chan;                /* the reader's event: exchange done */
++static struct {
++	uint32_t n, slow;               /* answered requests in this window; of them over UR_FAST_SLOW_US */
++	uint64_t sum_us, min_us, max_us;
++	uint64_t polls0;                /* sweet_usb_rx_short_polls() at the window start */
++	uint64_t total;                 /* answered requests since boot */
++} ur_fs;                                /* under ur_lock (ur_xfer callers hold it) */
++
++static uint64_t
++ur_uptime_us(void)
++{
++	uint64_t t = 0, ns = 0;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* One answered request of us microseconds into the window; prints and restarts it every UR_FAST_STATS_N. */
++static void
++ur_fast_account(uint64_t us)
++{
++	if (ur_fs.n == 0) {
++		ur_fs.min_us = ~0ULL;
++		ur_fs.max_us = ur_fs.sum_us = 0;
++		ur_fs.slow = 0;
++	}
++	ur_fs.n++;
++	ur_fs.total++;
++	ur_fs.sum_us += us;
++	ur_fs.min_us = MIN(ur_fs.min_us, us);
++	ur_fs.max_us = MAX(ur_fs.max_us, us);
++	if (us > UR_FAST_SLOW_US) {
++		ur_fs.slow++;
++	}
++	if (ur_fs.n == UR_FAST_STATS_N) {
++		uint64_t polls = sweet_usb_rx_short_polls();
++		printf("SWEET USBROOT: fast stats: %u answers (total %llu), request->answer us mean %llu min %llu max %llu, "
++		    "over %u us %u, event-thread short polls %llu, bad frames %u\n", ur_fs.n, ur_fs.total,
++		    ur_fs.sum_us / ur_fs.n, ur_fs.min_us, ur_fs.max_us, UR_FAST_SLOW_US, ur_fs.slow, polls - ur_fs.polls0,
++		    ur.bad_frames);
++		ur_fs.polls0 = polls;
++		ur_fs.n = 0;
++	}
++}
++
+ /*
+  * Frame from the USB RX path (sweet_usb.c, runs in the USB event thread: must not sleep). Returns true when
+  * the frame is ours (consumed), false for everything else (goes to the IP stack as before).
+@@ -232,7 +291,11 @@
+ 			}
+ 		}
+ 	}
++	bool finished = (ur.state == EX_DONE);
+ 	lck_spin_unlock(&ur_spin);
++	if (ur_fast && finished) {
++		thread_wakeup(&ur_done_chan);   /* never blocks (osfmk/kern/sched_prim.c thread_wakeup_prim); after the unlock */
++	}
+ 	return true;
+ 
+ bad:
+@@ -313,6 +376,10 @@
+ 		ur_put32(h + 12, total);
+ 		ur_put64(h + 16, lba);
+ 		ur_put32(h + 32, crc32(0, h, UR_CRC_SPAN));
++		if (ur_fast) {
++			sweet_usb_rx_hurry(true);       /* the event thread polls fast until this request is over */
++		}
++		uint64_t t0_us = ur_fast ? ur_uptime_us() : 0;
+ 		/* A refused send (TX queue full, no mbuf) is retried for up to UR_WAIT_MS and is not a spent try. */
+ 		bool sent = sweet_usb_raw_tx(frame, UR_TX_MIN);
+ 		for (unsigned t = 0; !sent && t < UR_WAIT_MS; t++) {
+@@ -322,7 +389,23 @@
+ 		unsigned waited = 0;
+ 
+ 		UR_TRACE("request op %u lba 0x%llx total %u seq %u attempt %d sent %d", op, lba, total, seq, attempt, sent);
+-		for (; sent && waited < UR_WAIT_MS; waited++) {
++		if (ur_fast && sent) {
++			/* One sleep, woken by sweet_usbroot_rx when done; waited = elapsed ms (not 1 ms loop iterations). */
++			uint64_t deadline, now = 0;
++			clock_interval_to_deadline(UR_WAIT_MS, NSEC_PER_MSEC, &deadline);
++			lck_spin_lock(&ur_spin);
++			while (ur.state != EX_DONE) {
++				clock_get_uptime(&now);
++				if (now >= deadline ||
++				    lck_spin_sleep_deadline(&ur_spin, LCK_SLEEP_DEFAULT, &ur_done_chan, THREAD_UNINT, deadline) ==
++				    THREAD_TIMED_OUT) {
++					break;
++				}
++			}
++			lck_spin_unlock(&ur_spin);
++			waited = (unsigned)((ur_uptime_us() - t0_us) / 1000);
++		}
++		for (; !ur_fast && sent && waited < UR_WAIT_MS; waited++) {
+ 			lck_spin_lock(&ur_spin);
+ 			bool finished = (ur.state == EX_DONE);
+ 			lck_spin_unlock(&ur_spin);
+@@ -336,6 +419,12 @@
+ 		*status = ur.status;
+ 		ur.state = EX_IDLE;
+ 		lck_spin_unlock(&ur_spin);
++		if (ur_fast) {
++			sweet_usb_rx_hurry(false);
++			if (done) {
++				ur_fast_account(ur_uptime_us() - t0_us);
++			}
++		}
+ 		UR_TRACE("attempt %d %s after %u ms, status %u, %u bad frames", attempt, done ? "answered" : "unanswered",
+ 		    waited, (unsigned)*status, ur.bad_frames);
+ 		if (done) {
+@@ -757,6 +846,17 @@
+ 		printf("SWEET USBROOT: gs101 only\n");
+ 		return ENODEV;
+ 	}
++	char fast[8] = "";
++	if (PE_parse_boot_arg_str("sweetusbrootfast", fast, sizeof(fast))) {
++		if (strcmp(fast, "1") == 0) {
++			ur_fast = true;
++			sweet_usb_rx_fast_enable();
++			printf("SWEET USBROOT: fast receive on (sweetusbrootfast=1, patch 0172): reader woken on the last "
++			    "fragment, stats every %u answers\n", UR_FAST_STATS_N);
++		} else if (strcmp(fast, "0") != 0) {
++			printf("SWEET USBROOT: GAP: sweetusbrootfast='%s' ignored (only 0 or 1), fast receive stays off\n", fast);
++		}
++	}
+ 	UR_TRACE("starting the USB device");
+ 	sweet_usb_probe();
+ 	UR_TRACE("sweet_usb_probe returned, gs101 %d ready %d", sweet_usb_is_gs101(), sweet_usb_ready());

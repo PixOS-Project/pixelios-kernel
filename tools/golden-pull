@@ -1,0 +1,1148 @@
+#!/bin/bash
+# adb side of the stock-Android golden-trace session (TP-035, docs/research/85 s.4.4, s.6 steps 7, 9, 10). Root commands use Magisk `su`.
+#   tools/golden-pull [--out DIR] [--dry-run] [--method-a] identity | su-check | boot-capture | inventory | blobs | start | kprobes | events-extra | ui ... | mark ROW [done] | stop-pull BLOCK
+#   Wi-Fi trace (20z): wifi-trace-probe | wifi-fw-bind DIR | wifi-fw-unbind | wifi-kprobes | wifi-kprobes-off | wifi-scan | wifi-trace-pull
+# identity      step 7: cmdline, uname, filtered getprop -> build.txt, cmdline.txt (creates ~/pixelios-artifacts/golden/<stamp>)
+#               /proc/cmdline is root-only on BP31 (`cat: /proc/cmdline: Permission denied` as the adb shell user [obs gdbgfs-20261029T155047Z-steps/identity1.txt]), so it is read through the
+#               Magisk `su` form of the R helper (adb exec-out su -c "CMD; r=$?; printf '\n__GP_RC=%s\n' $r"), filtered of serial|imei|mac|ssid tokens in memory (the raw line is never written).
+#               su unavailable: one plain `adb shell cat` is tried; if that fails too, exactly ONE GAP naming the shell denial (cmdline-stderr.txt).
+#               --method-a    opt-in: also require trace_event=rwmmio in /proc/cmdline (kernel-cmdline tracing, "method A" of docs/research/85 s.4.3). Default: not checked, because
+#               method B (runtime tracefs, boot-capture/start) is the one in use; a missing trace_event is then no GAP.
+# boot-read     READ-ONLY: boot_b of the running slot (BP31 system, but boot_b holds the cp3a Magisk image [obs 20261027T222522Z-bootb, review golden-wifi-load-gki-r1 F2]), read twice (sha equal) -> boot_b.img (input of magisk-patch; rule 4: never into git);
+#               also vendor_boot_b the same way (cat only, twice, cmp, VNDRBOOT magic) -> vendor_boot_b.img (BP31 vendor_boot holds the GKI vendor ramdisk; kept as golden evidence)
+# magisk-install  `adb install` of ~/pixelios-artifacts/golden/magisk/Magisk-v30.7.apk (sha256 pinned, no override) after identity proved bluejay; GAP unless 'Success'.
+#               Replaces golden-1/2 step 4's hand-typed adb install (blocked by agent-guard E3a).
+# su-prep       TP-037 S0-3 boot 1 of the two-boot busybox delivery [research 45 "Two-boot delivery"]: lib/arm64-v8a/libbusybox.so out of the pinned Magisk-v30.7.apk (same sha pin as
+#               magisk-install; extracted to a host temp file, never kept; the busybox member is pinned transitively by the APK sha pin + the zip CRC) -> `adb push` /data/local/tmp/pixos_busybox,
+#               pushed sha256 checked, then (only after a match) debug.pixos.bb.done cleared, `setprop debug.pixos.bb 0` then `1` (fires the image rc's pixos_bb service, which copies it to
+#               /data/magisk in the magisk domain, deletes the push and sets debug.pixos.bb.done ok|fail), one bounded 20 s on-device wait for that property. PASS iff sha matched AND done=ok.
+#               Needs NO su. /data/adb is created by Magisk's own boot_complete on boot 1 (bootstages.rs:180-184), so the rc has no mkdir of it. Then reboot and run su-check (boot 2).
+# magisk-patch  Magisk v30.7 boot_patch.sh on the phone (as the Magisk app does, files only in /data/local/tmp/gp-magisk) on boot_b.img -> boot_b-magisk.img.
+#               Optional env GOLDEN_MAGISK_IN=PATH (golden-pull takes no per-subcommand args): patch PATH instead of boot_b.img; its sha256 must be in the pinned list GOLDEN_MAGISK_PINS
+#               (BP31 stock boot, from `tools/ota-extract ... --part boot`), else REFUSED. Output is then boot-<first 8 of the input sha>-magisk.img.
+#               boot_patch.sh only unpacks/patches/repacks to new-boot.img; it never calls flash_image/install_magisk [read from source: Magisk-v30.7.apk
+#               assets/boot_patch.sh 1-269, util_functions.sh 431-439]. Writes no partition. The result is RAM-booted by fboot-android only (its PIN).
+# wifi-load-gki wifi-load, preceded by insmod of the cp3a GKI-signed rfkill.ko (sha-pinned, from the cp3a factory vendor_dlkm): the cp3a kernel refuses the
+#               BP31 unsigned vendor rfkill.ko ("exports protected symbol rfkill_alloc"). Pushes only /data/local/tmp/gp-rfkill.ko. Writes no partition.
+# wifi-on       `cmd wifi set-wifi-enabled enabled` (framework state, RAM/data only);  wifi-status: `cmd wifi status` + wlan0 link -> wifi-status.txt (holds the SSID: never into git;
+#               the 'Wifi is enabled' / 'is connected to' strings are a guess until the first run shows the real text: a mismatch is a loud GAP)
+# wifi-join     SECRETFILE = 2 lines (SSID, WPA2 PSK), e.g. a request_secret file; sent on stdin to `su -c sh` as `cmd wifi connect-network`,
+#               never printed, never written on the host (on the phone it is in cmd's argv briefly and in Android's WifiConfigStore, userdata: r1 F7); a failure prints only "wifi-join failed" (ported from golden-unattended a5669f9 + d60b48c, only this subcommand).
+# events-extra  after kprobes: enable the i2c, spi, gpio, mali, drm event groups for the interactive rows (a missing group is a GAP) (salvaged from golden-unattended a5669f9).
+# mmio-on       method B (research 85 s.4.3) at runtime: events/rwmmio/enable=1, then enable + buffer_size_kb (98304 KB per cpu) + trace_options -> tracing-state-mmio.txt; GAP unless enable is 1
+# wifi-log      READ-ONLY: Wi-Fi lines of logcat (main/system/events, last 3000) + getprop wifi/wlan + dmesg tail -> wifi-log-<UTC>.txt (may hold SSID/MAC: never into git)
+# wifi-cold-off `cmd wifi set-scan-always-available disabled` then set-wifi-enabled disabled (settings in the wiped userdata only), then the dhd/wlan dmesg lines after a /dev/kmsg marker (15 s wait) -> wifi-cold-off-<UTC ns>.txt. Why: golden-2 [obs]: plain wifi-off left the chip in runtime PM, the next wifi-on ran no dhd_open (guess: scan-always
+#               keeps the driver up). GAP unless a dhd_stop / wl_android_wifi_off line shows up [obs golden-2: dhd_stop ENTER/EXIT].
+#               NOT a cold power-off: WLAN_ACCEL_BOOT keeps REG_ON (dmesg 'wl_android_wifi_accel_off: force_reg_on:0' [obs]).
+# (no wifi-unload: `rmmod bcmdhd4389` panicked the kernel [obs golden-2 2026-10-28, bootreason kernel_panic]. A cold dhd_open needs a fresh module:
+#  reboot, wifi-load-gki, then the first wifi-on downloads [src refs/wlan-stage1/bcm4389-dhd_linux.c:14030-14036 force_reg_on at module init, 6756, 7102]).
+# wifi-dmesg    READ-ONLY: dmesg grep for the cold dhd_open milestones (golden-2 row 7b), which `wifi-log`'s dmesg tail -150 can lose -> wifi-dmesg-<UTC ns>.txt;
+#               one GAP per missing string. Strings observed on hardware [obs wifi-log-225059 golden 20261027T224642Z: dhdpcie_bus_write_vars 'Download, Upload
+#               and compare of NVRAM succeeded', dhdpcie_bus_download_state 'Took ARM out of Reset', 'dhdpcie_readshared:', 'dhd_open: EXIT'].
+# wifi-hal-restart  `setprop ctl.restart` of vendor.wifi_hal_legacy then wificond (init service restarts, RAM state only); GAP unless each pid changed and runs again.
+#               wificond: 'Failed to setup iface in wificond=wlan0' after the HAL restart [obs wifi-log 20261027T224642Z 18:51:30] (started before nl80211 existed: guess).
+#               Why: the boot-time HAL (started with no Wi-Fi driver) fails nl_connect on every retry ("Could not connect handle") [obs wifi-log 20261027T224642Z];
+#               the HAL binds netlink to the fixed port pid + port<<22 [read from source: AOSP hardware/broadcom/wlan bcmdhd/wifi_hal/wifi_hal.cpp:221-243] (stale socket = guess).
+# wifi-off      `cmd wifi set-wifi-enabled disabled` (framework state)
+# mmio-filter-gpu / -gpu-pmu / -dpu / -wifi-s2mpu: the same filter on the module lists in MMIO_MODS, files mmio-modules-<block>.txt / mmio-filter-<block>.txt.
+# mmio-filter-gpu-acpm / -dpu-iommu  gpu-pmu / dpu modules + gs_acpm / + samsung_iommu exynos_pd (names read from lsmod.txt 20261027T220758Z). mmio-filter-wifi-dwc: always a GAP + exit 1 (no cited built-in range yet).
+# su-policy-diag  research 104 (a): read-only `magisk -v`, three `magisk --sqlite SELECT` and `logcat -d -s Magisk` through `su -c sh` -> su-magisk-v/su-policy-count/-all/-one/su-magisk-log .txt; GAP per empty file.
+# screen-off / screen-on  `input keyevent KEYCODE_SLEEP` / `KEYCODE_WAKEUP` + one swipe up (RAM state only): the GPU/DPU power-down -> power-up cycle.
+# provision-skip  unattended golden run (research 106): su -c sh scripts, each && -chained with a marker: device_provisioned/user_setup_complete=1, pm disable-user the setup wizard, locksettings set-disabled + stayon + screen_off_timeout max, WAKEUP/dismiss-keyguard/HOME -> provision-flags/-suw/-lock/-keys.txt + readbacks provision-state.txt; verified in the action (markers, 1/1, wizard in `pm list packages -d`, focus nexuslauncher (one retry after 3 s), keyguard showing=false); every miss = GAP. Writes /data settings + package state only (no partition, no pm clear/uninstall/reboot/flash); undo: pm enable com.google.android.setupwizard, locksettings set-disabled false.
+# GP_BT_TRACE=1 (env, BT() actions: bt-static, bt-snoop-on, ...): opt-in remote trace. The stdin script starts with `set -x` (POSIX set -x, same effect as `sh -x`, without passing -x through adb/su arg parsing [guess: unverified])
+#               and the remote stderr is kept apart in bt/FILE.stderr (address-masked) instead of merged into FILE. Default unchanged. Why: bt/bt-dt.txt was only `__GP_RC=1` in all 3 device runs that ran
+#               `bt-static before` [obs g-bt-20261028T230353Z-b2, gbp31b-20261029T081941Z-b2, gbtcold-20261029T111135Z-b2] while the same script prints dt-root=/dt=ok under dash on the host: the cause is NOT known, the trace is how the next run finds it.
+# bt-static [before|after]  golden-bt-s0 (runplans/golden-bt-s0.md G3, G5): READ-ONLY, files under $out/bt/. before: bt-dt.txt (DT nodes bluetooth/btbcm/bt-*/175b0000, props as od dumps, address-like props skipped),
+#               bt-rfkill-before.txt, bt-tty.txt, bt-fw-sha.txt (/vendor/firmware bcm|4389|hcd|bt names + sha256), bt-vendor-conf/*.conf, bt-props.txt (getprop bt|bluetooth|bdaddr, address VALUES masked to <masked> on the host BEFORE
+#               the file is written), bt-bdaddr-where.txt (property NAMES / file paths / DT paths that hold an address, never a value). after: bt-rfkill-after.txt, bt-tty-after.txt, bt-props-after.txt.
+#               Never reads the pairing store (hard rule in bt_forbid, checked before any adb call).
+# bt-snoop-on   the persist write of this action (bt-vnd-on and bt-debugfs-mount have their own, listed below): `setprop persist.bluetooth.btsnooplogmode full` (read back), then `cmd bluetooth_manager disable` + `wait-for-state:STATE_OFF`, `enable` + `wait-for-state:STATE_ON`
+#               [research 107 Q1/Q3, read from source]; one file per step (bt-snoop-set/-off/-on.txt), a failed wait = GAP and the action goes on.
+# bt-vnd-on      writes ONLY two persist props (userdata; wiped by the inj9 restore [read from source: persist.* props live in /data/property; restore per HANDOFF 21m, golden-bt-cold C11]) + the BT toggle: `setprop persist.bluetooth.vendor.btsnoop true`, `setprop persist.bluetooth.disable.accelerate.bt.on true` [names from strings of the CP3A HAL, BP31 identical = guess], both read back (exact `true`), marker vnd=ok, then disable/wait STATE_OFF/enable/wait STATE_ON as bt-snoop-on. Files bt-vnd-{set,off,on}.txt.
+# bt-debugfs-mount  if /sys/kernel/debug/gpio is missing: `mount -t debugfs debugfs /sys/kernel/debug` (runtime mount, no persistent write [read from source: mount(2) is kernel RAM state; that the Magisk su shell mounts into the namespace other processes see = guess until the run]); skipped when debugfs is already a mountpoint (no stacked mount); marker mounted=ok + `grep debugfs /proc/mounts` in bt-debugfs-mount.txt. On failure the same file holds the mount error, getenforce, id -Z, ls -ldZ, the debugfs count in /proc/filesystems and the debugfs/avc dmesg lines, then a GAP. Also bt-debug-pinctrl.txt: pins + pinmux-pins of every /sys/kernel/debug/pinctrl/* dir and /proc/tty/driver/* (a missing file is an INFO line, counted); the bt-debug on|off action should work unchanged after this [guess: untested on the phone]; /sys/kernel/debug/gpio as the success test is taken from the bt-debug arm [guess on BP31 until the run]. A mount rc != 0 is a mount_rc_nonzero line and no mounted=ok marker, gpio absent after the mount step is gpio_missing (rc kept), both end in the marker GAP.
+# bt-toggle off|on  one half of the above (disable+wait OFF / enable+wait ON) -> bt-toggle-<arg>.txt.
+# bt-snoop-pull  sizes of btsnoop_hci.log, .log.last and /data/vendor/bluetooth/btsnoop_hci_vnd.log (bt-snoop-size.txt), then `cat` of each into $out/bt/ (never printed); GAP if the main file is missing, size 0 or does not start with the btsnoop magic; a missing .last or vnd file (path is a [guess]) is an INFO, as is a vnd file without the btsnoop magic.
+# bt-debug off|on  debugfs gpio, regulator_summary, clk_summary -> bt-debug-<arg>-{gpio,regulator,clk}.txt; GAP if debugfs is unreadable.
+# bt-stty       READ-ONLY: `stty -F /dev/ttySAC16 -a` (BT UART line settings) -> bt-stty.txt; GAP unless the command succeeded (stty=ok marker).
+# bt-logs       dmesg + `logcat -d -b all` -> bt-dmesg.txt, bt-logcat.txt, `logcat -g` (buffer sizes) -> bt-logcat-size.txt (+ -filtered copies minus serial|imei|ssid|androidboot|cmdline lines; bt-dmesg.txt and bt-logcat.txt are NEVER to be shared); address-looking strings masked on the host right after the pull; INFO with the hci_reset fail count.
+# gpu-state     READ-ONLY: 1c500000.mali runtime_status [obs dmesg-coldboot 20261027T220758Z: "mali 1c500000.mali", autosuspend 500ms] + power wakefulness -> gpu-state-<UTC ns>.txt (GAP unless a runtime PM state; the runplan predicts which).
+# mmio-filter-wifi  (kptr_restrict lowered to 0 for the one /proc/modules read, restored + checked)  events/rwmmio/filter = caller0 inside the core range (/proc/modules base, base+size) of bcmdhd4389, pcie_exynos_gs, pcie_exynos_gs101_rc_cal.
+#               Why: unfiltered rwmmio overran 13-142 M events per cpu in one Wi-Fi session [obs tracing-stats-wifi.txt 20261027T224642Z]. Ranges computed on the host;
+#               filter + rwmmio_write format read back -> mmio-filter.txt; GAP on a missing module, a zero address (kptr_restrict) or a filter that did not take.
+# Wi-Fi golden trace modes (20z, W36 R29; docs/runplans/golden-wifi-trace.md "New golden-pull modes" + docs/research/golden-wifi-trace-sources.md D). ALL of this is UNVERIFIED on the phone
+#   (host-tested with a fake adb only): every phone-side output format, the Magisk `su --mount-master` flag, `ls -Z`/`chcon`/`mount -o bind` behaviour and the kernel's kprobe/filter text are guesses until the first run.
+#   Files under $out/wifi/. Secret file for masking and the S1 checks: GP_WIFI_SECRET (default ~/pixelios-artifacts/golden/.wifi-join, 2 lines SSID, PSK; AP-279); never in argv, never printed.
+# wifi-trace-probe  READ-ONLY: procfs/params/sysfs/ksym/cmd/props/ firmware ls -lZ + sha256 / bcmdhd4389.ko sha256 vs WF_KO_PIN (probe-ko.txt; GAP if absent or different: the probe offsets are tied to one build) / /proc/interrupts / `su --mount-master` rc + mnt-ns id / the line `pre_download_count=N` (= `dmesg | grep -c 'Took ARM out of Reset'`, N>0 means dhd_open already ran: init missed, review r1 F4); absent /proc/dhd_trace, /sys/wifi/wl_dbg_level, events/cfg80211 = INFO (info=N), not a GAP.
+# wifi-fw-bind DIR  W0. RAM only (tmpfs /mnt/gp-wfw) + bind mounts over /vendor/firmware/{fw_bcmdhd.bin,bcmdhd.cal,bcmdhd_clm.blob} in the GLOBAL mount ns (su --mount-master; request_firmware resolves in init's ns [guess]).
+#               The 3 files from DIR must match the sha256 pins in the WF_FW table BEFORE any adb push (REFUSED otherwise). Staged briefly in /data/local/tmp/gp-wfw-* (removed again), label copied from the stock file, sha read back
+#               through the bound path (second su --mount-master process). Second bind without unbind = GAP. Any GAP rolls the bind back (unbind). Writes no partition; /vendor stays read-only.
+# wifi-fw-unbind    umount x3 + the tmpfs; read-back sha must equal the stock sha recorded by wifi-fw-bind (wifi/fw-stock-sha.txt). Nothing bound = INFO.
+# wifi-kprobes / wifi-kprobes-off  probes P1-P24 + P4b of the run plan (29 events, table WF_PROBES at the top of this file, group gpwifi) + events/cfg80211 if present; prints `kprobes_registered=N` (GAP unless N == WF_EXPECT); P2 and P4b filters read back.
+#               Module identity first (WF_KO_PIN, r1 F14); a GAP while arming (or an interrupt) disarms again; the prior events/cfg80211/enable value is recorded (wifi/cfg80211-prev.txt) and restored by -off (r1 F5).
+#               Arms and enables only: NEVER touches tracing_on or clears the buffer (the caller runs `start`); events land in the global $T buffer that stop-pull reads. -off removes every gpwifi probe and checks none is left.
+# wifi-scan         `cmd wifi start-scan` + list-scan-results through wifi_scan_mask (SSID column + MAC/BSSID masked); "No scan results" = GAP.
+# wifi-trace-pull   masked pulls (full dmesg, filtered logcat, /proc/dhd_trace, dumpsys wifi, markers), read-only EXCEPT /proc/dhd_trace: its read handler CONSUMES the debug ring (it pulls with a read-pointer update: [obs] BP31 bcmdhd4389.ko sha256 222cd8d6..,
+#               dhd_ring_proc_read 0x193b38 -> dhd_dbg_read_ring_into_trace_buf 0x15ccbc -> dhd_dbg_ring_pull_single 0x1933e8, `str w6,[x19,#0x2c]` 0x19353c stores the new read index; that dhd_ring_proc_ops.proc_read is dhd_ring_proc_read = guess from the symbol names), so it is read ONCE (count=64 x 4096) and a failed pull cannot be repeated, r1 F9.
+#               + S1: PSK literal/hex in the whole out dir (grep -F -f from a mode-600 tmp file; a hit in a file THIS run wrote deletes that file, a hit in an older file is a GAP and the file stays),
+#               SSID literal and MAC pattern only in the 5 files this mode wrote under wifi/ (older wifi-status/stop-pull files are unmasked by design, AP-282); any hit = GAP, rc 1.
+# su-check      step 8: `su -c id` -> su-id.txt, GAP unless uid=0(root) (run it BEFORE boot-capture so the Magisk prompt is answered first). Also GAP rows (TP-037 S0-3 boot 2): no /data/adb/magisk/busybox (su-busybox.txt),
+#               /data/magisk still present (su-data-magisk.txt), the policies row for uid 2000 not exactly uid=2000|policy=2|until=0|logging=0|notification=0 (su-policy.txt; read by the stdin-script form `su -c sh`, __GP_RC=0 required)
+# boot-capture  step 9: tracing state + per-cpu stats, stop tracing, trace/vmallocinfo/dmesg (coldboot), iomem, lsmod, kallsyms, pci-resource (BAR bases)
+# inventory     after boot-capture, before start (read-only, user 2026-10-27 "collect everything at once"): live device tree (minus serial-number and chosen/),
+#               clk/regulator/pinctrl/gpio debugfs summaries, /proc/interrupts (baseline; stop-pull pulls it again per block), mali0 sysfs, trace event list,
+#               cpufreq/thermal, USB configfs gadget (minus *serial*), ps -A, lshal, vendor init rc + fstab, firmware listing, logcat -d.
+#               Its only phone-side change: mounting debugfs at /sys/kernel/debug if it is not mounted (Android RAM state, gone at reboot).
+#               NOT pulled (named): debugfs regmap registers (a read of a volatile clear-on-read PMIC IRQ status register is a side effect: needs a cited list first);
+#               /data/vendor/wifi (holds wpa_supplicant.conf with the user's Wi-Fi password: never pulled).
+# blobs         one tar of vendor modules, firmware and the GPU/HWC/Wi-Fi HAL libraries (blobs.tar) for tools/rea; binaries never go into git (rule 4).
+# start         step 10: clear the buffer, options overwrite, tracing_on=1;  kprobes: s.4.4 pcicfg probes (a failing write is a GAP line)
+# mark ROW      write `MARK ROW` (or `MARK ROW done`) into trace_marker;  stop-pull BLOCK: tracing off, trace-BLOCK.txt + vmallocinfo-BLOCK.txt
+# ui            ATTENDED driving only until review golden-ui-r2 condition (golden-3 row 7b) is met: every action but key BACK/HOME refuses unless GP_UI_ATTENDED=yes-a-human-watches-the-screen (r3 F1). NOT root (adb shell input/uiautomator/am).
+#               ui dump NAME | tap X Y | swipe X1 Y1 X2 Y2 [MS] | key KEY | text WORD | open PAGE (whitelisted keys/pages; text is [A-Za-z0-9._-]{1,40}).
+#               Every action other than dump first refuses (RESULT: FAIL, no input sent) unless: persist.sys.locale (else ro.product.locale) is en*;
+#               a fresh guard dump (old dump removed first, a failed dump is fatal) shows no $FORBID word (case-insensitive, raw XML incl. OTA and Emergency strings) and only
+#               allowlisted foreground packages (settings, systemui, nexuslauncher, GoogleCamera; Magisk is not); tap lands inside a clickable node whose text/desc is not forbidden;
+#               swipe endpoints are on screen; a second dump just before `input` has the same sha256 as the guard dump (nothing masked [guess: the status-bar clock can
+#               cause a false refusal at a minute change; retry]). key BACK/HOME skip the word/package checks (the way out of a bad screen) but still need a fresh dump.
+#               ui-actions.log lines end in rc=N; a failing action is a GAP. The guard is a denylist plus allowlist, not proof of safety [guess: untested on the phone].
+#               LIMITS (review golden-ui-r1): the guard sees the uiautomator dump of the active window plus `dumpsys window` (focus + visible windows must be allowlisted or
+#               StatusBar/NavigationBar; the dumpsys text format was measured on BP31 (golden-3 ui7b, 2026-10-28) [observed on hardware]: windows are
+#               decided on title + package= (see uiwin); a visible NotificationShade (lockscreen, heads-up, shade) is refused, so those states fail closed; anything unparseable REFUSES). Heads-up notifications are only caught if they show up as a visible non-allowlisted window; disabling them for the session
+#               (settings put global heads_up_notifications_enabled 0 [guess: key unchecked]) is NOT done. The sha recheck narrows the dump-to-input window, it does not close it;
+#               an `after` dump reports a visible FORBID word as a GAP. `ui text` + `key ENTER` is refused back to back; `open developer` is gone; FORBID bare stems (Install, Update,
+#               Restart, ...) over-refuse on purpose and also match resource-ids. Dry-run prints `would check:` and the would-run lines but runs no check.
+#               UNATTENDED USE GATED: needs one attended session capturing dumpsys window + ui dump in 7 states (Settings>Wi-Fi, heads-up over Settings, shade open,
+#               lockscreen, launcher, keyboard up, system dialog); until then a human watches [review golden-ui-r2 F3/F5: HUN-in-StatusBar and over-refusal of
+#               NotificationShade/wallpaper/InputMethod windows are guesses until measured]. FORBID on the screen is the real boundary (ENTER-after-text checks only the last action).
+#               ANDROID_SERIAL is pinned from `adb get-serialno` after the identity check (never printed) so a swapped phone makes later calls fail.
+# Refuses: ro.product.device != bluejay, an output dir inside any git checkout. Never prints serials (no `adb devices`; build.txt/cmdline.txt are filtered).
+# The raw dmesg/kallsyms/trace/logcat/device-tree/blobs files are NOT filtered (logcat can hold MAC/SSID/IMEI: review golden-inventory-r1 F1) and may hold serial/MAC: never copy them into git.
+# Pulls use `adb exec-out su -c CMD` (exec-out never forwards stdin); push scripts go to `adb shell su -c sh` on stdin (a guess that Magisk su accepts it until the first run).
+# Files land in the out dir (default: newest ~/pixelios-artifacts/golden/2*) with SHA256SUMS refreshed. RESULT: PASS|FAIL|ERROR (exit 0/1/2).
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac; set -uo pipefail   # T-7dff:help (R29: this file may not grow)
+root=$HOME/pixelios-artifacts/golden; out=""; dry=0; method_a=0
+while [ $# -gt 0 ]; do case "$1" in
+	--out) [ $# -ge 2 ] || { echo "RESULT: ERROR $1 needs a value"; exit 2; }; out=$2; shift 2 ;; --dry-run) dry=1; shift ;; --method-a) method_a=1; shift ;; *) break ;; esac; done
+cmd=${1:-}; [ $# -gt 0 ] && shift
+T=/sys/kernel/tracing
+# ---- Wi-Fi golden-trace TABLES (20z; edit here only). Probe texts = docs/runplans/golden-wifi-trace.md "Probe set gpwifi": P1-P18 from run plan commit b55643b0 (H1 disasm applied); P19-P24 and P4b added in commit 6171f331 (H1b).
+# Row = "P#|kprobe_events text" or "P#|kprobe_events text|event filter" (the filter is written to events/gpwifi/<event>/filter and read back; P2: GET_VAR 262 / SET_VAR 263 only, so the iovar NAME fetch never
+# sees other buffers; the passphrase TLV after the NUL of the name is never read). One row per EVENT: P7 (scan, connect) and P13 (rxctrl, rxctrl_ret) are 2 rows each, P14 has no return probe (void function), P21 has 2 rows (escanparams, escanparamsv1), so N = 29 (run plan c1dc240b).
+# Allowed text (whitelist, enforced by wf_probe_guard): p|r:gpwifi/EVENT SYMBOL[+OFF] [NAME=FETCH:TYPE ...]; FETCH = $argN (1-8) | $retval (r: only) | %x0..%x30 | +OFF(BASE) | +OFF(+OFF(BASE)), BASE = $argN | %xN;
+# TYPE = u8 u16 u32 u64 s8 s16 s32 s64 x8 x16 x32 x64 string. A memory fetch through $arg4 or %x3 (the ioctl buffer) is refused except P2's `name=+0($arg4):string`. WF_EXPECT must equal the row count (checked at run time).
+WF_PROBES=(
+	'P1|p:gpwifi/ioctl dhd_wl_ioctl ifidx=$arg2:s32 cmd=+0($arg3):u32 len=+16($arg3):u32 set=+20($arg3):u8'
+	'P2|p:gpwifi/iovar dhd_wl_ioctl cmd=+0($arg3):u32 len=+16($arg3):u32 set=+20($arg3):u8 name=+0($arg4):string|cmd == 262 || cmd == 263'
+	'P3|r:gpwifi/ioctl_ret dhd_wl_ioctl rc=$retval:s32'
+	'P4|p:gpwifi/cfgevent wl_cfg80211_event etype=+4($arg2):x32 status=+8($arg2):x32 reason=+12($arg2):x32'
+	'P5|p:gpwifi/supevent wl_cfg80211_sup_event_handler st=+8($arg3):x32 rsn=+12($arg3):x32'
+	'P6|p:gpwifi/capcall dhd_get_fw_capabilities'
+	'P7|p:gpwifi/scan wl_cfg80211_scan'
+	'P7|p:gpwifi/connect wl_cfg80211_connect'
+	'P8|p:gpwifi/d2hmb dhd_bus_handle_mb_data mb=$arg2:x32'
+	'P9|p:gpwifi/h2dmb dhdpcie_send_mb_data mb=$arg2:x32'
+	'P10|p:gpwifi/h2dmbmsg dhd_prot_h2d_mbdata_send_ctrlmsg mb=$arg2:x32'
+	'P11|p:gpwifi/d2hmbmsg dhd_prot_process_d2h_mb_data t=+0($arg2):u8 st=+8($arg2):s16 mb=+12($arg2):x32'
+	'P12|p:gpwifi/wshared dhd_bus_cmn_writeshared len=$arg3:u32 type=$arg4:u8 ringid=$arg5:u16 v32=+0($arg2):x32 v64=+0($arg2):x64'
+	'P13|p:gpwifi/rxctrl dhd_msgbuf_rxbuf_post_ctrlpath type=$arg2:u8 max=$arg3:u32'
+	'P13|r:gpwifi/rxctrl_ret dhd_msgbuf_rxbuf_post_ctrlpath rc=$retval:s32'
+	'P14|p:gpwifi/rxdata dhd_msgbuf_rxbuf_post posted=+12(+16($arg1)):u16 burst=+14(+16($arg1)):u16 max=+18(+16($arg1)):u16 rxsz=+8(+16($arg1)):u16 allocsz=+10(+16($arg1)):u16 rxoff=+940(+16($arg1)):u32'
+	'P15|p:gpwifi/frcreate dhd_prot_flow_ring_create flowid=+98($arg2):u16 tid=+100($arg2):u8 ifidx=+101($arg2):u8'
+	'P16|p:gpwifi/frresp dhd_prot_flow_ring_create_response_process st=+8($arg2):s16 flowid=+10($arg2):u16'
+	'P17|p:gpwifi/ioctcmplt dhd_prot_ioctcmplt_process st=+8($arg2):s16 rlen=+12($arg2):u16 tid=+14($arg2):u16 cmd=+16($arg2):u32'
+	'P18|r:gpwifi/readshared_ret dhdpcie_readshared rc=$retval:s32'
+	'P19|p:gpwifi/wrcmpl dhd_prot_ring_write_complete ringid=+2($arg2):u16 wr=+8($arg2):u16 h2dupd=+13934($arg1):u8 idmaenb=+13936($arg1):u8 idmaact=+13940($arg1):u32 ifrmenb=+13944($arg1):u8 ifrmact=+13948($arg1):u32'
+	'P20|p:gpwifi/capstr dhd_get_fw_capabilities+0x80 cap=+3520(%x20):string'
+	'P21|p:gpwifi/escanparams wl_do_escan+0xfe4 plen=%x3:u32 ver=+0(%x2):u32 act=+4(%x2):u16 sync=+6(%x2):u16 sv=+4274(%x20):u8 stype=+56(%x2):u32 nprobes=+60(%x2):s32 active=+64(%x2):s32 passive=+68(%x2):s32 home=+72(%x2):s32 chnum=+76(%x2):x32'
+	'P21|p:gpwifi/escanparamsv1 wl_do_escan+0xfe4 plen=%x3:u32 ver=+0(%x2):u32 act=+4(%x2):u16 sync=+6(%x2):u16 active=+56(%x2):s32 passive=+60(%x2):s32 home=+64(%x2):s32 chnum=+68(%x2):x32'
+	'P4b|p:gpwifi/evdata wl_cfg80211_event etype=+4($arg2):x32 st=+8($arg2):x32 dlen=+20($arg2):x32 d0=+0($arg3):u32 d4=+4($arg3):u32 d8=+8($arg3):u32 d12=+12($arg3):u32 d16=+16($arg3):u32|etype == 0x45000000'
+	'P22|p:gpwifi/edlinit dhd_prot_init_edl_rings edlring=+872(+16($arg1)):x64'
+	'P22b|p:gpwifi/d2hringcreate dhd_send_d2h_ringcreate ringid=+2($arg2):u16 rtype=$arg3:u32 reqid=$arg4:x32'
+	'P23|p:gpwifi/d2hcc dhd_prot_process_d2h_ring_create_complete reqid=+4($arg2):x32 status=+8($arg2):s16 ringid=+10($arg2):u16'
+	'P24|p:gpwifi/rxoff dhd_prot_rx_dataoffset off=$arg2:u32'
+)
+# P21 v1 row (r1 F2): the v1 fields stype=+51(%x2):u8 and nprobes=+52(%x2):s32 are NOT fetched: in the v2/v3 layout (the expected one, sv=2|3) buffer bytes 48..53 are the BSSID, 54 bss_type, 55 pad [src docs/research/golden-wifi-trace-h1b.md:32], so +51/+52 would print BSSID bytes as integers.
+# docs/runplans/golden-wifi-trace.md (P21 row) and docs/research/golden-wifi-trace-h1b.md:39,74 still show the old v1 text: they need the same edit (run-plan owner).
+WF_EXPECT=${#WF_PROBES[@]}   # N = number of EVENTS = rows (an entry+return pair is 2 rows); derived, never typed twice. The host test holds its own literal (29 for the P1-P24 table).
+# W0 firmware table: sha256 of ~/pixelios-artifacts/wlan-fw/files/<name> (computed 2026-10-29 on the host; prefixes 3a6dbf5a / 49437aa6 / eea06b8f = the run plan W0 row), phone-side paths.
+WF_FW_NAMES=(fw_bcmdhd.bin bcmdhd.cal bcmdhd_clm.blob)
+declare -A WF_FW_PIN=([fw_bcmdhd.bin]=3a6dbf5a726304f83e154ff1b265a06c77d669506eb5c784fd864f10bdda6533 [bcmdhd.cal]=49437aa63d15cff7393a92b884ef886480cd18b2710259b00201f6f68beae424 [bcmdhd_clm.blob]=eea06b8f963dd6ff771a5edd25114b5fe1f857fefa342cd8f200c4cbc65b3e2e)
+WF_FW_V=/vendor/firmware; WF_FW_D=/mnt/gp-wfw; WF_FW_S=/data/local/tmp/gp-wfw-
+# Module identity (r1 F14): the probe offsets (dhd_get_fw_capabilities+0x80, wl_do_escan+0xfe4, ...) come from the disassembly of ONE build. WF_KO_PIN = sha256 of that file [obs: sha256sum of /tmp/21t-wfAnZ0/vendor_dlkm/lib/modules/bcmdhd4389.ko, 2026-10-29,
+# the 'stock BP31 module' named in docs/research/golden-wifi-trace-h1b.md:1-3]. The phone paths holding the loaded module are a guess (modprobe -d /vendor/lib/modules is observed, test_golden_capture.sh wifi-load): no file found = GAP, any found file with another sha = GAP, before anything is armed.
+WF_KO_PIN=222cd8d65290a9fc913c8b6012363457454fc87e0eae94e21baf3cff1e5bcaff; WF_KO_PATHS="/vendor/lib/modules/bcmdhd4389.ko /vendor_dlkm/lib/modules/bcmdhd4389.ko"
+# rwmmio filter blocks: module names as in /proc/modules (= modinfo name= of the vendor_dlkm .ko [read from blobs.tar 20261027T224642Z: exynos-drm.ko name=exynos_drm]).
+# gpu-pmu adds exynos_pd + cmupmucal (the G3D power-domain writes [guess: the write may go through exynos_pmu_if/exynos_pd_el3/ACPM instead, then gpu-pmu shows none]; lsmod: both used by mali_kbase; cmupmucal serves every block: overrun risk, stop-pull reports it).
+# wifi-s2mpu adds s2mpu.ko (lsmod: used by pcie_exynos_gs): whether Android programs the HSI2 S2MPU from EL1 around PCIe power-up (no rows = EL2/pKVM or not touched: guess, the run tells).
+declare -A MMIO_MODS=([wifi]="bcmdhd4389 pcie_exynos_gs pcie_exynos_gs101_rc_cal" [wifi-s2mpu]="bcmdhd4389 pcie_exynos_gs pcie_exynos_gs101_rc_cal s2mpu"
+	[gpu]="mali_kbase mali_pixel" [gpu-pmu]="mali_kbase mali_pixel exynos_pd cmupmucal" [dpu]="exynos_drm gs_panel phy_exynos_mipi_dsim"
+	[gpu-acpm]="mali_kbase mali_pixel exynos_pd cmupmucal gs_acpm" [dpu-iommu]="exynos_drm gs_panel phy_exynos_mipi_dsim samsung_iommu exynos_pd")
+# GOLDEN_MAGISK_IN pin list: sha256 of the BP31.250610.004 stock boot.img extracted by tools/ota-extract from the Google OTA (sha 056fa041...) [obs driver 20l 2026-10-29, ota-extract --part boot]
+GOLDEN_MAGISK_PINS="a18afa36cfe5c8568d6273d9043df56e3538e4a99f7ddc6dc6b6a34a4a12d04c"
+fail() { echo "REFUSED: $1" >&2; echo "RESULT: FAIL $1"; exit 1; }
+err() { echo "RESULT: ERROR $1"; exit 2; }
+case "$cmd" in
+	bt-snoop-on|bt-vnd-on|bt-debugfs-mount|bt-snoop-pull|bt-logs|bt-stty|provision-skip|identity|su-check|boot-capture|inventory|blobs|start|kprobes|events-extra|wifi-probe|wifi-load|wifi-load-gki|wifi-on|wifi-status|boot-read|magisk-patch|magisk-install|su-prep|mmio-on|wifi-log|wifi-dmesg|wifi-cold-off|wifi-hal-restart|wifi-off|mmio-filter-wifi|mmio-filter-wifi-s2mpu|mmio-filter-gpu|mmio-filter-gpu-pmu|mmio-filter-dpu|mmio-filter-gpu-acpm|mmio-filter-dpu-iommu|mmio-filter-wifi-dwc|su-policy-diag|screen-off|screen-on|gpu-state|wifi-trace-probe|wifi-fw-unbind|wifi-kprobes|wifi-kprobes-off|wifi-scan|wifi-trace-pull) [ $# -eq 0 ] || err "$cmd takes no arguments" ;;
+	ui) n='^[0-9]{1,4}$'; case "${1:-} $#" in
+		"dump 2") [[ "$2" =~ ^[A-Za-z0-9._-]+$ ]] ;; "tap 3") [[ "$2" =~ $n && "$3" =~ $n ]] ;;
+		"swipe 5"|"swipe 6") [[ "$2" =~ $n && "$3" =~ $n && "$4" =~ $n && "$5" =~ $n && "${6:-300}" =~ $n ]] ;;
+		"key 2") [[ "$2" =~ ^(BACK|HOME|ENTER|TAB|WAKEUP|SLEEP|APP_SWITCH|DPAD_UP|DPAD_DOWN|DPAD_LEFT|DPAD_RIGHT|MEDIA_PLAY|VOLUME_UP|VOLUME_DOWN)$ ]] ;;
+		"text 2") [[ "$2" =~ ^[A-Za-z0-9._-]{1,40}$ ]] ;;
+		"open 2") [[ "$2" =~ ^(wifi|bluetooth|sound|display|settings|camera)$ ]] ;;
+		*) false ;; esac || err "usage: ui dump NAME | tap X Y | swipe X1 Y1 X2 Y2 [MS] | key KEY (whitelist) | text WORD | open wifi|bluetooth|sound|display|settings|camera" ;;
+	bt-static) { [ $# -eq 0 ] || { [ $# -eq 1 ] && [[ "$1" =~ ^(before|after)$ ]]; }; } || err "usage: bt-static [before|after]" ;;
+	bt-toggle|bt-debug) { [ $# -eq 1 ] && [[ "$1" =~ ^(off|on)$ ]]; } || err "usage: $cmd off|on" ;;
+	wifi-fw-bind) { [ $# -eq 1 ] && [ -d "$1" ]; } || err "usage: wifi-fw-bind DIR (a directory holding fw_bcmdhd.bin bcmdhd.cal bcmdhd_clm.blob)" ;;
+	wifi-join) { [ $# -eq 1 ] && [ -r "$1" ]; } || err "usage: wifi-join SECRETFILE (readable, 2 lines: SSID, PSK)" ;;
+	mark) { [ $# -ge 1 ] && [ $# -le 2 ] && [[ "$1" =~ ^[A-Za-z0-9._:/-]+$ ]] && { [ $# -eq 1 ] || [ "$2" = "done" ]; }; } || err "usage: mark ROW [done] (ROW: letters digits . _ : / -)" ;;
+	stop-pull) { [ $# -eq 1 ] && [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; } || err "usage: stop-pull BLOCK (letters digits . _ -)" ;;
+	*) err "usage: golden-pull [--out DIR] [--dry-run] [--method-a] identity|su-check|boot-capture|inventory|blobs|boot-read|magisk-patch|magisk-install|su-prep|provision-skip|bt-static [before|after]|bt-snoop-on|bt-vnd-on|bt-debugfs-mount|bt-toggle off|on|bt-snoop-pull|bt-debug off|on|bt-logs|bt-stty|start|kprobes|events-extra|wifi-probe|wifi-load|wifi-load-gki|mmio-on|wifi-on|wifi-join FILE|wifi-log|wifi-dmesg|wifi-cold-off|wifi-hal-restart|wifi-off|mmio-filter-wifi|mmio-filter-wifi-s2mpu|mmio-filter-gpu|mmio-filter-gpu-pmu|mmio-filter-dpu|mmio-filter-gpu-acpm|mmio-filter-dpu-iommu|mmio-filter-wifi-dwc|su-policy-diag|screen-off|screen-on|gpu-state|wifi-status|wifi-trace-probe|wifi-fw-bind DIR|wifi-fw-unbind|wifi-kprobes|wifi-kprobes-off|wifi-scan|wifi-trace-pull|ui ...|mark ROW [done]|stop-pull BLOCK" ;;
+esac
+if [ -z "$out" ]; then
+	if [ "$cmd" = identity ]; then out=$root/$(date -u +%Y%m%dT%H%M%SZ)
+	else out=$(find "$root" -maxdepth 1 -mindepth 1 -type d -name '2*' 2>/dev/null | sort | tail -1); fi
+	[ -n "$out" ] || [ "$dry" = 1 ] || fail "no output dir yet: run identity first or pass --out DIR"
+	[ -n "$out" ] || out="$root/STAMP"
+fi
+case "$out" in /*) ;; *) out=$PWD/$out ;; esac
+while [ "$out" != / ] && [ "${out%/}" != "$out" ]; do out=${out%/}; done   # r2 R2-3: DIR/ (tab completion) must compare equal to the paths grep prints (S1 "written by this run")
+anc=$out; while [ ! -d "$anc" ]; do anc=$(dirname "$anc"); done
+if git -C "$anc" rev-parse --is-inside-work-tree >/dev/null 2>&1; then fail "output dir $out is inside a git checkout (golden data never goes into git)"; fi
+if [ "$dry" = 1 ]; then
+	echo "DRY-RUN (no adb call is made; out=$out)"
+	A() { echo "would run: adb $*"; }; R() { echo "would run: adb exec-out su -c \"$1\" > $out/$2"; }; S() { echo "would run: adb shell su -c sh   (script on stdin: $1)"; }
+else
+	# F14/F9 (review golden-unattended-r1): pin the device for the whole command; never printed or logged. Pinned BEFORE the identity check so a swap in between cannot pin an unchecked phone. A later swap of the attached phone then fails instead of retargeting.
+	sn=$(timeout 15 adb get-serialno 2>/dev/null </dev/null | tr -d '\r\n'); [ -n "$sn" ] && [ "$sn" != unknown ] || fail "adb get-serialno gave no device serial"
+	export ANDROID_SERIAL=$sn; unset sn
+	prod=$(timeout 15 adb shell getprop ro.product.device 2>/dev/null </dev/null | tr -d '\r\n')
+	[ "$prod" = bluejay ] || fail "adb device ro.product.device is '$prod', not bluejay"
+	mkdir -p "$out" || err "cannot create $out"
+	A() { timeout 60 adb "$@" </dev/null; }
+	# exec-out returns no remote exit code and merges stderr (r2 N2): the remote shell appends a sentinel with the command's rc, checked and stripped here.
+	R() { local f=$out/$2; timeout 600 adb exec-out su -c "$1; r=\$?; printf '\\n__GP_RC=%s\\n' \$r" </dev/null | { if [ -n "${rmask-}" ]; then sed -E "$rmask"; else cat; fi; } > "$f"
+		if [ "$(tail -c 11 "$f")" = $'\n__GP_RC=0' ]; then truncate -s -11 "$f"; else echo "GAP: pull of '$1' failed (rc sentinel '$(tail -c 11 "$f" | tr -d '\n')', su denied or command error)" >&2; bad=$((bad + 1)); return; fi
+		[ -s "$f" ] || { echo "GAP: pull of '$1' is empty" >&2; bad=$((bad + 1)); }; }
+	S() { printf '%s\n' "$1" | timeout 60 adb shell su -c sh || { echo "GAP: su -c '$1' failed" >&2; bad=$((bad + 1)); }; }
+fi
+# D: one stdin script (su -c sh) per output file; no nested quoting (golden-6 su-policy-all.txt worked, su-check R with nested quotes did not); used by su-policy-diag and su-check
+D() { local f=$1; shift
+	if [ "$dry" = 1 ]; then echo "would run: adb shell su -c sh   (script on stdin: $* > $f)"; return; fi
+	printf '%s; echo __GP_RC=$?\n' "$*" | timeout 60 adb shell su -c sh > "$out/$f" 2>&1 || { echo "GAP: $cmd: adb shell su -c sh failed for $f" >&2; bad=$((bad + 1)); }
+	tr -d '\r' < "$out/$f" > "$out/$f.lf" && mv "$out/$f.lf" "$out/$f"   # CRLF -> LF so the run-plan grep -x answers match (golden-6 r1 F8)
+	grep -qx '__GP_RC=0' "$out/$f" || { echo "GAP: $cmd: $f command did not exit 0 (no __GP_RC=0 line, see $f)" >&2; bad=$((bad + 1)); }   # golden-6 r1 F6
+	if grep -v '^__GP_RC=' "$out/$f" | grep -q '[^[:space:]]'; then :
+	elif [ "$f" = su-magisk-log.txt ] && grep -qx '__GP_RC=0' "$out/$f"; then   # the ONE file allowed empty (rc 0 + nothing printed); the other four keep their GAP (rule 8: named, counted as info=N on RESULT)
+		echo "INFO: $cmd: $f is empty: expected on this release build [guess: Magisk 30.7 logs nothing under tag Magisk, research 105 item 3; logcat -d -s Magisk rc 0]" >&2; info=$((info + 1))
+	else echo "GAP: $cmd: $f is empty (see 104 (a))" >&2; bad=$((bad + 1)); fi; }
+bad=0; info=0
+# exec-out merges stderr into the stream (r2 N2): tar's stderr goes to a phone temp file, pulled next to the tar; any text there is a GAP (rule 8)
+Rtar() { R "tar $1 2>/data/local/tmp/golden-tar.err" "$2"; R "cat /data/local/tmp/golden-tar.err; echo end-of-tar-stderr" "$2.stderr.txt"
+	[ "$dry" = 1 ] && return
+	[ "$(cat "$out/$2.stderr.txt" 2>/dev/null)" = end-of-tar-stderr ] || { echo "GAP: tar for $2 wrote to stderr (see $2.stderr.txt)" >&2; bad=$((bad + 1)); }
+	tar -tf "$out/$2" > "$out/$2.list.txt" 2>&1 || { echo "GAP: $2 is not a readable tar on the host (r1 F6)" >&2; bad=$((bad + 1)); }
+	! grep -qE '(^|/)base/(serial-number|chosen)(/|$)' "$out/$2.list.txt" || { echo "GAP: $2 holds base/serial-number or base/chosen: the exclude did not apply (r1 F4); delete it before anything else" >&2; bad=$((bad + 1)); }; }
+# bt helpers (golden-bt-s0). bt_forbid: no script sent by a bt-* action may hold one of these words (checked before any adb call, like ps_forbid); the pairing store is never read.
+bt_forbid='pm clear|uninstall|dd if=|dd of=|flash|fastboot|rm |reboot|unpair|bt_config'
+# address-looking strings (xx:xx:xx:xx:xx:xx, xx-xx-..., or a [12 hex] property value) are masked on the host before any bt/ text file is written
+bt_mask='s/([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}/<masked>/g; s/\[[0-9A-Fa-f]{12}\]/[<masked>]/g; s/\b[0-9A-Fa-f]{12}\b/<masked>/g'
+bt_guard() { local s; for s in "$@"; do
+	! printf '%s\n' "$s" | grep -qE "$bt_forbid" || fail "$cmd script holds a forbidden word: $s"; done; }
+# bt-debug clock read (research clk-summary-reboot s.4, AP-252): `cat /sys/kernel/debug/clk/clk_summary` REBOOTED the phone (golden-debugfs 2026-10-29, inventory 2026-10-27):
+# every gs101 vclk is CLK_GET_RATE_NOCACHE, so clk_summary / clk_dump / clk_rate recalc each rate with readl on CMU registers, no power-domain check [src, research s.1-2].
+# So only the CACHED per-clock files (clk_enable_count prepare_count protect_count phase flags min_rate max_rate possible_parents; CORE clk.c:3682-3695) of the two BT UART clocks
+# (clk_possible_parents is NOT read: debugfs creates it only for clocks with >1 parent, clk.c:3708, and both vclks have none, review bt-debug-clk-r1 F1). The value is captured with $(...) so the line is emitted whole (stderr/stdout ordering over adb, F2).
+# (UART16: gate_uart_clk16 = MUX_APM_FUNC id 11, ipclk_uart16 = DOUT_CLK_APM_USI1_UART id 14) are read, never clk_rate/clk_summary/clk_dump/clk_orphan*. The dir listing names the clocks that
+# exist (readdir of debugfs dirs, no hardware), so a renamed clock shows in the file next to its MISSING line.
+bt_clk_dir=/sys/kernel/debug/clk; bt_clk_names='MUX_APM_FUNC DOUT_CLK_APM_USI1_UART'
+bt_clk_files='clk_enable_count clk_prepare_count clk_protect_count clk_phase clk_flags clk_min_rate clk_max_rate'
+bt_clk_script="d=$bt_clk_dir; ls \$d | grep -E 'APM_FUNC|APM_USI._UART' | sed 's/^/clk-dir /'; for c in $bt_clk_names; do [ -d \"\$d/\$c\" ] || { echo \"MISSING clk \$c\"; continue; }; for f in $bt_clk_files; do if v=\$(cat \"\$d/\$c/\$f\" 2>/dev/null); then echo \"\$c \$f \$v\"; else echo \"UNREADABLE \$c \$f\"; fi; done; done; echo debugfs=ok"
+bt_init() { [ "$dry" = 1 ] || mkdir -p "$out/bt/bt-vendor-conf" || err "cannot create $out/bt"; }
+# BT FILE MARKER SCRIPT [TIMEOUT]: one stdin script (su -c sh) -> $out/bt/FILE through the address mask; GAP unless the script printed the exact MARKER line (every step && -chained, D keeps only the last rc: research 106)
+BT() { local f=bt/$1 m=$2 s=$3 t=${4:-90}
+	if [ "$dry" = 1 ]; then echo "would run: adb shell su -c sh   (script on stdin: $s > $out/$f, marker $m)"; return; fi
+	local ef=""; [ "${GP_BT_TRACE-}" != 1 ] || ef=$out/$f.stderr   # opt-in trace (see header): the script runs under `set -x`, remote stderr goes to FILE.stderr instead of the merged stream
+	{ [ -z "$ef" ] || echo 'set -x'; printf '%s; echo __GP_RC=$?\n' "$s"; } | { if [ -n "$ef" ]; then timeout "$t" adb shell su -c sh 2> "$ef"; else timeout "$t" adb shell su -c sh 2>&1; fi; } | tr -d '\r' | sed -E "$bt_mask" > "$out/$f" || { echo "GAP: $cmd: adb shell su -c sh failed for $f" >&2; bad=$((bad + 1)); }
+	[ -z "$ef" ] || { tr -d '\r' < "$ef" | sed -E "$bt_mask" > "$ef.m" && mv "$ef.m" "$ef"; }   # mask the trace like the output (addresses)
+	grep -qx "$m" "$out/$f" || { echo "GAP: $cmd: $f has no '$m' marker (a step failed or timed out, see $f)" >&2; bad=$((bad + 1)); return; }
+	case $f in bt/bt-vendor-conf/*) sed -i "/^__GP_RC=/d;/^$m\$/d" "$out/$f" ;; esac; }
+# bt_wait off|on: disable/enable + wait-for-state [research 107 Q3]; a failed wait leaves its marker out = GAP, the caller goes on
+bt_tog_script() { if [ "$1" = off ]; then echo 'cmd bluetooth_manager disable && echo disable=ok && cmd bluetooth_manager wait-for-state:STATE_OFF && echo state_off=ok'
+	else echo 'cmd bluetooth_manager enable && echo enable=ok && cmd bluetooth_manager wait-for-state:STATE_ON && echo state_on=ok'; fi; }
+bt_mask_file() { [ "$dry" = 1 ] || sed -i -E "$bt_mask" "$out/$1"; }
+# ---- Wi-Fi golden-trace helpers (20z, W36 R29). All phone-side behaviour is UNVERIFIED until the first phone run (see the header block).
+wf_secret=${GP_WIFI_SECRET:-$root/.wifi-join}; wf_tmp=""
+wf_gap() { echo "GAP: $cmd: $1" >&2; bad=$((bad + 1)); }
+wf_info() { echo "INFO: $cmd: $1" >&2; info=$((info + 1)); }
+# Never-write list (research F.3 + AGENTS hard rules): no script or command sent by a wifi-* mode may hold one of these words, checked before any adb call. Mounting is allowed (RAM tmpfs + bind), `remount` and block devices are not.
+# The one `rm` allowed is the EXACT stage-clean string below (removal of our own 3 staged files under /data/local/tmp/gp-wfw-*); it is cut out of the text before the check (an exact match, not a prefix: r1 F8), nothing else is removed.
+# Also refused (r1 F8): svc, setprop, setenforce, dmesg -c/-C, logcat -c, set-wifi-enabled, mv, truncate, kill*, and any redirect into /dev/ except `> /dev/kmsg` (the scan marker) and /dev/null.
+wf_forbid='dd of=|of=/dev|/dev/block|flash|fastboot|mkfs|reboot|settings put|remount|pm clear|uninstall|memdump|assert|hang_privcmd_err|dump_start|dump_stateinfo|sssr_enab|fis_enab|wl_accel_force_reg_on|firmware_path|nvram_path|clk_summary|clk_dump|rmmod|insmod|(^|[^a-z])rm |svc |setprop|setenforce|dmesg -[cC]|logcat -c|set-wifi-enabled|(^|[^a-z])(mv|truncate|kill|killall|pkill) |>>? */dev/'
+wf_stageclean="rm -f ${WF_FW_S}${WF_FW_NAMES[0]} ${WF_FW_S}${WF_FW_NAMES[1]} ${WF_FW_S}${WF_FW_NAMES[2]}; echo stage_clean=ok"
+wf_guard() { local s t; for s in "$@"; do t=${s//"$wf_stageclean"/}; t=${t//"> /dev/kmsg"/}; t=${t//"/dev/null"/}
+		! printf '%s\n' "$t" | grep -qE "$wf_forbid" || fail "$cmd: script holds a forbidden word (never-write list): ${s:0:60}"; done; }
+# Probe-table guard: a WHITELIST of probe forms (see the table header), checked per row before any adb call. The 4th argument ($arg4 = %x3 on arm64) is the ioctl buffer, which carries the passphrase TLV and scan SSIDs:
+# a memory fetch through it is refused, except exactly P2's `name=+0($arg4):string` (the name only; the filter limits P2 to GET_VAR/SET_VAR). A plain register value (`type=$arg4:u8`, P12) is not a memory fetch and passes.
+# Nested fetches through other arguments (P14: counters of the driver struct) pass. Events and filters: unique event names, filter identifiers must be fields of the same probe, filter charset fixed, no quote.
+wf_row_text() { local r=${1#*|}; echo "${r%%|*}"; }
+wf_row_filter() { local r=${1#*|}; if [[ "$r" == *'|'* ]]; then echo "${r#*|}"; fi; }
+wf_ev() { local t=${1#?:gpwifi/}; echo "${t%% *}"; }
+# Probes on the escan params (symbol wl_do_escan, any label or offset, and wldev_iovar_setbuf which receives the same buffer; r1 F6): the params buffer in %x2 is [8 B header][wl_scan_params]. v1 puts SSID/BSSID/bss_type at buffer bytes 8..50,
+# v2/v3 put the SSID at 12..47, the BSSID at 48..53, bss_type 54, pad 55 [src docs/research/golden-wifi-trace-h1b.md:32-33]. So no fetch there may touch bytes 8..55 (offset+width intersecting [8,55] is refused; r1 F2), only
+# whitelisted forms: plain %x3 (length), +OFF(%x2) with OFF in 0..7 or >= 56 (decimal/hex, no :string), +OFF(%x20) (driver struct). Nothing else. Offsets: 0, 1-5 decimal digits without a leading zero, or 0x + 1-4 hex digits (r1 F7:
+# `08` is an arithmetic error in bash and a registration error in the kernel; an evaluation failure is a refusal, never a pass).
+wf_p21_field() { local nm=$1 fe=$2 off="" w ty; local re='^[a-z0-9_]+=\+(0x[0-9a-fA-F]{1,4}|0|[1-9][0-9]{0,4})\((%x2|%x20)\):(u8|s8|x8|u16|s16|x16|u32|s32|x32|u64|s64|x64)$'
+	if [[ "$fe" =~ ^[a-z0-9_]+=%x3:(u32|x32|u64|x64)$ ]]; then return 0; fi
+	[[ "$fe" =~ $re ]] || fail "$cmd: probe $nm: field '${fe:0:50}' is not an allowed escan-params form (plain %x3, +OFF(%x2), +OFF(%x20))"
+	[ "${BASH_REMATCH[2]}" = %x2 ] || return 0
+	ty=${BASH_REMATCH[3]}; off=$(( ${BASH_REMATCH[1]} ))
+	[[ "$off" =~ ^[0-9]+$ ]] || fail "$cmd: probe $nm: cannot evaluate the offset of '${fe:0:50}'"
+	case $ty in *8) w=1 ;; *16) w=2 ;; *32) w=4 ;; *) w=8 ;; esac
+	if [ "$off" -le 55 ] && [ $((off + w - 1)) -ge 8 ]; then fail "$cmd: probe $nm: fetch '${fe:0:50}' touches bytes 8..55 of the escan params (SSID/BSSID/bss_type)"; fi; }
+wf_probe_guard() { local row nm t fl ev sym f fe fnm ib seen=" " nreg='(\$arg[1-8]|%x([0-9]|[12][0-9]|30))' num='(0x[0-9a-fA-F]{1,4}|0|[1-9][0-9]{0,4})' ty='(u8|u16|u32|u64|s8|s16|s32|s64|x8|x16|x32|x64|string)' re
+	local d1="[+-]?$num\\($nreg\\)"; local d2="[+-]?$num\\($d1\\)"; local fetch="($nreg|\\\$retval|$d1|$d2)"
+	[ "${#WF_PROBES[@]}" -ge 1 ] || err "wifi probe table is empty"
+	for row in "${WF_PROBES[@]}"; do nm=${row%%|*}; t=$(wf_row_text "$row"); fl=$(wf_row_filter "$row")
+		case $t in *"'"*) fail "$cmd: probe $nm holds a quote" ;; esac
+		[[ "$t" =~ ^([pr]):gpwifi/([a-z0-9_]+)\ ([A-Za-z0-9_.]+)(\+$num)?(\ .*)?$ ]] || fail "$cmd: probe $nm is not 'p|r:gpwifi/EVENT SYMBOL[+OFF] fields': ${t:0:60}"
+		ev=${BASH_REMATCH[2]}; sym=${BASH_REMATCH[3]}; f=${BASH_REMATCH[6]}
+		[ "${BASH_REMATCH[1]}" = p ] || [ -z "${BASH_REMATCH[4]}" ] || fail "$cmd: probe $nm is a return probe with a symbol offset"
+		case $seen in *" $ev "*) fail "$cmd: probe $nm: event name $ev is used twice" ;; esac; seen="$seen$ev "
+		local names=" "
+		for fe in $f; do
+			re="^([a-z0-9_]+)=($fetch):$ty$"
+			[[ "$fe" =~ $re ]] || fail "$cmd: probe $nm: field '${fe:0:50}' is not a whitelisted fetch form"
+			fnm=${BASH_REMATCH[1]}; names="$names$fnm "
+			[[ "$fe" == *'$retval'* && "${t:0:1}" != r ]] && fail "$cmd: probe $nm: \$retval in an entry probe"
+			if [ "$sym" = wl_do_escan ] || [ "$sym" = wldev_iovar_setbuf ]; then wf_p21_field "$nm" "$fe"; fi   # keyed on the probed symbol, not the label (r1 F6)
+			if [[ "$fe" == *'('* ]]; then ib=${fe##*(}; ib=${ib%%)*}
+				case $ib in '$arg4'|'%x3') [ "$sym:$ev:$fe:$fl" = 'dhd_wl_ioctl:iovar:name=+0($arg4):string:cmd == 262 || cmd == 263' ] || fail "$cmd: probe $nm: memory fetch through $ib (ioctl buffer: payload/passphrase risk): ${fe:0:50}" ;; esac; fi
+		done
+		if [ -n "$fl" ]; then
+			[[ "$fl" =~ ^[A-Za-z0-9_\ =\!\<\>\&\|\(\)\.-]+$ ]] || fail "$cmd: probe $nm: filter has a character outside the allowed set"
+			for fnm in $(printf '%s' "$fl" | sed -E 's/0x[0-9a-fA-F]+//g; s/[0-9]+//g' | grep -oE '[A-Za-z_][A-Za-z0-9_]*'); do
+				case $names in *" $fnm "*) ;; *) fail "$cmd: probe $nm: filter names '$fnm', which is not a field of the probe" ;; esac; done
+		fi
+		wf_guard "$t" "$fl"; done; }
+wf_kp_script() { local row t ev fl
+	for row in "${WF_PROBES[@]}"; do t=$(wf_row_text "$row"); ev=$(wf_ev "$t")
+		printf '%s\n' "echo '$t' >> $T/kprobe_events && echo probe_ok=$ev || echo probe_fail=$ev"; done
+	for row in "${WF_PROBES[@]}"; do fl=$(wf_row_filter "$row"); [ -n "$fl" ] || continue; ev=$(wf_ev "$(wf_row_text "$row")")
+		printf '%s\n' "echo '$fl' > $T/events/gpwifi/$ev/filter; echo filter_$ev=\$(cat $T/events/gpwifi/$ev/filter)"; done
+	printf '%s\n' "echo 1 > $T/events/gpwifi/enable; echo gpwifi_enable=\$(cat $T/events/gpwifi/enable)"
+	printf '%s\n' "if [ -d $T/events/cfg80211 ]; then echo cfg80211_prev=\$(cat $T/events/cfg80211/enable); echo 1 > $T/events/cfg80211/enable; echo cfg80211_enable=\$(cat $T/events/cfg80211/enable); else echo cfg80211_group=absent; fi"
+	printf '%s\n' "echo kprobes_registered=\$(grep -c '^[pr]:gpwifi/' $T/kprobe_events)"
+	printf '%s\n' "echo kprobes_script_end=ok"; }
+# PREV = the events/cfg80211/enable value recorded by the arm script (0|1) to put back, or `keep` (unknown: leave it alone, r1 F5)
+wf_kpoff_script() { local row t ev prev=${1:-keep}
+	case $prev in keep|0|1) ;; *) echo "ERROR: wf_kpoff_script: prior cfg80211 value '${prev:0:20}' is not keep|0|1 (r2 R2-2): nothing is sent" >&2; return 1 ;; esac
+	printf '%s\n' "if [ -d $T/events/gpwifi ]; then echo 0 > $T/events/gpwifi/enable; echo gpwifi_enable=\$(cat $T/events/gpwifi/enable); else echo gpwifi_events=absent; fi"
+	if [ "$prev" = keep ]; then printf '%s\n' "echo cfg80211_untouched=1"
+	else printf '%s\n' "if [ -d $T/events/cfg80211 ]; then echo $prev > $T/events/cfg80211/enable; echo cfg80211_enable=\$(cat $T/events/cfg80211/enable); else echo cfg80211_group=absent; fi"; fi
+	for row in "${WF_PROBES[@]}"; do t=$(wf_row_text "$row"); ev=$(wf_ev "$t")
+		printf '%s\n' "if grep -q '^[pr]:gpwifi/$ev ' $T/kprobe_events; then echo '-:gpwifi/$ev' >> $T/kprobe_events && echo probe_off=$ev || echo probe_off_fail=$ev; else echo probe_absent=$ev; fi"; done
+	printf '%s\n' "echo gpwifi_left=\$(grep -c '^[pr]:gpwifi/' $T/kprobe_events)"
+	printf '%s\n' "if [ -d $T/events/gpwifi ]; then echo gpwifi_dir=still; else echo gpwifi_dir=gone; fi"
+	printf '%s\n' "echo kprobes_off_end=ok"; }
+# module identity script: sha256 of every bcmdhd4389.ko found at WF_KO_PATHS
+wf_ko_script() { local p; for p in $WF_KO_PATHS; do printf '%s\n' "[ -f $p ] && sha256sum $p"; done; printf '%s\n' "echo ko_end=ok"; }
+# W0 bind script (runs in the GLOBAL mount ns: su --mount-master). Per file: stock sha + stock SELinux label BEFORE the bind, copy from the staged file into the tmpfs, sha of the tmpfs copy must equal the pin, chcon to the stock label, bind, read back.
+wf_bind_script() { local n V=$WF_FW_V D=$WF_FW_D S=$WF_FW_S
+	printf '%s\n' "if grep -q ' $D ' /proc/mounts || grep -q ' $V/' /proc/mounts; then echo bind_already=1; else"
+	printf '%s\n' "mkdir -p $D && mount -t tmpfs -o size=16m,mode=0755 tmpfs $D && echo tmpfs=ok"
+	for n in "${WF_FW_NAMES[@]}"; do
+		printf '%s\n' "echo stock_sha_$n=\$(sha256sum $V/$n | cut -d' ' -f1)"
+		printf '%s\n' "l=\$(ls -Z $V/$n | cut -d' ' -f1); echo label_$n=\$l"
+		printf '%s\n' "[ -n \"\$l\" ] && cp $S$n $D/$n && [ \"\$(sha256sum $D/$n | cut -d' ' -f1)\" = ${WF_FW_PIN[$n]} ] && chmod 0444 $D/$n && chcon \$l $D/$n && mount -o bind $D/$n $V/$n && echo bind_$n=ok || echo bind_fail_$n=1"
+		printf '%s\n' "echo bound_sha_$n=\$(sha256sum $V/$n | cut -d' ' -f1); echo bound_label_$n=\$(ls -Z $V/$n | cut -d' ' -f1)"; done
+	printf '%s\n' "fi"
+	printf '%s\n' "echo bind_script_end=ok"; }
+wf_readback_script() { local n
+	for n in "${WF_FW_NAMES[@]}"; do printf '%s\n' "echo rb_sha_$n=\$(sha256sum $WF_FW_V/$n | cut -d' ' -f1)"; done
+	printf '%s\n' "echo readback_end=ok"; }
+wf_unbind_script() { local n V=$WF_FW_V D=$WF_FW_D
+	for n in "${WF_FW_NAMES[@]}"; do printf '%s\n' "if grep -q ' $V/$n ' /proc/mounts; then umount $V/$n && echo unbound_$n=ok || echo unbind_fail_$n=1; else echo not_bound_$n=1; fi"; done
+	printf '%s\n' "if grep -q ' $D ' /proc/mounts; then umount $D && echo tmpfs_off=ok || echo tmpfs_off_fail=1; else echo no_tmpfs=1; fi"
+	for n in "${WF_FW_NAMES[@]}"; do printf '%s\n' "echo sha_$n=\$(sha256sum $V/$n | cut -d' ' -f1)"; done
+	printf '%s\n' "echo binds_left=\$(grep -c ' $V/' /proc/mounts)"
+	printf '%s\n' "echo unbind_script_end=ok"; }
+# Teardown state and traps (r1 F1/F5): every phone-side change a wifi mode makes is recorded in a flag; wf_cleanup (EXIT, and INT/TERM/HUP turned into an exit) undoes what is still flagged: the staged firmware copies, an active bind, armed kprobes.
+# A normal run clears the flag when it has finished the step itself (a good bind and good probes stay on purpose). A signal ends in RESULT: FAIL, never PASS. SIGKILL cannot be caught (rerun wifi-fw-unbind / wifi-kprobes-off by hand).
+# bash defers a trap while a foreground child (timeout adb ...) runs, so a TERM sent to the script only fires after that adb call returned (<= 60/90/600 s); Ctrl-C reaches the children too.
+wf_x=""; wf_sig=""; wf_fw_staged=0; wf_fw_bind=0; wf_kp_armed=0; wf_kp_prev=keep
+wf_traps() { exec 7>&1 8>&2; trap wf_cleanup EXIT; trap 'wf_sig=TERM; exit 143' TERM; trap 'wf_sig=INT; exit 130' INT; trap 'wf_sig=HUP; exit 129' HUP; }
+# fd 7/8 = the real stdout/stderr: a trap fired inside `Q ... > /dev/null` would otherwise run with that redirection still active and swallow the RESULT line
+wf_cleanup() { local rc=$?; trap - EXIT INT TERM HUP; exec 1>&7 2>&8
+	if [ "$wf_fw_staged" = 1 ] || [ "$wf_fw_bind" = 1 ] || [ "$wf_kp_armed" = 1 ]; then
+		echo "wf cleanup: ${wf_sig:+interrupted by SIG$wf_sig; }undoing what this run left on the phone (staged firmware copies=$wf_fw_staged, active bind=$wf_fw_bind, armed kprobes=$wf_kp_armed)" >&2
+		if [ "$wf_fw_staged" = 1 ]; then ( wf_fw_stageclean ) || true; fi
+		# r2 R2-6: a bind script that reported bind_already=1 changed nothing; the active bind belongs to an earlier run, never unbind it. fw-bind.txt is truncated by WF when the bind script starts; a signal in the microseconds between the flag and that truncation is the one window left (a stale file from an earlier run is read then) [guess: not testable].
+		if [ "$wf_fw_bind" = 1 ] && grep -qx 'bind_already=1' "$out/wifi/fw-bind.txt" 2>/dev/null; then echo "wf cleanup: the bind script found an earlier bind (bind_already=1): left as it was" >&2; wf_fw_bind=0; fi
+		if [ "$wf_fw_bind" = 1 ]; then ( wf_unbind_run ) || true; fi
+		# r2 R2-1: the arm script records the prior events/cfg80211/enable in kprobes.txt (cfg80211_prev=0|1, printed before it writes 1); an interrupt before the host parsed it must still restore it
+		if [ "$wf_kp_armed" = 1 ] && [ "$wf_kp_prev" = keep ] && [ -f "$out/wifi/kprobes.txt" ]; then
+			wf_pv=$(sed -n 's/^cfg80211_prev=\([01]\)$/\1/p' "$out/wifi/kprobes.txt" | head -n 1); [ -z "$wf_pv" ] || wf_kp_prev=$wf_pv
+		fi
+		if [ "$wf_kp_armed" = 1 ] && [ "$wf_kp_prev" = keep ]; then echo "INFO: wf cleanup: prior events/cfg80211/enable is unknown: left alone (it may still hold the armed value 1)" >&2; fi
+		if [ "$wf_kp_armed" = 1 ]; then ( wf_kp_off kprobes-disarm.txt "$wf_kp_prev" ) || true; fi
+		[ "$rc" != 0 ] || rc=1
+	fi
+	if [ -n "$wf_sig" ]; then rc=1; echo "RESULT: FAIL $cmd interrupted by SIG$wf_sig gaps=$bad out=$out info=$info"; fi
+	[ -z "$wf_x" ] || rm -rf "$wf_x"; [ -z "$wf_tmp" ] || rm -rf "$wf_tmp"
+	exit "$rc"; }
+wf_init() { wf_traps; [ "$dry" = 1 ] || mkdir -p "$out/wifi" || err "cannot create $out/wifi"; }
+# Secret handling (R C-mask, AP-279): SSID/PSK come from GP_WIFI_SECRET (2 lines), are written only to mode-600 files in a private temp dir (removed on exit), never to argv, a log line or the phone.
+# CR is stripped (CRLF file, r1 F4); a control character left in either line is a refusal. The secret file must not lie inside the output dir (S1 scans the whole dir; r1 F3). mask.sed = SSID literal -> <ssid>, PSK literal and hex -> <psk>
+# (the PSK never reaches the host disk through a masked pull; S1 stays the verifier). The hex forms (plain and colon-separated, any case) are masked before bt_mask so the MAC mask cannot eat half of a colon-hex SSID.
+wf_sedlit() { printf '%s' "$1" | sed 's|[].[\\/^$*]|\\&|g'; }
+wf_hexs() { printf '%s' "$1" | od -An -v -tx1 | tr -d '\n' | sed 's/^ *//; s/  */ /g'; }
+wf_secret_init() { local um ssid psk hs hp
+	if [ "$dry" = 1 ]; then return 0; fi
+	[ -r "$wf_secret" ] || fail "$cmd: secret file $wf_secret is missing or unreadable (SSID/PSK are needed for the mask and the S1 checks; AP-279)"
+	case "$(realpath -m -- "$wf_secret")" in "$(realpath -m -- "$out")"/*) fail "$cmd: secret file $wf_secret is inside the output dir $out (S1 scans and deletes in that dir)" ;; esac
+	um=$(umask); umask 077
+	wf_tmp=$(mktemp -d) || { umask "$um"; err "$cmd: mktemp failed"; }
+	ssid=$(sed -n 1p "$wf_secret" | tr -d '\r'); psk=$(sed -n 2p "$wf_secret" | tr -d '\r')
+	if [ -z "$ssid" ] || [ "${#psk}" -lt 8 ]; then umask "$um"; fail "$cmd: $wf_secret needs line 1 = SSID and line 2 = PSK (8+ chars)"; fi
+	if [[ "$ssid$psk" =~ [[:cntrl:]] ]]; then umask "$um"; fail "$cmd: $wf_secret holds a control character in the SSID or PSK (after stripping CR)"; fi
+	printf '%s\n' "$ssid" > "$wf_tmp/ssid.lit"; printf '%s\n' "$psk" > "$wf_tmp/psk.lit"
+	hs=$(wf_hexs "$ssid"); printf '%s\n%s\n' "${hs// /}" "${hs// /:}" > "$wf_tmp/ssid.hex.lit"
+	hp=$(wf_hexs "$psk"); printf '%s\n%s\n' "${hp// /}" "${hp// /:}" > "$wf_tmp/psk.hex.lit"
+	# sed BRE escape: \ / . [ * ^ $ are literal on the pattern side. The SSID hex forms are masked only from 4 bytes on (a 1-3 byte SSID would mask unrelated hex); S1 checks them in every case.
+	{ printf 's/%s/<ssid>/g\n' "$(wf_sedlit "$ssid")"; printf 's/%s/<psk>/g\n' "$(wf_sedlit "$psk")"
+		printf 's/%s/<psk>/Ig\n' "${hp// /}" ; printf 's/%s/<psk>/Ig\n' "${hp// /:}"
+		if [ "$(printf '%s' "$ssid" | wc -c)" -ge 4 ]; then printf 's/%s/<ssid>/Ig\n' "${hs// /}" ; printf 's/%s/<ssid>/Ig\n' "${hs// /:}"; fi; } > "$wf_tmp/mask.sed"
+	umask "$um"; }
+# wifi_mask: MAC/BSSID (bt_mask), SSID literal, PSK literal/hex of the secret file. wifi_scan_mask: first the TAIL of `cmd wifi list-scan-results` rows from the SSID column on (neighbour SSIDs are unknown literals),
+# fixed columns from ScanResultUtil.dumpScanResults, android14-release framework/java/android/net/wifi/util/ScanResultUtil.java:451-: pw.printf("  %17s  %9d  %18s   %7s    %-32s  %s\n", BSSID, freq, rssiInfo, age, ssid(%1.32s), caps)
+# = 2+17+2+9+2+18+3+7+4 = 64 ASCII characters before the SSID [read from source; the BP31 build may be a QPR with another format = guess, an unmatched data line is a GAP in wifi-scan]. Everything after those 64 characters is masked
+# (SSID AND flags): SSID width/bytes/multibyte no longer matter (r1 F10), the cost is that the capability flags are not kept. Field widths are minimums, so a wider field only shifts the SSID right = more is masked, never less.
+wf_scan_col='s/^(  [0-9A-Fa-f:]{17}.{45}).*/\1<ssid-masked>/'
+wifi_mask() { if [ -s "$wf_tmp/mask.sed" ]; then sed -f "$wf_tmp/mask.sed" | sed -E "$bt_mask"; else sed -E "$bt_mask"; fi; }
+wifi_scan_mask() { LC_ALL=C sed -E "$wf_scan_col" | wifi_mask; }
+# WF FILE MARKER SCRIPT [TIMEOUT] [MASKFN] [SU-OPTION]: one stdin script (su -c sh) -> $out/wifi/FILE through MASKFN (default wifi_mask); GAP unless the exact MARKER line was printed (BT() style). SU-OPTION = --mount-master for the global ns.
+WF() { local f=wifi/$1 m=$2 s=$3 t=${4:-90} mk=${5:-wifi_mask} mm=${6:-}
+	wf_guard "$s"
+	if [ "$dry" = 1 ]; then echo "would run: adb shell su ${mm:+$mm }-c sh   (script on stdin: ${s//$'\n'/ ; } > $out/$f, marker $m)"; return 0; fi
+	printf '%s\n' "$s" | timeout "$t" adb shell su ${mm:+$mm} -c sh 2>&1 | tr -d '\r' | "$mk" > "$out/$f" || wf_gap "adb shell su ${mm:+$mm }-c sh failed for $f"
+	grep -qx "$m" "$out/$f" || { wf_gap "$f has no '$m' marker (a step failed or timed out, see $f)"; return 1; }; return 0; }
+# WFR FILE CMD: exec-out pull through wifi_mask with the same rc sentinel as R (so the raw text never reaches disk); GAP on rc != 0 or empty output.
+WFR() { local f=$out/wifi/$1 c=$2
+	wf_guard "$c"
+	if [ "$dry" = 1 ]; then echo "would run: adb exec-out su -c \"$c\" > $f (through wifi_mask)"; return 0; fi
+	timeout 600 adb exec-out su -c "$c; r=\$?; printf '\\n__GP_RC=%s\\n' \$r" </dev/null | wifi_mask > "$f" || wf_gap "mask/pipe failed for $1"
+	if [ "$(tail -c 11 "$f")" = $'\n__GP_RC=0' ]; then truncate -s -11 "$f"; else wf_gap "pull of '$c' failed (rc sentinel '$(tail -c 11 "$f" | tr -d '\n')', su denied or command error)"; return 1; fi
+	[ -s "$f" ] || { wf_gap "pull of '$c' is empty"; return 1; }; return 0; }
+# wf_mk FILE KEY: value of the first KEY=value line of $out/wifi/FILE
+wf_mk() { sed -n "s/^$2=//p" "$out/wifi/$1" | head -n 1; }
+wf_stock=wifi/fw-stock-sha.txt
+# unbind (also the rollback of a failed bind): umount x3 + tmpfs; the sha read through the stock path must equal the recorded stock sha
+wf_unbind_run() { local n want got nb=0 nt=0
+	WF fw-unbind.txt unbind_script_end=ok "$(wf_unbind_script)" 90 cat --mount-master
+	[ "$dry" = 1 ] && return 0
+	for n in "${WF_FW_NAMES[@]}"; do
+		[ -z "$(wf_mk fw-unbind.txt "unbind_fail_$n")" ] || wf_gap "umount of $WF_FW_V/$n failed (see fw-unbind.txt)"
+		[ -z "$(wf_mk fw-unbind.txt "not_bound_$n")" ] || nb=$((nb + 1))
+		want=$(awk -v n="$n" '$2 == n { print $1 }' "$out/$wf_stock" 2>/dev/null); got=$(wf_mk fw-unbind.txt "sha_$n")
+		if [ -z "$want" ]; then wf_gap "no recorded stock sha256 for $n in $wf_stock (wifi-fw-bind never recorded it): cannot verify the unbind"
+		elif [ "$got" != "$want" ]; then wf_gap "after unbind $WF_FW_V/$n reads sha256 '${got:0:12}' != recorded stock '${want:0:12}'"; fi
+	done
+	[ -z "$(wf_mk fw-unbind.txt tmpfs_off_fail)" ] || wf_gap "umount of $WF_FW_D failed"
+	[ -z "$(wf_mk fw-unbind.txt no_tmpfs)" ] || nt=1
+	[ "$(wf_mk fw-unbind.txt binds_left)" = 0 ] || wf_gap "binds_left is not 0 (a mount under $WF_FW_V/ remains, see fw-unbind.txt)"
+	if [ "$nb" = "${#WF_FW_NAMES[@]}" ] && [ "$nt" = 1 ]; then wf_info "nothing was bound (all $nb files already stock, no tmpfs)"; fi; }
+# staged firmware copies in /data/local/tmp (userdata): removed again as soon as the bind step is over, on every path (wf_cleanup retries it if the normal-path removal failed)
+wf_fw_stageclean() { WF fw-stage-clean.txt stage_clean=ok "$wf_stageclean" 60 cat && wf_fw_staged=0; }
+# kprobes off/disarm: FILE = output file, PREV = events/cfg80211/enable value to put back (0|1) or keep. Used by wifi-kprobes-off, by the disarm after a failed arm, and by wf_cleanup.
+wf_kp_off() { local f=$1 prev=$2 w ev row c b0=$bad s
+	s=$(wf_kpoff_script "$prev") || { wf_gap "kprobes off/disarm refused: the cfg80211 prior value is not keep|0|1 (nothing sent; the probes may still be armed)"; return 1; }
+	WF "$f" kprobes_off_end=ok "$s" 90 cat || return 1
+	[ "$dry" = 1 ] && return 0
+	w=$out/wifi/$f
+	for row in "${WF_PROBES[@]}"; do ev=$(wf_ev "$(wf_row_text "$row")"); ! grep -qx "probe_off_fail=$ev" "$w" || wf_gap "removing gpwifi/$ev failed (see $f)"; done
+	[ "$(wf_mk "$f" gpwifi_left)" = 0 ] || wf_gap "gpwifi_left='$(wf_mk "$f" gpwifi_left)': tracefs still shows gpwifi probes"
+	[ "$(wf_mk "$f" gpwifi_dir)" = gone ] || wf_gap "events/gpwifi still exists"
+	if grep -qx 'gpwifi_events=absent' "$w"; then wf_info "no events/gpwifi group (nothing was armed)"; elif [ "$(wf_mk "$f" gpwifi_enable)" != 0 ]; then wf_gap "events/gpwifi/enable does not read 0"; fi
+	c=$(wf_mk "$f" cfg80211_enable)
+	if [ "$prev" = keep ]; then [ -z "$c" ] || wf_gap "events/cfg80211/enable was to be left alone but the script wrote it"
+	elif [ -n "$c" ] && [ "$c" != "$prev" ]; then wf_gap "events/cfg80211/enable reads '$c', not the recorded prior value $prev"; fi
+	! grep -q '^probe_absent=' "$w" || wf_info "$(grep -c '^probe_absent=' "$w") of ${#WF_PROBES[@]} gpwifi probes were not registered when removing"
+	[ "$bad" != "$b0" ] || wf_kp_armed=0; return 0; }
+# module identity (r1 F14): FILE = probe-ko.txt / kprobes-ko.txt. Returns 1 (and a GAP) unless at least one bcmdhd4389.ko was found and every found one has the sha256 WF_KO_PIN.
+wf_ko_check() { local f=$1 n=0 mism=0 h _
+	WF "$f" ko_end=ok "$(wf_ko_script)" 60 cat || return 1
+	[ "$dry" = 1 ] && return 0
+	while read -r h _; do [[ "$h" =~ ^[0-9a-f]{64}$ ]] || continue; n=$((n + 1)); [ "$h" = "$WF_KO_PIN" ] || { mism=1; echo "ko_sha256_found=${h:0:12}.. want ${WF_KO_PIN:0:12}.." >&2; }; done < "$out/wifi/$f"
+	if [ "$n" = 0 ]; then wf_gap "no bcmdhd4389.ko at any of: $WF_KO_PATHS (paths are a guess); the probe offsets cannot be tied to the disassembled build, nothing is armed"; return 1; fi
+	if [ "$mism" = 1 ]; then wf_gap "bcmdhd4389.ko on the phone is not the disassembled build (sha256 != WF_KO_PIN ${WF_KO_PIN:0:12}..): the probe offsets would land on other instructions"; return 1; fi
+	echo "ko_sha256=${WF_KO_PIN:0:12}.. (matches WF_KO_PIN, $n file(s))"; return 0; }
+# S1 (run plan S1 + review golden-wifi-trace-r1 F1, golden-wifi-modes-r1 F3/F11): the PSK literal and its hex forms are grepped over the WHOLE out dir; the SSID literal, its hex forms and the MAC pattern only over the files
+# THIS mode wrote under wifi/ (args; masked by construction). A PSK hit in a file THIS run wrote deletes that file (nothing is copied); a hit in any other file (older capture, stop-pull trace) is a GAP and the file is NOT touched (it is evidence;
+# delete or move it by hand). The secret file itself is never touched. grep rc 2 (unreadable file) is a GAP "scan INCOMPLETE" and hits found before it are still handled. File names only are printed, never a match.
+wf_s1() { local lst f c rc spec mine nps=0 nss=0 nmac=0 chk=()
+	for f in "$@"; do [ -f "$f" ] && chk+=("$f"); done
+	for spec in psk.lit:-rlaF psk.hex.lit:-rlaiF; do
+		lst=$(grep "${spec#*:}" -f "$wf_tmp/${spec%%:*}" -- "$out"); rc=$?
+		[ "$rc" -le 1 ] || wf_gap "S1 PSK grep (${spec%%:*}) failed rc=$rc: the scan is INCOMPLETE (unreadable file in $out?)"
+		while IFS= read -r f; do [ -n "$f" ] || continue
+			[ ! "$f" -ef "$wf_secret" ] || continue
+			mine=0; for c in "${chk[@]}"; do [ "$c" != "$f" ] || mine=1; done
+			nps=$((nps + 1)); bad=$((bad + 1))
+			if [ "$mine" = 1 ]; then echo "GAP: S1 PSK hit: ${f#"$out"/} (file written by this run: deleted, nothing copied)" >&2; rm -f -- "$f"
+			else echo "GAP: S1 PSK hit: ${f#"$out"/} (NOT written by this run: left in place, delete or move it by hand)" >&2; fi
+		done <<< "$lst"
+	done
+	if [ "${#chk[@]}" -gt 0 ]; then
+		for spec in "SSID literal:-laF:ssid.lit" "SSID hex form:-laiF:ssid.hex.lit"; do
+			lst=$(grep "$(echo "$spec" | cut -d: -f2)" -f "$wf_tmp/${spec##*:}" -- "${chk[@]}"); rc=$?
+			[ "$rc" -le 1 ] || wf_gap "S1 ${spec%%:*} grep failed rc=$rc: the scan is INCOMPLETE"
+			while IFS= read -r f; do [ -n "$f" ] || continue; wf_gap "S1 ${spec%%:*} in ${f#"$out"/}"; nss=$((nss + 1)); done <<< "$lst"
+		done
+		lst=$(grep -laE '([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}' -- "${chk[@]}"); rc=$?
+		[ "$rc" -le 1 ] || wf_gap "S1 MAC grep failed rc=$rc: the scan is INCOMPLETE"
+		while IFS= read -r f; do [ -n "$f" ] || continue; wf_gap "S1 MAC pattern in ${f#"$out"/}"; nmac=$((nmac + 1)); done <<< "$lst"
+	fi
+	echo "S1: psk_hits=$nps ssid_hits=$nss mac_hits=$nmac"; }
+# ui guard (review golden-unattended-r1 F1-F8). FORBID is matched case-insensitively against the raw guard dump (text, content-desc, resource-id, anything).
+# No trailing \b: prefixes catch plurals and -ing forms (review golden-ui-r1 F2); bare stems over-refuse on purpose (BACK/HOME stay allowed).
+FORBID='\b(Erase all data|Factory data reset|factory reset|Reset options|Erase downloaded SIMs|Erase eSIMs|Direct install|Select and Patch|Install to inactive slot|OEM unlocking|Uninstall Magisk|Restore images|Complete uninstall|Format|Download and install|Install now|Restart now|Restart to update|Update now|System update|Software update|Automatic system updates|Install update|Emergency|Emergency call|Emergency SOS|Restart|Reboot|Power off|Install|Uninstall|Update|Download|DSU|DSU Loader|USB debugging|Revoke USB debugging|Wireless debugging|Default USB configuration)'
+UI_PKGS='com.android.settings com.android.systemui com.google.android.apps.nexuslauncher com.google.android.GoogleCamera com.google.android.settings.intelligence'   # Settings search measured s6 (golden-3 ui7b); Magisk (com.topjohnwu.magisk) is deliberately absent
+uifatal() { case "$1" in guard|recheck) fail "ui: $2, refusing to act blind" ;; esac; echo "GAP: $2" >&2; bad=$((bad + 1)); }
+# uidump NAME: remove the old dump first (a failed dump must never leave a stale screen behind: F2), dump, pull. guard/recheck failures are fatal.
+Q() { if [ "$dry" = 1 ]; then A "$@"; else A "$@" > /dev/null; fi; }   # dry-run keeps the "would run" lines (review golden-ui-r1 F10)
+uidump() { Q shell rm -f /data/local/tmp/ui.xml || uifatal "$1" "cannot remove the old ui dump"
+	Q shell uiautomator dump /data/local/tmp/ui.xml || uifatal "$1" "uiautomator dump failed"
+	if [ "$dry" = 1 ]; then echo "would run: adb exec-out cat /data/local/tmp/ui.xml > $out/ui-$1.xml"; [[ "$1" =~ ^(guard|recheck)$ ]] || echo "would run: adb exec-out screencap -p > $out/ui-$1.png"; return; fi
+	timeout 60 adb exec-out cat /data/local/tmp/ui.xml > "$out/ui-$1.xml" </dev/null; grep -q '<hierarchy' "$out/ui-$1.xml" || uifatal "$1" "ui-$1.xml is not a uiautomator dump"
+	[[ "$1" =~ ^(guard|recheck)$ ]] || { timeout 60 adb exec-out screencap -p > "$out/ui-$1.png" </dev/null; [ -s "$out/ui-$1.png" ] || { echo "GAP: screencap failed" >&2; bad=$((bad + 1)); }; }; }
+# uicheck FILE ACTION [ARGS]: package allowlist of the top-level nodes (F5), tap inside a clickable non-FORBID node (F4a), swipe endpoints on screen (F4a). Exit 1 + reason on stdout.
+uicheck() { UI_FORBID=$FORBID UI_PKGS=$UI_PKGS python3 -I -c '
+import os, re, sys, xml.etree.ElementTree as ET
+f, act, a = sys.argv[1], sys.argv[2], [int(x) for x in sys.argv[3:]]
+bad = re.compile(os.environ["UI_FORBID"], re.I)
+def die(m): print(m); sys.exit(1)
+try: root = ET.parse(f).getroot()
+except Exception as e: die("dump is not parseable XML (%s)" % type(e).__name__)
+top = list(root)
+if not top: die("dump has no top-level node")
+if act == "parse": sys.exit(0)
+def norm(v): return re.sub(r"[\u00ad\u200b-\u200f\u2060\ufeff]", "", re.sub(r"\s+", " ", v))   # NBSP and entities (ElementTree unescapes) -> plain text (F2)
+for n in root.iter("node"):
+    for k, v in n.attrib.items():
+        if bad.search(norm(v)): die("forbidden word in %s=%r" % (k, norm(v)[:40]))
+pk = sorted({n.get("package", "") for n in root.iter("node")})   # nested nodes too (F6)
+for p in pk:
+    if p not in os.environ["UI_PKGS"].split(): die("foreground package %r is not allowlisted" % p)
+def box(n):
+    m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds", ""))
+    return tuple(map(int, m.groups())) if m else None
+def inside(b, x, y): return b and b[0] <= x < b[2] and b[1] <= y < b[3]
+if act == "tap":
+    ok = any(n.get("clickable") == "true" and inside(box(n), a[0], a[1]) and not bad.search(norm(n.get("text", "") + "\n" + n.get("content-desc", ""))) for n in root.iter("node"))
+    if not ok: die("tap (%d,%d) is not inside a clickable non-forbidden node" % tuple(a[:2]))
+if act == "swipe":
+    for x, y in ((a[0], a[1]), (a[2], a[3])):
+        if not any(inside(box(n), x, y) for n in top): die("swipe endpoint (%d,%d) is outside the screen" % (x, y))
+    ms = a[4] if len(a) > 4 else 300
+    if ms > 2000: die("swipe longer than 2000 ms is a long-press (F7)")
+    if abs(a[2] - a[0]) + abs(a[3] - a[1]) < 100 and not any(n.get("clickable") == "true" and inside(box(n), a[0], a[1]) and not bad.search(norm(n.get("text", "") + "\n" + n.get("content-desc", ""))) for n in root.iter("node")):
+        die("short swipe acts as a tap and its start is not a clickable non-forbidden node (F7)")
+' "$@"; }
+# uiwin WINFILE XMLFILE: review golden-ui-r1 F1. `dumpsys window` format MEASURED on BP31 (golden-3 ui7b, 2026-10-28) [observed on hardware]: section `WINDOW MANAGER WINDOWS (dumpsys window windows)`,
+# per window `  Window #N Window{HEX uN TITLE}:` with one `isVisible=true|false` and one `package=PKG`; anything unparseable refuses (fail closed).
+# mCurrentFocus package must be allowlisted AND one of the uiautomator dump's packages. Window rule: a visible window must have a title in ScreenDecorOverlay[Bottom]/Taskbar/StatusBar/InputMethod/ImageWallpaper with its measured package= (r1 F6; no NavigationBar, no systemui activities r1 F2),
+# or be PKG/CLASS with PKG == its package= value and PKG in UI_PKGS (decided on the TITLE: NotificationShade is package com.android.systemui, in UI_PKGS, and must still be refused).
+# Lockscreen and heads-up both show a visible NotificationShade and are refused (fail closed).
+uiwin() { UI_PKGS=$UI_PKGS python3 -I -c '
+import os, re, sys, xml.etree.ElementTree as ET
+ok = os.environ["UI_PKGS"].split()
+def die(m): print(m); sys.exit(1)
+try:
+    t = open(sys.argv[1], errors="replace").read()
+    dp = {n.get("package", "") for n in ET.parse(sys.argv[2]).getroot().iter("node")}
+except Exception as e: die("dump not parseable (%s)" % type(e).__name__)
+# EVERY mCurrentFocus line is checked (r2 F2): null only if another one parses; anything else must be a full Window{...} value with an allowlisted, dumped package.
+fs = re.findall(r"mCurrentFocus=(\S.*)", t)
+if not fs: die("no mCurrentFocus in dumpsys window [format unmeasured]")
+good = 0
+for f in fs:
+    if f.strip() == "null": continue
+    m = re.fullmatch(r"Window\{\S+ u\d+ ([^\s}/]+)(?:/[^\s}]*)?\}", f.strip())
+    if not m: die("unparseable mCurrentFocus %r [format unmeasured]" % f[:60])
+    if m.group(1) not in ok or m.group(1) not in dp: die("focus window package %r is not allowlisted or not the dumped package" % m.group(1))
+    good += 1
+if not good: die("mCurrentFocus is null everywhere")
+ms = list(re.finditer(r"(?m)^WINDOW MANAGER WINDOWS \(dumpsys window windows\)$", t))
+if len(ms) != 1: die("%d WINDOW MANAGER WINDOWS sections, need exactly 1 [BP31 format]" % len(ms))   # r1 F1
+m = ms[0]
+sec = t[m.end():]
+e = re.search(r"(?m)^WINDOW MANAGER ", sec)
+if e: sec = sec[:e.start()]
+hdr = re.compile(r"  Window #\d+ Window\{[0-9a-f]+ u\d+ ([^\s}]+)\}:")
+for ln in sec.splitlines():
+    if "Window #" in ln and not hdr.fullmatch(ln): die("unparseable window header %r [BP31 format]" % ln[:60])
+parts = re.split(r"(?m)^(  Window #\d+ Window\{[0-9a-f]+ u\d+ [^\s}]+\}:)$", sec)
+if len(parts) < 3: die("no windows parsed from dumpsys window [BP31 format]")
+# r1 F6: decoration titles only with the package measured on BP31 (golden-3 ui7b) [obs]
+deco = {"ScreenDecorOverlay": "com.android.systemui", "ScreenDecorOverlayBottom": "com.android.systemui", "StatusBar": "com.android.systemui",
+        "com.android.systemui.wallpapers.ImageWallpaper": "com.android.systemui", "Taskbar": "com.google.android.apps.nexuslauncher",
+        "InputMethod": "com.google.android.inputmethod.latin"}
+for i in range(1, len(parts), 2):
+    title = hdr.fullmatch(parts[i]).group(1); w = parts[i + 1]
+    v = re.findall(r"(?m)^    isVisible=(true|false)$", w); pk = re.findall(r"\bpackage=(\S+)", w)
+    if len(v) != 1 or len(pk) != 1: die("window %r has no single isVisible=/package= [BP31 format]" % title)
+    if v[0] == "false": continue
+    if deco.get(title) == pk[0]: continue   # NavigationBar* not seen on BP31 (gesture nav): refused until measured
+    # r1 F2: no systemui PKG/CLASS activity (permission/media-projection dialogs are systemui activities)
+    if "/" in title and title.split("/")[0] == pk[0] and pk[0] in ok and pk[0] != "com.android.systemui": continue
+    die("visible window %r (package %s) is not allowlisted (heads-up/shade/lockscreen/dialog?)" % (title, pk[0]))
+' "$@"; }
+wguard() { [ "$dry" != 1 ] && [ "$ui1 $ui2" != "key BACK" ] && [ "$ui1 $ui2" != "key HOME" ] || return 0   # F1: all windows, not just the active one
+	timeout 60 adb shell dumpsys window > "$out/ui-windows-${1:-guard}.txt" </dev/null || fail "ui: dumpsys window failed, refusing to act blind"
+	local r; r=$(uiwin "$out/ui-windows-${1:-guard}.txt" "$out/ui-${1:-guard}.xml") || fail "ui $ui_all: ${r:-uiwin gave no reason}"; }
+case "$cmd" in
+	identity)
+		# /proc/cmdline is root-only on BP31 [obs gdbgfs-20261029T155047Z-steps/identity1.txt]: read via the su form of R above (`adb exec-out su -c "CMD; r=$?; printf ... __GP_RC"`), filtered in memory, never raw on disk.
+		ie=/dev/null; [ "$dry" = 1 ] || ie=$out/cmdline-stderr.txt
+		cmdfilt() { tr ' ' '\n' | { grep -viE 'serial|imei|mac|ssid' || true; } | tr '\n' ' '; }
+		if [ "$dry" = 1 ]; then echo "would run: adb exec-out su -c \"cat /proc/cmdline; r=\$?; printf '\\n__GP_RC=%s\\n' \$r\" | filter serial|imei|mac|ssid > $out/cmdline.txt"
+		else
+			cl=""; raw=$(A exec-out su -c "cat /proc/cmdline; r=\$?; printf '\\n__GP_RC=%s\\n' \$r")
+			case $raw in *$'\n__GP_RC=0') cl=${raw%$'\n__GP_RC=0'} ;; esac
+			if [ -z "${cl//[[:space:]]/}" ]; then   # su failed: one plain shell read, its stderr is the evidence (cmdline-stderr.txt)
+				cl=$(A shell cat /proc/cmdline 2> "$ie") || cl=""
+				if [ -z "${cl//[[:space:]]/}" ]; then cl=""; echo "GAP: reading /proc/cmdline failed: su gave '$(printf '%s' "$raw" | cmdfilt | head -c 200)', adb shell gave '$(head -c 300 "$ie" | tr '\n' ' ')' (see cmdline-stderr.txt)" >&2; bad=$((bad + 1))
+				else echo "INFO: identity: su could not read /proc/cmdline, read as the adb shell user" >&2; fi
+			fi
+			printf '%s' "$cl" | cmdfilt | tee "$out/cmdline.txt"
+			[ ! -s "$ie" ] || echo "NOTE: adb stderr of cat /proc/cmdline ($ie): $(head -c 300 "$ie" | tr '\n' ' ')" >&2
+		fi; echo
+		if [ "$method_a" != 1 ]; then echo "NOTE: identity: trace_event=rwmmio (method A) not checked; --method-a to require it (method B is in use, research 85 s.4.3)" >&2
+		elif [ "$dry" = 1 ]; then echo "would check: cmdline.txt has trace_event=rwmmio (--method-a)"
+		else grep -q 'trace_event=rwmmio' "$out/cmdline.txt" || { echo "GAP: /proc/cmdline has no trace_event=rwmmio: method A did not apply (research 85 s.4.3), use method B" >&2; bad=$((bad + 1)); }; fi
+		if [ "$dry" = 1 ]; then A shell "uname -a; getprop (filtered: serial imei mac ssid phone) > build.txt"
+		else { A shell uname -a; A shell getprop; } | { grep -viE 'serial|imei|meid|mac|ssid|bssid|phone|iccid|imsi|address' || true; } > "$out/build.txt" || { echo "GAP: uname/getprop -> build.txt failed" >&2; bad=$((bad + 1)); }; fi ;;
+	wifi-probe)
+		# READ-ONLY (user 2026-10-27 "load the WiFi": find why bcmdhd is not loaded before any load). pstore = the crash record of the inventory reboot.
+		R "ls -la /sys/fs/pstore; for f in /sys/fs/pstore/*; do [ -e \"\$f\" ] || { echo \"== (pstore empty: no record files)\"; continue; }; echo \"== \$f\"; tail -c 65536 \"\$f\"; done" pstore.txt
+		R "ls -la /vendor_dlkm/lib/modules /vendor/lib/modules 2>&1 | grep -iE 'dhd|bcm|wlan|wifi|cfg80211|^/'; for f in /vendor_dlkm/lib/modules/modules.load* /vendor/lib/modules/modules.load*; do echo \"== \$f\"; grep -inE 'dhd|bcm|wlan|wifi|cfg80211' \$f; done; echo == lsmod; lsmod | grep -iE 'dhd|bcm|wlan|wifi|cfg80211'; true" wifi-modules.txt
+		R "for f in /vendor/lib/modules/modules.blocklist /vendor_dlkm/lib/modules/modules.blocklist; do echo \"== \$f\"; cat \$f 2>&1; done; echo '== strings bcmdhd4389.ko (persist/efs/otp, r1 F2)'; strings /vendor/lib/modules/bcmdhd4389.ko | grep -iE '/mnt/vendor|persist|/efs|otp' | head -80; true" wifi-blocklist.txt
+		R "for f in \$(grep -liE 'dhd|bcmdhd|wlan|insmod' /vendor/etc/init/*.rc /vendor/etc/*.sh /vendor/bin/*.sh 2>/dev/null); do echo \"== \$f\"; cat \$f; done" wifi-rc.txt
+		R "for f in /vendor/etc/init*.cfg; do echo \"== \$f\"; cat \$f; done; echo '== files naming bcmdhd4389'; grep -rl bcmdhd4389 /vendor/etc /vendor/bin /system/etc/init /vendor_dlkm/etc /odm/etc 2>/dev/null; echo '== insmod services'; grep -rn -A3 'service insmod' /vendor/etc/init /odm/etc/init /vendor_dlkm/etc 2>/dev/null; echo '== /vendor_dlkm/etc/init.insmod.bluejay.cfg'; cat /vendor_dlkm/etc/init.insmod.bluejay.cfg; for f in \$(grep -rhoE '/[a-z_/]+\\.cfg' /vendor/etc/init /odm/etc/init 2>/dev/null | sort -u); do echo \"== \$f\"; cat \$f 2>&1; done; true" wifi-cfg.txt
+		R "getprop | grep -iE 'wifi|wlan|dhd|insmod|vendor.all.modules|ro.boot.hardware|ro.revision|ro.boot.revision'; ls /sys/bus/pci/devices; for d in /sys/bus/pci/devices/*; do echo \$d \$(cat \$d/vendor \$d/device); done; ls /vendor/firmware | grep -iE 'bcm|fw_|nvram|clm|4389'; dmesg | grep -iE 'dhd|wlan|pcie|wifi|bcm' | tail -80" wifi-state.txt ;;
+	wifi-load)
+		# User 2026-10-27 "load the WiFi". The stock boot's own loader (/vendor/bin/insmod.sh: modprobe -a -d /vendor/lib/modules -b --all=modules.load)
+		# lists cfg80211.ko (line 43) and bcmdhd4389.ko (line 317) but neither is loaded [obs wifi-probe 20261027T221517Z]. This runs the SAME stock
+		# modprobe on just those two stock modules, to get the load error (or the driver). Fixed names, no argument. Writes no partition; a kernel
+		# crash only reboots the phone (recover: phone goto fastboot + fboot-android, no erase).
+		# EXACTLY the stock line: init.blueport.rc insmod_sh_blueport -> /vendor_dlkm/etc/init.insmod.bluejay.cfg `modprobe|bcmdhd4389.ko` ->
+		# insmod.sh `modprobe -a -d /vendor/lib/modules bcmdhd4389.ko` (no -b: the blocklist only keeps it out of the bulk load) [obs golden
+		# 20261027T221517Z wifi-cfg.txt, wifi-rc.txt; resolves review golden-wifi-load-r1 F1]. cfg80211 comes in through the stock modules.dep.
+		R "modprobe -a -d /vendor/lib/modules bcmdhd4389.ko 2>&1; echo modprobe-rc=\$?; lsmod | grep -iE 'cfg80211|dhd'; dmesg | tail -60" wifi-load.txt
+		[ "$dry" = 1 ] || { grep -q '^modprobe-rc=0$' "$out/wifi-load.txt" && grep -q '^cfg80211 ' "$out/wifi-load.txt" && grep -q '^bcmdhd4389 ' "$out/wifi-load.txt"; } || { echo "GAP: wifi-load: modprobe-rc not 0 or cfg80211/bcmdhd4389 not loaded (see wifi-load.txt)" >&2; bad=$((bad + 1)); } ;;
+	boot-read)
+		# READ-ONLY. Slot and build are checked first: the image must match the running system (Wi-Fi modules need the matching GKI, HANDOFF note 4).
+		R "getprop ro.boot.slot_suffix; getprop ro.build.id" boot-read-id.txt
+		[ "$dry" = 1 ] || [ "$(tr -d '\r' < "$out/boot-read-id.txt" | paste -sd' ')" = "_b BP31.250610.004" ] || fail "boot-read: slot/build is '$(tr -d '\r' < "$out/boot-read-id.txt" | paste -sd' ')', not '_b BP31.250610.004'"
+		R "cat /dev/block/by-name/boot_b" boot_b.img; R "cat /dev/block/by-name/boot_b" boot_b-reread.img
+		R "cat /dev/block/by-name/vendor_boot_b" vendor_boot_b.img; R "cat /dev/block/by-name/vendor_boot_b" vendor_boot_b-reread.img
+		if [ "$dry" = 0 ]; then
+			cmp -s "$out/boot_b.img" "$out/boot_b-reread.img" || { echo "GAP: boot-read: the two reads of boot_b differ" >&2; bad=$((bad + 1)); }
+			[ "$(head -c 8 "$out/boot_b.img")" = 'ANDROID!' ] || { echo "GAP: boot-read: boot_b.img has no ANDROID! magic" >&2; bad=$((bad + 1)); }
+			rm -f "$out/boot_b-reread.img"; echo "boot_b.img sha256 $(sha256sum "$out/boot_b.img" | cut -d' ' -f1) size $(stat -c %s "$out/boot_b.img")"
+			cmp -s "$out/vendor_boot_b.img" "$out/vendor_boot_b-reread.img" || { echo "GAP: boot-read: the two reads of vendor_boot_b differ" >&2; bad=$((bad + 1)); }
+			[ "$(head -c 8 "$out/vendor_boot_b.img")" = 'VNDRBOOT' ] || { echo "GAP: boot-read: vendor_boot_b.img has no VNDRBOOT magic" >&2; bad=$((bad + 1)); }
+			rm -f "$out/vendor_boot_b-reread.img"; echo "vendor_boot_b.img sha256 $(sha256sum "$out/vendor_boot_b.img" | cut -d' ' -f1) size $(stat -c %s "$out/vendor_boot_b.img")"
+		fi ;;
+	magisk-install)
+		apk=$root/magisk/Magisk-v30.7.apk
+		[ "$(sha256sum "$apk" 2>/dev/null | cut -d' ' -f1)" = e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5 ] || fail "magisk-install: $apk missing or sha256 differs from the pin"
+		if [ "$dry" = 1 ]; then echo "would run: adb install $apk"
+		else timeout 120 adb install "$apk" > "$out/magisk-install.txt" 2>&1 </dev/null; grep -q '^Success' "$out/magisk-install.txt" || { echo "GAP: magisk-install: no Success line (see magisk-install.txt)" >&2; bad=$((bad + 1)); }; fi ;;
+	su-prep)
+		apk=$root/magisk/Magisk-v30.7.apk; bbm=lib/arm64-v8a/libbusybox.so; dst=/data/local/tmp/pixos_busybox
+		[ "$(sha256sum "$apk" 2>/dev/null | cut -d' ' -f1)" = e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5 ] || fail "su-prep: $apk missing or sha256 differs from the pin"
+		x=$(mktemp -d); trap 'rm -rf "$x"' EXIT
+		python3 -I -c 'import sys,zipfile; open(sys.argv[3],"wb").write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))' "$apk" "$bbm" "$x/bb" 2>/dev/null && [ -s "$x/bb" ] || fail "su-prep: no readable $bbm in $apk"
+		want=$(sha256sum "$x/bb" | cut -d' ' -f1); chmod 0755 "$x/bb"
+		if [ "$dry" = 1 ]; then echo "would run: adb push $bbm ($want) $dst; adb shell sha256sum $dst; adb shell setprop debug.pixos.bb.done ''; setprop debug.pixos.bb 0; setprop debug.pixos.bb 1; one bounded 20 s wait; getprop debug.pixos.bb.done"
+		else
+			A push "$x/bb" "$dst" >/dev/null || fail "su-prep: adb push failed"
+			got=$(A shell sha256sum "$dst" | tr -d '\r' | cut -d' ' -f1); [ "$got" = "$want" ] || fail "su-prep: pushed sha256 '$got' != extracted $want (nothing set)"
+			# adb joins its argv with spaces, unescaped (adb client commandline.cpp "We don't escape here, just like ssh(1)"): the '' must reach the phone sh inside one string
+			A shell "setprop debug.pixos.bb.done ''" || fail "su-prep: setprop debug.pixos.bb.done failed"
+			A shell setprop debug.pixos.bb 0 || fail "su-prep: setprop debug.pixos.bb 0 failed"
+			A shell setprop debug.pixos.bb 1 || fail "su-prep: setprop debug.pixos.bb 1 failed"
+			A shell 'i=0; while [ -z "$(getprop debug.pixos.bb.done)" ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done; getprop debug.pixos.bb.done' > "$x/done" || true
+			done_=$(tr -d '\r\n' < "$x/done")
+			[ "$done_" = ok ] || fail "su-prep: debug.pixos.bb.done is '${done_:-empty}' after 20 s (want ok): the pixos_bb service failed or never ran (check logcat/dmesg for pixos_bb)"
+			echo "su-prep: pushed $dst sha256 $want, pixos_bb done=ok"
+			echo "NEXT: reboot, then tools/golden-pull su-check (boot 2 verifies /data/adb/magisk/busybox and the su policy row)"
+		fi ;;
+	magisk-patch)
+		apk=$root/magisk/Magisk-v30.7.apk; M=/data/local/tmp/gp-magisk
+		bin=$out/boot_b.img; mout=boot_b-magisk.img
+		if [ -n "${GOLDEN_MAGISK_IN:-}" ]; then
+			[ -s "$GOLDEN_MAGISK_IN" ] || fail "magisk-patch: GOLDEN_MAGISK_IN '$GOLDEN_MAGISK_IN' is missing or empty"
+			# F5: copy once to a private temp, hash and patch that same copy (no TOCTOU between hash and use)
+			x=$(mktemp -d); trap 'rm -rf "$x"' EXIT
+			cp "$GOLDEN_MAGISK_IN" "$x/in.img" || fail "magisk-patch: cannot copy GOLDEN_MAGISK_IN '$GOLDEN_MAGISK_IN'"
+			insha=$(sha256sum "$x/in.img" | cut -d' ' -f1)
+			case " $GOLDEN_MAGISK_PINS " in *" $insha "*) ;; *) rm -f "$x/in.img"; fail "magisk-patch: GOLDEN_MAGISK_IN sha256 $insha is not in the pinned list" ;; esac
+			bin=$x/in.img; mout=boot-${insha:0:8}-magisk.img
+		fi
+		[ "$dry" = 1 ] || [ -s "$bin" ] || fail "magisk-patch: no $bin (run boot-read first)"
+		[ "$dry" = 1 ] || [ -s "$apk" ] || fail "magisk-patch: no $apk"
+		[ -n "${x:-}" ] || { x=$(mktemp -d); trap 'rm -rf "$x"' EXIT; }
+		if [ "$dry" = 0 ]; then
+			unzip -q -o "$apk" assets/boot_patch.sh assets/util_functions.sh assets/stub.apk lib/arm64-v8a/libmagiskboot.so lib/arm64-v8a/libmagiskinit.so lib/arm64-v8a/libmagisk.so lib/arm64-v8a/libinit-ld.so -d "$x" || err "magisk-patch: unzip of $apk failed"
+			mkdir "$x/mp"; for f in boot_patch.sh util_functions.sh stub.apk; do mv "$x/assets/$f" "$x/mp/$f"; done
+			for f in magiskboot magiskinit magisk init-ld; do mv "$x/lib/arm64-v8a/lib$f.so" "$x/mp/$f"; done
+			cp "$bin" "$x/mp/boot.img"
+		fi
+		A shell rm -rf "$M" || { echo "GAP: magisk-patch: rm of $M failed" >&2; bad=$((bad + 1)); }; A push "$x/mp" "$M" >/dev/null || fail "magisk-patch: adb push failed"
+		# KEEPVERITY/KEEPFORCEENCRYPT=true: the Magisk app's choice on this device class [guess: app source not read]; only the ramdisk config differs.
+		R "cd $M && KEEPVERITY=true KEEPFORCEENCRYPT=true PATCHVBMETAFLAG=false sh ./boot_patch.sh $M/boot.img 2>&1" magisk-patch.txt
+		R "cat $M/new-boot.img" "$mout"
+		if [ "$dry" = 0 ]; then
+			grep -q '^- Repacking boot image' "$out/magisk-patch.txt" && ! grep -q '^!' "$out/magisk-patch.txt" || { echo "GAP: magisk-patch: boot_patch.sh did not finish cleanly (see magisk-patch.txt)" >&2; bad=$((bad + 1)); }
+			[ "$(head -c 8 "$out/$mout")" = 'ANDROID!' ] || { echo "GAP: magisk-patch: $mout has no ANDROID! magic" >&2; bad=$((bad + 1)); }
+			echo "$mout sha256 $(sha256sum "$out/$mout" | cut -d' ' -f1)"; [ "$bad" -gt 0 ] || echo "(pin it in tools/fboot-android after review)"
+		fi
+		A shell rm -rf "$M" || { echo "GAP: magisk-patch: cleanup of $M failed" >&2; bad=$((bad + 1)); } ;;
+	wifi-load-gki)
+		# [obs golden 20261027T221517Z wifi-load.txt] `rfkill: exports protected symbol rfkill_alloc` -> modprobe Permission denied for rfkill, then bcmdhd4389.
+		# [read from file] cp3a factory image-bluejay-cp3a.260905.009.zip vendor_dlkm.img lib/modules/rfkill.ko: vermagic 6.1.162-android14-11-g2ec90535fa34-ab15810641
+		# = the running kernel's uname [obs build.txt], "Module signature appended" (GKI-signed, so it may export protected symbols). The BP31 cfg80211/bcmdhd4389
+		# stay the stock ones: modprobe skips rfkill once it is loaded. Kernel crash = reboot to boot_b (same cp3a image [obs boot-read 20261027T222522Z-bootb]).
+		ko=$root/cp3a/rfkill.ko; RFPIN=907d2bac61b01dc8092700bdc7082c5005e54803d74b5f1c51eba54480a5165a
+		[ "$dry" = 1 ] || [ "$(sha256sum "$ko" 2>/dev/null | cut -d' ' -f1)" = "$RFPIN" ] || fail "wifi-load-gki: $ko sha256 is not the pinned $RFPIN"
+		A push "$ko" /data/local/tmp/gp-rfkill.ko >/dev/null || fail "wifi-load-gki: adb push of rfkill.ko failed (nothing loaded)"
+		R "if lsmod | grep -q '^rfkill '; then echo insmod-rc=already; elif [ \"\$(sha256sum /data/local/tmp/gp-rfkill.ko | cut -d' ' -f1)\" = $RFPIN ]; then insmod /data/local/tmp/gp-rfkill.ko 2>&1; echo insmod-rc=\$?; else echo insmod-rc=phone-sha-mismatch; fi; rm -f /data/local/tmp/gp-rfkill.ko; if lsmod | grep -q '^rfkill '; then modprobe -a -d /vendor/lib/modules bcmdhd4389.ko 2>&1; echo modprobe-rc=\$?; else echo modprobe-rc=skipped-no-rfkill; fi; lsmod | grep -iE 'rfkill|cfg80211|dhd'; dmesg | tail -120" wifi-load-gki.txt
+		[ "$dry" = 1 ] || { grep -qE '^insmod-rc=(0|already)$' "$out/wifi-load-gki.txt" && grep -q '^modprobe-rc=0$' "$out/wifi-load-gki.txt" && grep -q '^cfg80211 ' "$out/wifi-load-gki.txt" && grep -q '^bcmdhd4389 ' "$out/wifi-load-gki.txt"; } || { echo "GAP: wifi-load-gki: insmod/modprobe rc not 0 or cfg80211/bcmdhd4389 not loaded (see wifi-load-gki.txt)" >&2; bad=$((bad + 1)); } ;;
+	wifi-on) S "cmd wifi set-wifi-enabled enabled" ;;
+	wifi-status)
+		R "cmd wifi status 2>&1; echo '== ip link/addr wlan0'; ip addr show wlan0 2>&1" wifi-status.txt
+		[ "$dry" = 1 ] || { grep -q '^Wifi is enabled' "$out/wifi-status.txt" || { echo "GAP: wifi-status: Wi-Fi is not enabled" >&2; bad=$((bad + 1)); }
+			grep -qi 'is connected to' "$out/wifi-status.txt" && echo "wifi-status: connected" || { echo "GAP: wifi-status: not connected" >&2; bad=$((bad + 1)); }; } ;;
+	wifi-join)
+		{ ssid=$(sed -n 1p "$1"); psk=$(sed -n 2p "$1"); } 2>/dev/null
+		case "$ssid$psk" in *"'"*|*\\*|*[[:cntrl:]]*) ssid= ;; esac; case "$ssid" in -*) ssid= ;; esac; [ "${#ssid}" -ge 1 ] && [ "${#ssid}" -le 32 ] && [ "${#psk}" -ge 8 ] && [ "${#psk}" -le 63 ] || err "wifi-join: SECRETFILE line 1 SSID (1-32 chars) / line 2 PSK (8-63 chars), no quote or backslash"
+		if [ "$dry" = 1 ]; then echo "would run: adb shell su -c sh   (stdin: cmd wifi connect-network <SSID> wpa2 <PSK>, never printed)"
+		else printf "cmd wifi connect-network '%s' wpa2 '%s'\n" "$ssid" "$psk" | timeout 60 adb shell su -c sh > /dev/null 2>&1 || { echo "GAP: wifi-join failed (cmd output dropped on purpose: it may echo the PSK; see wifi-status)" >&2; bad=$((bad + 1)); }; fi
+		unset psk ;;
+	mmio-on)
+		# per-cpu buffer, one value for the write and the readback threshold. History: cmdline trace_buf_size=64M (65536 KB), lost when the phone boots without our cmdline (golden-2: default 7 KB overran). 65536 KB overran on cpu0 in golden-6b run 3 gpu-ui (95.4 s window: 67342668 bytes, 1369352 entries, overrun 27364 = ~2%, needed ~68.7 MB) [observed g6b-20261028T185059Z-b2/tracing-stats-gpuui.txt]; 98304 KB = 96 MiB gives ~40% headroom [guess: margin]
+		bufkb=98304
+		S "echo $bufkb > $T/buffer_size_kb; echo 1 > $T/events/rwmmio/enable"  # a failed write (ENOMEM) is not seen by S (last echo wins the exit status): the readback below makes it a GAP
+		R "echo enable=\$(cat $T/events/rwmmio/enable); echo buffer_size_kb=\$(cat $T/buffer_size_kb); echo tracing_on=\$(cat $T/tracing_on); grep overwrite $T/trace_options" tracing-state-mmio.txt
+		[ "$dry" = 1 ] || grep -q '^enable=1$' "$out/tracing-state-mmio.txt" || { echo "GAP: mmio-on: events/rwmmio/enable is not 1 (see tracing-state-mmio.txt)" >&2; bad=$((bad + 1)); }
+		[ "$dry" = 1 ] || [ "$(sed -n 's/^buffer_size_kb=\([0-9][0-9]*\)$/\1/p' "$out/tracing-state-mmio.txt")" -ge "$bufkb" ] 2>/dev/null || { echo "GAP: mmio-on: buffer_size_kb is missing, not a number or below $bufkb (the kernel rounds up: 65538 observed for 65536) (see tracing-state-mmio.txt)" >&2; bad=$((bad + 1)); } ;;
+	wifi-log) R "logcat -d -b main,system,events -t 3000 | grep -iE 'wifi|wlan|supplicant|hostapd|WifiHal|dhd'; echo '== getprop'; getprop | grep -iE 'wifi|wlan'; echo '== dmesg'; dmesg | tail -150" "wifi-log-$(date -u +%H%M%S).txt" ;;
+	wifi-dmesg)  # no { } group (adb joins su -c args unquoted): dmesg goes to a temp file and its rc travels as a dmesg-rc= line; the trailing echo keeps rc 0 when grep finds nothing; the per-string checks report what is missing.
+		# A present string can be from an earlier warm enable in the same boot (r1 F3): the analyst compares the [hh:mm:ss] stamps with the MARK rows.
+		f=wifi-dmesg-$(date -u +%Y%m%dT%H%M%S%N).txt
+		R "dmesg > /data/local/tmp/gp-dmesg.txt; echo dmesg-rc=\$?; grep -E 'Download, Upload and compare of NVRAM|Took ARM out of Reset|dhdpcie_readshared|dhd_open' /data/local/tmp/gp-dmesg.txt; rm -f /data/local/tmp/gp-dmesg.txt; echo '== end-of-wifi-dmesg'" "$f"
+		[ "$dry" = 1 ] || grep -qx 'dmesg-rc=0' "$out/$f" 2>/dev/null || { echo "GAP: wifi-dmesg: dmesg did not exit 0 (see $f)" >&2; bad=$((bad + 1)); }
+		[ "$dry" = 1 ] || for m in 'Download, Upload and compare of NVRAM succeeded' 'Took ARM out of Reset' 'dhdpcie_readshared:' 'dhd_open: EXIT'; do
+			grep -qF "$m" "$out/$f" 2>/dev/null || { echo "GAP: wifi-dmesg: no '$m' line in dmesg (cold dhd_open did not run, the ring buffer lost it or dmesg failed; see $f)" >&2; bad=$((bad + 1)); }
+		done ;;
+	ui)
+		if [ "$1" = dump ]; then uidump "$2"   # golden-3 row 7b: also the dumpsys window text of this state (read-only; feeds the uiwin format fix, r2 F3/F5)
+			if [ "$dry" = 1 ]; then echo "would run: adb shell dumpsys window > $out/ui-windows-$2.txt"
+			else timeout 60 adb shell dumpsys window > "$out/ui-windows-$2.txt" </dev/null && grep -q 'mCurrentFocus' "$out/ui-windows-$2.txt" || { echo "GAP: ui dump $2: dumpsys window failed or has no mCurrentFocus (ui-windows-$2.txt)" >&2; bad=$((bad + 1)); }; fi
+		else
+			ui1=$1; ui2=${2:-}; ui_all=$*
+			# review golden-ui-r3 F1: the unattended gate is code, not prose. Only BACK/HOME (the way out) run without a human watching.
+			if [ "$dry" = 1 ]; then echo "would check: attended flag (GP_UI_ATTENDED) unless key BACK/HOME"
+			elif [ "$ui1 $ui2" != "key BACK" ] && [ "$ui1 $ui2" != "key HOME" ] && [ "${GP_UI_ATTENDED-}" != "yes-a-human-watches-the-screen" ]; then
+				fail "ui $*: UNATTENDED USE GATED (review golden-ui-r2 condition + r3 F1, golden-3 row 7b open): set GP_UI_ATTENDED=yes-a-human-watches-the-screen only while a human watches the phone"
+			fi
+			if [ "$dry" != 1 ]; then   # F3: the guard only knows English strings
+				loc=$(A shell getprop persist.sys.locale | tr -d '\r\n'); [ -n "$loc" ] || loc=$(A shell getprop ro.product.locale | tr -d '\r\n')
+				[[ "$loc" =~ ^en(-(US|GB|AU|CA|IE|IN|NZ|SG|ZA))?$ ]] || fail "ui $*: phone locale is '$loc', not a plain English locale (pseudo-locales en-XA/XC excluded): the destructive-screen guard only knows English"
+			fi
+			[ "$dry" != 1 ] || echo "would check: locale, FORBID (raw + normalised), packages (all nodes), windows, node/swipe, sha recheck, ENTER-after-text, after-dump"
+			uidump guard; wguard
+			if [ "$dry" != 1 ]; then
+				# F7: BACK and HOME are the way out of a forbidden screen: no FORBID/package check, but the dump must still be fresh and parseable
+				if [ "$1 $2" = "key BACK" ] || [ "$1 $2" = "key HOME" ]; then uicheck "$out/ui-guard.xml" parse > /dev/null || fail "ui $*: guard dump is not parseable"
+				else
+					! grep -qiE "$FORBID" "$out/ui-guard.xml" || fail "ui $*: the screen shows a destructive control ($(grep -oiE "$FORBID" "$out/ui-guard.xml" | head -1)): press BACK/HOME first"
+					case "$1" in tap|swipe) r=$(uicheck "$out/ui-guard.xml" "$1" "${@:2:5}") ;; *) r=$(uicheck "$out/ui-guard.xml" none) ;; esac || fail "ui $*: $r"
+				fi
+			fi
+			# F4b: a second dump directly before the input must equal the guard dump byte for byte (nothing is masked [guess: the status-bar clock can change at a minute boundary, then the action is refused and is retried])
+			uidump recheck; wguard recheck
+			# a text word followed by ENTER can submit a Settings search to any page (review golden-ui-r1 F3): refused
+			[ "$dry" = 1 ] || [ "$1 $2" != "key ENTER" ] || ! tail -n 1 "$out/ui-actions.log" 2>/dev/null | grep -q ' ui text ' || fail "ui key ENTER: refused right after ui text (search submit can reach any page)"
+			[ "$dry" = 1 ] || [ "$(sha256sum < "$out/ui-guard.xml")" = "$(sha256sum < "$out/ui-recheck.xml")" ] || fail "ui $*: the screen changed between the guard dump and the action; retry"
+			case "$1" in
+				tap) A shell input tap "$2" "$3" ;; swipe) A shell input swipe "$2" "$3" "$4" "$5" "${6:-300}" ;;
+				key) A shell input keyevent "KEYCODE_$2" ;; text) A shell input text "$2" ;;
+				open) case "$2" in wifi) a=android.settings.WIFI_SETTINGS ;; bluetooth) a=android.settings.BLUETOOTH_SETTINGS ;; sound) a=android.settings.SOUND_SETTINGS ;;
+					display) a=android.settings.DISPLAY_SETTINGS ;; settings) a=android.settings.SETTINGS ;; camera) a=android.media.action.STILL_IMAGE_CAMERA ;;
+					esac
+					A shell am start -a "$a" ;;
+			esac
+			rc=$?; [ "$rc" = 0 ] || { echo "GAP: ui $* failed rc=$rc" >&2; bad=$((bad + 1)); }   # F13
+			[ "$dry" = 1 ] || echo "$(date -u +%FT%TZ) ui $* rc=$rc" >> "$out/ui-actions.log"
+			# F10 (old F4c): a destructive control visible after the action is a GAP (the sha recheck narrows the dump-to-input window, it does not close it)
+			if [ "$dry" != 1 ] && [ "$1 $2" != "key BACK" ] && [ "$1 $2" != "key HOME" ]; then uidump after
+				! grep -qiE "$FORBID" "$out/ui-after.xml" || { echo "GAP: ui: destructive control visible after $*: $(grep -oiE "$FORBID" "$out/ui-after.xml" | head -1)" >&2; bad=$((bad + 1)); }; fi
+		fi ;;
+	wifi-hal-restart)
+		for svc in vendor.wifi_hal_legacy wificond; do
+			R "P=init.svc_debug_pid.$svc; b=\$(getprop \$P); echo pid-before=\$b; setprop ctl.restart $svc; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do sleep 0.5; a=\$(getprop \$P); [ -n \"\$a\" ] && [ \"\$a\" != \"\$b\" ] && [ \"\$(getprop init.svc.$svc)\" = running ] && break; done; echo pid-after=\$(getprop \$P); echo state=\$(getprop init.svc.$svc)" "wifi-restart-$svc.txt"
+			[ "$dry" = 1 ] || { b=$(sed -n 's/^pid-before=//p' "$out/wifi-restart-$svc.txt"); a=$(sed -n 's/^pid-after=//p' "$out/wifi-restart-$svc.txt"); [ -n "$a" ] && [ "$a" != "$b" ] && grep -q '^state=running$' "$out/wifi-restart-$svc.txt"; } || { echo "GAP: wifi-hal-restart: $svc pid did not change or not running (see wifi-restart-$svc.txt)" >&2; bad=$((bad + 1)); }
+		done ;;
+	wifi-off) S "cmd wifi set-wifi-enabled disabled" ;;
+	wifi-cold-off)
+		f=wifi-cold-off-$(date -u +%Y%m%dT%H%M%S%N).txt
+		R "echo GP-COLD-OFF-MARK > /dev/kmsg; cmd wifi set-scan-always-available disabled; echo scan-rc=\$?; cmd wifi set-wifi-enabled disabled; echo off-rc=\$?; sleep 15; dmesg | sed -n '/GP-COLD-OFF-MARK/,\$p' | grep -E 'dhd|wlan|wifi' | grep -E 'stop|off|OFF|reset|power|remove' | tail -40; echo '== end-of-wifi-cold-off'" "$f"
+		[ "$dry" = 1 ] || { grep -qx 'scan-rc=0' "$out/$f" && grep -qx 'off-rc=0' "$out/$f"; } 2>/dev/null || { echo "GAP: wifi-cold-off: a cmd wifi call failed (see $f)" >&2; bad=$((bad + 1)); }
+		[ "$dry" = 1 ] || grep -qE 'dhd_stop|wl_android_wifi_off' "$out/$f" 2>/dev/null || { echo "GAP: wifi-cold-off: no dhd_stop / wl_android_wifi_off line in dmesg (chip may still be up; see $f)" >&2; bad=$((bad + 1)); } ;;
+	screen-off) S "input keyevent KEYCODE_SLEEP" ;;
+	screen-on) S "input keyevent KEYCODE_WAKEUP; input swipe 540 1800 540 600 200" ;;
+	provision-skip)  # research 106: one stdin script per file (D keeps only the LAST rc and GAPs on empty output), every step && -chained ending in a marker
+		ps_flags="settings put global device_provisioned 1 && settings put secure user_setup_complete 1 && echo flags=ok"
+		ps_suw="pm disable-user --user 0 com.google.android.setupwizard && echo suw=ok"
+		ps_lock="locksettings set-disabled true && svc power stayon true && settings put system screen_off_timeout 2147483647 && echo lock=ok"
+		ps_keys="input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; input keyevent KEYCODE_HOME; echo keys=ok"
+		ps_state="settings get global device_provisioned; settings get secure user_setup_complete; pm list packages -d | grep setupwizard; cmd lock_settings get-disabled; dumpsys window | grep -m1 mCurrentFocus; dumpsys window policy | grep -E 'showing=|secure='"
+		ps_focus="dumpsys window | grep -m1 mCurrentFocus; dumpsys window policy | grep -E 'showing=|secure='"
+		ps_forbid='pm clear|uninstall|dd if=|dd of=|flash|fastboot|reboot|magisk --install'
+		for ps_s in "$ps_flags" "$ps_suw" "$ps_lock" "$ps_keys" "$ps_state" "$ps_focus"; do   # step 4 safety: refuse before any adb call
+			! printf '%s\n' "$ps_s" | grep -qE "$ps_forbid" || fail "provision-skip script holds a forbidden word: $ps_s"; done
+		D provision-flags.txt "$ps_flags"
+		D provision-suw.txt "$ps_suw"
+		D provision-lock.txt "$ps_lock"
+		D provision-keys.txt "$ps_keys"
+		D provision-state.txt "$ps_state"
+		if [ "$dry" != 1 ]; then
+			for ps_m in flags:flags suw:suw lock:lock keys:keys; do
+				grep -qx "${ps_m%%:*}=ok" "$out/provision-${ps_m##*:}.txt" 2>/dev/null || { echo "GAP: provision-skip: provision-${ps_m##*:}.txt has no ${ps_m%%:*}=ok marker (a step failed)" >&2; bad=$((bad + 1)); }; done
+			[ "$(grep -cx 1 "$out/provision-state.txt")" -ge 2 ] || { echo "GAP: provision-skip: device_provisioned / user_setup_complete did not both read back 1 (see provision-state.txt)" >&2; bad=$((bad + 1)); }
+			grep -qx 'package:com.google.android.setupwizard' "$out/provision-state.txt" || { echo "GAP: provision-skip: setup wizard not in 'pm list packages -d' (still enabled or package name differs, see provision-state.txt)" >&2; bad=$((bad + 1)); }
+			grep -qx true "$out/provision-state.txt" || { echo "GAP: provision-skip: 'cmd lock_settings get-disabled' did not read back true (output format [guess] until the first run; see provision-state.txt)" >&2; bad=$((bad + 1)); }
+			ps_f="$out/provision-state.txt"
+			if ! { grep 'mCurrentFocus' "$ps_f" | grep -qi nexuslauncher && grep -q 'showing=false' "$ps_f" && ! grep -q 'showing=true' "$ps_f"; }; then
+				sleep 3; printf '%s; echo __GP_RC=$?\n' "$ps_focus" | timeout 60 adb shell su -c sh 2>&1 | tr -d '\r' > "$out/provision-focus.txt"   # one retry, focus + keyguard readback only
+				ps_f="$out/provision-focus.txt"; fi
+			grep 'mCurrentFocus' "$ps_f" | grep -qi nexuslauncher || { echo "GAP: provision-skip: focus is not the launcher after retry: $(grep -m1 mCurrentFocus "$ps_f" | head -1)" >&2; bad=$((bad + 1)); }
+			grep -q 'showing=false' "$ps_f" && ! grep -q 'showing=true' "$ps_f" || { echo "GAP: provision-skip: keyguard not showing=false (see $(basename "$ps_f"))" >&2; bad=$((bad + 1)); }
+		fi ;;
+	bt-static)  # golden-bt-s0 G3 + G5: passive reads only (see header)
+		ph=${1:-before}
+		b_dt='ls -ld /proc/device-tree; dtr=$(readlink -f /proc/device-tree) || dtr=/proc/device-tree; echo "dt-root=$dtr"; n=0; for d in $(find "$dtr" -type d \( -iname "*bluetooth*" -o -iname "*btbcm*" -o -iname "bt-*" -o -iname "*175b0000*" \)); do n=$((n+1)); echo "== $d"; for p in $d/*; do case $p in *addr*|*mac*|*bd_*|*bd-*) echo "-- $p <skipped: address property>" ;; *) echo "-- $p"; if [ -f $p ]; then od -An -v -tx1 $p | head -n 20; od -An -v -c $p | head -n 20; fi ;; esac; done; done; if [ $n -gt 0 ]; then echo dt=ok; else echo "dt: no bluetooth/btbcm/bt-/175b0000 node under $dtr"; fi'
+		b_rf='ls -d /sys/class/rfkill/rfkill* && for d in /sys/class/rfkill/rfkill*; do echo "== $d"; cat $d/name $d/type $d/state; done && echo rfkill=ok'
+		b_tty='ls -l /dev/ttySAC* && ls -l /dev/logbuffer_tty* && echo tty=ok'
+		b_fw='ls -l /vendor/firmware | grep -iE "bcm|4389|hcd|bt"; n=0; for f in $(ls /vendor/firmware | grep -iE "bcm|4389|hcd|bt"); do if [ -f /vendor/firmware/$f ]; then n=$((n+1)); sha256sum /vendor/firmware/$f || echo "sha-fail=$f"; fi; done; [ $n -gt 0 ] && echo fw=ok'
+		b_props='getprop | grep -iE "bt|bluetooth|bdaddr" && echo props=ok'
+		b_where='getprop | grep -iE "bdaddr|btmac|bt_addr|macaddr" | sed "s/\]: \[.*\$/]/"; grep -rliE "([0-9a-f]{2}:){5}[0-9a-f]{2}" /vendor/etc/bluetooth; dtr=$(readlink -f /proc/device-tree) || dtr=/proc/device-tree; echo "dt-where-root=$dtr"; find "$dtr" -iname "*mac-address*" -o -iname "*bd-addr*" -o -iname "*bdaddr*"; echo where=ok'
+		b_conf='ls /vendor/etc/bluetooth/*.conf && echo conflist=ok'
+		bt_guard "$b_dt" "$b_rf" "$b_tty" "$b_fw" "$b_props" "$b_where" "$b_conf"; bt_init
+		if [ "$ph" = before ]; then
+			BT bt-dt.txt dt=ok "$b_dt"; BT bt-rfkill-before.txt rfkill=ok "$b_rf"; BT bt-tty.txt tty=ok "$b_tty"; BT bt-fw-sha.txt fw=ok "$b_fw"
+			[ "$dry" = 1 ] || ! grep -q '^sha-fail=' "$out/bt/bt-fw-sha.txt" || { echo "GAP: bt-static: a sha256sum failed (see bt-fw-sha.txt)" >&2; bad=$((bad + 1)); }
+			BT bt-props.txt props=ok "$b_props"; BT bt-bdaddr-where.txt where=ok "$b_where"
+			BT bt-conf-list.txt conflist=ok "$b_conf"
+			if [ "$dry" = 1 ]; then echo "would run: adb shell su -c sh   (script on stdin: cat /vendor/etc/bluetooth/NAME.conf > $out/bt/bt-vendor-conf/NAME.conf, once per name listed)"
+			else for bc in $(grep -E '^/vendor/etc/bluetooth/[A-Za-z0-9._-]+\.conf$' "$out/bt/bt-conf-list.txt"); do
+				bc_s="cat $bc && echo conf=ok"; bt_guard "$bc_s"; BT "bt-vendor-conf/$(basename "$bc")" conf=ok "$bc_s"; done
+				grep -qE '^/vendor/etc/bluetooth/[A-Za-z0-9._-]+\.conf$' "$out/bt/bt-conf-list.txt" || { echo "GAP: bt-static: no /vendor/etc/bluetooth/*.conf listed (see bt-conf-list.txt)" >&2; bad=$((bad + 1)); }; fi
+		else
+			BT bt-rfkill-after.txt rfkill=ok "$b_rf"; BT bt-tty-after.txt tty=ok "$b_tty"; BT bt-props-after.txt props=ok "$b_props"; fi ;;
+	bt-snoop-on)  # research 107 Q1/Q3: the one persist.* write, then the BT toggle; every step has its own file so a failed wait names itself
+		b_set='setprop persist.bluetooth.btsnooplogmode full && [ "$(getprop persist.bluetooth.btsnooplogmode)" = full ] && echo snoopmode=ok'
+		b_off=$(bt_tog_script off); b_on=$(bt_tog_script on)
+		bt_guard "$b_set" "$b_off" "$b_on"; bt_init
+		BT bt-snoop-set.txt snoopmode=ok "$b_set" 30; BT bt-snoop-off.txt state_off=ok "$b_off" 90; BT bt-snoop-on.txt state_on=ok "$b_on" 90 ;;
+	bt-toggle)
+		b_t=$(bt_tog_script "$1"); bt_guard "$b_t"; bt_init
+		BT "bt-toggle-$1.txt" "state_$1=ok" "$b_t" 90 ;;
+	bt-snoop-pull)  # research 107 Q2: files hold the BD address -> artifacts only; contents are never printed
+		bs=/data/misc/bluetooth/logs/btsnoop_hci.log; bv=/data/vendor/bluetooth/btsnoop_hci_vnd.log   # bv path is a [guess] (golden-bt-cold): missing = INFO, never a GAP
+		b_sz="for f in $bs $bs.last $bv; do if [ -e \$f ]; then stat -c '%s %n' \$f; else echo \"missing \$f\"; fi; done; ls -l /data/misc/bluetooth/logs; echo size=ok"
+		bt_guard "$b_sz" "cat $bs" "cat $bs.last" "cat $bv"; bt_init
+		BT bt-snoop-size.txt size=ok "$b_sz" 60
+		if [ "$dry" = 1 ]; then R "cat $bs" bt/btsnoop_hci.log; R "cat $bs.last" bt/btsnoop_hci.log.last; R "cat $bv" bt/btsnoop_hci_vnd.log
+		else
+			for bf in "$bs" "$bs.last" "$bv"; do
+				bn=${bf##*/}; bz=$(awk -v p="$bf" '$2==p{print $1; exit}' "$out/bt/bt-snoop-size.txt")
+				if ! [[ "$bz" =~ ^[0-9]+$ ]] || [ "$bz" -eq 0 ]; then
+					if [ "$bf" = "$bs" ]; then echo "GAP: bt-snoop-pull: $bs is missing or size 0 (size='${bz:-none}', see bt-snoop-size.txt)" >&2; bad=$((bad + 1))
+					else echo "INFO: bt-snoop-pull: $bn missing or size 0 (not on every build; see bt-snoop-size.txt)" >&2; info=$((info + 1)); fi
+					continue; fi
+				R "cat $bf" "bt/$bn"
+				if [ "$(head -c 8 "$out/bt/$bn" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != 6274736e6f6f7000 ]; then
+					if [ "$bf" = "$bv" ]; then echo "INFO: bt-snoop-pull: $bn does not start with the btsnoop magic (format of the vendor log unverified)" >&2; info=$((info + 1))
+					else echo "GAP: bt-snoop-pull: $bn does not start with the btsnoop magic (btsnoop + NUL)" >&2; bad=$((bad + 1)); fi; fi
+			done; fi ;;
+	bt-debug)  # G4: root debugfs reads, one file each
+		b_g='cat /sys/kernel/debug/gpio && echo debugfs=ok'; b_r='cat /sys/kernel/debug/regulator/regulator_summary && echo debugfs=ok'; b_c=$bt_clk_script
+		bt_guard "$b_g" "$b_r" "$b_c"; bt_init
+		BT "bt-debug-$1-gpio.txt" debugfs=ok "$b_g"; BT "bt-debug-$1-regulator.txt" debugfs=ok "$b_r"; BT "bt-debug-$1-clk.txt" debugfs=ok "$b_c"
+		# a missing clock dir or an unreadable cached file is a loud GAP (rule 8), never a silent hole in the file
+		[ "$dry" = 1 ] || while IFS= read -r bl; do echo "GAP: bt-debug: bt/bt-debug-$1-clk.txt: $bl" >&2; bad=$((bad + 1)); done < <(grep -E '^(MISSING clk|UNREADABLE) ' "$out/bt/bt-debug-$1-clk.txt") ;;
+	bt-stty)  # golden-bt-cold: the BT UART line settings, one read-only command; BT() makes a failed stty (no marker) a GAP
+		b_st='stty -F /dev/ttySAC16 -a && echo stty=ok'; bt_guard "$b_st"; bt_init
+		BT bt-stty.txt stty=ok "$b_st" 30 ;;
+	bt-vnd-on)  # 21m R22: vendor snoop switch; the only writes are the 2 persist props + the BT toggle (same frame as bt-snoop-on)
+		b_set='setprop persist.bluetooth.vendor.btsnoop true && setprop persist.bluetooth.disable.accelerate.bt.on true && echo "vendor.btsnoop=$(getprop persist.bluetooth.vendor.btsnoop)" && echo "disable.accelerate.bt.on=$(getprop persist.bluetooth.disable.accelerate.bt.on)" && [ "$(getprop persist.bluetooth.vendor.btsnoop)" = true ] && [ "$(getprop persist.bluetooth.disable.accelerate.bt.on)" = true ] && echo vnd=ok'
+		b_off=$(bt_tog_script off); b_on=$(bt_tog_script on)
+		bt_guard "$b_set" "$b_off" "$b_on"; bt_init
+		BT bt-vnd-set.txt vnd=ok "$b_set" 30; BT bt-vnd-off.txt state_off=ok "$b_off" 90; BT bt-vnd-on.txt state_on=ok "$b_on" 90 ;;
+	bt-debugfs-mount)  # 21m R22: mount debugfs (runtime only), then the pinctrl + tty driver reads; failures keep their evidence in the file
+		b_m='if [ -e /sys/kernel/debug/gpio ]; then echo debugfs=already-present; elif mountpoint -q /sys/kernel/debug; then echo debugfs=mountpoint-present-no-gpio; else mount -t debugfs debugfs /sys/kernel/debug 2>&1; mrc=$?; echo "mount-rc=$mrc"; fi; if [ -e /sys/kernel/debug/gpio ]; then if [ "${mrc:-0}" -ne 0 ]; then echo "mount_rc_nonzero: $mrc"; else grep debugfs /proc/mounts && echo mounted=ok; fi; else echo "gpio_missing: /sys/kernel/debug/gpio absent after the mount step (mount-rc=${mrc:-none})"; echo "getenforce=$(getenforce 2>&1)"; echo "id-Z=$(id -Z 2>&1)"; ls -ldZ /sys/kernel/debug 2>&1; echo "debugfs-in-filesystems=$(grep -c debugfs /proc/filesystems)"; dmesg | tail -n 40 | grep -iE "debugfs|avc"; fi'
+		b_p='n=0; for d in /sys/kernel/debug/pinctrl/*; do [ -d "$d" ] || continue; n=$((n+1)); echo "== $d"; for f in pins pinmux-pins; do if [ -r "$d/$f" ]; then echo "-- $d/$f"; cat "$d/$f"; else echo "INFO: missing or unreadable $d/$f"; fi; done; done; t=0; for f in /proc/tty/driver/*; do if [ -r "$f" ]; then t=$((t+1)); echo "-- $f"; cat "$f"; fi; done; [ $t -gt 0 ] || echo "INFO: no readable /proc/tty/driver/* file"; [ $n -gt 0 ] && echo pinctrl=ok'
+		bt_guard "$b_m" "$b_p"; bt_init
+		BT bt-debugfs-mount.txt mounted=ok "$b_m" 60; BT bt-debug-pinctrl.txt pinctrl=ok "$b_p" 90
+		if [ "$dry" != 1 ]; then bn=$(grep -c '^INFO: ' "$out/bt/bt-debug-pinctrl.txt" 2>/dev/null); if [ "${bn:-0}" -gt 0 ]; then echo "INFO: bt-debugfs-mount: $bn INFO line(s) in bt-debug-pinctrl.txt (missing pinctrl files / tty drivers)" >&2; info=$((info + bn)); fi; fi ;;
+	bt-logs)  # G2: full dmesg + logcat, address-looking strings masked right after the pull (the raw text is overwritten in place), filtered copies for the review
+		bt_init
+		rmask=$bt_mask; R "dmesg" bt/bt-dmesg.txt; R "logcat -d -b all" bt/bt-logcat.txt; rmask=; R "logcat -g" bt/bt-logcat-size.txt   # masked in the pipe: the raw text never reaches the disk (review golden-bt-s0-r1 F4)
+		if [ "$dry" != 1 ]; then
+			for bl in dmesg logcat; do bt_mask_file "bt/bt-$bl.txt"   # idempotent second pass
+				grep -iE 'bt|bluetooth|bcm|nitrous|uart|rfkill|4389|ttySAC' "$out/bt/bt-$bl.txt" | grep -viE 'serial|imei|ssid|androidboot|cmdline' > "$out/bt/bt-$bl-filtered.txt" || { echo "INFO: bt-logs: no line of bt-$bl.txt matches the BT filter" >&2; info=$((info + 1)); }; done
+			echo "INFO: bt-logs: 'hci_reset fail' lines: dmesg=$(grep -c 'hci_reset fail' "$out/bt/bt-dmesg.txt") logcat=$(grep -c 'hci_reset fail' "$out/bt/bt-logcat.txt")" >&2; info=$((info + 1)); fi ;;
+	gpu-state)  # path = platform device of the dmesg name + the standard runtime PM attribute [guess until the first pull]
+		f=gpu-state-$(date -u +%Y%m%dT%H%M%S%N).txt
+		R "cat /sys/devices/platform/1c500000.mali/power/runtime_status; echo screen=\$(dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+')" "$f"
+		[ "$dry" = 1 ] || grep -qxE 'active|suspended|suspending|resuming' "$out/$f" || { echo "GAP: gpu-state: runtime_status is not active|suspended|suspending|resuming (see $f)" >&2; bad=$((bad + 1)); } ;;
+	mmio-filter-wifi-dwc)  # golden-6 row D: dwc core is built-in, its caller range would come from /proc/kallsyms; NOT citable yet (no kallsyms text-range evidence for built-in code on this kernel: golden-1 addresses are zero [obs 103 C12]), so this fails loudly instead of inventing a range (AGENTS rule 7)
+		echo "GAP: $cmd: no cited caller range for the built-in dwc/exynos_pcie_rc code (kallsyms built-in text ranges unverified, runplans/golden-6.md row D); nothing was written" >&2; bad=$((bad + 1)) ;;
+	su-policy-diag)  # research 104 (a): read-only diagnostics, one stdin script (su -c sh) per output file; empty output = GAP
+		D su-magisk-v.txt 'command -v magisk; magisk -v'
+		D su-policy-count.txt 'magisk --sqlite "SELECT count(*) FROM policies"'
+		D su-policy-all.txt 'magisk --sqlite "SELECT * FROM policies"'
+		D su-policy-one.txt 'magisk --sqlite "SELECT 1 AS one"'
+		D su-magisk-log.txt 'logcat -d -s Magisk' ;;
+	mmio-filter-*)
+		b=${cmd#mmio-filter-}; mods=${MMIO_MODS[$b]}; sfx=""; [ "$b" = wifi ] || sfx=-$b
+		# /proc/modules shows 0x0 addresses at the stock kptr_restrict [obs 20261027T224642Z mmio-modules.txt]: lowered to 0 only for this one read, restored in the same shell
+		R "k=/proc/sys/kernel/kptr_restrict; o=\$(cat \$k); echo 0 > \$k; grep -E '^(${mods// /|}) ' /proc/modules; echo \$o > \$k; echo kptr_restrict-restored=\$(cat \$k) was=\$o" mmio-modules$sfx.txt
+		[ "$dry" = 1 ] || grep -qE '^kptr_restrict-restored=([0-9]) was=\1$' "$out/mmio-modules$sfx.txt" || { echo "GAP: $cmd: kptr_restrict not restored (see mmio-modules$sfx.txt)" >&2; bad=$((bad + 1)); }
+		if [ "$dry" = 1 ]; then flt="(caller0 >= BASE && caller0 < END) || ..."
+		else flt=""
+			for m in $mods; do
+				read -r _ size _ _ _ base _ < <(grep "^$m " "$out/mmio-modules$sfx.txt")
+				[[ "${base:-}" =~ ^0x[0-9a-f]{16}$ ]] && [ "$base" != 0x0000000000000000 ] && [[ "${size:-}" =~ ^[0-9]+$ ]] || fail "$cmd: $m missing or zero address in /proc/modules (see mmio-modules$sfx.txt)"
+				flt="$flt${flt:+ || }(caller0 >= $base && caller0 < $(printf '0x%x' $((base + size))))"
+			done
+		fi
+		S "echo '$flt' > $T/events/rwmmio/filter"
+		# the subsystem filter file reads back only help text [obs 20261027T224642Z]: each event's own filter file is checked
+		R "for e in rwmmio_write rwmmio_post_write rwmmio_read rwmmio_post_read; do echo \"== \$e\"; cat $T/events/rwmmio/\$e/filter; done; echo == format; cat $T/events/rwmmio/rwmmio_write/format" mmio-filter$sfx.txt
+		[ "$dry" = 1 ] || { [ "$(grep -cxF "$flt" "$out/mmio-filter$sfx.txt")" = 4 ] && grep -q 'field:unsigned long caller0;' "$out/mmio-filter$sfx.txt"; } || { echo "GAP: $cmd: the filter is not on all 4 rwmmio events or there is no caller0 field (see mmio-filter$sfx.txt)" >&2; bad=$((bad + 1)); } ;;
+	su-check)
+		R id su-id.txt
+		[ "$dry" = 1 ] || grep -q "uid=0(root)" "$out/su-id.txt" || { echo "GAP: su -c id is not uid=0(root) (Magisk su not granted?)" >&2; bad=$((bad + 1)); }
+		R "ls -l /data/adb/magisk/busybox 2>&1; true" su-busybox.txt
+		[ "$dry" = 1 ] || grep -q '^-.* /data/adb/magisk/busybox$' <(tr -d '\r' < "$out/su-busybox.txt") || { echo "GAP: su-check: /data/adb/magisk/busybox not present (see su-busybox.txt): the boot-1 pixos_bb copy or magiskd's adoption failed" >&2; bad=$((bad + 1)); }
+		R "ls -d /data/magisk 2>&1; true" su-data-magisk.txt
+		[ "$dry" = 1 ] || ! grep -qx '/data/magisk' <(tr -d '\r' < "$out/su-data-magisk.txt") || { echo "GAP: su-check: /data/magisk still present (see su-data-magisk.txt): magiskd did not adopt it" >&2; bad=$((bad + 1)); }
+		# stdin script via D (shared with su-policy-diag): no nested quoting; D checks __GP_RC=0, strips CR/marker and GAPs on empty
+		D su-policy.txt 'magisk --sqlite "SELECT uid,policy,until,logging,notification FROM policies WHERE uid=2000"'
+		[ "$dry" = 1 ] || [ "$(grep -v '^__GP_RC=' "$out/su-policy.txt")" = "uid=2000|policy=2|until=0|logging=0|notification=0" ] || { echo "GAP: su-check: policies row for uid 2000 is not exactly uid=2000|policy=2|until=0|logging=0|notification=0 (see su-policy.txt)" >&2; bad=$((bad + 1)); } ;;
+	boot-capture)
+		R "cat $T/tracing_on; ls $T/events/rwmmio; for f in $T/per_cpu/cpu*/stats; do echo \$f; cat \$f; done" tracing-state-coldboot.txt
+		S "echo 0 > $T/tracing_on"
+		R "cat $T/trace" trace-coldboot.txt; R "cat /proc/vmallocinfo" vmallocinfo-coldboot.txt; R "cat /proc/iomem" iomem.txt
+		R lsmod lsmod.txt; R dmesg dmesg-coldboot.txt; R "cat /proc/kallsyms" kallsyms.txt
+		R "for d in /sys/bus/pci/devices/*; do echo \$d \$(cat \$d/vendor \$d/device); cat \$d/resource; done" pci-resource.txt   # BAR bases for trace-diff --bar0/--bar2 (research 85 s.7 #9)
+		[ "$dry" = 1 ] || for c in dhd kbase; do grep -qm1 "$c" "$out/trace-coldboot.txt" || { echo "GAP: no '$c' caller in trace-coldboot.txt (buffer full or module loaded untraced: method B, research 85 s.4.3/addendum)" >&2; bad=$((bad + 1)); }; done ;;
+	inventory)
+		S "mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug"
+		Rtar "-C /sys/firmware/devicetree -cf - --exclude=base/serial-number --exclude=base/chosen base" device-tree.tar   # /proc/device-tree is a symlink to this
+		# clk_summary / regulator_summary: one of them rebooted the phone during inventory [obs 2026-10-27 golden 20261027T220758Z: both 0 bytes, phone
+		# off USB right after device-tree.tar]; skipped LOUDLY until pstore names the read (wifi-probe pulls pstore).
+		echo "GAP: clk_summary and regulator_summary skipped (a debugfs summary read rebooted the phone, 2026-10-27)" >&2; bad=$((bad + 1))
+		R "for f in /sys/kernel/debug/pinctrl/*/pinmux-pins /sys/kernel/debug/pinctrl/*/pinconf-pins /sys/kernel/debug/gpio; do echo \"== \$f\"; cat \"\$f\"; done" pinctrl-gpio.txt
+		R "cat /proc/interrupts" interrupts-baseline.txt
+		R "cd /sys/class/misc/mali0/device && ls -l && for f in gpuinfo core_mask power_policy dvfs_table clock_info available_frequencies; do echo \"== \$f\"; cat \$f 2>&1; done" mali-sysfs.txt
+		R "ls $T/events; ls $T/events/mali $T/events/drm 2>&1; true" trace-events.txt
+		R "for p in /sys/devices/system/cpu/cpufreq/policy*; do echo \"== \$p\"; cat \$p/related_cpus \$p/scaling_available_frequencies \$p/cpuinfo_max_freq; done; for z in /sys/class/thermal/thermal_zone*; do echo \$z \$(cat \$z/type \$z/temp); done" cpufreq-thermal.txt
+		R "find /config/usb_gadget -type f ! -iname '*serial*' | while read -r f; do echo \"== \$f\"; cat \"\$f\" 2>&1 | head -c 512; echo; done" usb-gadget.txt
+		R "ps -A -o PID,PPID,USER,NAME,ARGS" ps.txt
+		R "lshal" lshal.txt
+		R "cat /vendor/etc/init/*.rc /vendor/etc/fstab.*" vendor-init-fstab.txt
+		R "ls -lR /vendor/firmware /vendor/etc/wifi /vendor_dlkm/lib/modules" firmware-list.txt
+		R "logcat -d -b all" logcat-boot.txt
+		# salvaged from golden-unattended a5669f9: more inventory, all reads (no write, no regmap register read)
+		R "cat /proc/config.gz" kernel-config.gz
+		R "cat /proc/cpuinfo /proc/meminfo /proc/bus/input/devices" proc-cpu-mem-input.txt
+		R "getevent -lp" getevent-lp.txt
+		R "for s in SurfaceFlinger display input wifi media.audio_flinger sensorservice battery power; do echo \"== dumpsys \$s\"; dumpsys \$s; done" dumpsys.txt
+		R "for d in /sys/bus/platform/devices/*; do echo \"\$d \$(readlink \$d/driver)\"; done" platform-drivers.txt
+		R "for d in /sys/bus/pci/devices/*; do echo \"== \$d\"; od -A x -t x4 \$d/config; done" pci-config.txt   # [guess: config-space reads have no side effect; status bits are RW1C, cleared by a WRITE of 1 (PCIe base spec 7.4, spec not on this host)]
+		R "ls -l /dev/block/by-name" by-name.txt   # names only
+		R "for d in /sys/kernel/debug/regmap/*; do echo \"\$d \$(cat \$d/name)\"; done" regmap-names.txt   # names only: no register reads
+		# R keeps only the last command's rc: errors inside the loops land in the files (r1 F2) -> every error text is a GAP per file
+		if [ "$dry" = 0 ]; then for f in pinctrl-gpio.txt mali-sysfs.txt trace-events.txt cpufreq-thermal.txt usb-gadget.txt vendor-init-fstab.txt firmware-list.txt dumpsys.txt platform-drivers.txt pci-config.txt regmap-names.txt; do
+			# comment lines (^\s*#) are not scanned: the stock vendor fstab comment says 'cannot' (golden-6 false positive, research 105 item 5); every other line still is
+			el=$(grep -vE '^[[:space:]]*#' "$out/$f" 2>/dev/null | grep -E 'No such file|Permission denied|Operation not permitted|not found|Invalid argument|cannot|Can.t find service'); n=$(printf '%s' "$el" | grep -c .); [ "${n:-0}" = 0 ] || { echo "GAP: $f holds $n error line(s) (first: $(printf '%s\n' "$el" | head -1))" >&2; bad=$((bad + 1)); }; done; fi ;;
+	blobs) Rtar "-C / -cf - vendor_dlkm/lib/modules vendor/firmware vendor/etc vendor/lib64 vendor/bin/hw" blobs.tar
+		# READ-only partition images of the running slot (vendor DTB, ramdisks, dtbo) for tools/rea; rule 4: never into git. cat only: no dd, no of=, no redirect to /dev/block.
+		R "getprop ro.boot.slot_suffix" slot-suffix.txt
+		for p in boot init_boot vendor_boot dtbo; do R "cat /dev/block/by-name/$p\$(getprop ro.boot.slot_suffix)" "part-$p.img"; done ;;
+	events-extra)
+		R "for e in i2c spi gpio mali drm; do if [ -d $T/events/\$e ]; then echo 1 > $T/events/\$e/enable && echo \"enabled \$e\"; else echo \"MISSING \$e\"; fi; done" events-extra.txt
+		[ "$dry" = 1 ] || ! grep -q MISSING "$out/events-extra.txt" || { echo "GAP: event groups missing: $(grep MISSING "$out/events-extra.txt" | tr '\n' ' ')" >&2; bad=$((bad + 1)); } ;;
+	start) S "echo > $T/trace; echo overwrite > $T/trace_options; echo 1 > $T/tracing_on" ;;
+	kprobes)
+		for w in "dword rd32 x32" "word rd16 x16" "byte rd8 x8"; do set -- $w
+			S "echo 'p:pcicfg/$2 pci_bus_read_config_$1 devfn=\$arg2:x32 pos=\$arg3:s32 vptr=\$arg4:x64' >> $T/kprobe_events"
+			S "echo 'r:pcicfg/${2}_ret pci_bus_read_config_$1 rc=\$retval:s32' >> $T/kprobe_events"
+			S "echo 'p:pcicfg/w${2#rd} pci_bus_write_config_$1 devfn=\$arg2:x32 pos=\$arg3:s32 val=\$arg4:$3' >> $T/kprobe_events"
+		done
+		S "echo 1 > $T/events/pcicfg/enable" ;;
+	mark) S "echo 'MARK $1${2:+ $2}' > $T/trace_marker" ;;
+	stop-pull)
+		S "echo 0 > $T/tracing_on"; R "cat $T/trace" "trace-$1.txt"; # vmallocinfo uses %pK (mm/vmalloc.c:4128 v6.1): kptr_restrict 2 = zeros [obs 20261027T224642Z], 0 = HASHED [obs every 20261028T034021Z file], only 1 + CAP_SYSLOG + euid==uid = real (lib/vsprintf.c:854-899 v6.1): set to 1 only for this read, restored in the same shell
+		R "k=/proc/sys/kernel/kptr_restrict; o=\$(cat \$k); echo 1 > \$k; cat /proc/vmallocinfo; echo \$o > \$k; echo kptr_restrict-restored=\$(cat \$k) was=\$o" "vmallocinfo-$1.txt"
+		[ "$dry" = 1 ] || grep -qE '^kptr_restrict-restored=([0-9]) was=\1$' "$out/vmallocinfo-$1.txt" || { echo "GAP: stop-pull $1: kptr_restrict not restored (see vmallocinfo-$1.txt)" >&2; bad=$((bad + 1)); }
+		[ "$dry" = 1 ] || ! grep -q '^0x0000000000000000-0x0000000000000000 .* ioremap' "$out/vmallocinfo-$1.txt" || { echo "GAP: stop-pull $1: vmallocinfo ioremap rows have zero addresses (VA->PA join impossible)" >&2; bad=$((bad + 1)); }
+		[ "$dry" = 1 ] || grep -qE '^0xffff[0-9a-f]{12}-0xffff[0-9a-f]{12} .* ioremap( .*)?$' "$out/vmallocinfo-$1.txt" || { echo "GAP: stop-pull $1: no ioremap row has a kernel VA (0xffff...): pointers hashed or zero, VA->PA join impossible" >&2; bad=$((bad + 1)); }
+		 R "cat /proc/interrupts" "interrupts-$1.txt"
+		R "for f in $T/per_cpu/cpu*/stats; do echo \$f; cat \$f; done" "tracing-stats-$1.txt"
+		[ "$dry" = 1 ] || ! grep -qE '^(overrun|commit overrun|dropped events): [1-9]' "$out/tracing-stats-$1.txt" || { echo "GAP: stop-pull $1: trace buffer overrun (events lost, see tracing-stats-$1.txt)" >&2; bad=$((bad + 1)); } ;;
+	wifi-trace-probe)
+		# READ-ONLY inventory of the Wi-Fi trace sources (research D.1) + the W0/W8 inputs (stock firmware files with SELinux label and sha256, /proc/interrupts, the global-ns su). Nothing is written on the phone.
+		# A missing /proc/dhd_trace, /sys/wifi/wl_dbg_level or events/cfg80211 is INFO (info=N): those are the questions being asked.
+		wf_init; wf_secret_init
+		fwp=""; for n in "${WF_FW_NAMES[@]}"; do fwp="$fwp $WF_FW_V/$n"; done
+		syms=$(for row in "${WF_PROBES[@]}"; do t=$(wf_row_text "$row"); t=${t#?:gpwifi/}; t=${t#* }; t=${t%% *}; echo "${t%%+*}"; done | sort -u)
+		symre=$(printf '%s\n' "$syms" | paste -sd'|')
+		WF probe-procfs.txt probe_procfs=ok "ls -l /proc/dhd_trace /proc/dhd_ecounters 2>&1; echo probe_procfs=ok"
+		WF probe-params.txt probe_params=ok 'for p in /sys/module/bcmdhd4389/parameters/*; do echo "$p=$(cat $p 2>/dev/null | head -c 300)"; done; echo probe_params=ok'
+		WF probe-sysfs.txt probe_sysfs=ok "ls -l /sys/wifi/ 2>&1; cat /sys/wifi/wl_dbg_level 2>&1; echo probe_sysfs=ok"
+		WF probe-ksym.txt probe_ksym=ok "ls $T/events/cfg80211/ 2>&1; grep -wE '$symre' /proc/kallsyms | cut -d' ' -f2-; echo probe_ksym=ok"
+		WF probe-cmd.txt probe_cmd=ok "cmd wifi help 2>&1 | grep -E 'start-scan|list-scan-results|connect-network|forget-network|set-verbose-logging'; echo probe_cmd=ok"
+		WF probe-props.txt probe_props=ok "getprop | grep -iE 'wifi|wlan|dhd'; lsmod | grep -E 'bcmdhd|cfg80211'; echo probe_props=ok"
+		WF probe-fw.txt probe_fw=ok "ls -lZ$fwp && sha256sum$fwp && echo probe_fw=ok"
+		wf_ko_check probe-ko.txt || true
+		WF probe-irq.txt probe_irq=ok "grep -iE 'dhd|wlan|pcie' /proc/interrupts; echo probe_irq=ok"
+		WF probe-predl.txt predl_end=ok 'd=$(dmesg); if [ -n "$d" ]; then c=$(printf "%s\n" "$d" | grep -c "Took ARM out of Reset"); echo pre_download_count=$c; fi; echo predl_end=ok'
+		WF probe-mm.txt probe_mm=ok 'true; echo mm_rc=$?; echo ns_mm=$(readlink /proc/self/ns/mnt); echo ns_init=$(readlink /proc/1/ns/mnt); echo probe_mm=ok' 90 wifi_mask --mount-master
+		if [ "$dry" != 1 ]; then w=$out/wifi
+			for p in /proc/dhd_trace /proc/dhd_ecounters; do ! grep -q "$p: No such file" "$w/probe-procfs.txt" || wf_info "$p is absent"; done
+			! grep -q 'No such file' "$w/probe-sysfs.txt" || wf_info "/sys/wifi or /sys/wifi/wl_dbg_level is absent (see probe-sysfs.txt)"
+			! grep -qE '/events/cfg80211.*No such file' "$w/probe-ksym.txt" || wf_info "tracefs events/cfg80211 is absent (cfg80211 not loaded?)"
+			! grep -q 'parameters/\*=' "$w/probe-params.txt" || wf_gap "no /sys/module/bcmdhd4389/parameters (module not loaded?)"
+			for s in $syms; do grep -qw "$s" "$w/probe-ksym.txt" || wf_gap "symbol $s is not in /proc/kallsyms (the gpwifi probe on it would fail)"; done
+			for s in start-scan list-scan-results connect-network; do grep -q -- "$s" "$w/probe-cmd.txt" || wf_gap "'cmd wifi help' does not list $s"; done
+			grep -q 'bcmdhd4389' "$w/probe-props.txt" || wf_gap "lsmod does not list bcmdhd4389"
+			[ "$(grep -cE '^[0-9a-f]{64}  ' "$w/probe-fw.txt")" = "${#WF_FW_NAMES[@]}" ] || wf_gap "probe-fw.txt does not hold ${#WF_FW_NAMES[@]} sha256 lines"
+			[ "$(grep -vcE '^probe_irq=ok$' "$w/probe-irq.txt")" -ge 1 ] || wf_gap "no dhd|wlan|pcie line in /proc/interrupts (driver not up?)"
+			pd=$(wf_mk probe-predl.txt pre_download_count); echo "pre_download_count=${pd:-unknown}"
+			[[ "$pd" =~ ^[0-9]+$ ]] || wf_gap "dmesg failed or was empty: no pre_download_count (grep -c 'Took ARM out of Reset' of the phone dmesg)"
+			[ "$(wf_mk probe-mm.txt mm_rc)" = 0 ] || wf_gap "su --mount-master -c true did not give rc 0"
+			a=$(wf_mk probe-mm.txt ns_mm); b=$(wf_mk probe-mm.txt ns_init)
+			{ [ -n "$a" ] && [ "$a" = "$b" ]; } || wf_gap "mount ns of su --mount-master ('${a:-unreadable}') != ns of init ('${b:-unreadable}'): not the global ns, a bind mount would not reach request_firmware [guess: equal ns links = same ns]"
+		fi ;;
+	wifi-fw-bind)
+		# W0. UNVERIFIED on the phone. Host first: the 3 files must match the pinned sha256 (REFUSED before any adb call otherwise). Copies are hashed AND pushed (no TOCTOU).
+		# Teardown (r1 F1): wf_cleanup (EXIT/INT/TERM/HUP) removes the staged copies and rolls an unfinished bind back, so an interrupt leaves nothing in /data/local/tmp and no half-done bind.
+		wf_traps; wf_x=$(mktemp -d) || err "$cmd: mktemp failed"
+		# host-side check also under --dry-run (review golden-wifi-trace-r1 F3): a missing file or sha mismatch is a GAP + rc 1 before anything could be pushed
+		for n in "${WF_FW_NAMES[@]}"; do
+			if [ ! -f "$1/$n" ]; then wf_gap "$1/$n is not a file (nothing pushed)"
+			elif ! cp "$1/$n" "$wf_x/$n"; then wf_gap "cannot copy $1/$n (nothing pushed)"
+			elif [ "$(sha256sum "$wf_x/$n" | cut -d' ' -f1)" != "${WF_FW_PIN[$n]}" ]; then wf_gap "sha256 of $1/$n is not the pinned ${WF_FW_PIN[$n]:0:12}... (nothing pushed)"; fi
+		done
+		[ "$bad" = 0 ] || { echo "RESULT: FAIL $cmd gaps=$bad out=$out info=$info"; exit 1; }
+		wf_init; pushed=1; [ "$dry" = 1 ] || wf_fw_staged=1
+		for n in "${WF_FW_NAMES[@]}"; do Q push "$wf_x/$n" "$WF_FW_S$n" || { wf_gap "adb push of $n failed"; pushed=0; }; done
+		if [ "$pushed" = 1 ]; then
+			[ "$dry" = 1 ] || wf_fw_bind=1
+			WF fw-bind.txt bind_script_end=ok "$(wf_bind_script)" 90 cat --mount-master
+			if [ "$dry" != 1 ]; then
+				if grep -qx 'bind_already=1' "$out/wifi/fw-bind.txt"; then wf_gap "already bound (second bind without wifi-fw-unbind); nothing changed"; norb=1   # wf_fw_bind stays 1 until the end: wf_cleanup skips the unbind when fw-bind.txt says bind_already=1 (r2 R2-6)
+				else
+					: > "$out/$wf_stock"
+					for n in "${WF_FW_NAMES[@]}"; do
+						[ "$(wf_mk fw-bind.txt "bind_$n")" = ok ] || wf_gap "$n was not bound (see fw-bind.txt)"
+						[ "$(wf_mk fw-bind.txt "bound_sha_$n")" = "${WF_FW_PIN[$n]}" ] || wf_gap "sha256 read through the bound path $WF_FW_V/$n is not the pinned ${WF_FW_PIN[$n]:0:12}..."
+						st=$(wf_mk fw-bind.txt "stock_sha_$n")
+						if [[ "$st" =~ ^[0-9a-f]{64}$ ]]; then echo "$st  $n" >> "$out/$wf_stock"; else wf_gap "no valid stock sha256 for $n (got '${st:0:20}')"; fi
+						l=$(wf_mk fw-bind.txt "label_$n"); bl=$(wf_mk fw-bind.txt "bound_label_$n")
+						{ [ -n "$l" ] && [ "$l" = "$bl" ]; } || wf_gap "SELinux label of the bound $n ('$bl') != stock label ('$l')"
+					done
+					[ "$(wf_mk fw-bind.txt tmpfs)" = ok ] || wf_gap "tmpfs $WF_FW_D was not mounted"
+					WF fw-readback.txt readback_end=ok "$(wf_readback_script)" 90 cat --mount-master
+					for n in "${WF_FW_NAMES[@]}"; do [ "$(wf_mk fw-readback.txt "rb_sha_$n")" = "${WF_FW_PIN[$n]}" ] || wf_gap "read-back (2nd su --mount-master process) of $WF_FW_V/$n is not the pinned sha256"; done
+				fi
+			fi
+		fi
+		# always (also after a failed push): remove the staged copies in /data/local/tmp (the RAM-only tmpfs is the bind source)
+		wf_fw_stageclean || true
+		# teardown: a bind that has any GAP is rolled back (except the already-bound refusal, which belongs to the earlier bind)
+		if [ "$dry" != 1 ] && [ "$pushed" = 1 ] && [ "$bad" -gt 0 ] && [ "${norb:-0}" != 1 ]; then echo "wifi-fw-bind: GAPs above, rolling the bind back (unbind)" >&2; wf_unbind_run; fi
+		wf_fw_bind=0 ;;
+	wifi-fw-unbind) wf_init; wf_unbind_run ;;
+	wifi-kprobes)
+		# P1-P24 + P4b (table WF_PROBES, 29 events). Arms and enables ONLY: no tracing_on write, no buffer clear (the caller runs `start`); events go to the global $T buffer that stop-pull reads (no tracefs instance).
+		# Module identity first (r1 F14). Any GAP while arming, or an interrupt, disarms again (r1 F5: no half-probed run); the prior events/cfg80211/enable value is recorded in wifi/cfg80211-prev.txt for wifi-kprobes-off.
+		wf_probe_guard; wf_init
+		if wf_ko_check kprobes-ko.txt; then
+			[ "$dry" = 1 ] || { wf_kp_prev=keep
+				if [ -f "$out/wifi/cfg80211-prev.txt" ]; then wf_pv=$(cat "$out/wifi/cfg80211-prev.txt"); [[ "$wf_pv" =~ ^[01]$ ]] || fail "$cmd: $out/wifi/cfg80211-prev.txt does not hold 0 or 1 (r2 R2-2): refused, nothing armed; delete the file if it is stale"; wf_kp_prev=$wf_pv; fi
+				wf_kp_armed=1; }   # kprobes.txt is truncated by WF when the arm script starts, so wf_cleanup reads this run's cfg80211_prev (r2 R2-1; a signal in the microseconds before that would read a stale file [guess: not testable])
+			WF kprobes.txt kprobes_script_end=ok "$(wf_kp_script)" 90 cat
+			if [ "$dry" = 1 ]; then echo "would expect: kprobes_registered=$WF_EXPECT, probe_ok for each of ${#WF_PROBES[@]} events, each filter read back equal, gpwifi_enable=1"
+			else w=$out/wifi/kprobes.txt
+				pv=$(wf_mk kprobes.txt cfg80211_prev)
+				if [[ "$pv" =~ ^[01]$ ]]; then [ -f "$out/wifi/cfg80211-prev.txt" ] || echo "$pv" > "$out/wifi/cfg80211-prev.txt"; wf_kp_prev=$(cat "$out/wifi/cfg80211-prev.txt"); fi
+				for row in "${WF_PROBES[@]}"; do ev=$(wf_ev "$(wf_row_text "$row")"); grep -qx "probe_ok=$ev" "$w" || wf_gap "probe ${row%%|*} gpwifi/$ev was not registered (see kprobes.txt: module not loaded or symbol missing?)"; done
+				n=$(wf_mk kprobes.txt kprobes_registered); echo "kprobes_registered=${n:-unknown}"
+				{ [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -eq "$WF_EXPECT" ]; } || wf_gap "kprobes_registered=${n:-unknown}, expected $WF_EXPECT"
+				for row in "${WF_PROBES[@]}"; do fl=$(wf_row_filter "$row"); [ -n "$fl" ] || continue; ev=$(wf_ev "$(wf_row_text "$row")")
+					[ "$(wf_mk kprobes.txt "filter_$ev")" = "$fl" ] || wf_gap "filter read-back of gpwifi/$ev (${row%%|*}) is '$(wf_mk kprobes.txt "filter_$ev")', want '$fl'"; done
+				[ "$(wf_mk kprobes.txt gpwifi_enable)" = 1 ] || wf_gap "events/gpwifi/enable does not read 1"
+				c=$(wf_mk kprobes.txt cfg80211_enable)
+				if [ -n "$c" ]; then [ "$c" = 1 ] || wf_gap "events/cfg80211/enable reads '$c', not 1"
+				elif grep -qx 'cfg80211_group=absent' "$w"; then wf_info "tracefs events/cfg80211 group is absent (cfg80211 not loaded?)"
+				else wf_gap "kprobes.txt says neither cfg80211_enable nor cfg80211_group=absent"; fi
+				if [ "$bad" -gt 0 ]; then echo "wifi-kprobes: GAPs above, disarming (wifi/kprobes-disarm.txt)" >&2; wf_kp_off kprobes-disarm.txt "$wf_kp_prev" || true
+				else wf_kp_armed=0; fi   # armed on purpose from here on: wifi-kprobes-off undoes it
+			fi
+		else echo "wifi-kprobes: module identity check failed, nothing armed" >&2; fi ;;
+	wifi-kprobes-off)
+		wf_probe_guard; wf_init
+		pv=0; if [ "$dry" != 1 ]; then
+			if [ -f "$out/wifi/cfg80211-prev.txt" ] && [[ "$(cat "$out/wifi/cfg80211-prev.txt")" =~ ^[01]$ ]]; then pv=$(cat "$out/wifi/cfg80211-prev.txt")
+			else wf_info "no recorded prior events/cfg80211/enable (wifi-kprobes never ran in this out dir): writing 0 [assumed]"; fi
+		fi
+		wf_kp_off kprobes-off.txt "$pv" || true
+		[ "$dry" = 1 ] || [ "$bad" -gt 0 ] || rm -f "$out/wifi/cfg80211-prev.txt" ;;
+	wifi-scan)
+		wf_init; wf_secret_init
+		WF wifi-scan.txt scan_list=ok "echo GP-WIFI-SCAN > /dev/kmsg && cmd wifi start-scan && echo scan_start=ok && sleep 8 && cmd wifi list-scan-results && echo scan_list=ok" 90 wifi_scan_mask
+		if [ "$dry" != 1 ]; then w=$out/wifi/wifi-scan.txt
+			grep -qx 'scan_start=ok' "$w" || wf_gap "no scan_start=ok (start-scan failed or is throttled, see wifi-scan.txt)"
+			if grep -q '^No scan results' "$w"; then wf_gap "'No scan results' (scan throttled for the shell package [guess] or no AP in range)"
+			else
+				[ "$(grep -c '<ssid-masked>' "$w")" -ge 1 ] || wf_gap "no scan result row in wifi-scan.txt"
+				u=$(grep -vcE '^$|^scan_(start|list)=ok$|BSSID +Frequency|^  <masked> +[0-9]+ .*<ssid-masked>$' "$w")
+				[ "$u" = 0 ] || wf_gap "$u line(s) are neither header, marker nor a masked result row (format differs from ScanResultUtil.dumpScanResults?); wifi-scan.txt may hold SSIDs, do not share"
+			fi
+		fi ;;
+	wifi-trace-pull)
+		# Masked pulls (research D.4; /proc/dhd_trace is read ONCE and consumed by the read, r1 F9) + S1. Run after wifi-join, wifi-status, wifi-kprobes-off, stop-pull.
+		wf_init; wf_secret_init
+		WFR wifi-dmesg-full.txt "dmesg"
+		WFR wifi-logcat.txt "logcat -d -b main,system,events,radio | grep -iE 'wifi|wlan|supplicant|wpa_|WifiHAL|dhd'"
+		WFR wifi-dhd-trace.txt "if [ -e /proc/dhd_trace ]; then timeout 5 dd if=/proc/dhd_trace bs=4096 count=64 2>/dev/null; else echo 'INFO: no /proc/dhd_trace'; fi"
+		WFR wifi-dumpsys.txt "dumpsys wifi | head -c 2000000"
+		WFR wifi-dmesg-markers.txt "dmesg | grep -E 'GP-WIFI|idsup|4way|PSK|CONSOLE|wl_dbg|FW supports Inband dw|sent DEEP SLEEP ACK|Deepsleep On|rx_dataoffset'; echo end-of-wifi-markers"
+		if [ "$dry" = 1 ]; then echo "would check S1: PSK literal in the whole out dir (grep -F -f mode-600 file), SSID literal and MAC pattern in the 5 files pulled under wifi/"
+		else w=$out/wifi
+			! grep -q '^INFO: no /proc/dhd_trace' "$w/wifi-dhd-trace.txt" 2>/dev/null || wf_info "no /proc/dhd_trace on this phone"
+			grep -qE 'idsup status|4way HS finished' "$w/wifi-dmesg-markers.txt" 2>/dev/null || wf_gap "no PSK_SUP evidence in dmesg (idsup status / 4way HS finished); WL_* may be silent at the default wl_dbg_level [guess], the gpwifi/supevent kprobe rows are then the evidence"
+			wf_s1 "$w"/wifi-dmesg-full.txt "$w"/wifi-logcat.txt "$w"/wifi-dhd-trace.txt "$w"/wifi-dumpsys.txt "$w"/wifi-dmesg-markers.txt
+		fi ;;
+esac
+if [ "$dry" = 0 ] && [ -d "$out" ]; then (cd "$out" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS); fi
+if [ "$bad" -gt 0 ]; then echo "RESULT: FAIL $cmd gaps=$bad out=$out info=$info"; exit 1; fi
+echo "RESULT: PASS $cmd gaps=0 dry=$dry out=$out info=$info"

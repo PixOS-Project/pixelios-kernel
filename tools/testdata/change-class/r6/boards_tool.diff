@@ -1,0 +1,8 @@
+diff --git a/tools/boards.py b/tools/boards.py
+--- a/tools/boards.py
++++ b/tools/boards.py
+@@ -10,3 +10,4 @@
+ a = 1
++WLAN_SEQ_EXTRA = [(0x1c500000, 1)]
+ b = 2
+ c = 3

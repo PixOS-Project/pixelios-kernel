@@ -1,0 +1,7 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,6 +1,8 @@
+ {
++	log_put_hex8(dst, 9, 0, v);
+ }

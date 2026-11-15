@@ -33,7 +33,7 @@ class ShellcheckStep(unittest.TestCase):
         text = (TOOLS / "check-all.sh").read_text()
         self.assertEqual(re.search(r'^ALL="([^"]*)"', text, re.M).group(1).split(), g.ALL)
         self.assertIn("step B shellcheck", text)
-        self.assertIn("shellcheck -S warning $(tools/shell-files)", text)
+        self.assertIn("tools/shell-files | xargs -P 8 -n 8 shellcheck -S warning", text)   # 8 files per process, 8 processes: the single process took 41 s CPU on this tree
 
     @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck not installed")
     def test_planted_bug_fails_the_step_command(self):
@@ -44,7 +44,7 @@ class ShellcheckStep(unittest.TestCase):
             (d / "bad").write_text('#!/bin/bash\nrm -rf $UNSET/*\ncd /x\nfoo\n')   # SC2164 (warning): cd without || exit
             subprocess.run(["git", "init", "-q", str(d)], check=True)
             subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
-            cmd = "shellcheck -S warning $(tools/shell-files)"
+            cmd = "tools/shell-files | xargs -P 8 -n 8 shellcheck -S warning"
             r = run("bash", "-c", cmd, cwd=d)
             self.assertNotEqual(r.returncode, 0, r.stdout)
             self.assertIn("bad", r.stdout)

@@ -1,0 +1,532 @@
+SWEET CPUTOP: who eats the CPU (patch 0341, GOAL-LOWCLK lever cpu-witness; R0 log only, reads only, no register access, no hardware write). [obs boot resident-065552-b5] all 5 cores 94-98 % busy while SWEET PROCCPU (0186/0247) knows only backboardd, SpringBoard and Preferences, and its two 'not found' lines are printed once at the first sweetperf tick (1089.069), 32 s before launchd execs either process (exec SpringBoard 1121.394, backboardd 1121.723): the name lookup itself works (bb_pid 301 / sb_pid 303 on 626 later lines), the lines were just early and never followed up. (1) new bsd/dev/sweet_cputop.c: boot-arg sweetcputop=N (period s, 1..60; absent = 1 under sweetperf=1, else off; 0 = off, said): every period one header 'SWEET CPUTOP: t_ms dt_ms procs kthr sum_ms top_ms idle_ms new gone late fail trunc kerr' and at most 8 rows 'SWEET CPUTOP: r R p pid PID ms MS cum_ms CUM name NAME' / 'r R k tid 0xTID ms MS cum_ms CUM cont 0xADDR name NAME' = the processes (proc_iterate + task_info TASK_ABSOLUTETIME_INFO, as 0186/0121) and kernel_task threads (new sweet_cputop_task in osfmk/kern/exception.c: task_lock + thread_info_internal THREAD_BASIC_INFO + thread name + unslid continuation, the walk of 0187) ranked by user+system CPU time used in the period; idle threads never ranked (idle_ms); every drop is counted on the header and named once on a SWEET CPUTOP GAP line (task_info failure, table caps 512 processes / 768 kernel threads, thread walk error); 150000-line cap. (2) kernel threads get names so the rows can be read: sweet_fb_vsync (the vsync timer + panel copy work loop), sweet_usb, sweet_usb_log (the USB log drain), sweet_mali, sweet_touch, sweet_cputop (thread_set_thread_name, osfmk/kern/thread.c). (3) SWEET PROCCPU: backboardd / SpringBoard print a line on every pid change ('not found' when absent, 'pid P (was Q)' when it appears or restarts) instead of one 'not found' at the first tick. Host test tools/test_cputop.py.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1fd869c..e9f7cf3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_qrstream.c		standard
+ bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_thrcpu.c			standard
++bsd/dev/sweet_cputop.c			standard
+ bsd/dev/sweet_surfcpu.c		standard
+ bsd/dev/sweet_thrwait.c		standard
+ bsd/dev/sweet_pcsamp.c		standard
+diff --git a/bsd/dev/sweet_cputop.c b/bsd/dev/sweet_cputop.c
+new file mode 100644
+index 0000000..eb3dc0a
+--- /dev/null
++++ b/bsd/dev/sweet_cputop.c
+@@ -0,0 +1,341 @@
++/*
++ * SWEET CPUTOP: who eats the CPU (patch 0341, GOAL-LOWCLK lever cpu-witness). R0: log only, reads only, no register access, no hardware write.
++ *
++ * Why: SWEET PROCCPU (patch 0186/0247) knows three names (backboardd, SpringBoard, Preferences); on boot resident-065552-b5 all five cores were 94-98 % busy and
++ * those three explain only about half of it (CPUSTAT deltas of the same boot: bluetoothd, coreduetd, biomed together ~1.4 cores). CPUSTAT (patch 0121) lists every
++ * process, but cumulative, every 60 s, and never a kernel thread.
++ *
++ * Boot-arg sweetcputop=N (period in seconds, 1..60). Absent: 1 when sweetperf=1 is set, else off. sweetcputop=0 turns it off under sweetperf=1 (one line says so).
++ * Every period, from its own kernel thread (named sweet_cputop, so it ranks itself):
++ *   SWEET CPUTOP: t_ms T dt_ms D procs P kthr K sum_ms S top_ms M idle_ms I new A gone B late C fail F trunc X kerr E
++ *   SWEET CPUTOP: r R p pid PID ms MS cum_ms CUM name NAME                 (a user process; NAME = p_name, to the end of the line)
++ *   SWEET CPUTOP: r R k tid 0xTID ms MS cum_ms CUM cont 0xADDR name NAME   (one kernel_task thread; NAME "-" = unnamed, ADDR = unslid continuation or 0)
++ * with at most CT_TOP rows (R = 1..), ranked by the CPU time (user + system) the entry used in the D ms since the previous sample. Header fields:
++ *   procs/kthr  entries sampled (processes with pid > 0, kernel_task threads without its idle threads)
++ *   sum_ms      CPU time of ALL sampled entries in the period; top_ms = the part the printed rows explain
++ *   idle_ms     the same for kernel_task's idle threads (TH_FLAGS_IDLE), which are never ranked
++ *   new         entries that were not in the previous sample (their whole CPU time counts as this period's: they started inside it)
++ *   gone        entries of the previous sample that are missing now (process exit / thread end): the CPU they used after the previous sample is NOT in sum_ms
++ *   late        new entries whose cumulative time is more than 8 cores x period: they did not start inside it (a table-cap flap); counted as 0, never ranked
++ *   fail        processes whose task was NULL or whose task_info failed (first one named on a SWEET CPUTOP GAP line); not ranked
++ *   trunc       processes + kernel threads beyond the table caps (CT_MAXP / CT_MAXK), not ranked (SWEET CPUTOP GAP line once)
++ *   kerr        thread_info error of the kernel thread walk (0 = ok); the threads after the failing one are not ranked in that period
++ * The first sample only prints `SWEET CPUTOP: baseline procs P kthr K`. Lines are capped at CT_CAP per boot (`SWEET CPUTOP: cap reached N`).
++ *
++ * Sources (xnu-8796.141.3 with this stack): processes via proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS) exactly as patch 0186 (bsd/kern/kern_proc.c
++ * proc_iterate: a proc reference is held per callout, no list lock) and task_info(TASK_ABSOLUTETIME_INFO) (osfmk/kern/task.c `case TASK_ABSOLUTETIME_INFO`:
++ * total_user/total_system = recount_task_times, live + terminated threads, mach time units; same call as bsd/dev/sweet_cpustat.c). Kernel threads via
++ * sweet_cputop_task(kernel_task) (osfmk/kern/exception.c, this patch): task_lock + thread_info_internal(THREAD_BASIC_INFO) per thread, the walk of patch 0187.
++ * user + system are always summed, so the witness does not depend on how this kernel splits the two.
++ * Locking: nothing is held while printing; the two sample tables are static and touched by this thread only.
++ */
++#ifndef SWEET_CPUTOP_HOST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/task_info.h>
++#include <mach/thread_info.h>
++#include <pexpert/pexpert.h>
++
++extern task_t proc_task(proc_t);
++extern int hz;
++extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);   /* osfmk/kern/task.c, as bsd/dev/sweet_cpustat.c */
++extern int sweet_cputop_task(task_t task, uint64_t *out, char *names, int namesz, int max, int *total);   /* osfmk/kern/exception.c (this patch) */
++#endif /* !SWEET_CPUTOP_HOST */
++void sweet_cputop_start(void);
++
++#define CT_MAXP   512          /* processes kept per sample (the baseline boot had 250-259) */
++#define CT_MAXK   768          /* kernel_task threads kept per sample */
++#define CT_TOP    8            /* rows per period */
++#define CT_NAME   28           /* name bytes kept, NUL included */
++#ifndef CT_CAP
++#define CT_CAP    150000       /* lines per boot (9 lines/s for more than 4 h); the host test builds a small one */
++#endif
++#define CT_NCPU   8            /* upper bound of cores for the `late` test */
++
++struct ct_ent {
++	uint64_t key;              /* pid, or the kernel thread's tid */
++	uint64_t us;               /* cumulative user + system CPU time */
++	uint64_t cont;             /* kernel thread: unslid continuation, 0 = none */
++	char kind;                 /* 'p' process, 'k' kernel thread, 'i' kernel idle thread */
++	char seen;                 /* set in the previous table when the current one has the same entry */
++	char name[CT_NAME];
++};
++
++struct ct_tab {
++	int n, np, nk;             /* entries, processes, kernel threads (idle ones not in nk) */
++	int fail, trunc, kerr;
++	struct ct_ent e[CT_MAXP + CT_MAXK];
++};
++
++static struct ct_tab ct_tabs[2];
++static uint64_t ct_kraw[CT_MAXK * 4];
++static char ct_knames[CT_MAXK * CT_NAME];
++static unsigned ct_lines;
++static int ct_fail_pid = -1, ct_fail_kr;
++static char ct_fail_name[CT_NAME];
++
++static uint64_t
++ct_abs_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static int
++ct_proc(proc_t p, void *arg)
++{
++	struct ct_tab *t = (struct ct_tab *)arg;
++	int pid = proc_pid(p);
++	if (pid == 0) {
++		return PROC_RETURNED;      /* kernel_task: sampled per thread by ct_kernel */
++	}
++	if (t->np >= CT_MAXP) {
++		t->trunc++;
++		return PROC_RETURNED;
++	}
++	task_t task = proc_task(p);
++	task_absolutetime_info_data_t ti;
++	mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
++	int kr = -1;                   /* -1 = no task */
++	if (task != TASK_NULL) {
++		kr = (int)task_info(task, TASK_ABSOLUTETIME_INFO, (task_info_t)&ti, &cnt);
++	}
++	if (kr != KERN_SUCCESS) {
++		if (t->fail++ == 0 && ct_fail_pid < 0) {
++			ct_fail_pid = pid;
++			ct_fail_kr = kr;
++			strlcpy(ct_fail_name, proc_best_name(p), sizeof(ct_fail_name));
++		}
++		return PROC_RETURNED;
++	}
++	struct ct_ent *e = &t->e[t->n++];
++	t->np++;
++	e->key = (uint64_t)pid;
++	e->us = ct_abs_us(ti.total_user + ti.total_system);
++	e->cont = 0;
++	e->kind = 'p';
++	e->seen = 0;
++	strlcpy(e->name, proc_best_name(p), sizeof(e->name));
++	return PROC_RETURNED;
++}
++
++static void
++ct_kernel(struct ct_tab *t)
++{
++	int total = 0;
++	t->kerr = sweet_cputop_task(kernel_task, ct_kraw, ct_knames, CT_NAME, CT_MAXK, &total);
++	int kept = (total < CT_MAXK) ? total : CT_MAXK;
++	if (total > CT_MAXK) {
++		t->trunc += total - CT_MAXK;
++	}
++	for (int i = 0; i < kept; i++) {
++		struct ct_ent *e = &t->e[t->n++];
++		e->key = ct_kraw[i * 4 + 0];
++		e->us = ct_kraw[i * 4 + 1];
++		e->cont = ct_kraw[i * 4 + 3];
++		e->kind = (ct_kraw[i * 4 + 2] & TH_FLAGS_IDLE) ? 'i' : 'k';
++		e->seen = 0;
++		ct_knames[i * CT_NAME + CT_NAME - 1] = '\0';
++		strlcpy(e->name, ct_knames[i * CT_NAME] ? &ct_knames[i * CT_NAME] : "-", sizeof(e->name));
++		if (e->kind == 'k') {
++			t->nk++;
++		}
++	}
++}
++
++/* The previous sample's entry for `c`, or NULL. The walk order of processes and threads is nearly the same from one sample to the next, so the search starts at
++ * *hint (the slot after the last hit) and wraps: one compare per entry in the common case. */
++static struct ct_ent *
++ct_find(struct ct_tab *prev, const struct ct_ent *c, int *hint)
++{
++	int n = prev->n;
++	for (int k = 0; k < n; k++) {
++		int j = *hint + k;
++		if (j >= n) {
++			j -= n;
++		}
++		struct ct_ent *q = &prev->e[j];
++		if (q->key == c->key && q->kind == c->kind) {
++			*hint = (j + 1 < n) ? j + 1 : 0;
++			return q;
++		}
++	}
++	return NULL;
++}
++
++static void
++ct_line_done(void)
++{
++	if (++ct_lines == CT_CAP) {
++		printf("SWEET CPUTOP: cap reached %d\n", CT_CAP);
++	}
++}
++
++/* Pure: deltas of `cur` against `prev`, the header line and at most CT_TOP rows. */
++static void
++ct_report(struct ct_tab *prev, struct ct_tab *cur, uint64_t now_ms, uint64_t dt_us)
++{
++	struct { const struct ct_ent *e; uint64_t d; } top[CT_TOP];
++	int ntop = 0, nnew = 0, gone = 0, late = 0, hint = 0;
++	uint64_t sum = 0, idle = 0, shown = 0;
++
++	for (int i = 0; i < cur->n; i++) {
++		const struct ct_ent *c = &cur->e[i];
++		struct ct_ent *q = ct_find(prev, c, &hint);
++		uint64_t d;
++		if (q != NULL) {
++			q->seen = 1;
++		}
++		if (q != NULL && c->us >= q->us) {
++			d = c->us - q->us;
++		} else {
++			/* not there before, or the counter went back (the pid or tid was reused): the entry started inside this period */
++			nnew++;
++			d = c->us;
++			if (d > dt_us * CT_NCPU) {
++				late++;
++				d = 0;
++			}
++		}
++		if (c->kind == 'i') {
++			idle += d;
++			continue;
++		}
++		sum += d;
++		if (d == 0) {
++			continue;
++		}
++		int at = ntop;
++		while (at > 0 && top[at - 1].d < d) {
++			at--;
++		}
++		if (at >= CT_TOP) {
++			continue;
++		}
++		if (ntop < CT_TOP) {
++			ntop++;
++		}
++		for (int k = ntop - 1; k > at; k--) {
++			top[k] = top[k - 1];
++		}
++		top[at].e = c;
++		top[at].d = d;
++	}
++	for (int j = 0; j < prev->n; j++) {
++		if (!prev->e[j].seen) {
++			gone++;
++		}
++	}
++	for (int k = 0; k < ntop; k++) {
++		shown += top[k].d;
++	}
++	if (ct_lines >= CT_CAP) {
++		return;
++	}
++	printf("SWEET CPUTOP: t_ms %llu dt_ms %llu procs %d kthr %d sum_ms %llu top_ms %llu idle_ms %llu new %d gone %d late %d fail %d trunc %d kerr %d\n",
++	    (unsigned long long)now_ms, (unsigned long long)(dt_us / 1000), cur->np, cur->nk, (unsigned long long)(sum / 1000), (unsigned long long)(shown / 1000),
++	    (unsigned long long)(idle / 1000), nnew, gone, late, cur->fail, cur->trunc, cur->kerr);
++	ct_line_done();
++	for (int k = 0; k < ntop && ct_lines < CT_CAP; k++) {
++		const struct ct_ent *e = top[k].e;
++		if (e->kind == 'p') {
++			printf("SWEET CPUTOP: r %d p pid %llu ms %llu cum_ms %llu name %s\n", k + 1, (unsigned long long)e->key, (unsigned long long)(top[k].d / 1000),
++			    (unsigned long long)(e->us / 1000), e->name);
++		} else {
++			printf("SWEET CPUTOP: r %d k tid 0x%llx ms %llu cum_ms %llu cont 0x%llx name %s\n", k + 1, (unsigned long long)e->key,
++			    (unsigned long long)(top[k].d / 1000), (unsigned long long)(e->us / 1000), (unsigned long long)e->cont, e->name);
++		}
++		ct_line_done();
++	}
++}
++
++/* One sample: fill the table that is not the previous one, say every gap once, report against the previous one. */
++static void
++ct_tick(void)
++{
++	static int cur_i, have_prev, fail_said, trunc_said, kerr_said;
++	static uint64_t prev_us;
++	struct ct_tab *cur = &ct_tabs[cur_i], *prev = &ct_tabs[cur_i ^ 1];
++	uint64_t now = ct_abs_us(mach_absolute_time());
++
++	cur->n = cur->np = cur->nk = cur->fail = cur->trunc = cur->kerr = 0;
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, ct_proc, cur, NULL, NULL);
++	ct_kernel(cur);
++	/* no lock held from here on */
++	if (cur->fail && !fail_said) {
++		fail_said = 1;
++		printf("SWEET CPUTOP GAP: %d process(es) not ranked: first pid %d %s %s (%d); `fail` on every header counts them\n", cur->fail, ct_fail_pid, ct_fail_name,
++		    ct_fail_kr == -1 ? "has no task" : "task_info failed", ct_fail_kr);
++	}
++	if (cur->trunc && !trunc_said) {
++		trunc_said = 1;
++		printf("SWEET CPUTOP GAP: table full, %d entries not ranked (caps: %d processes, %d kernel threads); `trunc` on every header counts them\n", cur->trunc,
++		    CT_MAXP, CT_MAXK);
++	}
++	if (cur->kerr && !kerr_said) {
++		kerr_said = 1;
++		printf("SWEET CPUTOP GAP: kernel thread walk stopped by thread_info error %d: the kernel threads after it are not ranked; `kerr` on every header\n",
++		    cur->kerr);
++	}
++	if (have_prev) {
++		ct_report(prev, cur, now / 1000, now - prev_us);
++	} else {
++		have_prev = 1;
++		printf("SWEET CPUTOP: baseline procs %d kthr %d\n", cur->np, cur->nk);
++	}
++	prev_us = now;
++	cur_i ^= 1;
++}
++
++#ifndef SWEET_CPUTOP_HOST
++static int ct_period_s;
++
++static void
++sweet_cputop_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	thread_set_thread_name(current_thread(), "sweet_cputop");
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetctop", hz * ct_period_s);
++		if (ct_lines >= CT_CAP) {
++			continue;       /* capped: idle (a kernel thread function must not return) */
++		}
++		ct_tick();
++	}
++}
++
++void
++sweet_cputop_start(void)
++{
++	int perf = 0, per = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetperf", &perf, sizeof(perf));
++	if (!PE_parse_boot_argn("sweetcputop", &per, sizeof(per))) {
++		per = perf ? 1 : 0;
++	} else if (per == 0 && perf) {
++		printf("SWEET CPUTOP: off (sweetcputop=0 under sweetperf=%d)\n", perf);
++	}
++	if (per == 0) {
++		return;
++	}
++	if (per < 1 || per > 60) {
++		int use = per < 1 ? 1 : 60;
++		printf("SWEET CPUTOP GAP: sweetcputop=%d is outside 1..60 s, using %d\n", per, use);
++		per = use;
++	}
++	ct_period_s = per;
++	if (kernel_thread_start(sweet_cputop_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET CPUTOP: on, every %d s, top %d of processes + kernel threads by CPU time (patch 0341, reads only)\n", per, CT_TOP);
++	} else {
++		printf("SWEET CPUTOP GAP: unavailable (kernel_thread_start failed)\n");
++	}
++}
++#endif /* !SWEET_CPUTOP_HOST */
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 2f9de09..b202de1 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -616,16 +616,26 @@ pc_callout(proc_t p, void *arg)
+ static void
+ sm_proccpu_line(void)
+ {
+-	static int bb_said, sb_said, bb_tf_said, sb_tf_said, pf_tf_said, pf_last_pid = -2;
++	static int bb_last_pid = -2, sb_last_pid = -2, bb_tf_said, sb_tf_said, pf_tf_said, pf_last_pid = -2;
+ 	struct pc_find f = { -1, -1, 0, 0, 0, 0, -1, 0, 0 };
+ 	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, pc_callout, &f, NULL, NULL);
+-	if (f.bb_pid < 0 && !bb_said) {
+-		bb_said = 1;
+-		printf("SWEET PROCCPU: backboardd not found\n");
++	/* patch 0341: the two "not found" lines were printed once, at the first tick, which is before launchd starts either process (boot resident-065552-b5: tick at
++	 * 1089.069, exec SpringBoard 1121.394, exec backboardd 1121.723), and nothing said when they appeared. Now every pid change is a line, as for Preferences. */
++	if (f.bb_pid != bb_last_pid) {
++		if (f.bb_pid < 0) {
++			printf("SWEET PROCCPU: backboardd not found\n");
++		} else {
++			printf("SWEET PROCCPU: backboardd pid %d (was %d)\n", f.bb_pid, bb_last_pid);
++		}
++		bb_last_pid = f.bb_pid;
+ 	}
+-	if (f.sb_pid < 0 && !sb_said) {
+-		sb_said = 1;
+-		printf("SWEET PROCCPU: SpringBoard not found\n");
++	if (f.sb_pid != sb_last_pid) {
++		if (f.sb_pid < 0) {
++			printf("SWEET PROCCPU: SpringBoard not found\n");
++		} else {
++			printf("SWEET PROCCPU: SpringBoard pid %d (was %d)\n", f.sb_pid, sb_last_pid);
++		}
++		sb_last_pid = f.sb_pid;
+ 	}
+ 	if (f.bb_pid >= 0 && f.bb_kr != 0 && !bb_tf_said) {
+ 		bb_tf_said = 1;
+@@ -1744,6 +1754,7 @@ sm_bringup(volatile uint32_t *g, int s2mpu_open, int skip_config)
+ 		printf("SWEET MALI: no completion thread\n");
+ 		return 1;
+ 	}
++	thread_set_thread_name(sm.thread, "sweet_mali");   /* patch 0341: name for SWEET CPUTOP rows */
+ 	sm.up = 1;
+ 	printf("SWEET MALI: up, GPU VA window %#llx-%#llx, AS0 enabled\n", MALI_VA_START, MALI_VA_END);
+ 	return 0;
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index df8c82f..9d89909 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -1217,6 +1217,7 @@ sweet_touch_gs101_init(void)
+ 	tg.delay_s = (uint32_t)delay_s;
+ 	tg.mux_force = mux == 1;
+ 	if (kernel_thread_start(tg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet_touch");   /* patch 0341: name for SWEET CPUTOP rows */
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index bd798fd..5265cc1 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_thrcpu_start(void);   /* patch 0187, bsd/dev/sweet_thrcpu.c */
++extern void sweet_cputop_start(void);   /* patch 0341, bsd/dev/sweet_cputop.c */
+ extern void sweet_surfcpu_start(void);  /* patch 0194, bsd/dev/sweet_surfcpu.c */
+ extern void sweet_thrwait_start(void);  /* patch 0249, bsd/dev/sweet_thrwait.c */
+ extern void sweet_pcsamp_start(void);   /* patch 0263, bsd/dev/sweet_pcsamp.c */
+@@ -788,6 +789,7 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	sweet_thrcpu_start();         /* no-op without boot-arg sweetthrcpu=1 */
++	sweet_cputop_start();         /* patch 0341: on under sweetperf=1 or sweetcputop=N */
+ 	sweet_surfcpu_start();        /* no-op without boot-arg sweetsurfcpu=1 / sweetthrsample= */
+ 	sweet_thrwait_start();        /* no-op without boot-arg sweetthrwait=N */
+ 	sweet_pcsamp_start();         /* no-op without boot-arg sweetpcsamp=N */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2a345de..c85f3a9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2066,12 +2066,14 @@ sweet_usb_gadget_start(vm_offset_t dwc, uint64_t pool_pa)
+ 
+ 	ud_run();
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet_usb");   /* patch 0341: name for SWEET CPUTOP rows */
+ 		thread_deallocate(thread);
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	bool log_started = false;
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet_usb_log");   /* patch 0341: the USB log drain */
+ 		thread_deallocate(thread);
+ 		log_started = true;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 27e75bc..e907503 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ #include "../../../bsd/dev/sweet_mali.h"   /* patch 0186: sweet_mali_seq_peek for SWEET SWAPT */
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void thread_set_thread_name(thread_t th, const char *name);   /* patch 0341: osfmk/kern/thread.c (as iokit/Kernel/arm/AppleARMSMP.cpp uses it) */
+ extern "C" int sweet_qr_hold;          /* bsd/dev/sweet_qr.c: the QR log is on screen */
+ 
+ #if defined(SWEET)
+@@ -298,6 +299,7 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	thread_set_thread_name(fWorkLoop->getThread(), "sweet_fb_vsync");   /* patch 0341: the vsync timer + panel copy work loop, name for SWEET CPUTOP rows */
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 828d55f..03bfbfc 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1098,6 +1098,50 @@ sweet_thrcpu_task(task_t task, uint64_t *out, int max, int *total)
+ 	return kr;
+ }
+ 
++/*
++ * SWEET CPUTOP (patch 0341, bsd/dev/sweet_cputop.c, boot-arg sweetcputop=N / sweetperf=1): snapshot of every thread of `task` (the caller passes kernel_task) into
++ * `out`, 4 words per thread {tid, user + system us, THREAD_BASIC_INFO flags, unslid continuation or 0}, and its name into names[idx * namesz] (empty = unnamed),
++ * for the first `max` threads in task->threads queue order; *total = threads in the queue. Locking as sweet_thrcpu_task above (task_lock around the walk and
++ * thread_info_internal, fill_taskthreadinfo osfmk/kern/bsd_kern.c). The name is copied with thread_get_thread_name (osfmk/kern/thread.c; bsd_getthreadname copies
++ * MAXTHREADNAMESIZE bytes of uthread pth_name) under the task lock, as thread_info_internal THREAD_EXTENDED_INFO does (thread.c, `bsd_getthreadname(get_bsdthread_info(thread),
++ * extended_info->pth_name)`). continuation is read without the thread lock: advisory (a thread that blocks right now can show the old or the new one). Reads only, no printf.
++ * Returns KERN_SUCCESS or the first thread_info_internal error (the walk stops there; *total is then the index of the failing thread).
++ */
++int sweet_cputop_task(task_t task, uint64_t *out, char *names, int namesz, int max, int *total);
++
++int
++sweet_cputop_task(task_t task, uint64_t *out, char *names, int namesz, int max, int *total)
++{
++	thread_t thread;
++	int idx = 0;
++	int kr = KERN_SUCCESS;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (idx < max) {
++			thread_basic_info_data_t bi;
++			mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
++			char nm[MAXTHREADNAMESIZE];
++			kr = thread_info_internal(thread, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt);
++			if (kr != KERN_SUCCESS) {
++				break;
++			}
++			out[idx * 4 + 0] = thread_tid(thread);
++			out[idx * 4 + 1] = ((uint64_t)bi.user_time.seconds + (uint64_t)bi.system_time.seconds) * 1000000ULL + (uint64_t)bi.user_time.microseconds +
++			    (uint64_t)bi.system_time.microseconds;
++			out[idx * 4 + 2] = (uint64_t)(uint32_t)bi.flags;
++			out[idx * 4 + 3] = thread->continuation ? (uint64_t)VM_KERNEL_UNSLIDE(thread->continuation) : 0;
++			thread_get_thread_name(thread, nm);
++			nm[MAXTHREADNAMESIZE - 1] = '\0';
++			strlcpy(names + (size_t)idx * (size_t)namesz, nm, (size_t)namesz);
++		}
++		idx++;
++	}
++	*total = idx;
++	task_unlock(task);
++	return kr;
++}
++
+ /*
+  * SWEET single-thread sampler (patch 0194, bsd/dev/sweet_surfcpu.c, boot-arg sweetthrsample): one sample of thread `tid` of `task`: user pc/lr/sp from the saved
+  * user state (find_user_regs, same source as sweet_sample_task above, so the pc is the one of the last kernel entry), THREAD_BASIC_INFO run_state/flags, the

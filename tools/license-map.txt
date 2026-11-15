@@ -18,6 +18,9 @@ xnu/patches/.keep	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
 xnu/patches/00[6-7][0-9]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3 (0060-0079 = sweet 0061-0081 renumbered; 0061 own, 0070 and 0077 modified), THIRD_PARTY rows 2,5
 xnu/patches/NOTICE.md	MIT	pixos: notice text
 xnu/patches/0101-*	APSL-2.0 AND MIT	apple-xnu + idea/code from ios-flame 0121 (MIT dipa-studio, 0101 header line 10), THIRD_PARTY rows 2,5
+xnu/patches/0088-*	APSL-2.0 AND MIT	apple-xnu + structure modelled on ios-sweet 0060 (touch driver: MMIO read helper, thread loop, sweettouchdelay boot-arg; audit 0300 F1), THIRD_PARTY row 2
+xnu/patches/0157-*	APSL-2.0 AND MIT	apple-xnu + structure modelled on ios-sweet 0028 (read-only block device, buf_* loop; audit 0300 F1), THIRD_PARTY row 2
+xnu/patches/0173-*	APSL-2.0 AND MIT	apple-xnu + DWC3 soft reset, event buffer, EP0 config and SWEET USB: strings from ios-sweet 0073 (audit 0300 F1), THIRD_PARTY row 2
 xnu/patches/*	APSL-2.0	apple-xnu modifications written by this project, xnu/patches/NOTICE.md, THIRD_PARTY row 5
 xnu/patches-archive/006[023]-*	APSL-2.0 AND MIT	apple-xnu + ios-sweet@067c9b3 (retired, byte-identical to sweet 0060/0062/0063), THIRD_PARTY rows 2,5
 xnu/patches-archive/*.patch	APSL-2.0	apple-xnu modifications written by this project (retired), THIRD_PARTY row 5
@@ -37,10 +40,7 @@ shim/shim.c	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
 shim/start.S	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
 shim/ufs.[ch]	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
 tools/adt.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
-tools/check-exports.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
 tools/remotezip.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
-tools/sparsediff.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
-tools/xnu-cc.py	MIT	ios-sweet@067c9b3, THIRD_PARTY row 2
 tools/mkadt.py	MIT	ios-sweet (modified; licensed version 067c9b3 is a superset), THIRD_PARTY row 2
 tools/mkpayload.py	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
 tools/sweet-crash.py	MIT	ios-sweet@067c9b3 (modified), THIRD_PARTY row 2
@@ -49,10 +49,11 @@ soc/google/gs101/wlan_seq.json	MIT	UNRESOLVED: facts extracted from GPL-2.0 Goog
 tools/gen_wlan_seq.py	MIT	UNRESOLVED: generator reading GPL-2.0 sources, THIRD_PARTY row 11
 soc/google/gs101/shim/ufsphy_tables.h	MIT	UNRESOLVED: facts extracted from Linux phy-gs101-ufs.c (GPL-2.0 guess), THIRD_PARTY row 12
 tools/gen-ufsphy-tables.py	MIT	UNRESOLVED: generator for Linux phy-gs101-ufs.c facts, THIRD_PARTY row 12
-# AOSP tools: gitignored, fetched by tools/fetch-android-tools.sh (THIRD_PARTY row 19); listed so a stray tracked copy is checked
+# AOSP tools: tracked under tools/third_party (THIRD_PARTY row 19, fetched by tools/fetch-android-tools.sh)
 tools/third_party/avbtool.py	MIT	AOSP external/avb, THIRD_PARTY row 19 (LICENSES/MIT-AOSP-avbtool.txt)
 tools/third_party/*	Apache-2.0	AOSP mkbootimg + gki certificate, THIRD_PARTY row 19
 # everything else written by this project (THIRD_PARTY row 1 / PLAN-STANDALONE): explicit top-level paths, no catch-all
+shim/payload.h	MIT	ios-sweet@067c9b3 shim/loader.c boot_args and segment structs (layout is Apple pexpert/arm64/boot.h; audit 0300 F1), THIRD_PARTY row 2
 shim/usbgadget.[ch]	MIT	pixos; constants/state machine from ios-sweet 0073 (= our 0071), THIRD_PARTY row 2
 shim/*	MIT	pixos
 soc/google/gs101/docs/07-gs101-ufs-bringup.md	MIT	UNRESOLVED: Appendix A holds Linux phy-gs101-ufs.c tables (GPL-2.0-only), THIRD_PARTY row 12
@@ -73,3 +74,4 @@ README.md	MIT	pixos
 ROADMAP.md	MIT	pixos
 SECURITY.md	MIT	pixos
 THIRD_PARTY.md	MIT	pixos (THIRD_PARTY.md quotes third-party licence text)
+env.example	MIT	pixos

@@ -1,0 +1,204 @@
+SWEET PMIC DIAG (patch 0314, ALL-ON tracker T-02: silent hard resets of the Pixel 6a under load, docs/research/139-gs101-bcl-brownout.md). Two READ-ONLY diagnostics in bsd/dev/sweet_chg_i2c.c, nothing written to any chip or PMIC, no latch cleared. (R1) `SWEET PMIC LATCH: max77759 CHG_INT=0x.. CHG_INT2=0x.. CHG_DETAILS_00..02=0x..,0x..,0x..`: printed once in P2 group 4 (sweetchgi2c=1, the xrun default) from the charger reads 0xb0..0xbc that patch 0284 already does (no extra bus traffic; CHG_INT 0xb0, CHG_INT2 0xb1, CHG_DETAILS_00..02 0xb5..0xb7, charger note docs/research/charger-max77759-gs101.md register table, BMS 1cf4358a max77759_charger.c; all inside the existing i2c_target_ok range 0xb0..0xcc, so the read allowlist is unchanged). Clear-on-read: NOT for the MAX77759 (the Android IRQ handler reads CHG_INT/INT2 and writes the value back to ack, max77759_charger.c:2736-2745, so they are write-1-to-clear and this read changes nothing). S2MPG10 / S2MPG11 PWRONSRC, OFFSRC, STATUS, INT1..INT6 have NO read path in the kernel (the ACPM client is shim-only and restricted to rail registers; inventing a transaction is out of scope): two `SWEET PMIC GAP: s2mpg10|s2mpg11 ... no read path (needs an xnu ACPM client; INT1..6 clear on read)` lines name them. The S2MPG INT1..INT6 ARE clear-on-read (GS s2mpg10-irq.c:192-196 bulk-reads them and writes back only the mask registers), so a future read of them is a state change. (R2) boot-arg sweetfg=MS (100..5000, default off) + sweetfgn=SECONDS (1..3600, default 600): the fuel-gauge Current (0x36 reg 0x0a) and VCell (reg 0x09), same reads and conversions as patches 0298/0287, every MS ms (at least one USB-log tick, about 100 ms) as `SWEET CHG FAST: t_ms=<ms since boot> i=<uA>uA v=<mV>mV`, and every 10 s `SWEET CHG FAST MINMAX: vmin=<mV>mV imax=<|uA|>uA n=<samples>`. Runs from the same single tick as the other bus users (no second bus user), re-checks the phase-1 gate before each sample, ends with a GAP on a failed gate, a failed read (chg_i2c_read stops the bus, no retry), VCell 0 or above 5000 mV (16-bit register, full scale 5.12 V), an out-of-range argument value (GAP names the value) or phase 2 not passed. Per sample the only controller stores are the ones every read does plus the INT_ENABLE=0 that mon_row does. Applies after 0307. Host test: tools/test_chg_pmic.py. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+index 27f7405..63aba9d 100644
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -518,12 +518,28 @@ i2c_g_chg(int hi)
+ {
+ 	uint32_t a = hi ? 0xbd : 0xb0, b = hi ? 0xcc : 0xbc, r;
+ 
++	if (!hi) {
++		/* patch 0314 (ALL-ON T-02, docs/research/139): the S2MPG10 / S2MPG11 reset-source and interrupt latches have NO read path in this kernel (the ACPM client is in the
++		 * shim and only reads rail registers), so say so instead of inventing a transaction. Register numbers: GS s2mpg10-register.h / s2mpg11-register.h at 6e771b23: INT1..INT6
++		 * 0x0..0x5, STATUS1 0xc, S2MPG10 STATUS2 0xd / PWRONSRC 0xe / OFFSRC 0xf, S2MPG11 OFFSRC 0xd. The INT registers are CLEAR-ON-READ (s2mpg10-irq.c:192-196 reads INT1..INT6 and never
++		 * writes them back; only the mask registers are written): reading them from here WOULD be a state change. */
++		i2c_log("SWEET PMIC GAP: s2mpg10 PWRONSRC[0xe] OFFSRC[0xf] STATUS1[0xc] STATUS2[0xd] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
++		i2c_log("SWEET PMIC GAP: s2mpg11 OFFSRC[0xd] STATUS1[0xc] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
++	}
+ 	for (r = a; r <= b; r++) {
+ 		if (chg_i2c_read(0x69, r, 1, &i2c_chg[r - 0xb0]) != 0) {
++			if (!hi) {
++				i2c_log("SWEET PMIC GAP: max77759 CHG_INT[0xb0] CHG_INT2[0xb1] CHG_DETAILS_00..02[0xb5-0xb7] read failed at reg 0x%x\n", r);
++			}
+ 			return;
+ 		}
+ 	}
+ 	if (!hi) {
++#define C(x)    i2c_chg[(x) - 0xb0]
++		/* patch 0314: the latches of the charger chip from the reads above (0xb0..0xbc, no extra bus traffic). CHG_INT / CHG_INT2 are write-1-to-clear (the Android IRQ handler reads
++		 * them and writes the value back to ack, BMS 1cf4358a max77759_charger.c:2736-2745), so this read does not clear them. */
++		i2c_log("SWEET PMIC LATCH: max77759 CHG_INT=0x%02x CHG_INT2=0x%02x CHG_DETAILS_00..02=0x%02x,0x%02x,0x%02x\n", C(0xb0), C(0xb1), C(0xb5), C(0xb6), C(0xb7));
++#undef C
+ 		return;
+ 	}
+ #define C(x)    i2c_chg[(x) - 0xb0]
+@@ -553,6 +569,7 @@ i2c_g_chg(int hi)
+ }
+ 
+ static int i2c_icl_arg(uint32_t *v);
++static int i2c_fast_arg(uint32_t *ms, uint32_t *secs);
+ static uint64_t i2c_now_ms(void);
+ static int i2c_gate(int first);
+ 
+@@ -876,6 +893,132 @@ mon_row(uint32_t t_s)
+ 	    so >> 8, ((so & 0xffu) * 100u) >> 8, td < 0 ? "-" : "", (int)((td < 0 ? -td : td) / 10), (int)((td < 0 ? -td : td) % 10));
+ }
+ 
++/*
++ * Patch 0314 (ALL-ON T-02, silent hard resets under load): fast battery rows. Boot-arg sweetfg=MS (100..5000, default off) samples the fuel gauge's Current (0x36 reg 0x0a)
++ * and VCell (0x36 reg 0x09), the same two registers, reads and conversions as mon_row / p3_sample, every MS milliseconds for the first sweetfgn=SECONDS (1..3600, default
++ * 600) seconds and prints `SWEET CHG FAST: t_ms=<ms since boot> i=<uA> v=<mV>`; every 10 s it prints `SWEET CHG FAST MINMAX: vmin=<mV> imax=<|uA|> n=<samples>` (min VCell and max
++ * |current| since the last print). READS ONLY on the chips, through chg_i2c_read and the same i2c_gate(0) check as p3_sample; it runs from the same single tick as everything else on the
++ * bus (no concurrency, no second bus user), so the other readers are not starved except by one 2-register read per sample. The sampling period is at least one tick of the USB-log drain
++ * thread (about 100 ms), so MS below that is rounded up to the tick. A failed read (chg_i2c_read stops the whole bus, like for MON), a failed gate or a VCell outside 1..5000 mV stops the
++ * fast mode once with a GAP line (no retry). 5000 mV: the VCell register is 16 bits at 78.125 uV, full scale 5.12 V. Needs sweetchgi2c=1 (phase 2 must have passed identity).
++ */
++#define FAST_MS_MIN     100u
++#define FAST_MS_MAX     5000u
++#define FAST_SECS_DEF   600u
++#define FAST_SECS_MAX   3600u
++#define FAST_VMAX_MV    5000u
++#define FAST_PRINT_MS   10000u
++
++static int fast_stage;
++static uint32_t fast_ms, fast_secs, fast_n, fast_vmin, fast_imax;
++static uint64_t fast_t0, fast_next, fast_pr;
++
++static void
++fast_minmax(void)
++{
++	if (fast_n != 0) {
++		i2c_log("SWEET CHG FAST MINMAX: vmin=%umV imax=%uuA n=%u\n", fast_vmin, fast_imax, fast_n);
++	}
++	fast_n = 0;
++	fast_vmin = 0xffffffffu;
++	fast_imax = 0;
++}
++
++static void
++fast_stop(const char *why)
++{
++	fast_minmax();
++	i2c_log("SWEET CHG FAST: stopped (%s)\n", why);
++	fast_stage = 9;
++}
++
++static void
++i2c_fast_tick(void)
++{
++	uint8_t cu[2], vc[2];
++	uint64_t now;
++	int32_t cs, ua;
++	uint32_t v, raw_v;
++
++	if (fast_stage >= 9) {
++		return;
++	}
++	if (fast_stage == 0) {
++		fast_stage = 8;
++		if (!i2c_fast_arg(&fast_ms, &fast_secs)) {
++			i2c_log("SWEET CHG FAST: off (default; sweetfg=MS 100..5000 samples current and vcell every MS ms for sweetfgn=SECONDS, reads only, needs sweetchgi2c=1)\n");
++			fast_stage = 9;
++			return;
++		}
++		if (fast_ms < FAST_MS_MIN || fast_ms > FAST_MS_MAX) {
++			i2c_log("SWEET CHG GAP: FAST sweetfg=%u is outside 100..5000, fast rows off\n", fast_ms);
++			fast_stage = 9;
++			return;
++		}
++		if (fast_secs < 1u || fast_secs > FAST_SECS_MAX) {
++			i2c_log("SWEET CHG GAP: FAST sweetfgn=%u is outside 1..3600, fast rows off\n", fast_secs);
++			fast_stage = 9;
++			return;
++		}
++		if (!i2c_p2_ok) {
++			i2c_log("SWEET CHG GAP: FAST refused: phase 2 did not finish with 0 errors and passed identity checks (sweetchgi2c=1 needed), no fast rows\n");
++			fast_stage = 9;
++			return;
++		}
++		i2c_log("SWEET CHG FAST: start (patch 0314, sweetfg=%u sweetfgn=%u): reads only, current and vcell, minmax every 10 s\n", fast_ms, fast_secs);
++		fast_t0 = i2c_now_ms();
++		fast_next = fast_t0;
++		fast_pr = fast_t0 + FAST_PRINT_MS;
++		fast_n = 0;
++		fast_vmin = 0xffffffffu;
++		fast_imax = 0;
++		fast_stage = 1;
++	}
++	now = i2c_now_ms();
++	if (now < fast_next) {
++		return;
++	}
++	if (now - fast_t0 >= (uint64_t)fast_secs * 1000u) {
++		fast_minmax();
++		i2c_log("SWEET CHG FAST: done after %us\n", fast_secs);
++		fast_stage = 9;
++		return;
++	}
++	if (!i2c_gate(0)) {
++		fast_stop("phase-1 gate or controller state changed, no transfer done");
++		return;
++	}
++	if (chg_i2c_read(0x36, 0x0a, 2, cu) != 0 || chg_i2c_read(0x36, 0x09, 2, vc) != 0) {
++		(void)i2c_wr(I_INTEN, 0);
++		i2c_log("SWEET CHG GAP: FAST fuel-gauge read failed at t_ms=%u: bus stopped, no more fast rows\n", (uint32_t)now);
++		fast_stop("read failed");
++		return;
++	}
++	(void)i2c_wr(I_INTEN, 0);
++	cs = (int16_t)(cu[0] | ((uint32_t)cu[1] << 8));
++	raw_v = vc[0] | ((uint32_t)vc[1] << 8);
++	v = (uint32_t)(((uint64_t)raw_v * 78125u) / 1000000u);
++	ua = (int)((cs * 3125) / 10);
++	if (v == 0 || v > FAST_VMAX_MV) {
++		i2c_log("SWEET CHG GAP: FAST bad vcell=%u mV (raw 0x%04x) at t_ms=%u, current raw 0x%02x%02x\n", v, raw_v, (uint32_t)now, cu[1], cu[0]);
++		fast_stop("bad value");
++		return;
++	}
++	i2c_log("SWEET CHG FAST: t_ms=%u i=%duA v=%umV\n", (uint32_t)now, ua, v);
++	if (v < fast_vmin) {
++		fast_vmin = v;
++	}
++	if ((uint32_t)(ua < 0 ? -ua : ua) > fast_imax) {
++		fast_imax = (uint32_t)(ua < 0 ? -ua : ua);
++	}
++	fast_n++;
++	fast_next = now + fast_ms;
++	if (now >= fast_pr) {
++		fast_minmax();
++		fast_pr = now + FAST_PRINT_MS;
++	}
++}
++
+ static void
+ i2c_p3_tick(int log_pending)
+ {
+@@ -992,6 +1135,19 @@ i2c_icl_arg(uint32_t *v)
+ 	return PE_parse_boot_argn("sweetchgicl", v, sizeof(*v));
+ }
+ 
++/* literal names in the calls: tools/run-preflight --gen-bootargs finds boot-args by scanning PE_parse_boot_arg*("name", ...) */
++static int
++i2c_fast_arg(uint32_t *ms, uint32_t *secs)
++{
++	*ms = 0;
++	*secs = FAST_SECS_DEF;
++	if (!PE_parse_boot_argn("sweetfg", ms, sizeof(*ms))) {
++		return 0;
++	}
++	(void)PE_parse_boot_argn("sweetfgn", secs, sizeof(*secs));
++	return 1;
++}
++
+ static uint64_t
+ i2c_now_us(void)
+ {
+@@ -1062,6 +1218,7 @@ void
+ sweet_chg_i2c_tick(int log_pending)
+ {
+ 	if (i2c_group >= 9) {
++		i2c_fast_tick();                /* patch 0314: default off */
+ 		i2c_p3_tick(log_pending);       /* patch 0287: default off */
+ 		return;
+ 	}

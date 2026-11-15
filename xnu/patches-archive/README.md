@@ -24,7 +24,7 @@ the USB probe/ep0/ECM/rx-mbuf/live-log/link-state patches (the gs101 DWC3 gadget
 Old 0072, 0083, 0085 and 0088 (new 0070, 0081, 0083, 0086) had hunks whose context named `sweet_keys.c`,
 `sweet_touch.c`, `sweet_rpmh.c` or the `sweet_keys_init()` / `sweet_touch_init()` lines. The context lines were
 removed (the code they add is unchanged; old 0072's call to `sweet_usb_probe()` now follows `sweet_sample_start()`).
-`tools/make-qr-patch.py` still generates the QR patch (default output is now `0081-sweet-qr-log.patch`).
+The old make-qr-patch.py generated the QR patch (deprecated 2026-10-29, removed 2026-11-13; use `tools/make-qr2-patch.py`) (default output is now `0081-sweet-qr-log.patch`).
 
 ## How to restore
 

@@ -77,20 +77,156 @@ def fake_mac(kind):
     return bytes([0x02, e[0], e[1], e[2], e[3], (e[4] + kind) & 0xff])
 
 
-def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wlan_node=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (the QEMU virt smoke runs were retired, T2)."""
-    config = BOARDS[board]
-    if board == 'sweet':
-        phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
-        gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
-    else:
-        phys_base, mem_size = config['xnu_ram']
-        gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (config['gicd_base'], config['gicr_base'], config['timer_freq'])
-    seed = seed if seed is not None else os.urandom(64)
-    phandle = iter(range(1, 1000))
-    ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+def bt_gap_lines(bt_node=True):
+    """`BT GAP:` lines (rule 8; tools/xrun_report.py counts `<AREA> GAP: ` at line start) for every BT ADT value mkadt cannot source.
+    Keys follow docs/research/109-bt-conformance-matrix.md section 4 (M1-M5, M9); one line each, key first."""
+    m9 = "BT GAP: bd-address mac-address-bluetooth0 is a synthetic mac (not the controller's) [mkadt]"
+    if not bt_node:
+        return ["BT GAP: node-bluetooth no IOService named bluetooth or marconi-bt published (mkadt --no-bt-node); bluetoothd exits 0", m9]
+    mac = ':'.join('%02x' % b for b in fake_mac(1))
+    return [
+        "BT GAP: node-marconi-bt no IOService named marconi-bt published; bluetoothd falls back to the node named bluetooth [mkadt]",
+        f"BT GAP: local-mac-address synthetic ({mac}) not the controller's real BD address (BT-S3 D-3 A) [mkadt]",
+        "BT GAP: transport-encoding 3 (H4BC) is bluetoothd's own default, not measured on hardware; H4 (1) not tried [mkadt]",
+        "BT GAP: transport-speed not published; default 2400000 bps will be requested [mkadt]",
+        m9,
+    ]
 
-    chosen = node('chosen', [
+
+def bt_dt_node(ph):
+    """The /bluetooth root child (BT-S3 e; docs/research/BT-S3-transport-decision.md D-1 = option a, BT-S3-blueTool-rows.md s.5 D-3 = A). bluetoothd/BlueTool search the IODeviceTree plane
+    for an IOService named `marconi-bt`, then `bluetooth` (matrix M1/M2; bluetoothd 0x1000269ac, BlueTool 0x10003e33c) and read `local-mac-address` (M3, 6 bytes,
+    non-zero, else "No bluetooth on this device." and exit 0), `transport-encoding` (M4, u32) and `transport-speed` (M5, u32, read from `bluetooth` only).
+    A root child becomes an IOPlatformDevice nub under SweetPlatformExpert with this name (BT-S3-o12-o13.md O12, [src], not yet seen on hardware).
+    Never add `kernel-only` or `AAPL,ignore` here (they hide the properties / the nub). The address is the synthetic one of /chosen mac-address-bluetooth0 (M9).
+    `transport-encoding` 3 = H4BC, bluetoothd's own default when the key is absent (BT-S1-ios-side.md:35); decision O10: H4/H4BC both use termios mode 0.
+    `transport-speed` is deliberately absent: no cited source for a value (bluetoothd then asks for 2400000 bps); logged by bt_gap_lines() (rule 7/8)."""
+    return node('bluetooth', [ph(), ('local-mac-address', fake_mac(1)), ('transport-encoding', u32(3))])
+
+
+AUDIO_PROPS = ('wireless-splitter', 'supports-always-listening')
+
+
+def audio_mode(env=None):
+    """PIXOS_ADT_AUDIO: unset or 1 = empty /product/audio node, no hardware properties (default since bt/defaults: VirtualAudio needs the node, mediaserverd crashed without it);
+    0 = no node (the old default tree); d22ap = node with the two D22AP properties copied."""
+    v = (os.environ if env is None else env).get('PIXOS_ADT_AUDIO', '')
+    if v == '0':
+        return None
+    if v in ('', '1'):
+        return 'empty'
+    if v == 'd22ap':
+        return 'd22ap'
+    raise SystemExit(f"mkadt: GAP: PIXOS_ADT_AUDIO={v!r} is not 0, 1 or d22ap")
+
+
+def audio_gap_lines(mode):
+    """`ADT GAP:` lines (rule 7) for /product/audio, one per D22AP property: dropped ('empty') or copied ('d22ap') without matching hardware."""
+    if not mode:
+        return []
+    if mode == 'empty':
+        return [f"ADT GAP: /product/audio {p} omitted (D22AP has it, no matching hardware on bluejay); whether VirtualAudio needs it is unknown [mkadt]" for p in AUDIO_PROPS]
+    return [f"ADT GAP: /product/audio {p} copied from D22AP, no matching hardware on bluejay" for p in AUDIO_PROPS]
+
+
+def audio_node(ph, mode, path=D22AP_ADT):
+    """/product/audio, read by VirtualAudio as IODeviceTree:/product/audio (string 0x52486c, 20+ readers, e.g. 0x13bca0..0x13caa0 and 0x377af4..0x3786d0;
+    docs/research/ios-audio-route-no-codec.md s.3.3). Without the node mediaserverd crashed in a loop with VirtualAudio loaded (2026-10-17; crash site s.0 row 4, FAR 0x390).
+    The D22AP node (research/ipsw-x/d22ap.adt) has exactly two properties, both u32 1: `wireless-splitter` and `supports-always-listening`.
+    Neither describes anything a Pixel 6a has (no iPhone X wireless-audio splitter, no always-listening AOP audio path), so 'empty' publishes the node with no
+    properties (the honest "no built-in codec" answer; absent flag = off is a guess, the reader was not decoded: docs s.6 U1) and 'd22ap' copies them as a fallback
+    if the node alone does not stop the crash. Both modes print ADT GAP lines (audio_gap_lines)."""
+    props = [ph()]
+    if mode == 'd22ap':
+        root, _ = adt.parse(open(path, 'rb').read())
+        prod = [c for c in root.children if dict((k, v) for k, f, v in c.props).get('name') == b'product\0'][0]
+        aud = [c for c in prod.children if dict((k, v) for k, f, v in c.props).get('name') == b'audio\0'][0]
+        # COPIED from D22AP, no matching hardware on bluejay (ADT GAP printed at build time)
+        props += [(k, v) for k, f, v in aud.props if k in AUDIO_PROPS]
+    return node('audio', props)
+
+
+def wlan_node_default(board, qemu):
+    """The iOS-root boot (tools/xrun runs mkadt.py with no flag) carries the wlan node on a board that is not sweet (its tree stays unchanged) and not on a qemu tree."""
+    return board != 'sweet' and not qemu
+
+
+def product_overrides(props, config):
+    """/product edits of the Pixel boards: product-description (About > Model Name, MG ArtworkTraits) and, from soc.json wifi_chipset, wifi-chipset (MobileGestalt WifiChipset,
+    research 110 s.7 row WifiChipset 0x19c56d18c; SPEC-WIFI Part F W2). The D22AP tree says 4357 (iPhone X); a board without the soc.json key keeps it (nothing invented)."""
+    out = [(k, v) for k, v in props if k != 'product-description'] + [('product-description', cstr('Pixel 6a'))]
+    if config.get('wifi_chipset'):
+        out = [(k, v) for k, v in out if k != 'wifi-chipset'] + [('wifi-chipset', cstr(str(config['wifi_chipset'])))]
+    return out
+
+
+def add_wdt_node(root, board='sweet', qemu=False):
+    """bsd/dev/sweet_wdt.c (patch 0278 = port of 0193, docs/specs/SPEC-WDT.md SQ2): gs101 cluster-0 watchdog block (reg, 0x100 bytes; oracle R01) and the
+    three PMU offsets it reads (R08: reset mask 0x1244 bit 2, counter enable 0x1220 bit 8; RST_STAT 0x3b44). Read-only except WTCON/WTDAT/WTCNT. The PMU
+    base is the sweet-reset node's reg. Only boards whose soc.json names wdt_cl0_base get the node; sweet keeps its tree unchanged. Added after build()
+    (lint-size: build() may not change): the phandle is the tree's largest + 1, the node goes right after /sweet-reset."""
+    config = BOARDS[board]
+    if qemu or 'wdt_cl0_base' not in config or 'pmu_base' not in config:
+        return None
+    def phandles(n):
+        out = [struct.unpack('<I', v[:4])[0] for k, _, v in n.props if k == 'AAPL,phandle']
+        for c in n.children:
+            out += phandles(c)
+        return out
+    wdt = node('sweet-wdt', [
+        ('AAPL,phandle', u32(max(phandles(root) or [0]) + 1)),
+        ('compatible', cstr('google,gs101-wdt-cl0')),
+        ('reg', u64(config['wdt_cl0_base'], config['wdt_cl0_size'])),
+        ('pmu-rst-mask-off', u32(config['pmu_wdt_mask_off'])),
+        ('pmu-cnt-en-off', u32(config['pmu_wdt_cnt_off'])),
+        ('pmu-rst-stat-off', u32(config['pmu_rst_stat_off'])),
+    ])
+    names = [c.name for c in root.children]
+    root.children.insert(names.index('sweet-reset') + 1 if 'sweet-reset' in names else len(names), wdt)
+    return wdt
+
+
+def add_chg_node(root, board='sweet', qemu=False):
+    """bsd/dev/sweet_chg.c (xnu patch 0283, charger phase 1, docs/research/charger-max77759-gs101.md section 8 steps 1-2): the READ windows of the MAX77759 I2C bus
+    bring-up (HSI2C12/USI12, sysreg_peric1, CMU_PERIC1, CMU_TOP, pad bank gpp23) and the register offsets read in each. soc.json "chg_probe" is the only table (sources
+    cited there): `<window>-reg` = u64 (base, size), `w-<word>` = u32 offset inside its window. No write window exists: the driver has no store. Only boards whose
+    soc.json has chg_probe get the node; every other board keeps its tree. Added after build() like add_wdt_node: the phandle is the tree's largest + 1, the node goes
+    right after /sweet-wdt (else /sweet-reset)."""
+    config = BOARDS[board]
+    cp = config.get('chg_probe')
+    if qemu or not cp:
+        return None
+    n = lambda v: int(v, 0) if isinstance(v, str) else v
+    props = [('compatible', cstr('google,gs101-max77759-chg-probe'))]
+    sizes = {}
+    for name, (base, size) in cp['windows'].items():
+        sizes[name] = n(size)
+        props.append((name + '-reg', u64(n(base), n(size))))
+    for word, (win, off) in cp['words'].items():
+        if win not in sizes or n(off) % 4 or n(off) + 4 > sizes[win]:
+            sys.exit('mkadt: GAP: soc.json chg_probe word %s: window %s unknown or offset %s outside it' % (word, win, off))
+        props.append(('w-' + word, u32(n(off))))
+    ci = config.get('chg_i2c')      # xnu patch 0284 (phase 2): the transfer registers of the window above; `i-<word>` = u32 offset
+    if ci:
+        for word, off in ci['words'].items():
+            if ci['window'] not in sizes or n(off) % 4 or n(off) + 4 > sizes[ci['window']]:
+                sys.exit('mkadt: GAP: soc.json chg_i2c word %s: window %s unknown or offset %s outside it' % (word, ci['window'], off))
+            props.append(('i-' + word, u32(n(off))))
+    def phandles(nd):
+        out = [struct.unpack('<I', v[:4])[0] for k, _, v in nd.props if k == 'AAPL,phandle']
+        for c in nd.children:
+            out += phandles(c)
+        return out
+    chg = node('sweet-chg', [('AAPL,phandle', u32(max(phandles(root) or [0]) + 1))] + props)
+    names = [c.name for c in root.children]
+    at = names.index('sweet-wdt') + 1 if 'sweet-wdt' in names else (names.index('sweet-reset') + 1 if 'sweet-reset' in names else len(names))
+    root.children.insert(at, chg)
+    return chg
+
+
+def chosen_node(ph, phys_base, mem_size, seed):
+    """/chosen with its memory-map and asmb children (moved out of build() unchanged, bt/defaults: build() must not grow, lint-size)."""
+    return node('chosen', [
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
@@ -137,6 +273,22 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         # The iOS shared cache is in no trust cache, so dyld can only map it
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+
+
+def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wlan_node=False, bt_node=True, audio=None):
+    """audio: None (no node; the CLI default is 'empty' via audio_mode()) | 'empty' | 'd22ap', see audio_node(). qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (the QEMU virt smoke runs were retired, T2)."""
+    config = BOARDS[board]
+    if board == 'sweet':
+        phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+        gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    else:
+        phys_base, mem_size = config['xnu_ram']
+        gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (config['gicd_base'], config['gicr_base'], config['timer_freq'])
+    seed = seed if seed is not None else os.urandom(64)
+    phandle = iter(range(1, 1000))
+    ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+
+    chosen = chosen_node(ph, phys_base, mem_size, seed)
 
     # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
@@ -206,7 +358,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
             ('canvas-height', u32(2436)),
         ])] + ([
         # Makes launchd start wifid (com.apple.wifid is limited to the 'wlan' device tree node, per ios-flame notes,
-        # docs/research/26 row 1). Off by default: no IO80211 stand-in exists yet, so wifid would only fail and burn CPU.
+        # docs/research/26 row 1). build() is off by default; wlan_node_default() turns it on for the iOS-root boot (patch 0200 gives wifid its interface).
         node('wlan', [ph(), ('device_type', cstr('wlan')), ('compatible', cstr('sweet,wlan'))])] if wlan_node else []))
 
     fbcon = node('sweet-fbcon', [
@@ -242,7 +394,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
     product_props = d22ap_product()
     # About > Model Name reads /product product-description (MG ArtworkTraits, docs about-identity report)
     if product_props:
-        product_props = [(k, v) for k, v in product_props if k != 'product-description'] + [('product-description', cstr('Pixel 6a'))]
+        product_props = product_overrides(product_props, config)
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # bsd/dev/sweet_usb.c (patch 0082): the gs101 DWC3 and the DRAM range ABL keeps its event
@@ -341,13 +493,15 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         # xnu patch 0129 (W-D3 step 2, docs/research/43): tcm = BAR2 (the chip's 4 MiB backplane window, CPU range), atu-r2-off = outbound iATU region 2
         # inside the atu block. The driver pins both, like the five above, and refuses any other value.
         [('tcm', u64(int(w['tcm'], 0), int(w['tcm_bytes'], 0))), ('atu-r2-off', u32(int(w['atu_r2_off'], 0)))]
-        if all(k in w for k in ('tcm', 'tcm_bytes', 'atu_r2_off')) else [])
+        if all(k in w for k in ('tcm', 'tcm_bytes', 'atu_r2_off')) else []) + (
+        # xnu patch 0174 (Wi-Fi G2, docs/research/107 #3): RC DBI for the Command store, pinned by the driver.
+        [('dbi', u64(int(w['dbi'], 0), 0x1000))] if 'dbi' in w else [])
     ) if w and all(k in w for k in ('mem', 'cfg', 'atu', 'elbi', 'pmu_pcie1_iso')) and not qemu else None
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
-    return node('device-tree', [
+    dt = node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
@@ -360,7 +514,12 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wla
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or no_ufs) else [ufs]) + ([usb] if usb else []) + ([reset] if reset else []) + ([keys] if keys else []) + ([touch] if touch else []) + ([wlan] if wlan else []))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or no_ufs) else [ufs]) + ([usb] if usb else []) + ([reset] if reset else []) + ([keys] if keys else []) + ([touch] if touch else []) + ([wlan] if wlan else []) + ([bt_dt_node(ph)] if bt_node else []))
+    # /product/audio (default on, PIXOS_ADT_AUDIO=0 = off): built after the whole tree so no other phandle moves; PIXOS_ADT_AUDIO=0 is byte-identical to the old default tree.
+    if audio and product:
+        product[0].children.append(audio_node(ph, audio))
+
+    return dt
 
 
 if __name__ == '__main__':
@@ -371,8 +530,25 @@ if __name__ == '__main__':
     parser.add_argument('--highmem', action='store_true')
     parser.add_argument('--no-ufs', action='store_true', help='omit the /sweet-ufs node (no root device yet: the UFS driver must not probe)')
     parser.add_argument('--board', choices=BOARDS, default='sweet')
+    parser.add_argument('--no-wlan-node', action='store_true', help='omit the wlan node (wifid then is not started by launchd); default: present on every board but sweet and on non-qemu trees')
+    parser.add_argument('--no-bt-node', action='store_true', help='omit the /bluetooth node (bluetoothd then exits 0: "No bluetooth on this device.")')
+    parser.add_argument('--cpu-order', help='comma list of physical core numbers in /cpus DT order (a permutation starting with 0 = boot CPU); '
+                       'only the child order changes, every property keeps its value. --intent gpu passes 0,6,7,4,5,1,2,3 (sprint-gpu nav19+: with cpus=5 the kernel picks '
+                       'the boot A55 + the two A76 + the two X1 first)')
     args = parser.parse_args()
-    root = build(qemu=args.qemu, highmem=args.highmem, board=args.board, no_ufs=args.no_ufs)
+    root = build(qemu=args.qemu, highmem=args.highmem, board=args.board, no_ufs=args.no_ufs,
+                 wlan_node=wlan_node_default(args.board, args.qemu) and not args.no_wlan_node, bt_node=not args.no_bt_node, audio=audio_mode())
+    add_wdt_node(root, args.board, args.qemu)
+    add_chg_node(root, args.board, args.qemu)
+    for line in bt_gap_lines(not args.no_bt_node) + audio_gap_lines(audio_mode()):
+        print(line)
+    if args.cpu_order:
+        order = [int(x) for x in args.cpu_order.split(',')]
+        cpus_node = [c for c in root.children if c.name == 'cpus'][0]
+        byname = {c.name: c for c in cpus_node.children}
+        if sorted(order) != list(range(len(byname))) or order[0] != 0:
+            sys.exit(f'mkadt: GAP: --cpu-order {args.cpu_order} is not a permutation of 0..{len(byname) - 1} starting with 0')
+        cpus_node.children = [byname['cpu%d' % i] for i in order]
     blob = adt.serialize(root)
     open(args.output, 'wb').write(blob)
     if args.dump:

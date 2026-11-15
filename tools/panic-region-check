@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""panic-region-check: host-side scorer for the PR-3 panic-region work (docs/specs/SPEC-PANIC-REGION.md s.4). No phone.
+
+  marker FIXTURE        classify the 64-byte marker dumps of a fixture the way shim/pr3marker.c does (intact|zero|changed)
+                        and score them against the expected states in the fixture. Prints `RESULT: score=N first_divergence=...`.
+                        Fixture lines: `build=<hex16>` then `<addr hex> <expected state> <128 hex chars, '_' allowed as separator>`; `#` comments.
+  decide LOG1 LOG2 [--sha256 S1 S2]
+                        read the `PR3 MARKER` lines of run 1 and run 2 (same image) and print `RESULT: site=<A|B|C> usable`
+                        (preference C, B, A) or `RESULT: site=none`. A site is usable only if head AND tail are `intact` on
+                        run 2 with ctr == run 1's `wrote ctr ... readback ok` for that address (SPEC R1/R4).
+  region FILE           decode an Apple-layout panic region (struct embedded_panic_header, osfmk/kern/debug.h:351-375) into the
+                        `SWEET PANIC:` line (stock `panic(cpu N caller 0x..): ` prefix stripped, non-printables as `.`, <= 1 KiB).
+  selftest              marker on the golden fixture (100), corrupted fixture (< 100), decide and region on the fixtures.
+
+The marker layout and the fnv1a-64 below are an independent Python implementation; shim/pr3marker_host_test.c checks the C functions
+against the same golden fixture (`pr3marker_host_test FIXTURE`), so the two cannot drift silently.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os
+import re
+import struct
+import sys
+
+MAGIC = 0x505233524D4B5231
+GOLD = 0x9E3779B97F4A7C15
+M64 = (1 << 64) - 1
+SIZE = 64
+
+
+def fnv1a64(b):
+    h = 0xCBF29CE484222325
+    for x in b:
+        h = ((h ^ x) * 0x100000001B3) & M64
+    return h
+
+
+def encode(addr, ctr, build):
+    body = struct.pack("<QQQQ", MAGIC, ctr, build, addr)
+    body += b"".join(struct.pack("<Q", (ctr * GOLD + i) & M64) for i in range(3))
+    return body + struct.pack("<Q", fnv1a64(body))
+
+
+def classify(m, addr, build):
+    if len(m) != SIZE:
+        return "changed", None  # truncated
+    if not any(m):
+        return "zero", None
+    magic, ctr, bld, self_addr = struct.unpack_from("<QQQQ", m, 0)
+    if magic != MAGIC or self_addr != addr or bld != build:
+        return "changed", None
+    if struct.unpack_from("<Q", m, 0x38)[0] != fnv1a64(m[:0x38]):
+        return "changed", None
+    for i in range(3):
+        if struct.unpack_from("<Q", m, 0x20 + 8 * i)[0] != (ctr * GOLD + i) & M64:
+            return "changed", None
+    return "intact", ctr
+
+
+def cmd_marker(path):
+    build = None
+    total = ok = 0
+    first = "none"
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("build="):
+                build = int(line[6:], 16)
+                continue
+            parts = line.split()
+            if build is None or len(parts) != 3:
+                print("RESULT: FAIL marker %s:%d malformed line (build= first, then 'addr state hex')" % (path, n))
+                return 2
+            addr, exp, hx = int(parts[0], 16), parts[1], parts[2]
+            try:
+                m = bytes.fromhex(hx.replace("_", ""))
+            except ValueError:
+                print("RESULT: FAIL marker %s:%d bad hex" % (path, n))
+                return 2
+            got, _ = classify(m, addr, build)
+            total += 1
+            if got == exp:
+                ok += 1
+            elif first == "none":
+                first = "line%d(%s expected=%s got=%s)" % (n, parts[0], exp, got)
+    if total == 0:
+        print("RESULT: FAIL marker %s has no records" % path)
+        return 2
+    score = ok * 100 // total
+    print("RESULT: score=%d first_divergence=%s" % (score, first))
+    return 0
+
+
+LINE = re.compile(r"PR3 MARKER (?:(?P<addr>[0-9A-F]{16}) (?P<rest>.*)|(?P<done>done sites=.*)|(?P<rng>range .*))$")
+
+
+def parse_run(path):
+    """-> dict addr -> {state, ctr, wrote_ctr, readback}, done flag, text of range lines"""
+    sites, done, bad, gaps, build = {}, False, [], [], None
+    with open(path, errors="replace") as f:
+        for line in f:
+            if "PR3 MARKER GAP" in line:
+                gaps.append(line.strip())
+                continue
+            mb = re.search(r"PR3 MARKER build ([0-9A-F]{16})$", line.rstrip("\n"))
+            if mb:
+                build = mb.group(1)
+                continue
+            m = LINE.search(line.rstrip("\n"))
+            if not m:
+                continue
+            if m.group("done"):
+                done = True
+                continue
+            if m.group("rng"):
+                continue
+            a, rest = int(m.group("addr"), 16), m.group("rest").strip()
+            s = sites.setdefault(a, {})
+            if rest in ("intact", "changed", "zero", "fault", "skipped"):
+                s["state"] = rest
+            elif rest.startswith("ctr "):
+                s["ctr"] = int(rest[4:], 16)
+            elif rest.startswith("wrote ctr "):
+                mm = re.match(r"wrote ctr ([0-9A-F]{16}) readback (ok|FAIL)$", rest)
+                if not mm:
+                    bad.append(line.strip())
+                    continue
+                s["wrote"] = int(mm.group(1), 16)
+                s["readback"] = mm.group(2)
+            else:
+                bad.append(line.strip())
+    return sites, done, bad, gaps, build
+
+
+BASES = {"A": 0x97E000000, "B": 0xFD600000, "C": 0xFD7EF000}
+TAIL = 0xFFC0
+
+
+def cmd_decide(args):
+    shas = None
+    if "--sha256" in args:
+        i = args.index("--sha256")
+        shas = args[i + 1:i + 3]
+        args = args[:i] + args[i + 3:]
+        if len(shas) != 2:
+            print("RESULT: FAIL decide --sha256 needs two values")
+            return 2
+    if len(args) != 2:
+        print("RESULT: FAIL decide needs LOG1 LOG2")
+        return 2
+    if shas and shas[0] != shas[1]:
+        print("RESULT: FAIL decide the two runs used different images (%s vs %s)" % tuple(shas))
+        return 1
+    r1, d1, b1, g1, bl1 = parse_run(args[0])
+    r2, d2, b2, g2, bl2 = parse_run(args[1])
+    if g1 or g2:  # the run itself said it could not answer for some sites (rule 8: never drop a GAP line)
+        print("RESULT: FAIL decide the run logged PR3 MARKER GAP: %s" % (g1 + g2)[:2])
+        return 1
+    if bl1 is None or bl2 is None or bl1 != bl2:
+        print("RESULT: FAIL decide build line missing or different between the runs (%s vs %s): not the same image" % (bl1, bl2))
+        return 1
+    for tag, d, b in (("run1", d1, b1), ("run2", d2, b2)):
+        if not d or b:
+            print("RESULT: FAIL decide %s %s (no `PR3 MARKER done` line or unparsable PR3 MARKER lines: %s)" % (
+                tag, "incomplete", b[:2]))
+            return 1
+    usable = []
+    for name in ("C", "B", "A"):
+        ok = True
+        for off in (0, TAIL):
+            a = BASES[name] + off
+            s1, s2 = r1.get(a, {}), r2.get(a, {})
+            w = s1.get("wrote")
+            good = (w is not None and s1.get("readback") == "ok" and s2.get("state") == "intact"
+                    and s2.get("ctr") == w)
+            print("site %s %s %016X: run1 wrote=%s readback=%s | run2 state=%s ctr=%s -> %s" % (
+                name, "head" if off == 0 else "tail", a, "%016X" % w if w is not None else "-", s1.get("readback", "-"),
+                s2.get("state", "-"), "%016X" % s2["ctr"] if "ctr" in s2 else "-", "ok" if good else "not usable"))
+            ok = ok and good
+        if ok:
+            usable.append(name)
+    if usable:
+        print("RESULT: site=%s usable" % usable[0])
+    else:
+        print("RESULT: site=none")
+    return 0
+
+
+def strip_prefix(t):
+    return re.sub(r"^panic\(cpu \d+ caller 0x[0-9a-fA-F]+\): ", "", t)
+
+
+def decode_region(data):
+    """-> ('none'|'text'|'gap', text)"""
+    if len(data) < 28:
+        return "gap", "region too short"
+    magic, _crc, _ver = struct.unpack_from("<III", data, 0)
+    if magic != 0x46554E4B:  # EMBEDDED_PANIC_MAGIC "FUNK"
+        return "none", ""
+    off, ln = struct.unpack_from("<II", data, 20)  # eph_panic_log_offset, eph_panic_log_len (flags is a u64 at 12)
+    if off < 28 or off > len(data):
+        return "gap", "bad eph_panic_log_offset"
+    ln = min(ln, len(data) - off, 1024)
+    raw = data[off:off + ln].split(b"\0", 1)[0]
+    txt = "".join(chr(c) if 32 <= c < 127 else "." for c in raw)
+    return "text", strip_prefix(txt)
+
+
+def cmd_region(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    kind, txt = decode_region(data)
+    if kind == "gap":
+        print("SWEET GAP: panic region unreadable (%s)" % txt)
+        print("RESULT: FAIL region %s" % txt)
+        return 1
+    print("SWEET PANIC: %s" % ("none" if kind == "none" else txt))
+    print("RESULT: PASS region %s" % kind)
+    return 0
+
+
+def cmd_selftest():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "panic-region")
+    out = []
+    for fx, want_perfect in (("golden.marker", True), ("corrupt.marker", False)):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_marker(os.path.join(here, fx))
+        s = buf.getvalue()
+        m = re.search(r"score=(\d+)", s)
+        sc = int(m.group(1)) if m else -1
+        good = sc == 100 if want_perfect else 0 <= sc < 100
+        out.append(good)
+        print("%s: %s" % (fx, s.strip()))
+    import io, contextlib
+    for args, want in (((os.path.join(here, "run1.log"), os.path.join(here, "run2.log")), "RESULT: site=C usable"),
+                       ((os.path.join(here, "run1.log"), os.path.join(here, "run2-changed.log")), "RESULT: site=none")):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_decide(list(args))
+        good = want in buf.getvalue()
+        out.append(good)
+        print("decide %s -> %s" % (os.path.basename(args[1]), "ok" if good else "MISMATCH: " + buf.getvalue()[-200:]))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_region(os.path.join(here, "region.bin"))
+    good = "SWEET PANIC: IOFindBSDRoot: SWEET UFS root nosuchpart unavailable" in buf.getvalue()
+    out.append(good)
+    print("region -> %s" % ("ok" if good else "MISMATCH: " + buf.getvalue()))
+    if all(out):
+        print("RESULT: PASS panic-region-check selftest")
+        return 0
+    print("RESULT: FAIL panic-region-check selftest")
+    return 1
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[1] == "marker":
+        return cmd_marker(argv[2])
+    if len(argv) >= 2 and argv[1] == "decide":
+        return cmd_decide(argv[2:])
+    if len(argv) == 3 and argv[1] == "region":
+        return cmd_region(argv[2])
+    if len(argv) == 2 and argv[1] == "selftest":
+        return cmd_selftest()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

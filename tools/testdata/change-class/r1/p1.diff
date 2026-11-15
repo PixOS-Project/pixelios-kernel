@@ -1,0 +1,12 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+--- a/xnu/patches/0300-x.patch
++++ b/xnu/patches/0300-x.patch
+@@ -3,6 +3,6 @@
+ diff --git a/osfmk/a.c b/osfmk/a.c
+ --- a/osfmk/a.c
+-+++ b/osfmk/a.c
+-@@ -100,3 +100,4 @@
+++++ b/osfmk/b.c
++@@ -900,3 +900,4 @@
+  ctx
+ +	printf("x");

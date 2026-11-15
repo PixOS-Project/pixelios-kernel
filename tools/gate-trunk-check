@@ -1,0 +1,53 @@
+#!/bin/bash
+# gate-trunk-check (T-1386): refuse a gate on a branch whose GATE TOOLING is behind trunk, so a gate fix (a new GATE line format, a heavy-job fix) reaches every branch at once.
+#   tools/gate-trunk-check [--repo DIR]
+# A gate runs the checkout's own tools/check-all.sh and tools/heavy-job; a branch cut before a gate fix printed the old 'GATE FAIL ... unit census' line and workers re-gated over a
+# misread (T-2172, ba1296e6). For every file of the gate tooling (GATE_TOOLING_FILES, default list below) the committed blobs are compared: B = DIR's HEAD, T = the trunk tip
+# (first existing ref of GATE_TRUNK_REFS, default "trunk main master"), M = merge-base(HEAD, trunk).
+#   B == T                 ok.
+#   B != T, T == M         the branch edited the gate itself and trunk did not move it: ok (the branch's copy is the one under test).
+#   B != T, T != M         trunk changed the file since the branch left it (branch untouched or both changed): BEHIND -> refuse.
+# Output: `REFUSED: merge trunk first: gate tooling behind trunk by <trunk sha7> (<files>)` + `RESULT: FAIL gate-trunk-check behind=N trunk=<sha7> files=<f,...>` (exit 1), or
+# `RESULT: PASS gate-trunk-check files=N trunk=<sha7> branch-edits=<f,..|->` (exit 0). No trunk ref in the repo, or no merge-base: `RESULT: PASS gate-trunk-check SKIPPED <why>` (printed, never silent).
+# Override (logged, for a deliberate gate on old tooling): GATE_TOOLING_OVERRIDE="why" prints `gate-trunk-check: OVERRIDE <why>` and exits 0 even when behind. Exit 2 = usage/git error.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+repo=.
+while [ $# -gt 0 ]; do
+	case $1 in
+	--repo) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-trunk-check --repo needs a value"; exit 2; }; repo=$2; shift 2 ;;
+	*) echo "usage: tools/gate-trunk-check [--repo DIR]"; echo "RESULT: ERROR gate-trunk-check unknown argument '$1'"; exit 2 ;;
+	esac
+done
+git -C "$repo" rev-parse --verify -q HEAD >/dev/null 2>&1 || { echo "RESULT: ERROR gate-trunk-check no git HEAD in $repo"; exit 2; }
+files=${GATE_TOOLING_FILES:-tools/check-all.sh tools/heavy-job tools/heavy_job_parts.py tools/gate tools/gate-request tools/gate-summary tools/gate-lint-first tools/gate_lint_first_lib.py tools/gate-lint-steps.tsv tools/gate-xnu-build tools/gate_select.py tools/gate-inputs tools/gate-manifest tools/gate-manifest.json}
+trunk=
+for r in ${GATE_TRUNK_REFS:-trunk main master}; do
+	if git -C "$repo" rev-parse --verify -q "refs/heads/$r^{commit}" >/dev/null 2>&1; then trunk=$r; break; fi
+done
+[ -n "$trunk" ] || { echo "RESULT: PASS gate-trunk-check SKIPPED no trunk ref (${GATE_TRUNK_REFS:-trunk main master}) in $repo: nothing to compare"; exit 0; }
+t7=$(git -C "$repo" rev-parse --short=8 "refs/heads/$trunk")
+base=$(git -C "$repo" merge-base HEAD "refs/heads/$trunk" 2>/dev/null) || base=
+[ -n "$base" ] || { echo "RESULT: PASS gate-trunk-check SKIPPED no merge-base of HEAD and $trunk@$t7"; exit 0; }
+blob() { git -C "$repo" rev-parse --verify -q "$1:$2" 2>/dev/null || echo absent; }   # blob id, or `absent` (a file may exist on one side only)
+behind=(); edits=(); n=0
+for f in $files; do
+	n=$((n + 1))
+	b=$(blob HEAD "$f"); t=$(blob "refs/heads/$trunk" "$f")
+	[ "$b" = "$t" ] && continue
+	m=$(blob "$base" "$f")
+	if [ "$t" = "$m" ]; then edits+=("$f"); else behind+=("$f"); fi
+done
+join() { local IFS=,; echo "$*"; }
+if [ ${#behind[@]} -gt 0 ]; then
+	if [ -n "${GATE_TOOLING_OVERRIDE:-}" ]; then
+		echo "gate-trunk-check: OVERRIDE ${GATE_TOOLING_OVERRIDE} (gate tooling behind trunk by $t7: $(join "${behind[@]}"))"
+		echo "RESULT: PASS gate-trunk-check OVERRIDDEN behind=${#behind[@]} trunk=$t7"; exit 0
+	fi
+	echo "REFUSED: merge trunk first: gate tooling behind trunk by $t7 ($(join "${behind[@]}")); the gate would run this branch's old copy and print the old GATE format"
+	echo "RESULT: FAIL gate-trunk-check behind=${#behind[@]} trunk=$t7 files=$(join "${behind[@]}")"
+	exit 1
+fi
+echo "RESULT: PASS gate-trunk-check files=$n trunk=$t7 branch-edits=$([ ${#edits[@]} -gt 0 ] && join "${edits[@]}" || echo -)"
+exit 0

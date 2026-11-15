@@ -1,0 +1,296 @@
+sweet-diag-exit-ufs-vm (lowclk 2026-11-14, group A items A6-1 and A13-1; research docs/research/160-kernel-cpu-users-lskdd-boot-reads.md s.2, s.3, s.5; tracker L-25): three read-only diagnostics. NO HARDWARE ACCESS, no state change, no new register or command.
+(a) New bsd/dev/sweet_exitlog.c (+ bsd/conf/files): the SWEET exec site in kern_exec.c counts execs per process name; exit_with_reason (kern_exit.c, once per process, after p_exit_reason and p_xstat are set and before proc_prepareexit) prints for a name exec'd MORE than 10 times, for its first 5 exits and then every 100th: `SWEET EXIT: NAME[PID] ppid P life_ms L exec_n E exit_n N xstat 0xRV code C signal S reason ns A code 0xB jetsam_flags 0xF by KNAME[KPID]`. rv = the exit status word (signal bits 0..6, exit code = the signed status >> 8, so a negative main() return shows as a negative `code` (sel_code), as kern_exit.c W_EXITCODE forms it); reason = p_exit_reason (namespace OS_REASON_JETSAM = 1, bsd/sys/reason.h:88; code = the jetsam cause); jetsam_flags = the P_JETSAM_* bits exit_with_reason was given; by = current_proc() (the process itself for exit()/a crash, another for a kill); life_ms from p_stats->ps_start (mach time of the fork, kern_fork.c:1121; includes the xpcproxy part for a launchd job). One row when a name passes 10 execs; a full table (768 names; 48 filled at boot on hardware, resident-233035-b4) is a SWEET GAP row. Explains lskdd [obs research 160 s.2: new pid every 1.024 s, no exit row].
+(b) CPUSTAT `ufs` row: sweet_ufs_stat gets 4 slots ([6] read bytes, [7] write bytes, [8] read ios, [9] write ios; sweet_ufs.c, after the existing `sweet_ufs_stat[2] += count`, direction = the same `rd` the function already computed). The old fields (`ios cmds KiB busy lockwait maxcmd`, KiB = reads + writes) keep name and meaning; `rios wios rKiB wKiB` are appended at the end of the row.
+(c) CPUSTAT vm row every 10 s (every second tick of the 5 s cpustat thread; off with sweetcpustat=0): `CPUSTAT vm up MS ms window MS ms | pageins N pageouts N compressions N decompressions N swapins N swapouts N` (pages, delta since the previous row; first row since boot), read with counter_load of vm_statistics_pageins/pageouts/compressions/decompressions/swapins/swapouts (declared in sweet_cpustat.c with SCALABLE_COUNTER_DECLARE as osfmk/kern/host_statistics.h:45-57 does, because that header is not an installed private header; the counters host_statistics64 HOST_VM_INFO64 returns through get_host_vm_stats, osfmk/kern/host.c:138-150), lock-free.
+Host test: tools/test_sweet_diag362.py compiles the pure table logic of sweet_exitlog.c from this patch text (thresholds, every-100th, table full, whole-name match) and checks every hook by text with a mutant per check. NOT compiled as kernel code on the host: the kernel build (tools/xnu-local-build) is the compile check. Not run on hardware.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e9f7cf3..4228bd7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@ bsd/dev/sweet_pcsamp.c		standard
+ bsd/dev/sweet_kdbg.c		standard
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
++bsd/dev/sweet_exitlog.c		standard
+ bsd/dev/sweet_wlan_en0.c			standard
+ bsd/dev/sweet_wlan_a80211.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/dev/sweet_cpustat.c b/bsd/dev/sweet_cpustat.c
+index d52e65e..fd3a80b 100644
+--- a/bsd/dev/sweet_cpustat.c
++++ b/bsd/dev/sweet_cpustat.c
+@@ -15,6 +15,11 @@
+  *   CPUSTAT watch <name> live <n> at <ms> ms           (only when the count of live processes with that name changes)
+  * so the end of the migration is logged to 5 s. Deltas between two samples are computed on the host.
+  * UFS counters are kept by sweet_ufs_strategy (sweet_ufs.c) under its lock; reads here are unlocked (diagnostic only).
++ * Patch 0362 (lowclk A13-1, research 160 s.3): the `ufs ... KiB` field is the total of reads AND writes (sweet_ufs_strategy adds buf_count before it tests
++ * B_READ); that field keeps its name and meaning, and the row now ends with `rios <n> wios <n> rKiB <n> wKiB <n>` (the split, same cumulative scope). Every 10 s
++ * (every second 5 s tick, independent of sweetcpustat except 0 = off) one more row
++ *   CPUSTAT vm up <ms> ms window <ms> ms | pageins <n> pageouts <n> compressions <n> decompressions <n> swapins <n> swapouts <n> (pages, delta over the window; the first window is since boot)
++ * from the same counters host_statistics64(HOST_VM_INFO64) returns (osfmk/kern/host.c get_host_vm_stats: counter_load of vm_statistics_*), read lock-free.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -23,12 +28,20 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
++#include <kern/counter.h>
+ #include <mach/task_info.h>
+ #include <pexpert/pexpert.h>
+ 
++/* patch 0362: the VM page-movement counters, declared as osfmk/kern/host_statistics.h:45-57 declares them (that header is not an installed private header); defined in osfmk/kern/host.c:120-132 */
++SCALABLE_COUNTER_DECLARE(vm_statistics_pageins);
++SCALABLE_COUNTER_DECLARE(vm_statistics_pageouts);
++SCALABLE_COUNTER_DECLARE(vm_statistics_decompressions);
++SCALABLE_COUNTER_DECLARE(vm_statistics_compressions);
++SCALABLE_COUNTER_DECLARE(vm_statistics_swapins);
++SCALABLE_COUNTER_DECLARE(vm_statistics_swapouts);
+ extern task_t proc_task(proc_t);
+ extern int hz;
+-extern uint64_t sweet_ufs_stat[6];     /* ios, cmds, bytes, busy abs, lockwait abs, max cmd abs (sweet_ufs.c) */
++extern uint64_t sweet_ufs_stat[10];    /* ios, cmds, bytes (r+w), busy abs, lockwait abs, max cmd abs, read bytes, write bytes, read ios, write ios (sweet_ufs.c) */
+ extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+@@ -126,6 +139,22 @@ cs_parse_watch(char *watch)
+ 	}
+ }
+ 
++/* patch 0362: the VM page-movement counters, delta since the previous vm row (read-only; counter_load is the call get_host_vm_stats makes) */
++static void
++cs_vm_row(uint64_t now)
++{
++	static uint64_t prev[6], prev_ms;
++	uint64_t cur[6] = {
++		counter_load(&vm_statistics_pageins), counter_load(&vm_statistics_pageouts),
++		counter_load(&vm_statistics_compressions), counter_load(&vm_statistics_decompressions),
++		counter_load(&vm_statistics_swapins), counter_load(&vm_statistics_swapouts),
++	};
++	printf("CPUSTAT vm up %llu ms window %llu ms | pageins %llu pageouts %llu compressions %llu decompressions %llu swapins %llu swapouts %llu\n",
++	    now, now - prev_ms, cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2], cur[3] - prev[3], cur[4] - prev[4], cur[5] - prev[5]);
++	memcpy(prev, cur, sizeof(prev));
++	prev_ms = now;
++}
++
+ /* One 5 s tick; full = also the per-process CPU table. */
+ static void
+ cs_sample(bool full, uint64_t now)
+@@ -135,9 +164,10 @@ cs_sample(bool full, uint64_t now)
+ 	cs_tot_user = cs_tot_sys = cs_tot_n = 0;
+ 	bzero(cs_watch_seen, sizeof(cs_watch_seen));
+ 	if (cs_full) {
+-		printf("CPUSTAT --- up %llu ms | ufs ios %llu cmds %llu KiB %llu busy %llu ms lockwait %llu ms maxcmd %llu us\n",
++		printf("CPUSTAT --- up %llu ms | ufs ios %llu cmds %llu KiB %llu busy %llu ms lockwait %llu ms maxcmd %llu us rios %llu wios %llu rKiB %llu wKiB %llu\n",
+ 		    now, sweet_ufs_stat[0], sweet_ufs_stat[1], sweet_ufs_stat[2] >> 10,
+-		    cs_ms(sweet_ufs_stat[3]), cs_ms(sweet_ufs_stat[4]), cs_us(sweet_ufs_stat[5]));
++		    cs_ms(sweet_ufs_stat[3]), cs_ms(sweet_ufs_stat[4]), cs_us(sweet_ufs_stat[5]),
++		    sweet_ufs_stat[8], sweet_ufs_stat[9], sweet_ufs_stat[6] >> 10, sweet_ufs_stat[7] >> 10);
+ 	}
+ 	proc_iterate(PROC_ALLPROCLIST, cs_proc, NULL, NULL, NULL);
+ 	if (cs_full) {
+@@ -177,7 +207,11 @@ cs_thread(__unused void *arg, __unused wait_result_t wr)
+ 	(void)tsleep(&chan, PZERO, "sweetcpu", 20 * hz);
+ 	for (;; tick++) {
+ 		uint32_t every = (period + 4) / 5;
+-		cs_sample((tick % every) == 0, cs_ms(mach_absolute_time()));
++		uint64_t now_ms = cs_ms(mach_absolute_time());
++		cs_sample((tick % every) == 0, now_ms);
++		if ((tick & 1) == 0) {   /* patch 0362: every second 5 s tick = 10 s */
++			cs_vm_row(now_ms);
++		}
+ 		(void)tsleep(&chan, PZERO, "sweetcpu", 5 * hz);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_exitlog.c b/bsd/dev/sweet_exitlog.c
+new file mode 100644
+index 0000000..d66f668
+--- /dev/null
++++ b/bsd/dev/sweet_exitlog.c
+@@ -0,0 +1,128 @@
++/*
++ * sweet_exitlog.c - patch 0362 (lowclk 2026-11-14, group A item A6-1; research 160 s.2): log how a process that was exec'd many times ends.
++ * lskdd is launched about every 1.024 s with no exit, crash or jetsam row anywhere (research 160 s.2): the cause of its exit is not in the logs.
++ * Read-only: counts execs per process name (called from the SWEET exec site in kern_exec.c) and, for a name exec'd more than SEL_MIN_EXECS times, prints
++ *   SWEET EXIT: NAME[PID] ppid P life_ms L exec_n E exit_n N xstat 0xRV code C signal S reason ns A code 0xB jetsam_flags 0xF by KNAME[KPID]
++ * for the first SEL_FIRST exits of that name, then every SEL_EVERY-th (rv = the exit status word: signal in bits 0..6, exit code in bits 8..15, as in
++ * kern_exit.c; reason = the os_reason the exiting process was given: namespace OS_REASON_JETSAM = 1 for a jetsam kill (bsd/sys/reason.h:88), 0xB = its code,
++ * jetsam_flags = the P_JETSAM_* bits passed to exit_with_reason; by = the process whose thread ran the exit: the process itself for exit()/a crash, another one
++ * for a kill/jetsam). life_ms = mach time since the fork (p_stats->ps_start, set by microtime_with_abstime in kern_fork.c:1121), so for an xpcproxy launch it
++ * includes the xpcproxy part. No state change anywhere. A name that does not fit in the table is a SWEET GAP row.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/reason.h>
++#include <sys/resourcevar.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++
++#define SEL_NAMES       768     /* a boot execs ~317 distinct names (k15 boot resident-233035-b4); 48 filled at boot and lskdd never got a slot */
++#define SEL_MIN_EXECS   10      /* a name exec'd MORE than this many times is logged */
++#define SEL_FIRST       5       /* the first exits of such a name are all logged ... */
++#define SEL_EVERY       100     /* ... then every 100th */
++
++struct sel_ent {
++	char     name[2 * MAXCOMLEN + 1];
++	uint32_t execs, exits;
++};
++struct sel_tab {
++	struct sel_ent e[SEL_NAMES];
++	uint32_t       n, dropped;
++};
++
++enum { SEL_NO = 0, SEL_TRACK_NEW, SEL_FULL };      /* sel_exec results */
++
++/* pure: count one exec of name. SEL_TRACK_NEW = the count just passed SEL_MIN_EXECS (log once), SEL_FULL = no slot (GAP). */
++static int
++sel_exec(struct sel_tab *t, const char *name)
++{
++	struct sel_ent *e = NULL;
++
++	for (uint32_t i = 0; i < t->n; i++) {
++		if (strncmp(t->e[i].name, name, sizeof(t->e[i].name)) == 0) {
++			e = &t->e[i];
++			break;
++		}
++	}
++	if (e == NULL) {
++		if (t->n >= SEL_NAMES) {
++			t->dropped++;
++			return SEL_FULL;
++		}
++		e = &t->e[t->n++];
++		strlcpy(e->name, name, sizeof(e->name));
++	}
++	e->execs++;
++	return e->execs == SEL_MIN_EXECS + 1 ? SEL_TRACK_NEW : SEL_NO;
++}
++
++/* pure: the exit code of the status word rv = W_EXITCODE(ret, sig) = (ret << 8) | sig (bsd/sys/wait.h:158). Signed on purpose: the old (rv >> 8) & 0xff hid a negative main() return
++ * (xstat 0xff595c00 printed code 0 / 92 although main returned -42660, docs ALL-ON-TRACKER L-25). Arithmetic shift of a signed int (clang), as WEXITSTATUS does without _POSIX_C_SOURCE (wait.h:146). */
++static int
++sel_code(int rv)
++{
++	return rv >> 8;
++}
++
++/* pure: count one exit of name; true = print the row (name exec'd more than SEL_MIN_EXECS times and this is one of the first SEL_FIRST exits or a multiple of SEL_EVERY). */
++static bool
++sel_exit(struct sel_tab *t, const char *name, uint32_t *execs, uint32_t *exits)
++{
++	for (uint32_t i = 0; i < t->n; i++) {
++		if (strncmp(t->e[i].name, name, sizeof(t->e[i].name)) == 0) {
++			struct sel_ent *e = &t->e[i];
++			e->exits++;
++			*execs = e->execs;
++			*exits = e->exits;
++			return e->execs > SEL_MIN_EXECS && (e->exits <= SEL_FIRST || (e->exits % SEL_EVERY) == 0);
++		}
++	}
++	return false;
++}
++
++static LCK_GRP_DECLARE(sel_grp, "sweet_exitlog");
++static LCK_SPIN_DECLARE(sel_lock, &sel_grp);
++static struct sel_tab sel_t;
++
++void sweet_exitlog_exec(const char *name);
++void sweet_exitlog_exit(proc_t p, int rv, int jetsam_flags);
++
++void
++sweet_exitlog_exec(const char *name)
++{
++	lck_spin_lock(&sel_lock);
++	int r = sel_exec(&sel_t, name);
++	uint32_t dropped = sel_t.dropped;
++	lck_spin_unlock(&sel_lock);
++	if (r == SEL_TRACK_NEW) {
++		printf("SWEET EXIT: %s was exec'd more than %d times: its exits are logged (first %d, then every %dth)\n", name, SEL_MIN_EXECS, SEL_FIRST, SEL_EVERY);
++	} else if (r == SEL_FULL && (dropped <= 8 || (dropped & (dropped - 1)) == 0)) {
++		printf("SWEET GAP: exit log table full (%d names): exits of %s are not logged x%u\n", SEL_NAMES, name, dropped);
++	}
++}
++
++/* called once per process from exit_with_reason, after p_exit_reason and p_xstat are set, before the exit proceeds */
++void
++sweet_exitlog_exit(proc_t p, int rv, int jetsam_flags)
++{
++	uint32_t execs = 0, exits = 0;
++
++	lck_spin_lock(&sel_lock);
++	bool show = sel_exit(&sel_t, p->p_name, &execs, &exits);
++	lck_spin_unlock(&sel_lock);
++	if (!show) {
++		return;
++	}
++	uint64_t life_ns = 0;
++	if (p->p_stats != NULL && p->p_stats->ps_start != 0) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - p->p_stats->ps_start, &life_ns);
++	}
++	proc_t cur = current_proc();
++	struct os_reason *r = p->p_exit_reason;
++	printf("SWEET EXIT: %s[%d] ppid %d life_ms %llu exec_n %u exit_n %u xstat 0x%x code %d signal %d reason ns %u code 0x%llx jetsam_flags 0x%x by %s[%d]\n",
++	    p->p_name, proc_getpid(p), p->p_ppid, life_ns / NSEC_PER_MSEC, execs, exits, (unsigned)rv, sel_code(rv), rv & 0x7f,
++	    r != OS_REASON_NULL ? r->osr_namespace : 0, r != OS_REASON_NULL ? r->osr_code : 0, (unsigned)jetsam_flags,
++	    cur != NULL ? cur->p_name : "?", cur != NULL ? proc_getpid(cur) : -1);
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e2912b2..6fc4876 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,8 +59,9 @@ extern void sweet_pcsamp_start(void);   /* patch 0263, bsd/dev/sweet_pcsamp.c */
+ extern void sweet_kdbg_start(void);     /* patch 0264, bsd/dev/sweet_kdbg.c */
+ extern void sweet_cpustat_start(void);
+ extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+-/* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+-uint64_t sweet_ufs_stat[6];
++/* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes (reads + writes), busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock.
++ * Patch 0362: [6] read bytes, [7] write bytes, [8] read ios, [9] write ios ([2] stays the total of [6] + [7]) */
++uint64_t sweet_ufs_stat[10];
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
+ extern int sweet_restart_armed(void);   /* bsd/dev/sweet_restart.c (patch 0191) */
+@@ -838,6 +839,8 @@ sweet_ufs_strategy(buf_t bp)
+ 	uint64_t t_lock = mach_absolute_time();
+ 	sweet_ufs_stat[0]++;
+ 	sweet_ufs_stat[2] += count;
++	sweet_ufs_stat[rd ? 6 : 7] += count;   /* patch 0362: the same bytes split by direction (rd = buf_flags & B_READ, above) */
++	sweet_ufs_stat[rd ? 8 : 9]++;
+ 	sweet_ufs_stat[4] += t_lock - t_enter;
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9bd1bb3..eb8d396 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7522,6 +7522,10 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				uint64_t sweet_exec_ns;
+ 				absolutetime_to_nanoseconds(mach_absolute_time(), &sweet_exec_ns);
+ 				printf("SWEET EXEC: %s t %llu swaps %llu\n", p->p_name, sweet_exec_ns, sweet_fb_swap_count);
++				{   /* patch 0362: per-name exec count for the exit log (bsd/dev/sweet_exitlog.c) */
++					extern void sweet_exitlog_exec(const char *);
++					sweet_exitlog_exec(p->p_name);
++				}
+ 				if (strncmp(p->p_name, "Preferences", MAXCOMLEN) == 0) {
+ 					sweet_exec_pref_count++;
+ 				}
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index d3a8345..ec5bb00 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1601,6 +1601,13 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate,
+ 	proc_transend(p, 1);
+ 	proc_unlock(p);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{   /* patch 0362: log how a many-times-exec'd process ends (bsd/dev/sweet_exitlog.c); read-only */
++		extern void sweet_exitlog_exit(proc_t, int, int);
++		sweet_exitlog_exit(p, rv, jetsam_flags);
++	}
++#endif
++
+ 	proc_prepareexit(p, rv, perf_notify);
+ 
+ 	/* Last thread to terminate will call proc_exit() */

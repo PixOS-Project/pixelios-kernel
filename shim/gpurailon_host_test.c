@@ -199,7 +199,7 @@ int main(void)
 
 	/* acpm_s11_rail_set directly: nothing but the audited pair */
 	{
-		struct acpm_trace t;
+		struct acpm_trace t = { .seq = 1 };	/* the caller initialises seq (acpm.h:114); unset = stack garbage, reply seq check fails with optimisation */
 		uint32_t o = 0;
 
 		setup(ESZ); setrail(0x38, 0x40);

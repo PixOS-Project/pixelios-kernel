@@ -1,0 +1,129 @@
+#!/bin/bash
+# offload-stage-xnub (20w, W35 R22 "lane jam"): stage the XNU-build toolchain on offload-host so `tools/remote-job gate-pre` can compile HEAD's xnu/patches
+# INSIDE its offload-host slot (tools/remote-job header "XNU BUILD IN THE OFFLOAD-HOST SLOT"), without the lab-host heavy-job lock.
+#   tools/offload-stage-xnub [--validate] [--dry-run] | --help
+#   1. builds the image pixos-xnub:trixie-20261111 on offload-host from tools/gate-image/Dockerfile.xnub (gate image + m4/autoconf/automake/rsync);
+#   2. seeds the pinned-source mirrors on this host from HEAD's xnu/patches (git archive, the same stack --validate builds; tools/xnu-src-mirror seed, needs the network only for missing
+#      ones; a checkout without tools/xnu-src-mirror, or whose tools/xnu-local-build does not use it, is a hard error: stage from a checkout that has tools/xnub-mirror) and rsyncs --delete from ~/pixelios-artifacts (this host) to offload-host:$OFFLOAD_ROOT/work/xnub-art/: xnu-pristine/,
+#      localbuild/{sdk,theos,deps,hostroot,dxb,u1}/, git-mirror/ (the XNU stagers fetch from GitHub on every build; the --network=none container reads the
+#      local mirror libpthread.git, hfs.git, BearSSL.git; tools/remote-job refuses with rc 95 when it is missing or lacks a pinned sha);
+#   3. --validate: ships this checkout's tools+xnu (git archive HEAD, committed on offload-host into a real git checkout) and runs ONE build in the container with the
+#      SAME run line as remote-job's gate-pre (tools/xnub-line.sh xnub_argv: image, mounts, --network=none, `bash tools/gate-xnu-build --repo /job --always
+#      --label offload-gate --jobs 4`; label offload-gate; a fresh work tree with no object reuse, 32-45 s measured on offload-host 2026-10-29). review offload-xnub-r1 F6. BEFORE that build it prints the offload-host login uid (WARNING when it is not
+#      1000, the container's --user) and runs the pinned-source mirror check INSIDE the container (xnub_check_mirror: same image/uid/git as the build), rc 92 = fails in minutes, not after
+#      the build (review offload-xnub-r2 F1/F2).
+#   --dry-run: prints every ssh/scp/rsync step and the remote scripts, runs nothing (no network, no ssh); the source-dir checks still run.
+# It takes NO offload-host queue slot itself but REFUSES to run (rc 2) unless the caller holds one (OFFLOAD_QUEUE_HELD, exported by `heavy-job offload-host run`): it rsyncs
+# --delete into the live toolchain (review r1 F7). The caller:
+#   tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub [--validate]
+# (the same caller is named in remote-job's rc 95 message). Reads from this host, writes only under offload-host:$OFFLOAD_ROOT/work (xnub-image-20261111, xnub-art, xnub-stage-job[.tar]).
+# A killed validation kills its container rj-xnub-stage (trap). Remote scripts go to `bash -s` on stdin (the offload-host login shell is fish).
+# Env: REMOTE_JOB_HOST (default OFFLOAD_HOST of tools/offload-host.conf), OFFLOAD_STAGE_ART (default ~/pixelios-artifacts).
+# Last line: RESULT: PASS|FAIL|ERROR offload-stage-xnub ... Exit 0 / 1 (a step failed) / 2 (usage, missing source, no queue slot, ssh unreachable).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd) || { echo "RESULT: ERROR offload-stage-xnub: cannot resolve the repo"; exit 2; }
+. "$here/tools/offload-conf.sh"; offload_conf_load "$here"   # T-dd93: host/root/lab home from tools/offload-host.conf (gitignored) or the environment
+H=${REMOTE_JOB_HOST:-${OFFLOAD_HOST:-}}; A=${OFFLOAD_STAGE_ART:-$HOME/pixelios-artifacts}; validate=0; dry=0
+IMG=pixos-xnub:trixie-20261111
+OFFLOAD_ROOT=${OFFLOAD_ROOT:-/offload-root/unset}   # R64: the offload-host work root is $OFFLOAD_ROOT/work; the remote scripts get it as RJW
+RW=$OFFLOAD_ROOT/work
+err() { echo "RESULT: ERROR offload-stage-xnub: $*"; exit 2; }
+fail() { echo "RESULT: FAIL offload-stage-xnub: $*"; exit 1; }
+usage() { sed -n '2,/^# Last line/p' "$0" | sed 's/^# \{0,1\}//'; }
+for a in "$@"; do case $a in
+	--validate) validate=1 ;; --dry-run) dry=1 ;;
+	-h|--help) usage; echo "RESULT: PASS offload-stage-xnub: help"; exit 0 ;;
+	*) err "usage: tools/offload-stage-xnub [--validate] [--dry-run] (unknown '$a'; see --help)" ;; esac; done
+[[ $H =~ ^[A-Za-z0-9._@][A-Za-z0-9._@-]*$ ]] || err "bad REMOTE_JOB_HOST '$H'"
+[[ $OFFLOAD_ROOT =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] && [[ /$OFFLOAD_ROOT/ != */../* ]] || err "bad OFFLOAD_ROOT '$OFFLOAD_ROOT' (absolute, >= 2 components of [A-Za-z0-9._-])"
+[ "$dry" = 1 ] || [ -n "${OFFLOAD_QUEUE_HELD:-}" ] || err "refused: no offload-host queue slot held (OFFLOAD_QUEUE_HELD unset); this tool rsyncs --delete into the live toolchain. Run: tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub$([ "$validate" = 0 ] || echo " --validate")"
+[ -n "$H" ] || [ "$dry" = 1 ] || err "OFFLOAD GAP: no offload host configured (set OFFLOAD_HOST and OFFLOAD_ROOT in tools/offload-host.conf, template tools/offload-host.conf.example)"
+[ "$dry" = 1 ] || ! off=$(offload_off_reason "$here" build) || err "OFFLOAD OFF: use=build switched off by order, nothing is staged on the offload host: $off"   # per-use switch (web board)
+S=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=30 -o ServerAliveCountMax=40 "$H")   # the validation prints nothing while the container builds (tens of seconds measured)
+run() { if [ "$dry" = 1 ]; then echo "DRY: $*"; else "$@"; fi; }
+rs() { if [ "$dry" = 1 ]; then echo "DRY: ssh $H bash -s <<EOS"; cat; echo "DRY: EOS"; else { printf 'export RJW=%q\n' "$RW"; cat; } | "${S[@]}" bash -s; fi; }   # the remote script on stdin (RJW = the work root there)
+echo "stage: takes NO offload-host queue slot itself; run it as: tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub$([ "$validate" = 0 ] || echo " --validate")"
+[ -f "$here/tools/gate-image/Dockerfile.xnub" ] || err "$here/tools/gate-image/Dockerfile.xnub missing"
+[ -f "$here/tools/xnub-line.sh" ] || err "$here/tools/xnub-line.sh missing (the shared run line)"
+# shellcheck source=tools/xnub-line.sh
+. "$here/tools/xnub-line.sh" || err "cannot source $here/tools/xnub-line.sh"
+# the build is offline (--network=none): without the mirror tool in this checkout the validation dies at stager 0019 after the build starts (review offload-xnub-r2 F3), so this is an error, not a warning
+[ -f "$here/tools/xnu-src-mirror" ] || err "$here/tools/xnu-src-mirror missing: stage from a checkout that has tools/xnub-mirror (e.g. tools/batch-20u3), the offline XNU build cannot fetch its pinned sources without it"
+grep -q xnu-src-mirror "$here/tools/xnu-local-build" 2>/dev/null || err "$here/tools/xnu-local-build does not use tools/xnu-src-mirror: stage from a checkout that has tools/xnub-mirror (e.g. tools/batch-20u3)"
+# seed from the COMMITTED stack (what --validate builds), never from uncommitted xnu/patches edits (review r2 F7)
+if [ "$dry" = 1 ]; then echo "DRY: git -C $here archive HEAD xnu/patches | tar -x -C <tmp>; $here/tools/xnu-src-mirror seed --stack <tmp>/xnu/patches --dir $A/git-mirror"
+else
+	sd=$(mktemp -d) || err "mktemp failed"
+	git -C "$here" archive HEAD xnu/patches | tar -x -C "$sd" || { rm -rf "$sd"; err "cannot extract HEAD:xnu/patches for the mirror seed"; }
+	mres=$("$here/tools/xnu-src-mirror" seed --stack "$sd/xnu/patches" --dir "$A/git-mirror" 2>&1 | tail -n 3); mrc=${PIPESTATUS[0]}
+	rm -rf "$sd"
+	echo "stage: xnu-src-mirror seed: $(tail -n 1 <<<"$mres")"
+	[ "$mrc" = 0 ] || { echo "$mres"; fail "mirror seed rc=$mrc ($A/git-mirror lacks a pinned source and the network did not supply it)"; }
+fi
+for d in xnu-pristine git-mirror $(printf 'localbuild/%s ' $XNUB_LB_REQUIRED $XNUB_LB_EXTRA); do
+	[ -d "$A/$d" ] || err "toolchain source $A/$d missing on this host (nothing staged)"
+	# rsync --delete of an empty source would empty the live toolchain on offload-host (review r2 F7)
+	[ -n "$(ls -A "$A/$d" 2>/dev/null)" ] || err "toolchain source $A/$d is EMPTY: refusing to rsync --delete it over the live toolchain on offload-host (nothing staged)"
+done
+rs <<'EOS' || err "offload-host unreachable or $RW not creatable (ssh $H)"
+mkdir -p "$RJW/xnub-image-20261111" "$RJW/xnub-art/localbuild" || exit 1
+u=$(id -u); echo "stage: offload-host login uid $u (the build container runs --user 1000:1000 --userns=keep-id)"
+[ "$u" = 1000 ] || echo "stage: WARNING offload-host login uid is $u, not 1000: files rsynced here may be unreadable/dubious for the container; the in-container mirror check before the build decides"
+EOS
+vstarted=0
+cleanup() {   # a killed validation: the container has a fixed name (rj-xnub-stage); left behind it blocks the next run and heavy-job admission (rj-*), review r1 F11
+	[ -z "${bout:-}" ] || rm -f "$bout"
+	[ "$vstarted" = 1 ] || return 0
+	echo "stage: killing the validation container rj-xnub-stage on offload-host"
+	if [ "$dry" = 0 ]; then timeout 20 "${S[@]}" bash -s <<<'"$HOME/.local/bin/docker" kill rj-xnub-stage >/dev/null 2>&1; true' || echo "stage: WARNING could not kill rj-xnub-stage on offload-host"; fi
+}
+trap cleanup EXIT; trap 'exit 143' INT TERM HUP
+echo "stage: $(date -u +%T) image build"
+run scp -q -o BatchMode=yes "$here/tools/gate-image/Dockerfile.xnub" "$H:$RW/xnub-image-20261111/Dockerfile.xnub" || err "scp of Dockerfile.xnub failed"
+bs=$(cat <<EOS
+cd "\$RJW/xnub-image-20261111" && "\$HOME/.local/bin/docker" build -q -t $IMG -f Dockerfile.xnub .
+EOS
+)
+if [ "$dry" = 1 ]; then rs <<<"$bs"; imgid="(dry-run)"; else imgid=$(rs <<<"$bs") || fail "image build $IMG"; fi
+echo "stage: image $IMG id ${imgid:-unknown}"
+echo "stage: $(date -u +%T) rsync toolchain"
+for d in xnu-pristine git-mirror $(printf 'localbuild/%s ' $XNUB_LB_REQUIRED $XNUB_LB_EXTRA); do
+	run rsync -a --delete -e "ssh -o BatchMode=yes" "$A/$d/" "$H:$RW/xnub-art/$d/" || fail "rsync $d"
+done
+if [ "$validate" = 0 ]; then echo "RESULT: PASS offload-stage-xnub: image $IMG (${imgid:-unknown}) + toolchain staged (not validated: pass --validate for a fresh-work-tree build)"; exit 0; fi
+J=$RW/xnub-stage-job
+bout=$(mktemp) || err "mktemp failed"
+echo "stage: $(date -u +%T) ship tools+xnu of $(git -C "$here" rev-parse --short HEAD), fresh-work-tree build in the container"
+if [ "$dry" = 1 ]; then echo "DRY: git -C $here archive HEAD tools xnu -o <tmp.tar>; scp <tmp.tar> $H:$J.tar"
+else
+	tmp=$(mktemp) || err "mktemp failed"
+	git -C "$here" archive HEAD tools xnu -o "$tmp" && scp -q -o BatchMode=yes "$tmp" "$H:$J.tar"; src=$?; rm -f "$tmp"
+	[ "$src" = 0 ] || fail "ship tools+xnu"
+fi
+vstarted=1
+{ printf 'J=%q\nIMG=%q\nLAB_HOME=%q\n' "$J" "$IMG" "$LAB_HOME"; cat "$here/tools/xnub-line.sh"; cat <<'EOS'
+export HEAVY_JOB_HELD=xnub-stage   # inherited by name (-e HEAVY_JOB_HELD), as in gate-pre
+JD=$J
+rm -rf "${JD:?}" || { echo "stage: cannot remove the old $JD (root-owned leftover?)"; exit 90; }
+mkdir -p "$JD" && tar -x -C "$JD" -f "$JD.tar" && rm -f "$JD.tar" || { echo "stage: cannot unpack $JD.tar"; exit 90; }
+cd "$JD" || exit 90
+git init -q . && git add -A && git -c user.email=stage@offload-host -c user.name=xnub-stage commit -q -m "xnub-stage tree" || { echo "stage: git init of the shipped tree failed"; exit 91; }   # tools/gate-xnu-build needs a real checkout, as in gate-pre
+xnub_argv "$HOME/.local/bin/docker" "$IMG" "$RJW/xnub-art" "$JD" stage /job
+echo "stage: run line: ${XF[*]} ${XB[*]}"
+# the pinned-source mirror check in the container, BEFORE the build (uid/ownership problems show in seconds; review offload-xnub-r2 F2)
+xnub_check_mirror stage "$RJW/xnub-art" xnu/patches "re-run tools/offload-stage-xnub from a checkout with tools/xnub-mirror" </dev/null || { echo "stage: mirror precondition failed in the build container (rc $?), build NOT started"; exit 92; }
+"${XF[@]}" "${XB[@]}" </dev/null
+EOS
+} | rs | tee "$bout"
+rc=${PIPESTATUS[1]}
+vstarted=0
+echo "stage: $(date -u +%T) container build rc=$rc"
+[ "$rc" != 92 ] || fail "pinned-source mirror check failed in the build container (see the lines above), the build was not started"
+[ "$rc" = 0 ] || fail "validation build rc=$rc"
+if [ "$dry" = 1 ]; then echo "RESULT: PASS offload-stage-xnub: dry-run, nothing executed"; exit 0; fi
+gres=$(grep -a '^RESULT: PASS xnu-build sha=' "$bout" | tail -n 1)   # the container's gate-xnu-build verdict: sha=<kernel sha256> ... <wall>s
+ksha=$(sed -n 's/.* sha=\([0-9a-f]\{64\}\) .*/\1/p' <<<"$gres"); bw=$(sed -n 's/.* \([0-9][0-9]*s\)\( .*\)\?$/\1/p' <<<"$gres")
+[ -n "$ksha" ] && [ -n "$bw" ] || fail "validation build rc=0 but the container printed no 'RESULT: PASS xnu-build sha=<sha256> ... <N>s' line (no silent success): ${gres:-none}"
+echo "RESULT: PASS offload-stage-xnub: image $IMG (${imgid:-unknown}) + toolchain staged, build validated with the gate-pre run line (label offload-gate), gate-xnu-build wall $bw (fresh work tree, no object reuse), kernel sha256 $ksha"

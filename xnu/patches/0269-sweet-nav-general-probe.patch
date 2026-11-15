@@ -1,0 +1,130 @@
+SWEET nav General-row probe (patch 0269, sprint-gpu 2026-11-08, user OK to fix the General tap; input choice only, read-only framebuffer scan, no register, no store to hardware): before the general-open tap the nav session (patch 0243) asks sweet_fb_probe_general() for the General row of the Settings root list in the last presented layer-0 surface (icon column touch x 40..215: first grey run >= 30 rows below a purple Focus/Screen Time row) and taps its centre; implausible / not found = the calibrated 500,1900 + 'SWEET GAP: NAV general-open'. Logs 'SWEET NAV: general probe rep R rc C y Y runs N purple_last P -> tap 500,T'. Reason [obs camera frames nav27 r1, nav31 r1-2]: the list's resting scroll offset after settings-scroll-down varies by ~50-150 touch px, so the fixed 1900 hit the section gap or Screen Time.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4b75e44..cc86a83 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -726,9 +726,77 @@ sweet_fps_tick(uint64_t now_ns)
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/*
++ * Patch 0269 (sprint-gpu 2026-11-08, user OK; nav-session calibration, input choice only, read-only): the General row of the Settings root list is not at a fixed
++ * height. The list comes back from settings-scroll-down at a varying scroll offset (search bar shown or not, overscroll): camera frames nav27 r1 (+~50 touch px) and
++ * nav31 r1/r2 (+~150 px) put the calibrated tap 500,1900 into the section gap or onto Screen Time [obs]. The nav session asks this probe for the General row just before
++ * the tap: in the last presented layer-0 surface (logical 1125x2436, panel = logical - (fOffX, fOffY), copied 1:1 by present()), scan the icon column (touch x 40..215, every 4 px; >= 5 samples per class)
++ * from top to bottom, classify each row by its samples as grey (|R-G|,|G-B| < 14, 90 <= R <= 205: the General / Control Center icon) or purple (B > R+50, B > G+50: Focus /
++ * Screen Time), and return the centre of the first grey run of >= 30 rows that starts below a purple row, in touch y. 0 = not found (the caller keeps 1900 and logs a GAP).
++ */
++extern "C" uint32_t sweet_fb_last_surface;
++uint32_t sweet_fb_last_surface;
++extern "C" int sweet_fb_probe_general(int *out_y, int *runs, int *purple_last);
++int
++sweet_fb_probe_general(int *out_y, int *runs, int *purple_last)
++{
++	*out_y = 0;
++	*runs = 0;
++	*purple_last = -1;
++	uint32_t id = sweet_fb_last_surface;
++	SweetSurface *s = id ? sweet_surface_copy(id) : NULL;
++	if (s == NULL || s->kernelAddress() == 0 || s->memory == NULL || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->width < 1125 || s->height < 2436 || (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow > s->memory->getLength()) {
++		OSSafeReleaseNULL(s);
++		return -1;
++	}
++	const int offx = ((int)s->width - 1080) / 2, offy = ((int)s->height - 2400) / 2;
++	int run0 = -1;
++	bool seen_purple = false;
++	for (int ty = 200; ty < 2380; ty++) {
++		const uint8_t *row = (const uint8_t *)(s->kernelAddress() + s->offset + (uint64_t)(ty + offy) * s->bytesPerRow);
++		int grey = 0, purple = 0;
++		for (int tx = 40; tx <= 215; tx += 4) {
++			uint32_t px;
++			memcpy(&px, row + (uint64_t)(tx + offx) * 4, 4);
++			int r = (px >> 16) & 0xff, g = (px >> 8) & 0xff, b = px & 0xff;
++			int dr = r - g, dg = g - b;
++			if (dr < 0) {
++				dr = -dr;
++			}
++			if (dg < 0) {
++				dg = -dg;
++			}
++			if (dr < 14 && dg < 14 && r >= 90 && r <= 205) {
++				grey++;
++			} else if (b > r + 50 && b > g + 50) {
++				purple++;
++			}
++		}
++		if (purple >= 5) {
++			seen_purple = true;
++			*purple_last = ty;
++		}
++		bool isgrey = grey >= 5;
++		if (isgrey && run0 < 0) {
++			run0 = ty;
++		} else if (!isgrey && run0 >= 0) {
++			(*runs)++;
++			if (seen_purple && *purple_last < run0 && ty - run0 >= 30) {
++				*out_y = (run0 + ty - 1) / 2;
++				break;
++			}
++			run0 = -1;
++		}
++	}
++	OSSafeReleaseNULL(s);
++	return *out_y > 0 ? 0 : -2;
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	sweet_fb_last_surface = get32(rec, 0x54);   /* patch 0269: the surface the nav probe reads (layer 0 of the last swap) */
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index db29f1c..6d93af1 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -394,6 +394,7 @@ public:
+ 	uint64_t fNavAboutSw0;   /* patch 0256: swap count at the first about-open tap */
+ 	uint64_t fNavAboutDs0;   /* patch 0258: distinct-frame count at the first about-open tap */
+ 	uint64_t fNavGenSw0;   /* patch 0258: swap count at the General tap */
++	int fNavGenY;   /* patch 0269: touch y of the General tap of this repetition (probe or 1900) */
+ 	uint64_t fNavGateT0, fNavGateCnt, fNavGateFlatT;   /* patch 0258: about-open gate: start (0 = idle), last seen swap count, time that count last changed (ns) */
+ 	uint64_t fNavDs0;   /* patch 0260: distinct-frame count at the start of this unlock attempt */
+ 	UInt32 fNavHomeSt, fNavPref0;   /* patch 0255: 1-3 = the app-home swipe after a Preferences launch inside the unlock window is running, 4 = done; Preferences exec count at the first unlock attempt */
+@@ -446,6 +447,7 @@ uint64_t sweet_touch_down_ns;
+ extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: swaps presented so far, written by AppleCLCD::swap */
+ extern "C" uint64_t sweet_fb_distinct_count;   /* patch 0258: distinct frames so far (SWEET FPS `distinct`), written by AppleCLCD::swap when sweetfps is on */
+ extern "C" bool sweet_fb_distinct_live(void);   /* patch 0258 */
++extern "C" int sweet_fb_probe_general(int *out_y, int *runs, int *purple_last);   /* patch 0269: General row of the Settings root list, touch y */
+ extern "C" void sweet_fb_display_state(uint64_t *vsync, uint64_t *last_swap_abs);   /* patch 0260 */
+ extern "C" uint32_t sweet_exec_pref_count;   /* patch 0255: execs of "Preferences" so far, counted in bsd/kern/kern_exec.c */
+ 
+@@ -647,6 +649,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	fNavAboutTaps = 0;
+ 	fNavAboutSw0 = 0;
+ 	fNavAboutDs0 = fNavGenSw0 = 0;
++	fNavGenY = 0;   /* patch 0269 */
+ 	fNavDs0 = 0;
+ 	fNavGateT0 = fNavGateCnt = fNavGateFlatT = 0;
+ 	fNavRng = 0x5eed1234;
+@@ -733,6 +736,18 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bool aboutAct = strcmp(act.name, "about-open") == 0;
+ 	if (st == 0 && strcmp(act.name, "general-open") == 0) {
+ 		self->fNavGenSw0 = sweet_fb_swap_count;   /* patch 0258: swaps before the General tap (the gate below counts the push from here) */
++		/* patch 0269: the General row moves with the list's resting scroll offset (nav27 r1, nav31 r1-2: the fixed 1900 hit the section gap / Screen Time) [obs]: ask the
++		 * framebuffer probe for the row centre in the last presented frame; keep 1900 with a GAP line when it finds none or an implausible one */
++		int gy = 0, gruns = 0, gpur = -1;
++		int grc = sweet_fb_probe_general(&gy, &gruns, &gpur);
++		self->fNavGenY = (grc == 0 && gy >= 700 && gy <= 2340) ? gy : 1900;
++		IOLog("SWEET NAV: general probe rep %u rc %d y %d runs %d purple_last %d -> tap 500,%d\n", self->fNavRep, grc, gy, gruns, gpur, self->fNavGenY);
++		if (self->fNavGenY == 1900) {
++			IOLog("SWEET GAP: NAV general-open: probe found no General row (rc %d y %d), tapping the calibrated 500,1900\n", grc, gy);
++		}
++	}
++	if (strcmp(act.name, "general-open") == 0 && self->fNavGenY > 0) {
++		act.y0 = self->fNavGenY;   /* patch 0269: every step of this tap uses the probed row */
+ 	}
+ 	if (aboutAct && st == 0 && self->fNavAboutTaps == 0) {
+ 		/*

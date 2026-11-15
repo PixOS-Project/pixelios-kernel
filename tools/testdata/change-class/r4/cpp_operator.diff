@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0300-sweet-x.patch b/xnu/patches/0300-sweet-x.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-sweet-x.patch
+@@ -0,0 +1,10 @@
++witness
++
++diff --git a/iokit/Kernel/IOX.cpp b/iokit/Kernel/IOX.cpp
++--- a/iokit/Kernel/IOX.cpp
+++++ b/iokit/Kernel/IOX.cpp
++@@ -1,2 +1,3 @@
++ {
+++	IOLog("x %d\n", !dev);
++ 	obj->start();
++ }

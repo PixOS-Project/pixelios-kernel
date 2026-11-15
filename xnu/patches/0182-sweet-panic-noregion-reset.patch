@@ -1,0 +1,112 @@
+SWEET no panic region (patch 0182, rule 8): the ADT has no pram node / /chosen/embedded-panic-log-size, so panic_info stays NULL (X/pexpert/arm/pe_init.c:94-158) and SavePanicInfo's `while (!panic_info || ...)` (X/osfmk/arm/model_dep.c:816) spun on every panic. Under ARM64_BOARD_CONFIG_SWEET: SavePanicInfo returns when panic_info == NULL ONLY (a region with eph_panic_log_offset == 0 keeps the stock loop); kern_dump (kdp_core.c:1316), the debug.c corefile block and both PE_update_panicheader_nestedpanic sites are skipped when panic_info is NULL; debug_log_init prints once at boot `SWEET GAP: no panic region (...); panic log not saved, panics spin|reset ... (patch 0182; real fix PR-3)` by panicDebugging. With debug=0x8 a panic after sweet_restart_start reaches sweet_halt_restart; debug=0xc (default image) still spins; earlier panics still hang. No print at panic time (kprintf_lock). The full reset-path proof with every source cite (X/ = stack before 0182) is the docstring of tools/test_0182_panic_noregion.py (moved there: validate-repo needs the diff header in the first 2048 bytes). Review docs/reviews/pr-0182-r1 (Opus, SAFE WITH CONDITIONS, F1-F7 applied). Not run on hardware.
+
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 39daaf8..a7bd417 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -813,6 +813,17 @@ SavePanicInfo(
+ 	 * and see your PC here, look down a few frames to see your
+ 	 * early-boot panic there.
+ 	 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * PixOS patch 0182: this port's ADT has no pram node / embedded-panic-log-size, so
++	 * panic_info is NULL for good and the stock loop below would spin without ever
++	 * resetting. Only the NULL case returns; a region with eph_panic_log_offset == 0
++	 * keeps the stock loop. No print here: kprintf spins on kprintf_lock without bound.
++	 */
++	if (panic_info == NULL) {
++		return;
++	}
++#endif
+ 	while (!panic_info || panic_info->eph_panic_log_offset == 0) {
+ 		// rdar://87170225 (PanicHardening: audit panic code for naked spinloops)
+ 		// rdar://88094367 (Add test hooks for panic at different stages in XNU)
+diff --git a/osfmk/kdp/kdp_core.c b/osfmk/kdp/kdp_core.c
+index 836ce71..1a9de34 100644
+--- a/osfmk/kdp/kdp_core.c
++++ b/osfmk/kdp/kdp_core.c
+@@ -1317,6 +1317,12 @@ kern_dump(enum kern_dump_type kd_variant)
+ {
+ 	static boolean_t local_dump_in_progress = FALSE, dumped_local = FALSE;
+ 	int ret = -1;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* PixOS patch 0182: do_kern_dump dereferences panic_info; none on this port. Fail (-1), print nothing (panic context, see SavePanicInfo). */
++	if (panic_info == NULL) {
++		return ret;
++	}
++#endif
+ #if KASAN
+ 	kasan_kdp_disable();
+ #endif
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..19c385c 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -465,12 +465,25 @@
+ }
+ #endif /* defined (__x86_64__) */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* PixOS patch 0182 (rule 8): print the no-panic-region GAP once (debug_log_init also runs from kdp_init). */
++static boolean_t sweet_noregion_gap_printed = FALSE;
++#endif
++
+ void
+ debug_log_init(void)
+ {
+ #if defined(__arm64__)
+ 	if (!gPanicBase) {
+ 		printf("debug_log_init: Error!! gPanicBase is still not initialized\n");
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* PixOS patch 0182 (rule 8): same condition as panic_info == NULL; panicDebugging is already set (panic_init, STARTUP_SUB_TUNABLES). */
++		if (!sweet_noregion_gap_printed) {
++			sweet_noregion_gap_printed = TRUE;
++			printf("SWEET GAP: no panic region (no pram / embedded-panic-log-size in ADT); panic log not saved, panics %s (patch 0182; real fix PR-3)\n",
++			    panicDebugging ? "spin (debug= has DB_NMI 0x4)" : "reset once /sweet-reset is set up");
++		}
++#endif
+ 		return;
+ 	}
+ 	/* Shift debug buf start location and size by the length of the panic header */
+@@ -762,7 +775,14 @@
+ 		PEHaltRestartInternal(kPEPanicBegin, panic_details);
+ 
+ 		paniclog_append_noflush("Nested panic count exceeds limit %d, machine will reset or spin\n", max_debugger_entry_count);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* PixOS patch 0182: no panic region (panic_info == NULL): PE_update_panicheader_nestedpanic asserts on it. */
++		if (panic_info != NULL) {
++			PE_update_panicheader_nestedpanic();
++		}
++#else
+ 		PE_update_panicheader_nestedpanic();
++#endif
+ 		paniclog_flush();
+ 
+ 		if (!panicDebugging) {
+@@ -1264,7 +1284,12 @@
+ 			began_writing_paniclog = TRUE;
+ 		}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* PixOS patch 0182: no panic region (panic_info == NULL): PE_update_panicheader_nestedpanic asserts on it. */
++		if (CPUDEBUGGERCOUNT > 1 && panic_info != NULL) {
++#else
+ 		if (CPUDEBUGGERCOUNT > 1) {
++#endif
+ 			/*
+ 			 * we are in a nested panic.  Record the nested bit in panic flags and do some housekeeping
+ 			 */
+@@ -1337,7 +1362,12 @@
+ 	 * Consider generating a local corefile if the infrastructure is configured
+ 	 * and we haven't disabled on-device coredumps.
+ 	 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* PixOS patch 0182: no panic region (panic_info == NULL): the corefile code below dereferences it. */
++	if (on_device_corefile_enabled() && panic_info != NULL) {
++#else
+ 	if (on_device_corefile_enabled()) {
++#endif
+ 		if (!kdp_has_polled_corefile()) {
+ 			if (debug_boot_arg & (DB_KERN_DUMP_ON_PANIC | DB_KERN_DUMP_ON_NMI)) {
+ 				paniclog_append_noflush("skipping local kernel core because core file could not be opened prior to panic (mode : 0x%x, error : 0x%x)\n",

@@ -1,0 +1,72 @@
+SWEET drift-free vsync (patch 0149, boot-arg sweetvsync_abs=0 restores the old behaviour; G-10, research 52; review docs/reviews/0149-vsync-absolute-deadline.md SAFE WITH CONDITIONS, period==0 guard + doc note applied): the emulated vsync re-armed with a relative setTimeoutUS() from inside the callback, so callback run time + timer wake latency were added to every period (g63: ~19 ms, 52-53 callbacks/s instead of 60). Arm an absolute deadline one period after the previous one (restart from now if late). No hardware access.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -275,6 +275,41 @@
+ 	return true;
+ }
+ 
++/*
++ * Patch 0149 (G-10, research 52): drift-free vsync. Re-arming with setTimeoutUS() from inside the callback adds the callback's run time and
++ * the timer wake latency to every period (g63: 19 ms instead of 16.667 ms, 52-53 callbacks/s). Arm an ABSOLUTE deadline one period after the
++ * previous deadline instead; if the callback ran late (deadline already past) restart from now. Boot-arg sweetvsync_abs=0 restores the old
++ * relative re-arm. The static state and `abs_on` belong to the single AppleCLCD instance and are only touched from its (serialized)
++ * workloop callback; the boot-arg is read once.
++ */
++static uint64_t sweet_fb_next_vsync_abs;
++static void
++sweet_fb_rearm(IOTimerEventSource *sender, uint64_t now)
++{
++	static int abs_on = -1;
++	if (abs_on < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetvsync_abs", &v, sizeof(v));
++		abs_on = v != 0;
++	}
++	if (!abs_on) {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	uint64_t period;
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
++	if (period == 0) {   /* review 0149: unreachable today, never arm a zero-length period */
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	uint64_t next = sweet_fb_next_vsync_abs ? sweet_fb_next_vsync_abs + period : now + period;
++	if (next <= now) {
++		next = now + period;
++	}
++	sweet_fb_next_vsync_abs = next;
++	sender->wakeAtTime(next);
++}
++
+ static uint64_t sweet_fb_last_vsync_ns;   /* patch 0146: host time of the last vsync callback sent to CA, for the swap-after-vsync latency */
+ 
+ void
+@@ -343,7 +378,7 @@
+ 	if (sweet_qr_hold) {
+ 		/* the QR log owns the panel: no present(), no fade (vsync notifications keep flowing) */
+ 		IOLockUnlock(fb->fLock);
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sweet_fb_rearm(sender, now);
+ 		return;
+ 	}
+ 	if (fb->fPowerOff) {
+@@ -361,7 +396,7 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sweet_fb_rearm(sender, now);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -378,7 +413,7 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sweet_fb_rearm(sender, now);
+ }
+ 
+ void

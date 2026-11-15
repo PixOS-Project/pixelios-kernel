@@ -1,17 +1,39 @@
 #!/bin/bash
 # One hardware test cycle -> ONE short report (docs/AUTOMATION.md). Progress goes to <run dir>/xrun.log, stdout is the report.
-#   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--gpu-handover] [--wlan-hold [--wlan-level 1|2]] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
+#   tools/xrun --kernel K [--adt A | --board bluejay] [--cpus N (default 8)] [--qr S|off] [--restart S] [--args "boot-args"] [--gui] [--rails] [--no-rails (rails are the default except --intent el2; sweettouch=0 drops all touch defaults)] [--gpu-handover [--gpu-clk-level 3]] [--wlan-hold [--wlan-level 1|2]] [--dvfs K0,K1,K2|read] [--no-usbnet | --usbdma]   (USB UDP log is ON by default since 2026-10-22; QR only with --qr S) (always --rw: a read-only root panics in mount(8))
 #              [--reader "qr-log.py options"]   (e.g. "--workers 3 --average 3 --tiles 1"; QL2 boot-args go in --args: sweetqr_fmt=1|2 sweetqr_ver sweetqr_ecc sweetqr_tiles sweetqr_ms sweetqr_k sweetqr_red sweetqr_fec sweetqr_hold)
 #              [--expect REGEX]... [--expect-absent REGEX]... [--duration S] [--label NAME] [--no-flash-check]
-#              [--intent gpu|timing|wlan]   (tools/run-intents.json: exit 2 before any build when the flags/boot-args that intent needs are missing or a forbidden one is present; a label implying an intent with no/none/other --intent exits 2 unless XRUN_INTENT_OK=1)
-#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]... [--overlay DIR] [--wlanfw FILE]
-#   DEFAULT END (B1, 2026-10-25): every run ends by the host. --expect patterns imply --early (stop when all are seen; --full waits for --duration instead); a run without them ends at --duration
+#              [recovery (T-322d): refused with exit 2 unless --restart S (S > 0) or --args sweetrestart=S is given, or the run plan has a line `no-recovery: <why, >= 10 chars>` (tools/run-preflight c_recovery, via --intent-check); the timer is armed in XNU, so a hang in the shim before XNU is NOT covered (PR-4 watchdog, T-5d2f)]
+#              [needs a run plan docs/runplans/<label>.md (or a plan whose first line names the label) with a "## Questions" table and every --expect/--expect-absent regex verbatim: tools/run-preflight c_runplan, AGENTS rule 9; bypass: give it on the command line, `XRUN_NO_RUNPLAN="reason >= 10 chars" tools/xrun ...` (never export it; an exported one is still accepted, printed by run-preflight and recorded as runplan_bypass); --dry-run is exempt]
+#              [checks before the build: tools/usb-port --args (SuperSpeed is the XNU gadget DEFAULT since patch 0173 / user order R27, so a USB 3 link needs no sweetusb3=1; sweetusb3=0 is an explicit opt-out: USB3 WARN on a USB 3 link + `sweetusb3=0 OPT-OUT` in the run summary (AP-177); any other sweetusb3 value than exactly 0 or 1 is exit 2; USB3 WARN for SuperSpeed on a USB 2 link, only when the gadget runs (sweetusb=2, i.e. not with --no-usbnet); exactly one 18d1 device on the bus)
+#               and tools/run-preflight --userdata-check (exit 2 unless the newest flashed-userdata.txt line is an iOS root flash; an `erased` line from tools/fboot-android
+#               or no file = Android/unknown userdata; bypass `XRUN_USERDATA_BYPASS="reason >= 10 chars" tools/xrun ...`, printed as USERDATA BYPASS and marked userdata_bypass)]
+#              [--el2-b3]   (needs --el2-trap, sweetel2=2 instead of =1, no sweetgpu*/sweetwlan*/sweetmali*/sweettouch* arg, build.sh with EL2_B3; passes --el2-b3 to build.sh)
+#              [--panic-spin "REASON"]   (T-03ff: a debug= with DB_NMI 0x4, e.g. debug=0xc, spins on the panic screen until the user resets the phone: exit 2 from the build unless this gives a reason >= 10 chars; marked panic_spin= in the run summary)
+#              [--el2-trap]   (TP-045: B2 shim = build.sh --el2-trap --boot-xnu (EL2_RESIDENT); needs --intent el2, --cpus 1, sweetel2=1 in --args and a build.sh with EL2_RESIDENT (kernel branch el2/b2-report); refused with --gpu-handover/--wlan-hold/--rails/--dvfs; exit 2 before any build/lock/phone; prints `EL2: resident ... shim sha256 H`, RESULT gets ` intent=el2`)
+#              [--pmic-src-clear]   (implies --pmic-src; ADDS the one PMIC write of research 142: writes 0 to S2MPG10 OFFSRC/PWRONSRC + S2MPG11 OFFSRC after the reads and reads them back once; boot-arg sweetpsclr=N, pmicsrc.h)   [--pmic-src]   (shim --pmic-src: READ-ONLY PMIC reset-source latches printed at boot, nothing cleared, no boot-arg; ALL-ON T-02/T-24)   [--mif-clk-level KHZ]   (implies --mif-clk; the ONE MIF request goes to this table row instead of the top row: only the 13 gs101.dtsi mif_int_map rows, else exit 2; ALL-ON T-02)   [--sweet-probe]   (shim READ-ONLY probes of research 161 + boot-arg sweetprobe=1, forwarded to build-xnu-image.sh; needs a kernel with patch 0363; LOWCLK B1-B3)   [--mif-clk | --no-mif-clk]   (T-5030: the shim asks ACPM DVFS dom 0 (MIF) for its table top row once; ON BY DEFAULT with --intent gpu (T-1499), off for every other intent; --no-mif-clk is the old-baseline opt-out)
+#              [--intent gpu|timing|wlan|el2]   (tools/run-intents.json: exit 2 before any build when the flags/boot-args that intent needs are missing or a forbidden one is present; a label implying an intent with no/none/other --intent exits 2 unless XRUN_INTENT_OK=1)
+#              [--early] [--stop-on REGEX]... [--hard-timeout S] [--lock-wait S] [--remote-reset | --no-remote-reset] [--no-camera] [--fail-on REGEX]... [--overlay DIR [--compress]] [--wlanfw FILE]   (with --intent wlan and --args sweetwlan=N, N >= 24, xrun builds the RAM-only WLANCRED credential blob from the kernel .env by itself, tools/mkwlancred.py; no flag)
+#   DEFAULT END (B1, 2026-10-25): every run ends by the host. --expect patterns imply --early (stop when all are seen; --full waits for --duration instead); a run without them ends at --duration.
+#                  With --expect-absent too (fast-loop 2026-11-09): a forbidden line ends the run at once (FAIL); after the last --expect the run waits XRUN_ABSENT_GRACE s (30) more, then stops; --full = whole --duration (soak)
 #                  (default --restart, else 300 s after fastboot boot) with the software reset; the --restart timer is only the fallback (the B2 "recovery" result of run bl2-timer was a root-mount-failure reset at +207 s, not the timer).
 #   --remote-reset  adds boot-arg sweetremote=1 (xnu patch 0100): an early stop (--early / --stop-on) then resets the phone into the bootloader over the USB link (tools/phone goto fastboot sends
 #                  UDP SWEET-RESET-BL) instead of waiting for the self-reset timer. --restart N,bootloader (timer path) lands in fastboot directly, not in recovery.
 #                  --early / --stop-on turn --remote-reset ON by default (observed working 2026-10-24, run bl1-remote3: phone in fastboot ~95 s after the stop instead of waiting ~700 s); --no-remote-reset disables it.
+#   STANDARD ROOT (user 2026-11-09): every boot's overlay = the standard copies (from the flashed image + $A/std-extras) of the files earlier overlays and
+#                  devsh pushes changed since the last flash, plus launchd.plist, then this run's --overlay on top (tools/overlay_std.py; OVERLAY STD lines in the
+#                  log and the run record; re-prepared and rebuilt under the lock when another run changed the ledger meanwhile; files an overlay ADDED are RESIDUE)
 #   --fail-on RX   (repeatable) end the run as soon as RX appears in the log and score it FAIL: a failing run no longer waits out --restart. With --early/--stop-on these default to
 #                  `Kernel trap at|panic\(cpu|panic:|Assertion failed`; --fail-on none disables the defaults.
+#   SAFETY (RULES H9, docs/SAFETY-CHECKLIST.md, user 2026-11-12): `tools/safety-check pre` after the build and BEFORE the phone lock (a FAIL refuses the run, exit 2),
+#                  `safety-check fastboot` under the lock right before the boot (bluejay, battery-voltage, storage-temperature), `safety-check monitor` from
+#                  `fastboot boot` to the end (S1 temp >= 45 C, S3 no temp row, S4 soc/vcell, S6 silent boot): a monitor stop ends the boot (report SAFETY STOP)
+#                  and parks the phone in fastboot; an S6 stop or a failed park notifies the thread at once (`safety-check notify`) and marks HUMAN-NEEDED.
+#                  --no-usbnet, --no-chg and --no-wdt (once the early watchdog is on trunk) are refused by pre: the boot could not be watched. State: $A/safety.
+#   --no-wdt       do not add the default boot-arg sweetwdt=60 (SoC watchdog, patch 0278; a hard hang then needs the restart timer or a button)
+#   --no-epoch     do not add the default boot-arg sweetepoch=<host unix seconds now> (xnu patch 0345: the phone's calendar starts at the host date instead of 1970; the value is taken when xrun builds the line, so
+#                  drift = build-to-boot delay; kernels without 0345 ignore it; an own sweetepoch= in --args is kept; not added for --intent el2)
+#   --no-chg       do not add the default boot-args sweetchgi2c=1 sweetchgicl=900 (patches 0284/0287: PixOS charges at 875 mA over USB 3 instead of draining at 500 mA)
 #   --no-camera    do not start the ESP camera capture (saves ~5 s, and works without the camera; the report then has no SCREEN line)
 #   --lock-wait S  the phone lock (tools/phone-lock, TP-020) is taken only AFTER the image is built, right before the phone is touched; wait up to S s
 #                  (queued, in arrival order) for another owner to finish, default 0 = fail at once with who holds it. Under `phone-lock run` it is already held.
@@ -20,120 +42,446 @@
 #                  reachable; else ONE report line "PHONE: still running; self-reset due in ~Ns / Power+VolDown hold". RESULT PASS + "EARLY: stopped at +Ns (full run would have waited Ms)".
 #   --hard-timeout S  cap (from xrun start) on the wait for the run, plus up to XRUN_GRACE s (default 90) when the reset was due but the phone is not back yet; default none (--duration still applies). A FAIL on timeout carries
 #                  "PHONE:" from a bounded probe (lsusb, adb get-state, fastboot product; each under its own 5-8 s timeout).
+#   tools/xrun --print-bootargs ARGS...   (host only, TP-040) print "implicit: <boot-args xrun adds itself, e.g. sweetremote=1>|none" and the exact
+#                                            "boot-args: ..." line this run would build, then exit: no run dir, build, lock or phone; no --kernel/plan/CAM_HOST needed
 #   tools/xrun --dry-run --from-dir DIR [--stop-on RX]...   rebuild the report of an existing run dir (no phone); with --stop-on, replay an early stop
 #                                            (rewrites report.txt/merged.log in DIR: copy it first if it must stay untouched)
 # Cycle: mkadt -> build-xnu-image -> [take the phone lock] -> to-fastboot -> camera/QR capture -> fboot -> wait for the self-reset -> report.
 # Exit: 0 PASS, 1 FAIL/PARTIAL, 2 ERROR.  --no-flash-check: skip the to-fastboot step (the phone is already in fastboot).
+#   SIM SEAMS (simulation framework, docs/plans/PLAN-SIM.md; env only, default behaviour unchanged, each active one prints `SIM SEAM ACTIVE: NAME=value` on stderr at start, rule 8; tools/test_sim_seams.sh):
+#              XRUN_SAFETY=CMD        a command run instead of `python3 -I tools/safety-check` (pre/fastboot/monitor/notify; sandbox only, like the five below)
+#              XRUN_SYSFS_USB=DIR     USB sysfs root instead of /sys/bus/usb/devices (xrun, tools/usb-port, tools/xrun_report.py: tools/simseams.py)
+#              XRUN_TO_FASTBOOT / XRUN_FBOOT / XRUN_BUILD / XRUN_USB_PORT / XRUN_RUN_PREFLIGHT = a command path run instead of tools/to-fastboot.sh / tools/fboot.sh / tools/build-xnu-image.sh / tools/usb-port / `python3 -I tools/run-preflight`;
+#                                     these five replace safety wrappers (AP-299): REFUSED, exit 2, unless PHONE_LOCK_DIR is a test lock (set, not the real lock, under $TMPDIR; tools/simseams.py require)
+#              PIXOS_SLEEP_SCALE=F    (decimal 0..1000, at most 30 ASCII digits/dot, default 1) multiplier for the fixed sleeps of xrun (usb wait, camera start, usbnet start, post-wait) and the poll of tools/phone / tools/phone-lock acquire; 0 = no sleep in xrun; anything else = exit 2
+#              every active seam is also marked in the run record (run.json sim_seams, xrun.log, report "SIM SEAMS ACTIVE:", rule 8)
+#              (XRUN_PHONE / XRUN_POSTMORTEM / XRUN_POSTMORTEM_TIMEOUT below are older hooks and print nothing)
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "${XRUN_SELF:-$0}"; exit 0;; esac
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Run from a private copy (autorecover 2026-11-09, run ar-b-stalltest: tools/xrun was edited in the same worktree while it ran; bash reads a
+# script as it goes and died with "syntax error near unexpected token" at the end of a 15-min run, no report). tools-sync pull or any edit
+# can do the same to any thread. The copy is unlinked at once (bash keeps the open file); XRUN_SELF carries the real path.
+if [ -z "${XRUN_SELF:-}" ]; then
+	xsnap=$(mktemp "${TMPDIR:-/tmp}/xrun.XXXXXX") && cp -- "$0" "$xsnap" || { echo "RESULT: ERROR xrun: cannot copy itself to a private file" >&2; exit 2; }
+	XRUN_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0") XRUN_SNAP=$xsnap exec bash "$xsnap" "$@"
+fi
+[ -z "${XRUN_SNAP:-}" ] || rm -f -- "$XRUN_SNAP"
+xself=$XRUN_SELF; unset XRUN_SELF XRUN_SNAP   # children (a nested xrun, phone-session) make their own copy
+cd "$(dirname "$xself")/.."
+# SIM seams: sim_warn names the active override variables (stderr) and refuses a malformed PIXOS_SLEEP_SCALE before any phone lock; sim_sleep is the ONE scaled sleep (shell twin of tools/simseams.py sleep())
+sim_warn() { local n; simseams_list=""; for n in "$@"; do [ -z "${!n:-}" ] || { echo "SIM SEAM ACTIVE: $n=${!n}" >&2; simseams_list+="${simseams_list:+,}$n"; }; done
+	[ -z "${PIXOS_SLEEP_SCALE:-}" ] || sim_scale_ok "$PIXOS_SLEEP_SCALE" || { echo "SIM SEAM ERROR: PIXOS_SLEEP_SCALE=$PIXOS_SLEEP_SCALE is not a decimal number in 0..1000 (at most 30 ASCII characters)" >&2; exit 2; }; }
+sim_scale_ok() { ( export LC_ALL=C; [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "${#1}" -le 30 ] && awk -v k="$1" 'BEGIN { exit !(k + 0 <= 1000) }' ); }   # LC_ALL=C: a fullwidth digit must not match (the Python twin rejects it)
+sim_require() { local n any=""; for n in "$@"; do [ -z "${!n:-}" ] || any=1; done   # the command seams replace safety wrappers: only in a sandbox (review xrun-seams-r1 F1, AP-299)
+	[ -z "$any" ] || python3 -I tools/simseams.py require "$@" || exit 2; }
+sim_sleep() { local t
+	[ -n "${PIXOS_SLEEP_SCALE:-}" ] || { sleep "$1"; return; }
+	t=$(LC_ALL=C awk -v s="$1" -v k="$PIXOS_SLEEP_SCALE" 'BEGIN { printf "%.6f", s * k }')
+	[ "$t" = 0.000000 ] || sleep "$t"; }
+sim_warn XRUN_SYSFS_USB XRUN_TO_FASTBOOT XRUN_FBOOT XRUN_BUILD XRUN_USB_PORT XRUN_RUN_PREFLIGHT PIXOS_SLEEP_SCALE XRUN_SAFETY
+sim_require XRUN_TO_FASTBOOT XRUN_FBOOT XRUN_BUILD XRUN_USB_PORT XRUN_RUN_PREFLIGHT XRUN_SAFETY
+usbsys=${XRUN_SYSFS_USB:-/sys/bus/usb/devices}; tofb=${XRUN_TO_FASTBOOT:-tools/to-fastboot.sh}; fbootx=${XRUN_FBOOT:-tools/fboot.sh}; bxibin=${XRUN_BUILD:-tools/build-xnu-image.sh}; usbportx=${XRUN_USB_PORT:-tools/usb-port}
+pf=(python3 -I tools/run-preflight); [ -z "${XRUN_RUN_PREFLIGHT:-}" ] || pf=("$XRUN_RUN_PREFLIGHT")
+sc=(python3 -I tools/safety-check); [ -z "${XRUN_SAFETY:-}" ] || sc=("$XRUN_SAFETY")   # RULES H9
 A=${ARTIFACTS:-$HOME/pixelios-artifacts}
 R="python3 tools/xrun_report.py"   # not -I: PIL lives in the user site-packages
-kernel=""; adt=""; board=bluejay; cpus=1; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; handover=""; wlan=""; wlanlvl=""; dvfs=()
-intent=""; lockwait=0; remote=""; noremote=0; full=0; nocam=0; failons=(); dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""; overlay=""; wlanfw=""
+kernel=""; adt=""; board=bluejay; cpus=8; qr=off; restart=""; args=""; duration=""; label=run; check=1; rw="--rw"; gui=""; usbnet="--usbnet"; usbdma=""; rails=""; handover=""; pmicsrc=""; sweetprobe=""; pmicclr=""; gpuclklvl=""; mifclevel=""; wlan=""; wlanlvl=""; dvfs=()
+cpus_set=0; nowdt=0; nochg=0; noepoch=0; intent=""; lockwait=0; remote=""; noremote=0; full=0; nocam=0; failons=(); dry=0; fromdir=""; exps=(); abs=(); stops=(); early=0; hard=""; rawexp=(); reader=""; overlay=""; compress=""; wlanfw=""; printba=0; implicit=""; el2=""; el2b3=""; spin=""; nomif=0; mifclk=""
 orig=("$@")   # the option loop below shifts "$@" away
 while [ $# -gt 0 ]; do case "$1" in
-	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
+	--kernel) kernel=$2; shift 2 ;; --adt) adt=$2; shift 2 ;; --board) board=$2; shift 2 ;; --cpus) cpus=$2; cpus_set=1; shift 2 ;;
 	--qr) qr=$2; shift 2 ;; --restart) restart=$2; shift 2 ;; --args) args=$2; shift 2 ;; --duration) duration=$2; shift 2 ;;
-	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --full) full=1; shift ;; --remote-reset) remote=1; shift ;; --no-remote-reset) noremote=1; shift ;; --fail-on) failons+=("$2"); shift 2 ;; --no-camera) nocam=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
-	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --wlan-hold) wlan=--wlan-hold; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
-	--intent) intent=$2; shift 2 ;; --dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --wlanfw) wlanfw=$2; shift 2 ;;
-	*) echo "unknown option $1 (see the header of tools/xrun)" >&2; exit 2 ;; esac; done
-if [ "$dry" = 1 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
+	--label) label=$2; shift 2 ;; --expect) exps+=("expect=$2"); rawexp+=("$2"); shift 2 ;; --stop-on) stops+=("$2"); shift 2 ;; --early) early=1; shift ;; --hard-timeout) hard=$2; shift 2 ;; --lock-wait) lockwait=$2; [[ $lockwait =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR --lock-wait needs whole seconds"; exit 2; }; shift 2 ;; --full) full=1; shift ;; --remote-reset) remote=1; shift ;; --no-remote-reset) noremote=1; shift ;; --fail-on) failons+=("$2"); shift 2 ;; --no-camera) nocam=1; shift ;; --no-wdt) nowdt=1; shift ;; --no-chg) nochg=1; shift ;; --no-epoch) noepoch=1; shift ;; --expect-absent) abs+=("expect_absent=$2"); shift 2 ;;
+	--rw) rw=--rw; shift ;; --rails) rails=--rails; shift ;; --no-rails) norails=1; shift ;; --gpu-handover) handover=--gpu-handover; shift ;; --gpu-clk-level) gpuclklvl=$2; shift 2 ;; --mif-clk-level) mifclk=--mif-clk; mifclevel=${2:?--mif-clk-level needs a MIF table row in kHz}; shift 2 ;; --mif-clk) mifclk=--mif-clk; shift ;; --sweet-probe) sweetprobe=--sweet-probe; shift ;; --pmic-src) pmicsrc=--pmic-src; shift ;; --pmic-src-clear) pmicsrc=--pmic-src; pmicclr=--pmic-src-clear; shift ;; --no-mif-clk) nomif=1; shift ;; --wlan-hold) wlan=--wlan-hold; shift ;; --wlan-level) wlanlvl=$2; shift 2 ;; --dvfs) dvfs=(--dvfs "$2"); shift 2 ;; --gui) gui=--gui; shift ;; --usbnet) usbnet=--usbnet; shift ;; --no-usbnet) usbnet=""; shift ;; --usbdma) usbnet=--usbnet; usbdma=--usbdma; shift ;; --no-flash-check) check=0; shift ;;
+	--intent) intent=$2; shift 2 ;; --dry-run) dry=1; shift ;; --from-dir) fromdir=$2; shift 2 ;; --reader) reader=$2; shift 2 ;; --overlay) overlay=$2; shift 2 ;; --compress) compress=--compress; shift ;; --wlanfw) wlanfw=$2; shift 2 ;; --print-bootargs) printba=1; shift ;; --el2-trap) el2=--el2-trap; shift ;; --el2-b3) el2b3=--el2-b3; shift ;; --panic-spin) spin=$2; shift 2 ;;
+	*) echo "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$xself" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" >&2; exit 2 ;; esac; done
+# GPU INTENT DEFAULTS (goal "GPU result is the default", sprint-gpu 2026-11-09): `tools/xrun --kernel K --intent gpu` alone reproduces the nav44 configuration
+# (docs/sprint/2026-11-08-gpu.md GOAL MET: fps-bench v2.1 fps_min 56.7). Every default is overridable (an explicit flag / boot-arg key wins) and listed on the `implicit:` line.
+# NOT defaults: the kdebug stream (sweetkdbg), the GIC probe (sweetmali bit 0x40) and the witnesses
+# (sweetpcsamp, sweetthrwait, SWEETGL_GAPT/GAPW). The Mali L2 cache (sweetmalicache 2, patch 0266) IS a default since 2026-11-10 (user OK after
+# gputest-cache1/cache2: every captured screen matches the llvmpipe reference; gpu_add below).
+gpu_add() { case " $args " in *" $1="*) ;; *) args="${args:+$args }$1=$2"; gpuimplicit="${gpuimplicit:+$gpuimplicit }$1" ;; esac; }
+# TOUCH DEFAULTS (user 2026-11-11: touch is on for every boot and intent; el2 excluded: it refuses touch args and --rails by design, TP-045).
+# Recipe = the one that answered on hardware: 20261022T195946Z-demo1b and the three 20261104T12*Z-demo-gpu-touch-wifi runs (identify 36 48, SWEET TOUCH: ev).
+# Rails (shim --touch-probe=rails, ACPM LDO25M/LDO26M): without them the FTM5 never answers (gputest-* 2026-11-10: identify 00 00, MISO low).
+# Escape: boot-arg sweettouch=0 (kernel logs a TOUCH GAP, patch 0304) = no touch args and no rails; --no-rails drops only the rails. Explicit keys win.
+# Kernel side: sweettouch defaults to 2 (patch 0088), so only the bus/clock/pad keys are passed (~100 boot-arg bytes; gpu line 870 of 1023, patch 0176).
+if [ "$intent" != el2 ] && ! [[ " $args " =~ \ sweettouch=(0|-[0-9]+)\  ]]; then
+	[ -n "$rails" ] || [ "${norails:-0}" = 1 ] || { rails=--rails; gpuimplicit="${gpuimplicit:+$gpuimplicit }--rails"; }
+	gpu_add sweettouchmux 1; gpu_add sweettouchclk 3; gpu_add sweettouchcs 1; gpu_add sweettouchpoke 'm:10c00640=0=10;d:100;m:10c0180c=5=f;'
+fi
+if [ "$intent" = gpu ]; then
+	[ -n "$handover" ] || { handover=--gpu-handover; gpuimplicit="${gpuimplicit:+$gpuimplicit }--gpu-handover"; }
+	[ -n "$gpuclklvl" ] || { gpuclklvl=1; gpuclk_dflt=1; gpuimplicit="${gpuimplicit:+$gpuimplicit }--gpu-clk-level=1"; }   # G3D 762 / G3DL2 996 MHz = stock 6a maximum (shim soc.json row 1)
+	[ ${#dvfs[@]} -gt 0 ] || { dvfs=(--dvfs "1803000,2253000,2802000"); gpuimplicit="${gpuimplicit:+$gpuimplicit }--dvfs=1803000,2253000,2802000"; }   # A55 / A76 / X1 stock 6a maxima
+	[ "$cpus_set" = 1 ] || { cpus=5; gpuimplicit="${gpuimplicit:+$gpuimplicit }--cpus=5"; }
+	[ -n "$restart" ] || { restart=640,bootloader; gpuimplicit="${gpuimplicit:+$gpuimplicit }--restart=640,bootloader"; }
+	[ -n "$duration" ] || duration=600
+	[ -n "$hard" ] || hard=700
+	[ "$full" = 1 ] || full=1
+	cpuorder=0,6,7,4,5,1,2,3   # /cpus DT order: boot A55, the two A76, the two X1 first, so cpus=5 runs on them (sprint-gpu nav19+)
+	if [ -z "$adt" ]; then gpuimplicit="${gpuimplicit:+$gpuimplicit }--adt-cpu-order=$cpuorder"; fi
+	if [ ${#stops[@]} -eq 0 ]; then stops+=('SWEET NAV: done reps 3'); fi
+	[ ${#failons[@]} -gt 0 ] || failons=('GPU GAP: PLL' 'hfs_mountroot failed' 'Kernel trap at|panic\(cpu|panic:|Assertion failed')
+	gpu_add sweetmali 1; gpu_add sweetmaliirq 1; gpu_add sweetmaliovl 1; gpu_add sweetmalipend 3; gpu_add sweetmalicache 2   # GPU L2 caching, PTE index 0 + SH 3 (patch 0266): every captured screen matches the llvmpipe reference (gputest-cache1/cache2, user OK 2026-11-10)
+	gpu_add sweetrecores 0x1e   # patch 0270: the A55 boot core (cpu0) takes interrupts and bound kernel threads only; settings-open 51.4 -> 55.0/55.5 (gputest-count4 vs count5/count6, sprint-gpu 2026-11-10)
+	gpu_add sweetfvmap 0x206a000
+	gpu_add sweetnull devd,backboardd,SpringBoard
+	gpu_add sweetenv backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/libsweetgl.dylib,SWEETGL_BOCUT=1,SWEETGL_BOPOOL=1,SWEETGL_FLUSHT=1,SWEETGL_SPLITHEAP=1,SWEETGL_OVERLAP=1
+	gpu_add sweetfps 2; gpu_add sweetpace 1; gpu_add sweetperf 1; gpu_add sweetfb_noconsole 1; gpu_add sweetfb_hz 30; gpu_add sweetsubmittm 1
+	gpu_add sweetnav 3; gpu_add sweetnavstart 130
+fi
+# ALL-ON T-02 --mif-clk-level KHZ: only a MIF table row tools/boards.py accepts; exit 2 + RESULT: ERROR before build, lock or phone
+if [ -n "$mifclevel" ]; then
+	mlerr=$(python3 "$(dirname "$xself")/boards.py" "$board" --mif-clk-level-check "$mifclevel" 2>&1 >/dev/null) || { rc=$?; [ -n "$mlerr" ] || mlerr="MIF GAP: boards.py --mif-clk-level-check failed rc=$rc with no reason"; }
+	[ -z "$mlerr" ] || { echo "$mlerr" >&2; echo "RESULT: ERROR $mlerr"; exit 2; }
+fi
+# T-a214 --gpu-clk-level: only with --gpu-handover and only a pair index tools/boards.py accepts (reason printed); exit 2 + RESULT: ERROR before build, lock or phone
+if [ -n "$gpuclklvl" ] && [ "${gpuclk_dflt:-0}" = 0 ]; then
+	glerr=""
+	[ -n "$handover" ] || glerr="--gpu-clk-level needs --gpu-handover (the shim asks the pair after the rail-on step)"
+	[ -n "$glerr" ] || glerr=$(python3 "$(dirname "$xself")/boards.py" "$board" --gpu-clk-level-check "$gpuclklvl" 2>&1 >/dev/null) || { rc=$?; [ -n "$glerr" ] || glerr="GPU GAP: boards.py --gpu-clk-level-check failed rc=$rc with no reason"; }
+	[ -z "$glerr" ] || { echo "$glerr" >&2; echo "RESULT: ERROR $glerr"; exit 2; }
+fi
+# TP-045 --el2-trap refusals: exit 2 + RESULT: ERROR before any intent check, build, lock or phone step (also under --dry-run / --print-bootargs)
+if [ -n "$el2" ] || [ -n "$el2b3" ]; then
+	el2err=""
+	[ -z "$el2b3" ] || [ -n "$el2" ] || el2err="--el2-b3 needs --el2-trap (B3 is a mode of the resident-EL2 shim)"
+	[ -z "$el2err" ] && { [ "$intent" = el2 ] || el2err="--el2-trap needs --intent el2 (so a B2 run never looks like an ordinary XNU run)"; }
+	[ -z "$el2err" ] && { [ -z "$handover" ] || el2err="--el2-trap is refused with --gpu-handover (B2 takes no companion flag, spec 3.4 (b) item 1)"; }
+	[ -z "$el2err" ] && { [ -z "$wlan" ] || el2err="--el2-trap is refused with --wlan-hold (B2 takes no companion flag)"; }
+	[ -z "$el2err" ] && { [ -z "$rails" ] || el2err="--el2-trap is refused with --rails (B2 takes no companion flag)"; }
+	[ -z "$el2err" ] && { [ -z "$pmicsrc" ] || el2err="--el2-trap is refused with --pmic-src / --pmic-src-clear (B2 takes no companion flag)"; }
+	[ -z "$el2err" ] && { [ ${#dvfs[@]} = 0 ] || el2err="--el2-trap is refused with --dvfs (B2 takes no companion flag)"; }
+	[ -z "$el2err" ] && { [ "$cpus" = 1 ] || el2err="--el2-trap needs --cpus 1 (got $cpus; spec 3.4 (b) item 5 (ii))"; }
+	[ -z "$el2err" ] && [ -n "$el2b3" ] && { [ "$(printf '%s' "$args" | LC_ALL=C tr -d '[:graph:] ' | wc -c)" = 0 ] || el2err="--el2-b3: --args may hold only printable ASCII and plain spaces (a newline/tab/NBSP hides a token from the PMU refusal; review el2-b3-design-r1 F10, xrun-el2-b3-r1 F1)"; }
+	want=1; [ -z "$el2b3" ] || want=2   # B3 (SPEC-EL2-PROXY-PROBE DRAFT 10 C9) runs with sweetel2=2, B2 with sweetel2=1
+	[ -z "$el2err" ] && { n=0; read -ra at <<< "$args"; for t in ${at[@]+"${at[@]}"}; do [[ $t != sweetel2=* ]] || { n=$((n+1)); [ "$t" = sweetel2=$want ] || el2err="--el2-trap${el2b3:+ --el2-b3}: boot-arg $t must be sweetel2=$want"; }; done
+		[ -n "$el2err" ] || [ "$n" = 1 ] || el2err="--el2-trap${el2b3:+ --el2-b3} needs exactly one sweetel2=$want in --args (found $n sweetel2= tokens)"; }
+	# B3 trap: the GPU/Wi-Fi/Mali/touch bring-ups touch the PMU page 0x17460000 (review el2-b3-design-r1 F10)
+	[ -z "$el2err" ] && [ -n "$el2b3" ] && { read -ra at <<< "$args"; for t in ${at[@]+"${at[@]}"}; do [[ $t != sweetgpu* && $t != sweetwlan* && $t != sweetmali* && $t != sweettouch* ]] || el2err="--el2-b3: boot-arg $t is refused (it touches the PMU page 0x17460000; review el2-b3-design-r1 F10)"; done; }
+	[ -z "$el2err" ] && { grep -Eq '^[[:space:]]*CFLAGS="\$CFLAGS -DEL2_RESIDENT"' shim/build.sh || el2err="--el2-trap: this checkout's shim/build.sh has no EL2_RESIDENT; merge kernel branch el2/b2-report (B2 build mode)"; }
+	[ -z "$el2err" ] && [ -n "$el2b3" ] && { grep -Eq '^[[:space:]]*CFLAGS="\$CFLAGS -DEL2_B3"' shim/build.sh || el2err="--el2-b3: this checkout's shim/build.sh has no EL2_B3; merge kernel branch el2/b3-trap (B3 build mode)"; }
+	[ -z "$el2err" ] || { echo "$el2err" >&2; echo "RESULT: ERROR $el2err"; exit 2; }
+fi
+if [ "$dry" = 1 ] && [ "$printba" = 0 ]; then [ -d "$fromdir" ] || { echo "--dry-run needs --from-dir DIR" >&2; exit 2; }; a=(); for x in ${stops[@]+"${stops[@]}"}; do a+=(--stop-on "$x"); done; exec $R report "$fromdir" ${a[@]+"${a[@]}"}; fi
 # run intent (tools/run-intents.json): refuse a run that lacks the flags/boot-args its purpose needs BEFORE it costs a phone cycle (AP-55); the label hint is a warning only
-python3 -I tools/run-preflight --intent-check "$intent" --label "$label" -- tools/xrun ${orig[@]+"${orig[@]}"} || exit 2
+[ "$printba" = 1 ] || "${pf[@]}" --intent-check "$intent" --label "$label" -- tools/xrun ${orig[@]+"${orig[@]}"} || exit 2
 # the camera step needs CAM_HOST from .env (gitignored, absent in a new worktree): fail now, before the build and the phone lock (AP-78)
-[ "$nocam" = 1 ] || [[ " $reader " == *" --esp "* ]] || python3 -I tools/envfile.py require CAM_HOST || exit 2
+[ "$printba" = 1 ] || [ "$nocam" = 1 ] || [[ " $reader " == *" --esp "* ]] || python3 -I tools/envfile.py require CAM_HOST || exit 2
 [ "$early" = 0 ] || [ ${#stops[@]} -gt 0 ] || stops=("${rawexp[@]}")
-[ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
-[ "$full" = 1 ] || [ ${#stops[@]} -gt 0 ] || [ ${#rawexp[@]} = 0 ] || { early=1; stops=("${rawexp[@]}"); }   # B1 is the default: --expect stops the run when every pattern is seen (--full keeps the old wait)
-[ "$noremote" = 1 ] || remote=1   # the host ends every run with the software reset (proven on hardware, run bl1-remote3); the timer is only the fallback
+[ "$printba" = 1 ] || [ -f "$kernel" ] || { echo "RESULT: ERROR --kernel FILE is required (got '$kernel')"; exit 2; }
+[ "$full" = 1 ] || [ ${#stops[@]} -gt 0 ] || [ ${#rawexp[@]} = 0 ] || { early=1; stops=("${rawexp[@]}"); }   # B1 is the default: --expect stops the run when every pattern is seen (--full keeps the old wait for the whole --duration)
+# fast-loop 2026-11-09 (user goal "early stop on results"): --expect-absent no longer forces the full --duration (boot-dev-0121 F2 kept it, which cost 140-660 s per Wi-Fi/BT run).
+# Instead: (a) a forbidden line ends the run at once as FAIL (waitusb checks expect_absent like --fail-on), (b) after the last --expect line the run keeps going for
+# XRUN_ABSENT_GRACE s (default 30) so a late crash still lands inside the window, (c) the report says the absent patterns were checked to +Ns only; --full = old soak.
+stopgrace=0; if [ "$early" = 1 ] && [ "$full" = 0 ] && [ ${#abs[@]} -gt 0 ]; then stopgrace=${XRUN_ABSENT_GRACE:-30}; [[ $stopgrace =~ ^[0-9]+$ ]] || { echo "RESULT: ERROR XRUN_ABSENT_GRACE needs whole seconds"; exit 2; }; fi
+[ "$noremote" = 1 ] || [ -z "$usbnet" ] || remote=1   # the host ends every run with the software reset (proven on hardware, run bl1-remote3); the timer is only the fallback
 if { [ "$early" = 1 ] || [ ${#stops[@]} -gt 0 ]; } && [ ${#failons[@]} = 0 ]; then failons=('Kernel trap at|panic\(cpu|panic:|Assertion failed'); fi
 [ "${failons[0]:-}" != none ] || failons=()
-[ -z "$remote" ] || [[ " $args " == *" sweetremote=1 "* ]] || args="${args:+$args }sweetremote=1"
+if [ -n "$remote" ] && [[ " $args " != *" sweetremote=1 "* ]]; then args="${args:+$args }sweetremote=1"; implicit="sweetremote=1"; fi
+# autorecover 2026-11-09 (user: "auto panic recovery is a must"): every boot arms the SoC watchdog (patch 0278, sweetwdt=60: a hard hang resets in ~60 s, lands in
+# recovery, tools/phone parks it in fastboot) unless the args set sweetwdt themselves or --no-wdt is given; el2 runs (cpus=1, trap sessions) are left out.
+# The software stall detector (patch 0279, sweetstall, default 20 s in the kernel) needs no boot-arg. Kernels without 0278 ignore the arg.
+if [ "$nowdt" = 0 ] && [ "$intent" != el2 ] && [[ " $args " != *" sweetwdt="* ]]; then args="${args:+$args }sweetwdt=60"; implicit="${implicit:+$implicit }sweetwdt=60"; fi
+# charging 2026-11-10 (user: "fix those issues"; docs/sprint/2026-11-10-chg.md chg-p3: -40..-98 mA at 500 mA -> +107..+205 mA at 875 mA): every boot reads the
+# MAX77759 (0284) and raises the input limit to 875 mA while a USB 3 link declaring 896 mA is configured (0287, reviews chg-0284/0287); --no-chg or own sweetchg* args opt out.
+if [ "$nochg" = 0 ] && [ "$intent" != el2 ] && [[ " $args " != *" sweetchgi2c="* ]] && [[ " $args " != *" sweetchgicl="* ]]; then args="${args:+$args }sweetchgi2c=1 sweetchgicl=900"; implicit="${implicit:+$implicit }sweetchgi2c=1 sweetchgicl=900"; fi
+# wall clock 2026-11-13 (research 47 a1, xnu patch 0345): the phone has no RTC, so the calendar is 1970 + uptime (TLS validation fails, daemons misbehave). The host date goes in as
+# sweetepoch=<unix seconds> when the line is built (kernels without 0345 ignore it); --no-epoch or an own sweetepoch= opts out. The token is always 22 characters (10 digits until 2286),
+# so the boot-line length checks (build-xnu-image.sh, resident_core.line_limit) count it like any other token; a changing value never differs between two jobs' --args (it is not in them).
+if [ "$noepoch" = 0 ] && [ "$intent" != el2 ] && [[ " $args " != *" sweetepoch="* ]]; then ep=$(date -u +%s); args="${args:+$args }sweetepoch=$ep"; implicit="${implicit:+$implicit }sweetepoch=$ep"; fi
+# review autorecover-0278 F1: the watchdog must outlast a stall panic plus its on-screen hold, or it cuts the hold short (reset into recovery mid-hold).
+# Refuse a period <= sweetstall (20) + 2 + sweetpanichold (20) + 10 before any build or phone step.
+bav() { local v; v=$(grep -o -E "(^| )$1=[0-9]+" <<< " $args" | tail -n 1 | grep -o -E '[0-9]+$'); echo "${v:-$2}"; }
+if [[ " $args " == *" sweetwdt="* ]] && [ "$(bav sweetwdt 0)" -gt 0 ] && [[ " $args " != *" sweetwdt="*",stop="* ]]; then
+	wdtmin=$(( $(bav sweetstall 20) + 2 + $(bav sweetpanichold 20) + 10 ))
+	[ "$(bav sweetwdt 0)" -gt "$wdtmin" ] || { echo "RESULT: ERROR sweetwdt=$(bav sweetwdt 0) must be > sweetstall + 2 + sweetpanichold + 10 = $wdtmin (review autorecover-0278 F1: else the watchdog resets in the middle of a panic hold)"; exit 2; }
+fi
+implicit="${gpuimplicit:+$gpuimplicit }$implicit"; implicit="${implicit% }"
+# AP-177: since R27 SuperSpeed is the XNU default (patch 0173; the default lives in XNU, xrun adds no sweetusb3 boot-arg); only an explicit sweetusb3=0 on a USB 3 link (fastboot speed >= 5000) gives 0 B of USB log; the userdata must be an iOS root, not the Android one a golden
+# run left (AP-179). Both read-only, host only, before the build and the phone lock; not for --print-bootargs (--dry-run exited above).
+# run-summary mark for the USB 3 state in tools/usb-port's output (R27): loud on an opt-out and on SuperSpeed requested on a USB 2 link; the WARN lines also go to stderr
+usb3_mark() {
+	local u=$1
+	grep '^USB3 WARN' <<< "$u" >&2 || true
+	if grep -q '^RESULT: PASS .* sweetusb3=0$' <<< "$u"; then printf ' sweetusb3=0 OPT-OUT (HS-only gadget, expect 0 B of USB log on a USB 3 link, AP-177)'; fi
+	if grep -q '^USB3 WARN: SuperSpeed requested' <<< "$u"; then printf ' USB3 WARN (SuperSpeed requested on a USB 2 link)'; fi
+}
+# what reaches XNU: build-xnu-image.sh puts sweetusb=2 (--usbnet, xrun's default) or sweetusb=0 first, then the --args words (XNU keeps the last sweetusb=), so tools/usb-port judges that string (review usb3-default-r1 F7)
+usbargs="sweetusb=$([ -n "$usbnet" ] && echo 2 || echo 0)${args:+ $args}"
+usbport=""; usbmark=""; userdata=""
+if [ "$printba" = 0 ]; then
+	# before the lock the phone may be off the bus (a previous run rebooting, XNU 05ac, queued --lock-wait): 0 devices = loud note, strict re-check after to-fastboot
+	usbport=$("$usbportx" --args "$usbargs") || { grep -q 'usbport: 0 Google' <<< "$usbport" || { printf '%s\n' "$usbport"; exit 2; }
+		echo "USBPORT NOTE: phone not on the bus before the lock; the port is checked again after to-fastboot" >&2; usbport="USBPORT NOTE: not on the bus before the lock"; }
+	usbmark=$(sed -n 's/^usb-port: //p' <<< "$usbport"); [ -n "$usbmark" ] || usbmark="USBPORT GAP: UNCHECKED before the lock (phone off the bus)"
+	usbmark="$usbmark$(usb3_mark "$usbport")"
+	userdata=$("${pf[@]}" --userdata-check) || { printf '%s\n' "$userdata"; exit 2; }   # a bypass prints USERDATA BYPASS on stderr
+fi
+# T-1499: a GPU-intent run asks MIF for its table top row by default (observed score 27 vs 16, run gputest-5030-mif); --no-mif-clk reproduces the old baseline; wlan/bt/timing intents keep theirs until they opt in with --mif-clk
+[ -z "$mifclk" ] || [ "$nomif" = 0 ] || { echo "RESULT: ERROR --mif-clk and --no-mif-clk together: pick one (the request is on by default only for --intent gpu)"; exit 2; }
+mifstate=off; [ -z "$mifclk" ] || mifstate="on (--mif-clk)"; [ -z "$mifclevel" ] || mifstate="on (--mif-clk-level $mifclevel: the MIF request is that table row, not the top row; ALL-ON T-02)"
+if [ "$intent" = gpu ] && [ -z "$mifclk" ] && [ "$nomif" = 0 ]; then mifclk=--mif-clk; mifstate="on (default for --intent gpu; --no-mif-clk turns it off)"; fi
+# T-2b87: a GPU-intent run completes Mali jobs with a 20 us busy poll by default (patch 0207 boot-arg sweetmalipoll; observed score 27 -> 38, run gputest-cced-poll20, T-cced); an explicit sweetmalipoll= in --args wins (XNU keeps the last one, so 200 = the old poll), other intents keep the XNU default
+if [ "$intent" = gpu ] && [[ " $args " != *" sweetmalipoll="* ]]; then args="${args:+$args }sweetmalipoll=20"; implicit="${implicit:+$implicit }sweetmalipoll=20"; fi
+# T-f7d7: the SWEET MEM probe (patch 0212) is off unless asked (its 64 MiB kalloc moved the Wi-Fi DMA blocks outside the G2 window); a GPU-intent run asks for it because the gputest plans expect the SWEET MEM lines; an explicit sweetmem= in --args wins
+if [ "$intent" = gpu ] && [[ " $args " != *" sweetmem="* ]]; then args="${args:+$args }sweetmem=1"; implicit="${implicit:+$implicit }sweetmem=1"; fi
+mifnote="MIF CLK: request $mifstate; witness SWEET DVFS: dom 0 get khz=<top row> when=after (xnu patch 0214); a kernel without it shows no witness"
+# the build-xnu-image.sh flags of this run, defined ONCE: the real build below and --print-bootargs (tools/run-preflight c_cmdline, TP-040) use the same array
+# user 2026-11-09 (one standard root): every boot carries the standard copies of what earlier overlays / devsh pushes changed
+# since the last flash (tools/overlay_std.py, ledger in $A/overlay-ledger); the run's own --overlay goes on top. Not for --print-bootargs.
+ovorig=$overlay; ovstd=""; ovrev=unknown; ovout=""; booted=0
+ovstd_prepare() {
+	rm -rf -- "$ovstd"; ovstd=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/ovstd.XXXXXX")
+	ovout=$(python3 -I tools/overlay_std.py prepare --overlay "${ovorig:--}" --out "$ovstd" --label "$label" --intent "$intent" --kernel "$kernel" 2>&1) \
+		|| { printf '%s\n' "$ovout" >&2; rm -rf -- "$ovstd"; echo "RESULT: ERROR overlay_std prepare failed: $(tail -n 1 <<< "$ovout")"; exit 2; }
+	printf '%s\n' "$ovout" >&2
+	ovrev=$(sed -n 's/^OVERLAY STD REV: //p' <<< "$ovout"); local d; d=$(sed -n 's/^OVERLAY STD DIR: //p' <<< "$ovout")
+	overlay=$ovorig; [ "$d" = none ] || overlay=$d
+	! grep -q '^OVERLAY STD COMPRESS: yes' <<< "$ovout" || compress=--compress; }
+[ "$printba" = 1 ] || ovstd_prepare
+set_bxi() {
+bxi=(--qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} ${overlay:+--overlay "$overlay"} ${compress:+"$compress"} ${wlanfw:+--wlanfw "$wlanfw"} ${rw:+"$rw"} ${rails:+"$rails"} ${handover:+"$handover"} ${gpuclklvl:+--gpu-clk-level "$gpuclklvl"} ${mifclk:+"$mifclk"} ${mifclevel:+--mif-clk-level "$mifclevel"} ${pmicsrc:+"$pmicsrc"} ${sweetprobe:+"$sweetprobe"} ${pmicclr:+"$pmicclr"} ${wlan:+"$wlan"} ${wlanlvl:+--wlan-level "$wlanlvl"} ${dvfs[@]+"${dvfs[@]}"} ${gui:+"$gui"} ${usbnet:+"$usbnet"} ${usbdma:+"$usbdma"} ${el2:+"$el2"} ${el2b3:+"$el2b3"} ${spin:+--panic-spin "$spin"})
+}
+set_bxi
+el2desc="resident (build.sh --el2-trap${el2b3:+ --el2-b3} --boot-xnu)"   # ONE text for the --print-bootargs line and the run-record mark (xrun-el2-b3-r1 F4)
+if [ "$printba" = 1 ]; then echo "implicit: ${implicit:-none}"; echo "$mifnote"; [ -z "$el2" ] || echo "EL2: $el2desc shim sha256 not built (dry-run)"; XNU_IMAGE_ARGS_ONLY=1 exec "$bxibin" "${bxi[@]}"; fi
 label=$(printf %s "$label" | tr -c 'A-Za-z0-9._-' _)
 D=logs/runs/$(date -u +%Y%m%dT%H%M%SZ)-$label; mkdir -p "$D/snaps" "$D/frames"; LOG=$D/xrun.log; : >"$LOG"
 secs=${restart%%,*}
 if [ -n "$duration" ]; then :; elif [ -n "$remote" ]; then duration=${secs:-300}   # the host resets at --duration (B1); the timer is the fallback
 else duration=$(( ${secs:-60} + 300 )); fi   # --no-remote-reset: wait for the timer
 . tools/plock.sh
-cap=""; usbpid=""
-stop_capture() { touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }
+cap=""; usbpid=""; wlcdir=""; wlcimg=0; monpid=""   # wlcdir = temp dir of the WLANCRED blob (tmpfs), wlcimg = 1 once an image with the blob may exist (SPEC-WIFI TRANSPORT s.3, T-2952)
+stop_capture() { safety_end; [ ! -d "$D" ] || touch "$D/stop"; [ -z "$usbpid" ] || { wait "$usbpid" 2>/dev/null || true; usbpid=""; }; [ -z "${brpid:-}" ] || { wait "$brpid" 2>/dev/null || true; brpid=""; }
 	[ -z "$cap" ] || { sleep 1; kill "$cap" 2>/dev/null || true; wait "$cap" 2>/dev/null || true; }; }
-cleanup() { stop_capture; plock_drop; }
+# T-56: the build-only exit (XRUN_BUILD_ONLY, resident G7) removed $D before this EXIT-trap call: touch only an existing $D (a failed touch = rc 1)
+# EXIT trap: the blob dir and every image copy that holds the credentials go on EVERY path, the die paths included (a killed run leaves them: xrun_report names them as SECRET GAP)
+# after a boot (also on a die path): the ledger learns what this boot's archive wrote; before the lock is dropped, so no other run prepares in between
+ovstd_record() { [ "$booted" = 1 ] || return 0; booted=0
+	python3 -I tools/overlay_std.py boot --label "$label" --run "$D" >>"$LOG" 2>&1 || echo "OVERLAY STD GAP: boot count failed (see $LOG)" | tee -a "$LOG" >&2   # fast-loop: every boot counts, overlay or not
+	[ "$ovrev" != unknown ] && [ -n "$ovstd" ] && [ -d "$overlay" ] || return 0
+	python3 -I tools/overlay_std.py record --dir "$overlay" --label "$label" --run "$D" >>"$LOG" 2>&1 || echo "OVERLAY STD GAP: ledger record failed (see $LOG)" | tee -a "$LOG" >&2; }
+# RULES H9: the safety monitor ends with the boot (until-file); bounded, then killed. stop_capture calls it first, so cleanup() (EXIT trap) ends it on every path
+safety_end() { [ -n "$monpid" ] || return 0; touch "$D/safety-end"; local _; for _ in $(seq 1 20); do kill -0 "$monpid" 2>/dev/null || break; sleep 0.25; done
+	kill "$monpid" 2>/dev/null || true; wait "$monpid" 2>/dev/null || true; monpid=""; }
+cleanup() { stop_capture; ovstd_record; plock_drop
+	[ -z "$ovstd" ] || rm -rf -- "$ovstd"
+	[ -z "$wlcdir" ] || case $wlcdir in */wlancred-*) rm -rf -- "$wlcdir" ;; esac
+	cred_clean; }
+# L-12: every image copy that holds the Wi-Fi credentials, removed before any report scans the run dir (die) and again on EXIT
+cred_clean() { [ "$wlcimg" = 0 ] || rm -f -- shim/out/shim-boot-avb.img shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img"; }
 trap cleanup EXIT
-die() { $R error "$D" "$*" || exit $?; exit 2; }
+die() { cred_clean; $R error "$D" "$*" || exit $?; exit 2; }
 tailog() { tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-200; }
 
 stopkv=(); for x in ${stops[@]+"${stops[@]}"}; do stopkv+=("stop_on=$x"); done
 for x in ${failons[@]+"${failons[@]}"}; do stopkv+=("fail_on=$x"); done
 if head=$(git rev-parse --short HEAD 2>/dev/null); then git diff --quiet HEAD || head=$head+dirty; else head=nogit; fi
 $R mark "$D" label="$label" kernel="$kernel" cpus="$cpus" qr="$qr" restart="$restart" duration="$duration" \
-	git_head="$head" t_start=@now ${remote:+remote=1} ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
+	git_head="$head" t_start=@now stop_grace="$stopgrace" ${el2:+intent=el2} ${remote:+remote=1} ${hard:+hard_timeout="$hard"} kernel_sha256="$(sha256sum "$kernel" | cut -d' ' -f1)" \
 	${stopkv[@]+"${stopkv[@]}"} ${exps[@]+"${exps[@]}"} ${abs[@]+"${abs[@]}"}
+printf '%s\n' "$usbport" "$userdata" >>"$LOG"
+$R mark "$D" usb_port="$usbmark"
+[ -z "$simseams_list" ] || { $R mark "$D" sim_seams="$simseams_list"; printf 'SIM SEAMS ACTIVE: %s (this is NOT a real-phone run)\n' "$simseams_list" >>"$LOG"; }   # rule 8: the run record names every active seam
+# R26: where the kernel was built (tools/xnu-remote-build ledger, $LOCALBUILD/built-on.tsv): offload-host | lab-host-fallback | lab-host-local | unknown (loud, not an error); in the run summary too
+xnubuild=$(tools/xnu-remote-build ledger-line "$kernel" 2>&1) || xnubuild="XNU BUILD: unknown (ledger lookup failed: ${xnubuild:0:120})"
+echo "$xnubuild"; echo "$mifnote"; $R mark "$D" xnu_build="$xnubuild"$'\n'"$mifnote"
+[ -z "${XRUN_USERDATA_BYPASS:-}" ] || $R mark "$D" userdata_bypass="$XRUN_USERDATA_BYPASS"   # rule 8: the bypass shows in the run summary
 
-if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
+if [ -n "$adt" ]; then cp "$adt" "$D/A.adt"; else python3 -I tools/mkadt.py "$D/A.adt" --board "$board" ${cpuorder:+--cpu-order "$cpuorder"} >>"$LOG" 2>&1 || die "mkadt failed: $(tailog)"; fi
 # shim/out is shared with gates and other builds of this worktree: build under its lock and boot a PRIVATE copy of the image (a gate rebuilding shim/out between build and boot made fboot refuse, 2026-10-24)
 mkdir -p shim/out
+# T-2952: SSID/PSK/IP/gateway reach the shim only as the RAM-only WLANCRED blob (SPEC-WIFI TRANSPORT s.3): never a boot-arg, never a run file; only the blob PATH is an argument
+wlcarg=(); wl=0; read -ra wat <<< "$args"; for t in ${wat[@]+"${wat[@]}"}; do case $t in sweetwlan=*) wl=${t#sweetwlan=} ;; esac; done   # the last sweetwlan= wins, as in XNU
+if [ "$intent" = wlan ] && [[ $wl =~ ^[0-9]+$ ]] && [ "$wl" -ge 24 ]; then
+	wlout=$(python3 -I tools/mkwlancred.py 2>&1 </dev/null) || die "mkwlancred failed: $(tail -n 1 <<< "$wlout" | cut -c1-200)"   # the text names a KEY, never a value
+	wlpath=$(sed -n 's/^wlancred: //p' <<< "$wlout"); [ -f "$wlpath" ] || die "mkwlancred printed no blob path"
+	wlcdir=$(dirname "$wlpath"); wlcarg=(--wlancred "$wlpath"); wlcimg=1
+	$R mark "$D" wlancred=present   # presence only, no value, no size
+fi
+build_image() {
 fw=3600; tools/phone-lock check >/dev/null 2>&1 && fw=60   # under `phone-lock run` the phone is already ours: do not hold it for an hour behind a gate
 ( flock -x -w $fw 9 || { echo "shim/out busy: a gate or build in this worktree holds shim/out/.build.lock" >&2; exit 98; }
-  tools/build-xnu-image.sh --kernel "$kernel" --adt "$D/A.adt" --qr "$qr" --cpus "$cpus" ${restart:+--restart "$restart"} ${args:+--args "$args"} ${overlay:+--overlay "$overlay"} ${wlanfw:+--wlanfw "$wlanfw"} $rw $rails $handover $wlan ${wlanlvl:+--wlan-level "$wlanlvl"} "${dvfs[@]}" $gui $usbnet $usbdma >"$D/build.out" 2>>"$LOG" 9>&- &&
-  cp shim/out/shim-boot-avb.img "$D/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img.meta.json" ) 9>shim/out/.build.lock \
+  "$bxibin" --kernel "$kernel" --adt "$D/A.adt" "${bxi[@]}" ${wlcarg[@]+"${wlcarg[@]}"} >"$D/build.out" 2>>"$LOG" 9>&- &&
+  cp shim/out/shim-boot-avb.img "$D/shim-boot-avb.img" && cp shim/out/shim-boot-avb.img.meta.json "$D/shim-boot-avb.img.meta.json" &&
+  { [ "$wlcimg" = 0 ] || rm -f shim/out/shim-boot-avb.img shim/out/shim-boot-avb.img.meta.json; } ) 9>shim/out/.build.lock \
 	|| die "build-xnu-image failed: $(tail -n 3 "$D/build.out" "$LOG" | tr '\n' ' ' | cut -c1-200)"
+}
+build_image
+# XRUN_BUILD_ONLY=1 (tools/resident guard G7, user 2026-11-12): build + check the image exactly as this boot would, then stop BEFORE the phone lock
+if [ -n "${XRUN_BUILD_ONLY:-}" ]; then echo "RESULT: PASS build-only label=$label boot-args: $(sed -n 's/^boot-args: //p' "$D/build.out" | head -n 1 | cut -c1-300)"; rm -rf -- "$D"; exit 0; fi
+[ -z "$ovout" ] || { printf '%s\n' "$ovout" >>"$LOG"; $R mark "$D" overlay_std="$(grep '^OVERLAY STD' <<< "$ovout" | grep -v -E '^OVERLAY STD (REV|DIR):' | tr '\n' ' ' | cut -c1-600)"
+	! grep -q '^OVERLAY STD FIRST BOOT:' <<< "$ovout" || $R mark "$D" first_boot_after_flash="$(grep -m1 '^OVERLAY STD FIRST BOOT:' <<< "$ovout" | grep -o 'boot [0-9]*' | head -1)"
+	! grep -q '^OVERLAY STD JOBS:' <<< "$ovout" || $R mark "$D" overlay_jobs="$(grep -m1 '^OVERLAY STD JOBS:' <<< "$ovout" | cut -c1-400)"; }
 [ -z "$usbnet" ] || $R mark "$D" usbnet=1
+[ -z "$el2" ] || $R mark "$D" el2="$el2desc shim sha256 $(sha256sum "$D/shim-boot-avb.img" | cut -c1-16)"
 $R mark "$D" boot_args="$(sed -n 's/^boot-args: //p' "$D/build.out")"
+# T-03ff (rule 8): a deliberate panic spin and a kernel without the panic hold both show in the run summary
+[ -z "$spin" ] || $R mark "$D" panic_spin="$spin"
+grep -q '^RECOVERY GAP' "$LOG" 2>/dev/null && $R mark "$D" recovery_gap="$(sed -n 's/^RECOVERY GAP: //p' "$LOG" | head -1 | cut -c1-200)"
 cp "$D/shim-boot-avb.img.meta.json" "$D/image.meta.json" 2>/dev/null || true
 
+# RULES H9 (user 2026-11-12): the pre-boot items of docs/SAFETY-CHECKLIST.md on the built image, BEFORE the phone lock (a FAIL is refused here, never inside a hold)
+safety_pre() { local o rc=0
+	o=$("${sc[@]}" pre --kernel "$kernel" --bootline "$(sed -n 's/^boot-args: //p' "$D/build.out" | tail -n 1)" --build-out "$D/build.out" --image "$D/shim-boot-avb.img" \
+		--usbnet "$([ -n "$usbnet" ] && echo 1 || echo 0)" --profile "$label" --state "$A/safety" 2>&1) || rc=$?
+	printf '%s\n' "$o" >>"$LOG"; grep -E '^SAFETY (FAIL|PASS pre S5: WARN)' <<< "$o" >&2 || true
+	[ "$rc" = 0 ] || die "$(grep -m1 '^SAFETY FAIL' <<< "$o" || echo "SAFETY FAIL pre: rc=$rc $(tail -n 1 <<< "$o")")"
+	$R mark "$D" safety_pre="$(grep '^RESULT:' <<< "$o" | tail -n 1)$(! grep -q '^SAFETY PASS pre S5: WARN' <<< "$o" || echo ' (S5 WARN: no early watchdog in this kernel, S6 armed)')"; }
+$R mark "$D" safety=required
+safety_pre
+safety_notify() { local o; o=$("${sc[@]}" notify --line "$label: $1 (run dir $D)" --state "$A/safety" 2>&1) || o="NOTIFY FAIL: safety-check notify failed: $o"; printf '%s\n' "$o" | tee -a "$LOG" >&2; }
 # the image is ready: only now take the phone (builds and gates never hold the lock)
+[ -z "${XRUN_NO_RUNPLAN:-}" ] || $R mark "$D" runplan_bypass="$XRUN_NO_RUNPLAN"   # AGENTS rule 8/9: the bypass shows in the run summary (marked before the lock: a lock-busy exit still records it, r2 N2)
+[ -z "${PREFLIGHT_GATE_WAIVER:-}" ] || $R mark "$D" gate_waiver="$PREFLIGHT_GATE_WAIVER"   # rule 8: a user-waived gate stamp shows in the run summary (tools/run-preflight c_gate)
+# T-f32e (user order 2026-11-02): which gate admitted this RAM boot, in the run summary (rule 8); a missing answer is `unknown`, never silent
+admitted=$("${pf[@]}" --gate-check ram 2>/dev/null | sed -n 's/^RESULT: PASS gate.*admitted-by=\([a-z]*\).*$/\1/p' | tail -n 1) || admitted=
+$R mark "$D" admitted_by="${admitted:-unknown}"
 plock_take xrun "$lockwait" || die "phone lock busy: $PLOCK_MSG"
+# the ledger may have changed while this run waited (another run's overlay, a flash): prepare again and rebuild the image under the lock
+if [ "$ovrev" != unknown ] && ! python3 -I tools/overlay_std.py check --rev "$ovrev" >>"$LOG" 2>&1; then
+	ovstd_prepare 2>>"$LOG"; set_bxi; build_image; printf '%s\n' "$ovout" >>"$LOG"; $R mark "$D" overlay_std_rebuilt=1; safety_pre   # new image: new pre stamp
+fi
 $R mark "$D" t_start=@now   # --hard-timeout counts from here, not from the start of a (possibly long) wait for the phone lock
 if [ "$check" = 1 ]; then
 	# we own the phone now: after a previous run it is off the bus for a while while it reboots; wait (bounded) before asking for a button hold
-	uw=${XRUN_USB_WAIT:-120}; [[ $uw =~ ^[0-9]+$ ]] || uw=120
-	for _ in $(seq 1 "$uw"); do grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor && break; sleep 1; done
-	grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor || die "no Google USB device (18d1) appeared within ${uw} s: needs Power+VolDown hold"
-	tools/to-fastboot.sh 120 >>"$LOG" 2>&1 || {
+	# 2026-11-09 (ovstd-check): the previous holder released while its phone was still resetting (older phone-lock without the park); the reset
+	# took longer than 120 s, so wait up to 300 s for the bootloader/Android (18d1) OR a running iOS/shim gadget (1209), which to-fastboot converges
+	uw=${XRUN_USB_WAIT:-300}; [[ $uw =~ ^[0-9]+$ ]] || uw=300
+	for _ in $(seq 1 "$uw"); do grep -qsx -e 18d1 -e 1209 "$usbsys"/*/idVendor && break; sim_sleep 1; done
+	grep -qsx -e 18d1 -e 1209 "$usbsys"/*/idVendor || die "no Google USB device (18d1) appeared within ${uw} s (and no iOS gadget 1209): needs Power+VolDown hold"
+	"$tofb" 200 >>"$LOG" 2>&1 || {
 		if grep -q REFUSED "$LOG"; then die "device is not bluejay (to-fastboot refused): $(tailog)"; fi
 		die "needs Power+VolDown hold (phone not reachable by fastboot/adb)"; }
 fi
+# r1 F1/F2: both checks again while holding the lock, for EVERY run (--no-flash-check too): a queued run must not boot XNU on a userdata or a port that changed while it waited
+userdata=$("${pf[@]}" --userdata-check) || { printf '%s\n' "$userdata" >>"$LOG"; die "$(tail -n 1 <<< "$userdata")"; }
+printf '%s\n' "$userdata" >>"$LOG"
+# user 2026-11-10: a stand-in setting the flashed root carries (bluetoothd defaults, ...) is a GAP in EVERY run summary, read from the image itself (tools/root_gaps.py)
+rootimg=$(sed -n 's/^RESULT: PASS userdata [0-9a-f]\{64\} [^ ]* //p' <<< "$userdata" | tail -n 1)
+if [ -n "$rootimg" ] && [ -f "$rootimg" ]; then rootgaps=$(python3 -I tools/root_gaps.py "$rootimg" 2>&1); printf '%s\n' "$rootgaps" >>"$LOG"; rootgaps=$(sed -n '/ GAP: /p' <<< "$rootgaps")
+else rootgaps="ROOT GAP: the flashed root image is not known here (userdata check named '${rootimg:-nothing}'): its stand-in settings are not listed"; echo "$rootgaps" >>"$LOG"; fi
+[ -z "$rootgaps" ] || $R mark "$D" root_gaps="$rootgaps"
+if usbport=$("$usbportx" --args "$usbargs"); then
+	usbmark=$(sed -n 's/^usb-port: //p' <<< "$usbport")
+	usbmark="$usbmark$(usb3_mark "$usbport")"
+elif [ "$check" = 0 ] && grep -q 'usbport: 0 Google' <<< "$usbport"; then   # --no-flash-check: the phone may legitimately be elsewhere; loud, not silent (r1 F8)
+	echo "USBPORT GAP: phone not on the bus after the lock (--no-flash-check): the link speed was NOT checked" >&2; usbmark="USBPORT GAP: UNCHECKED (--no-flash-check, phone off the bus)"
+else printf '%s\n' "$usbport" >>"$LOG"; die "$(tail -n 1 <<< "$usbport")"; fi
+printf '%s\n' "$usbport" >>"$LOG"
+$R mark "$D" usb_port="$usbmark"
+# RULES H9: fresh readings under the lock (bluejay, fastboot battery-voltage, storage-temperature) and the S2/S4 state rules again (a queued run waited)
+fbo=$("${sc[@]}" fastboot --state "$A/safety" 2>&1) || { printf '%s\n' "$fbo" >>"$LOG"; die "$(grep -m1 '^SAFETY FAIL' <<< "$fbo" || echo "SAFETY FAIL fastboot: $(tail -n 1 <<< "$fbo")") (refused; the phone stays in fastboot)"; }
+printf '%s\n' "$fbo" >>"$LOG"; $R mark "$D" safety_fastboot="$(tail -n 1 <<< "$fbo")"
 
 if [ "$nocam" = 0 ]; then
-PYTHONPATH="$A/pylib" python3 tools/qr-log.py --esp --keep-going --follow --out "$D/snaps" --save-dir "$D/frames" --save-every 4 --until-file "$D/stop" $reader >"$D/capture.log" 2>&1 &
+PYTHONPATH="$A/pylib" python3 tools/qr-log.py --esp --keep-going --follow --out "$D/snaps" --save-dir "$D/frames" --save-every 4 ${usbnet:+--nav-log "$D/usbnet.log" --nav-dir "$D/frames/nav"} --until-file "$D/stop" $reader >"$D/capture.log" 2>&1 &
 cap=$!
-sleep 4
+sim_sleep 4
 kill -0 "$cap" 2>/dev/null || { cap=""; die "camera capture died at start: $(tail -n 2 "$D/capture.log" | tr '\n' ' ' | cut -c1-200)"; }
+# item 7 (2026-11-09): alternate the camera exposure (aec_value 180/400 every 8 s, restored at the end) so the saved frames read both
+# white and dark pages; only with the QR reader off (exposure changes would hurt QR decoding). XRUN_CAM_BRACKET=0 turns it off.
+if [ "${XRUN_CAM_BRACKET:-1}" != 0 ] && [ "$qr" = off ]; then python3 -I tools/cam_bracket.py --until-file "$D/stop" --log "$D/frames/exposure.tsv" >>"$D/capture.log" 2>&1 & brpid=$!; fi
 fi
 
 if [ -n "$usbnet" ]; then
 	# root-free UDP listener (stops on $D/stop); the interface address needs the user's one sudo line
 	python3 -I tools/usbnet-log.py --out "$D/usbnet.log" --until-file "$D/stop" --quiet >"$D/usbnet.out" 2>&1 &
 	usbpid=$!
-	sleep 1; kill -0 "$usbpid" 2>/dev/null || { usbpid=""; die "usbnet listener died (port 5140 busy?): $(tail -n 2 "$D/usbnet.out" | tr '\n' ' ')"; }
+	sim_sleep 1; kill -0 "$usbpid" 2>/dev/null || { usbpid=""; die "usbnet listener died (port 5140 busy?): $(tail -n 2 "$D/usbnet.out" | tr '\n' ' ')"; }
 	echo "USBNET: run once the phone enumerates (needs root): $(tools/sweet-usbnet.sh --stage)" | tee -a "$LOG" >&2
 fi
 $R mark "$D" t_boot=@now
-tools/fboot.sh --expect xnu --max-age-min $(( lockwait / 60 + 30 )) "$D/shim-boot-avb.img" >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
+booted=1   # from here the overlay archive may reach userdata (also when fboot fails late): cleanup records it if the kernel logged `SWEET DEV: copy`
+# RULES H9: the live monitor runs from right before `fastboot boot` to the end of the boot; its stop file ends the wait (waitusb prints SAFETY)
+rm -f "$D/safety-stop" "$D/safety-end"
+"${sc[@]}" monitor --log "$D/usbnet.log" --state "$A/safety" --stop "$D/safety-stop" --until "$D/safety-end" --t-boot "$(date +%s)" --sysfs "$usbsys" >"$D/safety-monitor.log" 2>&1 & monpid=$!
+sim_sleep 0.5; kill -0 "$monpid" 2>/dev/null || { monpid=""; die "SAFETY FAIL MON: the safety monitor died at start: $(tail -n 2 "$D/safety-monitor.log" | tr '\n' ' ' | cut -c1-200)"; }
+$R mark "$D" safety_monitor_pid="$monpid"
+"$fbootx" --expect xnu ${spin:+--panic-spin "$spin"} --max-age-min $(( lockwait / 60 + 30 )) "$D/shim-boot-avb.img" >>"$LOG" 2>&1 || die "fboot refused/failed: $(tailog)"
 rm -f "$D/shim-boot-avb.img"   # 64 MiB per run; the meta stays
 tb=$(date +%s)
 echo "booted; waiting up to ${duration}s" >>"$LOG"
-how=$($R waitusb "$D" || true)
-sleep 3
+how=$($R waitusb "$D" || { rc=$?; echo "xrun GAP: xrun_report waitusb failed rc=$rc: no stop answer" | tee -a "$LOG" >&2; })
+safety_end; cat "$D/safety-monitor.log" >>"$LOG" 2>/dev/null || true
+[ "$how" = SAFETY ] || [ ! -s "$D/safety-stop" ] || $R mark "$D" safety_stop="$(head -c 400 "$D/safety-stop") (seen after the wait ended: $how)"
+sim_sleep 3
 $R mark "$D" t_end=@now
-stop_capture; cap=""   # the phone lock stays held until exit: the EARLY/TIMEOUT recovery below still talks to the phone
+[ -z "$cap" ] || { sleep 1; kill "$cap" 2>/dev/null || true; wait "$cap" 2>/dev/null || true; }; cap=""   # camera off now; the usbnet listener stays on through the reset (review F4: it logs "SWEET RESTART: sync done"); the phone lock stays held until exit: the EARLY/TIMEOUT recovery below still talks to the phone
 # bounded probe: every call has its own timeout (never a bare fastboot call)
 probe() { local u a f
 	u=$(timeout 5 lsusb 2>/dev/null | awk '{print $6}' | grep -E '^(18d1|05ac)' | tr '\n' ' ')
 	a=$(timeout 8 adb get-state 2>&1 | head -1 | cut -c1-60)
 	f=$(timeout 8 fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
 	echo "usb ids [${u:-none}] adb [${a:-no answer}] fastboot product [${f:-no answer}]"; }
+# research 59 item 7: a run that ends with the phone in recovery (run E, 2026-10-26) is moved to fastboot here, while xrun still holds the phone lock.
+# Acts ONLY when `tools/phone state` says recovery (that state is reported only for a bluejay, tools/phone:540); fastboot/absent/ios/other = no call.
+# Prints recovered | recover-failed | nothing. XRUN_PHONE overrides the tool (host fixture tools/test_xrun_recover.py; no adb/fastboot there).
+recover_recovery() { local ph=${XRUN_PHONE:-tools/phone} st
+	st=$(timeout 30 "$ph" state 2>&1 | sed -n 's/^RESULT:.*state=\([a-z-]*\).*/\1/p' | tail -1)
+	[ "$st" = recovery ] || return 0
+	# research 75 rank 4: read-only post-reset evidence (adb getprop/dmesg, redacted) BEFORE goto moves the phone on; never blocks the recovery, but its
+	# outcome is always in the log (rule 8): a FAIL/ERROR/timeout is a POSTMORTEM line, not silence. XRUN_POSTMORTEM overrides the tool (host fixture).
+	# Probe output goes to the log behind a "  | " prefix, so no phone text (getprop values, dmesg) can pose as a RESULT or "<AREA> GAP:" line (review xrun-postmortem-r1 F2).
+	# XRUN_POSTMORTEM_TIMEOUT: host test only (r1 F3).
+	local pm pmr; pm=${XRUN_POSTMORTEM:-tools/phone-postmortem}
+	pmr=$(timeout "${XRUN_POSTMORTEM_TIMEOUT:-120}" "$pm" 2>&1 | sed -u 's/^/  | /' | tee -a "$LOG" | sed -n 's/^  | \(RESULT:.*\)/\1/p' | tail -1); pmr=${pmr:-RESULT: FAIL no RESULT line (timeout or crash)}
+	echo "POSTMORTEM $pmr" >>"$LOG"
+	# a postmortem that did not PASS is a counted gap on the run's RESULT line (xrun_report GAP_ANY: "<AREA> GAP: " at line start)
+	case $pmr in "RESULT: PASS"*) ;; *) echo "POSTMORTEM GAP: no post-reset evidence: ${pmr#RESULT: }" >>"$LOG" ;; esac
+	local n0 seg; n0=$(wc -l <"$LOG")
+	if timeout 200 "$ph" goto fastboot --timeout 180 >>"$LOG" 2>&1; then
+		# rule 8: a goto that printed a timeout / FAIL on the way (2026-10-27 g97: "Timeout exceeded", RESULT: FAIL, then PASS) is not a clean recovery
+		seg=$(tail -n +$((n0+1)) "$LOG" | grep -a -m1 -E 'Timeout exceeded|^RESULT: FAIL|NEED USER')
+		if [ -n "$seg" ]; then echo "recovered-after-timeout"; else echo recovered; fi
+	else echo recover-failed; fi; }
 case "$how" in
 EARLY) # every stop pattern seen: recover the phone if it can be reached, else say so in one line
 	el=$(( $(date +%s) - tb )); left=$(( ${secs:-0} - el ))
-	if { [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; } && timeout 120 tools/to-fastboot.sh 90 >>"$LOG" 2>&1; then
-		$R mark "$D" phone="back in fastboot (stopped early${remote:+, software reset over the USB link})"
-	elif [ -n "$remote" ] || grep -qsx 18d1 /sys/bus/usb/devices/*/idVendor; then $R mark "$D" phone="to-fastboot failed${remote:+ after the software reset request} (see xrun.log); check tools/phone-state before a Power+VolDown hold"
+	# waitusb prints EARLY for a stop pattern AND for the B1 host end (--duration up, phone still in iOS: run.json host_end); only the first is "early" (21j, dk-0181 2026-10-29)
+	ended="stopped early"; ! grep -qs '"host_end": *"1"' "$D/run.json" || ended="full --duration, ended by the host"
+	if { [ -n "$remote" ] || grep -qsx 18d1 "$usbsys"/*/idVendor; } && timeout 220 "$tofb" 180 >>"$LOG" 2>&1; then
+		$R mark "$D" phone="back in fastboot ($ended${remote:+, software reset over the USB link})"
+	elif [ -n "$remote" ] || grep -qsx 18d1 "$usbsys"/*/idVendor; then
+		rec=$(recover_recovery)
+		case "$rec" in
+		recovered) $R mark "$D" phone="back in fastboot (was in recovery after the stop, tools/phone goto fastboot)" ;;
+		recovered-after-timeout) $R mark "$D" phone="back in fastboot, BUT the first goto fastboot attempt timed out / failed (xrun.log: Timeout exceeded, RESULT: FAIL) before the retry passed; check cable/phone" ;;
+		*) $R mark "$D" phone="to-fastboot failed${remote:+ after the software reset request}${rec:+, recovery to fastboot failed} (see xrun.log); check tools/phone state before a Power+VolDown hold" ;;
+		esac
 	else $R mark "$D" phone="still running; self-reset due in ~$(( left > 0 ? left : 0 ))s / Power+VolDown hold"; fi ;;
-TIMEOUT) $R mark "$D" phone="$(probe)" ;;
+SAFETY) # RULES H9: the monitor stopped the boot. S6 (silent/hung phone): tell the user at once, then try the park; any failed park: tell the user
+	why=$(head -c 400 "$D/safety-stop" 2>/dev/null); hn=""; echo "$why" | tee -a "$LOG" >&2
+	case $why in *"SAFETY FAIL S6"*) hn=$why; safety_notify "$why" ;; esac
+	if { [ -n "$remote" ] || grep -qsx 18d1 "$usbsys"/*/idVendor; } && timeout 220 "$tofb" 180 >>"$LOG" 2>&1; then
+		$R mark "$D" phone="back in fastboot (safety stop${remote:+, software reset over the USB link})"
+	else rec=$(recover_recovery)
+		case "$rec" in
+		recovered*) $R mark "$D" phone="back in fastboot (safety stop; the phone was in recovery, tools/phone goto fastboot)" ;;
+		*) $R mark "$D" phone="safety stop: park FAILED (to-fastboot${rec:+, $rec}): $(probe)"; [ -n "$hn" ] || { hn="park to fastboot failed after: $why"; safety_notify "$hn"; } ;;
+		esac
+	fi
+	[ -z "$hn" ] || $R mark "$D" human_needed="$hn (phone may need Power+VolDown)" ;;
+TIMEOUT) rec=$(recover_recovery); $R mark "$D" phone="${rec:+$rec: }$(probe)" ;;
+DONE) # T-2cec, T-35ba: a reset that came back in recovery (panic, WDT, timer) also rests in fastboot; adb needs a moment after the usb id, so retry while the state is not yet recovery
+	if grep -qs '"usb_back_id": *"18d1:d001"' "$D/run.json"; then
+		rec=""; for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do rec=$(recover_recovery); [ -n "$rec" ] && break; sim_sleep 5; done
+		case "$rec" in
+		recovered) $R mark "$D" phone="back in fastboot (the reset landed in recovery, tools/phone goto fastboot)" ;;
+		recovered-after-timeout) $R mark "$D" phone="back in fastboot, BUT the first goto fastboot attempt timed out / failed (xrun.log) before the retry passed; check cable/phone" ;;
+		recover-failed) $R mark "$D" phone="recovery to fastboot failed (see xrun.log); check tools/phone state before a Power+VolDown hold" ;;
+		*) echo "XRUN GAP: the reset came back as 18d1:d001 but tools/phone never said recovery in 60 s: $(probe)" >>"$LOG"; $R mark "$D" phone="not moved to fastboot: $(probe)" ;;
+		esac
+	fi ;;
 esac
+stop_capture
 rc=0; $R report "$D" || rc=$?
+# GPU intent epilogue: the nav score and the frame-time witness (gpu-fps-bench v2.1, the goal number) of this run, into the run dir and the log
+if [ "$intent" = gpu ] && [ -f "$D/usbnet.log" ]; then
+	{ tools/gpu-nav-score "$D" --frames "$D/frames/nav" | tee "$D/gpu-nav.txt"; tools/gpu-fps-bench "$D" --rows --json "$D/fps-bench.json" | tee "$D/fps-bench.txt"; } 2>&1 | tee -a "$LOG" | tail -n 30 || true
+fi
 $R prune "$D" || true
 exit $rc

@@ -1,0 +1,8 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,3 +10,4 @@
+ 	foo();
+ #endif
++	printf("x");
+ 	write32(a, 1);

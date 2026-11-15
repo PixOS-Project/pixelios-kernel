@@ -1,0 +1,37 @@
+sweet-publish-iortc (boot-speed, docs/research/47-iortc-wait.md option a0): publish the IORTC resource from the platform expert so
+IOKitInitializeTime's waitForService(resourceMatching("IORTC"), 30 s) returns at once instead of timing out (30.003 s gap in run bs-q2,
+research 45 s2). There is NO real RTC: nothing reads one, getGMTTimeOfDay stays the IOPlatformExpert default (returns 0), so the
+calendar is still 1970 + uptime, exactly as after the timeout today (osfmk/kern/clock.c clock_initialize_calendar, research 47 s1).
+Boot-arg sweetiortc=0 skips the publish (the 30 s wait comes back) for an A/B run. Default (no boot-arg) = publish.
+Facts, read from source (xnu-8796.141.3): the only waiter is IOKitInitializeTime (iokit/Kernel/IOStartIOKit.cpp:73-91, called from
+bsd_init bsd/kern/bsd_init.c:688; the return value is ignored). PE_init_iokit -> StartIOKitMatching (osfmk/kern/startup.c:689,
+pexpert/arm/pe_init.c:382) registers the root nub, i.e. platform matching starts about 100 lines of kernel_bootstrap_thread BEFORE
+bsd_init (startup.c:790). waitForMatchingServiceWithToken first looks for an existing matched service, otherwise sets a matched
+notification and sleeps with the timeout (iokit/Kernel/IOService.cpp:6444-6552); so the wait ends whether publishResource runs
+before the wait (found) or during it (notification wakes it). Matching is asynchronous (matching thread), so which one happens is
+decided by the run log (SWEET: platform expert registered vs "using N buffer headers").
+publishResource sets the property on IOResources and registerService()s it (iokit/Kernel/IOService.cpp:4903-4917, research 47).
+Not verified on hardware.
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -33,6 +33,20 @@
+ 	}
+ 	sweet_restart_start();
+ 	registerService();
++	{
++		/*
++		 * IORTC (patch 0123, research 47): no RTC exists on this port. Publishing the resource only ends the
++		 * 30 s waitForService in IOKitInitializeTime; the calendar stays 1970 + uptime. sweetiortc=0 keeps the wait.
++		 */
++		uint32_t iortc = 1;
++		(void)PE_parse_boot_argn("sweetiortc", &iortc, sizeof(iortc));
++		if (iortc != 0) {
++			publishResource("IORTC");
++			IOLog("SWEET RTC: published IORTC resource, no time source (calendar 1970 + uptime)\n");
++		} else {
++			IOLog("SWEET RTC: sweetiortc=0, IORTC not published (30 s wait stays)\n");
++		}
++	}
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""gate-lint-first: run the formal gate's seconds-long lint steps on a checkout BEFORE a gate slot is spent (AP-278, R42 2nd occurrence).
+
+  tools/gate-lint-first [--repo DIR] [--list]
+
+Runs, in DIR (default: the repository this tool lives in), every row of DIR/tools/gate-lint-steps.tsv (fallback: this tool's own table, with a
+NOTE line) in table order: inputs, validate, mutant-needles, boot-markers, lint-silent, consumed, rules, census, public-split. The table is the
+single source; tools/test_gate_lint_first.py checks that each `gate = step` row is the same `step B <name> <command>` line of tools/check-all.sh.
+A row `needs FILE CMD` whose FILE is not in DIR is printed `SKIP name (no tool)`, never silently dropped. A SKIP is not a PASS: it is counted
+apart in the RESULT line (skipped=N).
+census: `tools/tool-census --check` exits 0 on a super-callers drift and only prints super_new=N / super_stale=N in its RESULT tail; here N>0
+is printed as `WARN census ...` (the formal gate itself passes on it: tool-census W26 decision); GATE_LINT_CENSUS_STRICT=1 makes it a
+failure `CENSUS DRIFT: run tools/tool-census --write` (the watcher's audit).
+Output: one line per step `PASS|FAIL|SKIP name Ns`; then
+  RESULT: PASS gate-lint-first steps=N [skipped=K]
+  RESULT: FAIL gate-lint-first failed=NAME[,NAME] first="<first output line of the first failing step>"
+The "first line" is the first output line that names a failure (FAIL, ERROR, MISSING, UNCONSUMED, DRIFT, HIT), else the first non-empty line.
+Every step runs with a timeout (GATE_LINT_TIMEOUT, default 120 s); a timeout is a FAIL. All steps run even after a failure, so one pass names
+every failing step. Exit 0 PASS / 1 FAIL / 2 usage or unreadable table. No network, no device. Stamp (T-f32e, user order 2026-11-02): a finished run writes
+DIR/shim/out/lint-first.result = `LINT-FIRST PASS|FAIL <short HEAD>[+dirty] steps=N skipped=K` (the file is gitignored; a write failure is
+printed `LINT-FIRST GAP`); tools/run-preflight c_gate reads it as the first half of the quick admission of a RAM-boot phone run
+(the other half: the quick gate's own GATE PASS <HEAD> quick: line). Nothing else is written.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os, re, shlex, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FAILWORD = re.compile(r"FAIL|ERROR|MISSING|UNCONSUMED|DRIFT|HIT")
+DRIFT = re.compile(r"\b(super_new|super_stale)=([0-9]+)")
+
+
+def load_table(path):
+    rows = []
+    for n, line in enumerate(open(path, encoding="utf-8"), 1):
+        line = line.rstrip("\n")
+        if not line.strip() or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) != 3 or not f[0] or not f[2]:
+            raise ValueError("%s:%d: want 3 TAB columns name, gate, command" % (path, n))
+        rows.append((f[0], f[1], f[2]))
+    return rows
+
+
+def first_line(text):
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    for x in lines:
+        if FAILWORD.search(x):
+            return x
+    return lines[0] if lines else "(no output)"
+
+
+def run_step(repo, name, cmd, timeout):
+    """Returns (verdict, seconds, first_line): verdict PASS|FAIL|SKIP."""
+    argv = shlex.split(cmd)
+    if argv and argv[0] == "needs":
+        if len(argv) < 3:
+            return "FAIL", 0, "bad table row: needs without FILE and command"
+        if not os.path.exists(os.path.join(repo, argv[1])):
+            return "SKIP", 0, "(no tool)"
+        argv = argv[2:]
+    t = time.monotonic()
+    try:
+        p = subprocess.run(argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "FAIL", time.monotonic() - t, "timeout after %ds" % timeout
+    except OSError as e:
+        return "FAIL", time.monotonic() - t, "cannot run %s: %s" % (argv[0], e)
+    dt = time.monotonic() - t
+    if p.returncode != 0:
+        return "FAIL", dt, first_line(p.stdout) if p.stdout.strip() else "rc=%d (no output)" % p.returncode
+    if name == "census":
+        bad = [m.group(0) for m in DRIFT.finditer(p.stdout) if int(m.group(2)) > 0]
+        if bad:
+            msg = "CENSUS DRIFT: run tools/tool-census --write (%s)" % ", ".join(bad)
+            if os.environ.get("GATE_LINT_CENSUS_STRICT") == "1":
+                return "FAIL", dt, msg
+            return "PASS", dt, "WARN " + msg
+    return "PASS", dt, ""
+
+
+def head_tag(repo):
+    """`<short HEAD>` or `<short HEAD>+dirty` (tracked or untracked changes, the same rule as shim/out/gate.result); None when not a git checkout."""
+    h = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    if h.returncode != 0:
+        return None
+    st = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=normal"], capture_output=True, text=True)
+    return h.stdout.strip() + ("+dirty" if st.returncode != 0 or st.stdout.strip() else "")
+
+
+def write_stamp(repo, verdict, ran, skipped):
+    """shim/out/lint-first.result (see the module docstring). Never silent (rule 8): a failure to write prints a GAP line."""
+    tag = head_tag(repo)
+    if tag is None:
+        print("LINT-FIRST GAP: %s is not a git checkout, no stamp written" % repo)
+        return
+    path = os.path.join(repo, "shim", "out", "lint-first.result")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("LINT-FIRST %s %s steps=%d skipped=%d\n" % (verdict, tag, ran, skipped))
+    except OSError as e:
+        print("LINT-FIRST GAP: cannot write %s: %s" % (path, e))
+
+
+def main(argv):
+    repo = os.path.dirname(HERE)
+    lst = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--repo" and i + 1 < len(argv):
+            repo = argv[i + 1]
+            i += 2
+        elif a == "--list":
+            lst = True
+            i += 1
+        else:
+            print("usage: tools/gate-lint-first [--repo DIR] [--list]")
+            print("RESULT: ERROR gate-lint-first usage: unknown argument %r" % a)
+            return 2
+    repo = os.path.abspath(repo)
+    if not os.path.isdir(repo):
+        print("RESULT: ERROR gate-lint-first no such directory %s" % repo)
+        return 2
+    table = os.path.join(repo, "tools", "gate-lint-steps.tsv")
+    if not os.path.isfile(table):
+        table = os.path.join(HERE, "gate-lint-steps.tsv")
+        print("NOTE: %s/tools/gate-lint-steps.tsv missing, using this tool's table %s" % (repo, table))
+    try:
+        rows = load_table(table)
+    except (OSError, ValueError) as e:
+        print("RESULT: ERROR gate-lint-first table: %s" % e)
+        return 2
+    if not rows:
+        print("RESULT: ERROR gate-lint-first table %s has no rows" % table)
+        return 2
+    if lst:
+        for name, gate, cmd in rows:
+            print("%s\t%s\t%s" % (name, gate, cmd))
+        print("RESULT: PASS gate-lint-first list=%d" % len(rows))
+        return 0
+    try:
+        timeout = int(os.environ.get("GATE_LINT_TIMEOUT", "120"))
+    except ValueError:
+        print("RESULT: ERROR gate-lint-first GATE_LINT_TIMEOUT is not an integer")
+        return 2
+    failed, firsts, skipped, ran = [], [], 0, 0
+    for name, _gate, cmd in rows:
+        verdict, dt, first = run_step(repo, name, cmd, timeout)
+        if verdict == "SKIP":
+            skipped += 1
+            print("SKIP %s (no tool)" % name)
+            continue
+        ran += 1
+        print("%s %s %ds" % (verdict, name, int(dt + 0.5)))
+        if verdict == "PASS" and first:
+            print("  %s: %s" % (name, first))
+        if verdict == "FAIL":
+            failed.append(name)
+            firsts.append(first)
+            print("  %s: %s" % (name, first))
+    write_stamp(repo, "FAIL" if failed else "PASS", ran, skipped)
+    if failed:
+        print('RESULT: FAIL gate-lint-first failed=%s first="%s"' % (",".join(failed), firsts[0].replace('"', "'")[:200]))
+        return 1
+    print("RESULT: PASS gate-lint-first steps=%d%s" % (ran, " skipped=%d" % skipped if skipped else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

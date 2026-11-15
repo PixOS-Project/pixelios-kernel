@@ -1,0 +1,229 @@
+diff --git a/shim/sweet_wlan_g2.h b/shim/sweet_wlan_g2.h
+index 94ffd411..6d74d881 100644
+--- a/shim/sweet_wlan_g2.h
++++ b/shim/sweet_wlan_g2.h
+@@ -114,7 +114,7 @@
+ #define SWG_E_BATCH      16u            /* ring-2 items judged per batch: more than 8 event buffers + ack + completion + one DS request can ever be pending [decision] */
+ #define SWG_E_CLMCHUNK   1400u          /* L22c (T-0f36): bytes of CLM per clmload request, MAX_CHUNK_LEN [src 108 s.9.1: LC fwil_types.h:185, BW bwfmreg.h:795] */
+ #define SWG_E_CLMMAX     12u            /* L22c: chunks at most (the packed blob 15,932 B = 11 x 1400 + 532 is 12); more is a STOP, the glue list has no more [src 108 s.9.1] */
+-#define SWG_E_MAX_CLM    48u            /* L22c: event items consumed per boot at most under sweetwlan=24. The 12 chunks + clmload_status + country add 14 requests = 28 ring-0 items; 97 - (64 - 48) + 28 + 12 DS items = 121 < 128 (ring-0 depth), the 64 of the other levels would reach 137 and wrap [computed] */
++#define SWG_E_MAX_CLM    48u            /* L22c: event items consumed per boot at most under sweetwlan=24. The 12 chunks + clmload_status + country add 14 requests = 28 ring-0 items; 97 - (64 - 48) + 28 + 12 DS items = 121 < 128 (ring-0 depth), the 64 of the other levels would reach 137 and hit the ring-0 post guard (a hard STOP) [computed] */
+ #define SWG_E_PAYW       355u           /* words of the payload shadow: the longest payload is a clmload chunk, 8 ("clmload" NUL) + 12 (wl_dload_data header) + 1400 = 1420 B = 355 words (L22c); before it the 86 B escan = 22 words [src 108 s.9.1] */
+ #define SWG_E_FRAME      72u            /* Ethernet (14) + bcm ether header (10) + wl_event_msg (48), the event data follows [src 72 Q1 table: BW bwfmreg.h:750-790; BE:74-87] */
+ #define SWG_E_ETYPE      0x886Cu        /* ethertype of a BCM event frame, frame +12 big endian [src BW bwfmreg.h:781, bwfm.c:2372] */
+@@ -2493,7 +2493,7 @@ swg_e_idle(struct swg_wx *x)
+ static int
+ swg_e_call(struct swg_wx *x, uint32_t cmd, const char *what, const char *name, const uint8_t *arg, uint32_t argn, uint32_t wlen, int soft, uint32_t nrsp, uint8_t *rsp, int repost, struct swd4b_ioctl_d2h *cmo, struct swg_ew *sc)
+ {
+-	uint8_t b[4u * SWG_E_PAYW];
++	static uint8_t b[4u * SWG_E_PAYW];      /* static, not on the kernel stack (review T-4adb-hwwrite-r1 C2): G2 is single-threaded and runs once per boot (sw_hw is static for the same reason) */
+ 	struct swg_eio io;
+ 	const uint32_t c = x->ncpl, tr = SWG_E_TRANS0 + x->ereq;       /* c >= 2 here: L18 and L20 were completions 0 and 1 (swg_e) */
+ 	uint32_t w = 0, waited = 0, e = 0, spent = 0, buf;
+diff --git a/shim/sweet_wlan_g2e.h b/shim/sweet_wlan_g2e.h
+index 672959f7..676ab17f 100644
+--- a/shim/sweet_wlan_g2e.h
++++ b/shim/sweet_wlan_g2e.h
+@@ -137,12 +137,13 @@ swg_e_l22(struct swg_wx *x, int clm)
+ 
+ /* L22c (sweetwlan=24, T-0f36; layout and order 108 s.9): the packed CLM blob as clmload chunks, then clmload_status, then country XZ, all inside L22 before its WLC_UP. Each request is SET_VAR/GET_VAR through swg_e_call (soft: a non-zero completion status is judged here).
+  * clmload chunk = name "clmload" NUL (8 B) + wl_dload_data { u16 flag = 0x1000 | DL_BEGIN 2 (first) | DL_END 4 (last), u16 dload_type 2 (CLM), u32 len, u32 crc 0, data[len] } with len 1400 for all but the last [src 108 s.9.1: WI:719-750, LC common.c:108-129, BW bwfm.c:3161-3175].
+- * Every refusal is a WIFI GAP and a soft stop (SWG_E_STOP): a missing blob, more than SWG_E_CLMMAX chunks, a chunk whose completion status is non-zero (clmload_status is read and printed first), clmload_status non-zero or short, country refused. 0 = done or soft stop; negative = stopped */
++ * Every refusal is a WIFI GAP and a soft stop (SWG_E_STOP): a missing blob, more than SWG_E_CLMMAX chunks, a chunk whose completion status is non-zero (its status comes from its own completion; clmload_status is read only after the last chunk, the glue list has no request after a refused one), clmload_status non-zero or short, country refused. 0 = done or soft stop; negative = stopped */
+ static int
+ swg_e_l22c(struct swg_wx *x)
+ {
+ 	static const uint8_t xz[12] = { 'X', 'Z', 0, 0, 0, 0, 0, 0, 'X', 'Z', 0, 0 };    /* wl_country_t: country_abbrev "XZ", rev 0, ccode "XZ" [src 108 s.9.3: WI:1817-1830, S1 bcm4389-dhd_linux.c:12278-12290; rev 0 is U-CL2] */
+-	uint8_t ch[12u + SWG_E_CLMCHUNK], rsp[4];
++	static uint8_t ch[12u + SWG_E_CLMCHUNK];  /* static, not on the kernel stack (review T-4adb-hwwrite-r1 C2): G2 is single-threaded and runs once per boot (sw_hw is static for the same reason) */
++	uint8_t rsp[4];
+ 	struct swd4b_ioctl_d2h cm;
+ 	uint32_t n, nch, len, flag, st;
+ 	int ex;
+@@ -151,11 +152,11 @@ swg_e_l22c(struct swg_wx *x)
+ 		SWG_E_STOP(x, "no CLM blob (absent or failed the glue CRC)");
+ 		return 0;
+ 	}
+-	nch = (x->in.clmlen + SWG_E_CLMCHUNK - 1u) / SWG_E_CLMCHUNK;
+-	if (nch > SWG_E_CLMMAX) {
++	if (x->in.clmlen > SWG_E_CLMMAX * SWG_E_CLMCHUNK) {       /* before the division: a length near 2^32 must not wrap nch to 0 */
+ 		SWG_E_STOP(x, "CLM blob %u B is more than %u chunks", x->in.clmlen, SWG_E_CLMMAX);
+ 		return 0;
+ 	}
++	nch = (x->in.clmlen + SWG_E_CLMCHUNK - 1u) / SWG_E_CLMCHUNK;
+ 	for (n = 0; n < nch; n++) {
+ 		len = x->in.clmlen - n * SWG_E_CLMCHUNK < SWG_E_CLMCHUNK ? x->in.clmlen - n * SWG_E_CLMCHUNK : SWG_E_CLMCHUNK;
+ 		flag = 0x1000u | (n == 0u ? 0x2u : 0u) | (n == nch - 1u ? 0x4u : 0u);
+@@ -171,16 +172,7 @@ swg_e_l22c(struct swg_wx *x)
+ 		}
+ 		printf("SWEET WLAN: L22c clmload chunk %u of %u: flag %#x len %u, status %d\n", n + 1u, nch, flag, len, (int)cm.status);
+ 		if (cm.status != 0) {
+-			const int cst = (int)cm.status;       /* the chunk's own status: the GET below overwrites cm */
+-
+-			memset(rsp, 0, sizeof rsp);
+-			ex = swg_e_call(x, SWD4B_WLC_GET_VAR, "WLC_GET_VAR clmload_status", "clmload_status", NULL, 4u, 15u + 4u, 1, 4u, rsp, 1, &cm, NULL);
+-			if (ex != 0 || x->d4dstop) {
+-				return ex;
+-			}
+-			st = cm.resp_len >= 4u ? swd4b_get32(rsp) : 0xFFFFFFFFu;
+-			printf("SWEET WLAN: L22c clmload_status after the refused chunk %u: %u (answer %u B)\n", n + 1u, st, cm.resp_len);
+-			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, cst);
++			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, (int)cm.status);
+ 			return 0;
+ 		}
+ 	}
+diff --git a/shim/wlan_g2_host_test.c b/shim/wlan_g2_host_test.c
+index 11ddc863..61f1763e 100644
+--- a/shim/wlan_g2_host_test.c
++++ b/shim/wlan_g2_host_test.c
+@@ -1478,7 +1478,7 @@ scan_save_log(const char *name)
+ static void
+ scan_run(struct swd_plan *p, struct swg_wx *x, int lv, int *rc, const char *name)
+ {
+-	if (strcmp(name, "main") == 0 || strcmp(name, "rxoff") == 0 || strcmp(name, "l22") == 0 || strcmp(name, "ds") == 0 || strcmp(name, "ds0") == 0 || strcmp(name, "cap") == 0 || strcmp(name, "lifo") == 0 || strcmp(name, "clm") == 0) {
++	if (strcmp(name, "main") == 0 || strcmp(name, "rxoff") == 0 || strcmp(name, "l22") == 0 || strcmp(name, "ds") == 0 || strcmp(name, "ds0") == 0 || strcmp(name, "cap") == 0 || strcmp(name, "lifo") == 0 || strcmp(name, "clm") == 0 || strcmp(name, "clmref") == 0) {
+ 		dump_label = name;      /* with G2_DUMP_STORES=1 the stores of these cases are printed for the glue replay (tools/test_wlan_wr_mutants.py SCAN24_LABELS) */
+ 	}
+ 	d4d_run(p, x, lv, IO_BOTH, 0, 0, rc);
+@@ -2358,14 +2358,14 @@ clm_tests(struct swd_plan *p)
+ 	CHECK(rc == 0 && x.d4dstop && ge.nclm == 0u && ge.up == 0u && has("WIFI GAP: scan CLM blob 16801 B is more than 12 chunks x1 [high]\n"));
+ 	clm_case(p, &x, clm_blob, 16800u, &rc, "clm12max");
+ 	CHECK(rc == 0 && !x.d4dstop && ge.nclm == 12u && ge.clen[11] == 1400u && ge.cflag[11] == 0x1004u);
+-	/* (refused chunk) the 5th chunk completes with status -23: clmload_status is read (once), the run stops, no further chunk, no country, no UP */
++	/* (refused chunk) the 5th chunk completes with status -23: the run stops at once (T-4adb-hwwrite-r1 C1: the glue list has no clmload_status after a refused chunk, so none is read), no further chunk, no country, no UP */
+ 	gd_arm();
+ 	ge.clmref = 5u;
+ 	ge.clmst = 9u;
+ 	tclm = clm_blob;
+ 	tclmlen = 15932u;
+ 	scan_run(p, &x, 24, &rc, "clmref");
+-	CHECK(rc == 0 && x.d4dstop && ge.nclm == 5u && ge.nclmst == 1u && ge.nctry == 0u && ge.up == 0u && ge.nescan == 0u && has("SWEET WLAN: L22c clmload_status after the refused chunk 5: 9 (answer 4 B)\n") && has("WIFI GAP: scan clmload chunk 5 refused, status -23 x1 [high]\n"));
++	CHECK(rc == 0 && x.d4dstop && ge.nclm == 5u && ge.nclmst == 0u && ge.nctry == 0u && ge.up == 0u && ge.nescan == 0u && has("WIFI GAP: scan clmload chunk 5 refused, status -23 x1 [high]\n"));
+ 	/* (clmload_status) non-zero after the last chunk: gap, no country, no UP */
+ 	gd_arm();
+ 	ge.clmst = 7u;
+diff --git a/tools/test_wlan_wr_mutants.py b/tools/test_wlan_wr_mutants.py
+index a25eeddc..de059b36 100644
+--- a/tools/test_wlan_wr_mutants.py
++++ b/tools/test_wlan_wr_mutants.py
+@@ -2042,7 +2042,7 @@ def glue_function_text():
+ _STREAMS = None
+ 
+ 
+-SCAN24_LABELS = ["main", "rxoff", "l22", "ds", "ds0", "lifo", "cap", "clm"]      # review 0174-w-d4e-scan24-l21-hwwrite-r1 finding 2: the L21-L23 host-test cases whose store streams are replayed through the glue (host test order)
++SCAN24_LABELS = ["main", "rxoff", "l22", "ds", "ds0", "lifo", "cap", "clm", "clmref"]      # review 0174-w-d4e-scan24-l21-hwwrite-r1 finding 2: the L21-L23 host-test cases whose store streams are replayed through the glue (host test order)
+ 
+ 
+ def g2_store_streams():
+@@ -2085,7 +2085,7 @@ def streams_c():
+     out = ["struct rs { int host; uint32_t a, v; };", "static const unsigned long long rs_pa = 0x%xull;" % pa]
+     for i, (_l, _r, st) in enumerate(sets):
+         out.append("static const struct rs rs_%d[] = { %s };" % (i, ", ".join("{ %d, 0x%x, 0x%x }" % (1 if h else 0, a, v) for h, a, v in st)))
+-    out.append("static const struct { const char *label; unsigned rounds, n; const struct rs *s; int d4b; } rsets[] = { %s };" % ", ".join('{ "%s", %d, %d, rs_%d, %d }' % (l, r, len(st), i, 11 if l == "clm" else 10 if l in SCAN24_LABELS else 7) for i, (l, r, st) in enumerate(sets)))
++    out.append("static const struct { const char *label; unsigned rounds, n; const struct rs *s; int d4b; } rsets[] = { %s };" % ", ".join('{ "%s", %d, %d, rs_%d, %d }' % (l, r, len(st), i, 11 if l in ("clm", "clmref") else 10 if l in SCAN24_LABELS else 7) for i, (l, r, st) in enumerate(sets)))
+     out.append("static const unsigned nrsets = %d;" % len(sets))
+     return "\n".join(out)
+ 
+@@ -4287,8 +4287,8 @@ E_G2_ROWS = [
+     _em("L22c: chunk size 1401", "#define SWG_E_CLMCHUNK   1400u", "#define SWG_E_CLMCHUNK   1401u"),
+     _em("L22c: 11 chunks at most", "#define SWG_E_CLMMAX     12u ", "#define SWG_E_CLMMAX     11u "),
+     _em("L22c: 13 chunks at most", "#define SWG_E_CLMMAX     12u ", "#define SWG_E_CLMMAX     13u "),
+-    _em("L22c: more than the chunk limit not refused", "	if (nch > SWG_E_CLMMAX) {", "	if (0) {"),
+-    _em("L22c: exactly the chunk limit refused", "	if (nch > SWG_E_CLMMAX) {", "	if (nch >= SWG_E_CLMMAX) {"),
++    _em("L22c: more than the chunk limit not refused", "	if (x->in.clmlen > SWG_E_CLMMAX * SWG_E_CLMCHUNK) {", "	if (0) {"),
++    _em("L22c: exactly the chunk limit refused", "	if (x->in.clmlen > SWG_E_CLMMAX * SWG_E_CLMCHUNK) {", "	if (x->in.clmlen >= SWG_E_CLMMAX * SWG_E_CLMCHUNK) {"),
+     _em("L22c: no blob not refused", "	if (x->in.clm == NULL || x->in.clmlen == 0u) {", "	if (0) {"),
+     _em("L22c: empty blob not refused", "	if (x->in.clm == NULL || x->in.clmlen == 0u) {", "	if (x->in.clm == NULL) {"),
+     _em("L22c: chunk count rounds down", "	nch = (x->in.clmlen + SWG_E_CLMCHUNK - 1u) / SWG_E_CLMCHUNK;", "	nch = x->in.clmlen / SWG_E_CLMCHUNK;"),
+@@ -4310,9 +4310,9 @@ E_G2_ROWS = [
+     _em("L22c: chunk payload length", '"clmload", ch, 12u + len, 8u + 12u + len, 1, 0u, NULL, 1, &cm, NULL);', '"clmload", ch, 12u + len, 8u + 12u + len + 1u, 1, 0u, NULL, 1, &cm, NULL);'),
+     _em("L22c: chunk argument length", '"clmload", ch, 12u + len, 8u + 12u + len, 1, 0u, NULL, 1, &cm, NULL);', '"clmload", ch, 11u + len, 8u + 12u + len, 1, 0u, NULL, 1, &cm, NULL);'),
+     _em("L22c: chunk is a GET", 'ex = swg_e_call(x, SWD4B_WLC_SET_VAR, "WLC_SET_VAR clmload",', 'ex = swg_e_call(x, SWD4B_WLC_GET_VAR, "WLC_SET_VAR clmload",'),
+-    _em("L22c: refused chunk goes on", "		if (cm.status != 0) {\n			const int cst", "		if (0) {\n			const int cst"),
+-    _em("L22c: refused chunk reads no clmload_status", '			ex = swg_e_call(x, SWD4B_WLC_GET_VAR, "WLC_GET_VAR clmload_status", "clmload_status", NULL, 4u, 15u + 4u, 1, 4u, rsp, 1, &cm, NULL);\n			if (ex != 0 || x->d4dstop) {\n				return ex;\n			}\n			st =', "			st ="),
+-    _em("L22c: refused chunk is no stop", '			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, cst);', "			(void)cst;"),
++    _em("L22c: refused chunk goes on", "		if (cm.status != 0) {\n			SWG_E_STOP(x, \"clmload chunk", "		if (0) {\n			SWG_E_STOP(x, \"clmload chunk"),
++    # "L22c: refused chunk reads no clmload_status" dropped: review T-4adb-hwwrite-r1 C1 removed that GET (the glue list has no request after a refused chunk)
++    _em("L22c: refused chunk is no stop", '			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, (int)cm.status);', "			(void)0;"),
+     _em("L22c: clmload_status non-zero accepted", "	if (cm.status != 0 || cm.resp_len < 4u || st != 0u) {", "	if (cm.status != 0 || cm.resp_len < 4u) {"),
+     _em("L22c: clmload_status completion status ignored", "	if (cm.status != 0 || cm.resp_len < 4u || st != 0u) {", "	if (cm.resp_len < 4u || st != 0u) {"),
+     _em("L22c: clmload_status answer of 3 B read", "	st = cm.resp_len >= 4u ? swd4b_get32(rsp) : 0xFFFFFFFFu;\n	printf(\"SWEET WLAN: L22c clmload_status %u", "	st = swd4b_get32(rsp);\n	printf(\"SWEET WLAN: L22c clmload_status %u"),
+diff --git a/xnu/patches/0174-sweet-wlan-g2-first-dma.patch b/xnu/patches/0174-sweet-wlan-g2-first-dma.patch
+index 269af1d9..cb0ec479 100644
+--- a/xnu/patches/0174-sweet-wlan-g2-first-dma.patch
++++ b/xnu/patches/0174-sweet-wlan-g2-first-dma.patch
+@@ -1831,7 +1831,7 @@ new file mode 100644
+ +#define SWG_E_BATCH      16u            /* ring-2 items judged per batch: more than 8 event buffers + ack + completion + one DS request can ever be pending [decision] */
+ +#define SWG_E_CLMCHUNK   1400u          /* L22c (T-0f36): bytes of CLM per clmload request, MAX_CHUNK_LEN [src 108 s.9.1: LC fwil_types.h:185, BW bwfmreg.h:795] */
+ +#define SWG_E_CLMMAX     12u            /* L22c: chunks at most (the packed blob 15,932 B = 11 x 1400 + 532 is 12); more is a STOP, the glue list has no more [src 108 s.9.1] */
+-+#define SWG_E_MAX_CLM    48u            /* L22c: event items consumed per boot at most under sweetwlan=24. The 12 chunks + clmload_status + country add 14 requests = 28 ring-0 items; 97 - (64 - 48) + 28 + 12 DS items = 121 < 128 (ring-0 depth), the 64 of the other levels would reach 137 and wrap [computed] */
+++#define SWG_E_MAX_CLM    48u            /* L22c: event items consumed per boot at most under sweetwlan=24. The 12 chunks + clmload_status + country add 14 requests = 28 ring-0 items; 97 - (64 - 48) + 28 + 12 DS items = 121 < 128 (ring-0 depth), the 64 of the other levels would reach 137 and hit the ring-0 post guard (a hard STOP) [computed] */
+ +#define SWG_E_PAYW       355u           /* words of the payload shadow: the longest payload is a clmload chunk, 8 ("clmload" NUL) + 12 (wl_dload_data header) + 1400 = 1420 B = 355 words (L22c); before it the 86 B escan = 22 words [src 108 s.9.1] */
+ +#define SWG_E_FRAME      72u            /* Ethernet (14) + bcm ether header (10) + wl_event_msg (48), the event data follows [src 72 Q1 table: BW bwfmreg.h:750-790; BE:74-87] */
+ +#define SWG_E_ETYPE      0x886Cu        /* ethertype of a BCM event frame, frame +12 big endian [src BW bwfmreg.h:781, bwfm.c:2372] */
+@@ -4210,7 +4210,7 @@ new file mode 100644
+ +static int
+ +swg_e_call(struct swg_wx *x, uint32_t cmd, const char *what, const char *name, const uint8_t *arg, uint32_t argn, uint32_t wlen, int soft, uint32_t nrsp, uint8_t *rsp, int repost, struct swd4b_ioctl_d2h *cmo, struct swg_ew *sc)
+ +{
+-+	uint8_t b[4u * SWG_E_PAYW];
+++	static uint8_t b[4u * SWG_E_PAYW];      /* static, not on the kernel stack (review T-4adb-hwwrite-r1 C2): G2 is single-threaded and runs once per boot (sw_hw is static for the same reason) */
+ +	struct swg_eio io;
+ +	const uint32_t c = x->ncpl, tr = SWG_E_TRANS0 + x->ereq;       /* c >= 2 here: L18 and L20 were completions 0 and 1 (swg_e) */
+ +	uint32_t w = 0, waited = 0, e = 0, spent = 0, buf;
+@@ -4937,7 +4937,7 @@ diff --git a/bsd/dev/sweet_wlan_g2e.h b/bsd/dev/sweet_wlan_g2e.h
+ new file mode 100644
+ --- /dev/null
+ +++ b/bsd/dev/sweet_wlan_g2e.h
+-@@ -0,0 +1,286 @@
++@@ -0,0 +1,278 @@
+ +/* L21: the 7 further response buffers (ids 5..11, slots 1..7) and 7 further event buffers (ids 0x21..0x27, slots 1..7), then ONE read-only watch of ring 2: events are consumed (their re-post waits), anything else is a soft stop */
+ +static int
+ +swg_e_l21(struct swg_wx *x)
+@@ -5077,12 +5077,13 @@ new file mode 100644
+ +
+ +/* L22c (sweetwlan=24, T-0f36; layout and order 108 s.9): the packed CLM blob as clmload chunks, then clmload_status, then country XZ, all inside L22 before its WLC_UP. Each request is SET_VAR/GET_VAR through swg_e_call (soft: a non-zero completion status is judged here).
+ + * clmload chunk = name "clmload" NUL (8 B) + wl_dload_data { u16 flag = 0x1000 | DL_BEGIN 2 (first) | DL_END 4 (last), u16 dload_type 2 (CLM), u32 len, u32 crc 0, data[len] } with len 1400 for all but the last [src 108 s.9.1: WI:719-750, LC common.c:108-129, BW bwfm.c:3161-3175].
+-+ * Every refusal is a WIFI GAP and a soft stop (SWG_E_STOP): a missing blob, more than SWG_E_CLMMAX chunks, a chunk whose completion status is non-zero (clmload_status is read and printed first), clmload_status non-zero or short, country refused. 0 = done or soft stop; negative = stopped */
+++ * Every refusal is a WIFI GAP and a soft stop (SWG_E_STOP): a missing blob, more than SWG_E_CLMMAX chunks, a chunk whose completion status is non-zero (its status comes from its own completion; clmload_status is read only after the last chunk, the glue list has no request after a refused one), clmload_status non-zero or short, country refused. 0 = done or soft stop; negative = stopped */
+ +static int
+ +swg_e_l22c(struct swg_wx *x)
+ +{
+ +	static const uint8_t xz[12] = { 'X', 'Z', 0, 0, 0, 0, 0, 0, 'X', 'Z', 0, 0 };    /* wl_country_t: country_abbrev "XZ", rev 0, ccode "XZ" [src 108 s.9.3: WI:1817-1830, S1 bcm4389-dhd_linux.c:12278-12290; rev 0 is U-CL2] */
+-+	uint8_t ch[12u + SWG_E_CLMCHUNK], rsp[4];
+++	static uint8_t ch[12u + SWG_E_CLMCHUNK];  /* static, not on the kernel stack (review T-4adb-hwwrite-r1 C2): G2 is single-threaded and runs once per boot (sw_hw is static for the same reason) */
+++	uint8_t rsp[4];
+ +	struct swd4b_ioctl_d2h cm;
+ +	uint32_t n, nch, len, flag, st;
+ +	int ex;
+@@ -5091,11 +5092,11 @@ new file mode 100644
+ +		SWG_E_STOP(x, "no CLM blob (absent or failed the glue CRC)");
+ +		return 0;
+ +	}
+-+	nch = (x->in.clmlen + SWG_E_CLMCHUNK - 1u) / SWG_E_CLMCHUNK;
+-+	if (nch > SWG_E_CLMMAX) {
+++	if (x->in.clmlen > SWG_E_CLMMAX * SWG_E_CLMCHUNK) {       /* before the division: a length near 2^32 must not wrap nch to 0 */
+ +		SWG_E_STOP(x, "CLM blob %u B is more than %u chunks", x->in.clmlen, SWG_E_CLMMAX);
+ +		return 0;
+ +	}
+++	nch = (x->in.clmlen + SWG_E_CLMCHUNK - 1u) / SWG_E_CLMCHUNK;
+ +	for (n = 0; n < nch; n++) {
+ +		len = x->in.clmlen - n * SWG_E_CLMCHUNK < SWG_E_CLMCHUNK ? x->in.clmlen - n * SWG_E_CLMCHUNK : SWG_E_CLMCHUNK;
+ +		flag = 0x1000u | (n == 0u ? 0x2u : 0u) | (n == nch - 1u ? 0x4u : 0u);
+@@ -5111,16 +5112,7 @@ new file mode 100644
+ +		}
+ +		printf("SWEET WLAN: L22c clmload chunk %u of %u: flag %#x len %u, status %d\n", n + 1u, nch, flag, len, (int)cm.status);
+ +		if (cm.status != 0) {
+-+			const int cst = (int)cm.status;       /* the chunk's own status: the GET below overwrites cm */
+-+
+-+			memset(rsp, 0, sizeof rsp);
+-+			ex = swg_e_call(x, SWD4B_WLC_GET_VAR, "WLC_GET_VAR clmload_status", "clmload_status", NULL, 4u, 15u + 4u, 1, 4u, rsp, 1, &cm, NULL);
+-+			if (ex != 0 || x->d4dstop) {
+-+				return ex;
+-+			}
+-+			st = cm.resp_len >= 4u ? swd4b_get32(rsp) : 0xFFFFFFFFu;
+-+			printf("SWEET WLAN: L22c clmload_status after the refused chunk %u: %u (answer %u B)\n", n + 1u, st, cm.resp_len);
+-+			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, cst);
+++			SWG_E_STOP(x, "clmload chunk %u refused, status %d", n + 1u, (int)cm.status);
+ +			return 0;
+ +		}
+ +	}

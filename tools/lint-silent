@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""lint-silent: no silent stub, ignored selector or swallowed error (rule 8, AP-102; gate step lint-silent, it FAILS the gate).
+
+  tools/lint-silent [--root DIR]   scan DIR (default: this clone), print findings, last line RESULT: PASS|FAIL
+  tools/lint-silent --self-test    inline fixtures + mutants of the rules (also run by tools/test_lint_silent.py); no device, no network
+
+What is scanned (read from this file, not guessed): shim/*.c *.h *.cpp *.mm and the ADDED lines of xnu/patches/*.patch hunks (C/C++/ObjC files only), per FUNCTION (the new side of
+each hunk: context + added lines; a hunk that starts inside a function, or ends inside one, is one "(hunk context)" unit); *.py and python-shebang files; sh/bash files, all under
+shim/, xnu/patches/ and tools/ (tools/third_party, __pycache__ and shim/out are skipped).
+
+Finding kinds (each line names file:line and the do-instead):
+  C-UNSUPPORTED  a `return`/assignment of kIOReturnUnsupported, ENOTSUP, EOPNOTSUPP or ENOSYS in a function with no gap log: log it once with swl_gap(..), sweet_note_ignored(..) or a print whose
+                 text contains " GAP:" (`<AREA> GAP: what was refused`) in the same function (AP-102: the pre-fix SweetSurface answered selectors Unsupported and ignored a key with no line).
+  C-NOT-IMPL     "not implemented" in a comment or string of a function with no gap log (a panic() counts as loud): a stub that answers success without a line.
+  C-SWITCH       `switch` over a selector/key/tag/method/cmd/ioctl/opcode/request (the switch expression, or a case label, has such a word) with no default, or a default, that logs no gap:
+                 add `default: <AREA> GAP: unhandled selector %d` (or a log after the switch when there is no default). Only a switch whose `switch (` line is added is checked.
+  C-TABLE        a `for` loop over ARRAY_SIZE/nitems/sizeof-quotient of a table that compares `tbl[i].sel|key|tag|method|cmd...` in a function with no gap log: log the miss.
+  PY-EXCEPT      `except ...:` whose whole body is pass / continue / return / return None / a docstring (not queue.Empty, socket.timeout, TimeoutError, KeyboardInterrupt, StopIteration, EOFError:
+                 those are polling/control-flow signals, the one named condition): log it (print(.., file=sys.stderr) with `<AREA> GAP:`), narrow it and re-raise.
+  SH-OR-TRUE     `cmd || true` (or `|| :`) on an assignment, or whose output is tested within the next 3 lines: it hides every failure; test the exit code (`|| { rc=$?; ... }`) and say GAP.
+                 Not flagged: lines using rm -f/-rf, mkdir -p, kill (cleanup).
+Marker: a silent `except` that answers ONE named, designed-normal condition (a process that exited, a missing optional file) may carry `# lint-silent: expected <what is normal>` on its `except` line;
+never on a bare except / Exception / BaseException, reason >= 10 chars.
+Limits (documented, not hidden): a patch is read alone, so a gap log added by a LATER patch (e.g. wip/gpu-accel 0162 for SweetSurface) does not clear the finding in the original patch (pin it in the allowlist with that patch as the reason); a string-compare if-chain over keys (`strcmp(key, "X")`) is not a switch/table and is not seen; comments are masked before matching; a gap log in ANOTHER function (a helper) does not count; a string counts as a log only as an argument of a call and outside `if (0)` / `#if 0`; a switch without default must log within 10 lines after it; an answer hidden behind a macro (`#define UNSUP (-95)`) is not seen (only the errno names are); a log inside a macro is seen only through its name or a string
+with " GAP:"; the table rule sees only the ARRAY_SIZE/sizeof forms; a patch hunk cut mid-function sees only the hunk, so a log outside the hunk is not seen.
+
+Exemptions only in tools/lint-silent-allow.txt: `path<ws>hits=N<ws>reason` per line (`#` and blank lines ignored; path relative to the root; reason >= 10 chars). N pins the finding count of the
+file: more is ALLOW-GREW, fewer ALLOW-SHRUNK (AP-300; a fixed file must drop its entry), a missing file / pin / reason / duplicate is a finding too.
+Exit 0 PASS / 1 FAIL / 2 usage. Last line: RESULT: PASS|FAIL silent files=N findings=M allowed=A"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import ast
+import hashlib
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ALLOW = "tools/lint-silent-allow.txt"
+MIN_REASON = 10
+SCAN_DIRS = ("shim", "xnu/patches", "tools", "soc", "qrlog", "xnu/qr", "docs/golden")
+FULL_DEPTH = {"tools", "soc", "qrlog", "xnu/qr", "docs/golden"}   # every level below these; shim/ and xnu/patches/ are read one level deep (shim/*/x.c, xnu/patches/*/y)
+C_ROOTS = ("shim/", "soc/", "qrlog/", "xnu/qr/")   # C is read here (tools/test_*_c.c host tests are not firmware)
+SKIP_DIRS = {"third_party", "__pycache__", "out", ".git"}
+C_EXT = (".c", ".h", ".cpp", ".mm", ".cc", ".m", ".hpp")
+C_IN = tuple(e + ".in" for e in C_EXT)   # xnu/qr/*.c.in templates
+
+UNSUP = r"kIOReturnUnsupported|ENOTSUP|EOPNOTSUPP|ENOSYS"
+# a return/assignment that ANSWERS unsupported (a comparison `== ENOTSUP` is a test, not an answer)
+UNSUP_RE = re.compile(r"(?:\breturn\b[^;{}]*?|(?<![=!<>])=(?!=)[^;{}=]*?)\b(%s)\b" % UNSUP)
+GAPCALL_RE = re.compile(r"\b(?:swl_gap|sweet_note_ignored)\s*\(")
+PANIC_RE = re.compile(r"\bpanic\s*\(")
+SEL_WORDS = {"sel", "selector", "selectors", "key", "tag", "method", "cmd", "command", "ioctl", "opcode", "request", "brequest", "req"}
+FIELD_WORDS = SEL_WORDS | {"id", "name"}
+LABEL_WORDS = SEL_WORDS - {"key", "tag"}   # `kIOHIDEventTypeSymbolicHotKey` is an event type, not a key selector: key/tag count only in the switch expression
+CTRL = ("if", "for", "while", "switch", "else", "do", "return", "case")
+
+
+def words(ident):
+    """lower-case words of an identifier: snake_case and camelCase/PascalCase ('kIOHIDKeyboard' -> k, io, hid, keyboard; 'bRequest' -> b, request, brequest)."""
+    out = set()
+    for part in re.split(r"[^A-Za-z0-9]+", ident):
+        out.update(w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", part))
+        out.add(part.lower())
+    return out
+
+
+# ---------------------------------------------------------------- C
+
+def mask(text, mid_comment=False):
+    """(code, strs, coms): three views of TEXT, same length and same newlines. code = comments and string contents blanked; strs = only string/char contents; coms = only comment contents."""
+    n = len(text)
+    code, strs, coms = [" "] * n, [" "] * n, [" "] * n
+    i = 0
+    first = next((l for l in text.split("\n") if l.strip()), "")
+    if mid_comment and re.match(r"\s*\*(\s|/|$)", first):   # a hunk that starts inside a /* .. */ block: its first line is ` * text` or ` */`
+        j = text.find("*/")
+        j = n if j < 0 else j + 2
+        for k in range(j):
+            if text[k] == "\n":
+                code[k] = strs[k] = coms[k] = "\n"
+            else:
+                coms[k] = text[k]
+        i = j
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            code[i] = strs[i] = coms[i] = "\n"
+            i += 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if text[k] == "\n":
+                    code[k] = strs[k] = coms[k] = "\n"
+                else:
+                    coms[k] = text[k]
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                coms[k] = text[k]
+            i = j
+        elif c in "\"'":
+            code[i] = c
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                if text[j] == "\\" and j + 1 < n and text[j + 1] != "\n":
+                    strs[j] = text[j]
+                    j += 1
+                strs[j] = text[j]
+                j += 1
+            if j < n and text[j] == c:
+                code[j] = c
+                j += 1
+            i = j
+        else:
+            code[i] = c
+            i += 1
+    return "".join(code), "".join(strs), "".join(coms)
+
+
+def hunks_of_patch(text):
+    """[(path, [(line_no_in_patch, text, added)])] new side of every hunk of every C/C++ file in a patch: context and '+' lines, '-' lines dropped."""
+    out, path, cur, hunk_ok, lines = [], None, None, False, text.split("\n")
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("+++ "):
+            p = l[4:].split("\t")[0].strip()
+            path = p[2:] if p[:2] in ("a/", "b/") else p
+            hunk_ok = False
+            cur = None
+        elif l.startswith("@@") and path:
+            hunk_ok = path.endswith(C_EXT)
+            cur = [] if hunk_ok else None
+            if cur is not None:
+                out.append((path, cur))
+        elif hunk_ok and cur is not None and l[:1] in ("+", " ") and not l.startswith("+++ "):
+            cur.append((i + 1, l[1:], l[:1] == "+"))
+        i += 1
+    return out
+
+
+def units(code):
+    """[(kind, start, end, name)] function bodies and 'ctx' stretches of top-level text outside any function, plus [(switch_start, body_start, body_end)] of every switch.
+    A `{` opens a function when no function is open, the statement header ends in ')' (maybe + const/override/noexcept) and does not start with a control keyword/struct/enum/'='."""
+    funcs, switches, stack = [], [], []   # stack entries: (kind, header_start, brace_pos, extra)
+    stmt = 0
+    ctx_start = 0
+    ctxs = []
+    for i, c in enumerate(code):
+        if c == "{":
+            hdr = code[stmt:i].strip()
+            infunc = any(k == "func" for k, *_ in stack)
+            if re.search(r"(?:^|[\s:])switch\s*\(.*\)$", hdr, re.S):
+                kind = "switch"
+            elif not infunc and re.search(r"\)\s*(?:const|override|noexcept|final)?\s*(?:__attribute__\s*\(\(.*\)\)\s*)?$", hdr, re.S) and \
+                    not re.match(r"(?:%s)\b|struct\b|enum\b|union\b|typedef\b|=" % "|".join(CTRL), hdr) and not re.search(r"=\s*\(?[\w\s*]*\)?\s*$", hdr.split("(")[0]):
+                kind = "func"
+                ctxs.append((ctx_start, stmt))
+            elif not infunc and re.match(r'(?:extern\s*"C"|namespace\b)', hdr):
+                kind = "ns"
+            else:
+                kind = "other"
+            stack.append((kind, stmt, i))
+            stmt = i + 1
+        elif c == "}":
+            if stack:
+                kind, hs, bp = stack.pop()
+                if kind == "func" and not any(k == "func" for k, *_ in stack):
+                    m = re.search(r"(\w+(?:::\w+)?)\s*\(", code[hs:bp])
+                    funcs.append((hs, i + 1, (m.group(1) + "()") if m else ""))
+                    ctx_start = i + 1
+                elif kind == "switch":
+                    switches.append((hs, bp, i))
+            else:   # a function closed that began before this hunk: what came before is its tail
+                ctxs.append((ctx_start, i + 1))
+                ctx_start = i + 1
+            stmt = i + 1
+        elif c == ";":
+            stmt = i + 1
+    ctxs.append((ctx_start, len(code)))
+    return funcs, ctxs, switches
+
+
+def lineno(text, off):
+    return text.count("\n", 0, off) + 1
+
+
+def c_findings(text, added, relpath, mid_comment=False):
+    """Findings [(line, kind, msg)] for one C text. added[i]: is line i+1 (1-based) of TEXT an added line (all True for a whole file)."""
+    code, strs, coms = mask(text, mid_comment)
+    funcs, ctxs, switches = units(code)
+    nl = lambda off: lineno(text, off)
+    isadd = lambda off: added[min(nl(off), len(added)) - 1]
+    out = []
+    spans = [("func", s, e, name) for s, e, name in funcs] + [("ctx", s, e, "(hunk context)") for s, e in ctxs if code[s:e].strip()]
+
+    # dead code never logs: `if (0) printf(..)` and `#if 0 .. #endif|#else`
+    dead = [(m.start(), m.end()) for m in re.finditer(r"\bif\s*\(\s*0\s*\)\s*(?:\{[^{}]*\}|[^;{}]*;)", code)]
+    dead += [(m.start(), m.end()) for m in re.finditer(r"^[ \t]*#[ \t]*if[ \t]+0\b.*?^[ \t]*#[ \t]*(?:else|elif|endif)\b", code, re.M | re.S)]
+    live = lambda p: not any(a <= p < b for a, b in dead)
+
+    def in_call(q):
+        """is the string literal opening at CODE[q] an argument of a call `name( .. "..." .. )` (not a variable initialiser or a bare string)?"""
+        depth, i = 0, q - 1
+        while i >= 0 and code[i] not in ";{}":
+            c = code[i]
+            if c == ")":
+                depth += 1
+            elif c == "(":
+                if depth == 0:
+                    m = re.search(r"([A-Za-z_]\w*)\s*$", code[max(0, i - 80):i])
+                    return bool(m) and m.group(1) not in CTRL + ("sizeof", "defined")
+                depth -= 1
+            i -= 1
+        return False
+
+    def gap_in(s, e):
+        for m in GAPCALL_RE.finditer(code, s, e):
+            if live(m.start()):
+                return True
+        for m in re.finditer(r"GAP:", strs[s:e]):
+            p = s + m.start()
+            q = max(code.rfind('"', 0, p), code.rfind("'", 0, p))
+            if live(p) and q >= 0 and in_call(q):   # a string that is only stored (`const char *u = "X GAP: .."`) is not a log
+                return True
+        return False
+
+    def depth1(body, rx, start=0):
+        """first match of RX in BODY (starts with `{`) at brace depth 1, i.e. directly in this switch, not in a nested block or switch; (start, end) offsets or None"""
+        depth = 0
+        marks = []
+        for i, ch in enumerate(body):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            marks.append(depth)
+        for m in rx.finditer(body, start):
+            if marks[m.start()] == 1:
+                return m.start(), m.end()
+        return None
+
+    for kind, s, e, name in spans:
+        logged = gap_in(s, e)
+        if not logged:
+            for m in UNSUP_RE.finditer(code, s, e):
+                if isadd(m.start(1)):
+                    out.append((nl(m.start(1)), "C-UNSUPPORTED", "%s answers %s with no gap log in %s: add swl_gap(..), sweet_note_ignored(..) or a print with \"<AREA> GAP: ...\" (AP-102)" % (relpath, m.group(1), name or "the function")))
+            if not PANIC_RE.search(code, s, e):
+                for src in (strs, coms):
+                    for m in re.finditer(r"not[\s*/]+implemented", src[s:e], re.I):
+                        if isadd(s + m.start()):
+                            out.append((nl(s + m.start()), "C-NOT-IMPL", "'not implemented' in %s with no gap log: say it loudly (\"<AREA> GAP: ...\") or implement it (AP-102)" % (name or "the function")))
+            for m in re.finditer(r"\bfor\s*\(([^;]*;)\s*\w+\s*<\s*(?:ARRAY_SIZE|nitems|NELEM|countof)\s*\(\s*(\w+)\s*\)|\bfor\s*\(([^;]*;)\s*\w+\s*<\s*sizeof\s*\(\s*(\w+)\s*\)\s*/", code[s:e]):
+                tbl = m.group(2) or m.group(4)
+                body = code[s + m.end(): min(e, s + m.end() + 600)]
+                el = r"\b%s\s*\[[^\]]*\]\s*\.\s*(\w+)" % re.escape(tbl)
+                f = re.search(el + r"\s*[=!]=|[=!]=\s*" + el + r"|\b(?:strn?c?a?s?e?cmp|memcmp)\s*\([^;]*?" + el, body)   # a comparison, not a field read or an argument
+                fld = next((g for g in f.groups() if g), "") if f else ""
+                if f and words(fld) & FIELD_WORDS and isadd(s + m.start()):
+                    out.append((nl(s + m.start()), "C-TABLE", "table lookup over %s[].%s in %s with no gap log: log the miss with \"<AREA> GAP: unknown ...\" (AP-102)" % (tbl, fld, name or "the function")))
+    for hs, bp, be in switches:
+        expr = re.search(r"switch\s*\((.*)\)\s*$", code[hs:bp].strip(), re.S)
+        if not expr:
+            continue
+        hdr_off = hs + code[hs:bp].find("switch")
+        if not isadd(hdr_off):
+            continue
+        body = code[bp:be]
+        labels = re.findall(r"\bcase\s+([^:]+?)\s*:", body)
+        ident = lambda t: set().union(*[words(w) for w in re.findall(r"[A-Za-z_]\w*", t)]) if re.search(r"[A-Za-z_]", t) else set()
+        if not (ident(expr.group(1)) & SEL_WORDS or any(ident(lb) & LABEL_WORDS for lb in labels)):
+            continue
+        d = depth1(body, re.compile(r"\bdefault\s*:"))   # the default of THIS switch (a nested `switch (mode) { default: .. }` is not it)
+        if d:
+            # the default section: up to the next case label at this level or the end of the switch body
+            nxt = depth1(body, re.compile(r"\bcase\s+[^:]+:"), d[1])
+            sec_s, sec_e = bp + d[0], bp + (nxt[0] if nxt else len(body))
+            ok = gap_in(sec_s, sec_e)
+        else:
+            # no default: the miss must be logged right after the switch (next 10 lines, same function), not by an unrelated print further down
+            f_end = next((fe for fs, fe, _ in funcs if fs <= hs < fe), None)
+            tail_e = f_end if f_end else len(code)
+            nl10 = be
+            for _ in range(10):
+                j = code.find("\n", nl10 + 1)
+                if j < 0:
+                    nl10 = len(code)
+                    break
+                nl10 = j
+            ok = gap_in(be, min(tail_e, nl10))
+        if not ok:
+            out.append((nl(hdr_off), "C-SWITCH", "switch (%s) over selectors/keys has %s: add `default:` with a print \"<AREA> GAP: unhandled ... %%d\" (AP-102)" % (expr.group(1).strip(), "a default with no gap log" if d else "no default and no gap log in the 10 lines after it")))
+    return sorted(set(out))
+
+
+def scan_c_file(root, rel):
+    try:
+        text = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+    except OSError as _err:
+        return [(1, "PARSE", "not scanned (%s): check the file permissions" % _err)]
+    if rel.endswith(".patch"):
+        out = []
+        for path, hunk in hunks_of_patch(text):
+            htext = "\n".join(l for _, l, _ in hunk)
+            for ln, kind, msg in c_findings(htext, [a for _, _, a in hunk], path, mid_comment=True):
+                out.append((hunk[ln - 1][0], kind, "%s (%s)" % (msg, path)))
+        return out
+    return c_findings(text, [True] * (text.count("\n") + 1), rel)
+
+
+# ---------------------------------------------------------------- Python
+
+def const_value(v):
+    """a falsy constant answer (None/False/0/''/{}/[]/()): the handler hands back "nothing" and says nothing. A truthy sentinel (`return "missing"`, `bad = True`) is a reported state, not a swallowed error."""
+    return (isinstance(v, ast.Constant) and not v.value) or (isinstance(v, (ast.Dict, ast.List, ast.Tuple, ast.Set)) and not getattr(v, "elts", None) and not getattr(v, "keys", None))
+
+
+def silent_body(body):
+    for st in body:
+        if isinstance(st, (ast.Pass, ast.Continue, ast.Break)):
+            continue
+        if isinstance(st, ast.Return) and (st.value is None or const_value(st.value)):
+            continue
+        if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+            continue
+        if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None and const_value(st.value):   # `except KeyError: v = None`
+            continue
+        return False
+    return True
+
+
+# control-flow signals, not errors: an empty queue / interrupt / end of iteration is the NAMED expected condition (rule 8 allows suppressing one explicitly named thing);
+# a timeout is one only around a single blocking read (queue.get, socket.recv ..): a TimeoutError from a connect or a longer body is a real failure
+PY_SIGNALS = {"queue.Empty", "Empty", "KeyboardInterrupt", "StopIteration", "EOFError"}
+PY_TIMEOUTS = {"socket.timeout", "TimeoutError", "subprocess.TimeoutExpired"}
+POLL_CALLS = {"get", "recv", "recvfrom", "accept", "read", "wait", "poll", "select", "communicate"}
+
+
+def single_poll(body):
+    """the try body is one statement that is a call (maybe assigned) of a blocking read"""
+    if len(body) != 1:
+        return False
+    st = body[0]
+    v = st.value if isinstance(st, (ast.Expr, ast.Assign, ast.Return)) else None
+    return isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr in POLL_CALLS
+
+
+# a silent handler that is the designed-normal answer of ONE named condition carries `# lint-silent: expected <what is normal and why>` on its `except` (or `with`) line (reason >= MIN_REASON chars);
+# a bare except / Exception / BaseException can never carry it (those hide every error, not one condition)
+MARKER = re.compile(r"#\s*lint-silent:\s*expected\s+(\S.*)$")
+BROAD = {"(bare)", "Exception", "BaseException"}
+
+
+def marked(lines, lineno, what):
+    mk = MARKER.search(lines[lineno - 1])
+    return bool(mk) and len(mk.group(1).strip()) >= MIN_REASON and what not in BROAD
+
+
+def scan_py(root, rel):
+    try:
+        text = open(os.path.join(root, rel), encoding="utf-8").read()
+        tree = ast.parse(text)
+    except (OSError, UnicodeDecodeError, SyntaxError) as _err:
+        return [(getattr(_err, "lineno", None) or 1, "PARSE", "not scanned (%s: %s): fix the file so the lint can read it" % (type(_err).__name__, _err))]
+    lines = text.split("\n")
+    out = []
+    for nd in ast.walk(tree):
+        if isinstance(nd, ast.Try):
+            for h in nd.handlers:
+                if not silent_body(h.body):
+                    continue
+                what = ast.unparse(h.type) if h.type else "(bare)"
+                if what in PY_SIGNALS or (what in PY_TIMEOUTS and single_poll(nd.body)):
+                    continue
+                if marked(lines, h.lineno, what):
+                    continue
+                out.append((h.lineno, "PY-EXCEPT", "except %s swallows the error with no log: print a GAP line to stderr, narrow it, re-raise, or (one named normal condition) mark it `# lint-silent: expected <why>` (rule 8)" % what))
+        elif isinstance(nd, (ast.With, ast.AsyncWith)):
+            for it in nd.items:
+                c = it.context_expr
+                if isinstance(c, ast.Call) and (getattr(c.func, "id", None) == "suppress" or getattr(c.func, "attr", None) == "suppress"):
+                    what = ", ".join(ast.unparse(a) for a in c.args) or "(nothing)"
+                    if marked(lines, nd.lineno, "Exception" if set(what.split(", ")) & (BROAD | {"(nothing)"}) else what):
+                        continue
+                    out.append((nd.lineno, "PY-EXCEPT", "contextlib.suppress(%s) swallows the error with no log: print a GAP line to stderr, narrow it, or (one named normal condition) mark it `# lint-silent: expected <why>` (rule 8)" % what))
+    return out
+
+
+# ---------------------------------------------------------------- shell
+
+OR_TRUE = re.compile(r"\|\|\s*(?:(?:/usr)?(?:/bin/)?true|:|exit\s+0)\b|;\s*(?:(?:/usr)?(?:/bin/)?true|:)\s*(?:$|[)}#])")   # `|| true`, `|| :`, `|| /bin/true`, `|| exit 0`, `; true`
+CLEANUP = re.compile(r"(?:^|[;&|({]|\$\()\s*(?:(?:sudo|command)\s+)?(?:rm\s+-[a-zA-Z]*f|mkdir\s+-[a-zA-Z]*p|kill)\b")   # the command the `|| true` belongs to is itself a cleanup
+ASSIGN = re.compile(r"^\s*(?:export\s+|local\s+|readonly\s+)?([A-Za-z_]\w*)=")
+TESTED_WINDOW = 12   # logical lines after the `|| true` in which a use of its output counts
+
+
+def logical_lines(lines):
+    """[(first physical line number, text)] with backslash continuations joined: `n=$(foo <backslash><newline> || true)` is one command"""
+    out, cur, first = [], "", 0
+    for i, l in enumerate(lines):
+        if not cur:
+            first = i + 1
+        if l.endswith("\\") and not l.lstrip().startswith("#"):
+            cur += l[:-1] + " "
+            continue
+        out.append((first, cur + l))
+        cur = ""
+    if cur:
+        out.append((first, cur))
+    return out
+
+
+def scan_sh(root, rel):
+    try:
+        lines = open(os.path.join(root, rel), encoding="utf-8").read().split("\n")
+    except (OSError, UnicodeDecodeError) as _err:
+        return [(1, "PARSE", "not scanned (%s: %s): fix the file so the lint can read it" % (type(_err).__name__, _err))]
+    out = []
+    ll = logical_lines(lines)
+    for k, (ln, l) in enumerate(ll):
+        m = OR_TRUE.search(l)
+        if l.lstrip().startswith("#") or not m:
+            continue
+        head = l[:m.start()]
+        seg = re.split(r";|&&|\|\|\s*\{?|\{", head)[-1]   # the command the `|| true` belongs to
+        if CLEANUP.search(seg):
+            continue
+        a = ASSIGN.match(seg)
+        names = [a.group(1)] if a else []
+        names += [x.strip("\"'") for x in re.findall(r"(?<![\d&])>>?\s*(\S+)", head)]   # stdout redirect targets (not 2> / &>)
+        names = [n for n in names if n and n not in ("/dev/null", "&1", "&2")]
+        tested = False
+        for _, nxt in ll[k + 1:k + 1 + TESTED_WINDOW]:
+            if nxt.lstrip().startswith("#"):
+                continue
+            tests = " ".join(re.findall(r"\[\[?\s[^\]]*\]\]?|\b(?:test|grep|case)\s[^;&|]*", nxt))   # only the text inside [ .. ] / [[ .. ]] / test / grep / case counts as a use
+            if any(re.search(r"(?<![\w])\$?\{?%s\b" % re.escape(n.lstrip("$")), tests) for n in names):
+                tested = True
+                break
+        if a or tested:
+            out.append((ln, "SH-OR-TRUE", "`|| true` hides the failure of a command whose %s is used: check the exit code (`|| { rc=$?; [ $rc = 1 ] || echo \"<AREA> GAP: ... rc=$rc\" >&2; }`) or drop it" % ("result" if a else "output")))
+    return out
+
+
+# ---------------------------------------------------------------- driver
+
+def is_sh(text, rel):
+    return rel.endswith(".sh") or re.match(r"#!\s*(/usr/bin/env\s+)?(/[a-z/]*/)?(ba|da)?sh(\s|$)", text[:80]) is not None
+
+
+def is_py(text, rel):
+    return rel.endswith(".py") or re.match(r"#!.*\bpython", text[:80]) is not None
+
+
+def walk(root):
+    for d in SCAN_DIRS:
+        top = os.path.join(root, d)
+        for dp, dn, fn in os.walk(top):
+            dn[:] = sorted(x for x in dn if x not in SKIP_DIRS)
+            if d not in FULL_DEPTH and dp != top:
+                dn[:] = []
+            for f in sorted(fn):
+                yield os.path.relpath(os.path.join(dp, f), root)
+
+
+def scan(root):
+    """{relpath: [(line, kind, msg)]} for every file with findings, and the number of files looked at."""
+    res, nfiles = {}, 0
+    for rel in walk(root):
+        full = os.path.join(root, rel)
+        if rel == ALLOW or rel.endswith((".pyc", ".md", ".txt", ".tsv", ".json", ".bin", ".img")) or not os.path.isfile(full):
+            continue
+        if d_is_c(rel):
+            f = scan_c_file(root, rel)
+        else:
+            try:
+                with open(full, "rb") as fh:
+                    raw = fh.read(200)
+                head = raw.decode("utf-8", "replace")
+            except OSError as _err:
+                res[rel] = [(1, "PARSE", "not scanned (%s): check the file permissions" % _err)]
+                continue
+            if b"\0" in raw:   # a binary file (image, object): not text, nothing to read
+                continue
+            if is_py(head, rel):
+                f = scan_py(root, rel)
+            elif is_sh(head, rel):
+                f = scan_sh(root, rel)
+            else:
+                continue
+        if not any(k == "PARSE" for _, k, _ in f):   # a file the lint could not read was NOT scanned: it is a finding, not a count
+            nfiles += 1
+        if f:
+            res[rel] = sorted(f)
+    return res, nfiles
+
+
+def d_is_c(rel):
+    return (rel.startswith(C_ROOTS) and rel.endswith(C_EXT + C_IN)) or (rel.startswith("xnu/patches/") and rel.endswith(".patch"))
+
+
+def file_sig(root, rel, fl):
+    """10 hex chars naming WHICH findings a file has: sha1 of the sorted `kind:source line text` list (a patch line without its +/space column). A swap (fix one, add another) changes it."""
+    try:
+        src = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read().split("\n")
+    except OSError:   # lint-silent: expected an unreadable file was already reported by scan() as PARSE; its sig then differs and the pin fails loudly
+        src = []
+    keys = []
+    for line, kind, _ in fl:
+        t = src[line - 1] if 0 < line <= len(src) else ""
+        if rel.endswith(".patch"):
+            t = t[1:]
+        keys.append("%s:%s" % (kind, " ".join(t.split())))
+    return hashlib.sha1("\n".join(sorted(keys)).encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def read_allow(root, findings):
+    allow, p = {}, os.path.join(root, ALLOW)
+    if not os.path.isfile(p):
+        findings.append("MISSING-ALLOWLIST %s (create it, even if empty)" % ALLOW)
+        return allow
+    for i, raw in enumerate(open(p, encoding="utf-8"), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split(None, 2)
+        pin = re.fullmatch(r"hits=(\d+)", parts[1]) if len(parts) > 1 else None
+        if not pin:
+            findings.append("ALLOW-NO-PIN %s:%d `%s` needs `path hits=N sig=HEX reason`" % (ALLOW, i, parts[0]))
+            continue
+        sg = re.match(r"sig=([0-9a-f]{10})(?:\s+(.*))?$", parts[2].strip(), re.S) if len(parts) > 2 else None
+        if not sg:
+            findings.append("ALLOW-NO-SIG %s:%d `%s` needs `sig=HEX` after hits=N (the findings it pins; run tools/lint-silent --sigs)" % (ALLOW, i, parts[0]))
+            continue
+        if len((sg.group(2) or "").strip()) < MIN_REASON:
+            findings.append("ALLOW-NO-REASON %s:%d `%s` needs a reason of >= %d chars" % (ALLOW, i, parts[0], MIN_REASON))
+            continue
+        if parts[0] in allow:
+            findings.append("ALLOW-DUPLICATE %s:%d `%s`" % (ALLOW, i, parts[0]))
+            continue
+        if not os.path.isfile(os.path.join(root, parts[0])):
+            findings.append("ALLOW-MISSING-FILE %s:%d `%s` does not exist: remove the entry" % (ALLOW, i, parts[0]))
+            continue
+        allow[parts[0]] = (int(pin.group(1)), i, sg.group(1))
+    return allow
+
+
+def report(root, out=sys.stdout):
+    findings = []
+    allow = read_allow(root, findings)
+    res, nfiles = scan(root)
+    allowed = 0
+    for rel, fl in sorted(res.items()):
+        if rel in allow:
+            pin, ln, sig = allow[rel]
+            now = file_sig(root, rel, fl)
+            allowed += min(pin, len(fl))
+            if len(fl) > pin:
+                findings.append("ALLOW-GREW %s has %d finding(s), allowlisted %d (%s:%d): the new ones are %s" % (rel, len(fl), pin, ALLOW, ln, ", ".join("%s:%d" % (rel, x[0]) for x in fl[pin:])))
+            elif len(fl) < pin:
+                findings.append("ALLOW-SHRUNK %s has %d finding(s), allowlisted %d (%s:%d): lower hits=%d (or drop the entry at 0)" % (rel, len(fl), pin, ALLOW, ln, len(fl)))
+            elif now != sig:
+                findings.append("ALLOW-CHANGED %s has other findings than the pinned ones (sig %s, pinned %s, %s:%d): fixed one and added another? now at %s; check them, then re-pin" % (
+                    rel, now, sig, ALLOW, ln, ", ".join("%s:%d" % (rel, x[0]) for x in fl)))
+            continue
+        for line, kind, msg in fl:
+            findings.append("%s %s:%d %s" % (kind, rel, line, msg))
+    for rel, (pin, ln, _) in sorted(allow.items()):
+        if rel not in res:
+            findings.append("ALLOW-SHRUNK %s has 0 finding(s), allowlisted %d (%s:%d): the file is fixed, drop the entry" % (rel, pin, ALLOW, ln))
+    for f in findings:
+        print(f, file=out)
+    total = sum(len(v) for v in res.values())
+    print("RESULT: %s silent files=%d findings=%d allowed=%d" % ("FAIL" if findings else "PASS", nfiles, total, allowed), file=out)
+    return 1 if findings else 0
+
+
+def print_sigs(root):
+    """the `path hits=N sig=HEX` pin of every file that has findings (to write or re-check an allowlist line)"""
+    res, _ = scan(root)
+    for rel, fl in sorted(res.items()):
+        print("%s hits=%d sig=%s" % (rel, len(fl), file_sig(root, rel, fl)))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+SELF_C_BAD = {
+    "unsupported": "static int f(int sel)\n{\n\tif (sel == 3)\n\t\treturn kIOReturnUnsupported;\n\treturn 0;\n}\n",
+    "enosys": "int g(void)\n{\n\treturn ENOSYS;\n}\n",
+    "switch_nodefault": "int h(int sel)\n{\n\tswitch (sel) {\n\tcase 1: return 0;\n\tcase 2: return 1;\n\t}\n\treturn 0;\n}\n",
+    "switch_default_silent": "int h(int selector)\n{\n\tswitch (selector) {\n\tcase 1: return 0;\n\tdefault: break;\n\t}\n\treturn 0;\n}\n",
+    "not_impl": "int j(void)\n{\n\t/* cycle learning is not implemented. */\n\treturn 0;\n}\n",
+    "table": "int k(int key)\n{\n\tfor (int i = 0; i < ARRAY_SIZE(tbl); i++)\n\t\tif (tbl[i].key == key)\n\t\t\treturn i;\n\treturn -1;\n}\n",
+    "sweetsurface_prefix": ("IOReturn SweetSurface::externalMethod(uint32_t selector, IOExternalMethodArguments *args)\n{\n\tswitch (selector) {\n\tcase 0: return create(args);\n"
+                           "\tcase 6: case 7: return kIOReturnUnsupported;\n\tdefault: return kIOReturnUnsupported;\n\t}\n}\n"
+                           "void SweetSurface::setProperty(const char *key)\n{\n\tif (!strcmp(key, \"IOSurfaceAddress\")) return;\n}\n"),
+}
+SELF_C_GOOD = {
+    "logged": "static int f(int sel)\n{\n\tif (sel == 3) {\n\t\tswl_gap(\"sel\", 3);\n\t\treturn kIOReturnUnsupported;\n\t}\n\treturn 0;\n}\n",
+    "noted": "int f(int sel)\n{\n\tsweet_note_ignored(\"sel\", sel);\n\treturn ENOTSUP;\n}\n",
+    "printed": "int f(void)\n{\n\tprintf(\"SWEET GAP: sel 6 refused\\n\");\n\treturn EOPNOTSUPP;\n}\n",
+    "switch_ok": "int h(int sel)\n{\n\tswitch (sel) {\n\tcase 1: return 0;\n\tdefault:\n\t\tprintf(\"SWEET GAP: sel %d\\n\", sel);\n\t\treturn -1;\n\t}\n}\n",
+    "switch_not_selector": "int h(int mode)\n{\n\tswitch (mode) {\n\tcase 1: return 0;\n\tdefault: break;\n\t}\n\treturn 0;\n}\n",
+    "comparison_only": "int f(int e)\n{\n\tif (e == ENOTSUP)\n\t\treturn 0;\n\treturn e;\n}\n",
+    "string_only": "int f(void)\n{\n\tprintf(\"never returns ENOTSUP\\n\");\n\treturn 0;\n}\n",
+    "table_ok": "int k(int key)\n{\n\tfor (int i = 0; i < ARRAY_SIZE(tbl); i++)\n\t\tif (tbl[i].key == key)\n\t\t\treturn i;\n\tprintf(\"X GAP: key %d\\n\", key);\n\treturn -1;\n}\n",
+    "panic_impl": "void p(void)\n{\n\tpanic(\"SWEET CPU: resume is not implemented\");\n}\n",
+}
+
+
+def self_test():
+    fails = []
+    tmp = tempfile.mkdtemp(prefix="lintsilent.")
+
+    def tree(name, files, allow=""):
+        r = os.path.join(tmp, name)
+        os.makedirs(os.path.join(r, "tools"))
+        os.makedirs(os.path.join(r, "shim"))
+        os.makedirs(os.path.join(r, "xnu", "patches"))
+        for p, body in files.items():
+            os.makedirs(os.path.dirname(os.path.join(r, p)), exist_ok=True)
+            open(os.path.join(r, p), "w").write(body)
+        open(os.path.join(r, ALLOW), "w").write(allow)
+        return r
+
+    def expect(label, root, rc, want=None):
+        import io
+        buf = io.StringIO()
+        got = report(root, buf)
+        if got != rc or (want and want not in buf.getvalue()):
+            fails.append("%s: rc=%d want %d %s\n%s" % (label, got, rc, want or "", buf.getvalue()))
+
+    try:
+        for k, body in SELF_C_BAD.items():
+            expect("c bad " + k, tree("cb-" + k, {"shim/x.c": body}), 1, "shim/x.c:")
+        for k, body in SELF_C_GOOD.items():
+            expect("c good " + k, tree("cg-" + k, {"shim/x.c": body}), 0)
+        expect("py bare except pass", tree("pyb", {"tools/a.py": "try:\n    x()\nexcept:\n    pass\n"}), 1, "PY-EXCEPT tools/a.py:3")
+        expect("py return None", tree("pyr", {"tools/a.py": "def f():\n    try:\n        return x()\n    except OSError:\n        return None\n"}), 1, "PY-EXCEPT")
+        expect("py logged ok", tree("pyl", {"tools/a.py": "try:\n    x()\nexcept OSError as e:\n    print('X GAP: %s' % e)\n"}), 0)
+        expect("py raise ok", tree("pyx", {"tools/a.py": "try:\n    x()\nexcept OSError:\n    raise\n"}), 0)
+        expect("sh assignment", tree("sha", {"tools/a.sh": "#!/bin/bash\nn=$(grep -c x f || true)\n"}), 1, "SH-OR-TRUE tools/a.sh:2")
+        expect("sh tested", tree("sht", {"tools/a.sh": "#!/bin/bash\nfoo > out.txt || true\n[ -s out.txt ] && echo ok\n"}), 1, "SH-OR-TRUE tools/a.sh:2")
+        expect("sh cleanup ok", tree("shc", {"tools/a.sh": "#!/bin/bash\nrm -f x || true\nmkdir -p y || true\nkill $p || true\n"}), 0)
+        expect("sh plain ok", tree("shp", {"tools/a.sh": "#!/bin/bash\nfoo || true\necho done\n"}), 0)
+        bad = {"shim/x.c": "int g(void)\n{\n\treturn ENOSYS;\n}\n"}
+        sg = file_sig(tree("sg", bad), "shim/x.c", scan(os.path.join(tmp, "sg"))[0]["shim/x.c"])
+        expect("allowlisted", tree("al", bad, "shim/x.c hits=1 sig=%s stub kept until the driver exists\n" % sg), 0)
+        expect("allow grew", tree("alg", {"shim/x.c": bad["shim/x.c"] + "int h(void)\n{\n\treturn ENOTSUP;\n}\n"}, "shim/x.c hits=1 sig=%s stub kept until the driver exists\n" % sg), 1, "ALLOW-GREW")
+        expect("allow shrank", tree("als", bad, "shim/x.c hits=2 sig=%s stub kept until the driver exists\n" % sg), 1, "ALLOW-SHRUNK")
+        expect("allow stale", tree("alst", {"shim/x.c": "int g(void) { return 0; }\n"}, "shim/x.c hits=1 sig=%s stub kept until the driver exists\n" % sg), 1, "ALLOW-SHRUNK")
+        expect("allow swapped", tree("alsw", {"shim/x.c": "int g(void)\n{\n\treturn ENOTSUP;\n}\n"}, "shim/x.c hits=1 sig=%s stub kept until the driver exists\n" % sg), 1, "ALLOW-CHANGED")
+        expect("allow no reason", tree("alnr", bad, "shim/x.c hits=1 sig=%s\n" % sg), 1, "ALLOW-NO-REASON")
+        expect("allow no sig", tree("alns", bad, "shim/x.c hits=1 stub kept until the driver exists\n"), 1, "ALLOW-NO-SIG")
+        expect("allow no pin", tree("alnp", bad, "shim/x.c stub kept until the driver exists\n"), 1, "ALLOW-NO-PIN")
+        expect("allow missing file", tree("almf", {}, "shim/gone.c hits=1 sig=%s removed a long time ago\n" % sg), 1, "ALLOW-MISSING-FILE")
+        expect("allow duplicate", tree("aldup", bad, "shim/x.c hits=1 sig=%s first reason text\nshim/x.c hits=1 sig=%s second reason text\n" % (sg, sg)), 1, "ALLOW-DUPLICATE")
+        r = tree("noallow", {})
+        os.remove(os.path.join(r, ALLOW))
+        expect("allow file missing", r, 1, "MISSING-ALLOWLIST")
+        # patch: only ADDED lines count; a context-only unsupported return is not ours
+        patch = ("--- a/IOKit/X.cpp\n+++ b/IOKit/X.cpp\n@@ -10,4 +10,6 @@ IOReturn X::m(int sel)\n {\n \tif (sel == 3)\n \t\treturn kIOReturnUnsupported;\n"
+                 "+\tif (sel == 4)\n+\t\treturn kIOReturnUnsupported;\n \treturn 0;\n }\n")
+        expect("patch added", tree("pa", {"xnu/patches/0001-x.patch": patch}), 1, "xnu/patches/0001-x.patch:")
+        ctx_only = patch.replace("+\tif (sel == 4)\n+\t\treturn kIOReturnUnsupported;\n", "")
+        expect("patch context only", tree("pc", {"xnu/patches/0001-x.patch": ctx_only}), 0)
+        logged = patch.replace("+\t\treturn kIOReturnUnsupported;\n", "+\t\treturn (printf(\"SWEET GAP: 4\\n\"), kIOReturnUnsupported);\n")
+        expect("patch logged", tree("pl", {"xnu/patches/0001-x.patch": logged}), 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for f in fails:
+        print("FAIL", f)
+    print("RESULT: %s self-test failures=%d" % ("FAIL" if fails else "PASS", len(fails)))
+    return 1 if fails else 0
+
+
+def main(argv):
+    if argv[:1] == ["--self-test"]:
+        return self_test()
+    root = os.path.dirname(HERE)
+    if argv[:1] == ["--root"] and len(argv) == 2:
+        root = argv[1]
+    elif argv == ["--sigs"]:
+        return print_sigs(root)
+    elif argv[:1] == ["--sigs"] and len(argv) == 3 and argv[1] == "--root":
+        return print_sigs(argv[2])
+    elif argv:
+        print("usage: lint-silent [--root DIR | --sigs [--root DIR] | --self-test]", file=sys.stderr)
+        return 2
+    return report(root)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

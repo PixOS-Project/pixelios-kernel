@@ -12,7 +12,7 @@ refs: "-"
 ---
 
 ## checked
-[observed 2026-10-26] `ls tools | grep -iE 'prune|disk|clean|artifact'` in the kernel clone: nothing; `ls docs/tool-proposals | grep -iE 'artifact|disk|clean'`: nothing. TP-017 prunes proposals/tools only, not disk artifacts. Scope [observed, du]: `localbuild` 13G, `scratch` 2.0G, 16 `kernel-*.sweet` at 16M each under `~/pixelios-artifacts`.
+[observed 2026-10-26] `ls tools | grep -iE 'prune|disk|clean|artifact'` in the kernel clone: nothing; `ls docs/tool-proposals | grep -iE 'artifact|disk|clean'`: nothing. TP-017 prunes proposals/tools only, not disk artifacts. Scope [observed, du]: `localbuild` 13G, `scratch` 2.0G, 16 `kernel-*.sweet` at 16M each under `/home/<user>/pixelios-artifacts`.
 
 ## why
 Cleanup #3 was done by hand: the first list (inventory, 7.7 GB) was built by grepping tools, HANDOFF and g*.sh only and called `localbuild/work/{7a7e487806ab,fd1ad36,kernelfinal}`, `scratch/stack-{aSgNDs,D8mSb1}` and 8 kernels "unreferenced" (AP-73, docs/ANTIPATTERNS.md:471-475). They were cited as source trees behind `[src file:line]` claims and 5 kernels booted in recorded runs; deleting them would orphan rule-5/7 citations and the binaries needed to read those panics. An Opus agent had to redo the checks (OPUS DECISION 2026-10-26 #3, super docs/HANDOFF.md:204-231: exists, no running process, lsof, not a worktree path, no mention in GOALS/PLAN/g*.sh) and approved 5.4 GB. The tool makes that check one command, the same every time. Cost [observed]: one extra Opus round plus a manual multi-grep per cleanup; 3 cleanups so far.

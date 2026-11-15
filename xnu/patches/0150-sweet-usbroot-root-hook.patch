@@ -1,0 +1,30 @@
+SWEET root hook for the USB root disk (patch 0150): IOFindBSDRoot gets a branch for rd=usbroot0 that calls sweet_usbroot_rootdev() (bsd/dev/sweet_usbroot.c, patch 0157) and panics with its error code, like the ufsroot0 branch of patch 0028. Unbuilt and untested on hardware.
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,25 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++//
++//	SWEET: read-only root served by the host over USB ECM (bsd/dev/sweet_usbroot.c, patch 0157)
++//
++	if (strcmp(rdBootVar, "usbroot0") == 0) {
++		extern int sweet_usbroot_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		printf("SWEET USBROOT: IOFindBSDRoot rd=%s, calling sweet_usbroot_rootdev\n", rdBootVar);
++		int usb_error = sweet_usbroot_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: SWEET USB root %s unavailable: %d", rdBootVar, usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //

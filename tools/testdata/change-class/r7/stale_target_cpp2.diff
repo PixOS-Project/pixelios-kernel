@@ -1,0 +1,19 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+--- a/xnu/patches/0300-x.patch
++++ b/xnu/patches/0300-x.patch
+@@ -12,8 +12,8 @@
+ +++ b/osfmk/kern/k.c
+ @@ -10,3 +10,4 @@
+  	foo();
+-+	printf("a");
+++	printf("b");
+  	bar();
+@@ -400,7 +400,7 @@
+  	foo();
+  	bar();
+  	baz();
+-+	IOLog("state %d\n", state);
+++	IOLog("state %d\n", state == wanted);
+  	qux();
+  	quux();
+  	corge();

@@ -1,0 +1,305 @@
+sweet-fb-hash (lowclk 2026-11-15, research 164 part B2 point e1): LOG ONLY witness "did the panel pixels change at this present", boot-arg sweetfbhash=1 (absent or 0 = off, byte-identical: only never-taken branches, one int, a few unused members). NO HARDWARE ACCESS: no register, no firmware command, no bus store; only reads of the layers' surface memory (kernel mapping, as the panel copy does) and one IOLog row per second.
+Why [obs from research 164]: presents during Settings page loads carry 2 GPU jobs, which tools/fps-wholerun does not count as drawn (rule: > 4 jobs since the previous present); patch 0361's "unchanged" signal (swap record + surface seeds + Mali seqno) found 0 unchanged presents but the seqno advances on any job. This is the direct witness.
+Where [read from source]: AppleCLCD::present(), before the panel copy loop and independent of the 0361 skip decision, so every present is hashed even when its copy is skipped. The hash is of the SOURCE surface of each layer (the memory the copy reads, kernelAddress()+offset, bytesPerRow), not of the panel memory: the panel memory is a separate mapping that the kernel console and the QR log also write, and the source is what a change of content shows in first. The whole surface extent is sampled (not only the clipped copy rectangle), the layer id and the source and destination rectangles of the swap record are mixed in, so a moved or re-bound layer also counts as changed.
+Hash [pure block SFH-PURE-BEGIN/END]: 64-bit FNV-1a style xor+multiply over a grid: every 32nd row (SFH_N), on it every 32nd 32-bit word (SFH_M), start column shifted by one word per sampled row. 1080x2400x4 B: 75 rows x 34 words = 2550 loads on distinct 64 B lines; ~13 ns each with 8 loads in flight ~ 33 us + ~3 us arithmetic = ~36 us [arithmetic, guess for the memory term]; the real cost is measured per present with mach_absolute_time and printed as cost_p50 / max in us. Limit: a change confined to fewer than 32 rows or between two sampled columns is missed, so "unchanged" is an upper bound. With sweetfb_inv=1 each sampled line is flushed first (the GPU writes behind the cache, patch 0144), which costs more and shows in the cost field.
+Jobs bucket [as SWEET SWAPT, patch 0186]: swap() stores the swap count n (the SWAPT n) and jobs = sweet_mali_seq_peek submitted seqno of this swap minus that of the previous swap, under fLock with fPending; vsyncFired copies both with the record. A present that shows several coalesced swaps uses the last swap's n and jobs; the change compared is against the previous present's hash. Seqno unavailable or first swap: bucket "nojobs".
+Row (once per second while presents flow, not at idle): `SWEET FB: hash jobs0 P/C jobs1_2 P/C jobs3_4 P/C jobs5p P/C cost_p50 X max Y us nojobs P/C nohash K` (P presents compared with the previous hashed present, C of them changed; the first hashed present and the first after a nohash present only seed the comparison and are not counted). At most 20 rows per boot `SWEET FB: hash changed present swap n N jobs J bucket 1-2|3-4 (first changed row i of 20)` for the first changed presents in the 1-2 and 3-4 buckets, N = the SWAPT n. The SWAPT row is not touched.
+Rule 7: unknown boot-arg value = GAP row, off; a layer surface that cannot be mapped (not found, no mapping, tiled, not 4 B per element, extent beyond the memory) = GAP row (first 5, then every 1000th) and the present is counted as nohash.
+Host test: tools/test_sweet_fbhash366.py compiles the pure block and checks the hash (grid positions, every sampled word matters, an unsampled word does not, pitch), buckets, accounting, p50, reset, then text checks of the hooks, with mutants. Not run on hardware. The new write path (none) is unreviewed; this patch writes nothing to hardware.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,6 +150,134 @@
+ 	}
+ 	return SFB_W_SKIP;
+ }
++/*
++ * Patch 0366 (lowclk, research 164 B2 e1, LOG ONLY, boot-arg sweetfbhash=1, default off = byte-identical): did the panel PIXELS change at this present?
++ * Hash of the SOURCE surfaces of the present (what the panel copy reads), compared with the previous present's hash; the result is counted per second split by
++ * the GPU job count of the swap (the seqno delta SWEET SWAPT shows, patch 0186: jobs = gpu_seq of this swap - gpu_seq of the previous swap). The hash is a sampled
++ * grid: every SFH_N-th row, and on it every SFH_M-th 32-bit word (start column shifted by 1 word per sampled row so the grid is not one column set).
++ * Cost calc [arithmetic; measured per present at runtime, row field cost_p50/max]: 1080x2400x4 B surface: 2400/32 = 75 rows x ceil(1080/32) = 34 words = 2550 loads,
++ * each on its own 128 B stride = its own 64 B cache line; independent loads (the hash chain does not serialise the addresses), ~100 ns DRAM latency / ~8 in flight =
++ * ~13 ns -> ~33 us, plus 2550 xor+multiply (~3 cycles each, ~3 us) = ~36 us (budget <= ~50 us). A change confined to fewer than 32 rows, or to the columns between
++ * two samples, can be missed: "unchanged" here means "no sampled word changed", an upper bound on the unchanged presents.
++ */
++/* SFH-PURE-BEGIN */
++#define SFH_N           32u
++#define SFH_M           32u
++#define SFH_COST_MAX    256u
++#define SFH_FNV_OFF     14695981039346656037ull
++#define SFH_FNV_PRIME   1099511628211ull
++enum { SFH_B_J0 = 0, SFH_B_J12, SFH_B_J34, SFH_B_J5P, SFH_B_UNK, SFH_B_N };
++struct sfh_state {
++	bool      have_prev;            /* a previous present has a hash to compare with */
++	uint64_t  prev;
++	uint32_t  pres[SFH_B_N];        /* presents compared this second, per bucket */
++	uint32_t  chg[SFH_B_N];         /* of them changed */
++	uint32_t  nohash;               /* presents with no hash (source not mappable) this second */
++	uint32_t  cost_n;               /* cost samples stored (us), at most SFH_COST_MAX */
++	uint32_t  cost[SFH_COST_MAX];
++	uint32_t  cost_max;             /* max cost this second, also past SFH_COST_MAX */
++	uint32_t  first_logged;         /* "first changed" rows printed since boot */
++};
++
++static inline uint64_t
++sfh_mix(uint64_t h, uint64_t v)
++{
++	return (h ^ v) * SFH_FNV_PRIME;
++}
++
++/* hash of one layer's source: base = first byte of the surface content, pitch bytes per row, w x hgt 32-bit words; touch (may be NULL) is called with each sampled address first */
++static uint64_t
++sfh_grid(uint64_t h, const uint8_t *base, uint32_t pitch, uint32_t w, uint32_t hgt, void (*touch)(const uint8_t *))
++{
++	for (uint32_t r = 0; r < hgt; r += SFH_N) {
++		const uint8_t *row = base + (uint64_t)r * pitch;
++		for (uint32_t c = (r / SFH_N) % SFH_M; c < w; c += SFH_M) {
++			uint32_t px;
++			if (touch != NULL) {
++				touch(row + (uint64_t)c * 4);
++			}
++			memcpy(&px, row + (uint64_t)c * 4, 4);
++			h = sfh_mix(h, px);
++		}
++	}
++	return h;
++}
++
++/* bucket of a swap's GPU job count; known = false (no seqno, first swap): unknown */
++static int
++sfh_bucket(bool known, uint32_t jobs)
++{
++	if (!known) {
++		return SFH_B_UNK;
++	}
++	return jobs == 0 ? SFH_B_J0 : jobs <= 2 ? SFH_B_J12 : jobs <= 4 ? SFH_B_J34 : SFH_B_J5P;
++}
++
++/* one present with a hash: returns 1 = changed, 0 = unchanged, -1 = first (nothing to compare with, not counted) */
++static int
++sfh_account(struct sfh_state *s, uint64_t hash, int bucket)
++{
++	int r = -1;
++	if (s->have_prev) {
++		r = hash != s->prev;
++		s->pres[bucket]++;
++		s->chg[bucket] += (uint32_t)r;
++	}
++	s->have_prev = true;
++	s->prev = hash;
++	return r;
++}
++
++/* a present with no hash: counted, and the next present has nothing to compare with */
++static void
++sfh_nohash(struct sfh_state *s)
++{
++	s->nohash++;
++	s->have_prev = false;
++}
++
++static void
++sfh_cost_add(struct sfh_state *s, uint32_t us)
++{
++	if (s->cost_n < SFH_COST_MAX) {
++		s->cost[s->cost_n++] = us;
++	}
++	if (us > s->cost_max) {
++		s->cost_max = us;
++	}
++}
++
++/* p50 of the stored cost samples (rank ceil(n/2), 1-based), 0 when none */
++static uint32_t
++sfh_cost_p50(const struct sfh_state *s)
++{
++	uint32_t tmp[SFH_COST_MAX];
++	uint32_t n = s->cost_n;
++	if (n == 0) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t v = s->cost[i], j = i;
++		while (j > 0 && tmp[j - 1] > v) {
++			tmp[j] = tmp[j - 1];
++			j--;
++		}
++		tmp[j] = v;
++	}
++	return tmp[(n + 1) / 2 - 1];
++}
++
++/* per-second reset: counters and cost samples; the previous hash and the first-changed count stay */
++static void
++sfh_reset(struct sfh_state *s)
++{
++	memset(s->pres, 0, sizeof(s->pres));
++	memset(s->chg, 0, sizeof(s->chg));
++	s->nohash = 0;
++	s->cost_n = 0;
++	s->cost_max = 0;
++}
++/* SFH-PURE-END */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /* patch 0289: selector 28 returns a float in the low 32 bits (research 133 D: GetDotPitch scalar = float bits); mm per dot at 458 ppi =
+  * 25.4 / 458 = 0.05546 = 0x3d632878 [computed]. Selector 29 (GetDisplayArea, two floats, mm [guess: unit by analogy]) for the presented
+@@ -216,6 +344,12 @@
+ 	uint32_t      fGateTicks;     /* patch 0343: flush ticks the pending swap was held back by the present gate; fLock */
+ 	volatile bool fForceCopy;     /* patch 0361: a panel event (power change, QR hold) happened: the next present() copies; atomic exchange */
+ 	struct sweet_fb_last fLast;   /* patch 0361: what the last panel copy saw; only present() (the vsync thread) touches it */
++	uint32_t      fHashSwapN;     /* patch 0366: swap count (the SWEET SWAPT n) and GPU jobs since the previous swap of the swap now in fPending; fLock */
++	uint32_t      fHashSwapJobs;  /* patch 0366: 0xffffffff = unknown (no seqno or first swap) */
++	uint64_t      fHashPrevSeq;   /* patch 0366: Mali submitted seqno at the previous swap (0 = none); fLock */
++	uint32_t      fHashPresN;     /* patch 0366: the two values above, copied with the record for the present() that shows it; vsync thread */
++	uint32_t      fHashPresJobs;
++	struct sfh_state fHash;       /* patch 0366: only present() (the vsync thread) touches it */
+ 
+ 	bool needsVsync(void);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -244,6 +378,7 @@
+  */
+ #define SWEET_FB_GATE_MAX_TICKS 12
+ static int gSweetFbGate;   /* boot-arg sweetfb_gate, read once in start() */
++static int gSweetFbHash;   /* patch 0366: boot-arg sweetfbhash, read once in start() */
+ static uint64_t sweet_fb_gate_shown, sweet_fb_gate_defer, sweet_fb_gate_timeout;   /* fLock */
+ static uint32_t sweet_fb_gate_maxticks, sweet_fb_gate_logged_at;                       /* fLock */
+ static uint64_t sweet_fb_gate_logged_sum;
+@@ -379,6 +514,24 @@
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fForceCopy = false;   /* patch 0361 */
+ 	memset(&fLast, 0, sizeof(fLast));
++	memset(&fHash, 0, sizeof(fHash));   /* patch 0366 */
++	fHashSwapN = 0;
++	fHashSwapJobs = 0xffffffffu;
++	fHashPrevSeq = 0;
++	fHashPresN = 0;
++	fHashPresJobs = 0xffffffffu;
++	{
++		int hv = 0;
++		gSweetFbHash = 0;
++		if (PE_parse_boot_argn("sweetfbhash", &hv, sizeof(hv))) {
++			if (hv == 1) {
++				gSweetFbHash = 1;
++			} else if (hv != 0) {
++				IOLog("SWEET FB: GAP sweetfbhash=%d is not 0 or 1: ignored (off)\n", hv);
++			}
++		}
++		IOLog("SWEET FB: sweetfbhash %s\n", gSweetFbHash ? "1: sampled source-content hash per present, counted per second by GPU job bucket" : "0: off");
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -606,6 +759,8 @@
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fHashPresN = fb->fHashSwapN;   /* patch 0366 */
++			fb->fHashPresJobs = fb->fHashSwapJobs;
+ 			fb->fDirty = false;
+ 			fb->fGateTicks = 0;
+ 			fb->fLastPresentCount = count;
+@@ -693,6 +848,13 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ extern "C" void flush_dcache64(addr64_t, unsigned, int);   /* osfmk/arm/caches_internal.h, virtual address with phys = 0 */
++
++/* patch 0366: sweetfb_inv=1: the hash must read DRAM too (the GPU writes behind the cache, patch 0144): clean+invalidate the line of each sampled word first */
++static void
++sfh_flush_line(const uint8_t *p)
++{
++	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++}
+ static uint32_t sweet_fb_present_count;
+ extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: read by the nav session of SweetHID.cpp (unlock check) */
+ uint64_t sweet_fb_swap_count;
+@@ -988,6 +1150,13 @@
+ 		uint64_t gsq = 0, gdn = 0;
+ 		fSwapSeq = (sweet_mali_seq_peek(&gsq, &gdn) == 0) ? gsq : 0;
+ 	}
++	if (gSweetFbHash) {   /* patch 0366: the SWEET SWAPT n of this swap (the count after its increment below) and its GPU jobs = seqno delta to the previous swap, as SWAPT; log only */
++		uint64_t hsq = 0, hdn = 0;
++		bool hok = sweet_mali_seq_peek(&hsq, &hdn) == 0;
++		fHashSwapN = (uint32_t)(sweet_fb_swap_count + 1);
++		fHashSwapJobs = (hok && fHashPrevSeq != 0 && hsq >= fHashPrevSeq) ? (uint32_t)(hsq - fHashPrevSeq) : 0xffffffffu;
++		fHashPrevSeq = hok ? hsq : 0;
++	}
+ 	IOLockUnlock(fLock);
+ 	sweet_fb_last_swap_abs = mach_absolute_time();   /* patch 0260 */
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -1320,6 +1489,76 @@
+ 		}
+ 	}
+ 
++	/* patch 0366: sampled hash of the SOURCE of this present, independent of the copy skip above (see the comment at SFH-PURE-BEGIN); log only */
++	if (gSweetFbHash) {
++		static int hinv = -1;
++		static uint64_t h_t0_ns, h_gap_n;
++		if (hinv < 0) {
++			int v = 0;
++			hinv = (PE_parse_boot_argn("sweetfb_inv", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		}
++		uint64_t c0 = mach_absolute_time();
++		uint64_t hh = SFH_FNV_OFF;
++		bool ok = true;
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			uint32_t id = get32(rec, 0x54 + 4 * layer);
++			if (!(mask & (1u << layer)) || id == 0) {
++				continue;
++			}
++			SweetSurface *hs = sweet_surface_copy(id);
++			if (hs != NULL && hs == fSurface) {
++				OSSafeReleaseNULL(hs);
++				continue;       /* the panel surface itself is never a copy source */
++			}
++			uint32_t bpe = (hs != NULL && hs->bytesPerElement) ? hs->bytesPerElement : 4;
++			const char *why = hs == NULL ? "surface not found" : hs->kernelAddress() == 0 ? "no kernel mapping" : hs->memory == NULL ? "no memory descriptor" :
++			    (hs->elementWidth != 1 || hs->elementHeight != 1) ? "compressed or tiled element" : bpe != 4 ? "bytes per element is not 4" :
++			    (hs->width == 0 || hs->height == 0) ? "empty surface" :
++			    ((uint64_t)hs->offset + (uint64_t)(hs->height - 1) * hs->bytesPerRow + (uint64_t)hs->width * 4 > hs->memory->getLength()) ? "extent beyond the memory" : NULL;
++			if (why != NULL) {
++				ok = false;
++				if (h_gap_n++ < 5 || (h_gap_n % 1000) == 0) {
++					IOLog("SWEET FB: GAP sweetfbhash: layer %u surface %u not mappable (%s): no hash for this present (counted as nohash; %llu so far)\n", layer, id, why, h_gap_n);
++				}
++				OSSafeReleaseNULL(hs);
++				break;
++			}
++			hh = sfh_mix(hh, ((uint64_t)layer << 32) | id);
++			for (uint32_t k = 0; k < 4; k++) {      /* the source and destination rectangles of the layer: a moved layer is a change */
++				hh = sfh_mix(hh, ((uint64_t)get32(rec, 0x64 + 16 * layer + 4 * k) << 32) | get32(rec, 0xc4 + 16 * layer + 4 * k));
++			}
++			hh = sfh_grid(hh, (const uint8_t *)(hs->kernelAddress() + hs->offset), hs->bytesPerRow, hs->width, hs->height, hinv ? sfh_flush_line : NULL);
++			OSSafeReleaseNULL(hs);
++		}
++		uint64_t c1 = mach_absolute_time();
++		uint64_t cost_ns;
++		absolutetime_to_nanoseconds(c1 - c0, &cost_ns);
++		struct sfh_state *hst = &fHash;
++		if (ok) {
++			sfh_cost_add(hst, (uint32_t)(cost_ns / 1000));
++			int bk = sfh_bucket(fHashPresJobs != 0xffffffffu, fHashPresJobs);
++			int r = sfh_account(hst, hh, bk);
++			if (r == 1 && (bk == SFH_B_J12 || bk == SFH_B_J34) && hst->first_logged < 20) {
++				hst->first_logged++;
++				IOLog("SWEET FB: hash changed present swap n %u jobs %u bucket %s (first changed row %u of 20)\n", fHashPresN, fHashPresJobs, bk == SFH_B_J12 ? "1-2" : "3-4", hst->first_logged);
++			}
++		} else {
++			sfh_nohash(hst);
++		}
++		uint64_t h_now;
++		absolutetime_to_nanoseconds(c1, &h_now);
++		if (h_t0_ns == 0) {
++			h_t0_ns = h_now;
++		}
++		if (h_now - h_t0_ns >= 1000000000ull) {
++			IOLog("SWEET FB: hash jobs0 %u/%u jobs1_2 %u/%u jobs3_4 %u/%u jobs5p %u/%u cost_p50 %u max %u us nojobs %u/%u nohash %u\n",
++			    hst->pres[SFH_B_J0], hst->chg[SFH_B_J0], hst->pres[SFH_B_J12], hst->chg[SFH_B_J12], hst->pres[SFH_B_J34], hst->chg[SFH_B_J34],
++			    hst->pres[SFH_B_J5P], hst->chg[SFH_B_J5P], sfh_cost_p50(hst), hst->cost_max, hst->pres[SFH_B_UNK], hst->chg[SFH_B_UNK], hst->nohash);
++			sfh_reset(hst);
++			h_t0_ns = h_now;
++		}
++	}
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !skip; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;

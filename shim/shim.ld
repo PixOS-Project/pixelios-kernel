@@ -7,7 +7,7 @@ SECTIONS
 	.data : { *(.data*) }
 	. = ALIGN(16);
 	_bss_start = .;
-	.bss : { *(.bss*) *(COMMON) }
+	.bss : { *(.bss*) *(COMMON) *(.el2stack) PROVIDE(_el2_stack_top = .); }
 	. = ALIGN(16);
 	_bss_end = .;
 	. += 0x8000;

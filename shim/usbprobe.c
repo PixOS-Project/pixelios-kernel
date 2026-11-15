@@ -39,7 +39,8 @@
 
 /* Linked image bounds (shim.ld); the event-buffer overlap flag compares
  * against the same range pstore_init uses. */
-extern char _head[], _end[];
+/* Linker-script symbols: _head = start.S:4 label (ENTRY, shim.ld:1), _end = shim.ld:19; names fixed by start.S/shim.ld/build.sh, so no rename. */
+extern char _head[], _end[]; // NOLINT(bugprone-reserved-identifier)
 
 /* Result of one fault-guarded register read. */
 struct usb_reg {
@@ -146,12 +147,10 @@ static const char *connect_speed_name(uint32_t s)
 {
 	if (s == 0)
 		return "(HS)";
-	else if (s == 1)
+	else if (s == 1 || s == 3)	/* 1 and 3 are both full speed (header comment); the raw value is printed by the caller */
 		return "(FS)";
 	else if (s == 2)
 		return "(LS)";
-	else if (s == 3)
-		return "(FS)";
 	else if (s == 4)
 		return "(SS)";
 	else if (s == 5)
@@ -328,12 +327,12 @@ void usbprobe_report(uintptr_t fdt)
 	for (unsigned row = 0; row < USBPROBE_PHY_DUMP_WORDS / 4; row++) {
 		p = 0;
 		p = put_txt(line, sizeof(line), p, "PHY+");
-		p = put_hex(line, sizeof(line), p, row * 16u, 2);
+		p = put_hex(line, sizeof(line), p, (uint64_t)row * 16u, 2);
 		p = put_txt(line, sizeof(line), p, " ");
 
 		for (unsigned col = 0; col < 4; col++) {
 			struct usb_reg w = usb_read(USBPROBE_PHY_BASE +
-						    (row * 4 + col) * 4u);
+						    (uintptr_t)(row * 4 + col) * 4u);
 			if (col)
 				p = put_txt(line, sizeof(line), p, " ");
 			if (w.ok)

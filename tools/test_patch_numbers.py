@@ -50,6 +50,29 @@ class T(unittest.TestCase):
         self.pn("release", "0104")
         self.assertEqual(self.pn("next", "--owner", "z").stdout.splitlines()[0], "0104")
 
+    def test_release_below_a_higher_number_keeps_a_skipped_placeholder(self):
+        # 0233-0239 class (T-8ad1): deleting a reservation under a used number left an unheld series gap
+        self.git("checkout", "-q", "main"); self.git("branch", "-D", "wifi")
+        self.pn("next", "--owner", "x", "--name", "foo"); self.pn("next", "--owner", "y", "--name", "bar")   # 0103, 0104
+        r = self.pn("release", "0103")
+        self.assertIn("skipped", r.stdout.splitlines()[-1])
+        self.assertIn("0103  (not committed anywhere)   RESERVED by skipped (?)", self.pn("status").stdout)
+        self.assertEqual(self.pn("next", "--owner", "z").stdout.splitlines()[0], "0105")
+        self.git("checkout", "-q", "gpu"); self.add("0103-sweet-late.patch"); self.git("add", "-A")
+        r = subprocess.run([sys.executable, os.path.join(self.d, "tools", "patch-numbers"), "precommit"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout)   # the placeholder is unnamed: a real patch may still take it
+
+    def test_precommit_refuses_a_number_that_skips_past_the_top(self):
+        self.git("checkout", "-q", "main"); self.git("branch", "-D", "wifi")
+        self.git("checkout", "-q", "gpu"); self.add("0106-sweet-far.patch"); self.git("add", "-A")   # top is 0102: 0103..0105 would be unheld
+        r = subprocess.run([sys.executable, os.path.join(self.d, "tools", "patch-numbers"), "precommit"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertIn("skips 0103..0105", r.stdout)
+        self.git("rm", "-q", "--cached", "xnu/patches/0106-sweet-far.patch")
+        self.add("0103-sweet-next.patch"); self.git("add", "xnu/patches/0103-sweet-next.patch")
+        r = subprocess.run([sys.executable, os.path.join(self.d, "tools", "patch-numbers"), "precommit"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_unnamed_placeholder_reservation_accepts_a_real_patch(self):
         # `claim N --owner wifi-reserved` (no name) is a placeholder: a real patch file with that number, any name, is not a conflict
         self.git("checkout", "-q", "main"); self.git("branch", "-D", "wifi")

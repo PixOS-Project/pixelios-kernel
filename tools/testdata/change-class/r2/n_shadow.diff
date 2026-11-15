@@ -1,0 +1,10 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,5 +1,6 @@
+ 	int err = 0;
+ 	if (x) {
++		int err = 0;
+ 		err = setup();
+ 	}
+ 	return err;

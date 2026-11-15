@@ -1,0 +1,3 @@
+#!/bin/sh
+# PixOS kernel repo post-rewrite (TP-055): mirror to offload-host in the background; see _offload-sync-trigger.
+exec "$(dirname "$0")/_offload-sync-trigger"

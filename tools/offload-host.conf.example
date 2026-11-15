@@ -1,0 +1,19 @@
+# tools/offload-host.conf.example (T-dd93, R66): copy to tools/offload-host.conf (gitignored) and fill in YOUR values.
+# The file is NOT sourced: only `KEY=VALUE` lines of the keys below are read (no quoting, no expansion, `#` comments), so a typo cannot run code.
+# Precedence: environment variable > this file > built-in default. No OFFLOAD_HOST = no offload host: remote-job / heavy-job / offload-sync run
+# local-only and print one `OFFLOAD GAP:` / `REMOTE: ... unavailable` line (the offload host is never a dependency).
+# Per-use switches (the queue web board): the offline list holds `<OFFLOAD_QUEUE_LABEL>` (master) or `<label>:<use>` rows, use = build gate test sync ci (tools/offload-conf.sh); a switched-off use prints `OFFLOAD OFF: use=<use>` and runs local.
+# Worktrees read the file of the MAIN clone (git common dir); OFFLOAD_CONF=/path overrides the location, OFFLOAD_CONF=none ignores any file.
+
+# ssh target of the second build host: an ssh alias or an address (also settable as REMOTE_JOB_HOST)
+OFFLOAD_HOST=offload-host.example
+# ssh user, only when the host has no `user@` and your ssh config does not already say it (empty = ssh default)
+OFFLOAD_USER=
+# absolute work root ON the offload host (>= 2 path components); jobs, caches and mirrors live in $OFFLOAD_ROOT/work
+OFFLOAD_ROOT=/mnt/offload-data/pixos
+# regex of foreign processes on the offload host that make heavy-job refuse admission (pgrep -f style)
+OFFLOAD_FOREIGN_RE=vitest|/mnt/offload-data/other-work.*(node|tsc|esbuild)
+# THIS host's home as the lab lane / xnu build container addresses the artifacts (empty = $HOME)
+LAB_HOME=
+# name of this host in the queue's offline list (the web board's on/off toggle writes `<name><TAB><reason>` there); remote-job / heavy-job then route nothing new here. Default: offload-host
+OFFLOAD_QUEUE_LABEL=

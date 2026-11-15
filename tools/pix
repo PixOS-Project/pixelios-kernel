@@ -8,13 +8,15 @@
   tools/pix xrun ARGS...               one hardware test cycle -> one report (tools/xrun, docs/AUTOMATION.md)
   tools/pix ci ARGS...                 CI kernel: find/wait/download/verify (tools/ci-kernel)
   tools/pix stack ARGS...              do the xnu patches apply on pristine xnu-8796? (tools/stack-apply)
-  tools/pix phone ARGS...              what state is the Pixel in, is it bluejay? (tools/phone-state)
+  tools/pix phone ARGS...              what state is the Pixel in, is it bluejay? (tools/phone state)
   tools/pix proposals ARGS...          tool-proposal register: list|check|new|validate (tools/tool-proposals)
   tools/pix recover ARGS...            wait for the phone after a reboot, bounded; software only (tools/hang-recover)
   tools/pix probe ARGS...              one shim probe cycle: build, capture, boot, verdict (tools/probe-run)
   tools/pix new-device VENDOR/CODENAME --soc VENDOR/SOC [--name NAME]
                                        scaffold device/ (and soc/ if missing) with TODO values
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import json
 import os
 import subprocess
@@ -136,7 +138,12 @@ def wrap(script):
     return run
 
 
-COMMANDS = {"xrun": wrap("xrun"), "ci": wrap("ci-kernel"), "stack": wrap("stack-apply"), "phone": wrap("phone-state"), "proposals": wrap("tool-proposals"), "recover": wrap("hang-recover"), "probe": wrap("probe-run"), "devices": cmd_devices, "info": cmd_info, "check": cmd_check, "build": cmd_build, "new-device": cmd_new}
+def cmd_phone(a):
+    """R38 (AP-291): observe through `tools/phone state` (the state machine); the hand-run tools/phone-state is denied by agent-guard E24."""
+    sys.exit(subprocess.call([os.path.join(ROOT, "tools", "phone"), "state"] + a, cwd=ROOT))
+
+
+COMMANDS = {"xrun": wrap("xrun"), "ci": wrap("ci-kernel"), "stack": wrap("stack-apply"), "phone": cmd_phone, "proposals": wrap("tool-proposals"), "recover": wrap("hang-recover"), "probe": wrap("probe-run"), "devices": cmd_devices, "info": cmd_info, "check": cmd_check, "build": cmd_build, "new-device": cmd_new}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

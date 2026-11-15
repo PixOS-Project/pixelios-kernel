@@ -1,0 +1,185 @@
+SWEET Bluetooth: replay v3 (patch 0219, ticket T-0351, W-BTUP; boot-arg sweetbtleprobe=3, default behaviour unchanged, =1 and =2 unchanged). bt-up6 [obs 20261107T030249Z-bt-up6]: comparing the per-command ROM answers, the 0217 replay differs from bluetoothd instance 1 in ONE answer of the first 48 commands: position 19 (0x204a) status 0x0c in the replay, 0x00 in bluetoothd; the replay sent a 0x2007 after every step, bluetoothd none before position 49 (refused there). Pass A replays the 48 commands back to back with NO probe between steps (byte-exact payloads incl. the full 0c52 EIR and bluetoothd's own fd48 from the bt-up6 `tx data@` rows) and ONE 0x2007 right after fd48; pass B (after a power-cycle) is the control with the probe after every step. Per step: the answer, bluetoothd's answer, the poll wait in ms. Same opcodes as 0217 (all sent by bluetoothd byte-exact), plus repeats of the read-only 0x2007, the 0x200b / 0x200c-OFF witnesses and 0x2007 again after ~0.1/1/5 s (pass A); no scan/advertising enable, no patchram, no baud change; volatile controller RAM state, cleared by the REG_ON power-cycle that follows (as 0216/0217). Applies after 0189, 0213, 0215, 0216 and 0217. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -627,6 +627,8 @@ sbu_probe_one(const struct sbu_cand *c)
+ #define SBU_CMD_MS      500
+ #define SBU_PM_SUPP     72      /* Read Local Supported Commands returns status + 64 octets */
+ 
++static unsigned sbu_cmd_ms;      /* patch 0219 (T-0351): poll time (ms, 5 ms steps) the last answered sbu_cmd waited for its Command Complete; log-only */
++
+ /* caller guarantees par holds plen bytes (patch 0217: plen is any uint8_t, the old plen > 8 guard is gone) */
+ static int
+ sbu_cmd(uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *st, uint8_t *rp, size_t rpmax, size_t *rpn)
+@@ -697,6 +699,7 @@ sbu_cmd(uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *st, uint8_t *rp,
+ 				}
+ 			}
+ 			if (match) {
++				sbu_cmd_ms = t;
+ 				sbu_trace("rx", buf, tot);
+ 				if (n > tot) {
+ 					printf("BT PROBE: %zu extra rx bytes after the answer to opcode %#x (first %02x): dropped\n", n - tot, op, buf[tot]);
+@@ -1024,6 +1027,132 @@ sbu_replay_probe(void)
+ 	}
+ }
+ 
++/*
++ * patch 0219 (T-0351, W-BTUP), boot-arg sweetbtleprobe=3: replay v3. bt-up6 [obs 20261107T030249Z-bt-up6] compared with the per-command ROM answers (merged.log): of bluetoothd's 48 first commands the replay of
++ * patch 0217 differs from bluetoothd instance 1 in exactly ONE answer, position 19 (0x204a, LE Read Periodic Advertiser List Size): replay status 0x0c, bluetoothd 0x00 (return parameter 06). The replay (0217) sent a
++ * 0x2007 after every step, bluetoothd none before position 49 (where it is refused 0x0c). Pass A is the bluetoothd-shaped sequence: the 48 commands back to back, every answer awaited, NO probe in between, byte-exact
++ * payloads (0c13 "Pixel 6a" + zeros and 0c52 EIR from the bt-up6 `tx data@` rows, fd48 bluetoothd's own `01 67 d2 70 72 f6 55`), then ONE 0x2007 right after fd48 like bluetoothd. Pass B (after a power-cycle + HCI Reset)
++ * is the control with the probe after every step (the 0217 shape, now byte-exact): it must show the position-19 refusal again, else the pass-A/B difference is not the probe. Same opcodes as 0217 (all sent by
++ * bluetoothd byte-exact in bt-up4/5/6) plus repeats of 0x2007 (read-only) and the 0x200b/0x200c-OFF witnesses; no scan/advertising enable, no flash, no patchram, no baud change; volatile controller RAM state, cleared by the
++ * REG_ON power-cycle that follows. Each step prints the answer, bluetoothd's answer for that step and the poll wait in ms (the pacing witness).
++ */
++static const char sbu_eir_hex[] = "01 09 09 50 69 78 65 6c 20 36 61 0f 03 00 12 1f 11 2f 11 0a 11 0c 11 32 11 01 18 01 05 21 07 fe ca ca de af de ca de de fa ca de 00 00 00 00 77 0a 6a 10 a2 22 f2 86 5f 41 19 1d 02 03 03 02 27 ff 00 4c 02 24 02";    /* 0c52 payload, bytes 0..69 of 241; bytes 70..240 are zero in the bt-up6 `tx data@` rows (instance 1 and 2 identical) */
++static const char sbu_fd48_bd_hex[] = "01 67 d2 70 72 f6 55";    /* fd48 payload of bluetoothd instance 1 (bt-up6); per-instance random, the ROM answers 0x01 either way */
++
++static void
++sbu_replay3(bool probed)
++{
++	static const uint8_t par_rnd[7] = { 0x00, 0xe0, 0x01, 0x30, 0x00, 0x01, 0x00 };    /* bluetoothd's LE Set Scan Parameters, bt-up4/5/6 trace */
++	static const uint8_t par_off[2] = { 0x00, 0x00 };                                    /* LE Set Scan Enable: off (witness only, never enable) */
++	static const unsigned decay_ms[3] = { 100, 900, 4000 };                              /* 2007 again after 0.1 s, 1 s, 5 s since the first one (pass A, when refused or not) */
++	const char *pass = probed ? "B" : "A";
++	uint8_t par[255], rp[SBU_PM_SUPP], none[1] = { 0 }, st, s7, sb;
++	size_t rpn;
++	unsigned timeouts = 0, ran = 0, diverged = 0, first_div = 0, flip = 0, wait_max = 0, wait_sum = 0, w;
++	uint16_t div_op = 0;
++	int e;
++
++	printf("BT PROBE: replay3 pass %s start (sweetbtleprobe=3, patch 0219): %zu steps, bluetoothd's own payloads (0c13/0c52/fd48 byte-exact from bt-up6), %s\n", pass, SBU_RM_N,
++	    probed ? "0x2007 after EVERY step (control, the 0217 shape)" : "NO probe between the steps, 0x2007 once at the end");
++	for (size_t i = 0; i < SBU_RM_N; i++) {
++		const struct sbu_rstep *r = &sbu_rm[i];
++		unsigned pos = (unsigned)i + 1;
++		const char *hex = r->op == 0x0c52 ? sbu_eir_hex : r->op == 0xfd48 ? sbu_fd48_bd_hex : r->hex;
++		uint8_t want = r->op == 0xfd48 ? 0x01 : 0x00;      /* bluetoothd instance 1, bt-up6 [obs]: every one of the 48 answered 0x00, fd48 0x01 (unknown command) */
++		size_t known;
++
++		memset(par, 0, sizeof(par));
++		known = sbu_hexparse(hex, par, sizeof(par));
++		if (known == (size_t)-1 || known > r->plen) {
++			SBU_GAP(SG_OTHER, "replay3 %s pos=%u op=0x%04x: payload table row malformed (known %ld of %u); step skipped, the replay is incomplete", pass, pos, r->op, (long)known, r->plen);
++			timeouts++;
++			continue;
++		}
++		st = 0xff;
++		ran++;
++		if ((e = sbu_cmd(r->op, par, r->plen, &st, rp, sizeof(rp), &rpn)) != 0) {
++			timeouts++;
++			printf("BT PROBE: replay3 %s pos=%u op=0x%04x plen=%u NO ANSWER (error %d)\n", pass, pos, r->op, r->plen, e);
++			continue;
++		}
++		w = sbu_cmd_ms;
++		wait_sum += w;
++		if (w > wait_max) {
++			wait_max = w;
++		}
++		if (st != want) {
++			if (diverged++ == 0) {
++				first_div = pos;
++				div_op = r->op;
++			}
++		}
++		s7 = 0xff;
++		if (probed) {       /* the row is printed after the probe: the probe's own HCI trace rows must not split it */
++			ran++;
++			if ((e = sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn)) != 0) {
++				timeouts++;
++				s7 = 0xff;
++				printf("BT PROBE: replay3 B pos=%u op=0x%04x 2007 after it NO ANSWER (error %d)\n", pos, r->op, e);
++			} else if (s7 != 0 && flip == 0) {
++				flip = pos;
++			}
++		}
++		printf("BT PROBE: replay3 %s pos=%u op=0x%04x plen=%u status=%#04x (%s) bluetoothd=%#04x%s wait=%u ms", pass, pos, r->op, r->plen, st, sbu_pstatus(st), want, st != want ? " DIVERGES-FROM-BLUETOOTHD" : "", w);
++		if (probed && s7 != 0xff) {
++			printf(" then 2007 status=%#04x (%s)%s", s7, sbu_pstatus(s7), s7 == 0x0c ? " DISALLOWED" : "");
++		}
++		printf("\n");
++	}
++	if (!probed) {
++		unsigned t0 = 0;
++
++		s7 = 0xff;
++		ran++;
++		if ((e = sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn)) != 0) {
++			timeouts++;
++			printf("BT PROBE: replay3 A final 2007 NO ANSWER (error %d)\n", e);
++		} else {
++			printf("BT PROBE: replay3 A final 2007 status=%#04x (%s) wait=%u ms%s\n", s7, sbu_pstatus(s7), sbu_cmd_ms, s7 == 0x0c ? " DISALLOWED" : "");
++			if (s7 != 0) {
++				flip = (unsigned)SBU_RM_N;
++				printf("BT PROBE: first-disallowed-after=%u op=0x%04x (2007 status %#04x)\n", flip, sbu_rm[SBU_RM_N - 1].op, s7);
++			}
++		}
++		sb = 0xff;
++		ran++;
++		if (sbu_cmd(0x200b, par_rnd, 7, &sb, rp, sizeof(rp), &rpn) == 0) {
++			printf("BT PROBE: replay3 A 200b(bluetoothd random) status=%#04x (%s)\n", sb, sbu_pstatus(sb));
++		} else {
++			timeouts++;
++			printf("BT PROBE: replay3 A 200b NO ANSWER\n");
++		}
++		sb = 0xff;
++		ran++;
++		if (sbu_cmd(0x200c, par_off, 2, &sb, rp, sizeof(rp), &rpn) == 0) {
++			printf("BT PROBE: replay3 A 200c(scan enable OFF) status=%#04x (%s)\n", sb, sbu_pstatus(sb));
++		} else {
++			timeouts++;
++			printf("BT PROBE: replay3 A 200c NO ANSWER\n");
++		}
++		for (size_t k = 0; k < 3; k++) {       /* is a refusal a state (stays) or a busy window (decays)? */
++			sbu.hw.msleep(decay_ms[k]);
++			t0 += decay_ms[k];
++			s7 = 0xff;
++			ran++;
++			if (sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn) == 0) {
++				printf("BT PROBE: replay3 A 2007 again after ~%u ms: status=%#04x (%s)\n", t0, s7, sbu_pstatus(s7));
++			} else {
++				timeouts++;
++				printf("BT PROBE: replay3 A 2007 again after ~%u ms: NO ANSWER\n", t0);
++			}
++		}
++	}
++	printf("BT PROBE: replay3 pass %s done: steps=%zu commands=%u no-answer=%u diverged-from-bluetoothd=%u first-diverged=%u op=0x%04x first-disallowed-after=%u wait-max=%u ms wait-sum=%u ms\n", pass, SBU_RM_N, ran, timeouts, diverged, first_div, div_op, flip, wait_max, wait_sum);
++	if (timeouts != 0) {
++		SBU_GAP(SG_OTHER, "replay3 %s: %u steps got no answer or a malformed row; the A/B is incomplete", pass, timeouts);
++	}
++}
++
+ /*
+  * patch 0217, boot-arg sweetbtrw200b=1 (diagnostic knob, not a fix): the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b
+  * is rewritten from 0x0c (Command Disallowed) to 0x00. bt-up4/5 [obs]: bluetoothd exits right after that status [read from source: scan completion 0x1005798d4]. The rewrite scores
+@@ -1296,8 +1425,18 @@ sweet_bt_uart_attach(void)
+ 			{       /* patch 0216 (T-0c77): boot-arg sweetbtleprobe=1; default behaviour unchanged. The rx thread is not running yet, so the probe owns the FIFO. */
+ 				int v = 0;
+ 
+-				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2)) {
+-					if (v == 2) {       /* patch 0217: full-sequence replay instead of the matrix */
++				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3)) {
++					if (v == 3) {       /* patch 0219: replay v3, pass A (no probes between steps), power-cycle, pass B (control with a probe after every step) */
++						sbu_replay3(false);
++						(void)sbu_power_off();
++						e = sbu_probe_one(&use[win]);
++						printf("BT UART: controller power-cycled between the replay passes: %s (error %d)\n", e == 0 ? "answered HCI Reset again" : "NO ANSWER", e);
++						if (e != 0) {
++							printf("BT GAP: backend not started after the replay pass A power-cycle; controller powered off\n");
++							return;
++						}
++						sbu_replay3(true);
++					} else if (v == 2) {       /* patch 0217: full-sequence replay instead of the matrix */
+ 						sbu_replay_probe();
+ 					} else {
+ 						sbu_le_probe();
+@@ -1317,7 +1456,7 @@ sweet_bt_uart_attach(void)
+ 	if (!settled) {
+ 		int v = 0;
+ 
+-		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2)) {
++		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3)) {
+ 			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
+ 		}
+ 	}

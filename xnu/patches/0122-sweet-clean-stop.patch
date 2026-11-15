@@ -1,0 +1,54 @@
+SWEET restart (patch 0122, B-A6/B1): flush the filesystems (sync_internal, bounded to 15 s) before the remote hard reset. A hard PMU reset with dirty root metadata left a journal that replays into "BTOpenPath returned (5)" and an unmountable root (observed on hardware 2026-10-25: bs-a1, bs-m3b, bs-r2; bs-r1 mounted fine before the reset). Does not fix the replay itself (open item).
+
+diff --git a/bsd/dev/sweet_restart.c b/bsd/dev/sweet_restart.c
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -95,6 +95,36 @@
+ 	}
+ }
+ 
++extern int sync_internal(void);
++static volatile int sweet_sync_done;
++
++static void
++sweet_sync_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	(void)sync_internal();
++	sweet_sync_done = 1;
++}
++
++/*
++ * Flush the filesystems (HFS journal + UFS cache) before the hard PMU reset: a reset with dirty root metadata leaves a
++ * journal that replays into "BTOpenPath returned (5)" (observed 2026-10-25, runs bs-m3b/bs-r2). Bounded to 15 s so a
++ * wedged filesystem still resets.
++ */
++static void
++sweet_clean_stop(void)
++{
++	thread_t th;
++	int i;
++	sweet_sync_done = 0;
++	if (kernel_thread_start(sweet_sync_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		for (i = 0; i < 150 && !sweet_sync_done; i++) {
++			delay_for_interval(100, 1000 * 1000);
++		}
++	}
++	printf("SWEET RESTART: sync %s after %d ms\n", sweet_sync_done ? "done" : "TIMED OUT", i * 100);
++}
++
+ /* sweetremote=1: block on a UDP socket, reset on the magic payload (see the header). */
+ static void
+ sweet_remote_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -130,9 +160,11 @@
+ 		buf[got] = 0;
+ 		if (strcmp(buf, "SWEET-RESET-BL") == 0) {
+ 			printf("SWEET RESTART: remote reset to bootloader\n");
++			sweet_clean_stop();
+ 			sweet_machine_reset(1);
+ 		} else if (strcmp(buf, "SWEET-RESET") == 0) {
+ 			printf("SWEET RESTART: remote restart\n");
++			sweet_clean_stop();
+ 			sweet_machine_reset(0);
+ 		}
+ 	}

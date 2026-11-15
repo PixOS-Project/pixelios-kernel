@@ -1,0 +1,10 @@
+diff --git a/xnu/patches/0303-sweet-log.patch b/xnu/patches/0303-sweet-log.patch
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/xnu/patches/0303-sweet-log.patch
+@@ -0,0 +1,4 @@
++--- a/inc/cfg.h
+++++ /dev/null
++@@ -1 +0,0 @@
++-/* old */

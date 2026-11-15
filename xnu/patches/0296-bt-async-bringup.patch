@@ -1,0 +1,282 @@
+SWEET Bluetooth: patch 0296 (bt/defaults 2026-11-11), the controller bring-up runs off the boot path. sweet_bt_uart_attach used to run the patchram download (about 42 s at 115200 baud, 3038 x 0xfc4c records), lefeat (0274) and the VSC capability read (0285) before launchd started [obs logs/runs/20261110T174143Z-bt-pr2: patchram start 1794332642.355, verified 1794332684.173, first exec launchd 1794332685.083]; with 0295 making that default ON it would add about 42 s to every boot. Now attach starts one kernel thread (sbu_bringup_thread) and returns: the thread runs the SAME call chain in the same order (sbu_patchram_attach, sbu_rfwit_knob, sbu_attach_finish) and then becomes the rx loop, so the rx poll never runs against a half-initialised controller and no controller command, register or bus store is new. While the thread runs, sweet_bt_uart_bringup_busy() is 1 and sbt_connect refuses every kctl client (plain and sk control) with EBUSY and one bounded `BT GAP:` row (BlueTool answers result 1, bluetoothd retries boot). Rows: `BT UART: bring-up done in N ms (async)`; failure paths keep their GAP rows. If kernel_thread_start fails the bring-up runs synchronously (one GAP). Applies after 0295.
+
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index add576c..2cdc639 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -123,6 +123,10 @@ int i = sbt_index(ref);
+ 	if (i < 0) {
+ 		return EINVAL;
+ 	}
++	if (sweet_bt_uart_bringup_busy()) {      /* patch 0296: the async bring-up owns the UART (patchram download); a client now would interleave bytes with it. BlueTool answers result 1, bluetoothd retries boot */
++		SBT_GAP(G_BUSY, "kctl %s: controller bring-up (patchram download) still running; connect refused with EBUSY, the client retries", i ? SBT_CTL_SK : SBT_CTL_PLAIN);
++		return EBUSY;
++	}
+ 	if (__atomic_exchange_n(&sbt.uart_busy, 1, __ATOMIC_ACQ_REL)) {      /* both controls drive ONE UART: one client at a time across them (review r1 F6) */
+ 		SBT_GAP(G_BUSY, "kctl %s: the UART already has a client (one UART, one client across both controls); connect refused", i ? SBT_CTL_SK : SBT_CTL_PLAIN);
+ 		return EBUSY;
+diff --git a/bsd/dev/sweet_bt.h b/bsd/dev/sweet_bt.h
+index 8b9290a..0f26366 100644
+--- a/bsd/dev/sweet_bt.h
++++ b/bsd/dev/sweet_bt.h
+@@ -20,6 +20,7 @@ void sweet_bt_set_ops(const struct sweet_bt_ops *ops);
+ int sweet_bt_rx(const void *data, size_t len);          /* backend -> connected control (ctl_enqueuedata); drops loudly without a client */
+ void sweet_bt_uart_disc(void);                          /* sweet_bt_uart.c (patch 0285), called when the client of either control disconnects */
+ void sweet_bt_uart_attach(void);                        /* sweet_bt_uart.c, called once from sweet_bt_init */
++int sweet_bt_uart_bringup_busy(void);                   /* sweet_bt_uart.c (patch 0296): 1 while the controller bring-up (patchram, lefeat, VSC caps) owns the UART; sbt_connect refuses clients then */
+ 
+ /* Skywalk UART channel (patch 0286, sweet_bt_sk.c; design docs/research/bt-skywalk-uart-channel.md). sweet_bt.c routes the two sk sockopts and the UART RX bytes here. */
+ void sweet_bt_sk_attach(void);                          /* parse boot-arg sweetbtsk (0 = off), one log line; called once from sweet_bt_init */
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index f703bab..a73b533 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -27,6 +27,9 @@ extern bool sweet_usb_board_is_gs101(void);     /* patch 0157 (sweet_usbroot.c)
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
++extern void thread_terminate_self(void);       /* patch 0296: the bring-up thread ends itself when no rx loop follows (same use as sweet_mali.c) */
++extern uint64_t mach_absolute_time(void);       /* osfmk/mach/mach_time.h:55 */
++extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);      /* osfmk/kern/clock.h:242 */
+ 
+ /* ---- addresses [src docs/research/BT-S4a-uart16-u4.md; each line cites it] ---- */
+ #define SBU_UART        0x175B0000u     /* A6, DT serial@175B0000 */
+@@ -3445,6 +3448,156 @@ sbu_nopcf_parse(void)       /* patch 0231: own function so the host test runs th
+ 	}
+ }
+ 
++/*
++ * patch 0296 (bt/defaults 2026-11-11): the controller bring-up (patchram download ~42 s at 115200 baud, lefeat 0274, VSC caps 0285, the sweetbtrfwit witness and the rest of
++ * attach) runs in a kernel thread; sweet_bt_uart_attach returns at once, so the default-on patchram (0295) no longer delays launchd. The command sequence is the same call chain
++ * as before (sbu_patchram_attach, then sbu_rfwit_knob, then sbu_attach_finish), in the same order, so no new controller command, register or bus store.
++ * While sbu_bringup_busy is set the UART belongs to the bring-up: sbt_connect (sweet_bt.c) refuses every kctl client with EBUSY and one bounded `BT GAP:` row, so bytes never
++ * interleave; BlueTool answers result 1 on a failed connect and bluetoothd retries `boot` (docs/research/bt-pixos-bluetool-spec.md). The rx poll (sbu_rx_thread) starts only
++ * after the bring-up finished (the bring-up thread becomes the rx loop), and the ops table is set before the flag drops.
++ */
++static int sbu_bringup_busy;            /* 1 from sbu_bringup_start until the sequence ended (success or failure); __atomic */
++static struct sbu_cand sbu_bringup_cand;       /* copy of the answering clock candidate: the attach stack frame is gone when the thread runs */
++
++int
++sweet_bt_uart_bringup_busy(void)
++{
++	return __atomic_load_n(&sbu_bringup_busy, __ATOMIC_ACQUIRE);
++}
++
++static uint64_t
++sbu_now_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++/* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness on the controller bluetoothd will meet; extracted unchanged from attach so the sync and the async path run the same code */
++static void
++sbu_rfwit_knob(void)
++{
++	int v = 0;
++
++	if (PE_parse_boot_argn("sweetbtrfwit", &v, sizeof(v)) && v == 1) {
++		sbu_hb_on = true;       /* patch 0230: rx heartbeat only with this knob */
++		sbu_rfwit();
++	}
++}
++
++/* the rest of attach after the (optional) patchram step; 0 = backend up, -1 = backend not started (controller powered off) */
++static int
++sbu_attach_finish(bool settled, bool inline_rx)
++{
++	if (!settled) {
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
++			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
++		}
++		if (sbu_knob_default_on("sweetbtpatchram")) {
++			printf("BT GAP: sweetbtpatchram (on) ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
++		}
++		sbu_rfwit_unused("the baud probe did not settle the clock");
++		sbu_vsc_unused("the baud probe did not settle the clock");      /* patch 0285 */
++	}
++	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtrw200b", &v, sizeof(v)) && v == 1) {
++			sbu_rw200b_on = true;
++			printf("BT GAP: sweetbtrw200b=1 active: Command Complete status 0x0c for opcode 0x200b is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
++		}
++	}
++	{       /* patch 0223 (T-08f7): boot-arg sweetbtrw200c=1, the same diagnostic status rewrite for LE Set Scan Enable; default off */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtrw200c", &v, sizeof(v)) && v == 1) {
++			sbu_rw200c_on = true;
++			printf("BT GAP: sweetbtrw200c=1 active: Command Complete status 0x0c for opcode 0x200c is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; the controller is NOT scanning; one BT GAP row per rewrite)\n");
++		}
++	}
++	{       /* patch 0225 (T-aea4): boot-arg sweetbtnopadv=1, hide LE feature bit 13 from bluetoothd so it skips 0x204a; default off */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtnopadv", &v, sizeof(v)) && v == 1) {
++			sbu_nopadv_on = true;
++			printf("BT GAP: sweetbtnopadv=1 active: LE feature bit 13 (Periodic Advertising) is cleared in the 0x2003 Command Complete on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
++		}
++	}
++	sbu_pubscan_parse();     /* patch 0226 (T-4b11) / 0232 (T-0936): boot-arg sweetbtpubscan=1|2, Own_Address_Type 0x01 -> 0x00 in bluetoothd's 0x200b on the way to the chip; default off */
++	sbu_nopcf_parse();       /* patch 0231 (T-b58f): boot-arg sweetbtnopcf=1, withhold bluetoothd's fce9 05/07 PCF scan filter from the chip and answer it; default off */
++	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
++		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
++		(void)sbu_power_off();
++		return -1;
++	}
++	sweet_bt_set_ops(&sbu_ops);
++	if (inline_rx) {        /* patch 0296: the bring-up thread becomes the rx loop (sbu_bringup_thread) once the busy flag is down: no second thread, no rx poll before this point */
++		sbu.rx_thread = true;
++	} else {
++		thread_t th;
++
++		if (kernel_thread_start(sbu_rx_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++			sbu.rx_thread = true;
++		} else {
++			printf("BT GAP: uart16 rx polling thread not started; received bytes are never relayed\n");
++		}
++	}
++	printf("BT UART: backend up (uart16 %u baud 8N1, polled rx); HOST_WAKE irq, pad PUD/DRV, sleep clock are GAPs\n", sbu.baud);
++	return 0;
++}
++
++/* runs the bring-up sequence; true = the backend is up and the caller must run the rx loop (inline_rx) or the rx thread already runs */
++static bool
++sbu_bringup_run(bool inline_rx)
++{
++	uint64_t t0 = sbu_now_ms(), dt;
++	bool ok = false;
++
++	if (sbu_patchram_attach(&sbu_bringup_cand) != 0) {
++		sbu_rfwit_unused("the backend did not start after the patchram step");
++	} else {
++		sbu_rfwit_knob();
++		ok = sbu_attach_finish(true, inline_rx) == 0;
++	}
++	dt = sbu_now_ms() - t0;
++	printf("BT UART: bring-up done in %llu ms (async)\n", (unsigned long long)dt);
++	if (!ok) {
++		printf("BT GAP: bring-up ended without a backend after %llu ms (async); kctl clients meet no UART backend (every transfer fails)\n", (unsigned long long)dt);
++	}
++	__atomic_store_n(&sbu_bringup_busy, 0, __ATOMIC_RELEASE);      /* last: ops and rx state are final before a client may connect */
++	return ok;
++}
++
++static void
++sbu_bringup_thread(void *arg, wait_result_t w)
++{
++#pragma unused(arg, w)
++	if (sbu_bringup_run(true)) {
++		sbu_rx_thread(NULL, 0);     /* never returns */
++	}
++	thread_terminate_self();
++}
++
++static void
++sbu_bringup_start(const struct sbu_cand *cand)
++{
++	thread_t th;
++
++	sbu_bringup_cand = *cand;
++	__atomic_store_n(&sbu_bringup_busy, 1, __ATOMIC_RELEASE);
++	printf("BT UART: bring-up (patchram, lefeat, VSC caps) runs in a kernel thread; kctl connects are refused with EBUSY until it is done\n");
++	if (kernel_thread_start(sbu_bringup_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		return;
++	}
++	printf("BT GAP: bring-up thread not started (kernel_thread_start failed); the bring-up runs synchronously in attach\n");
++	(void)sbu_bringup_run(false);
++}
++
+ void
+ sweet_bt_uart_attach(void)
+ {
+@@ -3573,75 +3726,17 @@ sweet_bt_uart_attach(void)
+ 				int v = 0;
+ 
+ 				v = sbu_knob_default_on("sweetbtpatchram") ? 1 : 0;
+-				if (v == 1 && sbu_patchram_attach(&use[win]) != 0) {
+-					sbu_rfwit_unused("the backend did not start after the patchram step");
++				if (v == 1) {
++					sbu_bringup_start(&use[win]);       /* patch 0296: patchram + lefeat + VSC caps + everything after them run in a kernel thread; attach returns at once */
+ 					return;
+ 				}
+-				if (v != 1) {
+-					sbu_lefeat_unused("sweetbtpatchram is off");      /* patch 0274 */
+-					sbu_vsc_unused("sweetbtpatchram is off (the adapter runs only after a verified patchram download)");      /* patch 0285 */
+-				}
++				sbu_lefeat_unused("sweetbtpatchram is off");      /* patch 0274 */
++				sbu_vsc_unused("sweetbtpatchram is off (the adapter runs only after a verified patchram download)");      /* patch 0285 */
+ 			}
+-			{       /* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness (LE scan 100% duty + classic Inquiry) on the controller bluetoothd will meet; before the rx thread */
+-				int v = 0;
+-
+-				if (PE_parse_boot_argn("sweetbtrfwit", &v, sizeof(v)) && v == 1) {
+-					sbu_hb_on = true;       /* patch 0230: rx heartbeat only with this knob */
+-					sbu_rfwit();
+-				}
+-			}
+-		}
+-	}
+-	if (!settled) {
+-		int v = 0;
+-
+-		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
+-			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
+-		}
+-		if (sbu_knob_default_on("sweetbtpatchram")) {
+-			printf("BT GAP: sweetbtpatchram (on) ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
+-		}
+-		sbu_rfwit_unused("the baud probe did not settle the clock");
+-		sbu_vsc_unused("the baud probe did not settle the clock");      /* patch 0285 */
+-	}
+-	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
+-		int v = 0;
+-
+-		if (PE_parse_boot_argn("sweetbtrw200b", &v, sizeof(v)) && v == 1) {
+-			sbu_rw200b_on = true;
+-			printf("BT GAP: sweetbtrw200b=1 active: Command Complete status 0x0c for opcode 0x200b is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
+-		}
+-	}
+-	{       /* patch 0223 (T-08f7): boot-arg sweetbtrw200c=1, the same diagnostic status rewrite for LE Set Scan Enable; default off */
+-		int v = 0;
+-
+-		if (PE_parse_boot_argn("sweetbtrw200c", &v, sizeof(v)) && v == 1) {
+-			sbu_rw200c_on = true;
+-			printf("BT GAP: sweetbtrw200c=1 active: Command Complete status 0x0c for opcode 0x200c is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; the controller is NOT scanning; one BT GAP row per rewrite)\n");
+-		}
+-	}
+-	{       /* patch 0225 (T-aea4): boot-arg sweetbtnopadv=1, hide LE feature bit 13 from bluetoothd so it skips 0x204a; default off */
+-		int v = 0;
+-
+-		if (PE_parse_boot_argn("sweetbtnopadv", &v, sizeof(v)) && v == 1) {
+-			sbu_nopadv_on = true;
+-			printf("BT GAP: sweetbtnopadv=1 active: LE feature bit 13 (Periodic Advertising) is cleared in the 0x2003 Command Complete on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
++			sbu_rfwit_knob();   /* patch 0229 (T-b0b4): see the function; before the rx thread */
+ 		}
+ 	}
+-	sbu_pubscan_parse();     /* patch 0226 (T-4b11) / 0232 (T-0936): boot-arg sweetbtpubscan=1|2, Own_Address_Type 0x01 -> 0x00 in bluetoothd's 0x200b on the way to the chip; default off */
+-	sbu_nopcf_parse();       /* patch 0231 (T-b58f): boot-arg sweetbtnopcf=1, withhold bluetoothd's fce9 05/07 PCF scan filter from the chip and answer it; default off */
+-	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */
+-		printf("BT GAP: hci uart backend failed to start; powering the controller off\n");
+-		(void)sbu_power_off();
++	if (sbu_attach_finish(settled, false) != 0) {
+ 		return;
+ 	}
+-	sweet_bt_set_ops(&sbu_ops);
+-	thread_t th;
+-	if (kernel_thread_start(sbu_rx_thread, NULL, &th) == KERN_SUCCESS) {
+-		thread_deallocate(th);
+-		sbu.rx_thread = true;
+-	} else {
+-		printf("BT GAP: uart16 rx polling thread not started; received bytes are never relayed\n");
+-	}
+-	printf("BT UART: backend up (uart16 %u baud 8N1, polled rx); HOST_WAKE irq, pad PUD/DRV, sleep clock are GAPs\n", sbu.baud);
+ }

@@ -1,0 +1,82 @@
+SWEET PMIC SRC print (patch 0318, ALL-ON tracker T-02/T-24, docs/research/139-gs101-bcl-brownout.md, review 0316). Log only, no hardware access, no new bus traffic: bsd/dev/sweet_chg_i2c.c prints the S2MPG10 / S2MPG11 reset-source latches that the shim read (shim/pmicsrc.c, `--pmic-src`; READ-ONLY ACPM FUNC_READ of STATUS1/STATUS2/PWRONSRC/OFFSRC and S2MPG11 STATUS1/OFFSRC, nothing cleared) and handed over as boot-args, because the shim console never reaches the host in a --boot-xnu boot (same route as --mif-clk / patch 0214). Boot-args (hex via PE_parse_boot_argn, pexpert/gen/bootargs.c getval, same as debug=0xBAADF00D): sweetps10=0xAABBCCDD (S2MPG10 STATUS1,STATUS2,PWRONSRC,OFFSRC, MSB first, present only when all four were read), sweetps11=0xAABB (S2MPG11 STATUS1,OFFSRC, present only when both were read), sweetpsrc=N (0 all six read; 1..6 the read of register index N-1 failed and the later ones were skipped; 7 an ACPM gate refused). Where patch 0314 printed the two `SWEET PMIC GAP: s2mpg10|s2mpg11 ... no read path` lines (P2 group 4, i2c_g_chg), a kernel that finds any of the three boot-args prints instead `SWEET PMIC SRC: s2mpg10 STATUS1=0x.. STATUS2=0x.. PWRONSRC=0x.. OFFSRC=0x.. s2mpg11 STATUS1=0x.. OFFSRC=0x.. rc=N (read by the shim, not cleared)` (a register with no value prints ERR, never a made-up one), a GAP line for rc != 0 or a missing sweetpsrc, and one GAP line that INT1..INT6 stay unread (clear-on-read). No sweetps* boot-arg (shim without --pmic-src): the 0314 GAP lines exactly as before. Bit meaning of PWRONSRC / OFFSRC is not public (research 139 section 2): printed raw. Applies after 0314. Host test: shim/pmicsrc_host_test.c (token format), kernel string check: tools/build-xnu-image.sh refuses --pmic-src without 'sweetps10' in the kernel. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -513,6 +513,66 @@
+ 	    i2c_fgb[0][0] | (i2c_fgb[0][1] << 8), vc, (uint32_t)(((uint64_t)vc * 78125u) / 1000000u), cu, (int)((cs * 3125) / 10), so, so >> 8, ((so & 0xffu) * 100u) >> 8);
+ }
+ 
++/*
++ * Patch 0318 (ALL-ON T-02/T-24): the S2MPG10 / S2MPG11 reset-source latches as the SHIM read them (shim/pmicsrc.c, --pmic-src, review 0316; the shim console never reaches the host in a
++ * --boot-xnu boot, so the shim appends the values to the command line like --mif-clk does and this only prints them: no hardware access, no ACPM client here).
++ *   sweetps10=0xAABBCCDD  S2MPG10 STATUS1 STATUS2 PWRONSRC OFFSRC (MSB first; present only when all four were read)
++ *   sweetps11=0xAABB      S2MPG11 STATUS1 OFFSRC (present only when both were read)
++ *   sweetpsrc=N           0 all six read; 1..6 the read of register index N-1 failed and every later one was skipped (0 S10 STATUS1, 1 STATUS2, 2 PWRONSRC, 3 OFFSRC, 4 S11 STATUS1, 5 OFFSRC);
++ *                         7 an ACPM gate refused (nothing sent). A register without a value prints ERR, never a made-up value. INT1..INT6 stay a GAP (clear-on-read, never read).
++ * No sweetps* boot-arg at all (shim built without --pmic-src): the old GAP lines. Bit meaning of PWRONSRC / OFFSRC is not public (research 139): printed raw.
++ */
++static void
++i2c_hex8(char *o, int ok, uint32_t v)
++{
++	static const char d[] = "0123456789abcdef";
++
++	if (!ok) {
++		o[0] = 'E';
++		o[1] = 'R';
++		o[2] = 'R';
++		o[3] = 0;
++		return;
++	}
++	o[0] = '0';
++	o[1] = 'x';
++	o[2] = d[(v >> 4) & 0xf];
++	o[3] = d[v & 0xf];
++	o[4] = 0;
++}
++
++static void
++i2c_pmic_src_log(void)
++{
++	uint32_t w10 = 0, w11 = 0, rc = 0;
++	int have10, have11, haverc;
++	char h[6][5];
++	unsigned int k;
++
++	have10 = PE_parse_boot_argn("sweetps10", &w10, sizeof(w10));
++	have11 = PE_parse_boot_argn("sweetps11", &w11, sizeof(w11));
++	haverc = PE_parse_boot_argn("sweetpsrc", &rc, sizeof(rc));
++	if (!have10 && !have11 && !haverc) {
++		i2c_log("SWEET PMIC GAP: s2mpg10 PWRONSRC[0xe] OFFSRC[0xf] STATUS1[0xc] STATUS2[0xd] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
++		i2c_log("SWEET PMIC GAP: s2mpg11 OFFSRC[0xd] STATUS1[0xc] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
++		return;
++	}
++	for (k = 0; k < 4; k++) {
++		i2c_hex8(h[k], have10, (w10 >> (24 - 8 * k)) & 0xffu);
++	}
++	for (k = 0; k < 2; k++) {
++		i2c_hex8(h[4 + k], have11, (w11 >> (8 - 8 * k)) & 0xffu);
++	}
++	i2c_log("SWEET PMIC SRC: s2mpg10 STATUS1=%s STATUS2=%s PWRONSRC=%s OFFSRC=%s s2mpg11 STATUS1=%s OFFSRC=%s rc=%u (read by the shim, not cleared)\n",
++	    h[0], h[1], h[2], h[3], h[4], h[5], haverc ? rc : 0xffffu);
++	if (!haverc) {
++		i2c_log("SWEET PMIC GAP: sweetpsrc missing (the shim always appends it with sweetps10/sweetps11): the read result code is unknown\n");
++	} else if (rc != 0) {
++		i2c_log("SWEET PMIC GAP: PMIC SRC rc=%u (1..6 the read of register index rc-1 failed and the later ones were skipped, 7 an ACPM gate refused): registers shown ERR have no value, see the shim console / pstore\n", rc);
++	}
++	i2c_log("SWEET PMIC GAP: s2mpg10 INT1..INT6[0x0-0x5] s2mpg11 INT1..INT6[0x0-0x5] not read (clear on read)\n");
++}
++
+ static void
+ i2c_g_chg(int hi)
+ {
+@@ -523,8 +583,7 @@
+ 		 * shim and only reads rail registers), so say so instead of inventing a transaction. Register numbers: GS s2mpg10-register.h / s2mpg11-register.h at 6e771b23: INT1..INT6
+ 		 * 0x0..0x5, STATUS1 0xc, S2MPG10 STATUS2 0xd / PWRONSRC 0xe / OFFSRC 0xf, S2MPG11 OFFSRC 0xd. The INT registers are CLEAR-ON-READ (s2mpg10-irq.c:192-196 reads INT1..INT6 and never
+ 		 * writes them back; only the mask registers are written): reading them from here WOULD be a state change. */
+-		i2c_log("SWEET PMIC GAP: s2mpg10 PWRONSRC[0xe] OFFSRC[0xf] STATUS1[0xc] STATUS2[0xd] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
+-		i2c_log("SWEET PMIC GAP: s2mpg11 OFFSRC[0xd] STATUS1[0xc] INT1..INT6[0x0-0x5] no read path (needs an xnu ACPM client; INT1..6 clear on read)\n");
++		i2c_pmic_src_log();
+ 	}
+ 	for (r = a; r <= b; r++) {
+ 		if (chg_i2c_read(0x69, r, 1, &i2c_chg[r - 0xb0]) != 0) {

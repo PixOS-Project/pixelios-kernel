@@ -1,0 +1,9 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,4 +10,5 @@ static void bump(unsigned long *p)
+ 	do {
+ 		old = __builtin_arm_ldrex(p);
++		printf("old %lx\n", old);
+ 	} while (__builtin_arm_strex(old + 1, p));
+ }

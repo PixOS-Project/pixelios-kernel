@@ -1,0 +1,85 @@
+SWEET nav12 (patch 0256, T-c87c, G-10b-nav; input injection only): the About tap is verified by its swap count like the unlock swipe (patch 0254). When fewer than 3 swaps follow the first about-open tap within its 1800 ms settle, the tap is sent again, at most twice: retry 1 at 500,370 (same row, a late General page), retry 2 at 500,400 (30 px lower in the same row; rows are 120 px apart). Logs `SWEET NAV: about-open retry N: S swaps ...`, `SWEET NAV: about-open: S swaps since the first About tap, R retries`, `SWEET GAP: NAV about-open: ...` when still silent. Reason [obs nav11 20261108T100829Z, T-9bc6-plancheck.md]: the About tap (500,370) is sent >= 754 ms after the General push has ended, Preferences CPU +6 ms, 0 swaps in all 3 reps, about-back pops General and general-back finds the root: About was never pushed; the quiet-display hold draft was a no-op on that baseline. Cause (tap ignored while General populates vs. a miss at 500,370) is [guess]; the retry log separates the two. No register, no store to hardware.
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 0d3dd71..b7d71a2 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -390,6 +390,8 @@ public:
+ 	UInt32 fNavReps, fNavRep, fNavIdx, fNavStep, fNavRng;
+ 	UInt32 fNavWakeTaps, fNavWakeSt;   /* patch 0254: unlock retries (wake taps sent), 1 = the wake tap finger is down */
+ 	uint64_t fNavSw0;   /* patch 0254: swap count at the start of the unlock attempt */
++	UInt32 fNavAboutTaps;   /* patch 0256: about-open retries sent so far */
++	uint64_t fNavAboutSw0;   /* patch 0256: swap count at the first about-open tap */
+ 	UInt32 fNavHomeSt, fNavPref0;   /* patch 0255: 1-3 = the app-home swipe after a Preferences launch inside the unlock window is running, 4 = done; Preferences exec count at the first unlock attempt */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+@@ -617,6 +619,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	fNavWakeTaps = fNavWakeSt = 0;
+ 	fNavSw0 = 0;
+ 	fNavHomeSt = fNavPref0 = 0;
++	fNavAboutTaps = 0;
++	fNavAboutSw0 = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
+@@ -698,6 +702,13 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		act.x0 = 665;
+ 		act.y0 = 1158;
+ 	}
++	bool aboutAct = strcmp(act.name, "about-open") == 0;
++	if (aboutAct && st == 0 && self->fNavAboutTaps == 0) {
++		self->fNavAboutSw0 = sweet_fb_swap_count;   /* patch 0256: swaps before the first About tap */
++	}
++	if (aboutAct && self->fNavAboutTaps == 2) {
++		act.y0 = 400;   /* patch 0256: the second retry probes 30 px lower inside the same row (rows are 120 px apart: About 370, Software Update 490) */
++	}
+ 	if (act.kind == 0) {
+ 		/* patch 0249 (T-10ba): a tap holds the finger at (x0,y0). The table rows of kind 0 carry x1=y1=0 (unused for a tap), and the drag interpolation below ran every tap
+ 		 * from (x0,y0) to (0,0) over ms/10 ticks and lifted the finger at 0,0: a 100 ms drag to the top-left corner, so iOS saw no tap [read from source: this function
+@@ -713,7 +724,7 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 			self->fNavPref0 = sweet_exec_pref_count;   /* patch 0255 */
+ 		}
+ 	}
+-	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
++	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 		if (a == &act && strcmp(a->name, "app-launch") == 0) {
+ 			IOLog("SWEET NAV: app-launch icon Clock at %d,%d (rep %u)\n", (int)a->x0, (int)a->y0, self->fNavRep);
+@@ -734,7 +745,7 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 	}
+ 	if (st <= ticks + 1) {   /* finger up (or the wait started): observe the animation for `settle` ms */
+-		if (!(i == 0 && self->fNavWakeTaps > 0)) {
++		if (!(i == 0 && self->fNavWakeTaps > 0) && !(aboutAct && self->fNavAboutTaps > 0)) {
+ 			IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 		}
+ 		self->fNavStep = ticks + 2;
+@@ -779,6 +790,29 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 			IOLog("SWEET GAP: NAV unlock: %llu swaps after %u wake taps, going on (rep 0 unlock / home-page rows will be no-anim)\n", d, self->fNavWakeTaps);
+ 		}
+ 	}
++	if (aboutAct) {
++		/*
++		 * Patch 0256 (T-c87c, G-10b-nav): the About tap is verified by its swap count, like the unlock swipe (patch 0254). nav11 [obs 20261108T100829Z, docs/reviews/T-c87c-proof.md s2-s3,
++		 * T-9bc6-plancheck.md]: in all three reps the About tap (500,370) was sent >= 754 ms after the last swap of the General push, Preferences CPU rose 6 ms and nothing was presented
++		 * (EVT swaps flat 629 -> 629); about-back then popped General (25 swaps) and general-back found Settings already at the root (distinct 0), i.e. About was never pushed. The
++		 * quiet-display hold of the first 0256 draft was a no-op on that baseline. Cause unknown (a tap ignored while the General page populates, or a miss at 500,370): if fewer than
++		 * 3 swaps follow the tap within its 1800 ms settle, the tap is sent again, at most twice: retry 1 at 500,370 (same row; a late General page), retry 2 at 500,400 (30 px lower in
++		 * the row). Every decision is logged; the action markers of the first tap stay the only ones. Input injection only.
++		 */
++		uint64_t ad = sweet_fb_swap_count - self->fNavAboutSw0;
++		if (ad < 3 && self->fNavAboutTaps < 2) {
++			self->fNavAboutTaps++;
++			IOLog("SWEET NAV: about-open retry %u: %llu swaps since the first About tap (< 3), tap again at 500,%d\n", self->fNavAboutTaps, ad, self->fNavAboutTaps == 2 ? 400 : 370);
++			self->fNavStep = 0;
++			sender->setTimeoutMS(300);
++			return;
++		}
++		IOLog("SWEET NAV: about-open: %llu swaps since the first About tap, %u retries\n", ad, self->fNavAboutTaps);
++		if (ad < 3) {
++			IOLog("SWEET GAP: NAV about-open: %llu swaps after %u retries, going on (about-open stays no-anim)\n", ad, self->fNavAboutTaps);
++		}
++		self->fNavAboutTaps = 0;
++	}
+ 	IOLog("SWEET NAV: ACTION %s end rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 	self->fNavStep = 0;
+ 	self->fNavIdx = i + 1;

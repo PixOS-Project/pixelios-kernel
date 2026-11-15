@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Shellcheck-disable reason lint (RULES R16, T-eff6): every own-line `# shellcheck disable=SCnnnn[,..]` directive in a shell script carries a reason on the same line.
+Why: a bare disable hides a finding for good and nobody can tell later whether it is still true (R16: "a `# shellcheck disable=` carries a reason comment").
+Accepted:   # shellcheck disable=SC2086  # fl is a word list on purpose          (a second `#`, or `--`, then >= 2 words)
+Rejected:   # shellcheck disable=SC2086                                          (no reason)      # shellcheck disable=SC2086 # ok   (one word)
+Only an own-line directive is read (a `printf '# shellcheck disable=..'` in a test fixture is a string, not a directive). The reason is never judged for quality beyond two words.
+  tools/lint-shellcheck-reason [FILE ...]      default: every file of tools/shell-files (the gate's shellcheck step runs this right after shellcheck)
+Exit 0 PASS, 1 FAIL (one `SHELLCHECK DISABLE WITHOUT REASON file:line: text` line each), 2 usage/unreadable. Last line: RESULT: PASS|FAIL shellcheck-reason files=N disables=D bare=B
+Do instead of tripping it: append `  # why the finding is wrong here`. There is no escape. Test: tools/test_lint_shellcheck_reason.py."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DIRECTIVE = re.compile(r"^\s*#\s*shellcheck\s+disable=([A-Za-z0-9,]+)(.*)$")
+REASON = re.compile(r"^\s*(?:#+|--)\s*(\S+(?:\s+\S+)+)")      # `# two or more words` / `-- two or more words` after the codes
+
+
+def scan(path):
+    """-> (disables, [(lineno, text)]) of one file."""
+    n, bare = 0, []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            m = DIRECTIVE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            n += 1
+            if not REASON.match(m.group(2)):
+                bare.append((i, line.strip()))
+    return n, bare
+
+
+def main(argv):
+    if any(a.startswith("-") for a in argv):
+        print(__doc__)
+        return 2
+    root = os.path.dirname(HERE)
+    if argv:
+        files = argv
+    else:
+        r = subprocess.run([os.path.join(HERE, "shell-files")], capture_output=True, text=True, cwd=root)
+        if r.returncode != 0:
+            print("RESULT: ERROR shellcheck-reason tools/shell-files failed: " + r.stderr.strip()[:200])
+            return 2
+        files = [os.path.join(root, x) for x in r.stdout.split()]
+    total, nbare = 0, 0
+    for p in files:
+        try:
+            n, bare = scan(p)
+        except OSError as e:
+            print("RESULT: ERROR shellcheck-reason cannot read %s: %s" % (p, e))
+            return 2
+        total += n
+        for i, text in bare:
+            nbare += 1
+            print("SHELLCHECK DISABLE WITHOUT REASON %s:%d: %s" % (os.path.relpath(p, root) if not argv else p, i, text))
+    print("RESULT: %s shellcheck-reason files=%d disables=%d bare=%d" % ("FAIL" if nbare else "PASS", len(files), total, nbare))
+    return 1 if nbare else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

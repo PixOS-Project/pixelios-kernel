@@ -1,0 +1,211 @@
+SWEET IOSurface client memory (patch 0161, G-11 icons, research 74): QuartzCore's GL renderer wraps its CPU images into IOSurfaces whose pixels live in the client's memory (IOSurfaceCreate with the key IOSurfaceAddress for 20 of 35 image formats, or selector 6 WrapClientImage). Our create ignored the address and returned zeroed memory (g92: the 19 backboardd 180x180 icon surfaces, 0 nonzero words, never written) and selector 6 answered Unsupported. Now the surface keeps a row-by-row copy of the client's pixels (IOMemoryDescriptor::withAddressRange in the creating task, writeBytes into the surface), refreshed at every lock trap of the same process (current_task() == connection owner); selector 6 implemented through the same path; boot-arg sweetsurf_clientaddr=0 disables it.
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -33,6 +33,11 @@
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
+ 	uint32_t cacheMode, planeCount, parentID;
++	/* patch 0161: a surface made from client memory (create with IOSurfaceAddress, or selector 6 WrapClientImage) keeps a COPY of the client's pixels; the
++	 * client's row pitch (before the 64-byte rounding of patch 0159), its address (valid in the creating process only) and that process id */
++	uint64_t clientAddr;
++	uint32_t clientBpr;
++	int      clientPid;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -383,6 +383,7 @@
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	s->clientBpr = s->bytesPerRow;   /* patch 0161: the pitch of the client's own memory, before patch 0159 rounds ours */
+ 	/* Patch 0159: a single-plane surface keeps the row pitch the client asked for only if it is a multiple of SWEET_SURFACE_ROW_ALIGN (64).
+ 	 * CoreAnimation asks for exact pitches (600x600 BGRA: 2400, 'LA08' 230 wide: 480) that Mali Valhall cannot import as a linear resource
+ 	 * (pan_linear_or_tiled_row_align_req = 64 [src pan_layout.h]), which forced a one-shot CPU copy of surfaces whose content arrives later (g74: 0
+@@ -496,6 +497,53 @@
+ 	return true;
+ }
+ 
++/* Patch 0161 (G-11 icons): QuartzCore's GL renderer wraps its CPU images into IOSurfaces whose pixels live in the CLIENT's memory: IOSurfaceCreate with the key
++ * IOSurfaceAddress (20 of 35 image formats) or selector 6 (WrapClientImage). Our create ignored the address and handed out zeroed memory, so every icon image
++ * reached the GPU empty (g92: 19 backboardd 180x180 surfaces, locks 2 / wunlocks 1 by backboardd, 0 nonzero words, never written by anyone). The surface now
++ * keeps a copy of the client's rows: read with the owner's task (IOMemoryDescriptor::withAddressRange), written through the surface's own descriptor
++ * (writeBytes flushes), at create and again at every lock trap of the same process (QuartzCore refreshes a changed image with Lock(0,0) + Unlock).
++ * Boot-arg sweetsurf_clientaddr=0 disables it. Row by row, so the client's pitch and ours (64-aligned) may differ. */
++#define SWEET_SURFACE_CLIENT_MAX (64u << 20)
++/* Returns true when every row was copied. Runs only in the context of the process that owns `task` (copyin reads the CURRENT map): the callers check
++ * current_task() == fTask (Opus review 0161 finding 1/2: no cross-process read, no page pinning, one row at a time). */
++static bool
++sweet_surface_sync_client(SweetSurface *s, task_t task)
++{
++	if (s->clientAddr == 0 || s->memory == NULL || task == NULL || task != current_task() || s->clientBpr == 0 || s->planeCount != 0) {
++		return false;
++	}
++	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
++	uint32_t rowBytes = sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement;
++	uint64_t srcLen = (uint64_t)s->clientBpr * rows;
++	if (rows == 0 || rowBytes == 0 || rowBytes > s->clientBpr || rowBytes > s->bytesPerRow || srcLen > SWEET_SURFACE_CLIENT_MAX ||
++	    s->clientAddr + srcLen < s->clientAddr ||
++	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * rows > s->allocSize) {
++		return false;
++	}
++	uint8_t *tmp = (uint8_t *)IOMallocData(rowBytes);
++	if (tmp == NULL) {
++		return false;
++	}
++	bool ok = true;
++	for (uint32_t y = 0; y < rows; y++) {
++		if (copyin((user_addr_t)(s->clientAddr + (uint64_t)y * s->clientBpr), tmp, rowBytes) != 0) {
++			ok = false;
++			break;
++		}
++		s->memory->writeBytes((uint64_t)s->offset + (uint64_t)y * s->bytesPerRow, tmp, rowBytes);
++	}
++	IOFreeData(tmp, rowBytes);
++	return ok;
++}
++
++static bool
++sweet_surface_clientaddr_enabled(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetsurf_clientaddr", &on, sizeof(on));
++	return on != 0;
++}
++
+ class IOSurfaceRootUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
+ 
+@@ -507,6 +555,8 @@
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn createFromProps(OSDictionary *props, IOExternalMethodArguments *args);
++	IOReturn wrapClientImage(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -749,7 +799,6 @@
+ 	const char *buf = (const char *)args->structureInput;
+ 	uint32_t len = args->structureInputSize;
+ 	char *copy = NULL;
+-	IOReturn ret;
+ 
+ 	if (args->structureInputDescriptor != NULL) {
+ 		len = (uint32_t)args->structureInputDescriptor->getLength();
+@@ -774,12 +823,23 @@
+ 		return kIOReturnBadArgument;
+ 	}
+ 
++	IOReturn cret = createFromProps(props, args);
++	props->release();
++	return cret;
++}
++
++/* The caller keeps ownership of props. */
++IOReturn
++IOSurfaceRootUserClient::createFromProps(OSDictionary *props, IOExternalMethodArguments *args)
++{
++	IOReturn ret;
+ 	SweetSurface *s = sweet_surface_alloc();
+ 	if (s == NULL) {
+-		props->release();
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	s->clientAddr = 0;
++	s->clientPid = 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+@@ -808,7 +868,19 @@
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
+-	props->release();
++	if (ret == kIOReturnSuccess) {   /* patch 0161: pixels that live in the creating process */
++		OSNumber *addr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (addr != NULL && addr->unsigned64BitValue() != 0 && sweet_surface_clientaddr_enabled()) {
++			s->clientAddr = addr->unsigned64BitValue();
++			s->clientPid = proc_selfpid();
++			bool copied = sweet_surface_sync_client(s, fTask);
++			static uint32_t logged;
++			if (logged < 8) {
++				logged++;
++				IOLog("SWEET SURF: id %u client memory 0x%llx %ux%u bpr %u (ours %u) %s\n", s->id, s->clientAddr, s->width, s->height, s->clientBpr, s->bytesPerRow, copied ? "copied" : "NOT copied");
++			}
++		}
++	}
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+ 		return ret;
+@@ -818,6 +890,45 @@
+ 	return ret;
+ }
+ 
++/* Selector 6 (iOS 16.7 IOSurface.framework _IOSurfaceClientWrapClientImage 0x1a3986580, research 74): struct in 0x20 bytes = u64 client address, u32 width,
++ * height, pixel format, bytes per element, bytes per row, alloc size; the reply is the create reply. Same path as a create with IOSurfaceAddress. */
++static void
++sweet_dict_put(OSDictionary *d, const char *key, uint64_t v, unsigned int bits)
++{
++	OSNumber *n = OSNumber::withNumber(v, bits);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++IOReturn
++IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
++{
++	if (args->structureInput == NULL || args->structureInputSize < 0x20 || !sweet_surface_clientaddr_enabled()) {
++		return kIOReturnUnsupported;
++	}
++	uint64_t addr;
++	uint32_t f[6];   /* width, height, pixel format, bytes per element, bytes per row, alloc size (memcpy: the struct may be unaligned) */
++	memcpy(&addr, (const uint8_t *)args->structureInput + 0x00, sizeof(addr));
++	memcpy(f, (const uint8_t *)args->structureInput + 0x08, sizeof(f));
++	OSDictionary *d = OSDictionary::withCapacity(8);
++	if (d == NULL || addr == 0) {
++		OSSafeReleaseNULL(d);
++		return kIOReturnBadArgument;
++	}
++	sweet_dict_put(d, "IOSurfaceWidth", f[0], 32);
++	sweet_dict_put(d, "IOSurfaceHeight", f[1], 32);
++	sweet_dict_put(d, "IOSurfacePixelFormat", f[2], 32);
++	sweet_dict_put(d, "IOSurfaceBytesPerElement", f[3], 32);
++	sweet_dict_put(d, "IOSurfaceBytesPerRow", f[4], 32);
++	sweet_dict_put(d, "IOSurfaceAllocSize", f[5], 32);
++	sweet_dict_put(d, "IOSurfaceAddress", addr, 64);
++	IOReturn ret = createFromProps(d, args);
++	d->release();
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -869,8 +980,10 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
+-	case kSweetSurfaceWrapClientImage:  /* wrap client image */
+-	case kSweetSurfaceWrapClientMemory: /* wrap client memory */
++	case kSweetSurfaceWrapClientImage:  /* wrap client image: patch 0161 (selector 6) */
++		sweet_surf_log_once("sel", selector);
++		return wrapClientImage(args);
++	case kSweetSurfaceWrapClientMemory: /* wrap client memory (selector 7: no caller seen) */
+ 		/* A fake success makes the framework build a client with a NULL state page. */
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnUnsupported;
+@@ -931,6 +1044,9 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->clientAddr != 0 && s->clientPid == proc_selfpid() && current_task() == fTask) {   /* patch 0161: refresh the copy of the client's image */
++		sweet_surface_sync_client(s, fTask);
++	}
+ 	uint32_t lid = (uint32_t)(uintptr_t)id;
+ 	if (lid < SWEET_SURFACE_MAX_ID) {   /* patch 0160c: lock accounting for the scan */
+ 		sweet_surf_locks[lid]++;

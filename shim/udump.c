@@ -34,6 +34,7 @@ static unsigned put_dec(char *dst, unsigned cap, unsigned pos, uint32_t v)
 	do {
 		tmp[n++] = (char)('0' + v % 10);
 		v /= 10;
+		/* bounded: v /= 10 reaches 0 (<= 10 digits for 32 bits) */
 	} while (v);
 	while (n > 0 && pos + 1 < cap)
 		dst[pos++] = tmp[--n];
@@ -65,10 +66,12 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n)
 	/* ARMv8 CRC32 instructions (poly 0xEDB88320, same as zlib): the bitwise loop below
 	 * costs ~16 operations per byte, twice per byte dumped, with the MMU off.
 	 * Doubleword loads must be 8-byte aligned (MMU off = device memory). */
+	/* bounded: n counts down to 0 */
 	for (; n && ((uintptr_t)p & 7); n--)
 		crc = hw_crc32b(crc, *p++);
 	for (; n >= 8; n -= 8, p += 8)
 		crc = hw_crc32d(crc, *(const uint64_t *)p);
+	/* bounded: n counts down to 0 */
 	for (; n; n--)
 		crc = hw_crc32b(crc, *p++);
 	return ~crc;
@@ -205,6 +208,7 @@ int udump_run(const struct udump_hooks *h, void *stage, size_t stage_len,
 	 * The deadline is computed ONCE - recomputing it each iteration would
 	 * let it slide with the clock and the wait would never end. */
 	uint64_t ready_dl = after(h, UDUMP_CHUNK_SECONDS);
+	/* bounded: past(ready_dl), computed once, returns UDUMP_ERR_NOT_READY */
 	while (!usbgadget_ready()) {
 		h->poll();
 		if (past(h, ready_dl)) {
@@ -216,12 +220,13 @@ int udump_run(const struct udump_hooks *h, void *stage, size_t stage_len,
 	unsigned pos = put_str(line, sizeof line, 0, "first=");
 	pos = put_dec(line, sizeof line, pos, (uint32_t)ud_first);
 	pos = put_str(line, sizeof line, pos, " count=");
-	pos = put_dec(line, sizeof line, pos, blocks);
+	(void)put_dec(line, sizeof line, pos, blocks);
 	con_str("UDUMP-BEGIN", line);
 
 	/* Flush the text log (BEGIN included) before the first record byte:
 	 * the wire order must be text, records, text (host receiver requirement). */
 	uint64_t drain_dl = after(h, UDUMP_CHUNK_SECONDS);
+	/* bounded: past(drain_dl), computed once, returns UDUMP_ERR_STALLED */
 	while (h->log_pending()) {
 		h->poll();
 		if (past(h, drain_dl)) {
@@ -234,6 +239,7 @@ int udump_run(const struct udump_hooks *h, void *stage, size_t stage_len,
 	uint64_t lba = ud_first;
 	uint32_t left = blocks, seq = 0, total_crc = 0;
 	uint64_t t_read = 0, t_crc = 0, t_send = 0, t0;
+	/* bounded: left drops by nb >= 1 per pass (nb = min(left, UDUMP_CHUNK_BLOCKS)) */
 	while (left) {
 		uint32_t nb = left < UDUMP_CHUNK_BLOCKS ? left : UDUMP_CHUNK_BLOCKS;
 		/* The reader moves at most 2 blocks per command (ufs.c's command
@@ -289,14 +295,14 @@ int udump_run(const struct udump_hooks *h, void *stage, size_t stage_len,
 	pos = put_str(line, sizeof line, 0, "total=");
 	pos = put_hex8(line, sizeof line, pos, total_crc);
 	pos = put_str(line, sizeof line, pos, " blocks=");
-	pos = put_dec(line, sizeof line, pos, blocks);
+	(void)put_dec(line, sizeof line, pos, blocks);
 	con_str("UDUMP-END", line);
 	pos = put_str(line, sizeof line, 0, "ms read=");
 	pos = put_dec(line, sizeof line, pos, (uint32_t)(t_read * 1000 / h->ticks_freq));
 	pos = put_str(line, sizeof line, pos, " crc=");
 	pos = put_dec(line, sizeof line, pos, (uint32_t)(t_crc * 1000 / h->ticks_freq));
 	pos = put_str(line, sizeof line, pos, " send=");
-	pos = put_dec(line, sizeof line, pos, (uint32_t)(t_send * 1000 / h->ticks_freq));
+	(void)put_dec(line, sizeof line, pos, (uint32_t)(t_send * 1000 / h->ticks_freq));
 	con_str("UDUMP-TIME", line);
 	return UDUMP_OK;
 }

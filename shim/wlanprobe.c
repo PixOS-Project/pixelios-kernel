@@ -239,6 +239,11 @@ void wlan_probe_l2_group(unsigned group)
 		p = ocr_ok ? put_hex(line, sizeof(line), p, (ocr >> 7) & 1u, 1) : put_txt(line, sizeof(line), p, "?");
 		emit(line, p);
 		break;
+	default:	/* groups 0..3 here and 4 above are WLAN_L2_GROUPS (wlanprobe.h:84): anything else is a bug, say so (AGENTS rule 8) */
+		p = put_txt(line, sizeof(line), 0, "WIFI GAP: wlan_probe_l2_group: unknown group 0x");
+		p = put_hex(line, sizeof(line), p, group, 1);
+		emit(line, p);
+		break;
 	}
 }
 

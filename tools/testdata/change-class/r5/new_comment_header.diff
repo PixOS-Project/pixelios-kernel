@@ -1,0 +1,6 @@
+diff --git a/shim/wlan_seq.h b/shim/wlan_seq.h
+new file mode 100644
+--- /dev/null
++++ b/shim/wlan_seq.h
+@@ -0,0 +1 @@
++/* placeholder */

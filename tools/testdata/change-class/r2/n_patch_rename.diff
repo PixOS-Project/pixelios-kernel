@@ -1,0 +1,11 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-x.patch
+@@ -0,0 +1,6 @@
++desc
++
++diff --git a/osfmk/kern/x.c b/osfmk/kern/y.c
++similarity index 100%
++rename from osfmk/kern/x.c
++rename to osfmk/kern/y.c

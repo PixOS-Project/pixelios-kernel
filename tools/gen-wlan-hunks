@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""gen-wlan-hunks: rewrites the new-file hunks of an xnu patch from shim/ (byte-identical copies, e.g. 0174 g2*.h, 0206 join/cred/l25*.h).
+
+Every `diff --git a/bsd/dev/X b/bsd/dev/X` + `new file mode` hunk whose shim/X exists gets shim/X's current content (index line, @@ count,
+'+' lines); other hunks are kept as they are. The output always ends with a newline (tools/xnu-local-build skips a patch whose last byte
+is not one, 2026-11-08). A shim file without a final newline is refused (the hunk would need a "\\ No newline" marker).
+  tools/gen-wlan-hunks PATCH...           rewrite in place; prints `regen PATCH: files`
+  tools/gen-wlan-hunks --check PATCH...   exit 1 and name the patch when it differs from what would be written
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os, re, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHIM = os.path.join(ROOT, "shim")
+
+
+def regen(text):
+    lines, out, i, changed = text.split("\n"), [], 0, []
+    while i < len(lines):
+        m = re.match(r"^diff --git a/bsd/dev/(\S+) b/bsd/dev/\1$", lines[i])
+        src = os.path.join(SHIM, m.group(1)) if m else None
+        if m and i + 1 < len(lines) and lines[i + 1].startswith("new file mode") and os.path.isfile(src):
+            body = open(src).read()
+            if not body.endswith("\n"):
+                sys.exit("gen-wlan-hunks: %s has no final newline" % src)
+            body = body[:-1].split("\n")
+            h = subprocess.run(["git", "hash-object", src], capture_output=True, text=True, check=True).stdout.strip()[:8]
+            out += [lines[i], lines[i + 1], "index 00000000.." + h, "--- /dev/null", "+++ b/bsd/dev/" + m.group(1), "@@ -0,0 +1,%d @@" % len(body)]
+            out += ["+" + b for b in body]
+            i += 2
+            while i < len(lines) and not lines[i].startswith("diff --git"):
+                i += 1
+            changed.append(m.group(1))
+            continue
+        out.append(lines[i])
+        i += 1
+    t = "\n".join(out)
+    while t.endswith("\n\n"):
+        t = t[:-1]
+    return (t if t.endswith("\n") else t + "\n"), changed
+
+
+def main(argv):
+    check = argv[:1] == ["--check"]
+    paths = argv[1:] if check else argv
+    if not paths:
+        print(__doc__)
+        return 2
+    bad = 0
+    for p in paths:
+        old = open(p).read()
+        new, changed = regen(old)
+        if check:
+            if new != old:
+                print("gen-wlan-hunks: %s differs from shim/ (run tools/gen-wlan-hunks %s)" % (p, p))
+                bad = 1
+        else:
+            open(p, "w").write(new)
+            print("regen %s: %s" % (os.path.basename(p), " ".join(changed)))
+    return bad
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,10 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,6 +1,3 @@
+ {
+-	printf("%d",
+-#define kick_wdt wdt_kick_real
+-	    a);
+ 	kick_wdt();
+ }

@@ -1,0 +1,12 @@
+SWEET WLAN join target from WLC_GET_BSS_INFO (patch 0288, T-fca2 design; run wd6-hotspot-b: `L24 join done` then `L25 not run: station MAC, BSSID, IP or gateway missing or invalid`, the hotspot was in none of the 20 scan records, the firmware found it during the join itself). After the L24 join (link up), when the target record was never seen (state NONE, wildcard BSSID, the credentials' SSID known), swl25_run calls the new hook x->bssget (sweet_wlan_l25_glue.h swl25g_bss_info) which sends ONE read-only WLC_GET_BSS_INFO (136) GET in the L25 phase (payload 1024 B = the length word 1024 and zeros, answer buf+0 echo, wl_bss_info_v109_t at buf+4) and feeds the record (version 109, length, BSSID, SSID, chanspec, RSSI, ctl_ch, ie_offset, ie_length, every field bounds-checked as wl_validate_bss_length) to swl25r_note_src; its SSID must equal the credentials' SSID, else `WIFI GAP: L25 WLC_GET_BSS_INFO names another SSID ...` and no target. Log: `SWEET WLAN: L24 target from WLC_GET_BSS_INFO (not in the scan): chan N rssi N` (no BSSID, no SSID). cfg.bssid + rsne_assoc/beacon are then set and L25 runs. The 0282 re-join keeps the cfg's beacon RSNE, so it uses the same record; this patch's sweet_wlan.c hunk logs where it came from. The headers (sweet_wlan_g2.h, sweet_wlan_l25_rsne.h, sweet_wlan_l25_glue.h, sweet_wlan_l25_hs.h, sweet_wlan_l25_wl.h) are regenerated in patches 0174 and 0206 from shim/. NEW firmware command: WLC_GET_BSS_INFO (136) GET, whitelist row {"", 136, 1024} (read-only, content bound). Not run on hardware.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2382,6 +2382,7 @@
+ sw_rj_capture(struct sw_hw *h)
+ {
+ 	(void)swl25_rj_arm(&sw_rj, &swl25_H, sw_l25g.cfg.pmk, h->jc, h->njc, sw_l25g.cfg.rsne_beacon, sw_l25g.cfg.rsne_beacon_len, sw_l25g.cfg.rsne_assoc, sw_l25g.cfg.rsne_assoc_len);
++	printf("SWEET WLAN: keep rejoin: the beacon RSNE kept is the L25 target record's (%u B, from %s)\n", (unsigned)sw_l25g.cfg.rsne_beacon_len, sw_l25g.tgt.via_bss_info ? "WLC_GET_BSS_INFO" : "the scan");   /* patch 0288 */
+ }
+ 
+ /* the keep run cannot go on: run the undo the engine skipped (EP/RC command, 0xC34, cfg 0x84) now, loudly; the hook continues as a normal run */

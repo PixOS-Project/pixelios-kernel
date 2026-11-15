@@ -1,0 +1,26 @@
+# tools/public-push-guard.rules (R66, 2026-10-31): one rule per line, TAB-separated: ID, KIND, REGEX, REASON.
+# KIND: line = matched against every added line of each pushed commit and every line of every blob of the pushed tip tree;
+#       path = matched against every file path (added in a pushed commit, or in the tip tree);
+#       public-url = a remote url matching this regex (case-insensitive) is a PUBLIC remote.
+#       identity = ALLOWED author/committer e-mail (case-insensitive regex); a commit whose author or committer e-mail does not match (and is not listed in the gitignored
+#                  tools/public-push-guard.identities, one e-mail or @domain suffix per line) is refused: pre-commit (git var), pre-push (pushed commits), gate (trunk..HEAD). The e-mail is masked in output.
+# Python re syntax. Write host-specific words with a character class (sm[u]ks) so this file does not match its own rules.
+# A false positive is fixed HERE (narrow the regex), with its reason in a comment; the tool has no bypass flag or env var.
+# Rule e (every non-empty value of the gitignored .env files) is not here: the tool reads it at runtime.
+# Narrowed 2026-10-31 (T-635d): a-private-ip skips 192.168.7.x (the USB-gadget link of the port, a project constant in xnu/patches and docs, not the author's LAN); d-wifi-secret also allows a printf/backtick placeholder (psk=%s, `psk=`); f-imei needs the 15 digits to stand alone (a 16-digit hex register such as GICD_TYPER 000000000079041E is no IMEI).
+# Rule f is copied from tools/check-readme.py LEAKS (IMEI = 15 digits, device serial).
+PUB1	public-url	github\.com[:/]PixOS-Project/	the PixOS-Project GitHub org is public (R66)
+PUB2	public-url	pixos-project/	same predicate as tools/agent-guard r_e4 ("pixos-project/" in url.lower())
+a-private-ip	line	(?<![\d.])(?:192\.168\.(?!7\.)|10\.\d{1,3}\.|172\.(?:1[6-9]|2\d|3[01])\.)\d{1,3}\.\d{1,3}(?!\d)	private LAN address of the author's network
+b-home-path	line	/home/sm[u]ks	host-specific home path
+b-mnt-data	line	/mnt/dat[a]\b	host-specific mount path
+b-work-pixos	line	~/work/pix[o]s	host-specific work path
+b-hostname	line	(?i)\b(?:sm[u]ks(?!-sync\b)|home[l]ab)\b	author's host name (not the retired tool name sm[u]ks-sync, which tools/tools-lifecycle.tsv keeps as history, T-e23b)
+c-host-tool-path	path	(?i)sm[u]ks	author-host-only tooling (path with the host name) must not reach a public repo (relocation task pending)
+d-wifi-file	path	(?:^|/)(?:wlan\.conf|wpa_supplicant[^/]*\.conf|[^/]*\.psk)$	Wi-Fi credentials file
+d-wifi-secret	line	(?i)\b(?:psk|wpa_passphrase|password)\s*=\s*["']?(?![<$.%`]|["']?\s*$|[\w.]+\()[^\s"']+	Wi-Fi/password value; placeholders (<..>, ..., $VAR, empty) and a call expression (psk = struct.unpack(..), the vendored avbtool.py:2497, T-93e6) are allowed
+env-file	path	(?:^|/)\.env$	a committed .env file
+f-imei	line	(?<![0-9A-Za-z])\d{15}(?![0-9A-Za-z])	15-digit number (IMEI?)
+f-serial	line	(?i)\bserial(?:no| number)?\s*[:=]\s*[A-Z0-9]{8,}\b	device serial number (AGENTS.md hard rule 4)
+f-private-key	line	-----BEGIN [A-Z ]*PRIVATE KEY	private key (AGENTS.md hard rule 4)
+g-identity	identity	@users\.noreply\.github\.com$	commit author/committer e-mail is not a GitHub noreply address (personal e-mails must not reach a public history, T-536a)

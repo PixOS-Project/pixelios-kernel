@@ -1,0 +1,8 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,6 +1,8 @@
+ {
+-	uint32_t st = readl(base + 0x10);
+ 	printf("x\n");
+ }

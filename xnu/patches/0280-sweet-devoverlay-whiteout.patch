@@ -1,0 +1,130 @@
+SWEET dev overlay whiteout + BT hot-reload paths (patch 0280, on top of 0117/0154; user 2026-11-09: one standard root, hot reload).
+An EMPTY entry with mode 0xFFFF REMOVES its path: a file an earlier overlay or devsh push ADDED (tools/overlay_std.py emits it only
+for paths the flashed standard root image does not contain). Kernel-side limits: only below /usr/local/ or /private/var/dev/ or
+exactly /usr/lib/libsweetgl.dylib (never the rest of /usr/lib), only a regular file, never one with a .sweetorig (that file came
+from the root image), every parent a real directory (NOFOLLOW, none created); the kernel cannot tell a never-replaced root-image file, so keeping whiteouts off those is the host tools' job (review 0280 F1). Logs `SWEET DEV: removed|absent|refused <path>`.
+Kernels without 0280 refuse such an entry as "mode above 0777" (harmless). Also allows exactly /Applications/BTApp.app/BTApp and
+/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist (tools/devd.c k_allow[] stays equal, H3).
+File writes on userdata only (rule 1 partition), no hardware register.
+
+diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
+--- a/bsd/dev/sweet_devoverlay.c
++++ b/bsd/dev/sweet_devoverlay.c
+@@ -25,6 +25,15 @@
+  * directory prefix. Each file is written to <path>.sweettmp, chmod/chown'ed, then renamed over the
+  * target; the first replaced pre-existing file is kept as <path>.sweetorig; identical files are
+  * skipped. sweetdev=restore renames <path>.sweetorig back over <path> for every archive entry.
++ * Patch 0280 (2026-11-09, one standard root): an EMPTY entry with mode 0xFFFF (SD_WHITEOUT) REMOVES its path: a file an
++ * earlier overlay or push ADDED (tools/overlay_std.py emits it only for paths the standard root image does not have). Only
++ * below sd_wh_allow[] (/usr/local/, /private/var/dev/, exactly /usr/lib/libsweetgl.dylib: never the rest of /usr/lib), only a
++ * regular file, never one with a .sweetorig (an overlay REPLACED it, so its original is a root-image file), parents checked
++ * with NOFOLLOW. The kernel cannot tell a root-image file that was never replaced (e.g. /usr/local/bin/wifid-probe of the
++ * standard root): keeping whiteouts off those is the HOST's job (overlay_std / mkdevoverlay check the flashed image; review
++ * 0280 F1). Userdata only, so a wrong removal is undone by the pre-approved userdata reflash. Kernels
++ * without 0280 refuse the entry ("mode above 0777"). Patch 0280 also allows exactly /Applications/BTApp.app/BTApp and
++ * /private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist (BT hot reload, user 2026-11-09).
+  * A failure on one entry is logged and the loop continues; this never panics and every loop is bounded.
+  *
+  * RAM disk range: IOFindBSDRoot (iokit/bsddev/IOKitBSDInit.cpp:753-764) turns the RAMDisk property into
+@@ -66,12 +75,19 @@
+ #define SD_MAXINF    (40ull << 20)       /* v2: inflated size of one entry and of the whole archive */
+ #define SD_MAXZ      (48ull << 20)       /* v2: stored length of one entry (40 MiB + deflate worst-case overhead) */
+ #define SD_MAXDEV    16
++#define SD_WHITEOUT  0xFFFFu            /* patch 0280: mode of an empty entry that removes its path */
+ 
+ enum { K_DIR, K_NAME, K_EXACT };
+ static const struct { const char *pfx; int kind; } sd_allow[] = {
+ 	{ "/usr/lib/", K_DIR }, { "/usr/local/", K_DIR }, { "/private/var/dev/", K_DIR },
+ 	{ "/System/Library/xpc/launchd.plist", K_EXACT },
+ 	{ "/System/Library/LaunchDaemons/org.pixelios.", K_NAME },
++	{ "/Applications/BTApp.app/BTApp", K_EXACT },                                          /* patch 0280 */
++	{ "/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist", K_EXACT },
++};
++/* patch 0280: the only paths a whiteout may remove (a subset of sd_allow[]) */
++static const struct { const char *pfx; int kind; } sd_wh_allow[] = {
++	{ "/usr/local/", K_DIR }, { "/private/var/dev/", K_DIR }, { "/usr/lib/libsweetgl.dylib", K_EXACT },
+ };
+ 
+ struct sd_ent {
+@@ -559,6 +575,65 @@
+ 	char shown[160], path[SD_MAXPATH + 1], tmp[SD_MAXPATH + 16], orig[SD_MAXPATH + 16];
+ } sd_w;
+ 
++/* patch 0280: remove an overlay-added regular file (SD_WHITEOUT entry); counts like a write (removed), a skip (absent) or a refusal. */
++static void
++sd_whiteout(const struct sd_ent *e, char *path, const char *shown, uint8_t *buf, uint64_t t0)
++{
++	char *tmp = sd_w.tmp, *orig = sd_w.orig;
++	size_t n = strlen(path);
++	bool ok = false;
++	for (size_t a = 0; a < sizeof(sd_wh_allow) / sizeof(sd_wh_allow[0]); a++) {
++		size_t pl = strlen(sd_wh_allow[a].pfx);
++		if (sd_wh_allow[a].kind == K_EXACT ? (n == pl && memcmp(path, sd_wh_allow[a].pfx, pl) == 0)
++		    : (n > pl && memcmp(path, sd_wh_allow[a].pfx, pl) == 0)) {
++			ok = true;
++		}
++	}
++	const char *why = !ok ? "whiteout outside /usr/local/, /private/var/dev/, /usr/lib/libsweetgl.dylib"
++	    : (e->usize != 0 ? "whiteout entry is not empty" : (!sd_verify(e, buf) ? "crc mismatch" : NULL));
++	if (!why && sd_names(path, tmp, sizeof(sd_w.tmp), orig, sizeof(sd_w.orig))) {
++		why = "name too long";
++	}
++	enum vtype vt = VNON, ot = VNON;
++	uint64_t sz = 0, osz = 0;
++	int serr = why ? 0 : sd_stat(path, &vt, &sz);
++	int oerr = why ? 0 : sd_stat(orig, &ot, &osz);
++	if (!why && oerr == 0) {
++		why = "has a .sweetorig (an overlay replaced a root-image file here: ship its standard copy instead)";
++	} else if (!why && oerr != ENOENT) {
++		why = "cannot check .sweetorig";
++	}
++	if (!why && serr == ENOENT) {
++		printf("SWEET DEV: absent %s (nothing to remove) %llu ms\n", shown, now_ms() - t0);
++		sd_ns++;
++		return;
++	}
++	if (!why && serr) {
++		printf("SWEET DEV: failed %s stat error %d\n", shown, serr);
++		sd_nr++;
++		return;
++	}
++	if (!why && vt != VREG) {
++		why = "target is not a regular file";
++	}
++	if (!why) {
++		why = sd_parents(path, ((size_t)-1));     /* every parent a real directory (NOFOLLOW), none created */
++	}
++	if (why) {
++		printf("SWEET DEV: refused %s (%s)\n", shown, why);
++		sd_nr++;
++		return;
++	}
++	int err = sd_rm(path);
++	if (err) {
++		printf("SWEET DEV: failed %s remove error %d\n", shown, err);
++		sd_nr++;
++		return;
++	}
++	printf("SWEET DEV: removed %s %llu ms\n", shown, now_ms() - t0);
++	sd_nw++;
++}
++
+ static void
+ sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
+ {
+@@ -567,6 +642,15 @@
+ 	uint64_t t0 = now_ms();
+ 	sd_show(e, shown, sizeof(sd_w.shown));
+ 	const char *why = sd_path_check(e, path, &mkmin);
++	if (!why && e->mode == SD_WHITEOUT) {           /* patch 0280; sweetdev=restore leaves a whiteout alone */
++		if (restore) {
++			printf("SWEET DEV: restore %s: whiteout, nothing to restore\n", shown);
++			sd_ns++;
++		} else {
++			sd_whiteout(e, path, shown, buf, t0);
++		}
++		return;
++	}
+ 	if (!why && !restore && e->mode > 0777) {
+ 		why = "mode above 0777";
+ 	}

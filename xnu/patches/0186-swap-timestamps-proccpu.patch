@@ -1,0 +1,187 @@
+SWEET swap timestamps + per-process CPU (patch 0186, R0 log only, no register writes; PLAN-60FPS P-G0 slices b,d; research 113 s.7.1): (b) under sweetpace=1 one `SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq %llu gpu_done %llu` line per IOMFB swap (ns, capped at 36000 per boot, loud line when the Mali seqnos are unavailable) via the new lock-free sweet_mali_seq_peek(); (d) under sweetperf=1 a second per-second line `SWEET PROCCPU: bb_pid %d bb_us %llu sb_pid %d sb_us %llu` = cumulative user+system CPU of backboardd and SpringBoard (proc_iterate + task_info TASK_ABSOLUTETIME_INFO), loud "not found" or "task_info failed" once per name.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -17,6 +17,9 @@
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
+ #include <mach/host_info.h>
++#include <mach/task_info.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
+ #include <mach/mach_types.h>
+ #include <vm/vm_kern.h>
+ #include <mach/vm_param.h>
+@@ -310,6 +313,82 @@
+ 	}
+ }
+ 
++/*
++ * SWEET PROCCPU (patch 0186, under sweetperf=1): cumulative user+system CPU time of backboardd and SpringBoard.
++ * Lookup: proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS) (bsd/kern/kern_proc.c:3583): snapshots the pids under proc_list_lock, drops it, then calls the callout
++ * per process with a proc reference held (released on PROC_RETURNED), no filterfn (it would run under proc_list_lock). NOWAITTRANS so the Mali completion
++ * thread (this one) never sleeps in proc_transwait for a process mid-exec (bsd/sys/proc_internal.h:988; used by bsd/dev/dtrace/dtrace.c:17543).
++ * Name: p_comm via proc_name_address (kern_proc.c:1390; MAXCOMLEN 16 holds both names). CPU: task_info(proc_task(p), TASK_ABSOLUTETIME_INFO) (osfmk/kern/task.c:5072;
++ * same use at bsd/kern/kern_resource.c:1004), total_user/total_system include terminated threads, mach absolute units; it takes the task lock briefly (task.c:4922),
++ * so it needs thread context, which sm_thread is. Called with no lock held; the printf is after the iteration.
++ */
++extern char *proc_name_address(void *p);   /* bsd/kern/kern_proc.c:1390 (declared only locally there, kern_proc.c:225) */
++extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);   /* osfmk/kern/task.c:4907, MIG routine, as used by bsd/kern/kern_resource.c:1004 */
++
++struct pc_find {
++	int bb_pid, sb_pid;
++	uint64_t bb_us, sb_us;
++	int bb_kr, sb_kr;   /* 0 = task_info ok; else its error, or -1 when proc_task() was NULL (review pg0-r1 F4) */
++};
++
++static int
++pc_callout(proc_t p, void *arg)
++{
++	struct pc_find *f = (struct pc_find *)arg;
++	const char *nm = proc_name_address(p);
++	int is_bb = (strncmp(nm, "backboardd", MAXCOMLEN) == 0), is_sb = (strncmp(nm, "SpringBoard", MAXCOMLEN) == 0);
++	if (is_bb || is_sb) {
++		task_t t = proc_task(p);
++		task_absolutetime_info_data_t ti;
++		mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
++		int kr = -1;
++		uint64_t us = 0;
++		if (t != TASK_NULL) {
++			kr = (int)task_info(t, TASK_ABSOLUTETIME_INFO, (task_info_t)&ti, &cnt);
++			if (kr == KERN_SUCCESS) {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(ti.total_user + ti.total_system, &ns);
++				us = ns / 1000;
++			}
++		}
++		if (is_bb) {
++			f->bb_pid = proc_pid(p);
++			f->bb_us = us;
++			f->bb_kr = kr;
++		} else {
++			f->sb_pid = proc_pid(p);
++			f->sb_us = us;
++			f->sb_kr = kr;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sm_proccpu_line(void)
++{
++	static int bb_said, sb_said, bb_tf_said, sb_tf_said;
++	struct pc_find f = { -1, -1, 0, 0, 0, 0 };
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, pc_callout, &f, NULL, NULL);
++	if (f.bb_pid < 0 && !bb_said) {
++		bb_said = 1;
++		printf("SWEET PROCCPU: backboardd not found\n");
++	}
++	if (f.sb_pid < 0 && !sb_said) {
++		sb_said = 1;
++		printf("SWEET PROCCPU: SpringBoard not found\n");
++	}
++	if (f.bb_pid >= 0 && f.bb_kr != 0 && !bb_tf_said) {
++		bb_tf_said = 1;
++		printf("SWEET PROCCPU: backboardd pid %d task_info failed (%d)\n", f.bb_pid, f.bb_kr);
++	}
++	if (f.sb_pid >= 0 && f.sb_kr != 0 && !sb_tf_said) {
++		sb_tf_said = 1;
++		printf("SWEET PROCCPU: SpringBoard pid %d task_info failed (%d)\n", f.sb_pid, f.sb_kr);
++	}
++	printf("SWEET PROCCPU: bb_pid %d bb_us %llu sb_pid %d sb_us %llu\n", f.bb_pid, f.bb_us, f.sb_pid, f.sb_us);
++}
++
+ static void
+ sm_perf_tick(void)
+ {
+@@ -373,6 +452,7 @@
+ 		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d cpus %d %d %d %d %d %d %d %d\n", jobs, busy / 1000, mx, sw / 1000, pct,
+ 		    cpct[0], cpct[1], cpct[2], cpct[3], cpct[4], cpct[5], cpct[6], cpct[7]);
+ 	}
++	sm_proccpu_line();
+ }
+ 
+ static void
+@@ -397,6 +477,21 @@
+ 
+ /* ---------------- public API (patch 0105 wrapper, self-test) ---------------- */
+ 
++/* patch 0186: seq_next is the last submitted seqno (sweet_mali_submit: busy_seq = ++sm.seq_next), seq_done the last completed (finish()). Plain 64-bit loads,
++ * no sm_lock (the caller is the framebuffer swap path, which must not wait for the Mali lock): a value can be one job stale. */
++int
++sweet_mali_seq_peek(uint64_t *submitted, uint64_t *done)
++{
++	if (!sm.up || sm.dead) {
++		return ENXIO;
++	}
++	/* order (review pg0-r1 F3): seq_done is stored after seq_next is incremented (submit before finish), so loading done FIRST with acquire and seq
++	 * second guarantees done <= seq even though no lock is held; the reverse order could print done > seq. */
++	*done = __atomic_load_n(&sm.seq_done, __ATOMIC_ACQUIRE);
++	*submitted = __atomic_load_n(&sm.seq_next, __ATOMIC_ACQUIRE);
++	return 0;
++}
++
+ int
+ sweet_mali_ready(void)
+ {
+--- a/bsd/dev/sweet_mali.h
++++ b/bsd/dev/sweet_mali.h
+@@ -24,6 +24,8 @@
+ int sweet_mali_unmap(uint64_t va, uint32_t n16k);
+ int sweet_mali_submit(uint64_t jc, uint32_t req, uint64_t *seq);
+ int sweet_mali_wait(uint64_t seq, uint64_t timeout_us);
++/* patch 0186: read-only, lock-free peek for logging (may be one job stale): last submitted and last completed seqno. 0 ok, ENXIO driver not up or dead. */
++int sweet_mali_seq_peek(uint64_t *submitted, uint64_t *done);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -35,6 +35,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include "../../../bsd/dev/sweet_mali.h"   /* patch 0186: sweet_mali_seq_peek for SWEET SWAPT */
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" int sweet_qr_hold;          /* bsd/dev/sweet_qr.c: the QR log is on screen */
+@@ -651,6 +652,39 @@
+ 			sec_start_ns = pn;
+ 		}
+ 	}
++	/*
++	 * Per-swap timestamps (patch 0186, boot-arg sweetpace=1, default off; PLAN-60FPS P-G0 slice b, research 113 s.7.1): one line per swap
++	 * `SWEET SWAPT: n N now NS vsync NS prev NS gpu_seq S gpu_done D` (now = this swap, vsync = last vsync callback, prev = previous swap, all
++	 * mach_absolute_time converted to ns, 0 = none yet; gpu_seq/gpu_done = last submitted/completed Mali job seqno). R0: log only. No lock is
++	 * added in the swap path: the counters are read with relaxed (unlocked) 64-bit loads by sweet_mali_seq_peek, so a value can be one job
++	 * stale. Capped at 36000 lines per boot (10 min at 60 swaps/s, review pg0-r1 F1).
++	 */
++	if (pace_on) {
++		static uint64_t swapt_prev_ns;
++		static uint32_t swapt_lines;
++		static int swapt_unavail_said;
++		if (swapt_lines < 36000) {
++			uint64_t tn, sq = 0, dn = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &tn);
++			int ok = (sweet_mali_seq_peek(&sq, &dn) == 0);
++			swapt_lines++;
++			if (ok) {
++				IOLog("SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq %llu gpu_done %llu\n", (uint32_t)sweet_fb_swap_count, tn,
++				    sweet_fb_last_vsync_ns, swapt_prev_ns, sq, dn);
++			} else {
++				if (!swapt_unavail_said) {
++					swapt_unavail_said = 1;
++					IOLog("SWEET SWAPT: gpu seq unavailable (sweet_mali not up or dead at swap n %u)\n", (uint32_t)sweet_fb_swap_count);
++				}
++				IOLog("SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq - gpu_done -\n", (uint32_t)sweet_fb_swap_count, tn,
++				    sweet_fb_last_vsync_ns, swapt_prev_ns);
++			}
++			if (swapt_lines == 36000) {
++				IOLog("SWEET SWAPT: cap reached 36000\n");
++			}
++			swapt_prev_ns = tn;
++		}
++	}
+ 	static int lat_on = -1;
+ 	if (lat_on < 0) {
+ 		int v = 0;

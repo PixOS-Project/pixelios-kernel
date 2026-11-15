@@ -1,10 +1,12 @@
 #!/bin/bash
 # Read-only post-reset evidence from the phone while it sits in recovery / Android (after an unexplained reset), BEFORE `adb reboot bootloader`.
 #   tools/phone-postmortem [--out DIR] [--dry-run]
-# Only runs when `adb shell getprop ro.product.device` says bluejay. Every probe is one fixed read-only `adb shell` command wrapped in
+# Only runs against an adb serial whose `getprop ro.product.device` says bluejay (every adb call after `adb devices` carries -s SERIAL). Every probe is one fixed read-only `adb shell` command wrapped in
 # `timeout 8` (no write, no flash, no reboot); serials (androidboot.serialno, ro.serialno) are redacted. Saves each probe to DIR/NN-name.txt
 # (default logs/phone/postmortem-<stamp>/) and prints the reset-cause lines. Ends in RESULT: PASS|FAIL|ERROR ... ; exit 0/1/2.
 # FAIL = nothing could be read (the phone is not in a state with adb); ERROR = usage or not a bluejay.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -u
 cd "$(dirname "$0")/.." || exit 2
 out=""; dry=0
@@ -24,12 +26,19 @@ PROBES=(
 )
 if [ "$dry" = 1 ]; then printf '%s\n' "${PROBES[@]}" | cut -c1-150; echo "RESULT: PASS dry-run ${#PROBES[@]} probes"; exit 0; fi
 t() { timeout -k 1 8 "$@"; }
-dev=$(t adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
-[ "$dev" = bluejay ] || { echo "RESULT: ERROR adb does not report bluejay (got '${dev:-nothing}'), nothing read"; exit 2; }
+# rule 2: never an unaddressed `adb shell` (it would hit whatever phone is attached). Like tools/phone-state:21, find the serial of an adb device whose
+# ro.product.device is bluejay (one read-only getprop per candidate, addressed with -s) and pass `-s SERIAL` to every later adb call.
+ser=""
+while read -r s st _; do
+	[ -n "$s" ] && [ -n "$st" ] || continue
+	case "$st" in device|recovery|sideload|rescue) ;; *) continue ;; esac
+	[ "$(t adb -s "$s" shell getprop ro.product.device 2>/dev/null | tr -d '\r')" = bluejay ] && { ser=$s; break; }
+done < <(t adb devices 2>/dev/null | sed 1d)
+[ -n "$ser" ] || { echo "RESULT: ERROR no adb device reports bluejay, nothing read"; exit 2; }
 mkdir -p "$out"; n=0; ok=0
 for p in "${PROBES[@]}"; do
 	name=${p%%|*}; cmd=${p#*|}; n=$((n+1)); f=$(printf '%s/%02d-%s.txt' "$out" "$n" "$name")
-	t adb shell "$cmd" 2>&1 | tr -d '\r' | sed -E 's/(androidboot\.serialno=|serialno=)[^ ]*/\1<redacted>/g;s/(ro\.serialno|serialno)(\]: \[|[ =:]+)[^] ]*/\1\2<redacted>/g' > "$f"
+	t adb -s "$ser" shell "$cmd" 2>&1 | tr -d '\r' | sed -E 's/(androidboot\.serialno=|serialno=)[^ ]*/\1<redacted>/g;s/(ro\.serialno|serialno)(\]: \[|[ =:]+)[^] ]*/\1\2<redacted>/g' > "$f"
 	[ -s "$f" ] && ok=$((ok+1))
 done
 echo "bootreason:"; sed -n 1,8p "$out"/01-bootreason.txt | sed 's/^/  /'

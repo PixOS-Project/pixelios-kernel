@@ -1,0 +1,35 @@
+sweet-wlan-irq-ring2-work (lowclk 2026-11-14, tracker L-18): the doorbell's stuck rule (patch 0349: 64 consecutive entries with 0xC30 non-zero and
+no ring work) counted only the data rings drained by en0_live_poll. Ring 2 (control complete; since patch 0281 it carries every WL_EVENT) is
+drained earlier in the same keep-thread pass by swg_keep_r2, whose consumed items were not counted [read sweet_wlan.c sw_keep_thread: `(void)swg_keep_r2(x)`
+before `got = en0_live_poll(e, b)`; x->kr2n = ring-2 items consumed in total, sweet_wlan_g2.h:266]. On boot B10c (job f012, resident-050206-b1,
+kernel k5) the doorbell ran 712 s (361421 interrupts, 0 spurious, 0 storm) and turned itself off as c30stuck (a=0x1 b=0x40) 150 ms after a passive
+all-channel escan began while no data traffic flowed [obs]: the escan results were consumed from ring 2 and judged "no work". Now the work passed to
+swi_post includes the ring-2 items of the pass (x->kr2n delta). Nothing else changes: the poll's own got, items and busy accounting are as before;
+no register, address, access kind or value is added (accounting only, no hardware access). ORDER: after 0349.
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2895,6 +2895,7 @@
+ 	int32_t rssi_now = 0;
+ 	int rc, found, rr, rjx;
+ 	uint64_t t_ro = 0, t_irq5 = 0, iv_irq5 = 0;     /* patch 0347 */
++	uint32_t kr2_0;                                 /* patch 0350: ring-2 items consumed before this pass */
+ 	struct swi_ro irq_ro;
+ 	int irq_ro_have = 0, irq_on_pass = 0;
+ 
+@@ -2958,12 +2959,15 @@
+ 		if (irq_on_pass) {
+ 			irq_ro_have = sw_irq_pre(&irq_ro, &t_ro);       /* patch 0347: mode 1 ack first, mode 2 the read-only sample */
+ 		}
++		kr2_0 = x->kr2n;
+ 		if (!x->stopped && !x->d4dstop) {
+ 			(void)swg_keep_r2(x);
+ 		}
+ 		got = en0_live_poll(e, b);
+ 		if (irq_on_pass) {
+-			got += sw_irq_post(got, irq_ro_have, &irq_ro);  /* patch 0347/0349: stuck + silent rules, 0xC30 re-check, unmask, counters, storm window / the ro line */
++			/* patch 0350: ring-2 items (WL_EVENTs, e.g. escan results) consumed by swg_keep_r2 in this pass are work too: without them a
++			 * scan with no data traffic looked like 64 idle entries and tripped c30stuck (B10c f012, resident-050206-b1, +21336 s) */
++			got += sw_irq_post(got + (x->kr2n - kr2_0), irq_ro_have, &irq_ro);  /* patch 0347/0349: stuck + silent rules, 0xC30 re-check, unmask, counters, storm window / the ro line */
+ 		}
+ 		items += got;
+ 		busy = got != 0u || e->tx_blocked != 0u;

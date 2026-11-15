@@ -20593,7 +20593,7 @@
 +
 --- /dev/null
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,543 @@
 +/*
 + * SWEET: HID event services for the iOS userland (backboardd's HID event
 + * system).
@@ -20831,8 +20831,10 @@
 +}
 +
 +IOReturn
-+IOHIDEventService::setElementValue(UInt32 usagePage __unused, UInt32 usage __unused, UInt32 value __unused)
++IOHIDEventService::setElementValue(UInt32 usagePage, UInt32 usage, UInt32 value)
 +{
++	/* T-07: no element is writable on these services; say which write was refused */
++	IOLog("SWEET HID GAP: %s setElementValue page 0x%x usage 0x%x value %u refused (kIOReturnUnsupported: no writable elements)\n", getName(), (unsigned)usagePage, (unsigned)usage, (unsigned)value);
 +	return kIOReturnUnsupported;
 +}
 +
@@ -20906,11 +20908,13 @@
 +	}
 +	if (!client->attach(this)) {
 +		client->release();
++		IOLog("SWEET HID GAP: %s user client attach failed: newUserClient refused (kIOReturnUnsupported)\n", getName());
 +		return kIOReturnUnsupported;
 +	}
 +	if (!client->start(this)) {
 +		client->detach(this);
 +		client->release();
++		IOLog("SWEET HID GAP: %s user client start failed: newUserClient refused (kIOReturnUnsupported)\n", getName());
 +		return kIOReturnUnsupported;
 +	}
 +	*handler = client;

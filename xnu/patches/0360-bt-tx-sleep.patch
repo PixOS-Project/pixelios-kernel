@@ -1,0 +1,93 @@
+bt-tx-sleep (lowclk 2026-11-14, group A item A5-2; research docs/research/160-kernel-cpu-users-lskdd-boot-reads.md s.1.3; tracker L-25): the BT patchram bring-up thread sleeps one tick while the UART TX FIFO is full instead of spinning on the UFSTAT read. NO NEW REGISTER ACCESS, no new value written: the wait reads the same UFSTAT TXFULL bit (bit 24) the old sbu_wait read, and the only write is still UTXH per byte. What is sent and when the download ends are unchanged.
+Why [obs from research 160]: the thread (0296) ran 41.49 s of CPU on all 6 lowclk boots, one whole core for the 3038-record download at 115200 baud (465737 payload bytes / 11520 B/s = 40.4 s [calc]).
+How [read from source]: sbu_tx_raw calls sbu_wait_txroom(). Only when sbu_txsleep_ok (set by sbu_bringup_run(true) = the bring-up kernel thread, cleared on its one exit path) and the baud is <= 128000 does it tsleep(..., 1) between two UFSTAT reads: tsleep(timo) waits timo x NSEC_PER_SEC / hz, hz = 100 (bsd/kern/kern_synch.c:391, bsd/kern/kern_clock.c:111) = 10 ms; at 115200 baud that drains 115 bytes of the 256-byte TX FIFO (stock DT samsung,fifo-size = <256>, docs/research/BT-S4a-uart16-u4.md:14), so the FIFO is never empty at wake-up and the line stays busy. Rule: sleep only if baud / 10 / hz <= FIFO / 2 (128000 baud); 4 Mbaud (sweetbtpatchrambaud=1) and every other caller (attach, kctl sends, rx thread) keep the spin. Stuck line: 64 consecutive sleeps with the FIFO still full (640 ms = 29 FIFO drain times at 115200) = ETIMEDOUT + the same BT GAP row as the spin bound (SBU_SPIN polls), rule 7.
+Log (once): "BT UART: bring-up tx fifo-full waits: N sleeps of one tick (M ms slept), P spin polls with the fifo full (baud B, tx bytes T)" before the bring-up done row.
+Host test: tools/test_sweet_bt_txsleep.sh (real sweet_bt_uart.c through this patch, FIFO model in virtual time): same bytes, same register set, UFSTAT reads fall > 50x, line never starved, stuck = GAP after 64 sleeps, 4 Mbaud and non-bring-up callers spin, flag down after success and failure; 8 mutants. Not run on hardware.
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -83,6 +83,12 @@ extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);      /* osfmk/ker
+ #define SBU_MAX_BAUD    4000000u        /* MAX_BAUD of the vendor driver (exynos_tty.c:269); 9.6 M is the AOC UART, not this path (U3) */
+ #define SBU_SPIN        (1u << 22)      /* bounded polls, then ETIMEDOUT + GAP */
+ #define SBU_RXBUF       256
++/* patch 0360: TX wait without a spin (bring-up thread only). Facts: TX FIFO = 256 bytes (stock DT samsung,fifo-size = <256>, docs/research/BT-S4a-uart16-u4.md:14); one 8N1 byte = 10 bits;
++ * tsleep(timo) waits timo x (NSEC_PER_SEC / hz) with hz = 100 (bsd/kern/kern_synch.c:391, bsd/kern/kern_clock.c:111), i.e. one 10 ms tick. A tick of sleep drains baud / 10 / hz bytes; the sleep is used
++ * only while that is at most half the FIFO, so the FIFO is never empty when the thread wakes (the line stays busy, the download time does not change). Above that (e.g. 4 Mbaud) the spin stays. */
++#define SBU_FIFO_DEPTH  256u
++#define SBU_TICK_HZ     100u
++#define SBU_TXSLEEP_MAX 64u     /* consecutive sleeps with the FIFO still full = stuck (64 ticks = 640 ms = 29 FIFO drain times at 115200); then the same ETIMEDOUT + GAP as the spin bound */
+ 
+ /* ---- register access: one audited write helper, the read/write functions are replaceable by the host test ---- */
+ struct sbu_hw {
+@@ -291,6 +297,46 @@ sbu_wait(uint32_t reg, uint32_t mask, uint32_t want)
+ 	return ETIMEDOUT;
+ }
+ 
++/* patch 0360: set only by the bring-up thread (sbu_bringup_run(true)): a thread that may block. Everything else (attach, kctl sends, the rx thread) keeps the spin. */
++static volatile bool sbu_txsleep_ok;
++static struct { uint32_t sleeps, polls_full; uint64_t slept_ms; } sbu_txw;      /* totals, printed once by sbu_bringup_run */
++static uint64_t sbu_now_ms(void);
++
++/* sleep one tick instead of spinning at this baud? (pure) */
++static bool
++sbu_txsleep_baud_ok(uint32_t baud)
++{
++	return baud != 0 && baud / 10u / SBU_TICK_HZ <= SBU_FIFO_DEPTH / 2u;
++}
++
++/* TX FIFO has room: reads the SAME UFSTAT TXFULL bit the old sbu_wait(U_UFSTAT, TXFULL, 0) read; between two reads it sleeps one tick (bring-up thread, baud <= 128000) or spins as before */
++static int
++sbu_wait_txroom(void)
++{
++	static int chan;
++	const bool sl = sbu_txsleep_ok && sbu_txsleep_baud_ok(sbu.baud);
++	uint32_t slept = 0;
++
++	for (uint32_t i = 0; i < SBU_SPIN; i++) {
++		if ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_TXFULL) == 0) {
++			return 0;
++		}
++		if (!sl) {
++			sbu_txw.polls_full++;
++			continue;
++		}
++		if (++slept > SBU_TXSLEEP_MAX) {
++			break;
++		}
++		uint64_t t0 = sbu_now_ms();
++
++		(void)tsleep(&chan, PZERO, "sweetbttx", 1);
++		sbu_txw.sleeps++;
++		sbu_txw.slept_ms += sbu_now_ms() - t0;
++	}
++	return ETIMEDOUT;
++}
++
+ static int
+ sbu_set_baud(uint32_t baud)
+ {
+@@ -517,7 +563,7 @@ static int
+ sbu_tx_raw(const uint8_t *p, size_t len)
+ {
+ 	for (size_t i = 0; i < len; i++) {
+-		if (sbu_wait(U_UFSTAT, SBU_UFSTAT_TXFULL, 0) != 0) {
++		if (sbu_wait_txroom() != 0) {
+ 			SBU_GAP(SG_TXFULL, "uart16 tx fifo stayed full (flow control stuck?); %zu of %zu bytes sent", i, len);
+ 			return ETIMEDOUT;
+ 		}
+@@ -3557,13 +3603,16 @@ sbu_bringup_run(bool inline_rx)
+ 	uint64_t t0 = sbu_now_ms(), dt;
+ 	bool ok = false;
+ 
++	sbu_txsleep_ok = inline_rx;     /* patch 0360: only the bring-up kernel thread may sleep; cleared on the one exit path below */
+ 	if (sbu_patchram_attach(&sbu_bringup_cand) != 0) {
+ 		sbu_rfwit_unused("the backend did not start after the patchram step");
+ 	} else {
+ 		sbu_rfwit_knob();
+ 		ok = sbu_attach_finish(true, inline_rx) == 0;
+ 	}
++	sbu_txsleep_ok = false;
+ 	dt = sbu_now_ms() - t0;
++	printf("BT UART: bring-up tx fifo-full waits: %u sleeps of one tick (%llu ms slept), %u spin polls with the fifo full (baud %u, tx bytes %u)\n", sbu_txw.sleeps, (unsigned long long)sbu_txw.slept_ms, sbu_txw.polls_full, sbu.baud, sbu.tx_bytes);
+ 	printf("BT UART: bring-up done in %llu ms (async)\n", (unsigned long long)dt);
+ 	if (!ok) {
+ 		printf("BT GAP: bring-up ended without a backend after %llu ms (async); kctl clients meet no UART backend (every transfer fails)\n", (unsigned long long)dt);

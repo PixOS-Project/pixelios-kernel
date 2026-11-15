@@ -1,0 +1,272 @@
+#!/bin/bash
+# xnu-remote-build (R26, user 2026-10-29 "Why don't you send the xnu to offload-host too?"): the ONE place that decides where an XNU build runs. tools/xnu-local-build calls it at its very
+# top, so every build goes through it: the gate's xnu step (tools/check-all.sh -> tools/gate-xnu-build -> tools/xnu-local-build) and a run-kernel build a driver starts by hand.
+# The lab-host heavy-job lock queue (tools/xnu-local-build, class build) kept the phone idle; offload-host (the second build host, its own FIFO) builds in the pinned pixos-xnub container.
+#   tools/xnu-remote-build [--stack DIR] [--label NAME] [--jobs N] [--fresh]      same flags and the same report as tools/xnu-local-build (RESULT: PASS|FAIL|ERROR, kernel:, sha256:)
+#   tools/xnu-remote-build ledger-add --sha S --label L --where offload-host|lab-host-fallback|lab-host-local [--reason R] [--dir LOCALBUILD]
+#   tools/xnu-remote-build ledger-line KERNEL [--dir LOCALBUILD]                  prints `XNU BUILD: <where> (label L)` or `XNU BUILD: unknown (no ledger entry)` (tools/xrun)
+# Where (env XNU_BUILD_WHERE): auto (default) = offload-host, and ONLY when offload-host is unavailable BEFORE the build starts a loud lab-host fallback; offload-host = no fallback (exit 2 when unavailable);
+#   local = lab-host only. Never remote (loud `XNU REMOTE SKIP: <flag> not supported on offload-host, building on lab-host`): --deps-only --compare --make-args --timeout. XNUB_IN_SLOT=1 (set in
+#   the xnub container by tools/xnub-line.sh) = we are already the in-slot build: local, no recursion.
+# Flow on offload-host (all steps of the build run under ONE offload-host queue slot: `tools/heavy-job offload-host run`, FIFO; the offload-host slot is not the lab-host lock, so a caller that holds HEAVY_JOB_HELD (the
+#   lab-host gate) is fine, and a caller already inside a offload-host slot (OFFLOAD_QUEUE_HELD) runs nested). WAIT = XNU_REMOTE_WAIT seconds for the queue turn AND the load admission together; unset:
+#   under the gate's xnu-build step (GATE_STEP_BUDGET = the step timeout, exported by tools/check-all.sh) it is derived from that budget, max(1, budget - 1500): the step timeout minus the
+#   build window (a fresh-work-tree build is 32-71 s measured, 2026-10-29: tools/gate-xnu-build header; 1500 s is a deliberately generous ceiling for a slow build plus the copy back), so a busy offload-host can never run
+#   the step into its `timeout` kill while it holds the lab-host lock (review xnu-remote-build-r1 F3); otherwise 5400. When the wait runs out:
+#     - the load probe kept refusing (heavy-job `offload-queue: not admitted within` / `probe kept failing`): LOUD FALLBACK to lab-host, reason `offload-host not admitted ...` (F8; the spec's
+#       "remote-job's load probe refuses" reason). There is no separate short admission threshold: heavy-job has ONE --wait budget, so the fallback comes after WAIT, not earlier;
+#     - still waiting for its queue TURN behind another holder: the caller holds the lab-host lock (HEAVY_JOB_HELD, the gate) = LOUD FALLBACK (nested local build, no second lock) with
+#       reason `offload-host queue busy`; a hand-started build without the lock = RESULT: ERROR exit 2 naming the holder (waiting is not a fallback reason, the driver retries);
+#     XNU_BUILD_WHERE=offload-host never falls back (ERROR). A fallback from inside a offload-host slot (OFFLOAD_QUEUE_HELD without HEAVY_JOB_HELD) is REFUSED (ERROR): it would take the lab-host lock
+#     while holding the offload-host slot, the reverse of the gate's order (F10).
+#   1. precheck over ssh (BatchMode, ConnectTimeout 3): pixos-xnub image + XNUB_LB_REQUIRED toolchain dirs (xnub_check_art, shared with tools/remote-job).
+#   2. in the slot: rsync the CURRENT tools/ of this checkout (the working tree, uncommitted edits included: it is the xnu-local-build that is running here, so a driver testing a tool edit
+#      builds with it; gate-pre ships a committed bundle instead, which would silently drop such an edit; the price is the provenance below) and the stack dir to a job dir on offload-host;
+#      xnub_check_mirror INSIDE the build container (the offline build needs the pinned git sources in git-mirror; same image/uid/git as the build; rc 98 = the stagers do not parse =
+#      ERROR, no fallback); the old local kernels are removed (F9: after a failed build nothing creditable stays, as xnu-local-build does at its start); docker run (tools/xnub-line.sh
+#      xnub_argv) of `bash tools/xnu-local-build --stack /job/stack --label L --jobs N [--fresh]`; guarded prune of the other work trees (keep L, offload-gate and the 2 most recently used others;
+#      `XNUB: pruned N`); the kernel comes back to
+#      $LOCALBUILD/out/L/ and $LOCALBUILD/work/L/fakeroot/System/Library/Kernels/ (where tools/gate-xnu-build reads it), sha256 checked against the `sha256:` line the remote build printed
+#      (mismatch of either copy = RESULT: FAIL). Always-run teardown: the container and the job dir on offload-host are removed on every exit.
+#   3. report: first line `XNU REMOTE: built on offload-host in Ns (label L, xnub image ID)`, the `XNUB:` lines, then the build's own report (RESULT: PASS ..., kernel:, sha256:, ..., log:) unchanged
+#      except that kernel:/log: name the local copies and the RESULT: PASS line gets ` where=offload-host head=H dirty=N stack=S [DIRTY] [ledger=FAILED]` appended. A compile failure on offload-host is RESULT: FAIL (rc 1), never a fallback.
+# Provenance (F4): the identity checked is the sha256 of the kernel (both copies re-hashed locally against the `sha256:` line the build printed). Alongside, `head` = git short HEAD of this
+#   checkout, `dirty` = number of changed/untracked files under tools/ and xnu/patches (git status; `unknown` when not a git checkout), `stack` = first 12 hex of the sha256 over the stack files
+#   actually built. dirty != 0 prints `XNU REMOTE: WARNING building from a DIRTY tree` (stdout and stderr), puts DIRTY on the RESULT line and in `XNU BUILD:` (tools/xrun); all three are in the
+#   ledger reason column. The ledger entry is written after the sha check; if that write fails (disk full, unwritable) the build stays PASS but with a WARNING line and `ledger=FAILED` on the
+#   RESULT line (rule 8: loud, the verified kernel is not thrown away).
+# Fallback (auto) only when offload-host is unavailable before the build starts (ssh unreachable, image/toolchain/mirror not staged, rsync failed, admission refused or, under a held lab-host lock,
+#   the queue wait ran out): `XNU REMOTE FALLBACK: <reason>; building on lab-host (lock queue)` on stdout AND stderr, then tools/xnu-local-build runs here and its RESULT line carries
+#   ` where=lab-host-fallback fallback=lab-host head=.. dirty=.. stack=..` (XNU_RESULT_EXTRA); tools/gate-xnu-build repeats where=/fallback= on its RESULT and tools/check-all.sh on the GATE line.
+# Ledger: every build appends `date<TAB>sha256<TAB>label<TAB>where<TAB>reason` to $LOCALBUILD/built-on.tsv (where = offload-host | lab-host-fallback | lab-host-local; the lab-host ones are written
+#   by tools/xnu-local-build from XNU_LEDGER_WHERE/XNU_LEDGER_REASON). tools/xrun prints and marks the entry of its --kernel.
+# Env: REMOTE_JOB_HOST / REMOTE_JOB_SSH (as tools/heavy-job and tools/remote-job), XNU_REMOTE_WAIT, GATE_STEP_BUDGET, XNU_BUILD_WHERE, ARTIFACTS / LOCALBUILD (as tools/xnu-local-build).
+# Test (host, fake ssh/rsync/docker + the real heavy-job queue; header of the test lists what stays UNVERIFIED until the offload-host `--validate` staging run): tools/test_xnu_remote_build.sh.
+# Exit: 0 PASS, 1 FAIL, 2 ERROR.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+SELF=$(readlink -f "$0"); ROOT=$(dirname "$(dirname "$SELF")")
+A=$(realpath -m -- "${ARTIFACTS:-$HOME/pixelios-artifacts}"); LB=${LOCALBUILD:-$A/localbuild}
+XIMG=pixos-xnub:trixie-20261111   # the pin of tools/remote-job, tools/offload-stage-xnub and tools/gate-image/Dockerfile.xnub
+. "$ROOT/tools/offload-conf.sh"; offload_conf_load "$ROOT"   # T-dd93: host/root/lab home from tools/offload-host.conf (gitignored) or the environment
+H=${REMOTE_JOB_HOST:-${OFFLOAD_HOST:-}}; SSH=${REMOTE_JOB_SSH:-ssh}
+sshp=("$SSH" -o BatchMode=yes -o ConnectTimeout=3)
+OFFLOAD_ROOT=${OFFLOAD_ROOT:-/offload-root/unset}   # R64: the offload-host work root is $OFFLOAD_ROOT/work (jobs, xnub-art, images); the remote scripts get it as RJW
+RW=$OFFLOAD_ROOT/work
+err() { [ -z "${XNUB_STATE:-}" ] || : >"$XNUB_STATE/reported"; echo "RESULT: ERROR xnu-remote-build: $*"; exit 2; }
+[[ $OFFLOAD_ROOT =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] && [[ /$OFFLOAD_ROOT/ != */../* ]] || err "bad OFFLOAD_ROOT '$OFFLOAD_ROOT' (absolute, >= 2 components of [A-Za-z0-9._-])"
+ledger_dir() { printf '%s' "${1:-$LB}"; }
+# prov STACKDIR: `head=<short sha|nogit> dirty=<N|unknown> stack=<12 hex>` of the tree that is about to be built (review xnu-remote-build-r1 F4)
+prov() {
+	local h dn sh
+	h=$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null) || h=nogit
+	if [ "$h" = nogit ]; then dn=unknown; else dn=$(git -C "$ROOT" status --porcelain -- tools xnu/patches 2>/dev/null | wc -l); fi
+	sh=$({ cd "${1:-/nonexistent}" 2>/dev/null && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-12; } 2>/dev/null); [ -n "$sh" ] || sh=unknown
+	echo "head=$h dirty=$dn stack=$sh"
+}
+dirty_of() { local d=${1#*dirty=}; echo "${d%% *}"; }   # N or unknown out of a prov string
+
+# ---------------------------------------------------------------- ledger
+# cmd_ledger_add returns 2 and sets LERR on failure (it never exits: slot() must be able to turn a failed write into a WARNING, review r1 F6; the CLI wrapper below turns LERR into RESULT: ERROR)
+LERR=
+cmd_ledger_add() {
+	local sha='' label='' where='' reason='' dir=''
+	LERR=
+	while [ $# -gt 0 ]; do case $1 in
+		--sha) sha=${2:-}; shift 2 ;; --label) label=${2:-}; shift 2 ;; --where) where=${2:-}; shift 2 ;; --reason) reason=${2:-}; shift 2 ;; --dir) dir=${2:-}; shift 2 ;;
+		*) LERR="ledger-add: unknown option '$1'"; return 2 ;; esac; done
+	[[ $sha =~ ^[0-9a-f]{64}$ ]] || { LERR="ledger-add: --sha needs 64 hex digits"; return 2; }
+	[ -n "$label" ] || { LERR="ledger-add: --label is required"; return 2; }
+	case $where in offload-host|lab-host-fallback|lab-host-local) ;; *) LERR="ledger-add: --where offload-host|lab-host-fallback|lab-host-local"; return 2 ;; esac
+	dir=$(ledger_dir "$dir"); mkdir -p "$dir" || { LERR="ledger-add: cannot create $dir"; return 2; }
+	reason=${reason//[$'\t\n\r']/ }; label=${label//[$'\t\n\r']/ }
+	printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sha" "$label" "$where" "$reason" >>"$dir/built-on.tsv" || { LERR="ledger-add: cannot append to $dir/built-on.tsv"; return 2; }
+}
+cmd_ledger_line() {
+	local k='' dir='' sha l w r dm
+	while [ $# -gt 0 ]; do case $1 in --dir) dir=${2:-}; shift 2 ;; *) [ -z "$k" ] && k=$1 || err "ledger-line: one KERNEL file"; shift ;; esac; done
+	[ -f "$k" ] || err "ledger-line: kernel '$k' is not a file"
+	sha=$(sha256sum "$k" | cut -d' ' -f1); dir=$(ledger_dir "$dir")
+	IFS=$'\t' read -r _ _ l w r < <(awk -F'\t' -v s="$sha" '$2 == s { x = $0 } END { if (x != "") print x }' "$dir/built-on.tsv" 2>/dev/null)
+	if [ -z "${w:-}" ]; then echo "XNU BUILD: unknown (no ledger entry)"; return 0; fi
+	dm=; case $r in *"dirty=unknown"*) dm=" DIRTY-UNKNOWN" ;; *"dirty="[1-9]*) dm=" DIRTY" ;; esac   # the kernel was built from a tree that does not equal HEAD (review r1 F4)
+	echo "XNU BUILD: $w (label $l)$dm${r:+ reason: $r}"
+}
+
+# ---------------------------------------------------------------- the in-slot part (re-invoked by tools/heavy-job offload-host run as `_slot`; state files in $XNUB_STATE)
+slot() {
+	local st=$XNUB_STATE label=$1 jobs=$2 fresh=$3 stack=$4 JR NAME rc el t0 report sha k1 k2 outd workd locallog got n f pv dn dm xl m lw=
+	local -a rs
+	: >"$st/started"
+	res() { : >"$st/reported"; echo "$@"; }   # every terminal report goes through here: the parent treats a slot that ended without one as an ERROR (killed/crashed)
+	unav() { printf '%s\n' "$*" >"$st/unavail"; exit 90; }   # offload-host unavailable BEFORE the build started: the parent falls back (or errors)
+	JR=$RW/xnub-jobs/$label-$$-$(date +%s); NAME=xr-$label-$$
+	rhead() {   # the head of every script sent to offload-host (its login shell is fish: always `bash -s`, script on stdin)
+		printf 'export RJW=%q\nJR=%q\nIMG=%q\nNAME=%q\nLABEL=%q\nJOBS=%q\nFRESH=%q\nSTG=%q\n' "$RW" "$JR" "$XIMG" "$NAME" "$label" "$jobs" "$fresh" "run tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub"
+		echo 'DK=$HOME/.local/bin/docker; XA=$RJW/xnub-art; JD=$JR'
+		echo 'case $JD in "$RJW"/xnub-jobs/?*) ;; *) echo "xnu-remote-build: refusing odd job dir $JD"; exit 91 ;; esac'
+		printf 'LAB_HOME=%q\n' "$LAB_HOME"; cat "$ROOT/tools/xnub-line.sh"
+	}
+	cleanup() {   # always runs: no container and no job dir is left on offload-host (the disk is small, a left container blocks offload-host admission)
+		local crc
+		{ rhead; echo '"$DK" kill "rj-xnub-$NAME" >/dev/null 2>&1; rm -rf -- "${JD:?}"; exit 0'; } | timeout 30 "${sshp[@]}" "$H" bash -s >/dev/null 2>&1; crc=$?
+		[ "$crc" = 0 ] || echo "xnu-remote-build: WARNING teardown on offload-host failed (rc $crc): job dir $JR and container rj-xnub-$NAME may be left behind" >&2
+	}
+	trap cleanup EXIT; trap 'exit 143' INT TERM HUP
+	{ rhead; echo 'mkdir -p "$JD"'; } | timeout 30 "${sshp[@]}" "$H" bash -s >/dev/null 2>"$st/prep.err" || unav "cannot create the job dir on offload-host (ssh: $(head -c 120 "$st/prep.err"))"
+	outd=$LB/out/$label; workd=$LB/work/$label/fakeroot/System/Library/Kernels; k1=$outd/kernel.development.sweet; k2=$workd/kernel.development.sweet
+	rm -f "$k1" "$k2" || unav "cannot remove the old local kernels $k1 $k2"   # F9: from the first step of the slot on nothing of an earlier build can be credited to this one (xnu-local-build does the same at its start)
+	rs=(timeout 600 rsync -a --delete -e "$SSH -o BatchMode=yes -o ConnectTimeout=3")
+	"${rs[@]}" --exclude=third_party --exclude=__pycache__ "$ROOT/tools/" "$H:$JR/tools/" >"$st/rs.out" 2>&1 || unav "rsync of tools/ to offload-host failed: $(tail -n 1 "$st/rs.out" | head -c 150)"
+	"${rs[@]}" "$stack/" "$H:$JR/stack/" >"$st/rs.out" 2>&1 || unav "rsync of the stack to offload-host failed: $(tail -n 1 "$st/rs.out" | head -c 150)"
+	# the pinned-source mirror check runs INSIDE the build container (same image/uid/git/mounts as the build: review r1 F5 / offload-xnub-r2 F1); rc 98 = the stagers of this stack do not parse:
+	# the lab-host build would fail the same way, so that is an ERROR here, not a fallback
+	report=$({ rhead; echo 'export HEAVY_JOB_HELD=xnub-remote; xnub_argv "$DK" "$IMG" "$XA" "$JD" "$NAME" /job; cd "$JD" && xnub_check_mirror xnu-remote-build "$XA" stack "$STG" </dev/null'; } | timeout 180 "${sshp[@]}" "$H" bash -s 2>&1); rc=$?
+	if [ "$rc" = 98 ]; then res "RESULT: ERROR xnu-remote-build: ${report:0:600}"; exit 2; fi
+	[ "$rc" = 0 ] || unav "${report:0:400}${report:+ }(mirror check rc $rc)"
+	pv=$(prov "$stack"); dn=$(dirty_of "$pv"); dm=; [ "$dn" = 0 ] || dm=" DIRTY"
+	echo "xnu-remote-build: building label $label on offload-host (job dir $JR, container rj-xnub-$NAME)" >&2
+	t0=$SECONDS
+	{ rhead; cat <<'EOS'
+export HEAVY_JOB_HELD=xnub-remote   # inherited by name (-e HEAVY_JOB_HELD): the container's xnu-local-build is nested, it never takes a heavy-job lock there
+xnub_argv "$DK" "$IMG" "$XA" "$JD" "$NAME" /job
+XB=(bash tools/xnu-local-build --stack /job/stack --label "$LABEL" --jobs "$JOBS"); [ "$FRESH" != 1 ] || XB+=(--fresh)
+cd "$JD" && "${XF[@]}" "${XB[@]}" </dev/null; rc=$?
+xnub_prune "$XA/localbuild/work" offload-gate "$LABEL"
+echo "XNUB: build rc=$rc"
+exit $rc
+EOS
+	} | "${sshp[@]}" -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$H" bash -s 2>&1 | tee "$st/build.all" >&2
+	rc=${PIPESTATUS[1]}
+	el=$((SECONDS - t0))
+	locallog=$A/scratch/xnu-remote-build.$label.log; mkdir -p "$A/scratch" && cp -f "$st/build.all" "$locallog" || { locallog=$st/build.all; echo "xnu-remote-build: WARNING cannot write $A/scratch, the build log stays in $st" >&2; }
+	hdr() { echo "XNU REMOTE: $1 on offload-host in ${el}s (label $label, xnub image ${XNUB_IMAGE_ID:-unknown})"; }
+	n=$(grep -an '^RESULT: ' "$st/build.all" | tail -n 1 | cut -d: -f1)
+	if [ -n "$n" ]; then
+		report=$(tail -n +"$n" "$st/build.all" | sed '/^log: /q' | awk -v lb="$LB" -v lg="$locallog" -v cart="$LAB_HOME/pixelios-artifacts/localbuild/" '
+			{ if (index($0, "kernel: " cart) == 1) { print "kernel: " lb "/" substr($0, length("kernel: " cart) + 1) } else if ($0 ~ /^log: /) print "log: " lg; else print }')
+	else report=; fi
+	case $rc in
+	0) ;;
+	1) # a compile failure on offload-host: FAIL, never a fallback. The make log comes back for the reader.
+		mkdir -p "$LB/work/$label" && rsync -a -e "$SSH -o BatchMode=yes -o ConnectTimeout=3" "$H:$RW/xnub-art/localbuild/work/$label/build.log" "$LB/work/$label/build.log" >/dev/null 2>&1 || echo "xnu-remote-build: WARNING the make log was not copied back ($LB/work/$label/build.log)" >&2
+		hdr FAILED; grep -a '^XNUB:' "$st/build.all"; grep -a -m8 -E '(^|: )(fatal )?error:|undefined' "$st/build.all" | cut -c1-220
+		[ -n "$report" ] && res "$report" || res "RESULT: FAIL xnu-remote-build: remote build rc 1 without a RESULT line (log $locallog)"
+		exit 1 ;;
+	*)
+		hdr "ERROR (remote rc $rc)"; grep -a '^XNUB:' "$st/build.all"
+		[ -z "$report" ] || res "$(sed '1s/^RESULT: /remote report, NOT trusted (the run ended rc '"$rc"'): /' <<<"$report")"   # never a RESULT: PASS line above an ERROR (rule 8)
+		res "RESULT: ERROR xnu-remote-build: the remote build ended rc $rc (ssh drop = 255) after it started; no fallback, log $locallog"; exit 2 ;;
+	esac
+	[[ $report == "RESULT: PASS"* ]] || { hdr "ERROR (no PASS report)"; res "RESULT: ERROR xnu-remote-build: remote rc 0 without a RESULT: PASS report (log $locallog)"; exit 2; }
+	sha=$(sed -n 's/^sha256: \([0-9a-f]\{64\}\)$/\1/p' <<<"$report" | tail -n 1)
+	[ -n "$sha" ] || { hdr "ERROR (no sha256)"; res "RESULT: ERROR xnu-remote-build: PASS report without a sha256 line (log $locallog)"; exit 2; }
+	mkdir -p "$outd" "$workd" || err "cannot create $outd or $workd"
+	rsync -a -e "$SSH -o BatchMode=yes -o ConnectTimeout=3" "$H:$RW/xnub-art/localbuild/out/$label/kernel.development.sweet" "$outd/" >"$st/rs.out" 2>&1 \
+		|| { hdr "ERROR (copy back)"; res "RESULT: ERROR xnu-remote-build: cannot copy the kernel back from offload-host: $(tail -n 1 "$st/rs.out")"; exit 2; }
+	rsync -a -e "$SSH -o BatchMode=yes -o ConnectTimeout=3" "$H:$RW/xnub-art/localbuild/work/$label/fakeroot/System/Library/Kernels/kernel.development.sweet" "$workd/" >"$st/rs.out" 2>&1 \
+		|| { hdr "ERROR (copy back)"; res "RESULT: ERROR xnu-remote-build: cannot copy the work-tree kernel back from offload-host: $(tail -n 1 "$st/rs.out")"; exit 2; }
+	for f in "$k1" "$k2"; do
+		got=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+		[ "$got" = "$sha" ] || { hdr "FAILED"; res "RESULT: FAIL xnu-remote-build: copied kernel $f has sha256 ${got:-missing}, the remote build printed $sha (corrupt copy or a stale remote tree)"; exit 1; }
+	done
+	# F6: a failed ledger write after a verified build is a WARNING line + `ledger=FAILED` on the RESULT line (the kernel is good, the record is not): never silent, never a thrown-away build
+	cmd_ledger_add --sha "$sha" --label "$label" --where offload-host --reason "$pv" --dir "$LB" || lw=" ledger=FAILED"
+	xl="where=offload-host $pv$dm$lw"
+	report=$(awk -v x="$xl" 'NR == 1 { print $0 " " x; next } { print }' <<<"$report")
+	hdr "built"
+	if [ -n "$lw" ]; then m="XNU REMOTE: WARNING ledger entry not written ($LERR): tools/xrun will print 'XNU BUILD: unknown (no ledger entry)'"; echo "$m"; echo "$m" >&2; fi
+	if [ -n "$dm" ]; then m="XNU REMOTE: WARNING built from a DIRTY tree: $dn changed/untracked file(s) under tools/ or xnu/patches ($pv); the kernel does not equal any commit"; echo "$m"; echo "$m" >&2; fi
+	grep -a '^XNUB:' "$st/build.all"; res "$report"
+	exit 0
+}
+
+# ---------------------------------------------------------------- main
+case ${1:-} in
+	ledger-add) shift; cmd_ledger_add "$@" || err "$LERR"; exit 0 ;;
+	ledger-line) shift; cmd_ledger_line "$@"; exit $? ;;
+esac
+mode=dispatch; if [ "${1:-}" = _slot ]; then mode=slot; shift; fi   # tools/heavy-job re-invokes us as `_slot <the same flags>` once it holds the offload-host slot
+ORIG=("$@")
+stack=$ROOT/xnu/patches; label=''; jobs=4; fresh=0; unsup=''
+while [ $# -gt 0 ]; do case $1 in
+	--stack) [ $# -ge 2 ] || err "--stack needs a directory"; stack=$2; shift 2 ;; --label) [ $# -ge 2 ] || err "--label needs a name"; label=$2; shift 2 ;;
+	--jobs) [ $# -ge 2 ] || err "--jobs needs a number"; jobs=$2; shift 2 ;; --fresh) fresh=1; shift ;;
+	--deps-only) unsup=${unsup:-$1}; shift ;;
+	--compare|--make-args|--timeout) [ $# -ge 2 ] || err "$1 needs a value"; unsup=${unsup:-$1}; shift 2 ;;
+	*) err "unknown option $1 (valid options: $(grep -oE '^[[:space:]]*(-[-A-Za-z0-9]+\|?)+\)' "$0" | tr -d ' \t)' | tr '|\n' '  '); -h prints the header)" ;; esac; done
+where=${XNU_BUILD_WHERE:-auto}
+case $where in auto|offload-host|local) ;; *) err "XNU_BUILD_WHERE must be auto, offload-host or local (got '$where')" ;; esac
+go_local() {   # WHERE REASON: the lab-host path; XNU_BUILD_WHERE=local stops tools/xnu-local-build from calling us again. XNU_RESULT_EXTRA is appended to its RESULT line (tools/xnu-local-build finish)
+	local pv dn x
+	pv=$(prov "$stack"); dn=$(dirty_of "$pv"); x="where=$1"
+	[ "$1" != lab-host-fallback ] || x="$x fallback=lab-host"
+	x="$x $pv"; [ "$dn" = 0 ] || x="$x DIRTY"
+	if [ "$dn" != 0 ]; then local m="XNU REMOTE: WARNING building from a DIRTY tree: $dn changed/untracked file(s) under tools/ or xnu/patches ($pv); the kernel does not equal any commit"; echo "$m"; echo "$m" >&2; fi
+	XNU_BUILD_WHERE=local XNU_LEDGER_WHERE=$1 XNU_LEDGER_REASON="${2:+$2 | }$pv" XNU_RESULT_EXTRA=$x exec "$ROOT/tools/xnu-local-build" "${ORIG[@]}"
+}
+if [ "$mode" = dispatch ]; then   # the slot process runs after the parent decided
+	if [ "${XNUB_IN_SLOT:-}" = 1 ]; then go_local lab-host-local ""; fi   # already the in-slot build (tools/xnub-line.sh sets it): never dispatch again
+	if [ "$where" = local ]; then go_local lab-host-local "XNU_BUILD_WHERE=local"; fi
+	if [ -n "$unsup" ]; then
+		if [ "$where" = offload-host ]; then err "XNU_BUILD_WHERE=offload-host but $unsup is not supported on offload-host"; fi
+		m="XNU REMOTE SKIP: $unsup not supported on offload-host, building on lab-host"; echo "$m"; echo "$m" >&2
+		go_local lab-host-local "$unsup not supported on offload-host"
+	fi
+fi
+[ -z "$label" ] || [[ $label =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "--label must be one path component [A-Za-z0-9._-]: $label"
+[ -n "$label" ] || label=main
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || err "--jobs needs a positive integer"; [ "$jobs" -le 4 ] || jobs=4
+stack=$(cd "$stack" 2>/dev/null && pwd) || err "--stack '$stack' is not a directory"
+# the wait: XNU_REMOTE_WAIT, else derived from the gate step budget (see the header: step timeout minus the 1500 s build window), else 5400
+if [ -n "${XNU_REMOTE_WAIT:-}" ]; then wait=$XNU_REMOTE_WAIT
+elif [ -n "${GATE_STEP_BUDGET:-}" ]; then [[ $GATE_STEP_BUDGET =~ ^[0-9]+$ ]] || err "GATE_STEP_BUDGET must be a number of seconds"; wait=$((GATE_STEP_BUDGET - 1500)); [ "$wait" -ge 1 ] || wait=1
+else wait=5400; fi
+[[ $wait =~ ^[0-9]+$ ]] || err "XNU_REMOTE_WAIT must be a number of seconds"
+if [ "$mode" = slot ]; then slot "$label" "$jobs" "$fresh" "$stack"; fi
+
+unavailable() {   # REASON: auto = the loud fallback, offload-host = exit 2
+	if [ "$where" = offload-host ]; then err "XNU_BUILD_WHERE=offload-host and offload-host is unavailable: $1"; fi
+	# F10: the fallback takes the lab-host heavy-job lock; from inside a offload-host slot (no lab-host lock held) that is the reverse of the gate's order (lab-host lock, then offload-host slot)
+	if [ -n "${OFFLOAD_QUEUE_HELD:-}" ] && [ -z "${HEAVY_JOB_HELD:-}" ]; then err "offload-host is unavailable ($1) and this caller holds a offload-host slot (OFFLOAD_QUEUE_HELD=$OFFLOAD_QUEUE_HELD) but no lab-host lock: a lab-host fallback would take the lab-host lock while holding the offload-host slot (lock-order inversion); not falling back"; fi
+	local m="XNU REMOTE FALLBACK: $1; building on lab-host (lock queue)"
+	echo "$m"; echo "$m" >&2
+	[ -z "${st:-}" ] || rm -rf -- "$st"   # exec below skips the EXIT trap
+	go_local lab-host-fallback "$1"
+}
+
+[ -n "$H" ] || unavailable "OFFLOAD GAP: no offload host configured (set OFFLOAD_HOST and OFFLOAD_ROOT in tools/offload-host.conf, template tools/offload-host.conf.example)"
+if off=$(offload_off_reason "$ROOT" build); then unavailable "OFFLOAD OFF: use=build switched off by order, nothing new is routed to the offload host: $off"; fi   # per-use switch (web board): the loud lab-host fallback below, never a wait
+# 1. precheck (before the queue: a dead or unstaged offload-host must not cost a queue wait)
+pre=$({ printf 'export RJW=%q\nIMG=%q\nSTG=%q\n' "$RW" "$XIMG" "run tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub"
+	echo 'DK=$HOME/.local/bin/docker; XA=$RJW/xnub-art'; printf 'LAB_HOME=%q\n' "$LAB_HOME"; cat "$ROOT/tools/xnub-line.sh"
+	echo 'xnub_check_art xnu-remote-build "$DK" "$IMG" "$XA" "$STG" || exit $?; echo "XNUB: image $xid"'; } | timeout 60 "${sshp[@]}" "$H" bash -s 2>&1); prc=$?
+case $prc in
+	0) ;;
+	255) unavailable "offload-host unreachable (ssh rc 255: $(head -n 1 <<<"$pre" | head -c 150))" ;;
+	124) unavailable "offload-host precheck timed out" ;;
+	*) unavailable "$(head -n 1 <<<"$pre" | head -c 300) (precheck rc $prc)" ;;
+esac
+export XNUB_IMAGE_ID; XNUB_IMAGE_ID=$(sed -n 's/^XNUB: image //p' <<<"$pre" | tail -n 1); XNUB_IMAGE_ID=${XNUB_IMAGE_ID#sha256:}; XNUB_IMAGE_ID=${XNUB_IMAGE_ID:0:12}
+
+# 2. the offload-host slot (HEAVY_JOB_QUIET: heavy-job's own lines go to stderr and never start with RESULT:, so the report below is the last RESULT: this tool prints)
+st=$(mktemp -d "${TMPDIR:-/tmp}/xnu-remote-build.XXXXXX") || err "mktemp failed"
+trap 'rm -rf -- "$st"' EXIT; trap 'exit 143' INT TERM HUP
+export XNUB_STATE=$st
+# heavy-job's stderr (queue progress) is shown live AND kept in hj.err (to tell "unreachable" from "slot not granted"); its stdout (the slot's report) goes straight through (fd 3)
+{ HEAVY_JOB_QUIET=1 "$ROOT/tools/heavy-job" offload-host run --owner xnu-remote-build --label "xnu-$label" --use build --wait "$wait" -- bash "$SELF" _slot "${ORIG[@]}" 2>&1 1>&3 | tee "$st/hj.err" >&2
+	echo "${PIPESTATUS[0]}" >"$st/hj.rc"; } 3>&1
+rc=$(cat "$st/hj.rc" 2>/dev/null); [[ $rc =~ ^[0-9]+$ ]] || rc=2
+if [ -s "$st/unavail" ]; then unavailable "$(cat "$st/unavail")"; fi
+if [ ! -e "$st/started" ]; then
+	if grep -q 'offload-host unreachable' "$st/hj.err"; then unavailable "$(grep -m1 'offload-host unreachable' "$st/hj.err" | head -c 200)"; fi
+	holder=$("$ROOT/tools/heavy-job" offload-host status 2>/dev/null | grep -m1 'offload-host holder' | head -c 200)
+	# F8: the load probe kept refusing for the whole wait = offload-host is effectively unavailable: loud fallback (any caller). F3: still behind another holder's queue turn while this caller holds the
+	# lab-host lock (the gate): loud fallback too, a nested local build takes no second lock and the step must not run into its timeout; without that lock it stays an ERROR (waiting is not a reason)
+	if adm=$(grep -a -m1 -o 'offload-queue: \(not admitted within.*\|probe kept failing.*\)' "$st/hj.err"); then unavailable "offload-host not admitted within the ${wait}s wait ($(head -c 200 <<<"$adm"))"; fi
+	if [ -n "${HEAVY_JOB_HELD:-}" ] && grep -aq 'not our turn' "$st/hj.err"; then unavailable "offload-host queue busy for the ${wait}s wait while this caller holds the lab-host lock ($HEAVY_JOB_HELD); holder: ${holder:-unknown}"; fi
+	err "the offload-host queue slot was not granted (heavy-job rc $rc, XNU_REMOTE_WAIT=${wait}s); holder: ${holder:-unknown}; no fallback while waiting"
+fi
+[ -e "$st/reported" ] || err "the offload-host build ended rc $rc without a report (killed or crashed); no fallback after the build started"
+exit "$rc"

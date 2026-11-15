@@ -1,0 +1,8 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,4 +1,9 @@
+ int f(void)
+ {
++	printf("%d", try_read32(base, (uint32_t *)REG_CTRL));
+ }

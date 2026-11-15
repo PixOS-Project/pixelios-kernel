@@ -84,8 +84,11 @@ static uintptr_t base_of(unsigned i)
 	case 0: return GPU_S2MPU_G3D0;
 	case 1: return GPU_S2MPU_G3D1;
 	case 2: return GPU_S2MPU_G3D2;
+	case 3: return GPU_S2MPU_G3D3;
+	default:	/* the only caller loops i < 4: unreachable, say so if that ever changes (AGENTS rule 8); the read stays a fault-guarded read */
+		con_str("GPU", "GPU GAP: S2MPU base_of: index beyond G3D3, reading G3D3");
+		return GPU_S2MPU_G3D3;
 	}
-	return GPU_S2MPU_G3D3;
 }
 
 void gpu_s2mpu_dump(uintptr_t probe_pa)

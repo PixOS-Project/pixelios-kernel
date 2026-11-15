@@ -1,0 +1,513 @@
+SWEET CPU PC sampler (patch 0263, sprint-gpu 2026-11-08, GPU sprint; R0 log only, no register or memory write outside the patch's own statics): boot-arg sweetpcsamp=N (N ms, clamped 1..50, default off: no thread, nothing printed) starts a kernel thread (bsd/dev/sweet_pcsamp.c, sweet_pcsamp_start next to sweet_thrwait_start in sweet_ufs, bsd/conf/files) that every N ms cross-calls every other CPU (cpu_broadcast_xcall_simple, as perfmon_arm64.c:177); the IPI handler sweet_pcsamp_cpu (osfmk/kern/exception.c) records, for an interrupted thread of backboardd / SpringBoard / Preferences, its tid and the interrupted state from getCpuDatap()->cpu_int_state (the read of osfmk/kern/backtrace.c:219-225): user pc/lr when interrupted in EL0 (kind 1), else the user pc/lr of the last kernel entry plus the unslid kernel pc (kind 2). Aggregated per second: 'SWEET PCSAMP: t NS rounds R reached C hits H bb B sb S pf P entries E dropped D', up to 12 'SWEET PCSAMP: tid <bb|sb|pf> 0xTID n N user U' and 40 'SWEET PCSAMP: pc <bb|sb|pf> 0xTID k K pc 0xPC lr 0xLR kpc 0xKPC n N' rows, 'SWEET PCSAMP: pid <p> P slide 0xS' once per process, 80000 lines per boot then 'cap reached'. Kind 2 samples also carry up to 6 unslid frames of the interrupted kernel stack (backtrace BTF_KERN_INTERRUPTED, as osfmk/kperf/callstack.c:276), printed as up to 24 'SWEET PCSAMP: kbt <p> 0xTID kpc 0xK f 0x.. x6 n N' rows per second.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bf2a0ce..1513eb7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_thrcpu.c			standard
+ bsd/dev/sweet_surfcpu.c		standard
+ bsd/dev/sweet_thrwait.c		standard
++bsd/dev/sweet_pcsamp.c		standard
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_wlan_en0.c			standard
+diff --git a/bsd/dev/sweet_pcsamp.c b/bsd/dev/sweet_pcsamp.c
+new file mode 100644
+index 0000000..0e6ed01
+--- /dev/null
++++ b/bsd/dev/sweet_pcsamp.c
+@@ -0,0 +1,365 @@
++/*
++ * SWEET CPU PC sampler (patch 0263, sprint-gpu 2026-11-08, boot-arg sweetpcsamp=N, default off: no thread, nothing printed). R0: log only, no register writes.
++ *
++ * Why: the THRWAIT witness (0249/0259) only sees WAITING threads (their pc is the syscall return). The nav20 hitches (100-250 ms with the GPU idle) sit in
++ * CPU time of a second backboardd GL thread (SWEETGL LAGPH cpu_us 247061 at the general-open hitch); which code burns it is not in any log. This samples what
++ * RUNS: every N ms (N = boot-arg, clamped to 1..50) one cross-call reaches every other CPU; the handler (sweet_pcsamp_cpu, osfmk/kern/exception.c) records the
++ * interrupted thread of backboardd, SpringBoard or Preferences: tid, kind (1 = user pc at the interrupt, 2 = in the kernel: user pc of the last kernel entry +
++ * unslid kernel pc). Samples are aggregated per second in a static table keyed (process, tid, kind, pc, kpc); once per second:
++ *   SWEET PCSAMP: t <abs_ns> rounds R reached C hits H bb B sb S pf P entries E dropped D
++ *   SWEET PCSAMP: tid <proc> 0x<tid> n N user U                                  (threads with samples, up to 12, highest n first)
++ *   SWEET PCSAMP: pc <proc> 0x<tid> k K pc 0x<pc> lr 0x<lr> kpc 0x<kpc> n N   (up to 40 rows, highest n first)
++ *   SWEET PCSAMP: kbt <proc> 0x<tid> kpc 0x<kpc> f 0x<f1> 0x<f2> .. 0x<f6> n N  (kind 2 kernel stacks, unslid, up to 24 rows, highest n first)
++ * Once per process: `SWEET PCSAMP: pid <proc> P slide 0x<slide>` (pc - slide = unslid shared-cache address; a pc outside the cache is a dylib such as
++ * libsweetgl, whose base the `SWEETGL: BASE` line gives). t = mach_absolute_time in ns, the clock of SWEET SWAPT / SWEET NAV `now`.
++ * Cost [guess, not measured]: one IPI per other CPU per round (4 at --cpus 5) plus one proc_iterate per second.
++ * Context: its own kernel thread, static buffers, single thread, printf only from this thread with no lock held.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
++
++extern task_t proc_task(proc_t);
++extern char *proc_name_address(void *p);      /* bsd/kern/kern_proc.c */
++extern int sweet_thrwait_slide(task_t task, uint64_t *slide);                       /* osfmk/kern/exception.c (patch 0249) */
++extern int sweet_pcsamp_round(const int *pids, int npid, uint64_t *out, int maxcpu);  /* osfmk/kern/exception.c (patch 0263), 12 words per CPU */
++extern int ml_get_max_cpu_number(void);
++extern void sweet_pcsamp_start(void);
++
++#define PCS_NP      3
++#define PCS_MAXCPU  16
++#define PCS_TAB     2048
++#define PCS_TOP     40
++#define PCS_KTAB    1024
++#define PCS_KTOP    24
++#define PCS_W       12
++#define PCS_TTOP    12
++#define PCS_CAP     80000
++#define PCS_MIN_MS  1
++#define PCS_MAX_MS  50
++
++static const char *const pcs_names[PCS_NP] = { "backboardd", "SpringBoard", "Preferences" };
++static const char *const pcs_short[PCS_NP] = { "bb", "sb", "pf" };
++
++struct pcs_ent {
++	uint64_t tid, pc, lr, kpc;
++	uint32_t w, kind, n;       /* n 0 = free slot */
++};
++
++static struct pcs_ent pcs_tab[PCS_TAB];
++static uint32_t pcs_used;
++static uint64_t pcs_dropped;
++static int pcs_pid[PCS_NP] = { -1, -1, -1 };
++static int pcs_slid_pid[PCS_NP] = { -1, -1, -1 };
++static uint64_t pcs_slide[PCS_NP];
++static int pcs_slide_kr[PCS_NP];
++static uint64_t pcs_out[PCS_MAXCPU * PCS_W];
++struct pcs_kent {
++	uint64_t tid, kpc, f[6];
++	uint32_t w, n;
++};
++static struct pcs_kent pcs_ktab[PCS_KTAB];
++static uint64_t pcs_kdropped;
++
++static void
++pcs_kadd(const struct pcs_kent *e)
++{
++	uint64_t h = 1469598103934665603ULL;
++
++	h ^= e->kpc; h *= 1099511628211ULL;
++	for (int i = 0; i < 6; i++) {
++		h ^= e->f[i];
++		h *= 1099511628211ULL;
++		h ^= h >> 29;
++	}
++	for (uint32_t i = 0; i < PCS_KTAB; i++) {
++		struct pcs_kent *t = &pcs_ktab[(uint32_t)((h + i) % PCS_KTAB)];
++
++		if (t->n == 0) {
++			*t = *e;
++			t->n = 1;
++			return;
++		}
++		if (t->w == e->w && t->tid == e->tid && t->kpc == e->kpc && t->f[0] == e->f[0] && t->f[1] == e->f[1] && t->f[2] == e->f[2] && t->f[3] == e->f[3] && t->f[4] == e->f[4] && t->f[5] == e->f[5]) {
++			t->n++;
++			return;
++		}
++	}
++	pcs_kdropped++;
++}
++static uint32_t pcs_period_ms;
++
++static void
++pcs_add(const struct pcs_ent *e)
++{
++	uint64_t h = 1469598103934665603ULL;
++	const uint64_t k[4] = { e->tid, e->pc, e->kpc, ((uint64_t)e->w << 8) | e->kind };
++
++	for (int i = 0; i < 4; i++) {
++		h ^= k[i];
++		h *= 1099511628211ULL;
++		h ^= h >> 29;
++	}
++	for (uint32_t i = 0; i < PCS_TAB; i++) {
++		struct pcs_ent *t = &pcs_tab[(uint32_t)((h + i) % PCS_TAB)];
++
++		if (t->n == 0) {
++			*t = *e;
++			t->n = 1;
++			pcs_used++;
++			return;
++		}
++		if (t->w == e->w && t->tid == e->tid && t->kind == e->kind && t->pc == e->pc && t->kpc == e->kpc) {
++			t->n++;
++			return;
++		}
++	}
++	pcs_dropped++;
++}
++
++static int
++pcs_callout(proc_t p, __unused void *arg)
++{
++	const char *nm = proc_name_address(p);
++
++	for (int w = 0; w < PCS_NP; w++) {
++		if (strncmp(nm, pcs_names[w], MAXCOMLEN) == 0) {
++			task_t task = proc_task(p);
++
++			pcs_pid[w] = proc_pid(p);
++			if (task != TASK_NULL && pcs_slid_pid[w] != pcs_pid[w]) {
++				pcs_slide_kr[w] = sweet_thrwait_slide(task, &pcs_slide[w]);
++				pcs_slid_pid[w] = -2 - pcs_pid[w];      /* print pending: the thread prints it (no printf under the proc ref) */
++			}
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static uint64_t
++pcs_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static void
++sweet_pcsamp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned lines = 0;
++	int cap_said = 0, maxcpu = ml_get_max_cpu_number() + 1;
++	uint64_t last_print = 0, rounds = 0, reached = 0, hits = 0, perproc[PCS_NP] = { 0, 0, 0 };
++
++	if (maxcpu > PCS_MAXCPU) {
++		printf("SWEET PCSAMP: %d CPUs, only the first %d are sampled\n", maxcpu, PCS_MAXCPU);
++		maxcpu = PCS_MAXCPU;
++	}
++	for (;;) {
++		uint64_t now;
++
++		if (lines >= PCS_CAP) {
++			if (!cap_said) {
++				cap_said = 1;
++				printf("SWEET PCSAMP: cap reached %d\n", PCS_CAP);
++			}
++			delay_for_interval(1000, 1000 * 1000);
++			continue;
++		}
++		delay_for_interval(pcs_period_ms, 1000 * 1000);
++		now = pcs_now_ns();
++		if (last_print == 0 || now - last_print >= 1000000000ULL) {
++			/* once per second: print the second that ended, then refresh the pids */
++			if (last_print != 0) {
++				uint32_t top[PCS_TOP];
++				int cnt = 0;
++				struct { uint64_t tid; uint32_t w, n, user; } tt[PCS_TTOP * 4];
++				int ntt = 0;
++
++				printf("SWEET PCSAMP: t %llu rounds %llu reached %llu hits %llu bb %llu sb %llu pf %llu entries %u dropped %llu\n",
++				    now, rounds, reached, hits, perproc[0], perproc[1], perproc[2], pcs_used, pcs_dropped);
++				lines++;
++				/* per-thread totals */
++				for (uint32_t s = 0; s < PCS_TAB; s++) {
++					const struct pcs_ent *e = &pcs_tab[s];
++					int j;
++
++					if (e->n == 0) {
++						continue;
++					}
++					for (j = 0; j < ntt; j++) {
++						if (tt[j].tid == e->tid && tt[j].w == e->w) {
++							break;
++						}
++					}
++					if (j == ntt) {
++						if (ntt == PCS_TTOP * 4) {
++							continue;
++						}
++						tt[j].tid = e->tid;
++						tt[j].w = e->w;
++						tt[j].n = tt[j].user = 0;
++						ntt++;
++					}
++					tt[j].n += e->n;
++					if (e->kind == 1) {
++						tt[j].user += e->n;
++					}
++				}
++				for (int r = 0; r < PCS_TTOP && r < ntt; r++) {
++					int b = r;
++
++					for (int j = r + 1; j < ntt; j++) {
++						if (tt[j].n > tt[b].n) {
++							b = j;
++						}
++					}
++					if (b != r) {
++						__typeof__(tt[0]) x = tt[r];
++						tt[r] = tt[b];
++						tt[b] = x;
++					}
++					printf("SWEET PCSAMP: tid %s 0x%llx n %u user %u\n", pcs_short[tt[r].w], tt[r].tid, tt[r].n, tt[r].user);
++					lines++;
++				}
++				/* top rows */
++				for (uint32_t s = 0; s < PCS_TAB; s++) {
++					int pos = cnt;
++
++					if (pcs_tab[s].n == 0) {
++						continue;
++					}
++					if (cnt == PCS_TOP && pcs_tab[top[PCS_TOP - 1]].n >= pcs_tab[s].n) {
++						continue;
++					}
++					if (cnt < PCS_TOP) {
++						cnt++;
++					} else {
++						pos = PCS_TOP - 1;
++					}
++					while (pos > 0 && pcs_tab[top[pos - 1]].n < pcs_tab[s].n) {
++						top[pos] = top[pos - 1];
++						pos--;
++					}
++					top[pos] = s;
++				}
++				for (int i = 0; i < cnt; i++) {
++					const struct pcs_ent *e = &pcs_tab[top[i]];
++
++					printf("SWEET PCSAMP: pc %s 0x%llx k %u pc 0x%llx lr 0x%llx kpc 0x%llx n %u\n", pcs_short[e->w], e->tid, e->kind, e->pc, e->lr, e->kpc, e->n);
++					lines++;
++				}
++				/* kernel stacks: PCS_KTOP rows, highest n first (selection by repeated max: 24 x 1024 compares per second) */
++				for (int r = 0; r < PCS_KTOP; r++) {
++					uint32_t b = PCS_KTAB;
++
++					for (uint32_t s = 0; s < PCS_KTAB; s++) {
++						if (pcs_ktab[s].n != 0 && (b == PCS_KTAB || pcs_ktab[s].n > pcs_ktab[b].n)) {
++							b = s;
++						}
++					}
++					if (b == PCS_KTAB) {
++						break;
++					}
++					const struct pcs_kent *k = &pcs_ktab[b];
++					printf("SWEET PCSAMP: kbt %s 0x%llx kpc 0x%llx f 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx n %u\n", pcs_short[k->w], k->tid, k->kpc,
++					    k->f[0], k->f[1], k->f[2], k->f[3], k->f[4], k->f[5], k->n);
++					lines++;
++					pcs_ktab[b].n = 0;   /* printed: consumed (the table is cleared below anyway) */
++				}
++				if (pcs_kdropped) {
++					printf("SWEET PCSAMP: kbt dropped %llu (table full)\n", pcs_kdropped);
++					lines++;
++				}
++			}
++			bzero(pcs_tab, sizeof(pcs_tab));
++			bzero(pcs_ktab, sizeof(pcs_ktab));
++			pcs_kdropped = 0;
++			pcs_used = 0;
++			pcs_dropped = 0;
++			rounds = reached = hits = 0;
++			perproc[0] = perproc[1] = perproc[2] = 0;
++			last_print = now;
++			pcs_pid[0] = pcs_pid[1] = pcs_pid[2] = -1;
++			proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, pcs_callout, NULL, NULL, NULL);
++			for (int w = 0; w < PCS_NP; w++) {
++				if (pcs_pid[w] >= 0 && pcs_slid_pid[w] == -2 - pcs_pid[w]) {
++					pcs_slid_pid[w] = pcs_pid[w];
++					if (pcs_slide_kr[w] == 0) {
++						printf("SWEET PCSAMP: pid %s %d slide 0x%llx\n", pcs_short[w], pcs_pid[w], pcs_slide[w]);
++					} else {
++						printf("SWEET PCSAMP: pid %s %d slide unavailable (no shared region)\n", pcs_short[w], pcs_pid[w]);
++					}
++					lines++;
++				}
++			}
++		}
++		if (pcs_pid[0] < 0 && pcs_pid[1] < 0 && pcs_pid[2] < 0) {
++			continue;
++		}
++		reached += (uint64_t)sweet_pcsamp_round(pcs_pid, PCS_NP, pcs_out, maxcpu);
++		rounds++;
++		for (int c = 0; c < maxcpu; c++) {
++			const uint64_t *o = &pcs_out[c * PCS_W];
++			struct pcs_ent e;
++
++			if (o[0] == 0 || o[0] > PCS_NP) {
++				continue;
++			}
++			e.w = (uint32_t)(o[0] - 1);
++			e.tid = o[1];
++			e.kind = (uint32_t)o[2];
++			e.pc = o[3];
++			e.lr = o[4];
++			e.kpc = o[5];
++			e.n = 0;
++			hits++;
++			perproc[e.w]++;
++			pcs_add(&e);
++			if (e.kind == 2) {
++				struct pcs_kent k;
++
++				k.w = e.w;
++				k.tid = e.tid;
++				k.kpc = e.kpc;
++				for (int i = 0; i < 6; i++) {
++					k.f[i] = o[6 + i];
++				}
++				k.n = 0;
++				pcs_kadd(&k);
++			}
++		}
++	}
++}
++
++void
++sweet_pcsamp_start(void)
++{
++	int v = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetpcsamp", &v, sizeof(v)) || v == 0) {
++		return;
++	}
++	if (v < 0) {
++		printf("SWEET PCSAMP: sweetpcsamp=%d ignored (a period in ms, %d..%d, is needed)\n", v, PCS_MIN_MS, PCS_MAX_MS);
++		return;
++	}
++	pcs_period_ms = (uint32_t)v < PCS_MIN_MS ? PCS_MIN_MS : ((uint32_t)v > PCS_MAX_MS ? PCS_MAX_MS : (uint32_t)v);
++	if (pcs_period_ms != (uint32_t)v) {
++		printf("SWEET PCSAMP: sweetpcsamp=%d clamped to %u ms (%d..%d)\n", v, pcs_period_ms, PCS_MIN_MS, PCS_MAX_MS);
++	}
++	printf("SWEET PCSAMP: period %u ms, processes backboardd SpringBoard Preferences\n", pcs_period_ms);
++	if (kernel_thread_start(sweet_pcsamp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET PCSAMP: unavailable (kernel_thread_start failed)\n");
++	}
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 64f1d6e..bf2c5d8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_thrcpu_start(void);   /* patch 0187, bsd/dev/sweet_thrcpu.c */
+ extern void sweet_surfcpu_start(void);  /* patch 0194, bsd/dev/sweet_surfcpu.c */
+ extern void sweet_thrwait_start(void);  /* patch 0249, bsd/dev/sweet_thrwait.c */
++extern void sweet_pcsamp_start(void);   /* patch 0263, bsd/dev/sweet_pcsamp.c */
+ extern void sweet_cpustat_start(void);
+ extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+ /* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+@@ -788,6 +789,7 @@ sweet_ufs_init(void)
+ 	sweet_thrcpu_start();         /* no-op without boot-arg sweetthrcpu=1 */
+ 	sweet_surfcpu_start();        /* no-op without boot-arg sweetsurfcpu=1 / sweetthrsample= */
+ 	sweet_thrwait_start();        /* no-op without boot-arg sweetthrwait=N */
++	sweet_pcsamp_start();         /* no-op without boot-arg sweetpcsamp=N */
+ 	sweet_cpustat_start();
+ 	sweet_el2_start();
+ 	sweet_keys_gs101_start();
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 60f5cfe..828d55f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1255,6 +1255,104 @@ sweet_thrwait_slide(task_t task, uint64_t *slide)
+ 	return 0;
+ }
+ 
++/*
++ * SWEET CPU PC sampler (patch 0263, sprint-gpu 2026-11-08, bsd/dev/sweet_pcsamp.c, boot-arg sweetpcsamp=N): one round = one cross-call to every other CPU
++ * (cpu_broadcast_xcall_simple, osfmk/arm/cpu_common.c, the call perfmon_arm64.c:177 uses). On each CPU the handler runs in the IPI interrupt and reads, for the
++ * thread it interrupted, only: its task's pid, its tid and the interrupted register state getCpuDatap()->cpu_int_state (set by BEGIN_INTERRUPT_HANDLER,
++ * osfmk/arm64/locore.s:644; the same read as osfmk/kern/backtrace.c:219-225). Interrupted in EL0: kind 1, pc / lr = the user registers at the interrupt.
++ * Interrupted in EL1: kind 2, pc / lr = the user registers of the thread's last kernel entry (thread->machine.upcb), kpc = the unslid kernel pc of the
++ * interrupt. Nothing is written but this round's own out[] slot of the CPU (6 words); no lock, no memory a register points to is read, no printf.
++ * Kind 2 also stores up to 6 frames of the interrupted kernel stack (backtrace with BTF_KERN_INTERRUPTED, the call kperf makes at interrupt time,
++ * osfmk/kperf/callstack.c:276), unslid. A sample taken where interrupts come back on stands for the interrupts-off section that ends there.
++ * Only threads of the npid pids are recorded (o[0] = 1 + index into pids); idle / other tasks leave o[0] = 0. Returns the number of CPUs the call reached.
++ */
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/machine_routines.h>
++#include <kern/backtrace.h>
++
++#define SWEET_PCS_W 12   /* w0 proc+1, tid, kind, pc, lr, kpc, kernel frames 1..6 (kind 2 only, unslid, 0 = none) */
++
++struct sweet_pcs_arg {
++	const int *pids;
++	int npid;
++	int maxcpu;
++	uint64_t *out;
++};
++
++static void
++sweet_pcsamp_cpu(void *p)
++{
++	struct sweet_pcs_arg *a = p;
++	int cpu = cpu_number();
++	thread_t th;
++	task_t task;
++	int pid, w = -1;
++	arm_saved_state_t *is, *us;
++	uint64_t *o;
++
++	if (cpu < 0 || cpu >= a->maxcpu) {
++		return;
++	}
++	o = &a->out[cpu * SWEET_PCS_W];
++	for (int i = 0; i < SWEET_PCS_W; i++) {
++		o[i] = 0;
++	}
++	th = current_thread();
++	task = get_threadtask(th);
++	if (task == TASK_NULL || task == kernel_task) {
++		return;
++	}
++	pid = task_pid(task);
++	for (int i = 0; i < a->npid; i++) {
++		if (pid > 0 && a->pids[i] == pid) {
++			w = i;
++			break;
++		}
++	}
++	if (w < 0) {
++		return;
++	}
++	is = getCpuDatap()->cpu_int_state;
++	us = th->machine.upcb;
++	o[1] = thread_tid(th);
++	if (is != NULL && is_saved_state64(is) && PSR64_IS_USER(get_saved_state_cpsr(is))) {
++		o[2] = 1;
++		o[3] = get_saved_state_pc(is);
++		o[4] = get_saved_state_lr(is);
++		o[5] = 0;
++	} else {
++		o[2] = 2;
++		o[3] = (us != NULL && is_saved_state64(us)) ? get_saved_state_pc(us) : 0;
++		o[4] = (us != NULL && is_saved_state64(us)) ? get_saved_state_lr(us) : 0;
++		o[5] = (is != NULL && is_saved_state64(is)) ? VM_KERNEL_UNSLIDE(ml_get_backtrace_pc(is)) : 0;
++		if (is != NULL) {
++			uintptr_t bt[8];
++			backtrace_info_t bti = BTI_NONE;
++			struct backtrace_control ctl = { .btc_flags = BTF_KERN_INTERRUPTED, };
++			unsigned nf = backtrace(bt, 8, &ctl, &bti);
++
++			for (unsigned i = 0; i < 6; i++) {
++				o[6 + i] = (i + 1 < nf) ? VM_KERNEL_UNSLIDE(bt[i + 1]) : 0;   /* bt[0] = the interrupted pc (= kpc) */
++			}
++		}
++	}
++	o[0] = (uint64_t)(w + 1);
++}
++
++int sweet_pcsamp_round(const int *pids, int npid, uint64_t *out, int maxcpu);
++
++int
++sweet_pcsamp_round(const int *pids, int npid, uint64_t *out, int maxcpu)
++{
++	struct sweet_pcs_arg a = { pids, npid, maxcpu, out };
++
++	for (int i = 0; i < maxcpu * SWEET_PCS_W; i++) {
++		out[i] = 0;
++	}
++	return (int)cpu_broadcast_xcall_simple(FALSE, sweet_pcsamp_cpu, &a);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ /*

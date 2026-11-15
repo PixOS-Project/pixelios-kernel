@@ -1,0 +1,41 @@
+#!/bin/bash
+# rj-local-transport ssh|scp ARGS... : stand-in for ssh/scp when the "remote" host is THIS host (tools/remote-job --where lab-host; TP-050).
+#   ssh ARGS : drop the leading `-o OPT` pairs and the host word, run the rest as ONE command line with `bash -c` (what sshd's remote shell does with the
+#              joined argument words) in $HOME with a clean env (HOME USER LOGNAME PATH XDG_RUNTIME_DIR only), stdin and exit code passed through. Nothing is dialled; there is no network and no sshd involved.
+#   scp ARGS : drop -q/-r/-o OPT, strip a `HOST:` prefix from the file operands (a relative path after it is relative to $HOME, as scp does),
+#              then `cp -rL SRC... DST` (last operand = destination). Exit code of cp.
+# Not a gate step and prints no RESULT line: stdout/stderr belong to the command it carries. Any usage error is a loud stderr line + exit 255
+# (255 = "transport failure", the code remote-job already treats as infra).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+mode=${1:-}; shift || true
+case $mode in
+ssh)
+	while [ "${1:-}" = -o ]; do shift 2 || break; done
+	[ $# -ge 2 ] || { echo "rj-local-transport: ssh needs HOST and a command" >&2; exit 255; }
+	shift   # the host word
+	# as sshd: a clean login-like env in $HOME (review lab-host-lane-r1 F3, AP-225): the caller's GATE_*/cwd never reach the job
+	cd "$HOME" || { echo "rj-local-transport: cannot cd to HOME '$HOME'" >&2; exit 255; }
+	exec env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" PATH="$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" bash -c "$*" ;;   # unset: what pam_systemd gives an ssh login (r2)
+scp)
+	args=()
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-q|-r) shift ;;
+		-o) [ $# -ge 2 ] || { echo "rj-local-transport: scp -o needs a value" >&2; exit 255; }; shift 2 ;;
+		*) args+=("$1"); shift ;;
+		esac
+	done
+	[ ${#args[@]} -ge 2 ] || { echo "rj-local-transport: scp needs SRC... DST" >&2; exit 255; }
+	for i in "${!args[@]}"; do
+		a=${args[$i]}
+		if [[ $a =~ ^[A-Za-z0-9._@-]+:(.*)$ ]]; then
+			a=${BASH_REMATCH[1]}
+			case $a in /*) ;; *) a=$HOME/$a ;; esac
+		fi
+		args[i]=$a
+	done
+	dst=${args[-1]}; unset 'args[-1]'
+	exec cp -rL -- "${args[@]}" "$dst" ;;   # -L: scp -r follows symlinks (review r1 F5)
+*) echo "rj-local-transport: usage: rj-local-transport ssh|scp ARGS..." >&2; exit 255 ;;
+esac

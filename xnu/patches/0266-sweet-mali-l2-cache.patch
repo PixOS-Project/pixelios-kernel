@@ -1,0 +1,55 @@
+SWEET Mali GPU L2 caching knob (patch 0266, sprint-gpu 2026-11-08; r2 after run gputest-nav26 corrupted the screen with index 0 and shareability 0): boot-arg sweetmalicache=1 makes every GPU leaf PTE use memattr index 0 (AS0 MEMATTR byte 0x88 = kbase AS_MEMATTR_INDEX_DEFAULT, mainline panfrost's only memattr) AND shareability bits 9:8 = 2 (SH_OS, as Linux panfrost on every Mali PTE, io-pgtable-arm.c v6.6:80,447-450); sweetmalicache=2 = index 0 with shareability 3 (kbase SHARE_INNER for BASE_MEM_COHERENT_LOCAL, mali_kbase_mem.c:2354-2357, mmu_mode_aarch64.c:132-138). Default unchanged (index 5 non-cacheable, shareability 0). One 'SWEET MALI: GPU L2 caching ON|off ...' line per bring-up, GAP for another value. Coherency flushes unchanged (JS_CONFIG_VAL 0x83B00). Research: super docs/research/sprint-gpu-l2-coherency.md.
+--- a/bsd/dev/sweet_mali_pt.h
++++ b/bsd/dev/sweet_mali_pt.h
+@@ -20,6 +20,14 @@
+ #define MALI_PTE_NX      (1ull << 54)
+ #define MALI_PTE_TABLE   (MALI_PTE_ACCESS | 3ull)
+ #define MALI_MEMATTR_NC  5u                                              /* AS0 MEMATTR byte 5 = 0x4C, non-cacheable */
++#define MALI_MEMATTR_DEFAULT 0u    /* patch 0266: AS0 MEMATTR byte 0 = 0x88 = kbase AS_MEMATTR_INDEX_DEFAULT (IMPL_DEF cache policy: GPU L2 caching); kbase maps every
++                                    * GPU-cached allocation with it and index 5 only for BASE_MEM_UNCACHED_GPU (mali_kbase_mem.c:2379-2404, gs-bluejay android13) */
++/* patch 0266: the memattr index of every leaf PTE written from now on; set once by sm_bringup from boot-arg sweetmalicache before the first mapping */
++static uint32_t mali_memattr_idx = MALI_MEMATTR_NC;
++/* patch 0266 r2: leaf PTE shareability bits 9:8 (0 = non-shareable, as before). With the cacheable index they must be set: Linux panfrost
++ * puts SH_OS 2<<8 on every Mali PTE (drivers/iommu/io-pgtable-arm.c v6.6:80,447-450), kbase SHARE_INNER 3<<8 on BASE_MEM_COHERENT_LOCAL
++ * memory (mali_kbase_mem.c:2354-2357, mmu/mali_kbase_mmu_mode_aarch64.c:132-138). Run gputest-nav26 (index 0, SH 0) corrupted the screen. */
++static uint64_t mali_pte_sh;
+ #define MALI_F_EXEC      1u
+ 
+ /* ---- VA allocator: one bit per 4 KB page, first fit from a rolling hint ---- */
+@@ -115,7 +123,7 @@
+ static inline uint64_t
+ mali_pte_leaf(uint64_t pa, uint32_t flags)
+ {
+-	return pa | MALI_PTE_ACCESS | 3ull | MALI_PTE_RW | ((uint64_t)MALI_MEMATTR_NC << 2) | ((flags & MALI_F_EXEC) ? 0 : MALI_PTE_NX);
++	return pa | MALI_PTE_ACCESS | 3ull | MALI_PTE_RW | ((uint64_t)mali_memattr_idx << 2) | mali_pte_sh | ((flags & MALI_F_EXEC) ? 0 : MALI_PTE_NX);
+ }
+ 
+ /* maps one 4 KB page; 0 ok, -1 bad VA or PA, -2 out of tables, -3 already mapped */
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -1500,6 +1500,25 @@
+ 		return 1;
+ 	}
+ 	sm_skip_config = skip_config;
++	{
++		/* patch 0266 (sprint-gpu 2026-11-08): boot-arg sweetmalicache=1 maps GPU memory with memattr index 0 (AS MEMATTR byte 0x88, kbase
++		 * AS_MEMATTR_INDEX_DEFAULT: cached in the GPU L2) instead of index 5 (0x4C, non-cacheable). Coherency as kbase: every job starts with
++		 * an L2 clean+invalidate and ends with a clean+invalidate (JS_CONFIG_VAL 0x83B00), so CPU writes before a job and GPU writes after it
++		 * meet in memory. Set before the first mapping; never changed afterwards. */
++		uint32_t cv = 0;
++
++		if (PE_parse_boot_argn("sweetmalicache", &cv, sizeof(cv)) && (cv == 1 || cv == 2)) {
++			mali_memattr_idx = MALI_MEMATTR_DEFAULT;
++			mali_pte_sh = (cv == 1) ? (2ull << 8) : (3ull << 8);   /* 1 = panfrost SH_OS, 2 = kbase SHARE_INNER */
++			printf("SWEET MALI: GPU L2 caching ON (sweetmalicache=%u): PTE memattr index %u (AS MEMATTR byte 0x88) shareability %llu (%s)\n", cv,
++			    mali_memattr_idx, (unsigned long long)(mali_pte_sh >> 8), cv == 1 ? "panfrost SH_OS" : "kbase SHARE_INNER");
++		} else {
++			if (PE_parse_boot_argn("sweetmalicache", &cv, sizeof(cv)) && cv != 0) {
++				printf("SWEET MALI GAP: sweetmalicache=%u is not 0, 1 or 2, ignored, GPU memory stays non-cacheable\n", cv);
++			}
++			printf("SWEET MALI: GPU L2 caching off: PTE memattr index %u (AS MEMATTR byte 0x4C, non-cacheable)\n", mali_memattr_idx);
++		}
++	}
+ 	if (mali_pt_init(&sm.pt, (struct mali_pt_ops){ sm_table_alloc, NULL })) {
+ 		printf("SWEET MALI: no memory for the page tables\n");
+ 		return 1;

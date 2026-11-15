@@ -1,0 +1,40 @@
+SWEET boot line 1024 (patch 0176, research 108): arm64 BOOT_LINE_LENGTH 608 -> 1024 (the i386 value of the same tree, pexpert/pexpert/i386/boot.h:76), so struct boot_args grows from 736 to 1152 bytes and the boot-args line holds 1023 characters instead of 607. No iBoot in this port: the shim (shim/loader.c, BOOT_LINE_LENGTH 1024, static asserts on the layout; payload version 2) is the only producer and changes in the same commit; tools/mkpayload.py and tools/run-preflight follow. Readers use the macro (kern_sysctl.c, kern_stackshot.c, IONVRAM.cpp) or the struct fields (start.s via genassym BA_BOOT_FLAGS, arm_vm_init.c memSizeActual). osfmk/arm64/arm_vm_init.c carries the string "SWEET_BOOT_LINE_LENGTH=1024" (from the macro) and tools/mkpayload.py refuses a kernel without it (review bootline-1024-r1 F1). Host test tools/test_bootline_layout.py. Not run on hardware.
+
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+index 2c2186f..7e26d36 100644
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -23,7 +23,14 @@
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
+  */
+-#define BOOT_LINE_LENGTH        608
++/*
++ * PixOS (patch 0176): 1024 instead of 608, the value the i386 header of this same tree uses
++ * (pexpert/pexpert/i386/boot.h:76). There is no iBoot in this port: the sweet shim (shim/loader.c)
++ * is the only producer of boot_args and is built with the same BOOT_LINE_LENGTH, so the IBOOT
++ * limit above does not bind us. Readers use the macro or the struct fields (start.s reads bootFlags
++ * through genassym BA_BOOT_FLAGS = offsetof), so they move with it; sizeof(struct boot_args) 736 -> 1152.
++ */
++#define BOOT_LINE_LENGTH        1024
+ 
+ /*
+  * Video information..
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -52,6 +52,14 @@
+ 
+ #include <san/kasan.h>
+ 
++/*
++ * PixOS (patch 0176): tools/mkpayload.py refuses a kernel without this string, so a kernel built without the
++ * 1024-byte boot line never boots on the 1024 shim (it would read boot-args text as bootFlags and memSizeActual).
++ */
++#define SWEET_BL_STR2(x) #x
++#define SWEET_BL_STR(x) SWEET_BL_STR2(x)
++__attribute__((used)) static const char sweet_boot_line_tag[] = "SWEET_BOOT_LINE_LENGTH=" SWEET_BL_STR(BOOT_LINE_LENGTH);
++
+ #if __ARM_KERNEL_PROTECT__
+ /*
+  * If we want to support __ARM_KERNEL_PROTECT__, we need a sufficient amount of

@@ -135,8 +135,8 @@ static int cmu_dump(uint32_t *mt, uint32_t *mc, uint32_t *ms)
 
 		nm[15] = (char)('0' + k);
 		n2[18] = (char)('0' + k);
-		rd(nm, GPU_CMU_G3D + CMU_PLL_G3D + 4u * k, &v);
-		rd(n2, GPU_CMU_G3D + CMU_PLL_G3D_L2 + 4u * k, &v);
+		rd(nm, GPU_CMU_G3D + CMU_PLL_G3D + (uintptr_t)4u * k, &v);
+		rd(n2, GPU_CMU_G3D + CMU_PLL_G3D_L2 + (uintptr_t)4u * k, &v);
 	}
 	rd("CMU_MUX_BUSD", GPU_CMU_G3D + 0x630u, &v);
 	rd("CMU_MUX_GLB", GPU_CMU_G3D + 0x640u, &v);
@@ -159,7 +159,7 @@ static int cmu_dump(uint32_t *mt, uint32_t *mc, uint32_t *ms)
 static void fvmap_dom(unsigned idx)
 {
 	char line[RAMLOG_LINE_MAX];
-	uintptr_t h = GPU_FVMAP_SRAM + FVMAP_HDR * idx;
+	uintptr_t h = GPU_FVMAP_SRAM + (uintptr_t)FVMAP_HDR * idx;
 	uint32_t w0, w2, w5, rate, volt;
 	unsigned p, nlv, init, orv;
 
@@ -190,7 +190,7 @@ static void fvmap_dom(unsigned idx)
 	}
 	emit(line, p);
 	for (unsigned l = 0; l < nlv; l++) {
-		uintptr_t e = GPU_FVMAP_SRAM + orv + 8u * l;
+		uintptr_t e = GPU_FVMAP_SRAM + orv + (uintptr_t)8u * l;
 
 		p = put_txt(line, sizeof(line), 0, "FVMAP");
 		p = put_dec(line, sizeof(line), p, idx);
@@ -220,7 +220,21 @@ void gpu_probe_cmu(void)
 		(void)cmu_dump(&mt, &mc, &ms);
 }
 
-/* Read-only state of the shader cores for --gpu-rail-on, printed right before the rail is restored: only when both PMU domains read as on. */
+/* The always-on PMU says both GPU power domains are on (status bit 0 of PMU_G3D_STAT and
+ * PMU_EMB_STAT); both words are printed. Two reads, no write. */
+int gpu_probe_pmu_on(void)
+{
+	uint32_t top = 0, emb = 0;
+	/* style-allow: sized-types int is rd()'s boolean and this module's API type (byte-pinned) */
+	/* style-allow: assert audited object, byte-pinned predicate: a failed read is a plain 0 */
+	int a = rd("PMU_G3D_STAT", GPU_PMU_G3D_STAT, &top);
+	int b = rd("PMU_EMB_STAT", GPU_PMU_EMB_STAT, &emb);
+
+	return a && b && (top & 1u) && (emb & 1u);
+}
+
+/* Read-only state of the shader cores for --gpu-rail-on, printed right before the rail is restored:
+ * only when both PMU domains read as on. */
 void gpu_probe_shaders(void)
 {
 	uint32_t top = 0, emb = 0, v;
@@ -290,6 +304,7 @@ void gpu_probe(void)
 
 void gpu_probe(void) {}
 void gpu_probe_cmu(void) {}
+int gpu_probe_pmu_on(void) { return 0; }
 void gpu_probe_shaders(void) {}
 
 #endif

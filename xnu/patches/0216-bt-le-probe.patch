@@ -1,0 +1,296 @@
+SWEET Bluetooth: LE-state probe matrix + HCI trace cap 200 -> 3000 (patch 0216, ticket T-0c77, W-BTUP; boot-arg sweetbtleprobe=1 gates the matrix, the trace cap applies to every sweetbt=1 boot). bt-up4 [obs 20261104T032008Z-bt-up4]: the unbooted BCM4389 ROM answers 67 of bluetoothd's commands but returns 0x0c (Command Disallowed) to LE Read Advertising Channel TX Power (0x2007) and LE Set Scan Parameters (0x200b); bluetoothd exits on the 0x200b status (scan completion handler 0x1005798d4 [read from source]). The matrix runs once after the baud probe settled, before the rx thread and bluetoothd, then power-cycles the controller and re-probes the baud so bluetoothd meets a clean ROM. Phase B replays bluetoothd's own LE commands of the bt-up4 trace in order (2003 2001 0c6d 2060 202f 2031 2024 201c 200f 204a 2074) with 0x2007 after every step (names the first step after which the ROM says 0x0c; Opus review T-0c77: 0x204a is an LE 5.0 command sent before 0x2007), then the triple (2007; 200b with bluetoothd's parameters, own address random; 200b own address public). Phase A resets and adds single preconditions each followed by the triple: LE Set Scan Enable off 0x200c 00 00, LE Set Random Address 0x2005, Write BD_ADDR 0xfc01 plen 6 [Android HAL + Linux btbcm.c:101-116, docs/research/BT-S1-android-oracle.md row 7], HCI Reset, plus BD address reads and the Supported Commands octets 24..30. Controller writes: standard HCI commands that bluetoothd or the Android HAL send themselves, volatile controller RAM state that REG_ON low clears (the power-cycle at the end), no flash, no patchram, no baud change, no scan or advertising enable (a test asserts it). The trace cap rises to 3000 transfers because bt-up4 hit 200 inside the 2nd respawn. Applies after 0189, 0213 and 0215. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -461,7 +461,9 @@
+ 	return e;
+ }
+ 
+-/* HCI byte trace (T-2c90, rule 8: the first chip talk must be visible): first 200 transfers, up to 24 bytes each, hex. Pure printf; no register access. */
++/* HCI byte trace (T-2c90, rule 8: the first chip talk must be visible): first SBU_TRACE_MAX transfers, up to 24 bytes each, hex. Pure printf; no register access.
++ * patch 0216 (T-0c77): the cap was 200; bt-up4 [obs 20261104T032008Z-bt-up4] hit it inside bluetoothd's 2nd launchd respawn, so respawns 2..21 were unwitnessed. */
++#define SBU_TRACE_MAX   3000u
+ static uint32_t sbu_trace_n;
+ 
+ static void
+@@ -470,10 +472,10 @@
+ 	char hex[24 * 3 + 1];
+ 	size_t k = len < 24 ? len : 24;
+ 
+-	if (sbu_trace_n >= 200) {
+-		if (sbu_trace_n == 200) {
++	if (sbu_trace_n >= SBU_TRACE_MAX) {
++		if (sbu_trace_n == SBU_TRACE_MAX) {
+ 			sbu_trace_n++;
+-			printf("BT HCI: trace cap reached (200 transfers); later transfers are not logged\n");
++			printf("BT HCI: trace cap reached (%u transfers); later transfers are not logged\n", SBU_TRACE_MAX);
+ 		}
+ 		return;
+ 	}
+@@ -598,6 +600,222 @@
+ 	return e != 0 ? e : ETIMEDOUT;
+ }
+ 
++/*
++ * patch 0216 (T-0c77, W-BTUP), boot-arg sweetbtleprobe=1: LE-state probe matrix. bt-up4 [obs 20261104T032008Z-bt-up4]: the unbooted ROM answers 67 of bluetoothd's
++ * commands, but LE Read Advertising Channel TX Power (0x2007) and LE Set Scan Parameters (0x200b, bluetoothd's own parameters) get 0x0c (Command Disallowed) and
++ * bluetoothd exits on the 0x200b status [read from source: scan completion handler 0x1005798d4]. Which precondition makes the ROM accept them is unknown (no source
++ * says); this runs once after the baud probe settled, BEFORE the rx thread and bluetoothd, owns the RX FIFO, and logs the status of every step as `BT PROBE:` lines.
++ * Controller writes: only standard HCI commands that bluetoothd or the Android HAL send itself, all volatile controller RAM state (cleared by REG_ON low), no flash,
++ * no patchram, no baud change: LE Set Scan Enable off, LE Set Event Mask (bluetoothd's mask, bt-up4 trace), Write LE Host Support (bluetoothd's, trace), LE Set Random
++ * Address (a probe-only static random value), Write BD_ADDR 0xfc01 plen 6 (Android HAL + Linux btbcm.c:101-116, docs/research/BT-S1-android-oracle.md row 7; the value
++ * is the synthetic D-3 A style 02:.. address, probe-only), HCI Reset. No scan enable, no advertising enable: the radio never transmits or listens.
++ */
++#define SBU_CMD_MS      500
++#define SBU_PM_SUPP     72      /* Read Local Supported Commands returns status + 64 octets */
++
++static int
++sbu_cmd(uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *st, uint8_t *rp, size_t rpmax, size_t *rpn)
++{
++	uint8_t pkt[4 + 8], buf[280];
++	size_t n = 0;
++	int e;
++
++	*rpn = 0;
++	if (plen > 8) {
++		return EINVAL;
++	}
++	{       /* bytes nobody asked for (a late event of the previous step) must not be silently eaten: log them (rule 8, review T-0c77 M3) */
++		unsigned stale = 0;
++
++		while (stale < 64 && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++			buf[stale++ & 63] = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++			sbu.rx_bytes++;
++		}
++		if (stale != 0) {
++			printf("BT PROBE: %u stale rx bytes before opcode %#x (first %02x): dropped\n", stale, op, buf[0]);
++		}
++	}
++	pkt[0] = 0x01;
++	pkt[1] = (uint8_t)(op & 0xff);
++	pkt[2] = (uint8_t)(op >> 8);
++	pkt[3] = plen;
++	memcpy(pkt + 4, par, plen);
++	if ((e = sbu_tx(pkt, 4u + plen)) != 0) {
++		return e;
++	}
++	for (unsigned t = 0; t <= SBU_CMD_MS; t += 5) {
++		uint32_t err = sbu_rd(SBU_UART + U_UERSTAT);
++
++		if (err != 0) {
++			sbu.rx_err++;
++			SBU_GAP(SG_RXERR, "uart16 rx error flags %#x during the LE probe (opcode %#x)", err, op);
++		}
++		while (n < sizeof(buf) && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++			buf[n++] = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++			sbu.rx_bytes++;
++		}
++		while (n > 0) {
++			size_t tot = 0;
++			uint16_t opc = 0;
++			bool match = false;
++
++			if (buf[0] != 0x04) {      /* not an event indicator: drop the byte, loudly */
++				SBU_GAP(SG_OTHER, "LE probe: dropped stray byte %#x while waiting for opcode %#x", buf[0], op);
++				memmove(buf, buf + 1, --n);
++				continue;
++			}
++			if (n < 3 || n < (tot = 3u + buf[2])) {
++				break;
++			}
++			if (buf[1] == 0x0e && buf[2] >= 4) {         /* Command Complete: ncmd, opcode lo/hi, status, return params */
++				opc = (uint16_t)(buf[4] | (buf[5] << 8));
++				if (opc == op) {
++					size_t k = tot - 7 < rpmax ? tot - 7 : rpmax;
++
++					*st = buf[6];
++					memcpy(rp, buf + 7, k);
++					*rpn = k;
++					match = true;
++				}
++			} else if (buf[1] == 0x0f && buf[2] == 4) {  /* Command Status: status, ncmd, opcode lo/hi */
++				opc = (uint16_t)(buf[5] | (buf[6] << 8));
++				if (opc == op) {
++					*st = buf[3];
++					match = true;
++				}
++			}
++			if (match) {
++				sbu_trace("rx", buf, tot);
++				if (n > tot) {
++					printf("BT PROBE: %zu extra rx bytes after the answer to opcode %#x (first %02x): dropped\n", n - tot, op, buf[tot]);
++				}
++				return 0;
++			}
++			printf("BT PROBE: skipped event %#x len %u while waiting for opcode %#x\n", buf[1], buf[2], op);
++			memmove(buf, buf + tot, n - tot);
++			n -= tot;
++		}
++		if (t < SBU_CMD_MS) {
++			sbu.hw.msleep(5);
++		}
++	}
++	return ETIMEDOUT;
++}
++
++struct sbu_pstep {
++	const char *name;
++	uint16_t op;
++	uint8_t plen;
++	uint8_t par[8];
++	uint8_t probe;  /* after this step: 0 nothing, 1 = 0x2007 only (read-only), 2 = the triple: 0x2007, 0x200b with bluetoothd's parameters (own address random), 0x200b with own address public */
++};
++
++/* Phase B replays bluetoothd's own LE commands of the bt-up4 instance 1 in its order (merged.log HCI trace: 2003, 2001, 0c6d, 2060, 202f, 2031, 2024, 201c, 200f, 204a, 2074, then 2007 and 200b)
++ * with 0x2007 after every step, so the first step after which the ROM says 0x0c is named (bisect; Opus review T-0c77: bluetoothd sends 0x204a, an LE 5.0 command, before 0x2007, and a controller that
++ * refuses mixing the legacy and the extended command set would answer 0x0c only after it). Phase A then resets and tries single preconditions, each followed by the triple. */
++static const struct sbu_pstep sbu_pm[] = {
++	{ "B0-after-reset",         0x0000, 0, { 0 }, 1 },
++	{ "B1-2003-le-features",    0x2003, 0, { 0 }, 1 },
++	{ "B2-2001-le-event-mask",  0x2001, 8, { 0x7f, 0xfa, 0x86, 0x3f, 0x07, 0x00, 0x00, 0x00 }, 1 },     /* bluetoothd's mask, bt-up4 trace */
++	{ "B3-0c6d-le-host",        0x0c6d, 2, { 0x01, 0x01 }, 1 },                                          /* Write LE Host Support, bt-up4 trace */
++	{ "B4-2060",                0x2060, 0, { 0 }, 1 },
++	{ "B5-202f-max-datalen",    0x202f, 0, { 0 }, 1 },
++	{ "B6-2031-default-phy",    0x2031, 3, { 0x00, 0x02, 0x02 }, 1 },                                    /* bt-up4 trace */
++	{ "B7-2024-suggested-dl",   0x2024, 4, { 0xfb, 0x00, 0x48, 0x08 }, 1 },                              /* bt-up4 trace */
++	{ "B8-201c-states",         0x201c, 0, { 0 }, 1 },
++	{ "B9-200f-list-size",      0x200f, 0, { 0 }, 1 },
++	{ "B10-204a-periodic-list", 0x204a, 0, { 0 }, 1 },
++	{ "B11-2074-host-feature",  0x2074, 2, { 0x20, 0x01 }, 2 },                                          /* bt-up4 trace; the state of bluetoothd at its failing 2007 */
++	{ "A0-hci-reset",           0x0c03, 0, { 0 }, 2 },                                                   /* clean ROM again; no bluetoothd command before */
++	{ "A1-scan-enable-off",     0x200c, 2, { 0x00, 0x00 }, 2 },                                          /* LE Set Scan Enable: enable 0, filter dup 0 (not in the bt-up4 trace) */
++	{ "A2-read-bd-before",      0x1009, 0, { 0 }, 0 },
++	{ "A3-le-random-address",   0x2005, 6, { 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0 }, 2 },                  /* c0:00:00:00:00:01, static random (top bits 11), probe-only (not in the bt-up4 trace) */
++	{ "A4-write-bd-addr",       0xfc01, 6, { 0x01, 0x00, 0x00, 0x00, 0x00, 0x02 }, 2 },                  /* 02:00:00:00:00:01, synthetic locally administered, probe-only */
++	{ "A5-read-bd-after",       0x1009, 0, { 0 }, 0 },
++	{ "A6-hci-reset",           0x0c03, 0, { 0 }, 2 },                                                   /* does the BD address / random address survive an HCI Reset? */
++	{ "A7-read-bd-after-reset", 0x1009, 0, { 0 }, 0 },
++};
++
++static const char *
++sbu_pstatus(uint8_t st)
++{
++	return st == 0x00 ? "success" : st == 0x01 ? "unknown HCI command" : st == 0x0c ? "command disallowed" : st == 0x12 ? "invalid parameters" : "other status";
++}
++
++static void
++sbu_pstep_run(const char *step, const char *label, uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *stout, unsigned *timeouts)
++{
++	uint8_t st = 0xff, rp[SBU_PM_SUPP];
++	size_t rpn = 0;
++	char hex[8 * 3 + 1];
++	int e = sbu_cmd(op, par, plen, &st, rp, sizeof(rp), &rpn);
++
++	for (uint8_t i = 0; i < plen; i++) {
++		snprintf(hex + 3 * i, 4, "%02x ", par[i]);
++	}
++	hex[3 * plen] = 0;
++	if (e != 0) {
++		(*timeouts)++;
++		printf("BT PROBE: step=%s cmd=%s op=%#06x par=[%s] NO ANSWER (error %d)\n", step, label, op, hex, e);
++		*stout = 0xff;
++		return;
++	}
++	printf("BT PROBE: step=%s cmd=%s op=%#06x par=[%s] status=%#04x (%s) ret=%zu bytes%s\n", step, label, op, hex, st, sbu_pstatus(st), rpn,
++	    st == 0x0c ? " DISALLOWED" : "");
++	if (op == 0x1009 && rpn >= 6) {
++		printf("BT PROBE: BD address read back %02x:%02x:%02x:%02x:%02x:%02x\n", rp[5], rp[4], rp[3], rp[2], rp[1], rp[0]);
++	}
++	if (op == 0x2007 && rpn >= 1) {
++		printf("BT PROBE: LE advertising channel TX power %d dBm\n", (int)(int8_t)rp[0]);
++	}
++	*stout = st;
++}
++
++static void
++sbu_le_probe(void)
++{
++	static const uint8_t par_rnd[7] = { 0x00, 0xe0, 0x01, 0x30, 0x00, 0x01, 0x00 };    /* bluetoothd's LE Set Scan Parameters, bt-up4 trace: passive, 0x1e0/0x30, own addr random */
++	static const uint8_t par_pub[7] = { 0x00, 0xe0, 0x01, 0x30, 0x00, 0x00, 0x00 };    /* the same with own address public */
++	uint8_t st = 0xff, rp[SBU_PM_SUPP], none[1] = { 0 };
++	size_t rpn = 0;
++	unsigned timeouts = 0, ran = 0;
++	const char *ok_2007 = "none", *ok_rnd = "none", *ok_pub = "none", *first_bad = "none";
++
++	printf("BT PROBE: LE matrix start (sweetbtleprobe=1, patch 0216): %zu steps, unbooted ROM after the baud-probe Reset\n", sizeof(sbu_pm) / sizeof(sbu_pm[0]));
++	if (sbu_cmd(0x1002, none, 0, &st, rp, sizeof(rp), &rpn) == 0 && st == 0 && rpn >= 31) {
++		/* raw octets only: the host decodes them against the Core spec Supported Commands table (octets 25/26 hold the LE advertising and scan commands) */
++		printf("BT PROBE: supported-commands octets 24..30 = %02x %02x %02x %02x %02x %02x %02x\n", rp[24], rp[25], rp[26], rp[27], rp[28], rp[29], rp[30]);
++	} else {
++		SBU_GAP(SG_OTHER, "LE probe: Read Local Supported Commands failed (status %#x, %zu bytes)", st, rpn);
++	}
++	for (size_t i = 0; i < sizeof(sbu_pm) / sizeof(sbu_pm[0]); i++) {
++		const struct sbu_pstep *p = &sbu_pm[i];
++		uint8_t s1 = 0xff, s2 = 0xff, s3 = 0xff;
++
++		if (p->op != 0x0000) {
++			sbu_pstep_run(p->name, p->name, p->op, p->par, p->plen, &st, &timeouts);
++			ran++;
++		}
++		if (p->probe >= 1) {
++			sbu_pstep_run(p->name, "2007-read-adv-txpower", 0x2007, none, 0, &s1, &timeouts);
++			ran++;
++			if (s1 == 0 && ok_2007[0] == 'n') { ok_2007 = p->name; }
++			if (s1 != 0 && first_bad[0] == 'n') { first_bad = p->name; }
++		}
++		if (p->probe >= 2) {
++			sbu_pstep_run(p->name, "200b-scan-params-bluetoothd(random)", 0x200b, par_rnd, 7, &s2, &timeouts);
++			sbu_pstep_run(p->name, "200b-scan-params-public", 0x200b, par_pub, 7, &s3, &timeouts);
++			ran += 2;
++			if (s2 == 0 && ok_rnd[0] == 'n') { ok_rnd = p->name; }
++			if (s3 == 0 && ok_pub[0] == 'n') { ok_pub = p->name; }
++		}
++	}
++	printf("BT PROBE: LE matrix done: commands=%u no-answer=%u first-2007-not-success-after=%s first-success-after: 2007=%s 200b(bluetoothd random)=%s 200b(public)=%s\n", ran, timeouts, first_bad, ok_2007, ok_rnd, ok_pub);
++	if (timeouts != 0) {
++		SBU_GAP(SG_OTHER, "LE probe: %u commands got no answer; the matrix is incomplete", timeouts);
++	}
++}
++
+ /* One polling pass (the rx thread calls it every tick): drain the RX FIFO into the connected control. Returns bytes queued. */
+ size_t sbu_rx_poll(void);
+ 
+@@ -793,11 +1011,12 @@
+ 			return;
+ 		}
+ 		if (nc == 2) {      /* BT-S4e: the chip's answer settles the layout; sbu_probe_one leaves the controller powered and open on the answering clock */
+-			int e = ETIMEDOUT;
++			int e = ETIMEDOUT, win = 0;
+ 
+ 			for (int i = 0; i < nu && e == ETIMEDOUT; i++) {
+ 				e = sbu_probe_one(&use[i]);
+ 				if (e == 0) {
++					win = i;
+ 					printf("BT UART: baud probe answered layout=%s uart16 clock %u Hz\n", use[i].layout, use[i].hz);
+ 					SBU_GAP(SG_CLK, "uart16 baud clock %u Hz settled by the chip's answer (layout %s), not by a source (BT-S4e); the CMU_APM mux layout stays unproven", use[i].hz, use[i].layout);
+ 				}
+@@ -807,6 +1026,28 @@
+ 				return;
+ 			}
+ 			settled = true;
++			{       /* patch 0216 (T-0c77): boot-arg sweetbtleprobe=1; default behaviour unchanged. The rx thread is not running yet, so the probe owns the FIFO. */
++				int v = 0;
++
++				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && v == 1) {
++					sbu_le_probe();
++					/* bluetoothd must meet the same ROM state as in bt-up4, not the probe's leftovers (written BD address, random address, LE mode): power-cycle and re-probe the baud (review T-0c77 M2) */
++					(void)sbu_power_off();
++					e = sbu_probe_one(&use[win]);
++					printf("BT UART: controller power-cycled after the LE matrix: %s (error %d)\n", e == 0 ? "answered HCI Reset again" : "NO ANSWER", e);
++					if (e != 0) {
++						printf("BT GAP: backend not started after the LE matrix power-cycle; controller powered off\n");
++						return;
++					}
++				}
++			}
++		}
++	}
++	if (!settled) {
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && v == 1) {
++			printf("BT GAP: sweetbtleprobe=1 ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n");
+ 		}
+ 	}
+ 	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */

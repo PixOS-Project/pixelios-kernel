@@ -1,0 +1,9 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,6 +1,8 @@
+ 	if (x) {
++		int ret = 0;
+ 		printf("a\n");
+ 		printf("b\n");
+ 		printf("c\n");

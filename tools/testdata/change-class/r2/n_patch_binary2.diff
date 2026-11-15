@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-x.patch
+@@ -0,0 +1,10 @@
++desc
++
++diff --git a/osfmk/kern/x.c b/osfmk/kern/x.c
++index 0123456789abcdef0123456789abcdef01234567..89abcdef0123456789abcdef0123456789abcdef 100644
++GIT binary patch
++literal 12
++zcmV+K0QDiW0RRAAAAAAAAAAA
++ 
++literal 0
++HcmV?d00001

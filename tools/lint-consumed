@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""lint-consumed: every tag/key a host packer packs has a kernel-side consumer or a gap log naming it (user R48 row 2, rule 8; gate step consumed).
+
+  tools/lint-consumed [--root DIR]   scan DIR (default: this clone), print findings, last line RESULT: PASS|FAIL|ERROR
+  tools/lint-consumed --list         print the packers and the tags parsed from their source, nothing else
+
+Packers (PACKERS below; the tag list of each is PARSED from the packer's source with ast, never hand-kept):
+  tools/pack_wlanfw.py   module constant TAGS (container entry tags FW/NVRM/CLM, read by xnu patches 0128-0131)
+  tools/mkpayload.py     names given to add_ramdisk_to_adt: its `name` default and every call that passes a name (ADT /chosen/memory-map properties)
+  tools/mkdevoverlay.py  module constant MAGIC (SWEETDEV archive magic, read by xnu patch 0117)
+Sources: shim/**/*.c|h|cpp (not out/, not files whose name has test/fixture/mock/fake: a test builds the input, it does not read it) and the ADDED lines
+of C/C++ files (.c .h .cpp .cc .hpp .S) in xnu/patches/*.patch, read as ONE stack in numeric order (a line a later patch removes, same file and text, is gone;
+hunks are walked by their counts, a malformed hunk is PATCH-PARSE). Comments, `#if 0` / dead `#else` blocks and preprocessor lines are removed, adjacent string
+literals are joined ("CL" "M "), and `#define NAME "literal"` is substituted at its uses.
+A tag is CONSUMED when the quoted literal ("CLM ", padding kept) or its 32-bit hex value is a whole argument of a compare/lookup call (memcmp bcmp strcmp
+strncmp strcasecmp SecureDTGetProperty DTGetProperty getProperty), or the direct operand of == / !=, or a hex `case` label. `(void)` and a bare compare call
+statement throw the result away: not a consumer. A tag is GAP-LOGGED when swl_gap, swl_miss or sweet_note_ignored has it inside a STRING argument, or one string
+literal holds `GAP:` and the tag; the tag is the whole word (len >= 3) or, for 1-2 letter words ("FW"), the padded tag as packed ("FW  ").
+Neither = UNCONSUMED (FAIL): consume it, or add the gap log naming it, or (stock code reads it, or a fix is queued) one row in
+tools/lint-consumed-allow.txt: `packer tag hits=N sha=HEX8 reason` (tag without trailing padding; reason >= 10 chars; `#` and blank lines ignored). N pins the number of
+literals of the tag in the packer code (two on one line count twice) and HEX8 the fingerprint (sha256, 8 hex) of the sorted, stripped source lines that hold them
+(--list prints both): more or fewer literals is ALLOW-GREW / ALLOW-SHRUNK, the same count on other text (an edited, swapped or moved-to-another-site line) is
+ALLOW-CHANGED (a new packing site needs a new review, AP-300); a row for a tag
+that is consumed or gap-logged now is ALLOW-STALE; a row for no packer/tag is ALLOW-UNKNOWN. A packer file that is missing or yields no tag is a FAIL
+(PACKER-MISSING / PACKER-EMPTY), never a silent pass. Other tools that pack tag-like records but have no extractor (usbroot-host.py, udump-recv.py wire
+magics, mkadt.py properties, mkpayload.py header fields) are printed as NOT COVERED and counted on the RESULT line, they do not fail.
+Known limits (rule 8: each is a reviewed gap, not a silent pass; allowlist the tag with the reason when one bites):
+  - a consumer that builds the tag at run time (table loop over a variable name, a byte-array compare like 0128 swf_parse magic[]) is not seen: LOUD false FAIL;
+    so are a compare through isEqualTo/OSSymbol, a function-like macro that wraps the tag, and code under xnu/qr or xnu/*.c.in (only shim/ and xnu/patches/ are read);
+  - FALSE PASS (no mechanical fix): a presence flag that only picks which gap message prints (`clm |= memcmp(e[i].tag, "CLM ", 4) == 0;`, the shape of patch 0185,
+    review lint-consumed-r1 S7) and a gap string that names the tag for another reason (`swl_gap("clm", "CLM region mismatch", ...)`, S9): a reviewer reads these;
+  - both branches of `#ifdef X / #else` count as live (only `#if 0` / `#if 1 ... #else` are decided);
+  - a packing site built WITHOUT the literal (`b'CL' + b'M '` passed to a new pack() call) changes neither hits nor sha (F7): PACKER-UNRESOLVED catches it only inside a
+    registered constant;
+  - F4 (review r1): the merge of patch 0185 (wip/w4-d4c-gaps fcc5c09) makes the CLM allow row ALLOW-STALE and breaks the two RealTree rows of
+    tools/test_lint_consumed.py (they hard-code allowed=3 and an unconsumed CLM in the REAL tree): the merge commit must drop the row and rewrite those rows from fixtures;
+  - F5 (review r1): the scope is exactly the PACKERS table. Tags a run plan or docs/KNOWN-GAPS*.md promise as consumed are NOT read, and a new tools/*.py packer with a
+    struct 4s/8s field only prints NOT COVERED (it does not fail): a separate check (key-in-swl_gap lint) is needed for those.
+Exit 0 PASS / 1 FAIL / 2 ERROR (usage)."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import ast
+import glob
+import hashlib
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ALLOW = "tools/lint-consumed-allow.txt"
+MIN_REASON = 10
+PACKERS = (("tools/pack_wlanfw.py", "const", "TAGS"), ("tools/pack_wlanfw.py", "const", "MAGIC"), ("tools/mkpayload.py", "adtnames", "add_ramdisk_to_adt"), ("tools/mkdevoverlay.py", "const", "MAGIC"))
+CMPFUNCS = r"memcmp|bcmp|strncmp|strcmp|strcasecmp|SecureDTGetProperty|DTGetProperty|getProperty"
+PURE = ("memcmp", "bcmp", "strncmp", "strcmp", "strcasecmp")   # compare calls: a bare statement of one of them throws the result away
+CALL = re.compile(r"\b(%s)\s*\(" % CMPFUNCS)
+GAPCALL = re.compile(r"\b(?:swl_gap|swl_miss|sweet_note_ignored)\s*\(")
+STR = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+TOKEN = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|[()\[\],]")
+STRRUN = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"(?:\s+\"(?:[^\"\\\n]|\\.)*\")*|'(?:[^'\\\n]|\\.)*'")
+LEX = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|[A-Za-z_]\w*")
+TESTISH = re.compile(r"test|fixture|mock|fake", re.I)   # a test or fixture builds the input, it does not read it
+TAGFMT = re.compile(r"(?<!\d)[48]s")   # a struct format holding a 4s or 8s tag/magic field
+
+
+def consts(node):
+    """Elements of a str/bytes constant or a tuple/list of them -> [(text, lineno, kind)]. An element the lint cannot resolve (a name, a call, `*MORE`,
+    `'CLM '.encode()`, a `+` of tuples, ...) comes back as (None, lineno, ast class): the caller turns it into a PACKER-UNRESOLVED finding, never drops it."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (bytes, str)):
+        v = node.value
+        return [(v.decode("latin-1") if isinstance(v, bytes) else v, node.lineno, "")]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [c for e in node.elts for c in consts(e)]
+    return [(None, getattr(node, "lineno", 0), type(node).__name__)]
+
+
+def extract_const(tree, name):
+    """Every top-level `NAME = ...`, `NAME: T = ...`, `A, NAME = ...` of the module; `NAME += ...` and an unpack the lint cannot align are unresolved."""
+    out = []
+    for st in tree.body:
+        if isinstance(st, ast.AugAssign) and isinstance(st.target, ast.Name) and st.target.id == name:
+            out.append((None, st.lineno, "AugAssign (+=): the constant is changed after its definition"))
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == name and st.value is not None:
+            out += consts(st.value)
+        elif isinstance(st, ast.Assign):
+            for tgt in st.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == name:
+                    out += consts(st.value)
+                elif isinstance(tgt, ast.Tuple) and any(isinstance(t, ast.Name) and t.id == name for t in tgt.elts):
+                    if isinstance(st.value, ast.Tuple) and len(tgt.elts) == len(st.value.elts) and not any(isinstance(e, ast.Starred) for e in tgt.elts + st.value.elts):
+                        out += [c for t, v in zip(tgt.elts, st.value.elts) if isinstance(t, ast.Name) and t.id == name for c in consts(v)]
+                    else:
+                        out.append((None, st.lineno, "tuple unpack the lint cannot align with its value"))
+    return out
+
+
+def extract_adtnames(tree, fn):
+    """The `name` default of def FN(..., name='X') and the 4th positional / name= argument of every call FN(...) or obj.FN(...). A name argument that is not a
+    literal, a `*`/`**` argument, and FN used as a value (alias, callback) are unresolved."""
+    out, callee = [], {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == fn:
+            a = n.args
+            pos = a.posonlyargs + a.args
+            for arg, dflt in zip(pos[len(pos) - len(a.defaults):], a.defaults):
+                if arg.arg == "name":
+                    out += consts(dflt)
+        elif isinstance(n, ast.Call) and (isinstance(n.func, ast.Name) and n.func.id == fn or isinstance(n.func, ast.Attribute) and n.func.attr == fn):
+            if any(isinstance(x, ast.Starred) for x in n.args):
+                out.append((None, n.lineno, "call of %s with a *args argument" % fn))
+            elif len(n.args) >= 4:
+                out += consts(n.args[3])
+            for k in n.keywords:
+                if k.arg is None:
+                    out.append((None, n.lineno, "call of %s with a **kwargs argument" % fn))
+                elif k.arg == "name":
+                    out += consts(k.value)
+        elif isinstance(n, (ast.Name, ast.Attribute)) and id(n) not in callee and (n.id if isinstance(n, ast.Name) else n.attr) == fn \
+                and not isinstance(getattr(n, "ctx", None), (ast.Store, ast.Del)):
+            out.append((None, n.lineno, "%s used as a value (alias or callback), its calls are not followed" % fn))
+    return out
+
+
+def unregistered(tree, rel, kind, arg):
+    """Same-shape packing constants/helpers of a registered packer file that no PACKERS row covers -> [(lineno, what)]."""
+    regs = {a for r, _, a in PACKERS if r == rel}
+    out = []
+    if kind == "const":
+        for st in tree.body:
+            names = [t.id for t in (st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else [])
+                     for t in (t.elts if isinstance(t, ast.Tuple) else [t]) if isinstance(t, ast.Name)]
+            val = getattr(st, "value", None)
+            if val is not None and isinstance(st, (ast.Assign, ast.AnnAssign)) and any(c[0] is not None for c in consts(val)):
+                out += [(st.lineno, "constant %s" % n) for n in names if re.search(r"magic|tag", n, re.I) and n not in regs]
+    else:
+        out += [(n.lineno, "function %s" % n.name) for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.endswith("_to_adt") and n.name not in regs]
+    return out
+
+
+def packer_tags(root, rel, kind, arg, findings):
+    """-> [(tag, first_line, hits, sha)]: hits = literals of the tag in the packer code (docstrings excluded; two on one line count twice), sha = fingerprint of their lines."""
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        findings.append("PACKER-MISSING %s: registered packer not found; fix the PACKERS table in tools/lint-consumed (renamed or removed?)" % rel)
+        return []
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read(), rel)
+    except (SyntaxError, UnicodeDecodeError) as e:
+        findings.append("PACKER-UNPARSEABLE %s: %s" % (rel, e))
+        return []
+    allf = extract_const(tree, arg) if kind == "const" else extract_adtnames(tree, arg)
+    for t, ln, what in allf:
+        if t is None:
+            findings.append("PACKER-UNRESOLVED %s:%d %s is not a str/bytes literal (%s): the lint cannot see that tag; make it a literal or register it by hand" % (rel, ln, arg, what))
+    for ln, what in unregistered(tree, rel, kind, arg):
+        findings.append("PACKER-UNREGISTERED %s:%d %s looks like a packed tag/magic but no PACKERS row in tools/lint-consumed covers it: register it" % (rel, ln, what))
+    found = [(t, ln) for t, ln, _ in allf if t is not None]
+    if not found:
+        findings.append("PACKER-EMPTY %s:1 no tag parsed from %s %s: the packer changed shape; fix the extractor in tools/lint-consumed, do not let it pass empty" % (rel, kind, arg))
+        return []
+    docs = {id(b.body[0].value) for b in ast.walk(tree) if isinstance(b, (ast.Module, ast.FunctionDef, ast.ClassDef)) and b.body
+            and isinstance(b.body[0], ast.Expr) and isinstance(b.body[0].value, ast.Constant)}
+    src = open(path, encoding="utf-8").read().split("\n")
+    res = {}
+    for tag, ln in found:
+        res.setdefault(tag, [ln])
+    sites = {t: [] for t in res}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Constant) and id(n) not in docs and isinstance(n.value, (bytes, str)):
+            v = n.value.decode("latin-1") if isinstance(n.value, bytes) else n.value
+            if v in sites:
+                sites[v].append(n.lineno)
+    return [(t, res[t][0], len(sites[t]), fingerprint([src[i - 1].strip() for i in sites[t]])) for t in res]
+
+
+def fingerprint(lines):
+    """8 hex of the sorted, stripped source lines that hold a tag: a moved line keeps it, an edited, swapped, added or removed one changes it (AP-300)."""
+    return hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()[:8]
+
+
+def strip_c(text):
+    """C comments removed, string/char literals kept, newlines kept (line numbers hold); \\x00 (a patch hunk boundary) resets state."""
+    out, i, n, st = [], 0, len(text), None   # st: None, '"', "'", 'b' (block), 'l' (line)
+    while i < n:
+        c = text[i]
+        if c == "\x00":
+            st = None
+            out.append(c)
+        elif st is None:
+            if text.startswith("/*", i):
+                st, i = "b", i + 1
+            elif text.startswith("//", i):
+                st, i = "l", i + 1
+            else:
+                out.append(c)
+                if c in "\"'":
+                    st = c
+        elif st in "\"'":
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == st or c == "\n":
+                st = None
+        elif st == "b":
+            if text.startswith("*/", i):
+                st, i = None, i + 1
+            elif c == "\n":
+                out.append(c)
+        elif c == "\n":   # line comment
+            st = None
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+CODE_EXT = (".c", ".h", ".cpp", ".cc", ".hpp", ".S")   # files whose added lines are C/C++ (a README or Makefile line is not a consumer)
+
+
+def parse_patch(text, disp, findings):
+    """Walk a unified diff by its hunk counts (a `+++n` code line is not a file header). -> (adds, rems, bounds, nlines):
+    adds/rems = [(lineno, file, line text)] of code files, bounds = {lineno of every @@ line}. A malformed hunk is a PATCH-PARSE finding, never skipped."""
+    adds, rems, bounds, f, ol, nl = [], [], set(), None, 0, 0
+    lines = text.split("\n")
+    for i, l in enumerate(lines, 1):
+        code = f is not None and f.endswith(CODE_EXT)
+        if ol > 0 or nl > 0:
+            if l.startswith("@@ "):
+                findings.append("PATCH-PARSE %s:%d hunk ended before its counts (old %d, new %d lines missing): fix the hunk header" % (disp, i, ol, nl))
+                ol = nl = 0
+            else:
+                c = l[:1]
+                if c == "+":
+                    nl -= 1
+                    if code:
+                        adds.append((i, f, l[1:]))
+                elif c == "-":
+                    ol -= 1
+                    if code:
+                        rems.append((i, f, l[1:]))
+                elif c != "\\":
+                    ol, nl = ol - 1, nl - 1
+                continue
+        m = HUNK.match(l)
+        if m:
+            ol, nl = int(m.group(2) if m.group(2) is not None else 1), int(m.group(4) if m.group(4) is not None else 1)
+            bounds.add(i)
+        elif l.startswith("+++ "):
+            f = l[4:].split("\t")[0].strip()
+            f = None if f == "/dev/null" else f[2:] if f[:2] in ("a/", "b/") else f
+        elif l.startswith("+") and not l.startswith("+++"):
+            findings.append("PATCH-PARSE %s:%d `+` line outside any hunk (hunk counts too small?): the line would be invisible to the lint" % (disp, i))
+    return adds, rems, bounds, len(lines)
+
+
+def sources(root, findings):
+    """-> [(display path, comment-stripped text)] of the kernel-side code: shim/*.c|h|cpp except host tests, and the ADDED lines of xnu/patches/*.patch
+    in code files, read as one stack in numeric order: a line a later patch removes (same file, same text) no longer counts as present."""
+    res = []
+    for dp, dn, fn in os.walk(os.path.join(root, "shim")):
+        dn[:] = sorted(d for d in dn if d != "out" and not d.startswith("."))
+        for f in sorted(fn):
+            if f.endswith((".c", ".h", ".cpp")) and not TESTISH.search(f):
+                p = os.path.join(dp, f)
+                res.append((os.path.relpath(p, root), strip_c(open(p, encoding="utf-8", errors="replace").read())))
+    parsed, live, gone = [], {}, set()
+    for pi, p in enumerate(sorted(glob.glob(os.path.join(root, "xnu", "patches", "*.patch")))):
+        disp = os.path.relpath(p, root)
+        adds, rems, bounds, n = parse_patch(open(p, encoding="utf-8", errors="replace").read(), disp, findings)
+        for _, f, t in rems:                      # removals first: they apply to the tree the EARLIER patches built
+            if t.strip() and live.get((f, t.strip())):
+                gone.add(live[(f, t.strip())].pop())
+        for ln, f, t in adds:
+            if t.strip():
+                live.setdefault((f, t.strip()), []).append((pi, ln))
+        parsed.append((disp, adds, bounds, n))
+    for pi, (disp, adds, bounds, n) in enumerate(parsed):
+        lines = ["\x00" if i in bounds else "" for i in range(1, n + 1)]
+        for ln, _, t in adds:
+            if (pi, ln) not in gone:
+                lines[ln - 1] = t
+        res.append((disp, strip_c("\n".join(lines))))
+    pre, defs = [], {}
+    for disp, text in res:
+        t, d = preprocess(text)
+        pre.append((disp, merge_literals(t)))
+        defs.update(d)
+    return [(disp, LEX.sub(lambda m: defs.get(m.group(), m.group()) if m.group()[0] not in "\"'" else m.group(), t)) for disp, t in pre]
+
+
+def statements(text):
+    """(offset, statement) of a comment-free text, split on ; { } and hunk boundaries."""
+    for m in re.finditer(r"[^;{}\x00]+", text):
+        yield m.start(), m.group()
+
+
+def merge_literals(text):
+    """Adjacent string literals ("CL" "M ") become one literal; the newlines between them are kept after it (line numbers hold)."""
+    def one(m):
+        g = m.group()
+        if g[0] == "'":
+            return g
+        return '"' + "".join(x[1:-1] for x in STR.findall(g)) + '"' + "\n" * g.count("\n")
+    return STRRUN.sub(one, text)
+
+
+def preprocess(text):
+    """-> (text, defines): preprocessor lines blanked (continuations too, newlines kept), `#if 0` / `#else` of `#if 1` blocks blanked, and
+    {NAME: '"literal"'} for every object-like `#define NAME "literal"` outside dead code. A hunk boundary (\\x00) clears the #if state."""
+    out, defs, stack, lines, k = [], {}, [], text.split("\n"), 0
+    while k < len(lines):
+        l = lines[k]
+        if l == "\x00":
+            stack.clear()
+            out.append(l)
+            k += 1
+        elif l.lstrip().startswith("#"):
+            j = k
+            while lines[j].endswith("\\") and j + 1 < len(lines):
+                j += 1
+            d = " ".join(x.rstrip("\\") for x in lines[k:j + 1])
+            dead = any(x in ("dead", "inh") for x in stack)
+            m = re.match(r"#\s*(\w+)\s*(.*)", d)
+            name, rest = (m.group(1), m.group(2).strip()) if m else ("", "")
+            if name in ("if", "ifdef", "ifndef"):
+                stack.append("inh" if dead else "dead" if name == "if" and rest in ("0", "(0)") else "live1" if name == "if" and rest in ("1", "(1)") else "live")
+            elif name in ("else", "elif") and stack:
+                stack[-1] = {"dead": "dead" if name == "elif" and rest in ("0", "(0)") else "live", "live1": "dead"}.get(stack[-1], stack[-1])
+            elif name == "endif" and stack:
+                stack.pop()
+            elif name == "define" and not dead:
+                dm = re.match(r"([A-Za-z_]\w*)(?!\()\s+(.*)$", rest)
+                if dm and STR.fullmatch(merge_literals(dm.group(2).strip())):
+                    defs[dm.group(1)] = merge_literals(dm.group(2).strip())
+            out.extend([""] * (j - k + 1))
+            k = j + 1
+        else:
+            out.append("" if any(x in ("dead", "inh") for x in stack) else l)
+            k += 1
+    return "\n".join(out), defs
+
+
+def hexforms(tag):
+    if len(tag) != 4 or not tag.isascii():
+        return None
+    b = tag.encode("latin-1")
+    return re.compile(r"\b0x(?:%08x|%08x)[uUlL]*\b" % (int.from_bytes(b, "little"), int.from_bytes(b, "big")), re.I)
+
+
+def call_args(stmt, i):
+    """stmt[i] is the '(' of a call -> ([(argument text, offset)], offset after the closing ')'); an unclosed call runs to the end of the statement."""
+    depth, args, start = 1, [], i + 1
+    for m in TOKEN.finditer(stmt, i + 1):
+        t = m.group()
+        if t in "([":
+            depth += 1
+        elif t in ")]":
+            depth -= 1
+            if depth == 0:
+                args.append((stmt[start:m.start()], start))
+                return args, m.end()
+        elif t == "," and depth == 1:
+            args.append((stmt[start:m.start()], start))
+            start = m.end()
+    args.append((stmt[start:], start))
+    return args, len(stmt)
+
+
+def consumer_at(stmt, lit, hx):
+    """Offset of the tag in a statement that COMPARES or LOOKS UP the tag, else -1: the quoted literal is a whole argument of a compare/lookup call
+    (memcmp bcmp strcmp strncmp strcasecmp SecureDTGetProperty DTGetProperty getProperty), or the direct operand of == / !=, or (hex form) a `case` label.
+    A `(void)` statement or a bare compare call throws the result away: not a consumer."""
+    if stmt.lstrip().startswith("(void)"):
+        return -1
+    arg = re.compile(r"(?:\([^()]*\)\s*)?" + re.escape(lit))
+    for m in CALL.finditer(stmt):
+        args, end = call_args(stmt, m.end() - 1)
+        for a, off in args:
+            if arg.fullmatch(a.strip()):
+                if m.group(1) in PURE and stmt.lstrip().startswith(m.group(1)) and not stmt[end:].strip():
+                    continue
+                return off + a.index(lit)
+    cast = r"(?:\([^()]*\)\s*)?"
+    for form in ((re.escape(lit),) if lit else ()) + ((hx.pattern,) if hx else ()):
+        m = re.search(r"(?<![=!<>])(?:==|!=)\s*%s(?:%s)|(?:%s)\s*(?:==|!=)(?!=)" % (cast, form, form), stmt)
+        if m:
+            return m.start()
+    if hx:
+        m = re.search(r"\bcase\s+%s\s*:" % hx.pattern, stmt, re.I)
+        if m:
+            return m.start()
+    return -1
+
+
+def gap_at(stmt, need):
+    """Offset of a gap log naming the tag, else -1: a swl_gap/swl_miss/sweet_note_ignored call with the tag inside a STRING argument, or a string
+    literal holding `GAP:` and the tag."""
+    for m in GAPCALL.finditer(stmt):
+        for a, off in call_args(stmt, m.end() - 1)[0]:
+            for sm in STR.finditer(a):
+                if need.search(sm.group()):
+                    return off + sm.start()
+    for sm in STR.finditer(stmt):
+        if "GAP:" in sm.group() and need.search(sm.group()):
+            return sm.start()
+    return -1
+
+
+def find_users(tag, srcs):
+    """-> (first consumer 'file:line' or None, first gap log 'file:line' or None)."""
+    word = tag.strip()
+    # a 1-2 letter word ("FW") is too common in prose to name a tag: it must appear padded exactly as packed ("FW  ")
+    needtext = word if len(word) >= 3 else tag
+    need = re.compile(r"(?<![A-Za-z0-9_])%s%s" % (re.escape(needtext), r"(?![A-Za-z0-9_])" if (needtext[-1].isalnum() or needtext[-1] == "_") else ""))
+    lit, hx = '"' + tag + '"', hexforms(tag)
+    cons = gap = None
+    for disp, text in srcs:
+        for start, stmt in statements(text):
+            if cons is None:
+                k = consumer_at(stmt, lit, hx)
+                if k >= 0:
+                    cons = "%s:%d" % (disp, text.count("\n", 0, start + k) + 1)
+            if gap is None:
+                k = gap_at(stmt, need)
+                if k >= 0:
+                    gap = "%s:%d" % (disp, text.count("\n", 0, start + k) + 1)
+    return cons, gap
+
+
+def read_allow(root, findings):
+    allow, p = {}, os.path.join(root, ALLOW)
+    if not os.path.isfile(p):
+        findings.append("MISSING-ALLOWLIST %s (create it, even if empty)" % ALLOW)
+        return allow
+    for i, raw in enumerate(open(p, encoding="utf-8"), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split(None, 4)
+        if len(parts) < 2:
+            findings.append("ALLOW-MALFORMED %s:%d needs `packer tag hits=N sha=HEX8 reason`" % (ALLOW, i))
+            continue
+        key = (parts[0], parts[1])
+        pin = re.fullmatch(r"hits=(\d+)", parts[2]) if len(parts) > 2 else None
+        sha = re.fullmatch(r"sha=([0-9a-f]{8})", parts[3]) if len(parts) > 3 else None
+        if not pin or not sha:
+            findings.append("ALLOW-NO-PIN %s:%d `%s %s` needs `hits=N sha=HEX8` (literals in the packer holding the tag and the fingerprint of their lines, see --list) after the tag" % (ALLOW, i, *key))
+        if len(parts) < 5 or len(parts[4].strip()) < MIN_REASON:
+            findings.append("ALLOW-NO-REASON %s:%d `%s %s` needs a reason of >= %d chars" % (ALLOW, i, *key, MIN_REASON))
+        if key in allow:
+            findings.append("ALLOW-DUPLICATE %s:%d `%s %s`" % (ALLOW, i, *key))
+        allow[key] = (i, int(pin.group(1)) if pin else None, sha.group(1) if sha else None)
+    return allow
+
+
+def uncovered(root):
+    """tools/*.py (not tests, not registered) that pack a 4s/8s tag field with struct: no extractor, so they are named, not checked."""
+    reg = {r for r, _, _ in PACKERS}
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, "tools", "*.py"))):
+        rel = os.path.relpath(p, root)
+        if rel in reg or os.path.basename(p).startswith("test_"):
+            continue
+        try:
+            tree = ast.parse(open(p, encoding="utf-8").read())
+        except (SyntaxError, UnicodeDecodeError) as _err:
+            print(f"lint-consumed GAP: {rel} not scanned for struct tags ({type(_err).__name__}: {_err})", file=sys.stderr)
+            continue
+        if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "struct"
+               and n.func.attr in ("pack", "pack_into", "Struct")
+               and any(isinstance(a, ast.Constant) and isinstance(a.value, str) and TAGFMT.search(a.value) for a in n.args[:1])
+               for n in ast.walk(tree)):
+            out.append(rel)
+    return out
+
+
+def scan(root):
+    """-> (findings, notes, packers, tags, unconsumed, allowed, uncovered)."""
+    findings, notes = [], []
+    srcs = sources(root, findings)
+    allow, used = read_allow(root, findings), set()
+    ntags = nun = nok = 0
+    seen = {}
+    for rel, kind, arg in PACKERS:
+        for tag, line, hits, sha in packer_tags(root, rel, kind, arg, findings):
+            ntags += 1
+            name = tag.strip()
+            if (rel, name) in seen:
+                findings.append("AMBIGUOUS-TAG %s:%d `%s` is listed twice (padding differs only); the allowlist key is the stripped tag" % (rel, line, name))
+            seen[(rel, name)] = 1
+            cons, gap = find_users(tag, srcs)
+            key = (rel, name)
+            if cons or gap:
+                notes.append("CONSUMED %s %r by %s" % (rel, tag, cons or "gap log " + gap))
+                if key in allow:
+                    findings.append("ALLOW-STALE %s:%d `%s %s` is %s now (%s): remove the row" % (ALLOW, allow[key][0], rel, name, "consumed" if cons else "gap-logged", cons or gap))
+                    used.add(key)
+                continue
+            if key in allow:
+                used.add(key)
+                i, pinned, psha = allow[key]
+                if pinned is not None and pinned != hits:
+                    findings.append("%s %s:%d `%s %s` pins hits=%d but the packer now holds the tag in %d literals: a changed packing site needs a review, then fix the pin to `hits=%d sha=%s`" %
+                                    ("ALLOW-GREW" if hits > pinned else "ALLOW-SHRUNK", ALLOW, i, rel, name, pinned, hits, hits, sha))
+                elif psha is not None and psha != sha:
+                    findings.append("ALLOW-CHANGED %s:%d `%s %s` pins sha=%s but the packing lines of the tag now hash to sha=%s (same count, other text: an edited, moved-to-another-site or swapped packing line): "
+                                    "review the new lines, then fix the pin to `hits=%d sha=%s`" % (ALLOW, i, rel, name, psha, sha, hits, sha))
+                nok += 1
+                notes.append("ALLOWED %s %r (%s:%d)" % (rel, tag, ALLOW, i))
+                continue
+            nun += 1
+            findings.append("UNCONSUMED %s:%d tag %r is packed but no statement in shim/*.c|h|cpp or added xnu/patches/*.patch lines compares or looks it up, and no gap log names it: "
+                            "consume it (memcmp/switch/lookup on %s), or add a gap log naming it (swl_gap(\"area\", \"%s ...\", sev) / sweet_note_ignored), "
+                            "or add `%s %s hits=%d sha=%s <reason>` to %s" % (rel, line, tag, '"%s"' % tag, name, rel, name, hits, sha, ALLOW))
+    for (rel, name), (i, _, _) in sorted(allow.items(), key=lambda kv: kv[1][0]):
+        if (rel, name) not in used:
+            findings.append("ALLOW-UNKNOWN %s:%d `%s %s` matches no tag of a registered packer: remove or fix the row" % (ALLOW, i, rel, name))
+    findings = list(dict.fromkeys(findings))   # a file with two PACKERS rows reports a shared problem once
+    unc = uncovered(root)
+    for rel in unc:
+        notes.append("NOT COVERED %s packs a 4s/8s field with struct and has no extractor in tools/lint-consumed (wire/protocol or one-off record: check its consumer by hand or register it)" % rel)
+    return findings, notes, len({r for r, _, _ in PACKERS}), ntags, nun, nok, len(unc)
+
+
+def main(argv):
+    root, lst = os.path.dirname(HERE), False
+    a = argv[1:]
+    while a:
+        if a[0] == "--root" and len(a) > 1:
+            root, a = a[1], a[2:]
+        elif a[0] == "--list":
+            lst, a = True, a[1:]
+        else:
+            print("usage: tools/lint-consumed [--root DIR] [--list]\nRESULT: ERROR consumed usage")
+            return 2
+    if lst:
+        fnd = []
+        try:
+            for rel, kind, arg in PACKERS:
+                for tag, line, hits, sha in packer_tags(root, rel, kind, arg, fnd):
+                    print("%s:%d %r hits=%d sha=%s" % (rel, line, tag, hits, sha))
+        except OSError as e:
+            print("RESULT: ERROR consumed %s" % e)
+            return 2
+        print("\n".join(fnd))
+        return 1 if fnd else 0
+    try:
+        findings, notes, npk, ntags, nun, nok, nunc = scan(root)
+    except OSError as e:
+        print("RESULT: ERROR consumed %s" % e)
+        return 2
+    for n in notes:
+        print(n)
+    for f in findings:
+        print(f)
+    print("RESULT: %s consumed packers=%d tags=%d unconsumed=%d allowed=%d findings=%d notcovered=%d" % ("FAIL" if findings else "PASS", npk, ntags, nun, nok, len(findings), nunc))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

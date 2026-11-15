@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""replay: T1 oracle (docs/PHASE-PLANNING.md s.3): score a recorded sequence against the stock golden trace, on the host, no phone.
+
+Usage:
+  tools/replay wifi --golden CSV [--golden-doorbells TW4] --run DIR|LOG [--baseline DIR|LOG]
+                    [--from MARK[,ALT]] [--to MARK[,ALT]] [--align first|best] [--require-complete] [--mask ADDR,...]
+Design and the row mapping: super docs/research/T1-wifi-replay-design.md.
+
+wifi, golden mode: the run side is a Wi-Fi G2 log (RUN_DIR/usbnet.log, else merged.log, else *.log; or a file such as the
+  stdout of shim/wlan_g2_host_test). Two lanes are compared, each in order, with poll repeats collapsed:
+  cfg   config-space stores (`W<n>/F<n> cfg 0x84 := V`, `G2 store rc|ep command off 0x4 := V`) vs golden CSV `CW` rows (op, addr, val).
+  bar0  BAR0 register stores at offsets 0x140 (doorbell), 0x144 (hostready), 0xc30, 0xc34 vs the golden TW4 ftrace (--golden-doorbells;
+        callers dhdpcie_bus_ringbell_fast + ai_corereg, address & 0xfff), else the `va` rows of the CSV. Doorbell values 0xff00NNNN
+        (ring-0 WR) and 0xdd02NNNN (ring-2 RD) compare as class + index relative to the first of that class in each stream.
+  The golden lane starts at its first row (--align best: the start with the longest match) equal to the run's first row (the golden is a longer window); from there every run row must
+  equal the next golden row. A run that ends before the golden does passes (golden_remaining=N) unless --require-complete.
+  --from/--to MARK: golden rows inside those mark sections (CSV `mark` column, TW4 `MARK x` ... `MARK x done`), inclusive.
+  --baseline: regression mode, no golden needed: every parsed store of RUN is compared with BASELINE in order (kind, addr, val; --mask skips the val).
+  Stores with no golden counterpart (TCM `bp`, host-memory ring items, teardown `restore`) are counted per class on a `REPLAY GAP:` line (rule 8);
+  an unparsed `:=` store line is a `REPLAY GAP: UNPARSED` line and exit 2. gaps=N is the number of REPLAY GAP lines.
+  RESULT: PASS score=N first_divergence=none gaps=G           (exit 0)
+  RESULT: FAIL score=N first_divergence=<lane>:<golden seq|line>/<run line> gaps=G   (exit 1)
+  RESULT: PARTIAL ... / ERROR ...                             (exit 2: unparsed lines, no comparable rows, bad input)
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BELL_OFFS = (0x140, 0x144, 0xc30, 0xc34)
+BELL_CALLERS = ("dhdpcie_bus_ringbell_fast", "ai_corereg")
+HEXN = r"(?:0x[0-9a-fA-F]+|0)"
+RE_STORE = re.compile(r"SWEET WLAN: G2 store (?P<name>.+?) (?P<sp>off|bp|host) (?P<a>%s)(?: old %s)? := (?P<v>%s)" % (HEXN, HEXN, HEXN))
+RE_CFG = re.compile(r"SWEET WLAN: [WF]\d+ cfg (?P<a>%s) := (?P<v>%s)\b" % (HEXN, HEXN))
+RE_BPW = re.compile(r"SWEET WLAN: [WF]\d+ .*\bbp (?P<a>%s)\b.* := (?P<v>%s)" % (HEXN, HEXN))
+RE_RESTORE = re.compile(r"SWEET WLAN: restore space \d+ .* := ")
+
+
+def load_td():
+    ld = importlib.machinery.SourceFileLoader("trace_diff", os.path.join(HERE, "trace-diff"))
+    spec = importlib.util.spec_from_loader("trace_diff", ld)
+    m = importlib.util.module_from_spec(spec)
+    ld.exec_module(m)
+    return m
+
+
+def run_file(path):
+    if os.path.isdir(path):
+        for n in ("usbnet.log", "merged.log"):
+            p = os.path.join(path, n)
+            if os.path.isfile(p):
+                return p
+        import glob
+        g = sorted(glob.glob(os.path.join(path, "*.log")))
+        if not g:
+            raise ValueError("no log in %s" % path)
+        return g[0]
+    return path
+
+
+def bell_norm(off, val):
+    """(class, index) for a doorbell value, else None."""
+    if off == 0x140 and (val >> 16) in (0xff00, 0xdd02):
+        return val >> 16, val & 0xffff
+    return None
+
+
+def key(r, base):
+    b = bell_norm(r["off"], r["val"]) if r["lane"] == "bar0" else None
+    if b is not None:
+        return (r["lane"], r["off"], b[0], b[1] - base.get(b[0], b[1]))
+    return (r["lane"], r["off"], r["val"])
+
+
+def loose(r):
+    b = bell_norm(r["off"], r["val"]) if r["lane"] == "bar0" else None
+    return (r["lane"], r["off"], b[0]) if b is not None else (r["lane"], r["off"], r["val"])
+
+
+def collapse(rows):
+    out = []
+    for r in rows:
+        if out and (out[-1]["lane"], out[-1]["off"], out[-1]["val"]) == (r["lane"], r["off"], r["val"]):
+            continue
+        out.append(r)
+    return out
+
+
+def bases(rows):
+    b = {}
+    for r in rows:
+        n = bell_norm(r["off"], r["val"]) if r["lane"] == "bar0" else None
+        if n is not None and n[0] not in b:
+            b[n[0]] = n[1]
+    return b
+
+
+def show(r):
+    if r is None:
+        return "END"
+    return "%s %s 0x%x 0x%x [%s]" % ("W", r["lane"], r["off"], r["val"], r["src"])
+
+
+def compare(run, gold, align=True, require_complete=False, mask=(), best=False):
+    """Returns dict(matched, div=(gold_row|None, run_row|None)|None, aligned, remaining)."""
+    run, gold = collapse(run), collapse(gold)
+    if not (align and run):
+        return _cmp(run, gold, 0, require_complete, mask)
+    cands = [i for i, g in enumerate(gold) if loose(g) == loose(run[0])]
+    if not cands:
+        return {"matched": 0, "div": (None, run[0]), "aligned": None, "remaining": len(gold), "notfound": True}
+    if not best:
+        return _cmp(run, gold, cands[0], require_complete, mask)   # default: the first golden row equal to the run's first row
+    top = None
+    for c in cands:   # --align best: the candidate start with the longest match (earliest on a tie); can pick a spurious window, say so in the report
+        r = _cmp(run, gold, c, require_complete, mask)
+        if top is None or r["matched"] > top["matched"]:
+            top = r
+    return top
+
+
+def _cmp(run, gold, start, require_complete, mask):
+    gold = gold[start:]
+    gb, rb = bases(gold), bases(run)
+    m = 0
+    for i, r in enumerate(run):
+        if i >= len(gold):
+            return {"matched": m, "div": (None, r), "aligned": start, "remaining": 0}
+        g = gold[i]
+        if key(g, gb) != key(r, rb) and not (g["off"] in mask and g["lane"] == r["lane"] and g["off"] == r["off"]):
+            return {"matched": m, "div": (g, r), "aligned": start, "remaining": len(gold) - i}
+        m += 1
+    rem = len(gold) - len(run)
+    if require_complete and rem:
+        return {"matched": m, "div": (gold[len(run)], None), "aligned": start, "remaining": rem}
+    return {"matched": m, "div": None, "aligned": start, "remaining": rem}
+
+
+def extract_g2(path):
+    """G2 log -> (events, gap_classes{cls: count}, unparsed[(lineno,text)])."""
+    ev, gaps, unp = [], {}, []
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            if "SWEET WLAN:" not in line:
+                continue
+            line = line.rstrip("\n")
+            src = "run line %d" % n
+            m = RE_STORE.search(line)
+            if m:
+                a, v, sp, name = int(m.group("a"), 16), int(m.group("v"), 16), m.group("sp"), m.group("name")
+                if sp == "off" and a == 4 and name in ("rc command", "ep command"):
+                    ev.append({"lane": "cfg", "off": a, "val": v, "src": src, "name": name})
+                elif sp == "off" and a in BELL_OFFS:
+                    ev.append({"lane": "bar0", "off": a, "val": v, "src": src, "name": name})
+                elif sp == "off":
+                    gaps["bar0-offset-not-in-golden-filter"] = gaps.get("bar0-offset-not-in-golden-filter", 0) + 1
+                    ev.append({"lane": None, "cls": "bar0-other", "off": a, "val": v, "src": src, "name": name})
+                else:
+                    cls = "tcm-bp" if sp == "bp" else "host-ring-payload"
+                    gaps[cls] = gaps.get(cls, 0) + 1
+                    ev.append({"lane": None, "cls": cls, "off": a, "val": v, "src": src, "name": name})
+                continue
+            if "G2 store " in line:
+                unp.append((n, line))
+                continue
+            m = RE_CFG.search(line)
+            if m:
+                ev.append({"lane": "cfg", "off": int(m.group("a"), 16), "val": int(m.group("v"), 16), "src": src, "name": "cfg"})
+                continue
+            m = RE_BPW.search(line)
+            if m:
+                gaps["tcm-bp"] = gaps.get("tcm-bp", 0) + 1
+                ev.append({"lane": None, "cls": "tcm-bp", "off": int(m.group("a"), 16), "val": int(m.group("v"), 16), "src": src, "name": "bp"})
+                continue
+            if "G2 undo ok" in line:   # prose status line that quotes `cfg 0x84 := 0`; the store itself is logged by the W17 line
+                continue
+            if RE_RESTORE.search(line):
+                gaps["restore-teardown"] = gaps.get("restore-teardown", 0) + 1
+                continue
+            if " := " in line:
+                unp.append((n, line))
+    return ev, gaps, unp
+
+
+def pick(spec, marks, what):
+    """--from/--to take comma-separated alternatives (the CSV and the TW4 trace name their marks differently): first one present."""
+    if not spec:
+        return None
+    alts = spec.split(",")
+    for x in alts:
+        if x in marks:
+            return x
+    NOTES.append("REPLAY NOTE: --from/--to %s: none of %s is a mark of %s (have %s); that source is not window-filtered" % (spec, alts, what, ",".join(m for m in marks if m)))
+    return None
+
+
+NOTES = []
+
+
+def sections(marks, a, b, what="golden"):
+    """marks: ordered unique names; returns the set between a and b inclusive (a/b may be comma alternatives)."""
+    a, b = pick(a, marks, what), pick(b, marks, what)
+    ia = marks.index(a) if a else 0
+    ib = marks.index(b) if b else len(marks) - 1
+    if ia > ib:
+        raise ValueError("--from after --to")
+    return set(marks[ia:ib + 1])
+
+
+def golden_cfg(td, csv, a, b):
+    block, rows = td.load_csv(csv)
+    marks = []
+    for r in rows:
+        if r["mark"] not in marks:
+            marks.append(r["mark"])
+    ok = sections(marks, a, b, csv)
+    cfg, va = [], []
+    for r in rows:
+        if r["mark"] not in ok:
+            continue
+        if r["op"] == "CW":
+            cfg.append({"lane": "cfg", "off": r["addr"], "val": r["val"], "src": "golden seq %d" % r["seq"]})
+    return cfg, rows
+
+
+def golden_bar0_csv_file(csv, a, b):
+    out, marks = [], []
+    rows = []
+    with open(csv) as f:
+        for line in f:
+            if line.startswith("#") or line.startswith("seq,"):
+                continue
+            p = line.rstrip("\n").split(",")
+            if len(p) != 11:
+                raise ValueError("bad CSV row: %s" % line)
+            rows.append(p)
+            if p[3] not in marks:
+                marks.append(p[3])
+    ok = sections(marks, a, b, csv)
+    for p in rows:
+        if p[3] in ok and p[5] == "W" and p[7] == "va" and p[4] in BELL_CALLERS and p[10]:
+            off = int(p[9], 16) & 0xfff
+            if off in BELL_OFFS:
+                out.append({"lane": "bar0", "off": off, "val": int(p[10], 16), "src": "golden seq %s" % p[0]})
+    return out
+
+
+def golden_bar0_tw4(td, path, a, b):
+    rows, marks, cur = [], [], None
+    for n, line in enumerate(open(path, errors="replace"), 1):
+        if "tracing_mark_write:" in line:
+            m = re.search(r"MARK (\S+)( done)?\s*$", line)
+            if m:
+                if m.group(1) not in marks:
+                    marks.append(m.group(1))
+                cur = None if m.group(2) else m.group(1)
+            continue
+        if "rwmmio_write:" not in line or not any(c in line for c in BELL_CALLERS):
+            continue
+        m = td.RE_LINE.match(line)
+        if not m or m.group(5) != "rwmmio_write":
+            continue
+        w = td.RE_RW.match(m.group(6))
+        if not w or w.group(1) not in BELL_CALLERS:
+            continue
+        off = int(w.group(4), 16) & 0xfff
+        if off in BELL_OFFS:
+            rows.append((cur, {"lane": "bar0", "off": off, "val": int(w.group(3), 16), "src": "golden TW4:%d" % n}))
+    ok = sections(marks, a, b, path)
+    return [r for mk, r in rows if mk in ok]
+
+
+def report_lane(name, res, out):
+    d = res["div"]
+    if d is None:
+        out.append("LANE %s: MATCH matched=%d aligned_at=%s golden_remaining=%d" % (name, res["matched"], res["aligned"], res["remaining"]))
+        return None
+    g, r = d
+    out.append("LANE %s: FIRST DIVERGENCE after matched=%d aligned_at=%s: golden %s | run %s" % (name, res["matched"], res["aligned"], show(g), show(r)))
+    return "%s:%s/%s" % (name, g["src"].split(" ", 1)[-1].replace(" ", "") if g else "END", r["src"].split(" ", 1)[-1].replace(" ", "") if r else "END")
+
+
+def cmd_wifi(a):
+    out, gapn = [], 0
+    ev, gaps, unp = extract_g2(run_file(a.run))
+    for cls, n in sorted(gaps.items()):
+        out.append("REPLAY GAP: %d stores of class %s have no golden counterpart (not compared)" % (n, cls))
+        gapn += 1
+    for n, line in unp:
+        out.append("REPLAY GAP: UNPARSED store line %d: %s" % (n, line[:160]))
+        gapn += 1
+    mask = tuple(int(x, 16) for x in a.mask.split(",")) if a.mask else ()
+    score, first, lanes = 0, None, 0
+    if a.baseline:
+        bev, bgaps, bunp = extract_g2(run_file(a.baseline))
+        for n, line in bunp:
+            out.append("REPLAY GAP: UNPARSED baseline store line %d: %s" % (n, line[:160]))
+            gapn += 1
+        def rowsof(e):   # the "b:" lane prefix keeps doorbells un-normalised: two runs compare raw
+            return [{"lane": "b:" + (x["lane"] or x["cls"]), "off": x["off"], "val": x["val"], "src": x["src"], "name": x["name"]} for x in e]
+        res = compare(rowsof(ev), rowsof(bev), align=False, require_complete=a.require_complete, mask=mask)
+        score += res["matched"]
+        first = report_lane("baseline", res, out)
+        lanes = 1
+        unp = unp + bunp
+    else:
+        td = load_td()
+        cfg_run = [e for e in ev if e["lane"] == "cfg"]
+        bar_run = [e for e in ev if e["lane"] == "bar0"]
+        gcfg, _ = golden_cfg(td, a.golden, a.from_, a.to)
+        lanes_in = [("cfg", cfg_run, gcfg)]
+        if a.golden_doorbells:
+            gbar = golden_bar0_tw4(td, a.golden_doorbells, a.from_, a.to)
+        else:
+            gbar = golden_bar0_csv_file(a.golden, a.from_, a.to)
+            if not gbar:
+                out.append("REPLAY GAP: no bar0/doorbell golden rows (CSV has no va rows, no --golden-doorbells): bar0 lane not compared")
+                gapn += 1
+        lanes_in.append(("bar0", bar_run, gbar))
+        for name, run, gold in lanes_in:
+            if not run or not gold:
+                out.append("LANE %s: not compared (run rows %d, golden rows %d)" % (name, len(run), len(gold)))
+                continue
+            lanes += 1
+            res = compare(run, gold, require_complete=a.require_complete, mask=mask, best=a.align == "best")
+            score += res["matched"]
+            f = report_lane(name, res, out)
+            first = first or f
+    out.extend(NOTES)
+    out.append("REPLAY NOTE: ring item payloads (ioctl/event bytes) live in host memory and are not in the golden trace; only MMIO/doorbell order is compared")
+    for l in out:
+        print(l)
+    if unp:
+        print("RESULT: PARTIAL score=%d first_divergence=%s gaps=%d unparsed=%d" % (score, first or "none", gapn, len(unp)))
+        return 2
+    if lanes == 0:
+        print("RESULT: PARTIAL score=0 first_divergence=none gaps=%d (no comparable rows)" % gapn)
+        return 2
+    if first:
+        print("RESULT: FAIL score=%d first_divergence=%s gaps=%d" % (score, first, gapn))
+        return 1
+    print("RESULT: PASS score=%d first_divergence=none gaps=%d" % (score, gapn))
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="replay", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    w = sub.add_parser("wifi")
+    w.add_argument("--golden")
+    w.add_argument("--golden-doorbells")
+    w.add_argument("--run", required=True)
+    w.add_argument("--baseline")
+    w.add_argument("--from", dest="from_")
+    w.add_argument("--to")
+    w.add_argument("--mask")
+    w.add_argument("--align", choices=("first", "best"), default="first")
+    w.add_argument("--require-complete", action="store_true")
+    try:
+        a = p.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code else 0
+    if a.cmd != "wifi":
+        print("RESULT: ERROR usage: tools/replay wifi ...")
+        return 2
+    if not a.baseline and not a.golden:
+        print("RESULT: ERROR --golden CSV is required without --baseline")
+        return 2
+    try:
+        return cmd_wifi(a)
+    except (OSError, ValueError) as e:
+        print("RESULT: ERROR %s" % e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

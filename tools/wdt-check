@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""wdt-check: host-side replay and lint for the PR-4 watchdog block (docs/specs/SPEC-WDT.md, ticket T-5d2f). Subcommands fixed by the spec (Strategy line):
+  arith PERIOD_S            print prescale/count/WTCON/real period/pet threshold for a period; fails outside the hardware range (count > 0xFFFF, prescale > 0xFF, period not 10..60).
+                            Golden: `arith 30` must give the values Android wrote on this phone (oracle R07): prescale 0x57, count 0xFFAF, WTCON 0x00015739.
+  log MERGED_LOG [--expect-stop]   check the Section 6 phone line set is present, in the Section 3 order, count the `WDT GAP:` lines, compute the WDT tick rate from the
+                            first pet line (U7), fail a log that has `parsed` but no `armed` (prints the host-side GAP), fail a pet line after the stop line.
+  matrix SPEC               re-run the Section 7 row count AND require every GAP cell of a not-implemented row to match a Section 6 key (phone-printed, host-side or documented);
+                            `..`, `<...>` and `N` in a key or cell are wildcards.
+Output ends in a `RESULT: PASS|FAIL <what> ...` line; exit 0 PASS, 1 FAIL, 2 usage. Pure python, no dependency, reads only the files it is given."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import re
+import sys
+
+TICKS_PER_S = 192000
+PERIOD_MIN, PERIOD_MAX = 10, 60
+WTCON_FLAGS = (1 << 16) | (3 << 3) | (1 << 5) | 1      # DBGACK | DIV128 | ENABLE | RSTEN, INTEN clear (spec D1, oracle R09)
+
+
+def period_calc(period_s):
+    """spec D1 / oracle R06: (prescale, count, wtcon) or None when out of range."""
+    if not isinstance(period_s, int) or period_s < PERIOD_MIN or period_s > PERIOD_MAX:
+        return None
+    ticks = period_s * TICKS_PER_S
+    div = -(-ticks // 0xFFFF)
+    if div < 1 or div > 0x100:
+        return None
+    count = -(-ticks // div)
+    if count > 0xFFFF:
+        return None
+    prescale = div - 1
+    return prescale, count, (prescale << 8) | WTCON_FLAGS
+
+
+def cmd_arith(argv):
+    if len(argv) != 1 or not argv[0].isdigit():
+        print("usage: wdt-check arith PERIOD_S", file=sys.stderr)
+        return 2
+    p = int(argv[0])
+    r = period_calc(p)
+    if r is None:
+        print("RESULT: FAIL arith period=%d outside %d..%d s or counter above 0xFFFF" % (p, PERIOD_MIN, PERIOD_MAX))
+        return 1
+    prescale, count, wtcon = r
+    real = count * (prescale + 1) / TICKS_PER_S
+    print("period=%d prescale=0x%02X count=0x%04X wtcon=0x%08X real_s=%.4f threshold_ms=%d" % (p, prescale, count, wtcon, real, p * 1000 // 3))
+    if p == 30 and (prescale, count, wtcon) != (0x57, 0xFFAF, 0x00015739):
+        print("RESULT: FAIL arith 30 differs from the Android trace values (oracle R07)")
+        return 1
+    print("RESULT: PASS arith period=%d" % p)
+    return 0
+
+
+LINE_RX = [
+    ("parsed", re.compile(r"SWEET WDT: sweetwdt=(\d+) stop=(\d+) parsed, arm (?:waits for the first USB-log poll|follows the first poll of the timer \(no USB needed\) or of the USB-log drain loop)")),
+    ("inherited", re.compile(r"SWEET WDT: inherited wtcon=0x\w+ wtdat=0x\w+ wtcnt=0x\w+ wtcnt10=0x\w+ wtmincnt=0x\w+ pmu1244=0x\w+ pmu1220=0x\w+ rst_stat=0x\w+ sysip=0x\w+")),
+    ("cluster1", re.compile(r"SWEET WDT: cluster 1 left stopped by the shim \(D5\)")),
+    ("first_poll", re.compile(r"SWEET WDT: first poll at \+(\d+) ms after parse")),
+    ("armed", re.compile(r"SWEET WDT: armed period=(\d+) threshold_ms=(\d+) wtcon=0x(\w+) count=0x(\w+) readback_wtcon=0x(\w+)")),
+    ("sysip", re.compile(r"SWEET WDT: SYSIP_DAT0 0x(\w+) -> 0x(\w+)")),
+    ("pet1", re.compile(r"SWEET WDT: pet n=1 max_gap_ms=(\d+) wtcnt=0x(\w+) wtcnt_before=0x(\w+) ms_since_arm=(\d+)")),
+    ("stopped", re.compile(r"SWEET WDT: test: petting stopped at \+(\d+) s, reset expected within (\d+) s")),
+]
+PET_RX = re.compile(r"SWEET WDT: pet n=(\d+) ")
+GAP_RX = re.compile(r"^(?:\[[^\]]*\]\s*)*(WDT GAP: .+)")
+NOT_ARMED = "SWEET WDT: soc watchdog not armed (no sweetwdt)"
+
+
+def cmd_log(argv):
+    expect_stop = "--expect-stop" in argv
+    argv = [a for a in argv if a != "--expect-stop"]
+    if len(argv) != 1:
+        print("usage: wdt-check log MERGED_LOG [--expect-stop]", file=sys.stderr)
+        return 2
+    with open(argv[0], errors="replace") as f:
+        lines = f.read().splitlines()
+    seen, pos, gaps, fails = {}, {}, [], []
+    last_pet_idx, stop_idx = None, None
+    for i, ln in enumerate(lines):
+        for name, rx in LINE_RX:
+            m = rx.search(ln)
+            if m and name not in seen:
+                seen[name], pos[name] = m, i
+            elif m and name == "stopped":
+                stop_idx = i
+        if "petting stopped" in ln and stop_idx is None:
+            stop_idx = i
+        if PET_RX.search(ln):
+            last_pet_idx = i
+        g = GAP_RX.match(ln)
+        if g:
+            gaps.append(g.group(1))
+    if any(NOT_ARMED in ln for ln in lines) and "parsed" not in seen:
+        print("WDT: default-off boot (no sweetwdt): nothing to check")
+        print("RESULT: PASS wdt-log default-off gaps=%d" % len(gaps))
+        return 0
+    if "parsed" in seen and "armed" not in seen:
+        gap = "WDT GAP: parsed but never armed (no pet vehicle?)"      # host-side key, section 6 (not counted by xrun_report)
+        print(gap)
+        fails.append(gap)
+    order = [n for n, _ in LINE_RX if n in pos]
+    prev = -1
+    for n in order:
+        if pos[n] < prev:
+            fails.append("line %s out of the Section 3 order" % n)
+        prev = max(prev, pos[n])
+    for need in ("parsed", "inherited", "cluster1", "first_poll"):
+        if need not in seen and "parsed" in seen:
+            fails.append("missing line: %s" % need)
+    if "armed" in seen:
+        for need in ("sysip", "pet1"):
+            if need not in seen:
+                fails.append("missing line after armed: %s" % need)
+        per, thr, wtcon, count, rb = seen["armed"].groups()
+        if int(rb, 16) & 0x1FF3D != int(wtcon, 16) & 0x1FF3D:   # review pr4-wdt F2: the value written, not only ENABLE+RSTEN
+            fails.append("armed readback 0x%s differs from the written wtcon 0x%s (mask 0x1FF3D)" % (rb, wtcon))
+    if "sysip" in seen and int(seen["sysip"].group(2), 16) != 0xFC:
+        fails.append("SYSIP_DAT0 not 0xFC after the write: 0x%s" % seen["sysip"].group(2))
+    if "pet1" in seen and "armed" in seen:
+        count = int(seen["armed"].group(4), 16)
+        before = int(seen["pet1"].group(3), 16)
+        ms = int(seen["pet1"].group(4))
+        prescale = int(seen["armed"].group(3), 16) >> 8 & 0xFF
+        nominal = TICKS_PER_S / (prescale + 1)
+        if ms > 0:
+            rate = abs(count - before) * 1000.0 / ms          # no assumption on the counting direction (U7)
+            print("WDT: tick rate %.1f/s from the first pet (nominal %.1f/s, window 0.5x..2x), counter %#x -> %#x in %d ms" % (rate, nominal, count, before, ms))
+            if not (0.5 * nominal <= rate <= 2.0 * nominal):
+                fails.append("tick rate %.1f/s outside 0.5x..2x of %.1f/s" % (rate, nominal))
+    if stop_idx is not None and last_pet_idx is not None and last_pet_idx > stop_idx:
+        fails.append("a pet line after the 'petting stopped' line")
+    if expect_stop and stop_idx is None:
+        fails.append("no 'petting stopped' line (stop test expected)")
+    for g in gaps:
+        print(g)
+    for fl in fails:
+        print("FAIL: " + fl)
+    print("RESULT: %s wdt-log lines=%d gaps=%d%s" % ("FAIL" if fails else "PASS", len(order), len(gaps), "".join(" cause=" + x.replace(" ", "_") for x in fails[:1])))
+    return 1 if fails else 0
+
+
+def wild(s):
+    """key/cell text -> regex: `..`, `...`, `<...>` and a bare N are wildcards."""
+    out, i = "", 0
+    tok = re.compile(r"<[^>]*>|\.{2,}|\bN\b")
+    for m in tok.finditer(s):
+        out += re.escape(s[i:m.start()]) + ".*"
+        i = m.end()
+    return out + re.escape(s[i:])
+
+
+def cmd_matrix(argv):
+    if len(argv) != 1:
+        print("usage: wdt-check matrix SPEC", file=sys.stderr)
+        return 2
+    text = open(argv[0], errors="replace").read()
+    m6 = re.search(r"^## 6\..*?(?=^## 7\.)", text, re.S | re.M)
+    if not m6:
+        print("RESULT: FAIL wdt-matrix no Section 6")
+        return 1
+    keys = re.findall(r"`(WDT GAP: [^`]+)`", m6.group(0))
+    rows = []
+    for ln in text.splitlines():
+        if re.match(r"^\| M\d\d \|", ln):
+            c = [x.strip() for x in ln.strip().strip("|").split("|")]
+            rows.append(c)
+    counts = {"implemented": 0, "partial": 0, "missing": 0}
+    bad = []
+    for c in rows:
+        rid, status, gapcell = c[0], c[3].replace(" ", ""), c[5]
+        if status not in counts:
+            bad.append("%s: status %r" % (rid, status))
+            continue
+        counts[status] += 1
+        if status == "implemented":
+            continue
+        if rid in ("M13", "M14", "M15", "M16"):
+            keys.append(gapcell)                      # documented texts: the cell is its own key (Section 6, last paragraph)
+        cell = re.sub(r"\s*\((?:map failure|implemented)[^)]*\)\s*$", "", gapcell)
+        if not cell.startswith("WDT GAP:"):
+            bad.append("%s: GAP cell does not start with 'WDT GAP:': %r" % (rid, gapcell))
+            continue
+        if not any(re.fullmatch(wild(k), cell) or re.fullmatch(wild(cell), k) for k in keys):
+            bad.append("%s: GAP cell matches no Section 6 key: %r" % (rid, cell))
+    total = len(rows)
+    ok = not bad and total > 0 and sum(counts.values()) == total
+    for b in bad:
+        print("UNMATCHED " + b)
+    print("RESULT: %s wdt-matrix rows=%d implemented=%d partial=%d missing=%d keys=%d unmatched=%d" % ("PASS" if ok else "FAIL", total, counts["implemented"], counts["partial"], counts["missing"], len(keys), len(bad)))
+    return 0 if ok else 1
+
+
+def main(argv):
+    cmds = {"arith": cmd_arith, "log": cmd_log, "matrix": cmd_matrix}
+    if len(argv) < 2 or argv[1] not in cmds:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return cmds[argv[1]](argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

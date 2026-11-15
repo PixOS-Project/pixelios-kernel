@@ -1,10 +1,12 @@
 #!/bin/sh
-# Fetch AOSP boot tools, pinned to commits and verified by sha256 (fail closed).
+# Refresh/verify the vendored (tracked) AOSP boot tools in tools/third_party, pinned to commits and verified by sha256 (fail closed).
 # Pins resolved 2026-10-25 from refs/heads/main via the googlesource JSON log:
 #   platform/system/tools/mkbootimg d2bb0af5ba6d3198a3e99529c97eda1be0b5a093 (2025-03-02)
 #   platform/external/avb           761178607206f4cb2af79ed9eec52d8cbd814adb (2025-03-13)
 # Licences (file headers): mkbootimg.py, generate_gki_certificate.py = Apache-2.0;
 # avbtool.py = MIT-style permission notice (Copyright 2016 The Android Open Source Project).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 set -eu
 root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 dest="$root/tools/third_party"

@@ -1,0 +1,180 @@
+sweet-mali-smbind (lowclk 2026-11-15, research 164 part B1 levers 2 and 3): boot-arg sweetsmbind=<mask> for the Mali completion thread sm_thread (bsd/dev/sweet_mali.c). CODE ONLY: no register access, no new hardware write, no new firmware command, no new bus store (the existing JOB interrupt routing, GICD_IROUTER = boot CPU at pexpert/arm/pe_fiq.c:336, is not touched), so there is nothing new for AGENTS rule 8 to review; the only scheduler calls are the ones this file already uses (thread_bind + thread_block in mem_probe_cpu, kernel_thread_start).
+sweetsmbind absent or 0: behavior byte-identical to patch 0364 (kernel_thread_start as before, never bound; only never-taken branches added).
+Bit 0 (1): bind sm_thread to the cpu that takes SPI 452 = master_cpu = ml_get_boot_cpu_number() (every sweet SPI is routed to affinity 0.0.0.0 = the boot CPU, pe_fiq.c:336 + :234 [obs SWEET CPU: cpu=0 mpidr=0x0]; arm_init.c:435; not hardcoded). Prints `SWEET MALI: sm_thread bound to cpu N (sweetsmbind=V)`; a missing processor or a failed bind is a SWEET MALI GAP line and the thread stays unbound.
+Bit 1 (2): create sm_thread at priority 93 = BASEPRI_PREEMPT_HIGH instead of 81 (kernel_thread_start passes -1 = BASEPRI_KERNEL, thread.c:1960; bands in osfmk/kern/sched.h: BASEPRI_KERNEL 81, BASEPRI_PREEMPT 92, BASEPRI_PREEMPT_HIGH 93, MAXPRI_KERNEL 95, BASEPRI_REALTIME 96). Priorities of the other threads that must keep running: USB log drain thread ud_log_thread 81 (kernel_thread_start), sweet_wdt pet = thread_call KERNEL_HIGH group 92 (thread_call.c), the stall detector is a timer_call (interrupt context, not a thread), thread_call HIGH group 93, thread_call daemon 94. sm_thread runs about 3.5 % of one core [obs K17 CPUTOP] and blocks between jobs, so it is not expected to starve them [guess, not measured]. Prints `SWEET MALI: sm_thread priority 81 -> 93 (sweetsmbind=V ...)` (old value is read from source, not measured).
+Other bits: GAP line, ignored.
+Log only, needs sweetcomplat=1 (the ISR stamp of patch 0364): once per second `SWEET PERF: complat_wake wake_same N wake_other M isr_cpu C bound_cpu B sweetsmbind V`: per consumed JOB-interrupt stamp, the cpu sm_isr ran on (written before the stamp with a release fence) against cpu_number() in sm_thread after lck_mtx_sleep_deadline returned. Printed on its own row, so the 0364 complat row is unchanged.
+Host test: tools/test_sweet_smbind365.py compiles the pure block between SMBIND-PURE-BEGIN/END and checks every hook with mutants. Not run on hardware. The new write path (none) is unreviewed; the thread-priority and bind change is a scheduling change a reviewer may still want to look at.
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -410,6 +410,69 @@ static int cl_on, cl_armed;
+ static uint64_t cl_isr_t0, cl_start_t0, cl_done_n, cl_last_us;
+ static struct cl_state cl_st;
+ 
++/*
++ * Patch 0365 (lowclk 2026-11-15, code only: no register access, no new hardware write; research 164 part B1 levers 2 and 3): boot-arg sweetsmbind=<mask> for sm_thread.
++ *   absent / 0 = off, behavior byte-identical to patch 0364 (the thread is still made by kernel_thread_start, never bound; the only additions are never-taken branches).
++ *   bit 0 (1): bind sm_thread to the cpu that takes the GPU JOB SPI. Every sweet SPI is routed to GICD_IROUTER affinity 0.0.0.0 = the boot CPU (pexpert/arm/pe_fiq.c:336, comment :234
++ *              [obs SWEET CPU: cpu=0 mpidr=0x0]); the boot CPU number is master_cpu = ml_get_boot_cpu_number() (osfmk/arm/arm_init.c:435, osfmk/kern/cpu_number.h:62), so the
++ *              target is master_cpu, not a hardcoded 0. Binding as in mem_probe_cpu below: thread_bind(cpu_to_processor(n)) + thread_block (osfmk/kern/sched_prim.c:1834).
++ *   bit 1 (2): create sm_thread at priority 93 = BASEPRI_PREEMPT_HIGH (osfmk/kern/sched.h: BASEPRI_KERNEL 81, BASEPRI_PREEMPT 92, BASEPRI_PREEMPT_HIGH 93, MAXPRI_KERNEL 95,
++ *              BASEPRI_REALTIME 96). The default kernel_thread_start passes -1 = the kernel task priority 81 (osfmk/kern/thread.c:1960). 93 is the lowest value that preempts the
++ *              92 panel-copy thread call (thread_call.c group KERNEL_HIGH, tcg_thread_pri BASEPRI_PREEMPT, also the sweet_wdt pet) and is not above the thread_call HIGH group (93) nor the
++ *              thread_call daemon (94); the USB log drain thread (sweet_usb.c ud_log_thread, kernel_thread_start = 81) and the stall timer_call (interrupt context, not a thread)
++ *              are not starved because sm_thread runs ~3.5 % of one core [obs K17 CPUTOP] and blocks in lck_mtx_sleep_deadline between jobs.
++ *   other bits: GAP line, ignored.
++ * Log only (needs sweetcomplat=1, the ISR stamp): once per second `SWEET PERF: complat_wake wake_same N wake_other M ...`: per consumed JOB-interrupt stamp, whether the cpu
++ * that ran sm_isr (smb_isr_cpu) equals the cpu sm_thread woke on (cpu_number() after lck_mtx_sleep_deadline returned).
++ */
++/* SMBIND-PURE-BEGIN (host test tools/test_sweet_smbind365.py compiles this block) */
++#define SMB_BIND 1u
++#define SMB_PRIO 2u
++#define SMB_PRI_RAISED 93
++#define SMB_PRI_DEFAULT 81
++static uint32_t
++smb_known(uint32_t v)
++{
++	return v & (SMB_BIND | SMB_PRIO);
++}
++static uint32_t
++smb_unknown(uint32_t v)
++{
++	return v & ~(SMB_BIND | SMB_PRIO);
++}
++/* the priority sm_thread is created with: 0 = use kernel_thread_start (default priority, byte-identical to patch 0364) */
++static int
++smb_priority(uint32_t v)
++{
++	return (v & SMB_PRIO) ? SMB_PRI_RAISED : 0;
++}
++/* the cpu to bind to, or -1 = do not bind; boot_cpu = master_cpu */
++static int
++smb_bind_cpu(uint32_t v, int boot_cpu)
++{
++	return (v & SMB_BIND) ? boot_cpu : -1;
++}
++struct smb_wake {
++	uint64_t same, other;
++};
++static void
++smb_wake_account(struct smb_wake *w, int isr_cpu, int thread_cpu)
++{
++	if (isr_cpu == thread_cpu) {
++		w->same++;
++	} else {
++		w->other++;
++	}
++}
++/* SMBIND-PURE-END */
++
++static uint32_t smb_mask;      /* sweetsmbind after the unknown bits were cut; set once in sm_bringup before sm_thread exists */
++static int smb_bound_cpu = -1; /* set by sm_thread after the bind took effect (log only) */
++static uint32_t smb_isr_cpu;   /* cpu of the sm_isr that left the pending stamp: written by the ISR before the stamp, read by sm_thread after it took the stamp */
++static struct smb_wake smb_w;  /* under sm_lock */
++static uint64_t smb_last_us;
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);   /* osfmk/kern/thread.h:1073; bsd/ does not see it */
++
+ static uint64_t
+ cl_ns(uint64_t abs)
+ {
+@@ -454,6 +517,27 @@ cl_tick(void)
+ 	}
+ }
+ 
++/* sm_thread, lock NOT held: once per second print and reset the wake counters (patch 0365, log only) */
++static void
++smb_tick(void)
++{
++	if (!cl_on) {
++		return;
++	}
++	uint64_t now = now_us();
++	if (now - smb_last_us < 1000000) {
++		return;
++	}
++	smb_last_us = now;
++	lck_mtx_lock(&sm_lock);
++	struct smb_wake w = smb_w;
++	smb_w.same = smb_w.other = 0;
++	lck_mtx_unlock(&sm_lock);
++	if (w.same || w.other) {
++		printf("SWEET PERF: complat_wake wake_same %llu wake_other %llu isr_cpu %u bound_cpu %d sweetsmbind %u\n", w.same, w.other, os_atomic_load(&smb_isr_cpu, relaxed), smb_bound_cpu, smb_mask);
++	}
++}
++
+ static void
+ perf_job_done_at(uint64_t start_us, uint64_t seq, unsigned slot)
+ {
+@@ -1107,6 +1191,10 @@ sm_isr(void *arg, uint32_t intid __unused)
+ 			return 0;
+ 		}
+ 		if (cl_on) {   /* patch 0364: stamp of the first non-spurious JOB interrupt since sm_thread consumed it (t_isr taken at entry); no lock, no printf */
++			if (os_atomic_load(&cl_isr_t0, relaxed) == 0) {   /* patch 0365, log only: the cpu goes in before the stamp, so a consumer that sees the stamp sees this cpu */
++				os_atomic_store(&smb_isr_cpu, (uint32_t)cpu_number(), relaxed);
++				os_atomic_thread_fence(release);
++			}
+ 			(void)os_atomic_cmpxchg(&cl_isr_t0, 0, t_in, relaxed);
+ 		}
+ 		sm.g[R_JOB_MASK / 4] = 0;
+@@ -1217,6 +1305,22 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 			printf("SWEET MALI GAP: sweetcomplat=%u is not 0 or 1, ignored, the completion latency log stays off\n", pv);
+ 		}
+ 	}
++	if (smb_bind_cpu(smb_mask, master_cpu) >= 0) {   /* patch 0365, bit 0: bind to the cpu that takes SPI 452 (the boot CPU, see the block comment) */
++		int bc = smb_bind_cpu(smb_mask, master_cpu);
++		processor_t bpr = cpu_to_processor(bc);
++		if (bpr == PROCESSOR_NULL) {
++			printf("SWEET MALI GAP: sweetsmbind=%u: cpu %d has no processor, sm_thread stays unbound\n", smb_mask, bc);
++		} else {
++			(void)thread_bind(bpr);
++			thread_block(THREAD_CONTINUE_NULL);
++			if (cpu_number() != bc) {
++				printf("SWEET MALI GAP: sweetsmbind=%u: bind to cpu %d failed (running on cpu %d), sm_thread may run elsewhere\n", smb_mask, bc, cpu_number());
++			} else {
++				smb_bound_cpu = bc;
++				printf("SWEET MALI: sm_thread bound to cpu %d (sweetsmbind=%u)\n", bc, smb_mask);
++			}
++		}
++	}
+ 	sm_irq_setup();   /* patch 0272 */
+ 	if (cl_on && !sm_irq_on) {
+ 		printf("SWEET MALI GAP: sweetcomplat=1 needs the JOB interrupt (sweetmaliirq=1 and attach accepted): no ISR stamps, every completion will count as noirq\n");
+@@ -1226,6 +1330,10 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 		lck_mtx_lock(&sm_lock);
+ 		(void)os_atomic_xchg(&sm_irq_pend, 0u, relaxed);
+ 		uint64_t t_isr = cl_on ? os_atomic_xchg(&cl_isr_t0, 0, relaxed) : 0;   /* patch 0364 */
++		if (t_isr != 0) {   /* patch 0365, log only: where did sm_thread wake relative to the ISR cpu */
++			os_atomic_thread_fence(acquire);
++			smb_wake_account(&smb_w, (int)os_atomic_load(&smb_isr_cpu, relaxed), cpu_number());
++		}
+ 		if (sm.busy) {
+ 			uint64_t before = sm.seq_done;
+ 			uint64_t cl_jobs0 = cl_done_n;
+@@ -1265,6 +1373,7 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 		lck_mtx_unlock(&sm_lock);
+ 		sm_perf_tick();
+ 		cl_tick();   /* patch 0364 */
++		smb_tick();   /* patch 0365 */
+ 		sm_submit_tm_tick();
+ 	}
+ }
+@@ -1944,7 +2053,17 @@ sm_bringup(volatile uint32_t *g, int s2mpu_open, int skip_config)
+ 		printf("SWEET MALI: AS0 UPDATE failed\n");
+ 		return 1;
+ 	}
+-	if (kernel_thread_start(sm_thread, NULL, &sm.thread) != KERN_SUCCESS) {
++	uint32_t smv = 0;
++	if (PE_parse_boot_argn("sweetsmbind", &smv, sizeof(smv)) && smv != 0) {   /* patch 0365 */
++		if (smb_unknown(smv)) {
++			printf("SWEET MALI GAP: sweetsmbind=%u has unknown bits %#x, ignored (known: 1 = bind to the SPI cpu, 2 = priority %d)\n", smv, smb_unknown(smv), SMB_PRI_RAISED);
++		}
++		smb_mask = smb_known(smv);
++		if (smb_mask & SMB_PRIO) {
++			printf("SWEET MALI: sm_thread priority %d -> %d (sweetsmbind=%u; 81 = BASEPRI_KERNEL from kernel_thread_start priority -1, 93 = BASEPRI_PREEMPT_HIGH)\n", SMB_PRI_DEFAULT, SMB_PRI_RAISED, smb_mask);
++		}
++	}
++	if ((smb_priority(smb_mask) != 0 ? kernel_thread_start_priority(sm_thread, NULL, smb_priority(smb_mask), &sm.thread) : kernel_thread_start(sm_thread, NULL, &sm.thread)) != KERN_SUCCESS) {
+ 		printf("SWEET MALI: no completion thread\n");
+ 		return 1;
+ 	}

@@ -1,0 +1,38 @@
+SWEET boot line 2048 (patch 0320, user 2026-11-12 "there has to be a better way"): arm64 BOOT_LINE_LENGTH 1024 -> 2048 on top of patch 0176, so struct boot_args grows from 1152 to 2176 bytes. Why: with --mif-clk + --pmic-src-clear the shim appends up to 165 B of sweetmif*/sweetps* tokens into the same field, which left 843 B for the host line and forced feature trims (ALL-ON profile all_on5_nav_psclr_mif). Same mechanism and the same producer/consumer argument as 0176 (research 108): the shim is the only producer, built with the same constant (shim/payload.h); readers use the macro or offsetof (genassym BA_BOOT_FLAGS); the sysctl handler's stack copy (bsd/kern/kern_sysctl.c `char buf[BOOT_LINE_LENGTH]`) becomes 2 KiB on a kernel stack of at least 16 KiB (osfmk/mach/arm/vm_param.h KERNEL_STACK_SIZE); stackshot copies MIN(strlen+1, BOOT_LINE_LENGTH) as a variable-length kcdata record; IONVRAM's check is unused (no NVRAM boot-args on this port). The 0176 tag string follows the macro, so tools/mkpayload.py refuses a 1024 kernel on a 2048 shim and vice versa. No device register, no store.
+
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -30,7 +30,11 @@
+  * limit above does not bind us. Readers use the macro or the struct fields (start.s reads bootFlags
+  * through genassym BA_BOOT_FLAGS = offsetof), so they move with it; sizeof(struct boot_args) 736 -> 1152.
+  */
+-#define BOOT_LINE_LENGTH        1024
++/*
++ * PixOS (patch 0320): 2048 on top of 0176, same reasoning; sizeof(struct boot_args) 1152 -> 2176. The shim's appended
++ * sweetmif and sweetps tokens (up to 165 B) no longer cut into the host line (ALL-ON T-02/T-24, 2026-11-12).
++ */
++#define BOOT_LINE_LENGTH        2048
+ 
+ /*
+  * Video information..
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2248,5 +2248,5 @@
+ 	}
+ 	/*
+-	 * r2 rules, applied to the view: BOOT_LINE_LENGTH is 1024 here (patch 0176), stock arm64 is 608, and stock
++	 * r2 rules, applied to the view: BOOT_LINE_LENGTH is 2048 here (patches 0176 + 0320), stock arm64 is 608, and stock
+ 	 * userland sizes its buffers for that.
+ 	 * - oldlen >= 608: such callers never saw ENOMEM on stock and may not handle one (watchdogd: 608-byte buffer,
+diff --git a/bsd/dev/sweet_touch_poke.h b/bsd/dev/sweet_touch_poke.h
+--- a/bsd/dev/sweet_touch_poke.h
++++ b/bsd/dev/sweet_touch_poke.h
+@@ -17,5 +17,5 @@
+ 
+ #define POKE_MAX_OPS      32u
+-#define POKE_MAX_LEN      240u       /* script characters; boot-args total is 1023 (BOOT_LINE_LENGTH 1024, patch 0176) */
++#define POKE_MAX_LEN      240u       /* script characters; boot-args total is 2047 (BOOT_LINE_LENGTH 2048, patches 0176 + 0320) */
+ #define POKE_MAX_DELAY_US 1000000u
+ #define POKE_MAX_RANGES   16u

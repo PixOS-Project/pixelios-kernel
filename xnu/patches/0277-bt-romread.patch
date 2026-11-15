@@ -1,0 +1,261 @@
+SWEET Bluetooth: patch 0277 (sprint-bt 2026-11-09), boot-arg sweetbtromread=1 (default off): READ-ONLY controller witness for the controller-side Apple multi-advertising (0xfd48) work, docs/research/sprint-bt-fd48-firmware.md s.6. Pass R on the ROM controller before the patchram download: Read_RAM (opcode 0xfc4d, Address uint32 LE + Length uint8, returns Status + data [src: Cypress AN215184 Rev *A s.3.10]) probes at 8 addresses, then one 512 KiB window (start = boot-arg sweetbtromoff, default 0; review M2/M3) in 128-byte reads up to the first refusal or the patch base 0x1a0400, rows `BT ROM: d <addr> <hex>` (firmware bytes only in the gitignored run log), HCI trace quiet meanwhile; then the controller is power-cycled and re-probed so the download starts clean. Pass P after a verified download: 0xfd54 with the unused sub-opcode 0xee (status 0x01 = no 0xfd54 handler) and a 32-byte read of the patch head (host compares it with BCM.hcd). No write command is sent; every refusal is a GAP row and nothing stops the bring-up. 0xfd54 without an answer is followed by an HCI Reset check (review M1); every refusal is a BT GAP row. Review docs/reviews/sprint-bt-0277-review.md (SAFE WITH CONDITIONS; M1, M2/M3, L1 fixed). Mode 2 (sweetbtromread=2, added after bt-rom1 20261109T221218Z lost ~97 % of the mode-1 hex rows in the live USB log [obs]): the whole range 0..0x1a0400 into one kernel buffer (new file bsd/dev/sweet_bt_rom.c), no hex rows, progress every 256 KiB, an FNV-1a row over the bytes, served read-only by sysctl debug.sweetbtrom (a userland helper copies it to a file the host pulls). Applies after 0274.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6b89694..8f4cf4c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -128,6 +128,7 @@ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_bt_uart.c		standard
+ bsd/dev/sweet_bt_hcd.c		standard
++bsd/dev/sweet_bt_rom.c		standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_mmio_log.c		standard
+diff --git a/bsd/dev/sweet_bt_rom.c b/bsd/dev/sweet_bt_rom.c
+new file mode 100644
+index 0000000..81d32d3
+--- /dev/null
++++ b/bsd/dev/sweet_bt_rom.c
+@@ -0,0 +1,46 @@
++/* PixOS patch 0277 (sprint-bt 2026-11-09): read-only export of the BCM4389 ROM bytes that sweet_bt_uart.c read with Read_RAM 0xfc4d at boot
++ * (boot-arg sweetbtromread=2). The live USB log dropped ~97 % of the hex rows of mode 1 (bt-rom1 20261109T221218Z: 104 of ~4096 rows) [obs],
++ * so mode 2 keeps the bytes in one kernel buffer and serves them whole through the read-only sysctl debug.sweetbtrom (CTLTYPE_OPAQUE,
++ * SYSCTL_OUT of the filled length; bsd/sys/sysctl.h). A userland helper copies it to a file the host pulls. Firmware bytes never enter git. */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/kalloc.h>
++
++static uint8_t *sbr_buf;
++static uint32_t sbr_cap, sbr_len;
++
++uint8_t *sweet_bt_rom_buffer(uint32_t n);
++void sweet_bt_rom_publish(uint32_t n);
++
++uint8_t *
++sweet_bt_rom_buffer(uint32_t n)
++{
++	if (sbr_buf == NULL) {
++		sbr_buf = kalloc_data(n, Z_WAITOK | Z_ZERO);
++		sbr_cap = sbr_buf != NULL ? n : 0;
++	}
++	return n <= sbr_cap ? sbr_buf : NULL;
++}
++
++void
++sweet_bt_rom_publish(uint32_t n)
++{
++	sbr_len = n <= sbr_cap ? n : sbr_cap;
++}
++
++static int
++sbr_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (sbr_buf == NULL || sbr_len == 0) {
++		return ENOENT;
++	}
++	return SYSCTL_OUT(req, sbr_buf, sbr_len);
++}
++
++SYSCTL_PROC(_debug, OID_AUTO, sweetbtrom, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sbr_sysctl, "S", "BCM4389 ROM bytes read at boot by patch 0277 (sweetbtromread=2)");
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index 53f0dd0..7684d00 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1619,6 +1619,153 @@ sbu_lefeat(void)
+ 	return 0;
+ }
+ 
++/*
++ * patch 0277 (sprint-bt 2026-11-09), boot-arg sweetbtromread=1 (default off), READ-ONLY witness for the controller-side 0xfd48 work
++ * (docs/research/sprint-bt-fd48-firmware.md s.6): the vendor-command dispatch of the BCM4389 lives in its ROM, not in BCM.hcd.
++ * Read_RAM = OCF 0x04D (opcode 0xfc4d): parameters Address uint32 little endian + Length uint8, returns Status + up to 251 data bytes
++ * [src: Cypress AN215184 "Cypress Vendor-Specific Bluetooth Commands" Rev *A s.3.10 p.16]. Nothing is written to the controller:
++ * pass R (ROM state, before the patchram download): 32-byte probes at a few addresses, then a dump from address 0 in 128-byte reads,
++ * stopping at the first missing answer or status != 0, at SBU_ROM_MAX, or at the patch base. Rows `BT ROM: <addr> <hex>` (firmware bytes
++ * stay in the gitignored run log, never in git). The controller is then power-cycled and re-probed before the patchram download, so
++ * bluetoothd meets the usual state. Pass P (after the download): 0xfd54 with sub-opcode 0xee (no handler takes it: 0x01 = no 0xfd54
++ * handler at all, any other status = a handler exists and refused the sub-op) and a 32-byte read of the patch head 0x1a0400 (compared on
++ * the host with BCM.hcd: proves Read_RAM returns real memory). Every refusal is a BT GAP row; nothing here stops the bring-up.
++ */
++#define SBU_ROM_CHUNK 128u
++#define SBU_ROM_MAX   0x1a0400u      /* the first patchram record address in BCM.hcd [obs, research note s.4]: ROM is below it [guess] */
++#define SBU_ROM_WIN   0x80000u       /* review sprint-bt-0277 M2/M3: one 512 KiB window per boot (~4k reads, ~1 min, ~1.1 MB of log rows); boot-arg sweetbtromoff=<start> picks it */
++
++static int
++sbu_rom_read(uint32_t addr, uint8_t len, uint8_t *out, size_t *n, uint8_t *st)
++{
++	uint8_t par[5] = { (uint8_t)addr, (uint8_t)(addr >> 8), (uint8_t)(addr >> 16), (uint8_t)(addr >> 24), len };
++	uint8_t rp[280];
++	size_t rpn = 0;
++	int e;
++
++	*st = 0xff;
++	*n = 0;     /* review L1 */
++	e = sbu_cmd(0xfc4d, par, sizeof(par), st, rp, sizeof(rp), &rpn);
++	if (e == 0) {
++		*n = rpn < len ? rpn : len;
++		memcpy(out, rp, *n);
++	}
++	return e;
++}
++
++static void
++sbu_rom_row(const char *tag, uint32_t addr, const uint8_t *b, size_t n)
++{
++	char hex[SBU_ROM_CHUNK * 2 + 1];
++	size_t i;
++
++	for (i = 0; i < n && i < SBU_ROM_CHUNK; i++) {
++		static const char d[] = "0123456789abcdef";
++
++		hex[2 * i] = d[b[i] >> 4];
++		hex[2 * i + 1] = d[b[i] & 15];
++	}
++	hex[2 * i] = 0;
++	printf("BT ROM: %s %08x %s\n", tag, addr, hex);
++}
++
++static void
++sbu_romread_rom(void)
++{
++	static const uint32_t probes[] = { 0x0, 0x100, 0x1000, 0x10000, 0x80000, 0x100000, 0x180000, 0x1a0400 };
++	uint8_t b[SBU_ROM_CHUNK], st;
++	size_t n;
++	uint32_t a;
++	unsigned rows = 0;
++	int e;
++
++	sbu_trace_quiet = true;
++	printf("BT ROM: start (sweetbtromread=1, patch 0277): Read_RAM 0xfc4d probes + one %u KiB window in %u-byte reads, cap 0x%x\n", SBU_ROM_WIN / 1024, SBU_ROM_CHUNK, SBU_ROM_MAX);
++	for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
++		e = sbu_rom_read(probes[i], 32, b, &n, &st);
++		if (e != 0 || st != 0) {
++			SBU_GAP(SG_OTHER, "sweetbtromread: probe %08x refused: error %d status 0x%02x", probes[i], e, st);
++			continue;
++		}
++		sbu_rom_row("probe", probes[i], b, n);
++	}
++	uint32_t start = 0, end;
++
++	if (PE_parse_boot_argn("sweetbtromoff", &start, sizeof(start)))
++		start &= ~(SBU_ROM_CHUNK - 1);
++	end = start < SBU_ROM_MAX - SBU_ROM_WIN ? start + SBU_ROM_WIN : SBU_ROM_MAX;
++	printf("BT ROM: window %08x..%08x (sweetbtromoff)\n", start, end);
++	for (a = start; a < end; a += SBU_ROM_CHUNK) {
++		e = sbu_rom_read(a, SBU_ROM_CHUNK, b, &n, &st);
++		if (e != 0 || st != 0 || n != SBU_ROM_CHUNK) {
++			SBU_GAP(SG_OTHER, "sweetbtromread: dump stopped at %08x: error %d status 0x%02x bytes %zu", a, e, st, n);
++			break;
++		}
++		sbu_rom_row("d", a, b, n);
++		rows++;
++	}
++	sbu_trace_quiet = false;
++	printf("BT ROM: dump done rows=%u bytes=%u end=%08x quiet_transfers=%u\n", rows, rows * SBU_ROM_CHUNK, a, sbu_trace_quiet_n);
++}
++
++uint8_t *sweet_bt_rom_buffer(uint32_t n);      /* sweet_bt_rom.c (patch 0277 mode 2) */
++void sweet_bt_rom_publish(uint32_t n);
++
++/* mode 2 (sweetbtromread=2): the whole range 0..SBU_ROM_MAX into the kernel buffer, no hex rows; served by sysctl debug.sweetbtrom */
++static void
++sbu_romread_buf(void)
++{
++	uint8_t *buf = sweet_bt_rom_buffer(SBU_ROM_MAX), st;
++	size_t n;
++	uint32_t a, fnv = 2166136261u;
++	int e = 0;
++
++	if (buf == NULL) {
++		SBU_GAP(SG_OTHER, "sweetbtromread=2: no %u-byte buffer; nothing read", SBU_ROM_MAX);
++		return;
++	}
++	sbu_trace_quiet = true;
++	printf("BT ROM: start mode 2 (buffer, sysctl debug.sweetbtrom): 0..0x%x in %u-byte reads\n", SBU_ROM_MAX, SBU_ROM_CHUNK);
++	for (a = 0; a < SBU_ROM_MAX; a += SBU_ROM_CHUNK) {
++		e = sbu_rom_read(a, SBU_ROM_CHUNK, buf + a, &n, &st);
++		if (e != 0 || st != 0 || n != SBU_ROM_CHUNK) {
++			SBU_GAP(SG_OTHER, "sweetbtromread=2: read stopped at %08x: error %d status 0x%02x bytes %zu", a, e, st, n);
++			break;
++		}
++		if ((a & 0x3ffffu) == 0)
++			printf("BT ROM: progress %08x\n", a);
++	}
++	sbu_trace_quiet = false;
++	for (uint32_t i = 0; i < a; i++)
++		fnv = (fnv ^ buf[i]) * 16777619u;
++	sweet_bt_rom_publish(a);
++	printf("BT ROM: buffer done bytes=%u fnv1a=0x%08x quiet_transfers=%u (sysctl debug.sweetbtrom)\n", a, fnv, sbu_trace_quiet_n);
++}
++
++static void
++sbu_romread_patched(void)
++{
++	static const uint8_t bad_sub = 0xee;
++	uint8_t rp[64], b[32], st = 0xff;
++	size_t rpn = 0, n = 0;
++	int e = sbu_cmd(0xfd54, &bad_sub, 1, &st, rp, sizeof(rp), &rpn);
++
++	if (e != 0) {      /* review M1: no answer = the controller may be wedged; check it with a Reset before anything else talks to it */
++		SBU_GAP(SG_OTHER, "sweetbtromread: 0xfd54 probe got no answer (error %d)", e);
++		e = sbu_cmd(0x0c03, &bad_sub, 0, &st, rp, sizeof(rp), &rpn);
++		if (e != 0 || st != 0)
++			SBU_GAP(SG_OTHER, "sweetbtromread: HCI Reset after the 0xfd54 probe failed (error %d status 0x%02x): the controller may be wedged; bluetoothd will show it", e, st);
++		return;
++	}
++	printf("BT ROM: fd54 probe sub=0x%02x: error %d status 0x%02x (%s) return bytes %zu\n", bad_sub, e, st,
++	    st == 0x01 ? "Unknown HCI Command: no 0xfd54 handler" : "a 0xfd54 handler exists", rpn);
++	e = sbu_rom_read(0x1a0400, 32, b, &n, &st);
++	if (e != 0 || st != 0)
++		SBU_GAP(SG_OTHER, "sweetbtromread: patch-head read refused: error %d status 0x%02x", e, st);
++	else
++		sbu_rom_row("patchhead", 0x1a0400, b, n);
++}
++
+ /* attach side of the knob (review T-60ed F7: a function the host test can call). 0 = go on to bluetoothd (patched, refused or ROM restored), else the backend must not start. */
+ static int
+ sbu_patchram_attach(const struct sbu_cand *cand)
+@@ -1629,6 +1776,12 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ 		int v = 0;
+ 
+ 		printf("BT UART: patchram download verified; bluetoothd will meet the patched controller\n");
++		{
++			int rr = 0;
++
++			if (PE_parse_boot_argn("sweetbtromread", &rr, sizeof(rr)) && (rr == 1 || rr == 2))      /* patch 0277: read-only, before the 0274 step */
++				sbu_romread_patched();
++		}
+ 		if (PE_parse_boot_argn("sweetbtlefeat", &v, sizeof(v)) && v == 1) {      /* patch 0274 */
+ 			int le = sbu_lefeat();
+ 
+@@ -2626,6 +2779,23 @@ sweet_bt_uart_attach(void)
+ 					}
+ 				}
+ 			}
++			{       /* patch 0277: boot-arg sweetbtromread=1, read-only ROM witness on the ROM controller, then a power-cycle so the download starts clean */
++				int v = 0;
++
++				if (PE_parse_boot_argn("sweetbtromread", &v, sizeof(v)) && (v == 1 || v == 2)) {
++					if (v == 2)
++						sbu_romread_buf();
++					else
++						sbu_romread_rom();
++					(void)sbu_power_off();
++					e = sbu_probe_one(&use[win]);
++					printf("BT UART: controller power-cycled after the ROM read: %s (error %d)\n", e == 0 ? "answered HCI Reset again" : "NO ANSWER", e);
++					if (e != 0) {
++						printf("BT GAP: backend not started after the ROM-read power-cycle; controller powered off\n");
++						return;
++					}
++				}
++			}
+ 			{       /* patch 0218 (T-86c9): boot-arg sweetbtpatchram=1; bluetoothd then meets the PATCHED controller (no power-cycle after a good download). Runs after the 0216/0217 probes and their power-cycle. */
+ 				int v = 0;
+ 

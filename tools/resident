@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""resident: the resident iOS session (user 2026-11-11). The phone stays booted in iOS; every stream thread submits jobs to it; one owner holds
+the phone lock for the session. Rules: AGENTS hard rule 3 / docs/RULES.md H3 (parks in fastboot when idle > 30 min, low or falling battery, crash,
+session end). Recipe: super repo docs/recipes/resident-session.md. Decisions: tools/resident_core.py (pure, host-tested by tools/test_resident.py).
+
+Submit (any thread; never touches the phone itself):
+  resident submit --stream gpu|bt|wlan|tools --est S [--max S] [--prio 1..9] [--profile NAME|any] [--label L]
+                  [--push SRC:DST]... [--restart NAME]... [--run "/abs/prog args"]... [--hot "hot subcommand args"]... [--wait-for REGEX]...
+                  [--sleep S]... [--pull SRC:HOSTDST]... [--host "cmd {dir}"]...          steps run in the order given (--host after the log cut)
+                  [--expect REGEX]... [--expect-absent REGEX]...                           oracles on the job's own USB-log slice + step output
+                  [--kernel K] [--args "k=v ..."] [--overlay TREE]                         a KERNEL job: batched into ONE reboot at the next boundary
+                  [--thread ID | --notify none] [--follow] [--no-start] [--dry-run]
+      Prints `JOB id=<id> ...`. Files are copied at submit time (a later edit does not change the job). Without a running session one is started
+      (`phone-lock run --owner resident --detach`, it waits for the current holder through the lock). At the end the thread gets ONE line
+      `RESIDENT JOB END id=.. stream=.. result=PASS|FAIL|CUT|CRASH|NOTRUN dir=<slice dir> why=..` (phone-lock's notify, t3 thread send). CRASH = the session
+      crashed while this job ran (panic, stall, watchdog reset, xrun gone); every other waiting job then ends NOTRUN and the phone parks.
+  resident follow ID [--timeout S]        block until job ID has a result; prints it (exit 0 PASS, 1 otherwise, 3 timeout)
+  resident status                          session, boot, battery, queue
+  resident cancel ID                       a queued job ends NOTRUN; a running one is cut at its next check (CUT, GAP line)
+  resident start [--kernel K] [--floor MV] [--max S] [--set key=value]...   start a session now (normally submit does it);
+                                          --floor/--set: THIS session only; lasting settings: config.json "settings"
+  resident reserve --stream S --from HH:MM --to HH:MM | --clear    a window (UTC today) where only stream S's jobs start; before it, other
+                                          streams' jobs start only if their --max ends before it opens (demo slots)
+  resident owner [--stream KEY --thread ID]   the thread that gets KEY's job notices (handoff: the old one becomes 'former');
+                                          submit --owner KEY (or $PIXOS_OWNER) routes a job's notices to KEY's current owner
+  resident end [--reason TEXT] [--now]    graceful: finish the running job, then end (the phone parks). --now = phone-lock end (job cut)
+  resident _serve                         the session owner (run by start under phone-lock run; not for hand use)
+Files: $RESIDENT_DIR (default ~/pixelios-artifacts/resident): config.json (kernel, settings), profiles.json (boot profiles; example
+tools/resident-profiles.example.json), queue/, jobs/<id>/ (job.json, files/, steps.log, result.json), session.json, events.log.
+Every refusal, cut or skipped job is a `RESIDENT GAP:` line in events.log, the job's steps.log and its result (rule 7).
+Last line of every command: RESULT: PASS|FAIL|ERROR resident ...
+"""
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, re, shlex, shutil, signal, subprocess, sys, time, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import resident_core as rc  # noqa: E402
+
+from resident_session_lib import *  # noqa: E402,F401,F403  (helpers, Session, RealPhone: the owner half lives there)
+from resident_session_lib import OWNER, PANIC_RX, WAIVERS, STEP_OPS, STREAMS  # noqa: E402,F401
+import resident_fit as rf  # noqa: E402  (G6 kernel tag)
+
+
+# ---------------------------------------------------------------- submit side
+class StepAction(argparse.Action):
+    def __call__(self, parser, ns, value, opt=None):
+        steps = getattr(ns, "steps", None) or []
+        steps.append([self.dest.replace("_", "-"), value])
+        ns.steps = steps
+
+
+def build_job(a, guard=None):
+    jid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + a.stream + "-" + uuid.uuid4().hex[:4]
+    jd = p("jobs", jid)
+    files = os.path.join(jd, "files")
+    os.makedirs(files)
+    cfg = rc.cfg_with(jload(p("config.json"), {}).get("settings"))
+    max_s = a.max or cfg["job_max_default_s"]
+    if not 10 <= max_s <= cfg["job_max_cap_s"]:
+        raise Fail("--max %d s outside 10..%d s (job_max_cap_s): split the job" % (max_s, cfg["job_max_cap_s"]))
+    if not 1 <= a.est <= max_s:
+        raise Fail("--est %d s must be 1..--max (%d s)" % (a.est, max_s))
+    steps = []
+    for op, val in getattr(a, "steps", None) or []:
+        if op == "push":
+            src, _, dst = val.partition(":")
+            if not dst.startswith("/") or not os.path.isfile(src):
+                raise Fail("--push %s: needs SRC:DST with an existing host file and an absolute phone path" % val)
+            keep = os.path.join(files, "%02d-%s" % (len(steps), os.path.basename(src)))
+            shutil.copy2(src, keep)
+            steps.append(["push", keep + ":" + dst])
+        elif op == "pull":
+            src, _, dst = val.partition(":")
+            if not src.startswith("/"):
+                raise Fail("--pull %s: SRC must be an absolute phone path" % val)
+            steps.append(["pull", src + ":" + (os.path.abspath(dst) if dst else "")])
+        elif op in ("sleep",):
+            if not 0 < float(val) <= max_s:
+                raise Fail("--sleep %s outside 0..--max" % val)
+            steps.append([op, val])
+        elif op == "wait-for":
+            re.compile(val)
+            steps.append([op, val])
+        elif op == "run":
+            if not val.startswith("/"):
+                raise Fail("--run %r: an absolute program path (devd has no shell, no PATH)" % val)
+            steps.append([op, val])
+        else:
+            steps.append([op, val])
+    for rx in (a.expect or []) + (a.expect_absent or []):
+        re.compile(rx)
+    spec = {"profile": a.profile, "kernel": None, "kernel_sha": None, "args": rc.parse_args(a.args), "overlay": None, "overlay_files": {}}
+    kind = "user"
+    if a.kernel:
+        kern = os.path.join(files, "kernel")
+        shutil.copy2(a.kernel, kern)
+        spec["kernel"], spec["kernel_sha"] = kern, sha256(kern)
+    if a.overlay:
+        if not os.path.isdir(a.overlay):
+            raise Fail("--overlay %s is not a directory" % a.overlay)
+        ov = os.path.join(files, "overlay")
+        shutil.copytree(a.overlay, ov, symlinks=True)
+        spec["overlay"], spec["overlay_files"] = ov, tree_files(ov)
+    spec["camera"] = bool(getattr(a, "camera", False))
+    spec["fresh"] = bool(getattr(a, "fresh_boot", False))
+    if a.kernel or a.args or a.overlay or spec["camera"] or spec["fresh"]:
+        kind = "kernel"
+    thread = None if a.notify == "none" else (a.thread or os.environ.get("T3CODE_THREAD_ID"))
+    owner_key = None if a.notify == "none" else (getattr(a, "owner", None) or os.environ.get("PIXOS_OWNER") or None)
+    job = {"id": jid, "stream": a.stream, "label": a.label or jid, "owner": os.environ.get("PHONE_OWNER") or a.stream, "thread": thread, "owner_key": owner_key,
+           "requeue_on_crash": bool(getattr(a, "requeue_on_crash", False)),
+           "prio": a.prio, "est_s": a.est, "max_s": max_s, "submitted": time.time(), "kind": kind, "spec": spec, "steps": steps,
+           "expect": a.expect or [], "expect_absent": a.expect_absent or [], "cwd": os.getcwd(), "state": "queued"}
+    if guard:
+        try:
+            guard(job, a, cfg, jd)
+        except Fail:
+            shutil.rmtree(jd, ignore_errors=True)
+            raise
+    if getattr(a, "dry_run", False):   # ALL-ON T-43: a dry check must never queue or start anything
+        shutil.rmtree(jd, ignore_errors=True)
+        return job
+    jsave(os.path.join(jd, "job.json"), job)
+    jsave(p("queue", jid + ".json"), {"id": jid})
+    return job
+
+
+def prebuild_job(job, prof, pname, kern, tools):
+    """G7: '' when the job's image builds and passes every check (resident_fit.prebuild), else why; None = that tree's xrun has no build-only
+    mode (never run: it would go on to the phone lock)."""
+    xrun = os.path.join(tools, "xrun")
+    if not rf.xrun_has_build_only(xrun):
+        return None
+    label = "prebuild-" + job["id"].rsplit("-", 1)[-1]
+    spec = {"profile": pname, "kernel": kern, "kernel_sha": sha256(kern), "args": job["spec"]["args"], "overlay_files": {},
+            "overlays": [job["spec"]["overlay"]] if job["spec"].get("overlay") else [], "camera": job["spec"].get("camera")}
+    os.makedirs(p("prebuild"), exist_ok=True)
+    try:
+        xr, env = RealPhone().stage(spec, label, 7200, prof)
+        xr[0] = xrun
+        return rf.prebuild(xr, env, p("prebuild", job["id"] + ".out"))
+    finally:
+        shutil.rmtree(p("boots", label), ignore_errors=True)
+
+
+def submit_guards(job, a, cfg, jd):
+    """G1-G4 (ALL-ON rules, coordinator 2026-11-12: a setup slip seen twice gets a host guard): checked at submit, before anything is
+    queued or booted. Each refusal is one line (why, do instead, escape); --guard-override "reason" turns them into GAP lines."""
+    conf = jload(p("config.json"), {})
+    std = conf.get("kernel")
+    std_sha = sha256(std) if std and os.path.isfile(std) else None
+    st = jload(p("session.json"), {}) if session_live() else {}
+    boot = {k: st.get("boot_" + k) for k in ("profile", "kernel", "kernel_sha")} if st.get("boot_profile") else None
+    bad = []
+    why = rc.profile_inherit_check(job, boot, cfg, std_sha)
+    if why:
+        bad.append(("G2", why, "pass --profile NAME (and --kernel K)"))
+    pname = job["spec"]["profile"] if job["spec"]["profile"] != "any" else (boot or {}).get("profile")
+    profiles = jload(p("profiles.json"), {}) or {}
+    prof = profiles.get(pname) if pname else None
+    if pname and prof is None:
+        bad.append(("G2", "unknown profile %r" % pname, "use one of %s" % ", ".join(sorted(profiles))))
+    kern = job["spec"].get("kernel") or ((boot or {}).get("kernel") if boot and pname == boot.get("profile") else None) or std
+    if prof is not None:
+        why = rc.profile_args_check(job["spec"]["args"], rc.parse_args(prof.get("args")))
+        if why:
+            bad.append(("G4", why, "drop the key from --args, or add a profile with that value"))
+        if kern:   # every profile (T-35): xrun --print-bootargs builds the exact line and refuses what the image build would refuse
+            tree = os.path.expanduser(prof["overlay"]) if prof.get("overlay") else jd
+            spec = {"kernel": kern, "args": job["spec"]["args"], "camera": job["spec"].get("camera")}
+            xr = xrun_argv(spec, "submit-check", 7200, prof, tree)
+            if st.get("tools") and st["tools"] != HERE:   # T-50: a live session runs the job with ITS tree's xrun (lane-t02 d596: 'unknown option --breadcrumb')
+                xr[0] = os.path.join(st["tools"], "xrun")
+                print("resident submit: G1 checks with the running session's xrun %s (not this tree's)" % xr[0])
+            line, out = print_bootline(xr, xrun_env())
+            refused = [ln for ln in out.splitlines() if ln.startswith("REFUSED:")]
+            if refused:   # T-35: xrun / build-xnu-image's own refusal is the authority (its token reserves can exceed line_limit's)
+                bad.append(("G1", refused[0][len("REFUSED: "):][:300], "shorten --args or the profile's args/sweetnull names"))
+            elif line is None:
+                event("RESIDENT GAP: submit %s: xrun --print-bootargs gave no boot-args line (%s): G1 line length not checked" % (job["id"], out.strip()[-120:]))
+            elif rc.mif_line_check(prof.get("xrun"), line):
+                bad.append(("G1", rc.mif_line_check(prof.get("xrun"), line), "shorten --args or the profile's sweetnull names"))
+    needs = rc.job_kernel_needs(job["steps"], getattr(a, "needs_kernel", None))
+    # a profile may name kernel strings its boot needs (literal), e.g. a PMIC-writing shim step whose kernel print must exist (review 0319 F1)
+    needs += [(re.escape(lit), "profile %s" % pname, lit) for lit in ((prof or {}).get("needs_kernel") or [])]
+    if needs:
+        if not kern or not os.path.isfile(kern):
+            bad.append(("G3", "kernel features needed but no kernel to check (%r)" % kern, "pass --kernel K"))
+        else:
+            with open(kern, "rb") as f:
+                miss = rc.missing_kernel_needs(needs, f.read())
+            if miss:
+                bad.append(("G3", "kernel %s lacks: %s" % (os.path.basename(kern), "; ".join(miss)), "pass --kernel with a kernel that has it"))
+    # G6 (T-50/T-51, 2026-11-12): a job kernel without mkpayload's boot-line tag (xnu 0320) is refused by build-xnu-image after the
+    # session took the phone (lanebt1 9311, allon-k21 991d)
+    bad += rf.guard_g6(job, event)
+    # G7 (user 2026-11-12: 3 crashes today were build-xnu-image failing INSIDE the hold): the job's real image is built and checked now, with
+    # the xrun that will boot it (the running session's tree, T-50); a job whose image fails is refused here and never costs a hold
+    if not bad and prof is not None and kern and os.path.isfile(kern) and not (job["kind"] == "user" and boot):
+        tools = st.get("tools") or HERE
+        why = prebuild_job(job, prof, pname, kern, tools)
+        if why is None:
+            event("RESIDENT GAP: submit %s: %s/xrun has no XRUN_BUILD_ONLY (a tree without 2026-11-12 G7): image not prebuilt" % (job["id"], tools))
+        elif why:
+            bad.append(("G7", "its image does not build: " + why, "fix the kernel/args/profile named above, then submit again"))
+        else:
+            print("resident submit: G7 image built and checked with %s/xrun" % tools)
+    # G5 (ALL-ON 2026-11-12, job f428): a host step runs in the job's cwd after the phone part; a relative program that is not there fails
+    # with rc 127 after the whole phone job (f428 was submitted from the super repo: no tools/gpu-fps-bench)
+    for op, val in job["steps"]:
+        prog = (val.split() or [""])[0] if op == "host" else ""
+        if prog and not prog.startswith("/") and "/" in prog and not os.path.exists(os.path.join(job["cwd"], prog)):
+            bad.append(("G5", "host step program %s not found under the job's cwd %s" % (prog, job["cwd"]), "submit from the kernel clone/worktree that has it, or give an absolute path"))
+    over = getattr(a, "guard_override", None)
+    for g, why, do in bad:
+        if over:
+            event("RESIDENT GAP: submit %s: guard %s overridden (%s): %s" % (job["id"], g, over, why))
+        else:
+            print("JOB REFUSED (%s): %s. Do instead: %s. Escape: --guard-override \"reason\"" % (g, why, do))
+    if bad and not over:
+        raise Fail("resident submit refused by %d guard(s): %s" % (len(bad), ", ".join(g for g, _, _ in bad)))
+
+
+def cmd_owner(a):
+    """resident owner [--stream KEY --thread ID]: the thread that gets the notices of KEY's jobs; the old one becomes 'former' (its
+    jobs' notices, queued or new, go to the new owner). Without --thread: list the owner files."""
+    d = owners_dir()
+    os.makedirs(d, exist_ok=True)
+    if a.stream:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", a.stream) or not a.thread or not re.fullmatch(r"[A-Za-z0-9:._-]{3,80}", a.thread):
+            raise Fail("resident owner --stream KEY --thread ID (KEY [A-Za-z0-9._-], ID a thread id)")
+        f = os.path.join(d, a.stream)
+        cur, former = rc.parse_owner_file(open(f).read()) if os.path.exists(f) else (None, [])
+        former = [x for x in former + ([cur] if cur and cur != a.thread else []) if x != a.thread]
+        tmp = f + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write("# resident notice owner of %s (tools/resident owner); first line = current thread\n%s\n" % (a.stream, a.thread)
+                     + "".join("former %s\n" % x for x in former))
+        os.replace(tmp, f)
+        event("RESIDENT OWNER: %s -> %s (former: %s)" % (a.stream, a.thread, ", ".join(former) or "-"))
+    for k, (cur, former) in sorted(load_owners().items()):
+        print("owner %s = %s (former %d)" % (k, cur, len(former)))
+    print("RESULT: PASS resident owner")
+    return 0
+
+
+def cmd_submit(a):
+    job = build_job(a, guard=submit_guards)
+    if a.dry_run:
+        print("DRY RUN: job %s passes the submit guards (kind=%s profile=%s steps=%d); not queued, no session start, phone-lock untouched" % (
+            job["id"], job["kind"], job["spec"]["profile"], len(job["steps"])))
+        print("RESULT: PASS resident submit --dry-run")
+        return 0
+    print("JOB id=%s stream=%s kind=%s est=%ds max=%ds prio=%d profile=%s steps=%d notify=%s" % (
+        job["id"], job["stream"], job["kind"], job["est_s"], job["max_s"], job["prio"], job["spec"]["profile"], len(job["steps"]),
+        "thread:" + job["thread"] if job["thread"] else "none"))
+    if session_live() or starting():
+        print("resident: queued on the running session")
+    elif a.no_start:
+        print("resident: queued; no session runs and --no-start: it waits for the next `resident start`")
+    else:
+        r = start_session(argparse.Namespace(kernel=None, floor=None, max=None, set=None))
+        if r != 0:
+            event("RESIDENT GAP: job %s queued but the session did not start (rc %d): it waits for the next start" % (job["id"], r))
+    if a.follow:
+        return cmd_follow(argparse.Namespace(id=job["id"], timeout=7200 + job["max_s"]))
+    print("RESULT: PASS resident submit id=%s" % job["id"])
+    return 0
+
+
+def cmd_follow(a):
+    t_end = time.time() + a.timeout
+    rp = p("jobs", a.id, "result.json")
+    if not os.path.exists(p("jobs", a.id, "job.json")):
+        print("RESULT: ERROR resident follow: no job %s" % a.id)
+        return 2
+    while time.time() < t_end:
+        r = jload(rp)
+        if r:
+            print(r.get("line", ""))
+            print("RESULT: %s resident job %s result=%s" % ("PASS" if r["result"] == "PASS" else "FAIL", a.id, r["result"]))
+            return 0 if r["result"] == "PASS" else 1
+        time.sleep(2)
+    print("RESULT: FAIL resident follow %s: no result after %d s (still queued or running: resident status)" % (a.id, a.timeout))
+    return 3
+
+
+def cmd_status(_a):
+    s = session_live()
+    st = jload(p("session.json"), {})
+    print("session: %s" % ("running pid %s since %s, state %s, boot %s, battery %s mV (comp %s mV), lock left %s s" % (
+        s["pid"], s.get("started_utc"), s.get("state"), s.get("boot_label"), s.get("battery_mv"), s.get("battery_comp_mv"), s.get("lock_left")) if s else
+        "none (last: %s %s)" % (st.get("state"), st.get("why", ""))))
+    if starting():
+        print("start: waiting for the phone lock since %s" % time.strftime("%H:%M:%SZ", time.gmtime(starting()["at"])))
+    for q in sorted(os.listdir(p("queue"))) if os.path.isdir(p("queue")) else []:
+        j = jload(p("jobs", q[:-5], "job.json"), {})
+        print("queued %s stream=%s kind=%s est=%s max=%s prio=%s state=%s" % (j.get("id"), j.get("stream"), j.get("kind"), j.get("est_s"), j.get("max_s"),
+                                                                          j.get("prio"), j.get("state")))
+    print("RESULT: PASS resident status")
+    return 0
+
+
+def cmd_cancel(a):
+    jd = p("jobs", a.id)
+    if not os.path.isdir(jd):
+        print("RESULT: ERROR resident cancel: no job %s" % a.id)
+        return 2
+    open(os.path.join(jd, "cancel"), "w").close()
+    print("RESULT: PASS resident cancel %s requested (queued: NOTRUN at the next loop; running: CUT at its next check)" % a.id)
+    return 0
+
+
+CANON_DIR = os.path.expanduser("~/pixelios-artifacts/resident")
+
+
+def start_session(a):
+    # ALL-ON T-43 (2026-11-12): a scratch RESIDENT_DIR started a REAL phone-lock waiter next to the live session. Only the canonical
+    # dir drives the phone; another dir needs RESIDENT_REAL_PHONE=1 (tests stub subprocess and set it).
+    if os.path.realpath(rdir()) != os.path.realpath(CANON_DIR) and os.environ.get("RESIDENT_REAL_PHONE") != "1":
+        print("RESIDENT REFUSED: start from RESIDENT_DIR=%s, not %s: a scratch dir never drives phone-lock. Do instead: submit --dry-run "
+              "(guards only) or use the canonical dir. Escape: RESIDENT_REAL_PHONE=1" % (rdir(), CANON_DIR))
+        print("RESULT: FAIL resident start: refused (scratch RESIDENT_DIR)")
+        return 2
+    conf = jload(p("config.json"), {})
+    if a.kernel:
+        conf["kernel"] = os.path.abspath(a.kernel)
+    # --floor/--set are THIS session's settings (session-settings.json), never persisted: a --floor 3500 of one session (18:43Z) stayed in
+    # config.json and every later session ran on it (ALL-ON 2026-11-11). Lasting settings: edit config.json "settings" by hand.
+    once = {}
+    if a.floor:
+        once["floor_mv"] = a.floor
+    for kv in a.set or []:
+        k, _, v = kv.partition("=")
+        once[k] = v
+    rc.cfg_with(dict(conf.get("settings", {}), **once))   # validate
+    if not conf.get("kernel") or not os.path.isfile(conf["kernel"]):
+        print("RESULT: ERROR resident start: no standard kernel (resident start --kernel K once; config.json kernel=%r)" % conf.get("kernel"))
+        return 2
+    jsave(p("config.json"), conf)
+    mx = int(a.max or 7200)
+    if session_live() or starting():
+        if once:
+            print("RESIDENT GAP: --floor/--set %s ignored: a session already runs or waits for the lock (they apply to a new session only)" % once)
+        print("RESULT: PASS resident start: a session already runs or waits for the lock (resident status)")
+        return 0
+    jsave(p("session-settings.json"), once)
+    try:   # one start at a time: two threads submitting at once must not queue two sessions
+        fd = os.open(p("starting.json"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        st = jload(p("starting.json"), {}) or {}
+        if time.time() - st.get("at", 0) < 7300:
+            print("RESULT: PASS resident start: another start waits for the lock")
+            return 0
+        os.unlink(p("starting.json"))
+        fd = os.open(p("starting.json"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"at": time.time(), "pid": os.getpid()}, f)
+    cmd = [sys.executable, os.path.join(HERE, "phone-lock"), "run", "--owner", OWNER, "--wait", "7200", "--max", str(mx), "--detach", "--",
+           sys.executable, os.path.join(HERE, "resident"), "_serve"]
+    r = subprocess.run(cmd, cwd=ROOT, env=dict(os.environ, RESIDENT_DIR=rdir()))
+    if r.returncode != 0:
+        os.unlink(p("starting.json"))
+    print("RESULT: %s resident start (phone-lock run --owner %s --detach, rc %d)" % ("PASS" if r.returncode == 0 else "FAIL", OWNER, r.returncode))
+    return r.returncode
+
+
+def cmd_reserve(a):
+    """resident reserve --stream S --from HH:MM --to HH:MM (UTC, today) | --clear | --list"""
+    rs = jload(p("reserve.json"), []) or []
+    if a.clear:
+        rs = []
+    elif a.stream:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        import calendar
+        f = calendar.timegm(time.strptime(day + " " + a.frm, "%Y-%m-%d %H:%M"))
+        t = calendar.timegm(time.strptime(day + " " + a.to, "%Y-%m-%d %H:%M"))
+        if t <= f:
+            raise Fail("--to %s is not after --from %s" % (a.to, a.frm))
+        rs = [r for r in rs if r["to"] > time.time()] + [{"stream": a.stream, "from": f, "to": t}]
+    jsave(p("reserve.json"), rs)
+    for r in rs:
+        print("reserved for %s: %s .. %s UTC" % (r["stream"], time.strftime("%H:%M", time.gmtime(r["from"])), time.strftime("%H:%M", time.gmtime(r["to"]))))
+    print("RESULT: PASS resident reserve (%d window(s))" % len(rs))
+    return 0
+
+
+def cmd_end(a):
+    if a.now:
+        return subprocess.run([sys.executable, os.path.join(HERE, "phone-lock"), "end", "--owner", OWNER, "--reason", a.reason or "resident end --now"]).returncode
+    jsave(p("end-request.json"), {"reason": a.reason or "resident end", "at": time.time()})
+    print("RESULT: PASS resident end requested (the session ends after the running job; the phone parks)")
+    return 0
+
+
+def session_cfg(conf):
+    """This session's settings: config.json "settings" (persistent) + this start's --floor/--set (session-settings.json, consumed here).
+    Returns (cfg, lines): one `RESIDENT SETTING:` line per value that differs from the default, naming its source."""
+    once = jload(p("session-settings.json"), {}) or {}
+    try:
+        os.unlink(p("session-settings.json"))
+    except FileNotFoundError:   # lint-silent: expected a start without --floor/--set (or by hand) writes none
+        pass
+    cfg = rc.cfg_with(dict(conf.get("settings") or {}, **once))
+    lines = ["RESIDENT SETTING: %s=%s (default %s) from %s" % (k, cfg[k], rc.DEFAULTS.get(k), "this start's --floor/--set" if k in once else "config.json settings (persistent)")
+             for k in sorted(set(conf.get("settings") or {}) | set(once)) if cfg[k] != rc.DEFAULTS.get(k)]
+    return cfg, lines
+
+
+def cmd_serve(_a):
+    conf = jload(p("config.json"), {})
+    try:
+        os.unlink(p("starting.json"))
+    except FileNotFoundError:   # lint-silent: expected a start by hand (no submit) writes no starting.json
+        pass
+    cfg, lines = session_cfg(conf)
+    for ln in lines:
+        event(ln)
+    profiles = jload(p("profiles.json"), {})
+    if not profiles:
+        event("RESIDENT GAP: no profiles.json in %s: copy tools/resident-profiles.example.json and fill the overlay paths" % rdir())
+        return 2
+    if os.environ.get("PHONE_LOCK_TOKEN") is None:
+        print("RESULT: ERROR resident _serve runs only under phone-lock run (no PHONE_LOCK_TOKEN)")
+        return 2
+    s = Session(RealPhone(), cfg, conf["kernel"], profiles)
+
+    def on_term(sig, _f):   # phone-lock end / hard limit: tell the submitters, stop the boot; phone-lock parks after we exit
+        s.state, s.why = "ended", "signal %d (phone-lock end or hard limit)" % sig
+        event("RESIDENT END: %s" % s.why)
+        if s.buf is not None:
+            event("RESIDENT GAP: the running job was cut by the session end")
+        s.end_all("NOTRUN", "session stopped (%s): resubmit" % s.why)
+        s.stop_boot("signal")
+        s.save()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGUSR1, on_term)
+    r = s.serve()
+    print("RESULT: PASS resident session %s ended: %s" % (s.sid, s.why))
+    return r
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="resident", description=__doc__.split("\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("submit")
+    s.add_argument("--stream", required=True, choices=STREAMS)
+    s.add_argument("--est", type=int, required=True)
+    s.add_argument("--max", type=int)
+    s.add_argument("--prio", type=int, default=5, choices=range(1, 10))
+    s.add_argument("--profile", default="any")
+    s.add_argument("--label")
+    for op in STEP_OPS:
+        s.add_argument("--" + op, dest=op.replace("-", "_"), action=StepAction, default=argparse.SUPPRESS)
+    s.add_argument("--expect", action="append")
+    s.add_argument("--expect-absent", action="append")
+    s.add_argument("--kernel")
+    s.add_argument("--needs-kernel", action="append", help="REGEX the job's kernel must contain (strings); repeatable (guard G3)")
+    s.add_argument("--guard-override", help="reason: submit guards G1-G4 become GAP lines instead of refusals")
+    s.add_argument("--args", default="")
+    s.add_argument("--overlay")
+    s.add_argument("--camera", action="store_true", help="the boot runs the ESP camera capture (a boot need: a kernel job)")
+    s.add_argument("--thread")
+    s.add_argument("--owner", help="owner key (a stream/goal, e.g. all-on): notices go to that key's current owner thread (resident owner)")
+    s.add_argument("--notify", choices=("auto", "none"), default="auto")
+    s.add_argument("--follow", action="store_true")
+    s.add_argument("--no-start", action="store_true")
+    s.add_argument("--fresh-boot", action="store_true", help="the job gets its own boot (no other job merges in), after the jobs before it")
+    s.add_argument("--requeue-on-crash", action="store_true", help="kept for old callers: since 2026-11-12 EVERY queued job stays queued after a crash (only the running job ends; a job whose own boot crashed twice ends CRASH)")
+    s.add_argument("--dry-run", action="store_true", help="build the job and run the submit guards only: nothing queued, no start, no phone-lock")
+    f = sub.add_parser("follow")
+    f.add_argument("id")
+    f.add_argument("--timeout", type=int, default=9000)
+    sub.add_parser("status")
+    c = sub.add_parser("cancel")
+    c.add_argument("id")
+    st = sub.add_parser("start")
+    st.add_argument("--kernel")
+    st.add_argument("--floor", type=int)
+    st.add_argument("--max", type=int)
+    st.add_argument("--set", action="append")
+    e = sub.add_parser("end")
+    e.add_argument("--reason")
+    e.add_argument("--now", action="store_true")
+    ow = sub.add_parser("owner")
+    ow.add_argument("--stream")
+    ow.add_argument("--thread")
+    rv = sub.add_parser("reserve")
+    rv.add_argument("--stream", choices=STREAMS)
+    rv.add_argument("--from", dest="frm")
+    rv.add_argument("--to")
+    rv.add_argument("--clear", action="store_true")
+    sub.add_parser("_serve")
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "submit":
+            if a.profile != "any" and a.profile not in (jload(p("profiles.json"), {}) or {}):
+                raise Fail("--profile %s not in %s (known: %s)" % (a.profile, p("profiles.json"), sorted(jload(p("profiles.json"), {}) or {})))
+            return cmd_submit(a)
+        return {"follow": cmd_follow, "status": cmd_status, "cancel": cmd_cancel, "start": start_session, "end": cmd_end, "reserve": cmd_reserve, "owner": cmd_owner, "_serve": cmd_serve}[a.cmd](a)
+    except (Fail, ValueError, re.error, OSError) as e:
+        print("RESULT: ERROR resident %s: %s" % (a.cmd, e))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

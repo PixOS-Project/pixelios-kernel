@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""golden-gpu-analyze: host-only analysis of the golden GPU / DPU ftrace text traces (SPEC-GPU rows G-F1, UG8).
+Stdlib only, never touches a phone, bounded runtime (one streaming pass per file), no prompts.
+
+Usage:
+  tools/golden-gpu-analyze rows FILE --from N --to M [--csv]
+  tools/golden-gpu-analyze dpu-commit FILE --from N --to M [--out CSV] [--spec JSON]
+  tools/golden-gpu-analyze power-cycles FILE [--spec JSON]
+
+Row numbering (SPEC-GPU.md at cde0d2d, header, review F5): row N = the Nth (0-based) line of the file that matches
+`rwmmio_write | rwmmio_post_read | MARK` (same as `grep -nE 'rwmmio_write|rwmmio_post_read|MARK'`; a plain file line number is NOT
+the row). A MARK line is row 0 in the golden traces. Rows of kind r (post_read) count but are never "writes".
+Other ftrace events (rwmmio_post_write, rwmmio_read, ...) do not match and are not rows.
+
+rows:        print rows N..M: row, kind (w|r|mark), caller, width, val, addr, `+0xOFF` (addr low 12 bits). --csv: comma separated.
+dpu-commit:  ordered write table of rows N..M (SPEC-GPU G-F1: 17684..18030 of trace-dpu.txt). Addresses are grouped by 4 KiB page; VAs
+             are hashed/unjoined (AP-132) so pages are named P0,P1.. by first-seen order in the range; the DECON main page is the one
+             where `decon_reg_set_trigger` writes +0x30 (TRIG_CON), printed as DECON. Columns: row,page,off,caller,width,val.
+             Summary + CHECK lines (spec numbers in SPEC below, override with --spec JSON). The SHD_REG_UP_REQ histogram covers the WHOLE file;
+             the TRIG_CON / +0x70 / GLOBAL_CON checks use the rows given and assume the G-F1 range.
+power-cycles: GPU trace UG8. Mali page heuristic: among 4 KiB pages that have a GPU_IRQ_MASK (+0x28) write, take the one with the most
+             GPU_COMMAND (+0x30) writes of 0x1; ties/none -> ERROR. Lists every TILER_PWRON (+0x190) write with: row, SOFT_RESET (+0x30 = 1) seen
+             since the previous power-up, previous L2_PWROFF (+0x1E0) row and ms delta, caller; the 10 rows before each one without reset;
+             a hypothesis only if (a) every unreset power-up has no L2_PWROFF since the previous power-up and every reset one has one, or
+             (b) every unreset power-up follows its previous L2_PWROFF by a strictly smaller time than every reset one (timing separation only).
+
+Register offsets [src] ~/pixelios-artifacts/refs/gpu-full/mali_kbase/hw_access/mali_kbase_hw_access_regmap_legacy.h
+  GPU_IRQ_MASK 0x028 (:45), GPU_COMMAND 0x030 (:48), SHADER_PWRON_LO 0x180 (:108), TILER_PWRON_LO 0x190 (:113), L2_PWRON_LO 0x1A0 (:116),
+  SHADER_PWROFF_LO 0x1C0 (:128), L2_PWROFF_LO 0x1E0 (:134); GPU_COMMAND_SOFT_RESET = 0x01
+  [src] .../hw_access/regmap/mali_kbase_regmap_jm_macros.h:249-250.
+DECON offsets [src] ~/pixelios-artifacts/refs/dpu/regs-decon.h: GLOBAL_CON 0x0020 (:83), TRIG_CON 0x0030 (:97), SHD_REG_UP_REQ 0x0050 (:138),
+  0x0070 = DECON_INT_PEND (:166).
+
+  RESULT: PASS ...   (exit 0)   RESULT: FAIL ... any CHECK MISMATCH (exit 1)   RESULT: ERROR ... (exit 2)
+"""
+import argparse
+import json
+import re
+import sys
+
+# SPEC-GPU.md @ cde0d2d: G-F1 and UG8 rows.
+SPEC = {
+    "shd": {"0x10000000": 47, "0x1000003f": 45, "0x9010003f": 45, "0x80100000": 7, "0x3f": 2},
+    "trig_3070_rows": [17693, 17704], "trig_last": "0x3061",
+    "int70_rows": [17686, 17691], "int70_val": "0x1000",
+    "global_tail_rows": [18013, 18030], "global_tail_val": "0x100113", "global_tail_count": 2,
+    "tilerpwron": 79, "softreset": 73, "shader_pwron": 85, "l2_pwron": 0,
+}
+OFF_GLOBAL_CON, OFF_TRIG_CON, OFF_SHD_REQ, OFF_INT_PEND = 0x20, 0x30, 0x50, 0x70
+OFF_IRQ_MASK, OFF_GPU_COMMAND = 0x28, 0x30
+OFF_SHADER_PWRON, OFF_TILER_PWRON, OFF_L2_PWRON, OFF_L2_PWROFF = 0x180, 0x190, 0x1A0, 0x1E0
+SOFT_RESET = 0x1
+MAX_BYTES = 2 << 30
+
+RE_LINE = re.compile(r"^\s*(\S.*?)-(\d+)\s+\[(\d+)\]\s+\S+\s+([0-9.]+):\s+(\S+?):\s*(.*)$")
+RE_RW = re.compile(r"^(\S+?)(?:\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+)?(?:\s+\[\S+\])?(?:\s+->\s+\S+(?:\s+\[\S+\])?)?\s+width=(\d+)\s+val=(0x[0-9a-fA-F]+|0)\s+addr=(0x[0-9a-fA-F]+|0)\s*$")
+RE_ROW = re.compile(r"rwmmio_write|rwmmio_post_read|MARK")
+
+
+class Err(Exception):
+    pass
+
+
+def load_rows(path):
+    """Return list of rows (dicts) and the count of matching lines that failed to parse (error -> Err)."""
+    rows = []
+    try:
+        f = open(path, "r", errors="replace")
+    except OSError as e:
+        raise Err("cannot open %s: %s" % (path, e))
+    with f:
+        for ln, line in enumerate(f, 1):
+            if not RE_ROW.search(line):
+                continue
+            n = len(rows)
+            m = RE_LINE.match(line.rstrip("\n"))
+            if not m:
+                raise Err("%s:%d: row %d does not look like an ftrace line" % (path, ln, n))
+            ts, ev, rest = float(m.group(4)), m.group(5), m.group(6)
+            if ev == "tracing_mark_write" or (ev not in ("rwmmio_write", "rwmmio_post_read") and "MARK" in rest):
+                rows.append(dict(n=n, kind="mark", ts=ts, caller=rest.strip(), width=None, val=None, addr=None, ln=ln))
+                continue
+            if ev not in ("rwmmio_write", "rwmmio_post_read"):
+                raise Err("%s:%d: row %d event %r unrecognised" % (path, ln, n, ev))
+            r = RE_RW.match(rest)
+            if not r:
+                raise Err("%s:%d: row %d unparsable rwmmio payload" % (path, ln, n))
+            rows.append(dict(n=n, kind="w" if ev == "rwmmio_write" else "r", ts=ts, caller=r.group(1),
+                             width=int(r.group(2)), val=int(r.group(3), 16), addr=int(r.group(4), 16), ln=ln))
+    if not rows:
+        raise Err("%s: no rows" % path)
+    return rows
+
+
+def page(a):
+    return a >> 12
+
+
+def off(a):
+    return a & 0xFFF
+
+
+def rng(rows, a, b):
+    if a is None or b is None or a < 0 or b < a:
+        raise Err("bad --from/--to")
+    if b >= len(rows):
+        raise Err("--to %d beyond last row %d" % (b, len(rows) - 1))
+    return rows[a:b + 1]
+
+
+def load_spec(path):
+    spec = dict(SPEC)
+    if path:
+        try:
+            with open(path) as f:
+                spec.update(json.load(f))
+        except (OSError, ValueError) as e:
+            raise Err("bad --spec: %s" % e)
+    return spec
+
+
+class Checks:
+    def __init__(self):
+        self.bad = 0
+        self.n = 0
+
+    def check(self, name, spec, obs):
+        ok = spec == obs
+        self.n += 1
+        self.bad += not ok
+        print("CHECK %s spec=%s observed=%s %s" % (name, spec, obs, "OK" if ok else "MISMATCH"))
+
+
+def fmt(r):
+    if r["kind"] == "mark":
+        return "%d,mark,%s,,,," % (r["n"], r["caller"])
+    return "%d,%s,%s,%d,0x%x,0x%x,+0x%03x" % (r["n"], r["kind"], r["caller"], r["width"], r["val"], r["addr"], off(r["addr"]))
+
+
+def cmd_rows(a):
+    rows = load_rows(a.file)
+    sel = rng(rows, a.from_, a.to)
+    for r in sel:
+        if a.csv:
+            print(fmt(r))
+        elif r["kind"] == "mark":
+            print("row %d mark %s" % (r["n"], r["caller"]))
+        else:
+            print("row %d %s %s w=%d val=0x%x addr=0x%x +0x%03x" % (r["n"], r["kind"], r["caller"], r["width"], r["val"], r["addr"], off(r["addr"])))
+    print("RESULT: PASS rows=%d from=%d to=%d" % (len(sel), a.from_, a.to))
+    return 0
+
+
+def cmd_dpu(a):
+    spec = load_spec(a.spec)
+    rows = load_rows(a.file)
+    sel = [r for r in rng(rows, a.from_, a.to) if r["kind"] == "w"]
+    names, order = {}, []
+    for r in sel:
+        p = page(r["addr"])
+        if p not in names:
+            names[p] = "P%d" % len(names)
+            order.append(p)
+    decon = None
+    for r in sel:
+        if off(r["addr"]) == OFF_TRIG_CON and r["caller"] == "decon_reg_set_trigger":
+            decon = page(r["addr"])
+            break
+    if decon is None:
+        raise Err("no decon_reg_set_trigger write at +0x30 in rows %d..%d: DECON page not found" % (a.from_, a.to))
+    names[decon] += "=DECON"
+    lines = ["row,page,off,caller,width,val"]
+    for r in sel:
+        lines.append("%d,%s,+0x%03x,%s,%d,0x%x" % (r["n"], names[page(r["addr"])].split("=")[0], off(r["addr"]), r["caller"], r["width"], r["val"]))
+    if a.out:
+        try:
+            with open(a.out, "w") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError as e:
+            raise Err("cannot write --out: %s" % e)
+    else:
+        print("\n".join(lines))
+    print("SUMMARY writes=%d pages=%s" % (len(sel), " ".join("%s:%d" % (names[p], sum(1 for r in sel if page(r["addr"]) == p)) for p in order)))
+    ck = Checks()
+    hist = {}
+    for r in rows:
+        if r["kind"] == "w" and page(r["addr"]) == decon and off(r["addr"]) == OFF_SHD_REQ:
+            k = "0x%x" % r["val"]
+            hist[k] = hist.get(k, 0) + 1
+    print("SHD_REG_UP_REQ histogram (whole file): " + " ".join("%s x%d" % (k, hist[k]) for k in sorted(hist, key=lambda k: -hist[k])))
+    for k, v in spec["shd"].items():
+        ck.check("shd_req_%s" % k, v, hist.get(k, 0))
+    ck.check("shd_req_other_values", 0, sum(v for k, v in hist.items() if k not in spec["shd"]))
+    dsel = [r for r in sel if page(r["addr"]) == decon]
+    trig = [r for r in dsel if off(r["addr"]) == OFF_TRIG_CON]
+    print("TRIG_CON sequence: " + " ".join("%d:0x%x" % (r["n"], r["val"]) for r in trig))
+    ck.check("trig_con_0x3070_rows", spec["trig_3070_rows"], [r["n"] for r in trig if r["val"] == 0x3070])
+    ck.check("trig_con_last_val", spec["trig_last"], "0x%x" % trig[-1]["val"])
+    i70 = [r for r in dsel if off(r["addr"]) == OFF_INT_PEND]
+    print("+0x70 (DECON_INT_PEND) writes: " + " ".join("%d:0x%x" % (r["n"], r["val"]) for r in i70))
+    ck.check("int_pend_0x1000_rows_at_start", spec["int70_rows"], [r["n"] for r in i70 if r["val"] == int(spec["int70_val"], 16)][:len(spec["int70_rows"])])
+    last70 = [r for r in i70 if r["n"] < trig[-1]["n"]]
+    ck.check("int_pend_before_unmask", spec["int70_val"], ("0x%x" % last70[-1]["val"]) if last70 else None)
+    gc = [r for r in dsel if off(r["addr"]) == OFF_GLOBAL_CON]
+    print("GLOBAL_CON (+0x20) writes: " + " ".join("%d:0x%x" % (r["n"], r["val"]) for r in gc))
+    lo, hi = spec["global_tail_rows"]
+    ck.check("global_con_tail_count", spec["global_tail_count"], sum(1 for r in gc if lo <= r["n"] <= hi and r["val"] == int(spec["global_tail_val"], 16)))
+    print("RESULT: %s writes=%d checks=%d mismatches=%d" % ("FAIL" if ck.bad else "PASS", len(sel), ck.n, ck.bad))
+    return 1 if ck.bad else 0
+
+
+def find_mali_page(rows):
+    cand = {}
+    for r in rows:
+        if r["kind"] == "w":
+            p = page(r["addr"])
+            c = cand.setdefault(p, [0, 0])
+            if off(r["addr"]) == OFF_IRQ_MASK:
+                c[0] += 1
+            if off(r["addr"]) == OFF_GPU_COMMAND and r["val"] == SOFT_RESET:
+                c[1] += 1
+    good = sorted(((c[1], p) for p, c in cand.items() if c[0] and c[1]), reverse=True)
+    if not good:
+        raise Err("no page with both a GPU_IRQ_MASK (+0x28) write and a GPU_COMMAND (+0x30)=1 write")
+    if len(good) > 1 and good[0][0] == good[1][0]:
+        raise Err("ambiguous Mali page: two pages tie on SOFT_RESET count")
+    return good[0][1]
+
+
+def short(r, mp):
+    if r["kind"] == "mark":
+        return "%d mark %s" % (r["n"], r["caller"])
+    where = "M+0x%03x" % off(r["addr"]) if page(r["addr"]) == mp else "?0x%x" % r["addr"]
+    return "%d %s %s 0x%x %s" % (r["n"], r["kind"], where, r["val"], r["caller"])
+
+
+def _dt_separates(ups):
+    """True iff every unreset power-up has a previous L2_PWROFF and all their dt are below every dt of the reset power-ups that have one."""
+    d0 = [(u["r"]["ts"] - u["off"]["ts"]) for u in ups if not u["resets"] and u["off"]]
+    d1 = [(u["r"]["ts"] - u["off"]["ts"]) for u in ups if u["resets"] and u["off"]]
+    return bool(d0) and bool(d1) and len(d0) == sum(1 for u in ups if not u["resets"]) and max(d0) < min(d1)
+
+
+def cmd_power(a):
+    spec = load_spec(a.spec)
+    rows = load_rows(a.file)
+    mp = find_mali_page(rows)
+    print("Mali page: 0x%x (heuristic: IRQ_MASK write + most GPU_COMMAND=1 writes)" % (mp << 12))
+    mw = [r for r in rows if r["kind"] == "w" and page(r["addr"]) == mp]
+    cnt = lambda o, v=None: sum(1 for r in mw if off(r["addr"]) == o and (v is None or r["val"] == v))
+    ups = []
+    resets_since, last_off, l2off_since = 0, None, False
+    for r in mw:
+        o = off(r["addr"])
+        if o == OFF_GPU_COMMAND and r["val"] == SOFT_RESET:
+            resets_since += 1
+        elif o == OFF_L2_PWROFF:
+            last_off, l2off_since = r, True
+        elif o == OFF_TILER_PWRON:
+            ups.append(dict(r=r, resets=resets_since, off=last_off, l2off=l2off_since))
+            resets_since, l2off_since = 0, False
+    print("%-6s %-9s %-10s %-9s %-8s %s" % ("row", "softreset", "prevL2off", "dt_ms", "L2off_in", "caller"))
+    for u in ups:
+        r, p = u["r"], u["off"]
+        print("%-6d %-9s %-10s %-9s %-8s %s" % (r["n"], "yes" if u["resets"] else "NO", p["n"] if p else "-",
+                                                "%.3f" % ((r["ts"] - p["ts"]) * 1000) if p else "-", "yes" if u["l2off"] else "no", r["caller"]))
+    nores = [u for u in ups if not u["resets"]]
+    for u in nores:
+        n = u["r"]["n"]
+        print("NO-RESET power-up row %d; previous 10 rows:" % n)
+        for q in rows[max(0, n - 10):n]:
+            print("  " + short(q, mp))
+    if not nores:
+        print("all power-ups preceded by a reset")
+    elif all(not u["l2off"] for u in nores) and all(u["l2off"] for u in ups if u["resets"]):
+        print("HYPOTHESIS: every power-up without reset has no L2_PWROFF since the previous power-up (L2 stayed on), every power-up with reset has one")
+    elif _dt_separates(ups):
+        d0 = [(u["r"]["ts"] - u["off"]["ts"]) * 1000 for u in nores]
+        d1 = [(u["r"]["ts"] - u["off"]["ts"]) * 1000 for u in ups if u["resets"] and u["off"]]
+        print("HYPOTHESIS (timing only, mechanism is a guess): unreset power-ups follow L2_PWROFF by <= %.3f ms, reset ones by >= %.3f ms" % (max(d0), min(d1)))
+    else:
+        print("no pattern found (L2_PWROFF-in-between does not separate the %d unreset power-ups from the rest)" % len(nores))
+    ck = Checks()
+    ck.check("tilerpwron", spec["tilerpwron"], cnt(OFF_TILER_PWRON))
+    ck.check("softreset", spec["softreset"], cnt(OFF_GPU_COMMAND, SOFT_RESET))
+    ck.check("shader_pwron", spec["shader_pwron"], cnt(OFF_SHADER_PWRON))
+    ck.check("l2_pwron", spec["l2_pwron"], cnt(OFF_L2_PWRON))
+    print("RESULT: %s powerups=%d without_reset=%d checks=%d mismatches=%d" % ("FAIL" if ck.bad else "PASS", len(ups), len(nores), ck.n, ck.bad))
+    return 1 if ck.bad else 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="golden-gpu-analyze")
+    sub = ap.add_subparsers(dest="cmd")
+    for name in ("rows", "dpu-commit"):
+        p = sub.add_parser(name)
+        p.add_argument("file")
+        p.add_argument("--from", dest="from_", type=int, required=True)
+        p.add_argument("--to", type=int, required=True)
+        if name == "rows":
+            p.add_argument("--csv", action="store_true")
+        else:
+            p.add_argument("--out")
+            p.add_argument("--spec")
+    p = sub.add_parser("power-cycles")
+    p.add_argument("file")
+    p.add_argument("--spec")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as e:
+        return 0 if e.code == 0 else 2
+    if not a.cmd:
+        print("RESULT: ERROR no subcommand")
+        return 2
+    try:
+        return {"rows": cmd_rows, "dpu-commit": cmd_dpu, "power-cycles": cmd_power}[a.cmd](a)
+    except Err as e:
+        print("RESULT: ERROR %s" % e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

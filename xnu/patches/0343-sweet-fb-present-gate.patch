@@ -1,0 +1,135 @@
+SWEET present gate (patch 0343, LOWCLK lever real-flush, own code; boot-arg sweetfb_gate=1, default off = behaviour unchanged): kernel half of a non-blocking glFlush. libsweetgl made glFlush a glFinish so the panel copy (AppleCLCD::present, a CPU read of the IOSurface) never sees a frame the GPU is still drawing (docs/research/33 s.3 item 4: glFinish per frame OR a GPU fence the kernel waits on). With the gate on, swap() notes the last submitted Mali seqno (sweet_mali_seq_peek, lock-free, patch 0186) and the vsync tick copies that swap only once the in-order completion watermark reached it; until then the panel keeps the previous frame, fDirty stays set and the frame is shown on the first tick after completion (never sooner than fFlushTicks after the previous copy). Fail open and loud: Mali not up/dead = no gate; a swap held back 12 ticks (200 ms) is shown anyway with `SWEET FB: GAP GATE timeout ...`. Lines: `SWEET FB: present gate ON (sweetfb_gate=1, patch 0343) ...` at start, `SWEET FB: GATE shown N defer D timeout T maxticks M` every 300 ticks while the counts move. Read-only sysctl kern.sweetfbgate = 1 tells libsweetgl (userland lowclk/real-flush) that the gate exists; without it libsweetgl keeps glFlush = glFinish. No register access, no hardware write, no new wait (the tick compares two counters). With the gate on and an unchanged libsweetgl every swap arrives complete and the gate never defers. Not covered [read]: the per-swap pixel samples of sweetfps=2 / nav probes read the surface at swap time and can see an incomplete frame when libsweetgl really flushes. Host-checked: applies after 0339, kernel builds; not run on hardware.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -152,6 +152,9 @@
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	bool          fVsyncIdle;     /* patch 0190: vsync timer parked, no client and nothing to show (fLock) */
++	uint64_t      fSwapSeq;       /* patch 0343: last submitted Mali seqno at the latest swap (0 = none / Mali not up); fLock */
++	uint64_t      fLastPresentCount;      /* patch 0343: vsync count of the last panel copy */
++	uint32_t      fGateTicks;     /* patch 0343: flush ticks the pending swap was held back by the present gate; fLock */
+ 
+ 	bool needsVsync(void);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -166,6 +169,26 @@
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ /*
++ * Present gate (patch 0343, LOWCLK lever real-flush; boot-arg sweetfb_gate=1, default off = behaviour unchanged). libsweetgl made glFlush a glFinish so
++ * that the panel copy (present(), a CPU read of the IOSurface) never sees a frame the GPU is still drawing (research 33 s.3 item 4: "either glFinish
++ * per frame in the shim or an explicit GPU fence the kernel waits on"). This is the kernel half of the second option: swap() notes the last SUBMITTED
++ * Mali seqno (sweet_mali_seq_peek, lock-free; the frame's jobs all have their seqno when glFlush returns, also parked ones: patch 0227), and the vsync
++ * tick copies the swap only once the in-order completion watermark reached it (seq_done >= that seqno; patch 0240 K3 keeps the watermark in order).
++ * Until then the panel keeps the previous frame, fDirty stays set (the timer keeps running, needsVsync) and the frame is shown on the first tick after
++ * completion, any tick, but never sooner than fFlushTicks after the previous copy (the sweetfb_hz copy budget holds). Fail open, never silent: Mali
++ * not up/dead = no gate; a swap held back SWEET_FB_GATE_MAX_TICKS ticks (200 ms) is shown anyway and counted as timeout (GAP line). No register
++ * access, no new wait: the tick only compares two counters. kern.sweetfbgate (read-only) = 1 tells libsweetgl the gate exists; without it libsweetgl
++ * keeps glFlush = glFinish. With the gate on and libsweetgl unchanged every swap arrives complete (gpu_seq == gpu_done) and the gate never defers.
++ * Line (every 300 ticks with a non-zero count, and nothing else): `SWEET FB: GATE shown N defer D timeout T maxticks M` (sums since boot; maxticks = longest hold of the window).
++ */
++#define SWEET_FB_GATE_MAX_TICKS 12
++static int gSweetFbGate;   /* boot-arg sweetfb_gate, read once in start() */
++static uint64_t sweet_fb_gate_shown, sweet_fb_gate_defer, sweet_fb_gate_timeout;   /* fLock */
++static uint32_t sweet_fb_gate_maxticks, sweet_fb_gate_logged_at;                       /* fLock */
++static uint64_t sweet_fb_gate_logged_sum;
++SYSCTL_INT(_kern, OID_AUTO, sweetfbgate, CTLFLAG_RD | CTLFLAG_LOCKED, &gSweetFbGate, 0, "patch 0343: 1 = present gate on (a swap is shown after its GPU jobs completed)");
++
++/*
+  * configd's InterfaceNamer (the "network stack" part of SCNetworkInterfaceCopyAll, which Settings -> About calls on the main
+  * thread) matches IOServiceMatching("IONetworkStack"), IOServiceOpen()s it and keeps the connection in a flag (configd
+  * disassembly: first-match callback 0x100018894, flag 0x100071b38). When IOKit goes quiet and the flag is 0 it only logs
+@@ -306,6 +329,17 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	{
++		int g = 0;
++		if (PE_parse_boot_argn("sweetfb_gate", &g, sizeof(g)) && g != 0) {
++			if (g == 1) {
++				gSweetFbGate = 1;
++				IOLog("SWEET FB: present gate ON (sweetfb_gate=1, patch 0343): a swap is copied to the panel only after its GPU jobs completed, max hold %u ticks\n", SWEET_FB_GATE_MAX_TICKS);
++			} else {
++				IOLog("SWEET FB: GAP sweetfb_gate=%d is not 0 or 1: present gate OFF\n", g);
++			}
++		}
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -474,17 +508,63 @@
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool gate_timeout_log = false, gate_stat_log = false;
++	uint64_t gate_seq = 0, gate_done = 0, gl_shown = 0, gl_defer = 0, gl_timeout = 0;
++	uint32_t gl_max = 0;
++	if (gSweetFbGate && fb->fDirty) {   /* patch 0343: present gate, see the comment at gSweetFbGate */
++		if (!flush && fb->fGateTicks != 0 && count - fb->fLastPresentCount >= fb->fFlushTicks) {
++			flush = true;   /* a held-back swap: any tick, once the copy budget allows */
++		}
++		if (flush && fb->fSwapSeq != 0) {
++			uint64_t sq = 0, dn = 0;
++			if (sweet_mali_seq_peek(&sq, &dn) == 0 && dn < fb->fSwapSeq) {
++				if (fb->fGateTicks < SWEET_FB_GATE_MAX_TICKS) {
++					fb->fGateTicks++;
++					sweet_fb_gate_defer++;
++					flush = false;
++				} else {
++					sweet_fb_gate_timeout++;
++					gate_timeout_log = (sweet_fb_gate_timeout <= 20 || (sweet_fb_gate_timeout % 100) == 0);
++					gate_seq = fb->fSwapSeq;
++					gate_done = dn;
++				}
++			}
++		}
++		if (fb->fGateTicks > sweet_fb_gate_maxticks) {
++			sweet_fb_gate_maxticks = fb->fGateTicks;
++		}
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fGateTicks = 0;
++			fb->fLastPresentCount = count;
++			if (gSweetFbGate) {
++				sweet_fb_gate_shown++;
++			}
++		}
++	}
++	if (gSweetFbGate && (uint32_t)count - sweet_fb_gate_logged_at >= 300) {
++		sweet_fb_gate_logged_at = (uint32_t)count;
++		if (sweet_fb_gate_defer + sweet_fb_gate_timeout != sweet_fb_gate_logged_sum) {   /* quiet while the gate never held anything back */
++			sweet_fb_gate_logged_sum = sweet_fb_gate_defer + sweet_fb_gate_timeout;
++			gate_stat_log = true;
++			gl_shown = sweet_fb_gate_shown; gl_defer = sweet_fb_gate_defer; gl_timeout = sweet_fb_gate_timeout; gl_max = sweet_fb_gate_maxticks;
++			sweet_fb_gate_maxticks = 0;
+ 		}
+ 	}
+ 	again = fb->needsVsync();
+ 	fb->fVsyncIdle = !again;
+ 	IOLockUnlock(fb->fLock);
++	if (gate_timeout_log) {
++		IOLog("SWEET FB: GAP GATE timeout: swap seq %llu not complete after %u ticks (gpu_done %llu): shown anyway, the frame may be incomplete\n", gate_seq, SWEET_FB_GATE_MAX_TICKS, gate_done);
++	}
++	if (gate_stat_log) {
++		IOLog("SWEET FB: GATE shown %llu defer %llu timeout %llu maxticks %u\n", gl_shown, gl_defer, gl_timeout, gl_max);
++	}
+ 	if (rec != NULL) {
+ 		sweet_panel_lock();   /* patch 0276: a panel readback never sees half a copy */
+ 		fb->present(rec);
+@@ -837,6 +917,10 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	if (gSweetFbGate) {   /* patch 0343: the GPU work this frame needs = everything submitted so far (in-order queue); 0 = no gate for this swap */
++		uint64_t gsq = 0, gdn = 0;
++		fSwapSeq = (sweet_mali_seq_peek(&gsq, &gdn) == 0) ? gsq : 0;
++	}
+ 	IOLockUnlock(fLock);
+ 	sweet_fb_last_swap_abs = mach_absolute_time();   /* patch 0260 */
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {

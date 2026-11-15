@@ -70,7 +70,7 @@ struct jctx {
 /* The allowlist. RAM: any aligned word inside the five scratch pages. Registers: exactly these (address, value) pairs. */
 static int w32_allowed(uintptr_t pa, uint32_t v, const struct jctx *j)
 {
-	if (pa >= j->base && pa < j->base + NPAGES * PG)
+	if (pa >= j->base && pa < j->base + (uintptr_t)NPAGES * PG)
 		return !(pa & 3u);
 	if (pa == A_AS_TRANSCFG_LO)
 		return v == GPU_JOB_TRANSCFG_ON || v == GPU_JOB_TRANSCFG_OFF;
@@ -199,7 +199,7 @@ static int build(const struct jctx *j)
 {
 	int e = 0;
 
-	for (unsigned i = 0; i < NPAGES * PG / 4u && !e; i++)
+	for (uintptr_t i = 0; i < NPAGES * PG / 4u && !e; i++)
 		e = w32(j->base + 4u * i, 0, j);
 	if (e)
 		return e;

@@ -1,0 +1,23 @@
+SWEET surface row align (patch 0159, G-11 icons): a single-plane IOSurface create rounds IOSurfaceBytesPerRow up to SWEET_SURFACE_ROW_ALIGN (64). CoreAnimation asks for exact pitches (600x600 BGRA 2400, 'LA08' 230 wide 480) that Mali Valhall cannot import as a linear resource (pan_linear_or_tiled_row_align_req = 64), which forced libsweetgl to copy surfaces once; the copied icon surfaces held 0 nonzero bytes (gputest74: content arrives after the bind), so icons were transparent. With a 64-aligned pitch libsweetgl imports them live (zero copy). Multi-plane surfaces are unchanged; boot-arg sweetsurf_rowalign=0 disables the rounding; clients read the real pitch from the create reply.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -302,6 +302,19 @@
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/* Patch 0159: a single-plane surface keeps the row pitch the client asked for only if it is a multiple of SWEET_SURFACE_ROW_ALIGN (64).
++	 * CoreAnimation asks for exact pitches (600x600 BGRA: 2400, 'LA08' 230 wide: 480) that Mali Valhall cannot import as a linear resource
++	 * (pan_linear_or_tiled_row_align_req = 64 [src pan_layout.h]), which forced a one-shot CPU copy of surfaces whose content arrives later (g74: 0
++	 * nonzero bytes at copy time, icons transparent). IOSurface clients read the real pitch back from the create reply. Multi-plane surfaces
++	 * (display 'b3a8') are left alone. */
++	uint32_t rowalign = 1;
++	(void)PE_parse_boot_argn("sweetsurf_rowalign", &rowalign, sizeof(rowalign));   /* =0 disables the rounding (escape: [guess] clients read the pitch back from the create reply; one that writes with its own pitch would shear icons) */
++	if (rowalign != 0 && props->getObject("IOSurfacePlaneInfo") == NULL) {
++		uint64_t ap = ((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
++		if (ap != s->bytesPerRow && ap <= 0x7fffffffULL) {
++			s->bytesPerRow = (uint32_t)ap;
++		}
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));

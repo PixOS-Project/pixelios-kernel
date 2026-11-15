@@ -46,6 +46,8 @@ static int ignore_req;		/* 1: FREQ_REQ is accepted and answered but the rate doe
 static uint64_t delay_ticks, due, cur_delay;
 static unsigned delay_from;	/* the delay applies from this doorbell on (1-based; 0 = all of them) */	/* >0: the reply comes this many fake ticks after the doorbell (time based; 0 = after apm_delay polls) */
 static uint32_t get_err;	/* reply word 3 of FREQ_GET (error code) */
+static uint32_t get_err_dom;	/* 0: get_err applies to every domain, N: only to domain N-1 (T-5030) */
+static uint32_t req_err;	/* reply word 3 of FREQ_REQ (error code; T-5030) */
 static int never;		/* the APM never takes the request */
 static unsigned never_at;	/* the APM stops taking requests from this doorbell on (1-based; 0 = off) */
 static int badseq;		/* replies carry another sequence number */
@@ -70,12 +72,14 @@ static void setS(uint32_t off, uint32_t v) { sram[off / 4] = v; }
 static int in_table(uint32_t dom, uint32_t khz)
 {
 	static const uint32_t cl0[] = { 2196000, 2098000, 2024000, 1950000, 1803000, 1704000, 1598000, 1401000, 1328000, 1197000 };
-	static const uint32_t cl1[] = { 2466000, 2393000, 1836000, 1197000 };
-	static const uint32_t cl2[] = { 3195000, 1826000, 1106000 };
+	static const uint32_t cl1[] = { 2466000, 2393000, 2253000, 1836000, 1197000 };
+	static const uint32_t cl2[] = { 3195000, 2850000, 2802000, 1826000, 1106000 };
 	static const uint32_t g3d[] = { 848000, 762000, 701000, 572000, 510000, 471000, 400000, 351000, 302000, 251000, 202000, 151000 };	/* run g0b */
 	static const uint32_t g3dl2[] = { 996000, 885000, 750000, 603000, 434000, 302000, 151000 };
-	const uint32_t *t = dom == 2 ? cl0 : dom == 3 ? cl1 : dom == 5 ? g3d : dom == 6 ? g3dl2 : cl2;
-	unsigned n = dom == 2 ? 10 : dom == 3 ? 4 : dom == 5 ? 12 : dom == 6 ? 7 : 3, i;
+	static const uint32_t mif[] = { 3172000, 2730000, 2535000, 2288000, 2028000, 1716000, 1539000, 1352000, 1014000, 845000, 676000, 546000, 421000 };	/* run gputest-bbb3-mem */
+	static const uint32_t intc[] = { 533000, 465000, 332000, 267000, 200000, 155000, 100000 };
+	const uint32_t *t = dom == 2 ? cl0 : dom == 3 ? cl1 : dom == 5 ? g3d : dom == 6 ? g3dl2 : dom == 0 ? mif : dom == 1 ? intc : cl2;
+	unsigned n = dom == 2 ? 10 : dom == 3 ? 5 : dom == 5 ? 12 : dom == 6 ? 7 : dom == 0 ? 13 : dom == 1 ? 7 : 5, i;
 
 	for (i = 0; i < n; i++)
 		if (t[i] == khz)
@@ -93,12 +97,13 @@ static void apm_complete(void)
 	if (fn == 1) {			/* FREQ_GET */
 		nget++;
 		r1 = cur[dom & 7];
-		r3 = get_err;
+		r3 = (!get_err_dom || get_err_dom == (dom & 7) + 1) ? get_err : 0;
 	} else {			/* FREQ_REQ */
 		nreq++;
 		if (!ignore_req && in_table(dom, apm_w[1]))
 			cur[dom & 7] = apm_w[1];
 		r1 = cur[dom & 7];
+		r3 = req_err;
 	}
 	setS(RSP_BASE_O + ESZ * sf + 0, r0);
 	setS(RSP_BASE_O + ESZ * sf + 4, r1);
@@ -173,6 +178,8 @@ static void setup(uint32_t q_elem_size)
 	delay_ticks = due = cur_delay = 0;
 	delay_from = 0;
 	get_err = 0;
+	get_err_dom = 0;
+	req_err = 0;
 	never = badseq = 0;
 	never_at = 0;
 	apm_delay = 3;
@@ -183,6 +190,8 @@ static void setup(uint32_t q_elem_size)
 	cur[3] = 1197000;
 	cur[4] = 1106000;
 	cur[5] = cur[6] = 151000;	/* G3D / G3DL2 at the firmware's init level (run g0b) */
+	cur[0] = 2730000;		/* MIF / INT below their top rows (mifclk_host_test; the real values are what --mif-clk reads on the phone) */
+	cur[1] = 465000;
 	setS(INIT_O + 0x08, TAB_O);
 	setS(INIT_O + 0x0C, 3);
 	setS(INIT_O + 0x18, 3);		/* ipc_ap_max: channels 0, 1, 2 */
@@ -254,8 +263,8 @@ static void test_config(void)
 	assert(cfg.dvfs_ch == 1 && acpm_dvfs_ndom() == 3);
 	assert(acpm_dvfs_dom(0, &d) && d == 2 && acpm_dvfs_dom(1, &d) && d == 3 && acpm_dvfs_dom(2, &d) && d == 4 && !acpm_dvfs_dom(3, &d));
 	/* ceilings are table rows (also enforced by tools/boards.py); the very first rows are above them */
-#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* the tables exist only in images that can send a request (acpm.c); the rw run checks them */
-	assert(dvfs_ceil[0] == 1803000 && dvfs_ceil[1] == 1836000 && dvfs_ceil[2] == 1826000);
+#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK) || defined(MIF_CLK)	/* the tables exist only in images that can send a request (acpm.c); the rw run checks them */
+	assert(dvfs_ceil[0] == 1803000 && dvfs_ceil[1] == 2253000 && dvfs_ceil[2] == 2802000);
 	assert(dvfs_rate[0][0] == 2196000 && dvfs_rate[1][0] == 2466000 && dvfs_rate[2][0] == 3195000);
 	assert(dvfs_nr[0] == 15 && dvfs_nr[1] == 17 && dvfs_nr[2] == 21);
 #endif
@@ -290,7 +299,7 @@ static void test_get(void)
 	setup(ESZ);
 	t = trace();
 	assert(acpm_dvfs_get(&cfg, 7, &khz, &t) == ACPM_E_ARG && t.a.why == ACPM_W_DOM && nw == 0 && nbell == 0);
-	assert(acpm_dvfs_get(&cfg, 0, &khz, &t) == ACPM_E_ARG && nw == 0);
+	assert(acpm_dvfs_get(&cfg, 9, &khz, &t) == ACPM_E_ARG && nw == 0);
 	/* an error code in reply word 3 is a failure, and the channel is drained */
 	setup(ESZ);
 	t = trace();
@@ -329,6 +338,12 @@ static void test_set(void)
 	struct acpm_trace t = trace();
 	uint32_t khz = 0;
 
+	/* review L1 (T-a214): acpm_dvfs_set does not find the GPU domains 5 / 6 (their client is acpm_dvfs_reassert): refused before the pre-read, nothing sent */
+	setup(ESZ);
+	t = trace();
+	assert(acpm_dvfs_set(&cfg, 5, 151000, &t) == ACPM_E_ARG && t.a.why == ACPM_W_DOM && nw == 0 && nbell == 0 && nget == 0 && nreq == 0);
+	assert(acpm_dvfs_set(&cfg, 6, 151000, &t) == ACPM_E_ARG && nw == 0 && nbell == 0);
+	assert(acpm_dvfs_set(&cfg, 5, 572000, &t) == ACPM_E_ARG && acpm_dvfs_set(&cfg, 6, 750000, &t) == ACPM_E_ARG && nw == 0 && nreq == 0);
 	/* ok, the APM replies to the request */
 	setup(ESZ);
 	t = trace();
@@ -384,9 +399,11 @@ static void test_set(void)
 	setup(ESZ);
 	t = trace();
 	assert(acpm_dvfs_set(&cfg, 2, 1803000, &t) == ACPM_OK);
-	assert(acpm_dvfs_set(&cfg, 3, 1836000, &t) == ACPM_OK);
-	assert(acpm_dvfs_set(&cfg, 4, 1826000, &t) == ACPM_OK);
-	assert(cur[2] == 1803000 && cur[3] == 1836000 && cur[4] == 1826000 && nreq == 3);
+	assert(acpm_dvfs_set(&cfg, 3, 2253000, &t) == ACPM_OK);
+	assert(acpm_dvfs_set(&cfg, 4, 2802000, &t) == ACPM_OK);
+	assert(cur[2] == 1803000 && cur[3] == 2253000 && cur[4] == 2802000 && nreq == 3);
+	/* sprint-gpu 2026-11-08: the rows just above the new CL1 / CL2 ceilings (stock Pixel 6a maxima) stay refused */
+	assert(acpm_dvfs_set(&cfg, 3, 2393000, &t) == ACPM_E_ARG && acpm_dvfs_set(&cfg, 4, 2850000, &t) == ACPM_E_ARG && nreq == 3);
 	only_channel_writes();
 }
 

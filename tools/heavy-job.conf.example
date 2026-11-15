@@ -1,0 +1,5 @@
+# tools/heavy-job.conf.example (T-ee35): template for the per-user heavy-job limit file.
+# Real file: ${HEAVY_JOB_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pixelios/heavy-job.conf} (outside git; the web board's limit field writes it).
+# heavy-job re-reads it on every poll of its admission gate; an explicit env HEAVY_JOB_CPU_PSI_MAX wins over this file.
+# A local heavy job starts only while /proc/pressure/cpu "some" avg10 is below this percentage. Whole number 5-80; default 20 (T-a8b4).
+HEAVY_JOB_CPU_PSI_MAX=20

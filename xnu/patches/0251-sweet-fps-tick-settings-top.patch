@@ -1,0 +1,130 @@
+SWEET nav6 fixes (patch 0251, T-49fb, G-10b-nav; log only, input injection unchanged except one drag length): (1) the SWEET FPS bin of patch 0141/0244 is also printed by the vsync timer (sweet_fps_tick from AppleCLCD::vsyncFired) once it is >= 1 s old and holds a distinct frame, same line format: before, a bin was printed only by the next swap after >= 1 s, so an animation that ended inside the second after a line was stamped when the next action's first swap came, outside its own window (nav5 rep 1 app-launch: 37 Clock-launch swaps stamped 4.4 s late, scorer 'no-anim' [obs run 20261108T062128Z-gputest-nav5]); (2) nav action settings-scroll-down drags 400 -> 2300 (was 700 -> 1800) so the Settings list returns to its top: nav5 rep 2 left it about 1.5 rows down and general-open tapped Display & Brightness, not General, so about-open opened nothing [obs camera frames nav-r02-settings-open vs nav-r01-settings-open, nav-r02-general-open]. No register, no store.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 15172b1..05bf7be 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -340,6 +340,8 @@ sweet_fb_rearm(IOTimerEventSource *sender, uint64_t now)
+ static volatile uint64_t sweet_fb_vsync_count_mirror;   /* patch 0166: fVsyncCount is protected; the user client reads this copy (written in vsyncFired) */
+ static uint64_t sweet_fb_last_vsync_ns;   /* patch 0146: host time of the last vsync callback sent to CA, for the swap-after-vsync latency */
+ 
++static void sweet_fps_tick(uint64_t now_ns);   /* patch 0251 */
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -382,6 +384,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 		}
+ 		sweet_fb_last_vsync_ns = vns;
++		sweet_fps_tick(vns);   /* patch 0251: print a pending SWEET FPS bin that no swap came to stamp */
+ 	}
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	bool again;
+@@ -653,6 +656,55 @@ static int sweet_lat_state;   /* 0 idle, 1 waiting for the first changed swap, 2
+ 
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
++/*
++ * Patch 0251 (T-49fb, G-10b-nav): the SWEET FPS statistics of patch 0141 / 0244 moved to file scope so that the vsync timer can print a pending bin too.
++ * Until now a bin was printed only by the next swap that arrived >= 1 s after the previous line, so an animation that stopped inside the second after a
++ * line (the Clock launch of nav5 rep 1: 37 swaps in 0.25 s, then none) was stamped when the NEXT action's first swap came (4.4 s later, outside its action's
++ * window): `gpu-nav-score` saw no bin for the action [obs run 20261108T062128Z-gputest-nav5: app-launch rep 1 'no-anim', its 37 swaps sit in the app-idle bin
++ * stamped 181.093]. sweet_fps_tick() runs from vsyncFired every vsync and prints the bin once it is >= 1 s old and holds a distinct frame, with the same line
++ * format; an idle second is not printed and does not move sec_start (the first swap after idle still prints its own 1-swap lead bin). sweet_fps_emit() is
++ * entered by one thread at a time (OSCompareAndSwap try-lock, a contender skips: the next swap or tick prints); the counters themselves stay unlocked as before.
++ * Log only.
++ */
++static int fps_on = -1, fps_dense;
++static uint32_t last_hash, n_swaps, n_dist, idle_secs;
++static uint32_t n_dist4k, n_small, dense_prev[64 * 64];   /* patch 0244 */
++static bool dense_have, dense_gap_said;
++static uint64_t sec_start, last_dist_t, max_gap_ns;
++static volatile UInt32 fps_emit_busy;
++
++static void
++sweet_fps_emit(uint64_t now_ns, bool tick)
++{
++	if (!OSCompareAndSwap(0, 1, &fps_emit_busy)) {
++		return;
++	}
++	if (sec_start != 0 && now_ns - sec_start >= 1000000000ull) {
++		bool pending = n_dist > 0 || n_dist4k > 0;
++		if (pending || (!tick && (++idle_secs % 10) == 0)) {
++			if (fps_dense) {
++				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u distinct4k %u small_chg %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000), n_dist4k, n_small);
++			} else {
++				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000));
++			}
++		}
++		if (pending || !tick) {
++			n_swaps = n_dist = n_dist4k = n_small = 0;
++			max_gap_ns = 0;
++			sec_start = now_ns;
++		}
++	}
++	OSCompareAndSwap(1, 0, &fps_emit_busy);
++}
++
++static void
++sweet_fps_tick(uint64_t now_ns)
++{
++	if (fps_on > 0) {
++		sweet_fps_emit(now_ns, true);
++	}
++}
++
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+@@ -808,7 +860,6 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	 * content differs from the previous one ("distinct") and the longest gap between distinct frames in the second ("jank"). One
+ 	 * line per second that had a distinct frame (an idle second prints every 10th). Read-only.
+ 	 */
+-	static int fps_on = -1, fps_dense;
+ 	if (fps_on < 0) {
+ 		int v = 0;
+ 		fps_on = (PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0) ? 1 : 0;
+@@ -817,10 +868,6 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if (!fps_on) {
+ 		return;
+ 	}
+-	static uint32_t last_hash, n_swaps, n_dist, idle_secs;
+-	static uint32_t n_dist4k, n_small, dense_prev[64 * 64];   /* patch 0244 */
+-	static bool dense_have, dense_gap_said;
+-	static uint64_t sec_start, last_dist_t, max_gap_ns;
+ 	uint64_t now_ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 	uint32_t id = get32(rec, 0x54);
+@@ -884,18 +931,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if (sec_start == 0) {
+ 		sec_start = now_ns;
+ 	}
+-	if (now_ns - sec_start >= 1000000000ull) {
+-		if (n_dist > 0 || n_dist4k > 0 || (++idle_secs % 10) == 0) {
+-			if (fps_dense) {
+-				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u distinct4k %u small_chg %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000), n_dist4k, n_small);
+-			} else {
+-				IOLog("SWEET FPS: swaps %u distinct %u max_gap_ms %u\n", n_swaps, n_dist, (uint32_t)(max_gap_ns / 1000000));
+-			}
+-		}
+-		n_swaps = n_dist = n_dist4k = n_small = 0;
+-		max_gap_ns = 0;
+-		sec_start = now_ns;
+-	}
++	sweet_fps_emit(now_ns, false);
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 31f0d62..f0b41a5 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -412,7 +412,7 @@ static const SweetNavAct sweetNavActs[] = {
+ 	{ "about-back",       1,    5, 1200,  700, 1200, 250, 1200 },   /* edge back-swipe [guess] */
+ 	{ "general-back",     1,    5, 1200,  700, 1200, 250, 1200 },
+ 	{ "settings-scroll-up", 1, 540, 1800, 540,  700, 350,  900 },
+-	{ "settings-scroll-down", 1, 540, 700, 540, 1800, 350,  900 },
++	{ "settings-scroll-down", 1, 540, 400, 540, 2300, 350,  900 },   /* patch 0251: 1900 px (was 1100) so the list is back at its top, rubber-banded: nav5 rep 2 left it ~1.5 rows down and general-open hit Display & Brightness [obs frames nav-r02-settings-open vs nav-r01-settings-open] */
+ 	{ "app-home",         1,  540, 2398,  540, 1200, 200, 1500 },   /* calibrated: 2350 does not work inside an app */
+ 	{ "app-launch",       0,  676, 1720,    0,    0, 100, 3000 },   /* Settings icon (page 1) from the home screen after app-home: the same tap as settings-open, which animated 3/3 in nav1 [obs]; no longer behind Spotlight (T-b872) */
+ 	{ "app-idle",         2,    0,    0,    0,    0,   0, 3000 },

@@ -1,0 +1,113 @@
+SWEET Bluetooth: patch 0274 (sprint-bt 2026-11-09), boot-arg sweetbtlefeat=1 (default off): controller bring-up step after a verified patchram download (0228), replacing the diagnostic rx rewrite sweetbtnopadv=1 (0225) at its cause. bluetoothd runs this phone on the D22 platform profile (legacy LE scanning; its chipset enum is outside 0x13..0x17, so extended scans / advertising sets are off [bin bluetoothd 0x10025a4e8]), but sends the extended-class 0x204a whenever the controller reports LE feature bit 13 Periodic Advertising [bin 0x10010b5a8..0x10010b5c4], after which the BCM4389 refuses every legacy LE command with 0x0c (Core v5.4 Vol 4 Part E s.3.1.1). The step reads 0x2003, clears only bit 13, writes the 8 bytes back with the Broadcom VSC 0xfd3c (the command the platform's own stack sends: _BCM_WriteLELocalSupportedFeatures, bt-up9 status 00), sends HCI Reset and reads 0x2003 again to prove the value holds across the Reset bluetoothd sends first (persistence observed bt-up10). Rows `BT LEFEAT: before/after reset/done`; every missing answer or status != 0 is a BT GAP and stops the step; the knob is loud when patchram did not run. Nothing in bluetoothd's command/event stream is rewritten. Applies after 0232.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index b9ed817..53f0dd0 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -1555,6 +1555,70 @@ sbu_patchram(const struct sbu_cand *cand)
+ 	return 0;
+ }
+ 
++/*
++ * patch 0274 (sprint-bt 2026-11-09), boot-arg sweetbtlefeat=1: controller bring-up step, NOT a rewrite of bluetoothd's stream. bluetoothd runs this phone with the D22
++ * (iPhone X) platform profile: legacy scanning, chipset enum outside 0x13..0x17 so "BT chip support for extended scans / advertising sets" is off [bin bluetoothd
++ * 0x10025a4e8/0x10025a510/0x10025a114: (chipset - 0x13) < 5]. It still sends HCI_LE_Read_Periodic_Advertiser_List_Size (0x204a, an EXTENDED command, Core v5.4
++ * Vol 4 Part E s.3.1.1 table 3.2) whenever the controller reports LE feature bit 13 Periodic Advertising [bin 0x10010b5a8..0x10010b5c4: LE supported (LMP byte 4
++ * bit 6, stored 0x10010be8c) && LE features byte 1 bit 5]. The patched BCM4389 reports it (bt-up9 `ef 79 ff ff 0e ..`), so after that 0x204a every legacy command
++ * (0x2007/0x200b/0x200c) is refused with 0x0c, as s.3.1.1 requires. The platform's own stack writes the controller's LE feature set with the Broadcom VSC 0xfd3c
++ * (_BCM_WriteLELocalSupportedFeatures(uint8_t *), 8 bytes, bluetoothd bcm_vsc.c, builder 0x10012e940; bt-up9 tx `01 3c fd 08 ef 79 ff ff 09 00 00 00`, status 00),
++ * and the value it writes survives HCI Reset (bt-up10: after instance 1 wrote `ef 59 ..`, every later instance read `ef 59 ff ff 08` after its own Reset) [obs].
++ * This step does what a platform-matched controller configuration does before the host stack starts: read 0x2003, clear ONLY bit 13 (byte 1 bit 5), write the 8 bytes back
++ * with 0xfd3c, then Reset and read 0x2003 again to prove the value holds across the Reset bluetoothd sends first. Any other byte is written back unchanged. Every missing
++ * answer or status != 0 is a BT GAP and stops the step (the controller keeps the patch; bluetoothd then meets the unmodified feature set and the failure is visible).
++ */
++static void
++sbu_lefeat_unused(const char *why)
++{
++	int v = 0;
++
++	if (PE_parse_boot_argn("sweetbtlefeat", &v, sizeof(v)) && v == 1) {
++		printf("BT GAP: sweetbtlefeat=1 ignored: %s (the step runs only after a verified patchram download)\n", why);
++	}
++}
++
++static int
++sbu_lefeat(void)
++{
++	uint8_t rp[SBU_PM_SUPP], f[8], w[8];
++	size_t rpn = 0;
++	int e;
++
++	if ((e = sbu_pr_cmd("le-read-features", 0x2003, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if (rpn < 8) {
++		SBU_GAP(SG_OTHER, "sweetbtlefeat: 0x2003 reply has %zu return bytes (need 8); nothing written", rpn);
++		return EPROTO;
++	}
++	memcpy(f, rp, 8);
++	printf("BT LEFEAT: before %02x %02x %02x %02x %02x %02x %02x %02x (bit 13 Periodic Advertising %s)\n", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], (f[1] & 0x20) != 0 ? "set" : "clear");
++	if ((f[1] & 0x20) == 0) {
++		printf("BT LEFEAT: bit 13 already clear: nothing written\n");
++		return 0;
++	}
++	memcpy(w, f, 8);
++	w[1] = (uint8_t)(w[1] & ~0x20);
++	if ((e = sbu_pr_cmd("le-write-features", 0xfd3c, w, 8, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if ((e = sbu_pr_cmd("le-reset", 0x0c03, NULL, 0, rp, sizeof(rp), &rpn)) != 0 || (e = sbu_pr_cmd("le-read-features-2", 0x2003, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if (rpn < 8) {
++		SBU_GAP(SG_OTHER, "sweetbtlefeat: 0x2003 reply after the Reset has %zu return bytes (need 8)", rpn);
++		return EPROTO;
++	}
++	printf("BT LEFEAT: after reset %02x %02x %02x %02x %02x %02x %02x %02x (bit 13 %s)\n", rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rp[6], rp[7], (rp[1] & 0x20) != 0 ? "SET" : "clear");
++	if ((rp[1] & 0x20) != 0) {
++		SBU_GAP(SG_OTHER, "sweetbtlefeat: bit 13 is set again after the Reset: the 0xfd3c value did not hold; bluetoothd will send 0x204a");
++		return EIO;
++	}
++	printf("BT LEFEAT: done: LE feature bit 13 cleared in the controller and held across HCI Reset\n");
++	return 0;
++}
++
+ /* attach side of the knob (review T-60ed F7: a function the host test can call). 0 = go on to bluetoothd (patched, refused or ROM restored), else the backend must not start. */
+ static int
+ sbu_patchram_attach(const struct sbu_cand *cand)
+@@ -1562,14 +1626,25 @@ sbu_patchram_attach(const struct sbu_cand *cand)
+ 	int e = sbu_patchram(cand);
+ 
+ 	if (e == 0) {
++		int v = 0;
++
+ 		printf("BT UART: patchram download verified; bluetoothd will meet the patched controller\n");
++		if (PE_parse_boot_argn("sweetbtlefeat", &v, sizeof(v)) && v == 1) {      /* patch 0274 */
++			int le = sbu_lefeat();
++
++			if (le != 0) {
++				printf("BT GAP: sweetbtlefeat=1 FAILED (error %d); bluetoothd meets the patched controller with its own LE feature set\n", le);
++			}
++		}
+ 		return 0;
+ 	}
+ 	if (e == SBU_PR_REFUSED) {
+ 		printf("BT GAP: sweetbtpatchram=1 had no effect (refused, nothing sent); bluetoothd meets the unpatched ROM\n");
++		sbu_lefeat_unused("patchram refused");
+ 		return 0;
+ 	}
+ 	printf("BT GAP: sweetbtpatchram=1 FAILED (error %d): power-cycling the controller back to the unpatched ROM for bluetoothd\n", e);
++	sbu_lefeat_unused("patchram failed");
+ 	(void)sbu_power_off();
+ 	e = sbu_probe_one(cand);
+ 	if (e != 0) {
+@@ -2558,6 +2633,9 @@ sweet_bt_uart_attach(void)
+ 					sbu_rfwit_unused("the backend did not start after the patchram step");
+ 					return;
+ 				}
++				if (v != 1) {
++					sbu_lefeat_unused("sweetbtpatchram=1 is not set");      /* patch 0274 */
++				}
+ 			}
+ 			{       /* patch 0229 (T-b0b4): boot-arg sweetbtrfwit=1, RF witness (LE scan 100% duty + classic Inquiry) on the controller bluetoothd will meet; before the rx thread */
+ 				int v = 0;

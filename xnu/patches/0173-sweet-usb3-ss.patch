@@ -1,0 +1,644 @@
+SWEET USB 3 SuperSpeed, DEFAULT ON for the gs101 gadget (patch 0173, boot-arg sweetusb3=0 opts out to the HS-only gadget; user order R27, 2026-10-29).
+With sweetusb=2 (and sweetusb3 absent or =1) the gs101 gadget starts with DCFG.DEVSPD = SuperSpeed (4) instead of high speed (0), and keeps
+everything else as ABL left it (no USB 3 PHY, PMU or clock writes; NUMP kept). At ConnectDone: SuperSpeed -> ep0 max packet 512,
+SuperSpeed descriptors (bcdUSB 0x0320, bMaxPacketSize0 9, BOS with USB 2.0 extension + SuperSpeed capability with U1/U2 exit
+latency 0, 1024-byte bulk + endpoint companions, bMaxPower in 8 mA units), bulk DEPCFG max packet 1024 burst 0; high speed -> the
+existing HS descriptors and ep0 64 byte for byte. SET_SEL is acknowledged with a "USB3 GAP:" line, SET_ISOCH_DELAY with an informational "USB3:" line (as Linux dwc3), U1/U2
+SET/CLEAR_FEATURE are stalled with a "USB3 GAP:" line. If the gadget is not configured 10000 ms after RUN (no ConnectDone, or a failed SuperSpeed enumeration), or a ConnectDone
+speed contradicts the programmed bulk max packet, the controller is stopped (RUN_STOP = 0, wait DEVCTRLHLT), soft-reset and
+restarted at high speed once (ud_restart; "USB3 GAP: ..."), so the USB log link survives a failed SuperSpeed link. The SuperSpeed
+path writes new values to DCFG.DEVSPD, DCTL.RUN_STOP (fallback) and the max-packet fields of DEPCMDPAR0 for ep0/bulk; the first
+two go through an allowlist (ud_ss_wr). sweetusb3 is parsed once (starts at 1, PE_parse_boot_argn returns TRUE only when the arg is present: pexpert/gen/bootargs.c, xnu-8796.141.3): the default prints "SWEET USB3: default ON (sweetusb3=0 opts out)", an explicit sweetusb3=0 prints "SWEET USB3: sweetusb3=0: opted out, HS-only gadget (explicit)", and a requested SuperSpeed (the default or sweetusb3=N, N != 0) on a gs101 sweetusb=2 start that does not reach ud_hw_init prints "USB3 GAP: sweetusb3=N ignored: gadget not started", and an explicit sweetusb3=N on any other path does too; the default on sweetusb=0/1 or non-gs101 stays silent. The silent `!pn` return of sweet_usb_gadget_start now has its own USB3 GAP line. Read-only reports before and after the soft reset (GUSB2PHYCFG, GUSB3PIPECTL, DCFG, DSTS, GHWPARAMS0/7, GTXFIFOSIZ(1)) printed
+as "SWEET USB3:" lines. Every field is cited in the code (Linux v6.12 dwc3 core.h/gadget.c/gadget.h/ep0.c, ch9.h, composite.c,
+f_ecm.c, hub.c; ABL decompile offsets); spec super docs/specs/SPEC-USB3-SUPERSPEED.md, research super docs/research/102.
+Hardware status [obs-hw, docs/runplans/usb3-ss.md]: observed only with an EXPLICIT sweetusb3=1: usb3-ss-1 (USB 2 link: connected at high speed, no fallback) and usb3-ss-2 (USB 3 link: connected at SuperSpeed). The default-ON path (no sweetusb3 arg, R27) and the 10 s HS fallback (ud_ss_fallback/ud_restart) are unobserved [guess: the default takes the same `usb3 == 1` branch as the explicit arg]; a hardware run is pending.
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -47,7 +47,8 @@
+ bool sweet_usb_board_is_gs101(void);
+ bool sweet_usb_raw_tx(const void *frame, uint32_t len);
+ static void sweet_usb_gadget_start(vm_offset_t dwc, uint64_t pool_pa);
+-static bool sweet_usb_probe_gs101(int mode);
++static bool sweet_usb_probe_gs101(int mode, uint32_t usb3, bool usb3_explicit);
++static void sweet_usb_probe_run(uint32_t usb3, bool usb3_explicit);
+ static void usb_dump_dwc3(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -96,8 +97,8 @@
+ 	    usb_rd(dwc, 0xc140));
+ }
+ 
+-void
+-sweet_usb_probe(void)
++static void
++sweet_usb_probe_run(uint32_t usb3, bool usb3_explicit)
+ {
+ 	int enabled = 1;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+@@ -109,7 +110,7 @@
+ 		return;
+ 	}
+ 	/* Pixel 6a (gs101): the ADT's /sweet-usb node selects a path without any Qualcomm block. */
+-	if (sweet_usb_probe_gs101(enabled)) {
++	if (sweet_usb_probe_gs101(enabled, usb3, usb3_explicit)) {
+ 		return;
+ 	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+@@ -199,6 +200,30 @@
+ #define DCTL_ULSTCHNGREQ (0xfu << 5)
+ #define DSTS_DEVCTRLHLT (1u << 22)
+ 
++/*
++ * USB 3 SuperSpeed (patch 0173, default ON, boot-arg sweetusb3=0 opts out, gs101 only). Field values, each cited:
++ * DCFG.DEVSPD [2:0] SUPERSPEED=4 / HIGHSPEED=0, DCFG.NUMP [21:17], DSTS.CONNECTSPD [2:0] SUPERSPEED=4,
++ * SUPERSPEED_PLUS=5, DSTS.USBLNKST [21:18], GHWPARAMS0.MDWIDTH [15:8], GHWPARAMS7.RAM2_DEPTH [31:16],
++ * GUSB2PHYCFG 0xc200, GUSB3PIPECTL 0xc2c0, GTXFIFOSIZ(n) 0xc300+4n TXFDEP [15:0]: Linux v6.12
++ * drivers/usb/dwc3/core.h:113,120,137,142,144,342,360,404,435-443,520-532. ABL writes DCFG 0x00200804
++ * (DEVSPD 4, NUMP 16) on its SuperSpeed path (abl_code.bin 0x23bec-0x23c1c, docs/research/102).
++ */
++#define DCFG_SPEED_MASK         7u
++#define DCFG_SPEED_SS           4u
++#define DCFG_SPEED_HS           0u
++#define DCFG_NUMP(v)            (((v) >> 17) & 0x1f)
++#define DSTS_SPEED_SS           4u
++#define DSTS_SPEED_SSP          5u
++#define DSTS_USBLNKST(v)        (((v) >> 18) & 0xf)
++#define GHWPARAMS0              0xc140
++#define GHWPARAMS7              0xc15c
++#define GUSB2PHYCFG0            0xc200
++#define GUSB3PIPECTL0           0xc2c0
++#define GTXFIFOSIZ(n)           (0xc300 + 4 * (n))
++#define UD_SS_EP0_MPS           512     /* gadget.c:4105-4123 (SS ep0 512); HS/FS 64 :4129-4138 */
++#define UD_SS_BULK_MPS          1024    /* f_ecm.c:293-309 ss_ecm_in/out_desc */
++#define UD_SS_WAIT_MS           10000   /* policy (not hardware): not configured this long after RUN -> restart at HS (HS enumeration on the host takes < 1 s, observed) */
++
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+@@ -259,6 +284,16 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* USB 3 (patch 0173, default ON, sweetusb3=0 opts out, gs101 only): all false/zero until sweet_usb_probe_gs101 sets ss_mode = the HS-only gadget above */
++	bool        ss_mode;        /* DCFG.DEVSPD = SuperSpeed at start; HS descriptors stay as they are */
++	bool        ss_fell_back;   /* not configured in UD_SS_WAIT_MS (or speed changed after configuration): restarted at high speed */
++	bool        ss_restart;     /* set by ud_event at a ConnectDone whose speed contradicts the configured bulk max packet */
++	bool        hw_started;     /* ud_hw_init was reached (for the "sweetusb3 ignored" line) */
++	bool        ss_req;         /* SuperSpeed was requested (default or sweetusb3=1) on a gs101 sweetusb=2 start: hw_started must follow (rule 8) */
++	uint32_t    bulk_mps;       /* bulk max packet programmed by ud_configure */
++	uint32_t    speed;          /* DSTS.CONNECTSPD at the last ConnectDone */
++	uint32_t    ep0_mps;        /* 64 (HS/FS) or 512 (SS), set at ConnectDone */
++	uint64_t    ss_deadline;    /* mach absolute time: RUN at SuperSpeed + UD_SS_WAIT_MS */
+ } ud;
+ 
+ static inline void
+@@ -376,6 +411,44 @@
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
++/*
++ * SuperSpeed set (patch 0173), served only after a ConnectDone at SuperSpeed (ud.speed >= 4); at high
++ * speed the two arrays above are served unchanged, also in SuperSpeed mode. Layouts: Linux v6.12
++ * include/uapi/linux/usb/ch9.h:253-265 (BOS 0x0f, DEVICE_CAPABILITY 0x10, SS_ENDPOINT_COMP 0x30),
++ * :693-702 (companion, 6 B), :850-858 (BOS, 5 B), :899-916 (USB 2.0 extension, 7 B), :922-939 (SS
++ * capability, 10 B). Values: bcdUSB 0x0320 + bMaxPacketSize0 9 (2^9 = 512) at SS (composite.c:1833-1836);
++ * bulk 1024 with bMaxBurst 0 and interrupt companion wBytesPerInterval 16 (f_ecm.c:273-338); bMaxPower
++ * in 8 mA units at SS, 500 mA -> 62 (composite.c:540-547); SS capability speeds 0x000f and
++ * bFunctionalitySupport 1 (composite.c:792-802). Deviations, on purpose: U1/U2 exit latency 0 (LK
++ * usb30_udc.c:1286-1290 does the same), so a Linux host turns link power management off
++ * (hub.c:191-197) and never asks for U1/U2; USB 2.0 extension bmAttributes 0 (no LPM claim: the HS
++ * path never sets DCFG.LPM_CAP), where composite.c:771-779 claims LPM.
++ */
++static const uint8_t ud_ss_dev_desc[18] = {
++	18, 1, 0x20, 0x03, 0x02, 0x00, 0x00, 9,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_ss_cfg_desc[98] = {
++	9, 2, 98, 0, 2, 1, 0, 0x80, 62,                 /* config: 2 interfaces, 496 mA (8 mA units) */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) x 125 us */
++	6, 0x30, 0, 0, 16, 0,                           /* SS companion: burst 0, 16 bytes per interval */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x04, 0,                /* ep 0x81 bulk IN, 1024 */
++	6, 0x30, 0, 0, 0, 0,                            /* SS companion: burst 0, no streams */
++	7, 5, 0x01, 0x02, 0x00, 0x04, 0,                /* ep 0x01 bulk OUT, 1024 */
++	6, 0x30, 0, 0, 0, 0,                            /* SS companion: burst 0, no streams */
++};
++static const uint8_t ud_ss_bos_desc[22] = {
++	5, 0x0f, 22, 0, 2,                              /* BOS: 22 bytes, 2 capabilities */
++	7, 0x10, 2, 0, 0, 0, 0,                         /* USB 2.0 extension: no LPM */
++	10, 0x10, 3, 0, 0x0f, 0x00, 1, 0, 0, 0,         /* SuperSpeed: LS/FS/HS/5 Gb/s, U1/U2 exit 0 */
++};
++
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
+@@ -407,6 +480,8 @@
+ static void ud_tx_kick_locked(void);
+ extern bool sweet_usbroot_rx(const uint8_t *f, uint32_t len);
+ static void ud_link_event(bool up);
++static void ud_ss_fallback(void);
++static bool ud_restart(uint32_t devspd);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -427,10 +502,13 @@
+ 	if (ud.configured) {
+ 		return;
+ 	}
++	/* Bulk max packet: 512 at high speed, 1024 at SuperSpeed with DEPCFG burst field 0 = bMaxBurst 0
++	 * (gadget.c:586-592: BURST_SIZE(maxburst - 1), gadget.h:37-39 field positions; f_ecm.c:311-317). */
++	uint32_t bulk = ud.speed >= DSTS_SPEED_SS ? UD_SS_BULK_MPS : 512u;
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+-	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (bulk << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (bulk << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
+ 	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+@@ -440,8 +518,12 @@
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
++	ud.bulk_mps = bulk;
+ 	ud_rx_arm();
+ 	printf("SWEET USB: ECM endpoints configured\n");
++	if (ud.ss_mode) {
++		printf("SWEET USB3: bulk max packet %u (speed %u)\n", bulk, ud.speed);
++	}
+ }
+ 
+ static void
+@@ -463,10 +545,30 @@
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		bool ss = ud.speed >= DSTS_SPEED_SS;    /* only after a ConnectDone at SuperSpeed (default mode) */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1:
++			if (ss) {
++				memcpy(data, ud_ss_dev_desc, sizeof(ud_ss_dev_desc)); n = sizeof(ud_ss_dev_desc);
++			} else {
++				memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc);
++			}
++			break;
++		case 2:
++			if (ss) {
++				memcpy(data, ud_ss_cfg_desc, sizeof(ud_ss_cfg_desc)); n = sizeof(ud_ss_cfg_desc);
++			} else {
++				memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc);
++			}
++			break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
++		case 15:                        /* BOS: SuperSpeed only; at high speed bcdUSB 2.00 means none */
++			if (ss) {
++				memcpy(data, ud_ss_bos_desc, sizeof(ud_ss_bos_desc)); n = sizeof(ud_ss_bos_desc);
++			} else {
++				ok = false;
++			}
++			break;
+ 		default: ok = false; break;
+ 		}
+ 	} else if (req == 5) {          /* SET_ADDRESS: takes effect now (DWC3 handles the timing) */
+@@ -492,7 +594,19 @@
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
++	} else if (ud.speed >= DSTS_SPEED_SS && (req == 1 || req == 3) && (type & 0x1f) == 0 &&
++	    (value == 48 || value == 49)) {
++		/* U1_ENABLE/U2_ENABLE (ch9.h:152-153): not supported, DCTL.INITU1ENA/INITU2ENA stay 0 (core.h:474-477) */
++		printf("USB3 GAP: %s_FEATURE U%u_ENABLE refused (stall): U1/U2 not supported\n",
++		    req == 3 ? "SET" : "CLEAR", value - 47);
++		ok = false;
+ 	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++	} else if (ud.speed >= DSTS_SPEED_SS && req == 0x30 && length == 6) {
++		/* SET_SEL (ch9.h:89; ep0.c:737-768): 6 bytes taken, not programmed (no DGCMD periodic params; U1/U2 off) */
++		printf("USB3 GAP: SET_SEL data ignored (U1/U2 not supported)\n");
++	} else if (ud.speed >= DSTS_SPEED_SS && req == 0x31 && length == 0 && index == 0) {
++		/* SET_ISOCH_DELAY (ch9.h:90): ack, as Linux v6.1 dwc3 ep0.c:762-776 (it only stores wValue; no reader in drivers/usb, and no isochronous endpoint here) */
++		printf("USB3: SET_ISOCH_DELAY %u ns acked (informational: nothing reads it, as in Linux dwc3)\n", value);
+ 	} else {
+ 		ok = false;
+ 	}
+@@ -511,7 +625,8 @@
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		/* OUT data is not used here. SS: OUT TRBs must be a multiple of ep0's 512 (ep0.c:755-764) */
++		ud_start(0, UD_DATA, ud.ep0_mps == UD_SS_EP0_MPS ? UD_SS_EP0_MPS : 64, TRBCTL_DATA);
+ 	}
+ }
+ 
+@@ -880,15 +995,45 @@
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
+ 		} else if (type == 2) { /* connect done */
+-			uint32_t speed = dwc_rd(DSTS) & 7;
+-			/* ep0 max packet: 64 at high/full speed (modify action) */
+-			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			uint32_t dsts = dwc_rd(DSTS), speed = dsts & 7;
++			/* ep0 max packet: 64 at high/full speed, 512 at SuperSpeed (gadget.c:4095-4143), modify action */
++			uint32_t mps = (ud.ss_mode && speed >= DSTS_SPEED_SS) ? UD_SS_EP0_MPS : 64u;
++			ud.speed = ud.ss_mode ? speed : 0;
++			ud.ep0_mps = mps;
++			if (ud.ss_mode && !ud.ss_fell_back && ud.configured &&
++			    ud.bulk_mps != (speed >= DSTS_SPEED_SS ? UD_SS_BULK_MPS : 512u)) {
++				printf("USB3 GAP: speed changed after configuration (bulk %u -> %u): restarting the gadget\n",
++				    ud.bulk_mps, speed >= DSTS_SPEED_SS ? UD_SS_BULK_MPS : 512u);
++				ud.ss_restart = true;   /* done by ud_thread after the event ack */
++			} else if (ud.ss_mode && ud.ss_fell_back && ud.configured &&
++			    ud.bulk_mps != (speed >= DSTS_SPEED_SS ? UD_SS_BULK_MPS : 512u)) {
++				printf("USB3 GAP: speed changed after the high-speed fallback (bulk %u, speed %u): not restarted again\n",
++				    ud.bulk_mps, speed);
++			}
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (mps << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (0u << 25), 0);
+-			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (mps << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
++			if (ud.ss_mode) {
++				printf("SWEET USB3: connected at %s (DSTS 0x%08x link state %u), ep0 max packet %u%s\n",
++				    speed == DSTS_SPEED_SS ? "SuperSpeed 5 Gb/s" : speed == 0 ? "high speed" :
++				    speed == DSTS_SPEED_SSP ? "SuperSpeedPlus" : "full/low speed",
++				    dsts, DSTS_USBLNKST(dsts), mps, ud.ss_fell_back ? " (after the HS fallback)" : "");
++				if (speed == DSTS_SPEED_SSP) {
++					printf("USB3 GAP: SuperSpeedPlus reported although DCFG asked for SuperSpeed; served as SuperSpeed\n");
++				}
++			}
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			if (ud.ss_mode) {
++				uint32_t dsts = dwc_rd(DSTS);
++				printf("SWEET USB3: disconnect at speed %u, DSTS 0x%08x link state %u\n",
++				    ud.speed, dsts, DSTS_USBLNKST(dsts));
++			}
++		} else if (ud.ss_mode) {
++			/* DEVTEN stays 0x7 (disconnect, reset, connect done): any other device event is unexpected */
++			printf("USB3 GAP: unhandled device event type %u info 0x%03x\n", type, (ev >> 16) & 0x1ff);
+ 		}
+ 		return;
+ 	}
+@@ -949,6 +1094,7 @@
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
++			uint32_t skipped = 0;
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+@@ -956,9 +1102,26 @@
+ 				if (ud.events++ < 200) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
++				if (ud.ss_restart) {
++					skipped++;      /* stale session: the restart below re-initialises everything */
++					continue;
++				}
+ 				ud_event(ev);
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
++			if (skipped) {
++				printf("USB3 GAP: %u events after the speed change not handled (restart)\n", skipped);
++			}
++		}
++		if (ud.ss_restart) {
++			/* after the event ack above: ud_hw_init resets the event buffer, so never from inside ud_event */
++			ud.ss_restart = false;
++			ud.ss_fell_back = true;
++			ud_restart(DCFG_SPEED_HS);
++			continue;
++		}
++		if (ud.ss_mode && !ud.ss_fell_back && !ud.configured && mach_absolute_time() > ud.ss_deadline) {
++			ud_ss_fallback();       /* BEFORE the hurry branch: that one `continue`s every iteration of a usbroot request */
+ 		}
+ 		if (ud_rx_fast && ud_rx_hurry) {
+ 			ud_rx_fast_wait();      /* short poll: not a 1 ms tick, so the 30 s counter line keeps its rate */
+@@ -1047,7 +1210,7 @@
+ #define DWC3_REGS_MIN           0xd000  /* up to the DEPCMD blocks of the endpoints used (0xc85c) */
+ 
+ static bool
+-sweet_usb_probe_gs101(int mode)
++sweet_usb_probe_gs101(int mode, uint32_t usb3, bool usb3_explicit)
+ {
+ 	DTEntry node;
+ 	char const *compat = NULL;
+@@ -1086,6 +1249,19 @@
+ 	if (mode < 2) {
+ 		return true;
+ 	}
++	if (usb3 == 1) {
++		ud.ss_req = true;
++		ud.ss_mode = true;      /* patch 0173: DCFG SuperSpeed + HS fallback; default ON (R27), sweetusb3=0 = HS-only gadget */
++		if (usb3_explicit) {
++			printf("SWEET USB3: sweetusb3=1: SuperSpeed requested (explicit; no PHY writes; uses the USB 3 PHY state ABL left)\n");
++		} else {
++			printf("SWEET USB3: default ON (sweetusb3=0 opts out)\n");
++		}
++	} else if (usb3 == 0) {
++		printf("SWEET USB3: sweetusb3=0: opted out, HS-only gadget (explicit)\n");
++	} else {
++		printf("USB3 GAP: sweetusb3=%u unsupported (only 0 or 1); SuperSpeed off\n", usb3);
++	}
+ 	PE_parse_boot_argn("sweetusbdma", &dmamode, sizeof(dmamode));
+ 	if (dmamode != 1) {
+ 		if (SecureDTGetProperty(node, "dma-pool-range", (void const **)&range, &psize) != kSuccess ||
+@@ -1110,6 +1286,210 @@
+ 	return true;
+ }
+ 
++/*
++ * Patch 0173: sweetusb3 is parsed once here (default 1 = SuperSpeed; PE_parse_boot_argn leaves usb3 untouched and returns
++ * FALSE when the arg is absent). Every return of sweet_usb_probe_run that does not reach ud_hw_init (sweetusb=0/1, a
++ * refused board, no DMA, non-gs101, ...) says that an EXPLICIT sweetusb3 was dropped (rule 8). The default prints that
++ * line only when SuperSpeed was actually requested (ud.ss_req: gs101, sweetusb=2), never on sweetusb=0/1 or other boards.
++ */
++void
++sweet_usb_probe(void)
++{
++	uint32_t usb3 = 1;      /* R27: SuperSpeed is the default; sweetusb3=0 opts out */
++	bool usb3_explicit = PE_parse_boot_argn("sweetusb3", &usb3, sizeof(usb3));
++	sweet_usb_probe_run(usb3, usb3_explicit);
++	if ((ud.ss_req || (usb3_explicit && usb3 != 0)) && !ud.hw_started) {
++		printf("USB3 GAP: sweetusb3=%u ignored: gadget not started%s\n", usb3, usb3_explicit ? "" : " (default SuperSpeed was requested)");
++	}
++}
++
++/*
++ * USB 3 (patch 0173): the SuperSpeed path writes new values to DCFG.DEVSPD, DCTL.RUN_STOP (fallback) and the
++ * max-packet fields of DEPCMDPAR0 for ep0/bulk (via ud_epcmd, same registers as the HS-only gadget). The first
++ * two go through this independent allowlist: anything else is refused loudly.
++ */
++static const uint32_t ud_ss_wr_allow[] = { DCFG, DCTL };
++
++static bool
++ud_ss_wr(uint32_t off, uint32_t v)
++{
++	for (unsigned k = 0; k < sizeof(ud_ss_wr_allow) / sizeof(ud_ss_wr_allow[0]); k++) {
++		if (ud_ss_wr_allow[k] == off) {
++			dwc_wr(off, v);
++			return true;
++		}
++	}
++	printf("USB3 GAP: refused write 0x%08x to DWC3 +0x%x (not in the USB 3 allowlist)\n", v, off);
++	return false;
++}
++
++/* Read-only report of the controller state (SuperSpeed mode only, the default; not with sweetusb3=0): what = "handover" (ABL's state, before the soft reset) or "after reset". */
++static void
++ud_ss_report(const char *what)
++{
++	uint32_t hw0 = dwc_rd(GHWPARAMS0), hw7 = dwc_rd(GHWPARAMS7), dcfg = dwc_rd(DCFG), dsts = dwc_rd(DSTS);
++	uint32_t mdwidth = (hw0 >> 8) & 0xff;           /* bits; DWC_usb31: no GHWPARAMS6 part (core.h:1591-1599) */
++	uint32_t ram2 = (hw7 >> 16) & 0xffff;
++	int64_t nump = ((int64_t)ram2 * mdwidth / 8 - 24 - 16) / 1024;       /* gadget.c:2815-2826 */
++	uint32_t txf = dwc_rd(GTXFIFOSIZ(1)) & 0xffff;  /* FIFO 1 = EP_TX (DEPCFG FIFO_NUMBER, gadget.c:628) */
++	uint32_t txmin = mdwidth >= 8 ? (UD_SS_BULK_MPS + mdwidth / 8) / (mdwidth / 8) + 1 : 0; /* gadget.c:672-687 */
++
++	printf("SWEET USB3: %s GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x DCFG 0x%08x (DEVSPD %u NUMP %u) DSTS 0x%08x (speed %u link state %u)\n",
++	    what, dwc_rd(GUSB2PHYCFG0), dwc_rd(GUSB3PIPECTL0), dcfg, dcfg & DCFG_SPEED_MASK, DCFG_NUMP(dcfg),
++	    dsts, dsts & 7, DSTS_USBLNKST(dsts));
++	printf("SWEET USB3: GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x: MDWIDTH %u RAM2 depth %u -> Linux NUMP %lld (cap 16); GTXFIFOSIZ(1) depth %u (Linux minimum for 1024 B: %u)\n",
++	    hw0, hw7, mdwidth, ram2, nump < 0 ? 0 : (nump > 16 ? 16 : nump), txf, txmin);
++	if (txmin == 0 || txf < txmin) {
++		printf("USB3 GAP: TX FIFO 1 depth %u below the Linux minimum %u for one 1024-byte packet (MDWIDTH %u); bulk IN may fail at SuperSpeed\n",
++		    txf, txmin, mdwidth);
++	}
++}
++
++/* Device controller soft reset, event buffer, DCFG speed, endpoint 0 (PHY and global setup stay as ABL left them). */
++static bool
++ud_hw_init(uint32_t devspd)
++{
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		return false;
++	}
++	if (ud.gs101) {
++		delay(50 * 1000);       /* shim/usbgadget.c: 50 ms after CSFTRST clears (DWC_usb31 revision unknown) */
++	}
++
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++
++	/* High speed (SuperSpeed unless sweetusb3=0), address 0 */
++	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
++	if (devspd != DCFG_SPEED_HS) {
++		if (!ud_ss_wr(DCFG, dcfg | devspd)) {
++			return false;
++		}
++		printf("SWEET USB3: DCFG 0x%08x (DEVSPD %u, NUMP %u kept as ABL left it)\n",
++		    dwc_rd(DCFG), dwc_rd(DCFG) & DCFG_SPEED_MASK, DCFG_NUMP(dwc_rd(DCFG)));
++	} else {
++		dwc_wr(DCFG, dcfg | 0);
++	}
++	/* Events: disconnect, USB reset, connect done */
++	dwc_wr(DEVTEN, 0x7);
++
++	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed\n");
++		return false;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_start_setup();
++
++	return true;
++}
++
++/* RUN_STOP and wait for the controller to leave the halted state. */
++static void
++ud_run(void)
++{
++	int i;
++	uint32_t dctl = dwc_rd(DCTL);
++	if (ud.gs101) {
++		dctl &= ~DCTL_ULSTCHNGREQ;      /* shim/usbgadget.c: never write back a link state change request */
++	}
++	dwc_wr(DCTL, dctl | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	if (ud.ss_mode && !ud.ss_fell_back) {
++		clock_interval_to_deadline(UD_SS_WAIT_MS, NSEC_PER_MSEC, &ud.ss_deadline);
++		printf("SWEET USB3: running with DEVSPD SuperSpeed; high-speed restart if not configured in %u ms\n",
++		    UD_SS_WAIT_MS);
++	}
++}
++
++/*
++ * Stop (DCTL.RUN_STOP = 0, wait for DSTS.DEVCTRLHLT up to 1000 ms, the sequence of ABL's stop at
++ * abl_code.bin 0x24124-0x2414c and Linux dwc3_gadget_run_stop), then the same soft reset + start the
++ * HS-only gadget does, with DCFG.DEVSPD = devspd. Clears the per-session state. Only these writes, all
++ * through ud_hw_init / ud_run / the DCTL allowlist. Returns false (loudly) if the gadget could not be restarted.
++ */
++static bool
++ud_restart(uint32_t devspd)
++{
++	int i;
++	uint32_t dropped = 0;
++
++	if (ud_rx_hurry) {
++		printf("USB3 GAP: restart while a usbroot request is waiting (it times out and retries)\n");
++	}
++	/* review usb3-ss-r2 F1: stop every TX kick (ud_if_output, sweet_usb_raw_tx, ud_log_thread) before the stop */
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.data_alt = 0;
++	if (ud.tx_busy) {
++		printf("USB3 GAP: restart drops the TX transfer in flight\n");
++	}
++	ud.tx_busy = false;             /* the in-flight IN TRB dies with the soft reset: no XferComplete will clear it */
++	lck_mtx_unlock(ud.lock);
++	ud_link_event(false);
++	/* r2 F2b: no EndTransfer for the armed RX/TX TRBs (Linux dwc3_stop_active_transfer does one); not added (new command) */
++	printf("USB3 GAP: no EndTransfer before RUN_STOP=0 (armed transfers are dropped by the soft reset)\n");
++	if (!ud_ss_wr(DCTL, dwc_rd(DCTL) & ~(DCTL_RUN_STOP | DCTL_ULSTCHNGREQ))) {
++		return false;
++	}
++	for (i = 0; i < 1000 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		/* r2 F2a: events pending in GEVNTCOUNT keep the core from halting (linux gadget.c:2686-2691): ack, not dispatched */
++		uint32_t c = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (c) {
++			dwc_wr(GEVNTCOUNT, c);
++			ud.evt_pos = (ud.evt_pos + c) % UD_EVT_SIZE;
++			dropped += c / 4;
++		}
++		delay(1000);
++	}
++	if (dropped) {
++		printf("USB3 GAP: %u events dropped while stopping\n", dropped);
++	}
++	if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT)) {
++		printf("USB3 GAP: controller not halted 1000 ms after RUN_STOP = 0 (DSTS 0x%08x); soft reset anyway\n",
++		    dwc_rd(DSTS));
++	}
++	ud.speed = 0;
++	if (!ud_hw_init(devspd)) {
++		printf("USB3 GAP: high-speed restart failed: USB gadget stopped (no USB log)\n");
++		return false;
++	}
++	ud_run();
++	return true;
++}
++
++/*
++ * Not configured within UD_SS_WAIT_MS of RUN at SuperSpeed (no ConnectDone, or a SuperSpeed ConnectDone
++ * and a failed enumeration): restart at high speed, once (ud.ss_fell_back), from ud_thread.
++ */
++static void
++ud_ss_fallback(void)
++{
++	uint32_t dsts = dwc_rd(DSTS);
++
++	ud.ss_fell_back = true;
++	printf("USB3 GAP: not configured %u ms after RUN at SuperSpeed (ConnectDone %s, speed %u, ep0 max packet %u, DSTS 0x%08x link state %u): restarting at high speed\n",
++	    UD_SS_WAIT_MS, ud.ep0_mps ? "seen" : "not seen", ud.speed, ud.ep0_mps, dsts, DSTS_USBLNKST(dsts));
++	ud_restart(DCFG_SPEED_HS);
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc, uint64_t pool_pa)
+ {
+@@ -1145,7 +1525,8 @@
+ 			return;
+ 		}
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+ 		if (!pn) {
++			printf("USB3 GAP: SWEET USB: DMA buffer has no physical page (pmap_find_phys 0): gadget not started\n");
+ 			return;
+ 		}
+ 		ud.dma_pa = ptoa_64(pn);
+@@ -1152,45 +1532,17 @@
+ 	}
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
++	if (ud.ss_mode) {
++		ud_ss_report("handover");
+ 	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++	ud.hw_started = true;
++	if (!ud_hw_init(ud.ss_mode ? DCFG_SPEED_SS : DCFG_SPEED_HS)) {
+ 		return;
+ 	}
+-	if (ud.gs101) {
+-		delay(50 * 1000);       /* shim/usbgadget.c: 50 ms after CSFTRST clears (DWC_usb31 revision unknown) */
++	if (ud.ss_mode) {
++		ud_ss_report("after reset");    /* read-only: what the run actually uses (FIFO, PIPECTL, DCFG) */
+ 	}
+ 
+-	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+-	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+-	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+-	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+-	ud.evt_pos = 0;
+-
+-	/* High speed, address 0 */
+-	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+-	dwc_wr(DEVTEN, 0x7);
+-
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
+-		return;
+-	}
+-	dwc_wr(DALEPENA, 0x3);
+-	ud_start_setup();
+-
+ 	/* gs101 has no QSCRATCH wrapper: the shim enumerates with RUN_STOP alone (observed). */
+ 	vm_offset_t qs = ud.gs101 ? 0 : ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+@@ -1204,15 +1556,7 @@
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
+-	uint32_t dctl = dwc_rd(DCTL);
+-	if (ud.gs101) {
+-		dctl &= ~DCTL_ULSTCHNGREQ;      /* shim/usbgadget.c: never write back a link state change request */
+-	}
+-	dwc_wr(DCTL, dctl | DCTL_RUN_STOP);
+-	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	ud_run();
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

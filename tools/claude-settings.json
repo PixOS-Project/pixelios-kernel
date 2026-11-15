@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'P=$HOME/.t3/projects/pixelios/pixos-project/pixelios-kernel/tools/phone-guard; [ -f \"$P\" ] || P=\"$CLAUDE_PROJECT_DIR\"/tools/phone-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\"; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'P=$HOME/.t3/projects/pixelios/pixos-project/pixelios-kernel/tools/patch-guard; [ -f \"$P\" ] || P=\"$CLAUDE_PROJECT_DIR\"/tools/patch-guard; [ -f \"$P\" ] || { echo \"hook script missing: $P\" >&2; exit 1; }; python3 \"$P\"; r=$?; [ $r = 2 ] && exit 1; exit $r'"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "additionalDirectories": [
+      "~/.t3/worktrees",
+      "~/pixelios-artifacts"
+    ]
+  }
+}

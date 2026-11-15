@@ -1,0 +1,146 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -25,7 +25,9 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
+ #include <kern/startup.h>
++#include <kern/task.h>
+ #include <IOKit/IOBSD.h>
++#include <kern/kalloc.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+@@ -375,6 +377,124 @@
+ 	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
+ }
+ 
++/*
++ * Op 2 with a NULL operation: "is this process sandboxed" (sandbox_check(getpid(), NULL, SANDBOX_CHECK_NO_REPORT)). wifip2pd calls it from main
++ * (0x1000021d4 -> 0x1002eddd4) and exit(1)s when the answer is 0, i.e. it refuses to run unsandboxed (respawn every 10 s).
++ * Layout read from libsystem_sandbox (iOS 16.7.16 DSC): _sandbox_check @0x1d1af4bd4 builds the block, _sandbox_check_common @0x1d1af4c90 fills it and
++ * calls ___sandbox_ms_stub("Sandbox", 2, blk) @0x1d1af4e68..70. Block = 6 x u64: [0] pointer to a zeroed 4 x u64 scratch on the caller stack
++ * (str x9,[x0] @0x1d1af4cb4; zeroed @0x1d1af4ca4-ac), [1] pid (sxtw w20 @0x1d1af4bf8, stp x8,x9,[sp,#8] @0x1d1af4c14), [2] operation string pointer
++ * (stored unchanged by _sandbox_operation_fixup @0x1d1af5140 when NULL: cbz @0x1d1af515c), [3] filter type (type 0, which includes
++ * SANDBOX_CHECK_NO_REPORT 0x40000000 masked by 0x83ffffff @0x1d1af4cd8, stores 0 to [3] and [4] @0x1d1af4d04), [4] filter argument,
++ * [5] flags (bit 30 -> |= 1 @0x1d1af4d0c). Result: kernel nonzero -> library returns -1 (@0x1d1af4e78); otherwise scratch[0] (ldr x8,[sp] @0x1d1af4e80)
++ * != 0 -> returns 1 ("sandboxed", cset ne @0x1d1af4e88). So answering "sandboxed" = copyout of a u64 1 to scratch[0] and return 0.
++ * Only processes that hold a profile entitlement (real iOS applies the profile at exec) are answered; everything else keeps the permissive
++ * stand-in: return 0, nothing written (= "not sandboxed"), logged once per process name as a GAP. String entitlements are read with
++ * IOTaskGetEntitlement (iokit/bsddev/IOKitBSDInit.cpp:1544; the returned copy is kalloc_data'd with strlen+1 and freed with kfree_data as
++ * bsd/kern/kern_core.c:388,776 does). seatbelt-profiles is an array: no KPI returns arrays or tests for them, so it is not consulted (GAP
++ * for such a binary shows as the NOT sandboxed line).
++ */
++#define SWEET_SBX_OP_CHECK              2
++#define SWEET_SBX_CHECK_WORDS           6
++#define SWEET_SBX_CHECK_SCRATCH         0
++#define SWEET_SBX_CHECK_PID             1
++#define SWEET_SBX_CHECK_OPERATION       2
++#define SWEET_SBX_SEEN_MAX              32
++#define SWEET_SBX_NAME_LEN              32
++
++static const char *const sweet_sbx_profile_keys[] = {
++	"com.apple.private.sandbox.profile",
++	"com.apple.private.sandbox.profile:embedded",
++};
++
++static char sweet_sbx_yes_names[SWEET_SBX_SEEN_MAX][SWEET_SBX_NAME_LEN];
++static char sweet_sbx_no_names[SWEET_SBX_SEEN_MAX][SWEET_SBX_NAME_LEN];
++static int sweet_sbx_yes_count, sweet_sbx_no_count;
++static bool sweet_sbx_full_logged, sweet_sbx_copyin_logged;
++
++/* True the first time a name is seen in the bounded table; a full table is reported once and answers false. */
++static bool
++sweet_sbx_first_time(char names[][SWEET_SBX_NAME_LEN], int *count, const char *name)
++{
++	int n = *count > SWEET_SBX_SEEN_MAX ? SWEET_SBX_SEEN_MAX : *count;
++
++	for (int i = 0; i < n; i++) {
++		if (strncmp(names[i], name, SWEET_SBX_NAME_LEN) == 0) {
++			return false;
++		}
++	}
++	if (n >= SWEET_SBX_SEEN_MAX) {
++		if (!sweet_sbx_full_logged) {
++			sweet_sbx_full_logged = true;
++			printf("SWEET Sandbox GAP: self-check name table full (%d), later names not logged\n", SWEET_SBX_SEEN_MAX);
++		}
++		return false;
++	}
++	strlcpy(names[n], name, SWEET_SBX_NAME_LEN);
++	*count = n + 1;
++	return true;
++}
++
++/* Index into sweet_sbx_profile_keys of the profile entitlement the task holds as a string, or -1. */
++static int
++sweet_sbx_profile_key(task_t task)
++{
++	if (task == NULL || task == kernel_task) {
++		return -1;
++	}
++	for (size_t k = 0; k < sizeof(sweet_sbx_profile_keys) / sizeof(sweet_sbx_profile_keys[0]); k++) {
++		char *val = IOTaskGetEntitlement(task, sweet_sbx_profile_keys[k]);
++		if (val != NULL) {
++			kfree_data(val, strlen(val) + 1);
++			return (int)k;
++		}
++	}
++	return -1;
++}
++
++static int
++sweet_sbx_self_check(struct proc *p, user_addr_t arg)
++{
++	uint64_t blk[SWEET_SBX_CHECK_WORDS];
++	uint64_t one = 1;
++	char name[SWEET_SBX_NAME_LEN] = "?";
++	int key = -1, error;
++	int pid = proc_pid(p);
++
++	error = copyin(arg, blk, sizeof(blk));
++	if (error) {
++		if (!sweet_sbx_copyin_logged) {
++			sweet_sbx_copyin_logged = true;
++			printf("SWEET Sandbox GAP: op 2 argument copyin failed (%d)\n", error);
++		}
++		return error;
++	}
++	if (blk[SWEET_SBX_CHECK_OPERATION] != 0) {
++		return 0;       /* a real operation check: permissive, as before */
++	}
++	if (blk[SWEET_SBX_CHECK_PID] == 0 || (int)blk[SWEET_SBX_CHECK_PID] == pid) {
++		proc_name(pid, name, sizeof(name));
++		key = sweet_sbx_profile_key(proc_task(p));
++	} else {
++		proc_t target = proc_find((int)blk[SWEET_SBX_CHECK_PID]);
++		if (target != NULL) {
++			proc_name(proc_pid(target), name, sizeof(name));
++			key = sweet_sbx_profile_key(proc_task(target));
++			proc_rele(target);
++		}
++	}
++	if (key >= 0 && blk[SWEET_SBX_CHECK_SCRATCH] != 0) {
++		error = copyout(&one, (user_addr_t)blk[SWEET_SBX_CHECK_SCRATCH], sizeof(one));
++		if (error == 0 && sweet_sbx_first_time(sweet_sbx_yes_names, &sweet_sbx_yes_count, name)) {
++			printf("SWEET Sandbox: %s self-check answered sandboxed (entitlement %s)\n", name, sweet_sbx_profile_keys[key]);
++		}
++		return error;
++	}
++	if (sweet_sbx_first_time(sweet_sbx_no_names, &sweet_sbx_no_count, name)) {
++		printf("SWEET Sandbox GAP: %s self-check answered NOT sandboxed (no profile entitlement)\n", name);
++	}
++	return 0;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -391,6 +511,8 @@
+ 		return sweet_sandbox_ext_issue(arg);
+ 	case 6:         /* extension consume */
+ 		return sweet_sandbox_ext_consume(arg);
++	case SWEET_SBX_OP_CHECK:   /* sandbox_check / sandbox_check_by_audit_token */
++		return sweet_sbx_self_check(p, arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

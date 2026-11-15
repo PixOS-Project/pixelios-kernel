@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""kdbg2perfetto: decode 'SWEET KDBG: <base64>' lines (kernel patch 0264, boot-arg sweetkdbg=N) of a run's usbnet.log into a Chrome JSON trace (open at ui.perfetto.dev).
+
+usage: kdbg2perfetto RUN_DIR_OR_LOG [-o out.json]      kdbg2perfetto --self-test
+Tracks: pid 1 'CPU' (tid = cpu; slices = the thread that ran, from MACH_SCHED context switches), pid 2 'threads' (tid = kdebug thread id; every
+event as an instant, or B/E for DBG_FUNC_START/END). Unknown debugids are kept as 'ID 0x........' instants, never dropped.
+kd_buf layout (arm64, bsd/sys/kdebug_private.h, 64 bytes): u64 timestamp, u64 arg1..arg5 (arg5 = thread id), u32 debugid, u32 cpuid, u64 unused.
+Time base: kd timestamps are mach ticks [guess: kdebug_timestamp = mach_absolute_time on arm64]; ticks -> ns from the 'abs A ns T' fields of the per-second
+summary lines (fallback 24 MHz = x125/3). Replayed lines (the phone resends its last 64 KiB on re-plug) are de-duplicated on the whole record.
+Prints 'KDBG2PERFETTO: records R unique U lost L cpus C threads T out FILE' (--expect 'KDBG2PERFETTO: records [1-9]').
+"""
+import argparse, base64, json, os, re, struct, sys
+
+REC = struct.Struct("<QQQQQQIIQ")  # ts a1 a2 a3 a4 a5 debugid cpuid unused
+assert REC.size == 64
+LINE = re.compile(r"SWEET KDBG: ([A-Za-z0-9+/=]{4,})\s*$")
+SUMM = re.compile(r"SWEET KDBG: on records \d+ lost \d+ abs (\d+) ns (\d+)")
+TRACE_LOST_EVENTS = 0x07020008
+
+CLASSES = {1: "MACH", 2: "NETWORK", 3: "FSYSTEM", 4: "BSD", 5: "IOKIT", 6: "DRIVERS", 7: "TRACE", 8: "DLIL", 9: "PTHREAD",
+           12: "MONOTONIC", 20: "MISC", 31: "DYLD", 37: "PERF", 41: "XPC", 46: "DISPATCH", 53: "TURNSTILE"}
+MACH_SUB = {0x03: "EXCP_SYNC", 0x04: "EXCP_SERR", 0x05: "INTR", 0x0C: "MSC", 0x10: "IHDLR", 0x20: "IPC", 0x30: "VM", 0x40: "SCHED",
+            0x60: "LOCKS", 0x70: "PMAP", 0x80: "CLOCK", 0x90: "MP", 0xA9: "SCHED_CLUTCH", 0xAA: "IO", 0xAF: "MSC_ARM"}
+SCHED = {0x0: "MACH_SCHED", 0x1: "STACK_ATTACH", 0x2: "STACK_HANDOFF", 0x4: "CALLOUT", 0x5: "STACK_DETACH", 0x6: "MAKE_RUNNABLE",
+         0x9: "IDLE", 0xF: "BLOCK", 0x10: "WAIT", 0x18: "CHOOSE_PROCESSOR", 0x1F: "MAINTENANCE", 0x20: "DISPATCH", 0x27: "CHANGE_PRIORITY",
+         0x2F: "QUANTUM_EXPIRED", 0x48: "THREAD_SELECT"}
+IPC = {0x3: "MSG_SEND", 0x4: "MSG_RECV", 0x5: "MSG_RECV_VOUCHER_REFUSED", 0x6: "KMSG_FREE", 0xA: "KMSG_INFO", 0xB: "KMSG_LINK", 0xC: "PORT_ENTRY_MODIFY"}
+FUNC = {0: "", 1: " start", 2: " end", 3: " ?"}
+
+
+def split_id(d):
+    return d >> 24, (d >> 16) & 0xFF, (d >> 2) & 0x3FFF, d & 3
+
+
+def name_of(d):
+    cls, sub, code, fn = split_id(d)
+    if cls == 1 and sub == 0x40:
+        n = "SCHED " + SCHED.get(code, "0x%x" % code)
+    elif cls == 1 and sub == 0x20:
+        n = "IPC " + IPC.get(code, "0x%x" % code)
+    elif cls == 1 and sub == 0x05:
+        n = "INTR"
+    elif cls == 1 and sub == 0x0C:
+        n = "MSC %d" % code if code < 0x1000 else "MSC 0x%x" % code
+    elif cls == 4 and sub == 0x0C:
+        n = "BSC %d" % code
+    elif cls == 7 and d & ~3 == TRACE_LOST_EVENTS:
+        n = "TRACE_LOST_EVENTS"
+    elif cls == 1 and sub in MACH_SUB:
+        n = "%s 0x%x" % (MACH_SUB[sub], code)
+    elif cls in CLASSES:
+        n = "%s s0x%x c0x%x" % (CLASSES[cls], sub, code)
+    else:
+        return "ID 0x%08x" % d  # unknown: named by hex, kept
+    return n + FUNC[fn]
+
+
+def decode_log(lines):
+    """-> (records [(ts,a1..a5,debugid,cpu)], ticks-per-ns ratio (ns/tick) or None)"""
+    recs, seen, abs_ns = [], set(), []
+    for ln in lines:
+        m = SUMM.search(ln)
+        if m:
+            abs_ns.append((int(m.group(1)), int(m.group(2))))
+            continue
+        m = LINE.search(ln.rstrip("\r\n"))
+        if not m:
+            continue
+        try:
+            raw = base64.b64decode(m.group(1), validate=True)
+        except Exception as e:
+            print("KDBG2PERFETTO GAP: bad base64 line (%s), skipped" % e, file=sys.stderr)
+            continue
+        if len(raw) % 64:
+            print("KDBG2PERFETTO GAP: line of %d bytes is not a multiple of 64, tail dropped" % len(raw), file=sys.stderr)
+        for i in range(0, len(raw) - len(raw) % 64, 64):
+            r = REC.unpack_from(raw, i)
+            if r in seen:
+                continue
+            seen.add(r)
+            recs.append((r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]))
+    ratio = None
+    if len(abs_ns) >= 2 and abs_ns[-1][0] > abs_ns[0][0]:
+        ratio = (abs_ns[-1][1] - abs_ns[0][1]) / (abs_ns[-1][0] - abs_ns[0][0])
+    return recs, ratio
+
+
+def to_trace(recs, ratio):
+    ratio = ratio or 125.0 / 3.0
+    recs = sorted(recs, key=lambda r: r[0])
+    t0 = recs[0][0] if recs else 0
+    us = lambda ts: (ts - t0) * ratio / 1000.0
+    ev = [{"ph": "M", "name": "process_name", "pid": 1, "args": {"name": "CPU"}},
+          {"ph": "M", "name": "process_name", "pid": 2, "args": {"name": "threads"}}]
+    cpus, threads, lost = set(), set(), 0
+    run = {}  # cpu -> (start_us, tid)
+    last = 0.0
+    for ts, a1, a2, a3, a4, tid, d, cpu in recs:
+        t = us(ts)
+        last = max(last, t)
+        cpus.add(cpu)
+        threads.add(tid)
+        if d & ~3 == TRACE_LOST_EVENTS:
+            lost += 1
+        cls, sub, code, fn = split_id(d)
+        args = {"a1": hex(a1), "a2": hex(a2), "a3": hex(a3), "a4": hex(a4), "cpu": cpu, "debugid": "0x%08x" % d}
+        if cls == 1 and sub == 0x40 and code == 0 and fn == 0:  # context switch: arg2 = new thread (sched_prim.c:3194), arg5 = old thread
+            if cpu in run:
+                s, who = run[cpu]
+                ev.append({"ph": "X", "pid": 1, "tid": cpu, "ts": s, "dur": max(t - s, 0.0), "name": "tid 0x%x" % who, "args": {"tid": who}})
+            run[cpu] = (t, a2)
+        nm = name_of(d)
+        if fn == 1:
+            ev.append({"ph": "B", "pid": 2, "tid": tid, "ts": t, "name": nm.replace(" start", ""), "args": args})
+        elif fn == 2:
+            ev.append({"ph": "E", "pid": 2, "tid": tid, "ts": t, "name": nm.replace(" end", ""), "args": args})
+        else:
+            ev.append({"ph": "i", "s": "t", "pid": 2, "tid": tid, "ts": t, "name": nm, "args": args})
+    for cpu, (s, who) in run.items():  # close the last slice at the end of the capture
+        ev.append({"ph": "X", "pid": 1, "tid": cpu, "ts": s, "dur": max(last - s, 0.0), "name": "tid 0x%x" % who, "args": {"tid": who}})
+    for c in sorted(cpus):
+        ev.append({"ph": "M", "name": "thread_name", "pid": 1, "tid": c, "args": {"name": "cpu %d" % c}})
+    for t in sorted(threads):
+        ev.append({"ph": "M", "name": "thread_name", "pid": 2, "tid": t, "args": {"name": "tid 0x%x" % t}})
+    return {"traceEvents": ev, "displayTimeUnit": "ns"}, len(cpus), len(threads), lost
+
+
+def self_test():
+    def rec(ts, d, cpu, tid, a1=0, a2=0):
+        return REC.pack(ts, a1, a2, 0, 0, tid, d, cpu, 0)
+    sched = (1 << 24) | (0x40 << 16) | (0 << 2)
+    intr_s, intr_e = (1 << 24) | (5 << 16) | 1, (1 << 24) | (5 << 16) | 2
+    unknown = (0x3F << 24) | 0x1234 * 4
+    raw = (rec(1000, sched, 0, 0x10, 0, 0x20) + rec(2000, intr_s, 0, 0x20) + rec(2400, intr_e, 0, 0x20) + rec(3000, sched, 0, 0x20, 0, 0x10)
+           + rec(3100, unknown, 1, 0x30) + rec(3200, TRACE_LOST_EVENTS, 1, 0x30, 1))
+    lines = ["1.0\tSWEET KDBG: " + base64.b64encode(raw[:128]).decode(), "1.1\tSWEET KDBG: " + base64.b64encode(raw[128:]).decode(),
+             "1.2\tSWEET KDBG: " + base64.b64encode(raw[:64]).decode(),  # replay: de-duplicated
+             "1.3\tSWEET KDBG: on records 6 lost 1 abs 0 ns 0", "2.3\tSWEET KDBG: on records 0 lost 0 abs 24000000 ns 1000000000"]
+    recs, ratio = decode_log(lines)
+    assert len(recs) == 6 and abs(ratio - 1000000000 / 24000000) < 1e-9, (len(recs), ratio)
+    tr, ncpu, nthr, lost = to_trace(recs, ratio)
+    ev = tr["traceEvents"]
+    names = [e["name"] for e in ev if e["ph"] != "M"]
+    assert lost == 1 and ncpu == 2 and nthr == 3, (lost, ncpu, nthr)
+    assert any(e["ph"] == "X" and e["name"] == "tid 0x20" and e["pid"] == 1 for e in ev), "context switch slice missing"
+    assert "ID 0x%08x" % unknown in names, "unknown debugid dropped"
+    assert any(e["ph"] == "B" and e["name"] == "INTR" for e in ev) and any(e["ph"] == "E" and e["name"] == "INTR" for e in ev)
+    json.dumps(tr)
+    print("KDBG2PERFETTO: self-test PASS")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("src", nargs="?", help="run dir (usbnet.log inside) or a log file")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+    if not a.src:
+        ap.error("src needed")
+    path = os.path.join(a.src, "usbnet.log") if os.path.isdir(a.src) else a.src
+    with open(path, errors="replace") as f:
+        recs, ratio = decode_log(f)
+    if not recs:
+        print("KDBG2PERFETTO GAP: no SWEET KDBG records in %s (boot-args sweetkdbg=N and trace=N needed)" % path)
+        return 2
+    out = a.out or os.path.splitext(path)[0] + ".kdbg.json"
+    tr, ncpu, nthr, lost = to_trace(recs, ratio)
+    with open(out, "w") as f:
+        json.dump(tr, f)
+    print("KDBG2PERFETTO: records %d unique %d lost %d cpus %d threads %d out %s%s" % (
+        len(recs), len(recs), lost, ncpu, nthr, out, "" if ratio else " (GAP: no abs/ns summary line, 24 MHz assumed)"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

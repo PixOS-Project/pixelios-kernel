@@ -29,6 +29,55 @@ class WlanAdt(unittest.TestCase):
         self.assertIn(b"wlan\0", _kids(_kids(self.tree(wlan_node=True))[b"arm-io\0"]))
 
 
+def _root(board, **kw):
+    return adt.parse(adt.serialize(mkadt.build(seed=b"\0" * 64, board=board, **kw)))[0]
+
+
+def _props(n):
+    return dict((k, v) for k, _f, v in n.props)
+
+
+class IosRootWlanProperties(unittest.TestCase):
+    """T-2144 (P-W4, research 110 s.1 and 7 rows 1-2): what launchd and MobileGestalt read from the ADT on the iOS-root boot."""
+
+    def test_wlan_node_is_what_launchd_matches(self):
+        # launchd _LimitLoadToDeviceTree=['wlan','marconi-wifi'] -> IODTFindMatchingEntries: name, compatible, device_type or model equals the string
+        root = _root("bluejay", wlan_node=True)
+        node = _kids(_kids(root)[b"arm-io\0"])[b"wlan\0"]
+        p = _props(node)
+        self.assertEqual(p["device_type"], b"wlan\0")
+        self.assertEqual(p["name"], b"wlan\0")
+        self.assertNotIn("AAPL,ignore", p)  # an entry with AAPL,ignore is skipped by the matcher (IODeviceTreeSupport.cpp)
+
+    def test_cli_default_is_on_for_the_ios_root_boot_only(self):
+        self.assertTrue(mkadt.wlan_node_default("bluejay", False))
+        self.assertFalse(mkadt.wlan_node_default("bluejay", True))
+        self.assertFalse(mkadt.wlan_node_default("sweet", False))
+
+    def test_chosen_mac_address_wifi0_is_six_bytes(self):
+        p = _props(_kids(_root("bluejay", wlan_node=True))[b"chosen\0"])
+        self.assertEqual(len(p["mac-address-wifi0"]), 6)
+        self.assertNotEqual(p["mac-address-wifi0"], b"\0" * 6)  # D-13/D-14: six NON-ZERO bytes
+
+    def test_product_wifi_chipset_comes_from_soc_json(self):
+        want = str(boards.BOARDS["bluejay"]["wifi_chipset"]).encode() + b"\0"  # boards._num turns a digit string into an int
+        self.assertEqual(want, b"4389\0")
+        self.assertEqual(_props(_kids(_root("bluejay"))[b"product\0"])["wifi-chipset"], want)
+        saved = boards.BOARDS["bluejay"].pop("wifi_chipset")
+        try:
+            kept = _props(_kids(_root("bluejay"))[b"product\0"])["wifi-chipset"]
+        finally:
+            boards.BOARDS["bluejay"]["wifi_chipset"] = saved
+        self.assertEqual(kept, b"4357\0")  # no soc.json key: the D22AP value stays, nothing invented
+
+    def test_sweet_product_is_unchanged(self):
+        self.assertEqual(_props(_kids(_root("sweet"))[b"product\0"])["wifi-chipset"], b"4357\0")
+
+    def test_no_sdio_devices_property_is_absent(self):
+        # research 110 s.7 / W-D7 D-13: absent no-sdio-devices => the MG `wifi` capability is true
+        self.assertNotIn("no-sdio-devices", _props(_root("bluejay", wlan_node=True)))
+
+
 def wlan_node(board, **kw):
     root = adt.parse(adt.serialize(mkadt.build(seed=b"\0" * 64, board=board, **kw)))[0]
     for c in root.children:
@@ -71,7 +120,23 @@ class SweetWlanNode(unittest.TestCase):
 
     def test_tcm_is_the_only_new_surface_in_the_node(self):
         p = wlan_node("bluejay")
-        self.assertEqual(sorted(p), sorted(["name", "compatible", "reg", "cfg", "atu", "elbi", "pmu-iso", "tcm", "atu-r2-off", "AAPL,phandle"]))
+        self.assertEqual(sorted(p), sorted(["name", "compatible", "reg", "cfg", "atu", "elbi", "pmu-iso", "tcm", "atu-r2-off", "dbi", "AAPL,phandle"]))
+
+    def test_dbi_matches_soc_json(self):
+        # xnu patch 0174: RC DBI (Command store); the value is the soc.json one, not a copied constant
+        w = boards.BOARDS["bluejay"]["wlan"]
+        self.assertEqual(w["dbi"], "0x14800000")
+        self.assertEqual(wlan_node("bluejay")["dbi"], mkadt.u64(0x14800000, 0x1000))
+        self.assertEqual(wlan_node("bluejay")["dbi"], mkadt.u64(int(w["dbi"], 0), 0x1000))
+
+    def test_no_dbi_without_the_soc_key(self):
+        saved = boards.BOARDS["bluejay"]["wlan"].pop("dbi")
+        try:
+            p = wlan_node("bluejay")
+        finally:
+            boards.BOARDS["bluejay"]["wlan"]["dbi"] = saved
+        self.assertNotIn("dbi", p)
+        self.assertIn("tcm", p)
 
     def test_no_tcm_without_the_soc_keys(self):
         # a board whose soc.json lacks the stage-3 keys keeps the stage-1 node (the driver then has no tcm property and refuses level >= 3)
@@ -90,4 +155,6 @@ class SweetWlanNode(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    ok = unittest.main(exit=False).result.wasSuccessful()
+    print("RESULT: %s test_mkadt_wlan" % ("PASS" if ok else "FAIL"))
+    sys.exit(0 if ok else 1)

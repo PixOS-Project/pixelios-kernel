@@ -1,0 +1,117 @@
+SWEET T-df8f log-only witnesses + one knob (patch 0207, PLAN-60FPS G-F20 climb 2): (1) SweetCPU.cpp fvmap dump (boot-arg sweetfvmap=<pa>) now also prints the rate/volt tables of dom 0 (MIF), 1 (INT), 5 (G3D), 6 (G3DL2), read-only APM SRAM, bounds-checked as before; (2) sweet_surfcpu.c/exception.c: per-second line `SWEET THRSAMPLE: sec S cpu_all c0..c15 none cpu_busy c0..c15 none` = samples of the target thread by thread->last_processor->cpu_id (advisory, no thread lock); (3) sweet_mali.c: boot-arg sweetmalipoll=<us> (20..1000, default 200 = unchanged) sets the busy completion-poll interval of sm_thread, an out-of-range value prints a counted `SWEET MALI GAP:` line. No register write. Needs 0097, 0104, 0194.
+--- a/bsd/dev/sweet_surfcpu.c
++++ b/bsd/dev/sweet_surfcpu.c
+@@ -48,6 +48,7 @@
+ 	uint32_t run_state, flags;
+ 	int idx, nbt;
+ 	uint64_t bt[6];
++	int cpu;                                   /* patch 0207 */
+ };
+ extern int sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o);
+ 
+@@ -199,6 +200,9 @@
+ 
+ #define SM_BUF (SC_HZ_MAX + 8)
+ static struct sweet_thrsmp sm_buf[SM_BUF];     /* busy samples of the current second */
++/* patch 0207 (T-df8f, log only): samples of the current second by thread->last_processor->cpu_id, slot SM_NCPU = no processor / id out of range */
++#define SM_NCPU 16
++static int sm_cpu_all[SM_NCPU + 1], sm_cpu_busy[SM_NCPU + 1];
+ 
+ /* one sample of the target thread into sm_buf; counts via the pointers */
+ static void
+@@ -213,6 +217,13 @@
+ 		int rc = sweet_thrsample_task(task, target, &s);
+ 		if (rc == 0) {
+ 			(*nsamp)++;
++			{
++				int c = (s.cpu >= 0 && s.cpu < SM_NCPU) ? s.cpu : SM_NCPU;
++				sm_cpu_all[c]++;
++				if (s.run_state == 1) {
++					sm_cpu_busy[c]++;
++				}
++			}
+ 			if (s.run_state == 1 /* TH_STATE_RUNNING */ && *nbusy < SM_BUF) {
+ 				sm_buf[(*nbusy)++] = s;
+ 			}
+@@ -310,6 +321,21 @@
+ 		if (sm_on) {
+ 			printf("SWEET THRSAMPLE: sec %u tid 0x%llx hz %d samples %d busy %d idle %d miss %d\n", sec, cur_target, sm_hz, nsamp, nbusy,
+ 			    nsamp - nbusy, nmiss);
++			{
++				/* patch 0207: where the sampled thread last ran, per cpu id 0..15 then "none"; busy = run_state RUNNING (same test as busy above) */
++				char cl[320];
++				int l = snprintf(cl, sizeof(cl), "SWEET THRSAMPLE: sec %u cpu_all", sec);
++				for (int c = 0; c <= SM_NCPU; c++) {
++					l += snprintf(cl + l, sizeof(cl) - l, " %d", sm_cpu_all[c]);
++				}
++				l += snprintf(cl + l, sizeof(cl) - l, " cpu_busy");
++				for (int c = 0; c <= SM_NCPU; c++) {
++					l += snprintf(cl + l, sizeof(cl) - l, " %d", sm_cpu_busy[c]);
++				}
++				printf("%s\n", cl);
++				bzero(sm_cpu_all, sizeof(sm_cpu_all));
++				bzero(sm_cpu_busy, sizeof(sm_cpu_busy));
++			}
+ 			if (nbusy > 0 && rows < SC_ROW_CAP) {
+ 				printf("SMP backboardd[%d] slide 0x%llx mh 0x%llx\n", bb_pid, sm_buf[0].slide, sm_buf[0].mh);
+ 				for (int i = 0; i < nbusy && rows < SC_ROW_CAP; i++) {
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -458,6 +458,17 @@
+ static void
+ sm_thread(void *arg __unused, wait_result_t w __unused)
+ {
++	uint32_t poll_us = 200;   /* patch 0207 knob: boot-arg sweetmalipoll=<us> 20..1000 sets the busy completion poll; default 200 = unchanged */
++	uint32_t pv;
++
++	if (PE_parse_boot_argn("sweetmalipoll", &pv, sizeof(pv))) {
++		if (pv >= 20 && pv <= 1000) {
++			poll_us = pv;
++			printf("SWEET MALI: completion poll %u us (sweetmalipoll)\n", poll_us);
++		} else {
++			printf("SWEET MALI GAP: sweetmalipoll=%u outside 20..1000, ignored, poll stays %u us\n", pv, poll_us);
++		}
++	}
+ 	for (;;) {
+ 		uint64_t dl;
+ 		lck_mtx_lock(&sm_lock);
+@@ -465,7 +476,7 @@
+ 			check_job();
+ 		}
+ 		if (sm.busy) {
+-			clock_interval_to_deadline(200, NSEC_PER_USEC, &dl);
++			clock_interval_to_deadline(poll_us, NSEC_PER_USEC, &dl);
+ 		} else {
+ 			clock_interval_to_deadline(1000000, NSEC_PER_USEC, &dl);   /* idle: woken by submit */
+ 		}
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1106,6 +1106,7 @@
+ 	uint32_t run_state, flags;
+ 	int idx, nbt;
+ 	uint64_t bt[6];
++	int cpu;       /* patch 0207: cpu_id of thread->last_processor (-1 = none); advisory, read without the thread lock */
+ };
+ int sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o);
+ 
+@@ -1141,6 +1142,7 @@
+ 				o->run_state = (uint32_t)bi.run_state;
+ 				o->flags = (uint32_t)bi.flags;
+ 				o->idx = idx;
++				o->cpu = thread->last_processor != PROCESSOR_NULL ? thread->last_processor->cpu_id : -1;
+ 				o->pc = get_saved_state_pc(ss);
+ 				o->lr = get_saved_state_lr(ss);
+ 				o->sp = get_saved_state_sp(ss);
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -152,8 +152,8 @@
+ 		unsigned int o_rv = h[20] | (h[21] << 8);
+ 		IOLog("SWEET FVMAP: dom %u type=%u num_of_lv=%u num_of_members=%u init_lv=%u o_ratevolt=%#x\n",
+ 		    i, h[0], nlv, h[2], init, o_rv);
+-		if (i < 2 || i > 4) {
+-			continue;   /* only CPUCL0/1/2 tables */
++		if (i > 6) {
++			continue;   /* patch 0207 (T-df8f): MIF 0, INT 1, CPUCL0/1/2 2..4, G3D 5, G3DL2 6 tables (was CPUCL only); the bounds check below still rejects a table that does not fit */
+ 		}
+ 		if (nlv == 0 || nlv > 32 || o_rv + 8u * nlv > SWEET_FVMAP_BYTES || (o_rv & 3u)) {
+ 			IOLog("SWEET FVMAP: dom %u table rejected (nlv=%u o_ratevolt=%#x)\n", i, nlv, o_rv);

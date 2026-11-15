@@ -1,0 +1,356 @@
+SWEET SPI interrupts + Mali completion by interrupt (patch 0272, sprint-gpu 2026-11-09, user order 'start the proper interrupt build'; design docs/research/35-gpu-irq-path.md s.8): (1) sleh_irq sends INTID 32..1019 to a 4-slot SPI table in pexpert/arm/pe_fiq.c; an SPI with no handler (or a handler returning non-zero) is masked at the distributor and counted (safety net for review M2); (2) sweet_spi_attach/detach configure one SPI (Group 1 NS, prio 0xA0, level, routed to the boot CPU) with readback; (3) boot-arg sweetmaliirq=1 attaches JOB 452 / MMU 453: the ISR masks the source and wakes sm_thread, which re-arms while a job is in flight and sleeps with a 2 ms fallback instead of the poll; refused on a bad readback, falls back to polling if 200 jobs complete without a JOB interrupt. Lines 'SWEET MALI: irq attach ...', 'SWEET MALI: irq mode ON ...', per second 'SWEET PERF: irq on ... job ... mmu ... spurious ... fallback ... unhandled_total ...'. Default (no boot-arg): only the safety net is active; it changes nothing unless an SPI is delivered, which today none is (no SPI is enabled by XNU).
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index ab7d5ab..1a78eaa 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -23,6 +23,17 @@ extern void thread_terminate_self(void);
+ #include <kern/locks.h>
+ #include <os/atomic_private.h>   /* patch 0271 */
+ static uint64_t sm_bom_n[3], sm_bom_us[3], sm_bom_max[3], sm_bom_pg[3];   /* patch 0271: BO map / unmap / import counters (sweet_mali_perf_bo) */
++/* patch 0272: Mali interrupt mode state (sm_isr, sm_irq_setup, sm_thread, sm_perf_tick) */
++static int sm_irq_on;
++static uint32_t sm_irq_pend;
++static uint64_t sm_irq_job, sm_irq_mmu, sm_irq_spur, sm_irq_fallback, sm_irq_jobs_seen;
++extern int sweet_spi_attach(uint32_t intid, int (*fn)(void *, uint32_t), void *arg, uint32_t rb[4]);
++extern int sweet_spi_detach(uint32_t intid);
++extern void sweet_spi_counts(uint32_t intid, uint64_t *handled, uint64_t *unhandled, uint32_t *unhandled_last);
++#define SM_INTID_JOB 452u
++#define SM_INTID_MMU 453u
++#define R_JOB_STATUS 0x100Cu
++#define R_MMU_STATUS 0x200Cu
+ #include <mach/host_info.h>
+ #include <mach/task_info.h>
+ #include <sys/proc.h>
+@@ -864,6 +875,20 @@ sm_perf_tick(void)
+ 			bm[k] = sm_bom_max[k];
+ 			sm_bom_max[k] = 0;
+ 		}
++		if (sm_irq_on || sm_irq_job || sm_irq_mmu) {
++			/* patch 0272: interrupt counts this second (handled per INTID from the SPI table, safety-net masks in total) */
++			static uint64_t lj, lm, ls, lf;
++			uint64_t hj = 0, hm = 0, un = 0;
++			uint32_t ul = 0;
++			sweet_spi_counts(SM_INTID_JOB, &hj, &un, &ul);
++			sweet_spi_counts(SM_INTID_MMU, &hm, &un, &ul);
++			printf("SWEET PERF: irq on %d job %llu mmu %llu spurious %llu fallback %llu spi_job %llu spi_mmu %llu unhandled_total %llu last %u\n", sm_irq_on,
++			    sm_irq_job - lj, sm_irq_mmu - lm, sm_irq_spur - ls, sm_irq_fallback - lf, hj, hm, un, ul);
++			lj = sm_irq_job;
++			lm = sm_irq_mmu;
++			ls = sm_irq_spur;
++			lf = sm_irq_fallback;
++		}
+ 		if (bn[0] || bn[1] || bn[2]) {
+ 			printf("SWEET PERF: bomap map n %llu pages16k %llu us %llu max_us %llu unmap n %llu us %llu max_us %llu import n %llu pages16k %llu us %llu max_us %llu\n",
+ 			    bn[0], bp[0], bu[0], bm[0], bn[1], bu[1], bm[1], bn[2], bp[2], bu[2], bm[2]);
+@@ -884,6 +909,91 @@ sm_perf_tick(void)
+ 	sm_proccpu_line();
+ }
+ 
++/*
++ * Patch 0272 (sprint-gpu 2026-11-09, user order "start the proper interrupt build"; research 35 s.8 steps 3-5): boot-arg sweetmaliirq=1 takes job completion and
++ * MMU faults by GIC interrupt (JOB = INTID 452, MMU = INTID 453, SPI 420/421; the GPU line 451 is not used) instead of the busy poll. The ISR never clears a
++ * Mali interrupt: it reads the source's STATUS (RAWSTAT & MASK), writes that source's MASK to 0 (the level line drops, RAWSTAT keeps the bits for check_job),
++ * sets a pending bit and wakes sm_thread. sm_thread re-arms the masks while a job is in flight and sleeps with a 2 ms fallback deadline instead of poll_us; a
++ * wakeup lost between its check and the sleep costs at most that fallback (counted as `fallback`), never a hang. Masks are 0 whenever the GPU is idle, reset or dead.
++ * IRQ mode is refused (polling stays) when the attach readback shows the SPI not in Group 1 or not enabled, and it falls back to polling with a GAP line if
++ * 200 jobs complete without a single JOB interrupt.
++ */
++
++/* interrupt context: no lock, no printf, no MMIO log; non-zero return = let the dispatcher mask the SPI */
++static int
++sm_isr(void *arg, uint32_t intid __unused)
++{
++	uintptr_t which = (uintptr_t)arg;
++	if (!sm.up || sm.dead || sm.g == NULL) {
++		return 1;
++	}
++	if (which == 1) {
++		if (sm.g[R_JOB_STATUS / 4] == 0) {
++			sm_irq_spur++;
++			return 0;
++		}
++		sm.g[R_JOB_MASK / 4] = 0;
++		sm_irq_job++;
++	} else {
++		if (sm.g[R_MMU_STATUS / 4] == 0) {
++			sm_irq_spur++;
++			return 0;
++		}
++		sm.g[R_MMU_MASK / 4] = 0;
++		sm_irq_mmu++;
++	}
++	os_atomic_or(&sm_irq_pend, (uint32_t)which, relaxed);
++	thread_wakeup((event_t)&sm.thread);
++	return 0;
++}
++
++static void
++sm_irq_setup(void)
++{
++	uint32_t v = 0, rbj[4] = { 0 }, rbm[4] = { 0 };
++	if (!PE_parse_boot_argn("sweetmaliirq", &v, sizeof(v)) || v == 0) {
++		return;
++	}
++	if (v != 1) {
++		printf("SWEET MALI GAP: sweetmaliirq=%u is not 0 or 1, ignored, completion stays polled\n", v);
++		return;
++	}
++	lck_mtx_lock(&sm_lock);
++	wr(R_JOB_MASK, 0);
++	wr(R_MMU_MASK, 0);
++	lck_mtx_unlock(&sm_lock);
++	int ej = sweet_spi_attach(SM_INTID_JOB, sm_isr, (void *)(uintptr_t)1, rbj);
++	int em = ej ? -1 : sweet_spi_attach(SM_INTID_MMU, sm_isr, (void *)(uintptr_t)2, rbm);
++	printf("SWEET MALI: irq attach JOB %u rc %d group %u enabled %u icfgr %#x irouter %#x, MMU %u rc %d group %u enabled %u icfgr %#x irouter %#x\n",
++	    SM_INTID_JOB, ej, rbj[0], rbj[1], rbj[2], rbj[3], SM_INTID_MMU, em, rbm[0], rbm[1], rbm[2], rbm[3]);
++	/* nav42 [obs]: group reads 0 from the non-secure side even after the write (IGROUPR is RAZ/WI to NS for the secure view, research 35 s.3 item 7), so only
++	 * the enable bit is checked here; whether the line is really delivered as a Group 1 IRQ is settled at run time (no JOB interrupt in 200 jobs -> polling) */
++	if (ej || em || !rbj[1] || !rbm[1]) {
++		(void)sweet_spi_detach(SM_INTID_JOB);
++		(void)sweet_spi_detach(SM_INTID_MMU);
++		printf("SWEET MALI GAP: irq mode refused (attach rc or readback: not enabled), completion stays polled\n");
++		return;
++	}
++	sm_irq_on = 1;
++	printf("SWEET MALI: irq mode ON (sweetmaliirq=1): JOB/MMU completion by interrupt, poll replaced by a 2 ms fallback\n");
++}
++
++/* lock held: arm the masks while a job is in flight, clear them when idle */
++static void
++sm_irq_arm(int busy)
++{
++	if (!sm_irq_on || sm.dead) {
++		return;
++	}
++	if (busy) {
++		wr(R_JOB_MASK, 0x00030003u);       /* done + failed, slots 0 and 1 */
++		wr(R_MMU_MASK, 0xFFFFFFFFu);       /* page fault + bus fault, every AS */
++	} else {
++		wr(R_JOB_MASK, 0);
++		wr(R_MMU_MASK, 0);
++	}
++}
++
+ static void
+ sm_thread(void *arg __unused, wait_result_t w __unused)
+ {
+@@ -922,18 +1032,36 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 			printf("SWEET MALI GAP: sweetmaliovl=%u is not 0 or 1, ignored, overlap stays off\n", pv);
+ 		}
+ 	}
++	sm_irq_setup();   /* patch 0272 */
+ 	for (;;) {
+ 		uint64_t dl;
+ 		lck_mtx_lock(&sm_lock);
++		(void)os_atomic_xchg(&sm_irq_pend, 0u, relaxed);
+ 		if (sm.busy) {
++			uint64_t before = sm.seq_done;
+ 			check_job();
++			if (sm_irq_on && sm.seq_done != before) {
++				sm_irq_jobs_seen += sm.seq_done - before;
++				if (sm_irq_jobs_seen >= 200 && sm_irq_job == 0) {
++					sm_irq_on = 0;
++					wr(R_JOB_MASK, 0);
++					wr(R_MMU_MASK, 0);
++					(void)sweet_spi_detach(SM_INTID_JOB);
++					(void)sweet_spi_detach(SM_INTID_MMU);
++					printf("SWEET MALI GAP: irq mode off: %llu jobs completed without one JOB interrupt, back to polling every %u us\n", sm_irq_jobs_seen, poll_us);
++				}
++			}
+ 		}
++		sm_irq_arm(sm.busy != 0);
+ 		if (sm.busy) {
+-			clock_interval_to_deadline(poll_us, NSEC_PER_USEC, &dl);
++			clock_interval_to_deadline(sm_irq_on ? 2000 : poll_us, NSEC_PER_USEC, &dl);
+ 		} else {
+ 			clock_interval_to_deadline(1000000, NSEC_PER_USEC, &dl);   /* idle: woken by submit */
+ 		}
+-		(void)lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.thread, THREAD_UNINT, dl);
++		wait_result_t wres = lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.thread, THREAD_UNINT, dl);
++		if (sm_irq_on && wres == THREAD_TIMED_OUT && sm.busy) {
++			sm_irq_fallback++;
++		}
+ 		lck_mtx_unlock(&sm_lock);
+ 		sm_perf_tick();
+ 		sm_submit_tm_tick();
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..07b63dc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,9 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++extern void sweet_spi_dispatch(uint32_t intid);   /* patch 0272, pexpert/arm/pe_fiq.c */
++#endif
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1880,6 +1883,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
++	} else if (intid >= 32) {
++		/* patch 0272: SPIs go to the SWEET SPI table (pexpert/arm/pe_fiq.c); an SPI with no handler is masked there, never re-entered */
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		sweet_spi_dispatch(intid);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..6e6cc96 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,150 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++/*
++ * Patch 0272 (sprint-gpu 2026-11-09, user order "start the proper interrupt build"; design docs/research/35-gpu-irq-path.md s.8 in the kernel repo):
++ * SPI (shared peripheral interrupt) support for SWEET. Until now sleh_irq handed every INTID >= 16 except the timer to cdp->interrupt_handler, which is NULL on
++ * this port, so a level SPI that was enabled and asserted would re-enter at once and hang the CPU (review M2). Now:
++ *  - sweet_spi_dispatch (called by sleh_irq for 32 <= INTID < 1020) runs the handler attached for that INTID; an INTID with no handler, or a handler that
++ *    returns non-zero, is MASKED at the distributor (GICD_ICENABLER) and counted: the safety net that removes the M2 hazard for every SPI.
++ *  - sweet_spi_attach / sweet_spi_detach (thread context) configure one SPI: disable, clear pending/active, Group 1 non-secure, priority 0xA0, level,
++ *    routed to the boot CPU (IROUTER affinity 0.0.0.0 = MPIDR 0x0 [obs SWEET CPU: cpu=0 mpidr=0x0]), enable, and read back group/enable/config/route.
++ * Offsets: GICv3 architected distributor layout (research 35 s.6). Writes touch only the attached INTID's bits (set/clear-enable/pending/active registers
++ * are write-1-to-act; IGROUPR/IGRPMODR/ICFGR are read-modify-write of one bit). No other GIC state is changed.
++ */
++#define SWEET_GICD_IGROUPR    0x0080u
++#define SWEET_GICD_ISENABLER  0x0100u
++#define SWEET_GICD_ICENABLER  0x0180u
++#define SWEET_GICD_ICPENDR    0x0280u
++#define SWEET_GICD_ICACTIVER  0x0380u
++#define SWEET_GICD_IPRIORITYR 0x0400u
++#define SWEET_GICD_ICFGR      0x0C00u
++#define SWEET_GICD_IGRPMODR   0x0D00u
++#define SWEET_GICD_IROUTER    0x6000u
++#define SWEET_SPI_SLOTS       4
++
++typedef int (*sweet_spi_fn_t)(void *arg, uint32_t intid);
++static struct {
++	uint32_t intid;
++	sweet_spi_fn_t fn;
++	void *arg;
++	uint64_t count;
++} sweet_spi_tab[SWEET_SPI_SLOTS];
++uint64_t sweet_spi_unhandled;          /* SPIs masked by the safety net */
++uint32_t sweet_spi_unhandled_last;     /* INTID of the last one */
++
++static void
++sweet_gicd_rwp_wait(void)
++{
++	for (int i = 0; i < 1000000; i++) {
++		if ((gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) == 0) {
++			return;
++		}
++	}
++}
++
++void sweet_spi_dispatch(uint32_t intid);
++void
++sweet_spi_dispatch(uint32_t intid)
++{
++	for (int i = 0; i < SWEET_SPI_SLOTS; i++) {
++		sweet_spi_fn_t fn = os_atomic_load(&sweet_spi_tab[i].fn, acquire);
++		if (fn != NULL && sweet_spi_tab[i].intid == intid) {
++			sweet_spi_tab[i].count++;
++			if (fn(sweet_spi_tab[i].arg, intid) == 0) {
++				return;
++			}
++			break;   /* the handler asked for the line to be masked */
++		}
++	}
++	if (gicd_base != 0 && intid >= 32 && intid < 1020) {
++		gicd_write32(SWEET_GICD_ICENABLER + 4 * (intid / 32), 1u << (intid % 32));
++	}
++	sweet_spi_unhandled++;
++	sweet_spi_unhandled_last = intid;
++}
++
++/* rb[0] IGROUPR bit, rb[1] ISENABLER bit, rb[2] ICFGR word, rb[3] IROUTER low word. Returns 0 ok, 22 EINVAL, 28 ENOSPC (no free slot), 19 ENODEV (no GICD). */
++int sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4]);
++int
++sweet_spi_attach(uint32_t intid, sweet_spi_fn_t fn, void *arg, uint32_t rb[4])
++{
++	if (gicd_base == 0) {
++		return 19;
++	}
++	if (intid < 32 || intid >= 1020 || fn == NULL) {
++		return 22;
++	}
++	int slot = -1;
++	for (int i = 0; i < SWEET_SPI_SLOTS; i++) {
++		if (sweet_spi_tab[i].fn == NULL && slot < 0) {
++			slot = i;
++		}
++		if (sweet_spi_tab[i].fn != NULL && sweet_spi_tab[i].intid == intid) {
++			return 22;
++		}
++	}
++	if (slot < 0) {
++		return 28;
++	}
++	uint32_t w = 4 * (intid / 32), b = 1u << (intid % 32);
++	gicd_write32(SWEET_GICD_ICENABLER + w, b);
++	sweet_gicd_rwp_wait();
++	gicd_write32(SWEET_GICD_ICPENDR + w, b);
++	gicd_write32(SWEET_GICD_ICACTIVER + w, b);
++	gicd_write32(SWEET_GICD_IGROUPR + w, gicd_read32(SWEET_GICD_IGROUPR + w) | b);
++	gicd_write32(SWEET_GICD_IGRPMODR + w, gicd_read32(SWEET_GICD_IGRPMODR + w) & ~b);
++	*((volatile uint8_t *)(gicd_base + SWEET_GICD_IPRIORITYR + intid)) = 0xA0;
++	uint32_t cw = SWEET_GICD_ICFGR + 4 * (intid / 16), cb = 2u << (2 * (intid % 16));
++	gicd_write32(cw, gicd_read32(cw) & ~cb);          /* level-sensitive */
++	*((volatile uint64_t *)(gicd_base + SWEET_GICD_IROUTER + 8 * (uint64_t)intid)) = 0;   /* affinity 0.0.0.0 (boot CPU), bit 31 clear */
++	sweet_spi_tab[slot].intid = intid;
++	sweet_spi_tab[slot].arg = arg;
++	sweet_spi_tab[slot].count = 0;
++	os_atomic_store(&sweet_spi_tab[slot].fn, fn, release);
++	gicd_write32(SWEET_GICD_ISENABLER + w, b);
++	sweet_gicd_rwp_wait();
++	rb[0] = (gicd_read32(SWEET_GICD_IGROUPR + w) & b) != 0;
++	rb[1] = (gicd_read32(SWEET_GICD_ISENABLER + w) & b) != 0;
++	rb[2] = gicd_read32(cw);
++	rb[3] = gicd_read32(SWEET_GICD_IROUTER + 8 * intid);
++	return 0;
++}
++
++int sweet_spi_detach(uint32_t intid);
++int
++sweet_spi_detach(uint32_t intid)
++{
++	if (gicd_base == 0 || intid < 32 || intid >= 1020) {
++		return 22;
++	}
++	gicd_write32(SWEET_GICD_ICENABLER + 4 * (intid / 32), 1u << (intid % 32));
++	sweet_gicd_rwp_wait();
++	for (int i = 0; i < SWEET_SPI_SLOTS; i++) {
++		if (sweet_spi_tab[i].fn != NULL && sweet_spi_tab[i].intid == intid) {
++			os_atomic_store(&sweet_spi_tab[i].fn, (sweet_spi_fn_t)NULL, release);
++		}
++	}
++	return 0;
++}
++
++/* per-INTID handled counts and the safety-net count for log lines (thread context) */
++void sweet_spi_counts(uint32_t intid, uint64_t *handled, uint64_t *unhandled, uint32_t *unhandled_last);
++void
++sweet_spi_counts(uint32_t intid, uint64_t *handled, uint64_t *unhandled, uint32_t *unhandled_last)
++{
++	*handled = 0;
++	for (int i = 0; i < SWEET_SPI_SLOTS; i++) {
++		if (sweet_spi_tab[i].intid == intid) {
++			*handled = sweet_spi_tab[i].count;
++		}
++	}
++	*unhandled = sweet_spi_unhandled;
++	*unhandled_last = sweet_spi_unhandled_last;
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()

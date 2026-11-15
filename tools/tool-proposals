@@ -5,14 +5,16 @@
   tools/tool-proposals check NAME_OR_KEYWORD exists in tools/, tools/pix, docs/AUTOMATION.md, or already proposed?
   tools/tool-proposals new NAME [--extends X] [--related TP-NNN] [--force]
                                              write the next free TP-NNN-slug.md (does not edit the index)
-  tools/tool-proposals prune [--stale-days 14] [--unused-days 30]
-                                             read-only: stale `proposed` entries, unused `done` tools (TP-017)
+  tools/tool-proposals prune [--stale-days 14]
+                                             read-only: stale `proposed` entries (unused tools: tools/tool-census, TP-043)
   tools/tool-proposals validate              front matter, sections, ids, references, README index in sync
 
 check: last line `RESULT: EXISTS|ALREADY-PROPOSED|NONE ...`, exit 0 NONE / 1 hit / 2 error.
 validate: last line `RESULT: PASS|FAIL ...`, exit 0 / 1 / 2. No device access; writes only docs/tool-proposals/.
 Env TP_ROOT overrides the repo root (tests).
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import datetime, os, re, sys
 
 ROOT = os.environ.get("TP_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -282,33 +284,16 @@ def cmd_validate(a):
     return 1 if bad else 0
 
 
-def _last_use(rel):
-    """Newest of: last commit touching the tool file, mtime of any file under logs/ that mentions its name (epoch, 0 = never)."""
-    import subprocess
-    t = 0
-    r = subprocess.run(["git", "-C", ROOT, "log", "-1", "--format=%ct", "--", rel], capture_output=True, text=True)
-    if r.stdout.strip():
-        t = int(r.stdout)
-    logs = os.path.join(ROOT, "logs")
-    if os.path.isdir(logs):
-        r = subprocess.run(["grep", "-rlF", "--", os.path.basename(rel), logs], capture_output=True, text=True)
-        for f in r.stdout.split("\n"):
-            if f:
-                t = max(t, int(os.path.getmtime(f)))
-    return t
-
-
 def cmd_prune(args):
     import time
-    stale, unused = 14, 30
+    stale = 14
     while args:
         k = args.pop(0)
         if k == "--stale-days" and args:
             stale = int(args.pop(0))
-        elif k == "--unused-days" and args:
-            unused = int(args.pop(0))
         else:
             raise Err("unknown arg " + k)
+    print("prune: unused-tool check moved to tools/tool-census (TP-043)")
     now, hits = time.time(), 0
     for f, fm, body, err in load():
         if err:
@@ -318,14 +303,6 @@ def cmd_prune(args):
             if age > stale:
                 print("STALE %s %s proposed %d days ago -> rejected (stale)?" % (fm["id"], fm["tool"], age))
                 hits += 1
-        elif fm.get("status") == "done":
-            m = re.match(r"tools/[\w./-]+", fm["tool"])
-            if m and os.path.exists(os.path.join(ROOT, m.group(0))):
-                t = _last_use(m.group(0))
-                if (now - t) / 86400 > unused:
-                    print("UNUSED %s %s last use %s -> delete?" % (fm["id"], m.group(0),
-                          time.strftime("%Y-%m-%d", time.localtime(t)) if t else "never"))
-                    hits += 1
     print("RESULT: %s %d candidates (user approves any deletion)" % ("PARTIAL" if hits else "PASS", hits))
     return 1 if hits else 0
 

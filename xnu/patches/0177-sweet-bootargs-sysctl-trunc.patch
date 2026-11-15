@@ -1,0 +1,124 @@
+SWEET kern.bootargs for stock userland buffers (patch 0177 r4; research bootargs-callers-0177, bootargs-userland-tokens sections 5-6).
+BOOT_LINE_LENGTH is 1024 (patch 0176) and the PixOS line is 275 chars; launchd/launchd_cache_loader read it with 128 B, thermalmonitord and others with 256 B and got ENOMEM [obs wlan-runG2-d4a: 47 GAP lines].
+r4: the r3 denylist failed on runs with --restart/sweetrestart/sweetcntvct (280-char line -> 154-char view, launchd's 128 B probe still ENOMEM; research section 5 had said a denylist cannot reach 128). The view is now an ALLOWLIST: only tokens whose name is listed below (exact names or prefixes, research sections 5-6) are shown, everything else is hidden. PE_boot_args()/PE_parse_boot_argn are untouched. Names not proven read by userland (amfi*, cs_enforcement*, -v, -s, maxmem, ...) are hidden: a new --args token that userland must see needs its name added to sweet_shown_exact/sweet_shown_prefix (review bootargs-view-r2 F2).
+r3: userland gets a VIEW of the line, built in place.
+r2 rules apply to the view: trunc=1 iff oldlen >= 608 (stock BOOT_LINE_LENGTH; watchdogd 608 B crashes on any error), smaller buffers keep ENOMEM (launchd retries on it), GAP lines counted per kind.
+Rule 8: one "SWEET BOOTARGS: ... hides N tokens" line on the first request. Host test: tools/test_bootline_layout.py BootargsSysctl177. Not run on hardware in this form.
+
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffb..9fa376b 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2164,10 +2164,111 @@ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+ 	int error;
++#define SWEET_STOCK_BOOT_LINE_LENGTH 608   /* stock arm64 pexpert/pexpert/arm64/boot.h before patch 0176 */
+ 	char buf[BOOT_LINE_LENGTH];
++	size_t len, rawlen;
++	int small, trunc;
++	/*
++	 * ALLOWLIST (patch 0177 r4). A token is shown to userland iff its NAME (text before the first '=', or the whole
++	 * flag) equals an entry of sweet_shown_exact or starts with an entry of sweet_shown_prefix; every other token is
++	 * hidden, so a new kernel-only token (sweet*, ...) never lengthens the view. Names are the ones userland references
++	 * [docs/research/bootargs-userland-tokens.md sections 5-6]; debug and cpus stay visible because DumpPanic/ktrace
++	 * are kern.bootargs readers that were not traced (section 6). Add a name here when a binary needs one.
++	 */
++	static const char *const sweet_shown_exact[] = {
++		"debug", "cpus", "serial", "rd", "wdt", "wdt_test", "ignition_level", "libtrace_kic", "-restore",
++	};
++	static const char *const sweet_shown_prefix[] = {
++		"launchd_", "wdt_", "-wdt_", "cc.", "ramrod_exec-",
++	};
++	static uint32_t sweet_bootargs_views;
++	char hidden[160];   /* names of hidden tokens; bounded copy below, " ..." marks a cut list */
++	unsigned nhidden = 0;
++	int hcut = 0;
+ 
+ 	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
++	rawlen = strlen(buf);
++	hidden[0] = '\0';
++	{   /* build the userland view in place (write pointer d never passes read pointer s) */
++		const char *s = buf;
++		char *d = buf;
++		while (*s) {
++			const char *e;
++			size_t i, nlen, tlen;
++			int hide = 1;
++			while (*s == ' ' || *s == '\t') {
++				s++;
++			}
++			if (!*s) {
++				break;
++			}
++			for (e = s; *e && *e != ' ' && *e != '\t'; e++) {
++			}
++			tlen = (size_t)(e - s);
++			for (nlen = 0; nlen < tlen && s[nlen] != '='; nlen++) {
++			}
++			for (i = 0; i < sizeof(sweet_shown_exact) / sizeof(sweet_shown_exact[0]); i++) {
++				if (strlen(sweet_shown_exact[i]) == nlen && strncmp(s, sweet_shown_exact[i], nlen) == 0) {
++					hide = 0;
++				}
++			}
++			for (i = 0; i < sizeof(sweet_shown_prefix) / sizeof(sweet_shown_prefix[0]); i++) {
++				if (nlen >= strlen(sweet_shown_prefix[i]) && strncmp(s, sweet_shown_prefix[i], strlen(sweet_shown_prefix[i])) == 0) {
++					hide = 0;
++				}
++			}
++			if (hide) {
++				size_t hl = strlen(hidden);
++				nhidden++;
++				if (!hcut && hl + 1 + nlen + 4 < sizeof(hidden)) {   /* keep room for " ..." and the NUL */
++					if (hl) {
++						hidden[hl++] = ' ';
++					}
++					memcpy(hidden + hl, s, nlen);
++					hidden[hl + nlen] = '\0';
++				} else if (!hcut) {
++					hcut = 1;
++					strlcat(hidden, " ...", sizeof(hidden));
++				}
++			} else {
++				if (d != buf) {
++					*d++ = ' ';
++				}
++				memmove(d, s, tlen);
++				d += tlen;
++			}
++			s = e;
++		}
++		*d = '\0';
++	}
++	len = strlen(buf);
++	if (os_atomic_inc(&sweet_bootargs_views, relaxed) == 1) {   /* rule 8: the view is a departure from stock, say so once */
++		printf("SWEET BOOTARGS: kern.bootargs view hides %u tokens (line %lu chars, view %lu chars): %s\n",
++		    nhidden, (unsigned long)rawlen, (unsigned long)len, hidden);
++	}
++	/*
++	 * r2 rules, applied to the view: BOOT_LINE_LENGTH is 1024 here (patch 0176), stock arm64 is 608, and stock
++	 * userland sizes its buffers for that.
++	 * - oldlen >= 608: such callers never saw ENOMEM on stock and may not handle one (watchdogd: 608-byte buffer,
++	 *   any error -> __os_crash at 0x10000b5e8). They get the view cut to oldlen-1 chars + NUL (trunc=1, as kern.hostname).
++	 * - oldlen < 608: they handle ENOMEM (launchd, launchd_cache_loader: 128-byte buffer, retry with a size probe
++	 *   only on ENOMEM; a cut answer drops launchd_unsecure_cache= and stalls the boot [obs bootargs-trunc-long
++	 *   2026-10-28]). They keep trunc=0.
++	 * A GAP line (counted per kind) for every request with a buffer too small for the view: the first 32, then at
++	 * 100, 1000, 10000, 100000 (rule 8).
++	 */
++	small = req->oldptr && req->oldlen && req->oldlen < len + 1;   /* sysctl_io_string's own trunc test */
++	trunc = req->oldlen >= SWEET_STOCK_BOOT_LINE_LENGTH;
++	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, trunc, NULL);
++	if (small) {
++		static uint32_t sweet_bootargs_cut, sweet_bootargs_enomem;   /* separate, so ENOMEM noise cannot use up the cut lines */
++		uint32_t n = os_atomic_inc(trunc ? &sweet_bootargs_cut : &sweet_bootargs_enomem, relaxed);
++		if (n <= 32 || n == 100 || n == 1000 || n == 10000 || n == 100000) {
++			printf("SWEET GAP: kern.bootargs %s to %lu-byte buffer, line %lu chars, error %d x%u (%s pid %d)\n",
++			    trunc ? "truncated" : "ENOMEM", (unsigned long)req->oldlen, (unsigned long)len, error, n,
++			    req->p ? req->p->p_comm : "?", req->p ? proc_getpid(req->p) : -1);
++		}
++	}
+ 	return error;
+ }
+ 

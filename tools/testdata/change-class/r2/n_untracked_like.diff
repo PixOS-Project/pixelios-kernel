@@ -1,0 +1,3 @@
+diff --git a/shim/n.c b/shim/n.c
+@@ -0,0 +1 @@
++	printf("x"); return printf("y");

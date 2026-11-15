@@ -8,4 +8,4 @@ One directory per SoC: `soc/<vendor>/<soc>/{soc.json,shim/,docs/}`. `soc.json` i
 - `tools/pix check` must pass; generated headers for existing boards must stay byte-identical unless the change is
   the point of the commit.
 
-- Coding rules: `docs/CODING-RULES.md` (CR-xx ids; each names its check). Read the rules for this area before editing; `tools/check-rules.py` enforces the lint ones in the gate.
+- Coding rules: see `shim/AGENTS.md`.

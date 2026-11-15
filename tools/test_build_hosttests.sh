@@ -3,6 +3,8 @@
 # compile there is skipped), (2) build.sh's chk() stops a `set -e` script on a compile error and lists the compiled *host_test* outputs,
 # (3) the gate's host-tests step (extracted from check-all.sh) fails on a missing binary, a missing list or a failing test,
 # (4) the --wlan-iso --wlan-en gate step accepts only the intended refusal. ~1 s. Ends with RESULT: PASS|FAIL.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 cd "$(dirname "$0")/.." || exit 2
 T=$(mktemp -d) || exit 2; trap 'rm -rf "$T"' EXIT
 fail=0; bad() { echo "FAIL $*"; fail=1; }
@@ -19,7 +21,7 @@ awk '/^chk\(\) \{/{f=1} f{print} f&&/exit 1; fi; \}/{exit}' shim/build.sh >"$T/c
 echo 'int main(void){ return nope; }' >"$T/bad.c"; echo 'int main(void){ return 0; }' >"$T/ok.c"
 O=$T/o; mkdir -p "$O"
 cat >"$T/run.sh" <<EOT
-set -euo pipefail; O=$O
+set -euo pipefail; O=$O; in_ht=1; ht_filter=   # chk() reads both (shim/build.sh --host-tests filter)
 . $T/chk.sh
 chk "ok_host_test (compile)" gcc -o \$O/ok_host_test $T/ok.c
 chk "ok_host_test" \$O/ok_host_test

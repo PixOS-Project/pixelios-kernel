@@ -179,7 +179,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,326 @@
 +/*
 + * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
 + * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
@@ -298,6 +298,13 @@
 +	setAmperage(ma);
 +	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
 +	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	{       /* T-07 (silent-failure audit): the placeholder says so once per boot */
++		static bool cycle_gap_logged;
++		if (!cycle_gap_logged) {
++			cycle_gap_logged = true;
++			IOLog("SWEET GAP: battery CycleCount published as 0: cycle learning is not implemented (patch 0061 placeholder)\n");
++		}
++	}
 +	putBool("FullyCharged", full);
 +	putBool("AppleRawExternalConnected", external);
 +	putNumber("AppleRawCurrentCapacity", capacity);

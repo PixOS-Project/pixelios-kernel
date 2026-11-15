@@ -1,0 +1,20 @@
+diff --git a/xnu/patches/0300-sweet-log.patch b/xnu/patches/0300-sweet-log.patch
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/xnu/patches/0300-sweet-log.patch
+@@ -0,0 +1,14 @@
++diff --git a/osfmk/kern/x.c b/osfmk/kern/x.c
++--- a/osfmk/kern/x.c
+++++ b/osfmk/kern/x.c
++@@ -10,6 +10,10 @@ void f(int a, int dbg)
++ 	if (a) {
++ 		foo();
+++		printf("a\n");
++ 	}
+++	if (dbg) {
+++		printf("dbg\n");
+++	}
++ 	else {
++ 		off();
++ 	}

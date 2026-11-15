@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+index e39597c..7a7b37d 100644
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -7,5 +7,6 @@ int f(int err, uint32_t a)
+ 		/* best effort: log it */
+ 		printf("x\n");
+ 	write32(a, 1);
++	printf("x\n"); write32(a, 2);
+ 	return 0;
+ }

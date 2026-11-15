@@ -39,6 +39,11 @@
 #define R_PAR1(ep)	(0xC804u + 0x10u * (ep))
 #define R_PAR2(ep)	(0xC800u + 0x10u * (ep))
 
+#ifdef USB_GADGET_SS
+#define DCFG_BASE_SPD	4u	/* DEVSPD kept as the gadget wrote it (SuperSpeed) */
+#else
+#define DCFG_BASE_SPD	0u
+#endif
 #define DCTL_CSFTRST	(1u << 30)
 #define DCTL_RUN_STOP	(1u << 31)
 #define DEPCMD_CMDACT	(1u << 10)
@@ -369,7 +374,11 @@ static void test_bringup_sequence(void)
 	assert(usbgadget_init((uintptr_t)pool, sizeof(pool), &hooks) == 0);
 
 	e[n++] = (struct expw){ R_DCTL, 0x40000000u };		/* CSFTRST */
+#ifdef USB_GADGET_SS
+	e[n++] = (struct expw){ R_DCFG, 0x00000004u };		/* DEVSPD SuperSpeed, addr 0 */
+#else
 	e[n++] = (struct expw){ R_DCFG, 0x00000000u };		/* HS, addr 0 */
+#endif
 	e[n++] = (struct expw){ R_GEVNTADRLO, (uint32_t)evt_pa };
 	e[n++] = (struct expw){ R_GEVNTADRHI, (uint32_t)(evt_pa >> 32) };
 	e[n++] = (struct expw){ R_GEVNTSIZ, 0x80001000u };
@@ -410,6 +419,12 @@ static void test_bringup_sequence(void)
 	expect_writes(e, n);
 
 	assert_line("USB gadget: running");
+#ifdef USB_GADGET_HS_ONLY
+	assert_line("USB2 GAP: gadget built HS-only (--usb2)");
+	assert(last_write_val(R_DCFG) == 0);
+#else
+	assert(last_write_val(R_DCFG) == 4);
+#endif
 	/* setup TRB primed into pool memory */
 	struct trb t = trb_at(USBG_UD_TRB_OUT);
 	assert(t.lo == (uint32_t)((uintptr_t)pool + USBG_UD_SETUP));
@@ -429,12 +444,22 @@ static void test_fault_third_access(void)
 	assert_line("USB gadget fault");
 	/* access 1 = DCTL write, 2 = DCTL read (cleared), 3 = DCFG read: */
 	assert(n_access == 3);
+#ifdef USB_GADGET_SS
+	/* the read-only SS report (GUSB2PHYCFG, GUSB3PIPECTL) runs before the
+	 * soft reset, so the 3rd access fails before any write */
+	assert(n_writes == 0);
+#else
 	assert(n_writes == 1);
+#endif
 	/* sticky: poll and write never touch hardware again */
 	usbgadget_poll();
 	assert(usbgadget_write("x", 1) == 0);
 	assert(n_access == 3);
+#ifdef USB_GADGET_SS
+	assert(n_writes == 0);
+#else
 	assert(n_writes == 1);
+#endif
 }
 
 /* ---- (e) soft-reset timeout returns error, bounded ---- */
@@ -545,15 +570,15 @@ static void test_enumeration(void)
 	 * 0071 patch); the core applies it after the status stage itself */
 	inject_setup_complete(set_addr);
 	poll_all();
-	assert(reg_get(R_DCFG) == (0x2A << 3));	/* immediately */
+	assert(reg_get(R_DCFG) == ((0x2A << 3) | DCFG_BASE_SPD));	/* immediately */
 	inject_event(EVT_EP(1, 3, 2));
 	poll_all();
-	assert(reg_get(R_DCFG) == (0x2A << 3));
+	assert(reg_get(R_DCFG) == ((0x2A << 3) | DCFG_BASE_SPD));
 	assert(trb_at(USBG_UD_TRB_IN).ctl == CTL_STATUS2);
 	assert(trb_at(USBG_UD_TRB_IN).len == 0);
 	inject_event(EVT_EP(1, 1, 0));
 	poll_all();
-	assert(reg_get(R_DCFG) == (0x2A << 3));
+	assert(reg_get(R_DCFG) == ((0x2A << 3) | DCFG_BASE_SPD));
 	assert(trb_at(USBG_UD_TRB_OUT).ctl == CTL_SETUP);
 	assert(usbgadget_ready() == 0);
 
@@ -854,6 +879,254 @@ static void test_foreign_event(void)
 	assert(strstr(con_log, "EVT reset") == NULL);
 }
 
+#ifdef USB_GADGET_SS
+/* ---- SuperSpeed (USB_GADGET_SS) ---- */
+
+static unsigned count_substr(const char *needle)
+{
+	unsigned n = 0;
+	const char *p = con_log;
+
+	while ((p = strstr(p, needle)) != NULL) {
+		n++;
+		p += strlen(needle);
+	}
+	return n;
+}
+
+static void ss_enumerate(uint32_t dsts)
+{
+	static const uint8_t set_cfg[8] =
+		{ 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+	reg_seed(R_DSTS, dsts);
+	inject_event(EVT_DEV(2));
+	poll_all();
+	inject_setup_complete(set_cfg);
+	poll_all();
+	status_in_roundtrip();
+}
+
+static void test_ss_bringup_and_speed(void)
+{
+	static const uint8_t set_sel[8] =
+		{ 0x00, 0x30, 0, 0, 0, 0, 6, 0 };
+	static const uint8_t isoch[8] =
+		{ 0x00, 0x31, 100, 0, 0, 0, 0, 0 };
+	static const uint8_t set_u1[8] =
+		{ 0x00, 0x03, 48, 0, 0, 0, 0, 0 };
+	static const uint8_t get_bos[8] =
+		{ 0x80, 0x06, 0x00, 0x0f, 0, 0, 0xff, 0 };
+	static const uint8_t get_qual[8] =
+		{ 0x80, 0x06, 0x00, 0x06, 0, 0, 0x0a, 0 };
+	static const uint8_t set_dtr[8] =
+		{ 0x21, 0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	struct trb t;
+
+	/* DEVSPD 4 written, NUMP and all other DCFG bits kept, address 0 */
+	fake_reset();
+	reg_seed(R_DCFG, 0x00200888u);
+	reg_seed(R_DSTS, 0x00000004u);
+	assert(usbgadget_init((uintptr_t)pool, sizeof(pool), &hooks) == 0);
+	assert(last_write_val(R_DCFG) == 0x00200804u);
+	/* read-only reports before and after the soft reset, no PHY writes */
+	assert(count_substr("USB3: before soft reset (SS) GUSB2PHYCFG=0x") == 1);
+	assert(count_substr("USB3: after soft reset GUSB2PHYCFG=0x") == 1);
+	assert_whitelist();
+
+	/* SS ConnectDone: ep0 512, bulk 1024 after SET_CONFIGURATION */
+	ss_enumerate(0x00000004u);
+	assert_line("USB EVT conndone speed=4");
+	assert_line("USB3: conndone speed=4");
+	{	/* the ep0 DEPCFG modify writes: find the 512 one */
+		unsigned i, hit = 0;
+
+		for (i = 0; i < n_writes; i++)
+			if (wlog[i].addr == FAKE_BASE + R_PAR0(0) &&
+			    wlog[i].val == ((512u << 3) | (2u << 30)))
+				hit++;
+		assert(hit == 1);
+	}
+	{
+		unsigned i, hit = 0;
+
+		for (i = 0; i < n_writes; i++)
+			if (wlog[i].addr == FAKE_BASE + R_PAR0(3) &&
+			    wlog[i].val == ((2u << 1) | (1u << 17) | (1024u << 3)))
+				hit++;
+		assert(hit == 1);
+	}
+	assert_line("USB3: bulk max packet 1024");
+	assert(count_lines("USB3 GAP: speed contradicts the bulk max packet, not restarted again") == 0);
+
+	/* BOS served at SS (22 bytes), qualifier stalls with a GAP line */
+	inject_setup_complete(get_bos);
+	poll_all();
+	t = trb_at(USBG_UD_TRB_IN);
+	assert(t.len == 22);
+	assert(pool[USBG_UD_DATA] == 5 && pool[USBG_UD_DATA + 1] == 0x0f &&
+	       pool[USBG_UD_DATA + 16] == 0x0f);	/* BOS hdr, SS capability speeds */
+	inject_event(EVT_EP(1, 1, 0));	/* data IN complete */
+	poll_all();
+	status_out_roundtrip();
+	con_reset();
+	inject_setup_complete(get_qual);
+	poll_all();
+	assert(strstr(con_log, "USB3 GAP: ep0 request stalled") != NULL);
+	/* SET_SEL: 6-byte OUT stage, TRB length = ep0 max packet 512, in the data area */
+	con_reset();
+	inject_setup_complete(set_sel);
+	poll_all();
+	t = trb_at(USBG_UD_TRB_OUT);
+	assert(t.len == 512 && t.lo == (uint32_t)((uintptr_t)pool + USBG_UD_DATA));
+	assert(USBG_UD_DATA + t.len <= USBG_UD_BULK_TRB);
+	assert_line("USB3 GAP: SET_SEL acknowledged, not programmed");
+	inject_event(EVT_EP(0, 1, 0));	/* OUT data complete */
+	poll_all();
+	status_in_roundtrip();
+	/* line coding untouched by the discarded SET_SEL bytes */
+	assert(usbgadget_ready() == 0);
+	inject_setup_complete(set_dtr);
+	poll_all();
+	status_in_roundtrip();
+	assert(usbgadget_ready() == 1);
+	con_reset();
+	inject_setup_complete(isoch);
+	poll_all();
+	status_in_roundtrip();
+	assert_line("USB3: SET_ISOCH_DELAY ns=100");
+	con_reset();
+	inject_setup_complete(set_u1);
+	poll_all();
+	assert(strstr(con_log, "USB3 GAP: ep0 request stalled") != NULL);
+	assert(strstr(con_log, "gadget fault") == NULL);
+	assert(usbgadget_faulted() == 0);
+}
+
+static void test_hs_connect_in_ss_build(void)
+{
+	static const uint8_t get_bos[8] =
+		{ 0x80, 0x06, 0x00, 0x0f, 0, 0, 0xff, 0 };
+	unsigned i, hit = 0;
+
+	fake_reset();
+	assert(usbgadget_init((uintptr_t)pool, sizeof(pool), &hooks) == 0);
+	ss_enumerate(0x00000000u);	/* HS ConnectDone */
+	assert_line("USB3: conndone speed=0");
+	for (i = 0; i < n_writes; i++) {
+		if (wlog[i].addr == FAKE_BASE + R_PAR0(0) &&
+		    wlog[i].val == ((64u << 3) | (2u << 30)))
+			hit++;
+		assert(!(wlog[i].addr == FAKE_BASE + R_PAR0(0) &&
+			 wlog[i].val == ((512u << 3) | (2u << 30))));
+	}
+	assert(hit == 1);
+	hit = 0;
+	for (i = 0; i < n_writes; i++)
+		if (wlog[i].addr == FAKE_BASE + R_PAR0(3) &&
+		    wlog[i].val == ((2u << 1) | (1u << 17) | (512u << 3)))
+			hit++;
+	assert(hit == 1);
+	inject_setup_complete(get_bos);	/* BOS stalls at HS */
+	poll_all();
+	assert(strstr(con_log, "gadget fault") == NULL);
+	/* configured at HS: the SS timer must not fire */
+	fake_t += 20000u * 1000u;
+	poll_all();
+	assert(count_substr("restarting at high speed") == 0);
+}
+
+static void test_ss_fallback(void)
+{
+	unsigned i, dcfg_ss = 0, dcfg_hs = 0;
+
+	fake_reset();
+	reg_seed(R_DCFG, 0x00200888u);
+	assert(usbgadget_init((uintptr_t)pool, sizeof(pool), &hooks) == 0);
+	poll_all();
+	assert(count_substr("restarting at high speed") == 0);	/* before the timeout */
+	fake_t += 9000u * 1000u;
+	poll_all();
+	assert(count_substr("restarting at high speed") == 0);
+	fake_t += 2000u * 1000u;	/* past 10000 ms after RUN */
+	poll_all();
+	assert_line("USB3 GAP: not configured in 10000 ms: restarting at high speed");
+	for (i = 0; i < n_writes; i++)
+		if (wlog[i].addr == FAKE_BASE + R_DCFG) {
+			if ((wlog[i].val & 7u) == 4u)
+				dcfg_ss++;
+			else if (wlog[i].val == 0x00200800u)
+				dcfg_hs++;
+		}
+	assert(dcfg_ss == 1 && dcfg_hs == 1);
+	assert(last_write_val(R_DCFG) == 0x00200800u);
+	assert(last_write_val(R_DCTL) & DCTL_RUN_STOP);
+	assert(usbgadget_faulted() == 0);
+	/* never a second restart */
+	fake_t += 60000u * 1000u;
+	poll_all();
+	poll_all();
+	assert(count_substr("restarting at high speed") == 1);
+	/* the restarted session enumerates at HS normally */
+	ss_enumerate(0x00000000u);
+	assert_line("USB3: conndone speed=0");
+	assert(usbgadget_faulted() == 0);
+	assert_whitelist();
+}
+
+static void test_ss_speed_contradiction(void)
+{
+	static const uint8_t set_dtr[8] =
+		{ 0x21, 0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	unsigned i, start, end_i = 0, stop_i = 0;
+	const uint32_t endxfer = 8u | (1u << 11) | (4u << 16) | DEPCMD_CMDACT;
+
+	fake_reset();
+	assert(usbgadget_init((uintptr_t)pool, sizeof(pool), &hooks) == 0);
+	ss_enumerate(0x00000004u);	/* bulk programmed at 1024 */
+	assert_line("USB3: bulk max packet 1024");
+	inject_setup_complete(set_dtr);
+	poll_all();
+	status_in_roundtrip();
+	assert(usbgadget_ready() == 1);
+	assert(usbgadget_write("x", 1) == 1);	/* EP1IN transfer is now active */
+	con_reset();
+	start = n_writes;
+	/* No bus reset first (it would end EP1IN itself): the restart must
+	 * end the active transfer. A HS ConnectDone contradicts the 1024,
+	 * followed by 19 events of the old session: 15 skipped in the batch
+	 * of 16, 4 still pending in the buffer when the core is stopped. */
+	reg_seed(R_DSTS, 0x00000000u);
+	inject_event(EVT_DEV(2));
+	for (i = 0; i < 19; i++)
+		inject_event(EVT_DEV(1));
+	poll_all();
+	assert_line("USB3 GAP: speed contradicts the programmed bulk max packet: restarting at high speed");
+	assert_line("USB3 GAP: batch skipped: 15");
+	assert_line("USB3 GAP: events dropped: 4");
+	assert_line("USB3 GAP: controller not halted 1000 ms after RUN_STOP=0; soft reset anyway");
+	assert_line("USB3 high-speed restart done");
+	assert(count_substr("restarting at high speed") == 1);
+	assert(usbgadget_faulted() == 0);
+	/* the restart ended EP1IN before it cleared RUN_STOP */
+	for (i = start; i < n_writes; i++) {
+		if (!end_i && wlog[i].addr == FAKE_BASE + R_DEPCMD(3) &&
+		    wlog[i].val == endxfer)
+			end_i = i + 1;
+		if (!stop_i && wlog[i].addr == FAKE_BASE + R_DCTL &&
+		    !(wlog[i].val & DCTL_RUN_STOP))
+			stop_i = i + 1;
+	}
+	assert(end_i && stop_i && end_i < stop_i);
+	/* the old session is gone: nothing is ready, nothing is written */
+	assert(usbgadget_ready() == 0);
+	assert(usbgadget_write("x", 1) == 0);
+	/* second contradiction: no second restart */
+	ss_enumerate(0x00000000u);
+	assert(count_substr("restarting at high speed") == 1);
+}
+#endif
+
 int main(void)
 {
 	test_bringup_sequence();
@@ -869,6 +1142,12 @@ int main(void)
 	test_stop();
 	test_zero_length_get();
 	test_foreign_event();
+#ifdef USB_GADGET_SS
+	test_ss_bringup_and_speed();
+	test_hs_connect_in_ss_build();
+	test_ss_fallback();
+	test_ss_speed_contradiction();
+#endif
 	printf("PASS usbgadget host test: bring-up sequence, fault/sticky, "
 	       "soft-reset timeout, ep0 machine, SET_ADDRESS immediate, "
 	       "ep1 enable, bulk write, poll bound, arg checks, DEPCMD "

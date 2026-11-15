@@ -320,8 +320,8 @@ static void test_save_into_fake_zone(void)
 static void test_save_tail_keep(void)
 {
 	/* console-size 0x1000 -> data cap 0xff4; append more than that. */
-	uint8_t *zone = malloc(0x1000);
-	memset(zone, 0xee, 0x1000);
+	uint8_t *zone = malloc(0x1000 + 8);
+	memset(zone, 0xee, 0x1000 + 8);
 	struct fdt_builder b;
 	fb_init(&b);
 	fb_begin_node(&b, "");
@@ -374,8 +374,10 @@ static void test_save_tail_keep(void)
 	assert(zone[12 + marker_len + 1 + tlen] == '\n');
 	unsigned keep = 0xff4 - marker_len - 1 - (tlen + 1);
 	assert(memcmp(zone + 12 + marker_len + 1 + tlen + 1, expected + (e - keep), keep) == 0);
-	/* Nothing past the payload was written (zone_size cap holds). */
-	assert(zone[12 + 0xff4] == 0xee);
+	/* Nothing past the payload was written (zone_size cap holds). The payload
+	 * ends at the zone end (12 + 0xff4 == 0x1000), so the guard byte is in the
+	 * extra 8 bytes allocated above. */
+	assert(zone[0x1000] == 0xee);
 	free(zone);
 }
 

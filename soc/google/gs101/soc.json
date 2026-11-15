@@ -14,9 +14,15 @@
   "pmu_base": "0x17460000",
   "pmu_mode_off": "0x810",
   "pmu_swreset_off": "0x3a00",
+  "wdt_cl0_base": "0x10060000",
+  "wdt_cl0_size": "0x100",
+  "pmu_wdt_mask_off": "0x1244",
+  "pmu_wdt_cnt_off": "0x1220",
+  "pmu_rst_stat_off": "0x3b44",
   "usb_base": "0x11110000",
   "usb_size": "0x10000",
   "uart_base": "0x10a00000",
+  "wifi_chipset": "4389",
   "wlan": {
     "pmu_pcie1_iso": "0x17463EC4",
     "pmu_pcie0_iso": "0x17463EC0",
@@ -31,6 +37,8 @@
     "pma": "0x14550000",
     "pcs": "0x14540000",
     "dbi": "0x14800000",
+    "hsi2_s2mpu": "0x14480000",
+    "hsi2_ssmt": "0x144F0000",
     "pmu_txco": "0x17463C10",
     "cmu_off_pcie_mux": "0x620",
     "cmu_off_osc": "0x800",
@@ -89,6 +97,7 @@
     "0x600",
     "0x700"
   ],
+  "cpu_id_aa64mmfr0": "0x101122",
   "cpu_compatibles": [
     "arm,cortex-a55",
     "arm,cortex-a55",
@@ -150,6 +159,56 @@
       "bits": "read from source: docs/research/19 sections 2-3 (GK cmucal-sfr.c:7919-7921,11626-11629; Linux clk-exynos-arm64.c:24-25). Gate: MANUAL bit 20, CG_VAL bit 21, ENABLE_AUTOMATIC_CLKGATING bit 28. Not read back on hardware; whether the forced sequence opens the SCK is a guess."
     }
   },
+  "chg_probe": {
+    "windows": {
+      "hsi2c12": ["0x10D50000", "0x1000"],
+      "sysreg-peric1": ["0x10C21000", "0x1000"],
+      "cmu-peric1": ["0x10C00000", "0x10000"],
+      "cmu-top": ["0x1E080000", "0x10000"],
+      "gpp23": ["0x10C40060", "0x10"]
+    },
+    "words": {
+      "cmu-usi12-mux": ["cmu-peric1", "0x650"],
+      "cmu-usi12-div": ["cmu-peric1", "0x1810"],
+      "cmu-usi12-gate-ipclk": ["cmu-peric1", "0x2030"],
+      "cmu-usi12-gate-pclk": ["cmu-peric1", "0x2050"],
+      "cmu-usi12-gate-rstn": ["cmu-peric1", "0x206C"],
+      "cmu-usi12-qch": ["cmu-peric1", "0x3030"],
+      "top-ip-mux": ["cmu-top", "0x10E8"],
+      "top-ip-div": ["cmu-top", "0x18E0"],
+      "top-ip-gate": ["cmu-top", "0x2104"],
+      "sysreg-usi12-conf": ["sysreg-peric1", "0x10"],
+      "hsi2c12-ctl": ["hsi2c12", "0x00"],
+      "hsi2c12-int-status": ["hsi2c12", "0x24"],
+      "hsi2c12-fifo-status": ["hsi2c12", "0x30"],
+      "hsi2c12-conf": ["hsi2c12", "0x40"],
+      "hsi2c12-trans-status": ["hsi2c12", "0x50"],
+      "hsi2c12-timing-fs1": ["hsi2c12", "0x60"],
+      "hsi2c12-timing-fs2": ["hsi2c12", "0x64"],
+      "hsi2c12-timing-fs3": ["hsi2c12", "0x68"],
+      "hsi2c12-usi-con": ["hsi2c12", "0xC4"],
+      "gpp23-con": ["gpp23", "0x0"],
+      "gpp23-dat": ["gpp23", "0x4"],
+      "gpp23-pud": ["gpp23", "0x8"]
+    },
+    "source": {
+      "windows": "read from source: docs/research/charger-max77759-gs101.md (the note) section 1.1 (hsi2c12 0x10D50000/0x1000: Google gs101-usi.dtsi:340-359), 1.2 (sysreg_peric1 0x10C21000: gs101-usi.dtsi:69-72), 1.3 (CMU_PERIC1 0x10C00000, CMU_TOP 0x1E080000: cmucal-sfr.c:6,38), 1.4 (gpp23 bank 0x10C40000 + 0x60: pinctrl-gs.c:58-61,132). Window sizes: hsi2c12 from the DT reg, CMU sizes as the touch node (cmu_peric1), sysreg and pad sizes are the reads' extent (a guess for the sysreg page, as for USI11).",
+      "words": "read from source: note section 1.2 (SW_CONF = sysreg_peric1 + 0x10; USI_CON = hsi2c base + 0xC4), 1.3 (CMU_PERIC1 +0x650 mux, +0x1810 div, +0x2030/+0x2050/+0x206C gates, +0x3030 QCH; CMU_TOP +0x10E8 mux, +0x18E0 div, +0x2104 gate), 1.4 (gpp23 CON +0, DAT +4, PUD +8), 5.1 (hsi2c12 CTL 0x00, INT_STATUS 0x24, FIFO_STATUS 0x30, CONF 0x40, TRANS_STATUS 0x50, TIMING_FS1/2/3 0x60/0x64/0x68). READ-ONLY: this table feeds the /sweet-chg ADT node of xnu patch 0283, which has no store; RX_DATA (0x38, a read pops the FIFO) is deliberately not listed."
+    }
+  },
+  "chg_i2c": {
+    "window": "hsi2c12",
+    "words": {
+      "hsi2c12-fifo-ctl": "0x04",
+      "hsi2c12-int-enable": "0x20",
+      "hsi2c12-tx-data": "0x34",
+      "hsi2c12-rx-data": "0x38",
+      "hsi2c12-auto-conf": "0x44",
+      "hsi2c12-timeout": "0x48",
+      "hsi2c12-addr": "0x70"
+    },
+    "source": "read from source: docs/research/charger-max77759-gs101.md section 5.1 register table (FIFO_CTL 0x04, INT_ENABLE 0x20, TX_DATA 0x34, RX_DATA 0x38, AUTO_CONF 0x44, TIMEOUT 0x48, ADDR 0x70; Google i2c-exynos5.c lines cited there). Feeds the /sweet-chg properties i-* of xnu patch 0284 (phase 2, boot-arg sweetchgi2c=1, the only HSI2C12 STORES; the driver keeps its own independent write allowlist). CONF 0x40, TIMING_FS1-3 0x60-0x68, TRAILIG_CTL 0x08 and USI_CON 0xC4 are deliberately not here: phase 2 never writes them."
+  },
   "acpm": {
     "mbox_base": "0x17610000",
     "sram_base": "0x02039000",
@@ -182,23 +241,28 @@
       "ch_id": 1,
       "domains": [
         {"name": "CPUCL0", "idx": 2, "ceiling_khz": 1803000, "rates_khz": [2196000, 2098000, 2024000, 1950000, 1803000, 1704000, 1598000, 1401000, 1328000, 1197000, 1098000, 930000, 738000, 574000, 300000]},
-        {"name": "CPUCL1", "idx": 3, "ceiling_khz": 1836000, "rates_khz": [2466000, 2393000, 2348000, 2253000, 2130000, 1999000, 1836000, 1663000, 1491000, 1328000, 1197000, 1024000, 910000, 799000, 696000, 553000, 400000]},
-        {"name": "CPUCL2", "idx": 4, "ceiling_khz": 1826000, "rates_khz": [3195000, 3097000, 2950000, 2850000, 2802000, 2704000, 2630000, 2507000, 2401000, 2252000, 2188000, 2048000, 1826000, 1745000, 1582000, 1426000, 1277000, 1106000, 984000, 851000, 500000]},
-        {"name": "G3D", "idx": 5, "ceiling_khz": 151000, "rates_khz": [848000, 762000, 701000, 572000, 510000, 471000, 400000, 351000, 302000, 251000, 202000, 151000]},
-        {"name": "G3DL2", "idx": 6, "ceiling_khz": 151000, "rates_khz": [996000, 885000, 750000, 603000, 434000, 302000, 151000]}
+        {"name": "CPUCL1", "idx": 3, "ceiling_khz": 2253000, "rates_khz": [2466000, 2393000, 2348000, 2253000, 2130000, 1999000, 1836000, 1663000, 1491000, 1328000, 1197000, 1024000, 910000, 799000, 696000, 553000, 400000]},
+        {"name": "CPUCL2", "idx": 4, "ceiling_khz": 2802000, "rates_khz": [3195000, 3097000, 2950000, 2850000, 2802000, 2704000, 2630000, 2507000, 2401000, 2252000, 2188000, 2048000, 1826000, 1745000, 1582000, 1426000, 1277000, 1106000, 984000, 851000, 500000]},
+        {"name": "G3D", "idx": 5, "ceiling_khz": 762000, "rates_khz": [848000, 762000, 701000, 572000, 510000, 471000, 400000, 351000, 302000, 251000, 202000, 151000]},
+        {"name": "G3DL2", "idx": 6, "ceiling_khz": 996000, "rates_khz": [996000, 885000, 750000, 603000, 434000, 302000, 151000]},
+        {"name": "MIF", "idx": 0, "ceiling_khz": 3172000, "rates_khz": [3172000, 2730000, 2535000, 2288000, 2028000, 1716000, 1539000, 1352000, 1014000, 845000, 676000, 546000, 421000]},
+        {"name": "INT", "idx": 1, "ceiling_khz": 100000, "rates_khz": [533000, 465000, 332000, 267000, 200000, 155000, 100000]}
       ]
     },
+    "slc": {"ch_id": 10, "async_ch_id": 11, "pt_version": "0xd005", "known_major": 1},
     "rails": [
       {"name": "LDO25M TSP_DVDD", "reg": "0x5C", "group_min_uv": 700000, "step_uv": 25000, "dt_min_uv": 1600000, "dt_max_uv": 1950000, "vsel_min": 36, "vsel_max": 50},
       {"name": "LDO26M TS_AVDD", "reg": "0x5D", "group_min_uv": 1800000, "step_uv": 25000, "dt_min_uv": 2500000, "dt_max_uv": 3300000, "vsel_min": 28, "vsel_max": 60}
     ]
   },
   "notes": {
+    "wifi_chipset": "MobileGestalt WifiChipset reads /product wifi-chipset as a string (docs/research/110 s.7, libMobileGestalt 0x19c56d18c, observed by RE). The Pixel 6a chip is the Broadcom BCM4389 (docs/research/12-wifi-bluejay.md); the string form '4389' follows the D22AP tree's '4357' for the BCM4357 [guess: no iOS tree for a BCM4389 device was read]. tools/mkadt.py writes it into /product; SPEC-WIFI Part F W4.",
+    "cpu_id_aa64mmfr0": "ID_AA64MMFR0_EL1 = 0x101122 on all CPUs, OBSERVED (docs/specs/SPEC-EL2-PROXY-PROBE.md section 1.3: logs/usb-20261021T080052Z.txt and 588 CPU MMFR0 lines). tools/boards.py derives PARange [3:0] = 2 (40-bit) and TGran16 [23:20] = 1 / TGran16_2 [35:32] = 0 (16K granule usable at stage 2) for the --el2-trap VTCR_EL2; it fails on any other value (the field tables are only cited for those encodings).",
     "gpio_alive_dat_off": "Samsung ALIVE/FAR_ALIVE pin-bank type exynos850_bank_type_alive: CON +0x00 (4 bit/pin), DAT +0x04 (1 bit/pin), PUD +0x08, DRV +0x0c (drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:56-59 at Linux v6.12; used for gs101_pin_alive/gs101_pin_far_alive by EXYNOS850_PIN_BANK_EINTW, pinctrl-exynos.h:134-142). DAT read = readl(bank_base + pctl_offset + 0x04) >> pin & 1 (pinctrl-samsung.c:592-611). Read from source, not yet observed on hardware.",
     "usb": "DWC_usb31 (GSNPSID 0x3331) core at 0x11110000: read from source (gs101 DTS usbdrd31_dwc3, docs/02-gs101-peripherals.md section 9) and observed by shim/usbprobe.c on bluejay. Feeds the /sweet-usb ADT node (tools/mkadt.py, xnu patch 0082).",
     "wlan": "BCM4389 Wi-Fi path (PMU/pinctrl/HSI2 PCIe1 wrapper) addresses: read from source, docs/research/12-wifi-bluejay.md section 1.2; used only by the read-only shim/wlanprobe.c (--wlan-probe). pmu_pcie0_iso = PCIe0 (modem) PHY isolation word for comparison (research 20 section 3 table, D12 4 row 2). cmu_hsi2 = CMU_HSI2 base (gs101-pm-domains.dtsi:95 cmu_id of pd_hsi2; the user mux PLL_CON0_MUX_CLKCMU_HSI2_PCIE_USER is at +0x620, soc-gs flexpmu_cal_system_gs101.h:355), read by the level-2 gate. pd_hsi2_b 0x17462080 is the HSI0 domain (pd-hsi0 reg 0x17462080, gs101-pm-domains.dtsi:78-88; HSI0_STATUS = PMU +0x2084 bit0, flexpmu_cal_local_gs101.h hsi0_status); pd_hsi2_a 0x17462180 is the pd_hsi2 node (status = disabled in the DT, :90-98, and no hsi2 power sequence exists in pmucal_pd_list), so neither is a citable HSI2 status word. atu = DBI + 0x300000 (DEFAULT_DBI_ATU_OFFSET 0x3 << 20, pcie-designware.h:202; the unrolled iATU registers of rc.h:286-308, inside the 0x301000 DBI reg), read-only in --wlan-link=25; W2 additions (docs/research/29): ia = the I/A block of pcie_1 (gs101-pcie.dtsi:63), pmu_alive = PMU base (pmu_base, read by --wlan-link for the 0x3EC4 word); pmu_txco = PMU +0x3C10, bits 2,3,10 are TXCO-always-on (soc-gs dwc-whi pcie-exynos-rc.c:80,2692-2702); cmu_off_* = CMU_HSI2 offsets: pcie_mux +0x620 (flexpmu_cal_system_gs101.h:355), osc +0x800 bit 28 = OSCCLK automatic clock gating (rc.c:2693,2704-2706,3544-3550), qch_* = the DBG_NFO_QCH_CON_* debug words of GPIO_HSI2 +0x7018, QE_PCIE_GEN4A_HSI2 +0x7060, QE_PCIE_GEN4B_HSI2 +0x7064, QE_UFS_EMBD_HSI2 +0x7068 (the reference: UFS works), SYSREG_HSI2 +0x707C (flexpmu_cal_system_gs101.h:1313-1340; bit meaning UNKNOWN, printed raw); s10_l16m..l19m_ctrl = S2MPG10 LDO16M..LDO19M control registers 0x53..0x56 (the PCIe0/PCIe1 PHY supplies; S2MPG10_PM_L16M_CTRL.. soc-gs include/linux/mfd/samsung/s2mpg10-register.h:99-103), read by --wlan-rails through acpm_s10_read; gpp14_en_pin = 2 (WLAN_EN, DT wl_reg_on = <&gpp14 2 0x1>, gs101-common-wlan.dtsi:147), gph2_perst_pin = 0 (pcie_1 gpios = <&gph2 0 0x1>, gs101-pcie.dtsi:56); used by the --wlan-en writer (shim/wlanen.c). tcm/tcm_bytes = BAR2 (4 MiB, the BCM4389 backplane window) as the shim S28 assigns it: cfg 0x18 := 0x60400004 (wlan_seq.json row 374 via tools/gen_wlan_seq.py), size from the sizing readback 0xFFC00000 (row 364), PCI address == CPU address (pcie.dtsi:75-76); read by xnu patch 0129 (/sweet-wlan tcm). atu_r2_off = outbound iATU region 2 inside the unrolled block at atu: CR1 +0x400, CR2 +0x404, LOWER_BASE +0x408, UPPER_BASE +0x40C, LIMIT +0x410, LOWER_TARGET +0x414, UPPER_TARGET +0x418 (pcie-exynos-rc.h:302-308, region 1 is the same layout 0x200 lower, :294-300); programmed in the order of pcie-exynos-rc.c:1474-1483 by xnu patch 0129 (docs/research/43 s.1).",
     "gpu": "Mali-G78 MP20 power/clock/register addresses: read from source, docs/research/17-gpu-kernel-gs101.md section 2; used by the read-only shim/gpuprobe.c (--gpu-probe) and shim/gpupower.c (--gpu-power). mali = gs101-gpu.dtsi reg 0x1C500000 size 0x5000; PMU words = soc-gs flexpmu_cal_local_gs101.h; read on hardware 2026-10-23 (docs/research/27). id_expect/shader_present/tiler_present/l2_present = values OBSERVED on the Pixel 6a by the stage-0 probe (run g0, GPU_ID +0x000, SHADER_PRESENT_LO +0x100, TILER_PRESENT +0x110, L2_PRESENT +0x120; docs/research/27-gpu-g0-result.md); they are the only values shim/gpupower.c (--gpu-power) may write, and it refuses to write unless the live registers equal them; stack_present = STACK_PRESENT (+0xE00) OBSERVED in the G0 run (0x7F, docs/research/27), used only by the opt-in --gpu-power=stack (STACK_PWRON/STACK_PWROFF, kbase corestack_driver_control path); pinned by tools/boards.py _GPU_PINS. fvmap_sram = APM SRAM fvmap base (acpm.sram_base 0x2039000 + fvmap_addr 0x31000, gs101.dtsi; OBSERVED valid in run fvmap1: header type == index for all 14 domains, docs/research/25); fvmap_idx_g3d/g3dl2 = ACPM_DVFS indices 5/6, OBSERVED in run fvmap1 (init_lv 11 of 12 levels / 6 of 7, docs/research/27); read-only, used by gpuprobe.c. s2mpu_g3d0..3 = the four G3D S2MPU register blocks (size 0x10000 each), READ-ONLY dump of --gpu-s2mpu / --gpu-job (shim/gpus2mpu.c): reg values of &s2mpu_g3d0..3 in Google gs101-b0.dts:58-69 (kernel/devices/google/gs101 android-gs-bluejay-6.1-android16; local copy ~/pixelios-artifacts/refs/s2mpu/gs101-b0.dts), nodes gs101-s2mpu.dtsi:139-161 (power-domain-id 0x1C410204 = pd_g3d); register map: soc-gs drivers/soc/google/s2mpu/s2mpu-regs.h (local copy refs/s2mpu/); never written. clk_khz = the firmware's own INIT level of both GPU clock domains (G3D init_lv 11 and G3DL2 init_lv 6 are both 151000 kHz), OBSERVED in run g0b (docs/research/27): the only rate shim/gpuclk.c (--gpu-clk) may ask the ACPM DVFS channel for; pinned by tools/boards.py _GPU_PINS and equal to the ceiling and the last row of the acpm.dvfs G3D / G3DL2 domains.",
-    "acpm": "ACPM (APM firmware) client constants for shim/acpm.c: read from source, docs/research/23-acpm-regulator-client.md (GK gs101.dtsi:491-507, acpm_ipc.c, acpm_mfd.c, framework.h). mbox/sram/initdata/ch_id/speedy_ch/pmic_addr/intgr1/intcr0/intsr0 are [src] and pinned by tools/boards.py (_ACPM_PINS); desc_stride 0x48 and the u32 field offsets inside shim/acpm.c are hand-derived (guess) until layout_verified is set to 1 after comparing the shim's descriptor dump (--touch-probe=railsr) with a real read; elem_unit = bytes per q_elem_size unit: 1 = q_elem_size is in BYTES, read from source (acpm_ipc.c:762 passes tx_ch.size to memcpy_align_4 as a byte count; the MFD callers pass unsigned int command[4]; Google acpm.c:257-271), the shim requires q_elem_size * elem_unit == 16 and elem_unit_verified stays 0 until the --touch-probe=railsr buffer dump shows 16-byte slots (docs/research/23 erratum). rails: S2MPG10 enable registers 0x5C/0x5D bit 7 (doc 23 section 1); vsel_min/vsel_max = accepted voltage code range (reg bits 5:0) before the rail is enabled, derived by tools/boards.py check from the regulator group (gk_s2mpg10-register.h:319-323: group 4 = 700 mV + 25 mV * code, group 5 = 1800 mV + 25 mV * code; s2mpg10-regulator.c:275-278, vsel_mask = 63) and the device-tree limits (gs101-pmic.dtsi:535-553: L25M 1.60-1.95 V = codes 0x24-0x32, L26M 2.5-3.3 V = codes 0x1C-0x3C); null = unknown, and then the shim refuses to write. Flags flipped 2026-10-22 after run acpm3 (observed on bluejay: descriptor fields at the derived offsets, q_len=5, q_elem_size=0x10 with 5x16 B slots, both queues empty 3/3); the rails themselves are still unread. dvfs: ACPM DVFS channel 1 (gs101.dtsi:720 exynos_dm acpm-ipc-channel), domain indexes CPUCL0/1/2 = 2/3/4 (dt-bindings/clock/gs101.h:305-307, GET_IDX = id & 0xFFFF); rates_khz = the firmware fvmap rows OBSERVED on the phone (run fvmap1, 2026-10-22, docs/research/25); ceiling_khz is ours (no thermal management exists), a request must be a row at or below it. G3D (idx 5) / G3DL2 (idx 6): rates_khz = the fvmap rows OBSERVED in run g0b (docs/research/27; dt gs101-gpu.dtsi:46-47 gpu0_cmu_cal_id = ACPM_DVFS_G3DL2, gpu1 = ACPM_DVFS_G3D), ceiling_khz 151000 = their init level, so the client refuses every other rate for them (--gpu-clk only; the CPU --dvfs requests never use them).",
+    "acpm": "ACPM (APM firmware) client constants for shim/acpm.c: read from source, docs/research/23-acpm-regulator-client.md (GK gs101.dtsi:491-507, acpm_ipc.c, acpm_mfd.c, framework.h). mbox/sram/initdata/ch_id/speedy_ch/pmic_addr/intgr1/intcr0/intsr0 are [src] and pinned by tools/boards.py (_ACPM_PINS); desc_stride 0x48 and the u32 field offsets inside shim/acpm.c are hand-derived (guess) until layout_verified is set to 1 after comparing the shim's descriptor dump (--touch-probe=railsr) with a real read; elem_unit = bytes per q_elem_size unit: 1 = q_elem_size is in BYTES, read from source (acpm_ipc.c:762 passes tx_ch.size to memcpy_align_4 as a byte count; the MFD callers pass unsigned int command[4]; Google acpm.c:257-271), the shim requires q_elem_size * elem_unit == 16 and elem_unit_verified stays 0 until the --touch-probe=railsr buffer dump shows 16-byte slots (docs/research/23 erratum). rails: S2MPG10 enable registers 0x5C/0x5D bit 7 (doc 23 section 1); vsel_min/vsel_max = accepted voltage code range (reg bits 5:0) before the rail is enabled, derived by tools/boards.py check from the regulator group (gk_s2mpg10-register.h:319-323: group 4 = 700 mV + 25 mV * code, group 5 = 1800 mV + 25 mV * code; s2mpg10-regulator.c:275-278, vsel_mask = 63) and the device-tree limits (gs101-pmic.dtsi:535-553: L25M 1.60-1.95 V = codes 0x24-0x32, L26M 2.5-3.3 V = codes 0x1C-0x3C); null = unknown, and then the shim refuses to write. Flags flipped 2026-10-22 after run acpm3 (observed on bluejay: descriptor fields at the derived offsets, q_len=5, q_elem_size=0x10 with 5x16 B slots, both queues empty 3/3); the rails themselves are still unread. dvfs: ACPM DVFS channel 1 (gs101.dtsi:720 exynos_dm acpm-ipc-channel), domain indexes CPUCL0/1/2 = 2/3/4 (dt-bindings/clock/gs101.h:305-307, GET_IDX = id & 0xFFFF); rates_khz = the firmware fvmap rows OBSERVED on the phone (run fvmap1, 2026-10-22, docs/research/25); ceiling_khz is ours (no thermal management exists), a request must be a row at or below it. G3D (idx 5) / G3DL2 (idx 6): rates_khz = the fvmap rows OBSERVED in run g0b (docs/research/27; dt gs101-gpu.dtsi:46-47 gpu0_cmu_cal_id = ACPM_DVFS_G3DL2, gpu1 = ACPM_DVFS_G3D), ceiling_khz G3D 762000 / G3DL2 996000 = DT v2 pair row 1 (gs101-gpu.dtsi:55-90) = the stock maximum (gs101-gpu.dtsi:94 gpu_dvfs_max_freq), raised from row 3 (T-50eb) by sprint-gpu 2026-11-08 (pinned in tools/boards.py _GPU_DVFS_CEIL), so the client refuses every rate above it (--gpu-clk only; the CPU --dvfs requests never use them; the 151000 kHz init level stays a row below the ceiling). Was 151000 before T-a214. slc (SWEET PROBE, patch 0363, docs/research/161 s.1): the SLC service channel. ch_id 10 = DT node slc-acpm acpm-ipc-channel = 0x0a and async_ch_id 11 = its child node async acpm-ipc-channel = 0x0b [obs stock device tree capture, research 161 s.1.1]; pt_version 0xd005 = PT_VERSION and known_major 1 = PT_VERSION_KNOWN [src SG kernel/google-modules/soc/gs @ 20407875 drivers/soc/google/pt/slc_acpm.c:29-36, :160-195]. Read-only use only: shim/acpm.c acpm_slc_describe (descriptor of ch 10 and 11, reads) and acpm_slc_version (ONE fixed PT_VERSION request on ch 10); every other SLC opcode (0xd001-0xd004 enable/disable/mutate/check, PMON, trace) is not expressible. Pinned by tools/boards.py _ACPM_SLC.",
     "s2mpg11": "READ-ONLY S2MPG11 (sub PMIC, the GPU rails BUCK2S = S2S_VDD_G3D, BUCK8S = S8S_VDD_G3D_L2, LDO1S = L1S_VDD_G3D_M) registers for --gpu-rails (shim/gpurails.c, docs/research/27), read through the S2MPG10 railsr request path (acpm.c acpm_s11_read: same IPC channel 2, FUNC_READ only). Derived the same way as speedy_ch/pmic_addr 0/1 of S2MPG10 (doc 23 section 1): speedy_ch 1 = channel argument of every s2mpg11_*_reg (GK drivers/mfd/s2mpg11-core.c:55,73,91,109,127: u8 channel = 1) and DT acpm-speedy-channel = <1> (gs101-pmic.dtsi:710-718); pmic_addr 1 = I2C_ADDR_PMIC of the PM block (s2mpg11-core.c:29; the pmic dummy client). IPC channel stays 2 (acpm-ipc-channel = <2> in the same DT node). Registers (include/linux/mfd/samsung/s2mpg11-register.h:26-100): STATUS1 0x0C, B2S_CTRL 0x15 / OUT1 0x16 / OUT2 0x17, B8S_CTRL 0x25 / OUT1 0x26 / OUT2 0x27, L1S_CTRL1 0x41 / CTRL2 0x42, LDO_CTRL1 0x52. Rail descriptors (s2mpg11-regulator.c:226-275): BUCK2S/8S enable = *_CTRL mask 7:6 (S2MPG11_REG_ENABLE_MASK_7_6, register.h:335), vsel = *_OUT1, 256 steps, group 1 = 200000 uV + 6250 * sel (register.h:308-309); LDO1S enable = LDO_CTRL1 mask 5:4 (:334), vsel = L1S_CTRL1 mask 0x7F (128 steps), group 4 = 300000 uV + 12500 * sel (:314-315). Mode field: 0 off, 1 ON in standby (SEC_OPMODE_SUSPEND), 2 ON in PWREN_MIF mode, 3 ON normal (s2mpg11_of_map_mode, s2mpg11-regulator.c:35-46); DT initial mode of all three rails is SEC_OPMODE_SUSPEND (gs101-pmic.dtsi:760-773,850-860,936-946). Read on hardware 2026-10-23 (run g1rails2: BUCK2S mode 0 off, BUCK8S/LDO1S on). Which of OUT1/OUT2 is the live output is a guess (Linux reads and writes OUT1). WRITER (opt-in --gpu-rail-on, shim/gpurailon.c): rail_on = the only S2MPG11 register the shim may write, BUCK2S_CTRL (S2S_VDD_G3D, the shader rail) 0x15 (register.h:48) mask 0xC0 = the mode field bits 7:6 (S2MPG11_REG_ENABLE_MASK_7_6, register.h:335; regulator.c:259-260), val_on 0x40 = mode 1 'SUSPEND' = what LINUX writes for this rail: the DT gives BUCK2S regulator-initial-mode = SEC_OPMODE_SUSPEND (gs101-pmic.dtsi:766-779), s2mpg11_of_map_mode maps it to 1 (regulator.c:35-46), s2m_set_mode stores opmode[id] = mode << shift & mask (:48-73; the probe starts with opmode[id] = enable_mask, :718) and s2m_enable writes opmode[id] under the mask (:75-91), so the value proven on this rail in stock Android is 0x40, and a leftover 0x40 equals stock, val_off 0x00 = mode 0 = disabled (s2m_disable writes 0 under the mask, :95-111); only these two values, only under that mask (read-modify-write by the APM, FUNC_UPDATE). Allowed only when BUCK2S_CTRL reads exactly mode 0 (off, observed run g1rails2: 0x38) and out1_reg 0x16 (B2S_OUT1, observed 0x40 = 600000 uV) decodes inside min_uv..max_uv = 550000..700000 uV (fvmap G3D init level 562500 uV, run g0b; Linux DT window of the rail is 450000..1300000 uV, gs101-pmic.dtsi:766-768); the voltage registers are never written. soft_start_us 130 = S2MPG11_ENABLE_TIME_BUCK (register.h:339, the regulator core's enable_time in us); the shim waits 8x that. A null value makes the options refuse before any ACPM traffic.",
     "psci": "conduit SMC; SYSTEM_RESET 0x84000009",
     "watchdogs": "two cluster watchdogs armed by ABL; the shim disables them",

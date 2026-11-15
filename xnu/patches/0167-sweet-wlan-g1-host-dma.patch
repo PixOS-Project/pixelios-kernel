@@ -1,0 +1,299 @@
+SWEET WLAN run G1 (patch 0167, boot-arg sweetwlan=11; consumes docs/research/83 (spec + rw_index_sz answer), 53 s1.5/s3, 71 (G1), run F3 wlan-runF3-0136; amended 2026-10-28 by docs/research/94 s.2 steps 3 and 8 + s.3 (golden ring depths, host trap page), SPEC-WIFI D-7/D-8).
+Why: the msgbuf rings, the DMA index arrays and the scratch buffer live in host memory the dongle DMAs to; G2 (Command := 0x0406, ring_mem/host_cap writes, doorbell) needs their physical addresses and sizes, and the allocation must be proven before any bus write depends on it.
+What: sweet_wlan_dma.h (pure, host test shim/wlan_dma_host_test.c, mutants tools/test_wlan_dma_mutants.py): swd_plan_make() lays out ONE block (5 rings 128x40, 2048x32, 64x24, 2048x24, 1024x40 = the Android golden depths [R94 s.2 step 8], 162304 B; scratch 8; 4 index arrays, rw_index_sz 4 x 43/43/4/4,
+every buffer padded to 128 B; plus one 4 KiB zeroed host trap page [R94 step 3: host_trap_addr] at the next 4 KiB offset, total 167936 B; W-D4b D-10 amendment 2026-10-29: plus one 8192 B event buffer at the next 4 KiB offset, total 176128 B), swd_contig(), swd_audit_all(), swd_audit() = dhd_dma_buf_audit (pa != 0, aligned, 32-bit end does not wrap) + len multiple of 128. Glue sweet_wlan_g1() in sweet_wlan.c, level 11 = level 10 (run F3) unchanged + G1:
+kmem_alloc_contig (patch 0028 precedent) page aligned (16K pages here: 176128 B -> 180224 allocated), zeroed; first and last page PAs must be contiguous (swd_contig); block and each sub-buffer audited (swd_audit_all); flush_dcache64 after the zeroing; prints "SWEET WLAN: G1 <name> pa=0x.. len=N" per buffer and "G1 done".
+W-D4d amendment 2026-10-31 (sweetwlan>=17, used by patch 0174): plus one 8192 B ioctl-response buffer and one 8200 B ioctl payload buffer (padded to 8320 B), each at the next 4 KiB offset (176128 and 184320), total 192640 B -> 196608 allocated (12 pages); sizes from dhd_msgbuf.c:149 and :122-123; the block is 16 KiB larger at every sweetwlan>=11, no store changes.
+W-D4e amendment 2026-10-31 (sweetwlan>=21, used by patch 0174; docs/research/W-D4e-scan24-design.md s.1 item 6): the event buffer and the ioctl-response buffer become 8 contiguous buffers of 8192 B each (65536 B each; DHD posts 8 response buffers, dhd_msgbuf.c:153), the payload buffer moves to 299008, total 307328 B (19 pages of 16 KiB). The plan is the same for every sweetwlan level.
+Every failure has a swl_gap() on the line before its refusing printf (rule 8). The inputs rw_index_sz 4 / 43 / 4 are pinned from run F3 and a low gap says so (G2 re-reads them from the dongle).
+NO bus access: HW-WRITE path none; the only memory touched is a fresh kernel allocation.
+
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -30,9 +30,14 @@
+ #include <pexpert/device_tree.h>
+ #include <stdint.h>
+ #include <sys/random.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include "sweet_wlan_chip.h"
+ #include "sweet_wlan_fw.h"
+ #include "sweet_wlan_wr.h"
++#include "sweet_wlan_dma.h"
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* not declared by vm/pmap.h in this tree: same extern as patch 0028:81, 0067:12 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+ 
+@@ -374,6 +378,60 @@ sweet_wlan_stage3(struct sw_hw *hw, int level)
+ 	memset(x.rtlv, 0, sizeof x.rtlv);      /* the random bytes of the rTLV do not stay on the stack */
+ }
+ 
++/* Run G1 (patch 0167, boot-arg sweetwlan=11 = level 10 unchanged + this; no bus access, docs/research/83): ONE zeroed, physically contiguous, page aligned block for the five common rings, the scratch buffer, the four DMA index arrays and the 4 KiB host trap page,
++ * (PERMANENT: not freed on a refusal; G1 is a one-shot test run) laid out by swd_plan_make(), every sub-buffer and the block audited by swd_audit(), cache-flushed after the zeroing (G:1915-1925), and the physical addresses PRINTED for G2. Nothing is written to the chip. */
++_Static_assert(SWD_PAGE == PAGE_SIZE, "sweet_wlan_dma.h assumes this kernel page size");
++
++static void
++sweet_wlan_g1(void)
++{
++	struct swd_plan plan;
++	vm_offset_t va = 0;
++	vm_size_t sz;
++	ppnum_t pn, pl;
++	uint64_t pa;
++	unsigned i;
++	int rc;
++
++	swl_miss("g1", SWL_M_G1, "low");     /* W-D4b gaps: G2 (sweetwlan >= 12) verifies the pins and resolves it */
++	rc = swd_plan_make(SWD_RW_INDEX_SZ, SWD_MAX_SUB, SWD_MAX_CPL, &plan);
++	if (rc != 0) {
++		swl_gap("g1", "plan refused", "high");
++		printf("SWEET WLAN: G1 plan refused rc=%d\n", rc);
++		return;
++	}
++	sz = round_page(plan.total);
++	if (kmem_alloc_contig(kernel_map, &va, sz, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		swl_gap("g1", "no contiguous DMA memory, failed", "high");
++		printf("SWEET WLAN: G1 no contiguous DMA memory for %lu bytes, failed\n", (unsigned long)sz);
++		return;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	pl = pmap_find_phys(kernel_pmap, (addr64_t)(va + sz - PAGE_SIZE));
++	if (pn == 0 || pl == 0) {
++		swl_gap("g1", "no physical address for the DMA block, failed", "high");
++		printf("SWEET WLAN: G1 no physical address for the DMA block, failed\n");
++		return;
++	}
++	pa = ptoa_64(pn);
++	if (swd_contig(pa, ptoa_64(pl), sz, SWD_PAGE) != 0) {
++		swl_gap("g1", "DMA block is not physically contiguous, refused", "high");
++		printf("SWEET WLAN: G1 DMA block is not physically contiguous (first page 0x%llx, last page 0x%llx), refused\n", (unsigned long long)pa, (unsigned long long)ptoa_64(pl));
++		return;
++	}
++	rc = swd_audit_all(pa, (uint32_t)sz, &plan);
++	if (rc != 0) {
++		swl_gap("g1", "DMA audit failed, refused", "high");
++		printf("SWEET WLAN: G1 DMA audit failed rc=%d (block pa 0x%llx len %lu), refused\n", rc, (unsigned long long)pa, (unsigned long)sz);
++		return;
++	}
++	flush_dcache64((addr64_t)pa, (unsigned)sz, TRUE);
++	for (i = 0; i < SWD_NBUF; i++) {
++		printf("SWEET WLAN: G1 %s pa=0x%llx len=%u\n", plan.b[i].name, (unsigned long long)(pa + plan.b[i].off), plan.b[i].len);
++	}
++	printf("SWEET WLAN: G1 done %u bytes (%lu allocated) at pa 0x%llx\n", plan.total, (unsigned long)sz, (unsigned long long)pa);
++}
++
+ void
+ sweet_wlan_init(void)
+ {
+@@ -395,7 +453,7 @@ sweet_wlan_init(void)
+ 	if (!PE_parse_boot_argn("sweetwlan", &level, sizeof(level)) || level == 0) {
+ 		return;
+ 	}
+-	if (level > 10 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
++	if (level > 11 || SecureDTLookupEntry(NULL, "/sweet-wlan", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
+ 	    compat == NULL || csize < sizeof(SW_COMPAT) || strncmp(compat, SW_COMPAT, sizeof(SW_COMPAT)) != 0) {
+ 		swl_gap("adt", "no usable /sweet-wlan node, chip not touched", "high");
+@@ -479,7 +537,10 @@ sweet_wlan_init(void)
+ 			level = 6;
+ 		}
+ 		if (level >= 3) {
+-			sweet_wlan_stage3(&hw, (int)level);
++			sweet_wlan_stage3(&hw, level > 10 ? 10 : (int)level);
++			if (level >= 11) {
++				sweet_wlan_g1();
++			}
+ 		}
+ 	} else {
+ 		swl_gap("stage1", "stage 1 stopped", "high");
+diff --git a/bsd/dev/sweet_wlan_dma.h b/bsd/dev/sweet_wlan_dma.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_dma.h
+@@ -0,0 +1,184 @@
++/*
++ * BCM4389 msgbuf host DMA block, run G1 (docs/research/83-wlan-g1-host-dma-spec.md): the pure part, host-tested by shim/wlan_dma_host_test.c and killed by
++ * tools/test_wlan_dma_mutants.py. No libc, no device access, no allocation: swl_dma_plan() lays out the five common rings, the
++ * 8-byte scratch buffer and the four DMA index arrays inside ONE block, swd_audit() is dhd_dma_buf_audit() plus the alignment
++ * and padding rules of this port. The kernel glue (sweet_wlan_g1() in sweet_wlan.c) allocates and prints; nothing here or there
++ * writes to the chip.
++ * Keys: G = dhd_msgbuf.c, H = bcmmsgbuf.h, P = dhd_pcie.c of ~/pixelios-artifacts/refs/wlan-stage5.
++ */
++#ifndef SWEET_WLAN_DMA_H
++#define SWEET_WLAN_DMA_H
++
++#include <stdint.h>
++
++#define SWD_PAD         128u    /* DHD_DMA_PAD, G:370-372; dhd_dma_buf_alloc pads every buffer to it, G:1887-1893 */
++#define SWD_PAGE        16384u  /* this port runs 16K pages (patch 0004:227, 0010:128; PAGE_SIZE = 1 << ARM_PGSHIFT 14); the block is page aligned and a whole number of pages (kmem_alloc_contig, patch 0028) */
++#define SWD_TRAP_LEN    4096u   /* host_trap_addr buffer: 4096 B, 4 KiB aligned PA in the golden (0xff2e0000) [R94 s.2 step 3]; a 4 KiB offset inside the 16K aligned block keeps that */
++#define SWD_EVBUF_LEN   8192u   /* W-D4b D-10: the one event buffer the first ring-0 post names; the DHD size is not known yet [guess], G2 prints a WIFI GAP for it */
++#define SWD_EVBUF_N     8u      /* W-D4e (sweetwlan>=21): 8 event buffers of SWD_EVBUF_LEN each, contiguous (DHD posts 32: DHD_FLOWRING_MAX_EVENTBUF_POST, dhd_msgbuf.c:152, 4283-4286; 8 is what Linux posts and the minimum of docs/research/108 s.4 step 1: the shortfall is a WIFI GAP) */
++#define SWD_EVBUF_ALIGN 4096u   /* W-D4b D-10: 4 KiB aligned PA like the trap page; sits in the slack after the trap page (167936..180224 of the 11 x 16 KiB allocation) [SPEC-WIFI D-10] */
++#define SWD_RESPBUF_LEN 8192u   /* W-D4d: the one ioctl-response buffer (DHD_FLOWRING_IOCTL_BUFPOST_PKTSZ 8192, refs/wlan-stage5/dhd_msgbuf.c:149; host_buf_len = PKTLEN of it, dhd_msgbuf.c:6383-6385) */
++#define SWD_IOCTBUF_LEN 8200u   /* W-D4d: the ioctl request payload buffer (IOCT_RETBUF_SIZE = RX_DMA_OFFSET 8 + WLC_IOCTL_MAXLEN 8192, dhd_msgbuf.c:122-123, wlioctl_defs.h.new:667; allocated at dhd_msgbuf.c:3582); padded to SWD_PAD in the plan */
++#define SWD_RESPBUF_N   8u      /* W-D4e (sweetwlan>=21): 8 ioctl-response buffers of SWD_RESPBUF_LEN each, contiguous (DHD_FLOWRING_MAX_IOCTLRESPBUF_POST 8, dhd_msgbuf.c:153, 4286) */
++#define SWD_D4D_ALIGN   4096u   /* W-D4d: both buffers 4 KiB aligned like the trap page and the event buffer [guess, U4 of docs/research/W-D4d-ioctl-get-version.md s.7: DHD only logs a misalignment below 4 B, dhd_msgbuf.c:10914-10915] */
++#define SWD_MAX_RINGS   256u    /* sanity bound on a ring count read from ring_info (u16 there); observed 43 and 4 (run F3) */
++
++/* Inputs pinned from run F3 (wlan-runF3-0136, observed): shared flags 0x70050107 has PCIE_SHARED_2BYTE_INDICES (0x100000) clear -> rw_index_sz 4 (P:13771-13772);
++ * ring_info max_submission_queues 43 and max_completion_rings 4 (P:13889-13890). G1 does not re-read them (a swl_gap says so); G2 reads them from the dongle and compares. */
++#define SWD_RW_INDEX_SZ 4u
++#define SWD_MAX_SUB     43u
++#define SWD_MAX_CPL     4u
++
++enum {
++	SWD_H2D_CTRL,   /* H2D control submission ring, ring 0 */
++	SWD_H2D_RXP,    /* H2D rxpost, ring 1 */
++	SWD_D2H_CTRL,   /* D2H control completion, ring 2 */
++	SWD_D2H_TXC,    /* D2H tx completion, ring 3 */
++	SWD_D2H_RXC,    /* D2H rx completion, ring 4 */
++	SWD_SCRATCH,    /* D2H scratch buffer */
++	SWD_IDX_H2D_W,  /* DMA index array: H2D write (host updates) */
++	SWD_IDX_H2D_R,  /* H2D read (dongle updates) */
++	SWD_IDX_D2H_W,  /* D2H write (dongle updates) */
++	SWD_IDX_D2H_R,  /* D2H read (host updates) */
++	SWD_TRAP,       /* host firmware-trap buffer: 4096 B at a 4 KiB aligned offset (R94 step 3: host_trap_addr, S+0x58) */
++	SWD_EVBUF,      /* W-D4b D-10: SWD_EVBUF_N (W-D4e: 8) event buffers of SWD_EVBUF_LEN B at a 4 KiB aligned offset right after the trap page */
++	SWD_RESPBUF,    /* W-D4d: SWD_RESPBUF_N (W-D4e: 8) ioctl-response buffers of SWD_RESPBUF_LEN B at the next 4 KiB aligned offset (sweetwlan >= 17) */
++	SWD_IOCTBUF,    /* W-D4d: ioctl request payload buffer, SWD_IOCTBUF_LEN B (padded) at the next 4 KiB aligned offset (sweetwlan >= 18) */
++	SWD_NBUF
++};
++
++struct swd_buf {
++	const char *name;
++	uint32_t off;   /* from the block start, multiple of SWD_PAD */
++	uint32_t len;   /* padded to SWD_PAD */
++};
++
++struct swd_plan {
++	struct swd_buf b[SWD_NBUF];
++	uint32_t total; /* end of the last buffer (the trap page and the event buffer are 4 KiB aligned, so this can exceed the sum of len) */
++};
++
++/* Ring depth x item size: depth is a host choice (dhd_prot_ring_init, G:11080-11103), the constants are DHD's: G:3525-3528 / H:60,93; G:3534-3537 / H:59,90; G:3543-3546 / H:70,104;
++ * G:3552-3555 / H:62,91; G:3562-3565 / H:63,92. Scratch: DMA_D2H_SCRATCH_BUF_LEN 8, G:140. */
++/* sprint 2026-11-08: the ring depths as constants, the ONE source the engines (sweet_wlan_g2.h SWG_R0_DEPTH / SWG_R2_DEPTH) and the host tests' copies are checked against */
++#define SWD_R0_ITEMS    128u    /* h2d ctrl submit */
++#define SWD_R1_ITEMS    2048u   /* h2d rxpost */
++#define SWD_R2_ITEMS    64u     /* d2h ctrl complete */
++#define SWD_R3_ITEMS    2048u   /* d2h tx complete */
++#define SWD_R4_ITEMS    1024u   /* d2h rx complete */
++
++struct swd_ring {
++	const char *name;
++	uint32_t items, isz;
++};
++
++static const struct swd_ring swd_rings[SWD_SCRATCH + 1] = {
++	{ "h2d ctrl submit", SWD_R0_ITEMS, 40 },
++	{ "h2d rxpost", SWD_R1_ITEMS, 32 },
++	{ "d2h ctrl complete", SWD_R2_ITEMS, 24 },
++	{ "d2h tx complete", SWD_R3_ITEMS, 24 },
++	{ "d2h rx complete", SWD_R4_ITEMS, 40 },
++	{ "scratch", 1, 8 },
++};
++
++static inline uint32_t
++swd_pad(uint32_t n)
++{
++	return (n + SWD_PAD - 1u) / SWD_PAD * SWD_PAD;
++}
++
++/* The layout. rw_index_sz is 2 or 4 (P:13771); the h2d arrays hold max_sub entries, the d2h arrays max_cpl (P:13925-13945; bufsz = rw_index_sz * length, G:12148-12151).
++ * 0 ok; -1 rw_index_sz is not 2 or 4; -2 a ring count is 0 or above SWD_MAX_RINGS; -3 NULL plan. */
++static inline int
++swd_plan_make(uint32_t rw_index_sz, uint32_t max_sub, uint32_t max_cpl, struct swd_plan *p)
++{
++	static const char *const idx_name[4] = { "idx h2d wr", "idx h2d rd", "idx d2h wr", "idx d2h rd" };
++	uint32_t off = 0, len;
++	unsigned i;
++
++	if (!p) {
++		return -3;
++	}
++	if (rw_index_sz != 2u && rw_index_sz != 4u) {
++		return -1;
++	}
++	if (max_sub == 0 || max_sub > SWD_MAX_RINGS || max_cpl == 0 || max_cpl > SWD_MAX_RINGS) {
++		return -2;
++	}
++	for (i = 0; i < SWD_NBUF; i++) {
++		if (i == SWD_TRAP) {
++			off = (off + SWD_TRAP_LEN - 1u) / SWD_TRAP_LEN * SWD_TRAP_LEN;
++			len = SWD_TRAP_LEN;
++			p->b[i].name = "trap";
++		} else if (i == SWD_EVBUF) {
++			off = (off + SWD_EVBUF_ALIGN - 1u) / SWD_EVBUF_ALIGN * SWD_EVBUF_ALIGN;
++			len = SWD_EVBUF_N * SWD_EVBUF_LEN;
++			p->b[i].name = "evbuf";
++		} else if (i == SWD_RESPBUF || i == SWD_IOCTBUF) {
++			off = (off + SWD_D4D_ALIGN - 1u) / SWD_D4D_ALIGN * SWD_D4D_ALIGN;
++			len = i == SWD_RESPBUF ? SWD_RESPBUF_N * SWD_RESPBUF_LEN : swd_pad(SWD_IOCTBUF_LEN);
++			p->b[i].name = i == SWD_RESPBUF ? "respbuf" : "ioctbuf";
++		} else if (i <= SWD_SCRATCH) {
++			len = swd_pad(swd_rings[i].items * swd_rings[i].isz);
++			p->b[i].name = swd_rings[i].name;
++		} else {
++			len = swd_pad(rw_index_sz * ((i == SWD_IDX_H2D_W || i == SWD_IDX_H2D_R) ? max_sub : max_cpl));
++			p->b[i].name = idx_name[i - SWD_IDX_H2D_W];
++		}
++		p->b[i].off = off;
++		p->b[i].len = len;
++		off += len;
++	}
++	p->total = off;
++	return 0;
++}
++
++/* dhd_dma_buf_audit() (G:1848-1865) + this port's rules. 0 ok; 1 pa is 0; 2 pa not aligned to `align` (a power of two); 3 len is 0 or not a multiple of SWD_PAD;
++ * 4 the 32-bit end address wraps (the dongle uses 32-bit pointer arithmetic: DHD tests `(uint32)(pa_lo + len) < pa_lo`, so an end at exactly 4 GiB is refused too). */
++static inline int
++swd_audit(uint64_t pa, uint32_t len, uint32_t align)
++{
++	uint32_t lo = (uint32_t)pa;
++
++	if (pa == 0) {
++		return 1;
++	}
++	if ((pa & (uint64_t)(align - 1u)) != 0) {
++		return 2;
++	}
++	if (len == 0 || len % SWD_PAD != 0) {
++		return 3;
++	}
++	if ((uint32_t)(lo + len) < lo) {
++		return 4;
++	}
++	return 0;
++}
++
++/* The block is physically contiguous when the last page lies exactly (sz - page) bytes after the first. 0 yes; 1 no (also sz 0 or not a whole number of pages). */
++static inline int
++swd_contig(uint64_t pa_first, uint64_t pa_last, uint64_t sz, uint32_t page)
++{
++	if (sz == 0 || sz % page != 0) {
++		return 1;
++	}
++	return pa_last == pa_first + sz - page ? 0 : 1;
++}
++
++/* Audit of the whole block and of every planned sub-buffer at pa + off. 0 ok, else the first swd_audit() code. */
++static inline int
++swd_audit_all(uint64_t pa, uint32_t sz, const struct swd_plan *p)
++{
++	int rc = swd_audit(pa, sz, SWD_PAGE);
++	unsigned i;
++
++	for (i = 0; rc == 0 && i < SWD_NBUF; i++) {
++		rc = swd_audit(pa + p->b[i].off, p->b[i].len, i == SWD_TRAP ? SWD_TRAP_LEN : i == SWD_EVBUF ? SWD_EVBUF_ALIGN : (i == SWD_RESPBUF || i == SWD_IOCTBUF) ? SWD_D4D_ALIGN : SWD_PAD);
++	}
++	if (rc == 0 && p->total > sz) {
++		rc = 3;         /* the plan does not fit the block */
++	}
++	return rc;
++}
++
++#endif /* SWEET_WLAN_DMA_H */

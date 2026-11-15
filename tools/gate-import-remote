@@ -1,0 +1,118 @@
+#!/bin/bash
+# gate-import-remote OUTDIR WORKTREE : turn a remote-job gate-pre result (logs/remote-jobs/gate-pre/out) into the local gate stamp files.
+# Imports ONLY a formal run: RESULT is PASS, job gate-pre, tree=clean-at-bundle, in exactly one of two shapes (TP-050): where=offload-host + provenance=offload-host + label "formal (offload-host container, identity sha256:<hex>, image <id>)", or where=lab-host + provenance=lab-host + label "formal (lab-host container, ...)" (mixed shapes are REFUSED);
+# sha256(identity.txt raw bytes) == <hex> (what remote-job hashed); identity.txt == the importer's OWN tools/gate-identity.expected (next to this script, not the target's; no TODO/UNMEASURED/MISSING);
+# sha= in RESULT == WORKTREE HEAD and the tree is clean; commit.txt == "<target HEAD>\n<sha256 of the target's git ls-tree -r HEAD tools>" (what remote-job writes);
+# GATE_LINE is printable ASCII without backslash and `GATE PASS <hex prefix of HEAD>[ tag]` (check-all.sh's format; a container's short sha may be longer/shorter than ours, so prefix match;
+# the only quick: text allowed is check-all.sh:76's " quick: no usable stamp, ran full", written only when the run really was full; no +dirty, no "(see") and equals gate.log's last GATE PASS|FAIL line.
+# tools/third_party of the target (same find|sha256sum as tools/gate-identity:19) must equal the third_party= line of identity.txt. identity.txt may end with ONE `adt=<sha256>|none` line (remote-job: computed inside the
+# container from the read-only mounted research/ipsw-x/d22ap.adt; the pin compare ignores it). Target WITHOUT the ADT (gate_select --state a=0): accepted as before. Target WITH it (a=1): accepted only if adt= equals the
+# sha256 of the target's own research/ipsw-x/d22ap.adt (the container then ran the mkadt identity test on the same bytes); adt=none, a missing adt= line (old stamp) or another hash: REFUSED naming both hashes.
+# The label is read only from OUTDIR/RESULT, never from the environment. Anything else: refused loudly (AGENTS.md rule 8), nothing written.
+# Writes (atomic mktemp+mv inside shim/out, same format as tools/check-all.sh; refuses a symlinked shim/out or target file): shim/out/gate.remote.log (copy of gate.log, so the sidecar hash can be checked later),
+# shim/out/gate.remote.json (provenance sidecar; check-all.sh/run-preflight do not read it), shim/out/gate.stamp (full sha; only a clean full PASS is imported, which is exactly when check-all.sh writes it),
+# shim/out/gate.result ("GATE PASS <host short>[ tag] <epoch>").
+# Also written, best effort: the host gate-pass registry ($GATE_PASS_DIR, ~/.cache/pixelios/gate-pass; entry = check-all.sh blob + tools/gate_select.py --state of the target, like check-all.sh on a clean full PASS). The checks above prove what that entry claims (clean HEAD, same third_party, same ADT or none, a full PASS with no skipped-test tag). Without it, gates on the offload host left no base and every later quick gate ran full.
+# LIMIT (honest): this authenticates NOTHING, it only checks that the files in OUTDIR agree with each other, with the pinned identity and with the target commit. Every input is public or computable
+# from the repo, so a local user can fabricate an OUTDIR (as they could always write shim/out/gate.result by hand; check-all.sh is equally forgeable). It stops honest mistakes (pre-validation,
+# local run, FAIL, quick, wrong commit, stale OUTDIR, wrong image/third_party) and leaves an audit trail. Real binding would need a signature made on offload-host and a pinned public key (not built).
+# Last line: RESULT: PASS|FAIL gate-import-remote ... ; exit 0 imported, 1 refused (check failed), 2 usage / infra. Every exit path prints it.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+infra() { echo "gate-import-remote: ERROR: $*" >&2; echo "RESULT: FAIL gate-import-remote: $*"; exit 2; }
+refuse() { echo "gate-import-remote: REFUSED: $*" >&2; echo "RESULT: FAIL gate-import-remote refused: $*"; exit 1; }
+[ $# -eq 2 ] || infra "usage: tools/gate-import-remote OUTDIR WORKTREE"
+out=$1; wt=$2
+[ -d "$out" ] || infra "no such out dir $out"
+git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || infra "$wt is not a git worktree"
+so=$wt/shim/out
+[ ! -L "$wt/shim" ] && [ ! -L "$so" ] || refuse "shim or shim/out in the target is a symlink"
+for f in RESULT identity.txt commit.txt GATE_LINE gate.log; do [ -s "$out/$f" ] || refuse "$out/$f missing or empty (not a finished gate-pre run)"; done
+glog=$out/gate.log
+mkdir -p "$so" || infra "cannot create $so"
+exec 9>"$so/.gate.lock" || infra "cannot open $so/.gate.lock"
+flock -n 9 || refuse "a gate holds $so/.gate.lock in the target"
+
+sha=$(git -C "$wt" rev-parse HEAD) || infra "git rev-parse HEAD failed in $wt"
+short=$(git -C "$wt" rev-parse --short HEAD) || infra "git rev-parse --short failed in $wt"
+[ -z "$(git -C "$wt" status --porcelain --untracked-files=normal)" ] || refuse "target worktree is not clean (a remote gate covers a committed tree only)"
+
+res=$(tail -n 1 "$out/RESULT")
+# the runner name appears three times (where=, provenance=, container); ERE has no backreference, so one regex per runner: a mixed shape matches neither
+rx() { echo "^RESULT: PASS remote-job gate-pre where=$1 sha=([0-9a-f]{40}) tree=clean-at-bundle .* provenance=$1 gcc[^ ]* formal \\($1 container, identity sha256:([0-9a-f]{64}), image ([A-Za-z0-9:._-]+)\\)( verdicts:[^ ]*)? log=[^ ]*\$"; }
+runner=offload-host; re=$(rx offload-host)
+if ! [[ $res =~ $re ]]; then runner=lab-host; re=$(rx lab-host); fi
+[[ $res =~ $re ]] || refuse "RESULT line is not a formal offload-host or lab-host gate-pre PASS (pre-validation, FAIL, local run, mixed where/provenance/container, or odd): ${res:0:200}"
+rsha=${BASH_REMATCH[1]}; lhex=${BASH_REMATCH[2]}; limg=${BASH_REMATCH[3]}
+[ "$rsha" = "$sha" ] || refuse "RESULT sha $rsha != target HEAD $sha"
+
+ihex=$(sha256sum <"$out/identity.txt" | cut -d' ' -f1)
+[ "$ihex" = "$lhex" ] || refuse "identity.txt sha256 $ihex != label $lhex (spoofed label?)"
+pin=$(dirname "$0")/gate-identity.expected   # the importer's OWN pin, never the target's copy
+[ -s "$pin" ] || refuse "importer pin $pin missing or empty"
+grep -Eq 'TODO|UNMEASURED|MISSING' "$pin" && refuse "importer pin $pin has TODO/UNMEASURED/MISSING fields"
+# remote-job (tools/remote-job:265-270) accepted identity.txt iff `diff <(echo "$(cat pin)") identity.txt` was empty (trailing newlines of the pin ignored, identity.txt ends with one newline)
+# and labelled it with `sha256sum <identity.txt` over the raw file bytes: same here.
+[ "$(grep -c '^adt=' "$out/identity.txt")" -le 1 ] || refuse "identity.txt has more than one adt= line"
+sed '/^adt=/d' "$out/identity.txt" | cmp -s - <(printf '%s\n' "$(cat "$pin")") || refuse "identity.txt differs from the importer's pin $pin (image/toolchain differs from the pin)"
+[ "$(sed -n 's/^image=//p' "$out/identity.txt" | head -1)" = "$limg" ] || refuse "label image $limg != image= in identity.txt"
+
+# local tree state the container could not see (gitignored): same hash as tools/gate-identity:19, with gate_select.py's fallback to the main clone's tools/third_party
+tp=$wt/tools/third_party
+[ -e "$tp/mkbootimg.py" ] || tp=$(dirname "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)")/tools/third_party
+# keep identical to tools/gate-identity (third_party=): excludes bytecode, LC_ALL=C sort
+lg=$(cd "$tp/../.." 2>/dev/null && find -L tools/third_party -type f -not \( -path '*/__pycache__/*' -name '*.pyc' \) -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)
+rg=$(sed -n 's/^third_party=//p' "$out/identity.txt" | head -1)
+[ -n "$rg" ] && [ "$lg" = "$rg" ] || refuse "local tools/third_party hash ${lg:0:16} != the container's third_party= ${rg:0:16} (the local gate would test other bytes; run tools/check-all.sh locally)"
+st=$(cd "$wt" && python3 tools/gate_select.py --state 2>/dev/null) || infra "tools/gate_select.py --state failed in $wt"
+ast=${st#* }
+case $ast in
+	0) ;;
+	1) ladt=$wt/research/ipsw-x/d22ap.adt
+	   [ -s "$ladt" ] || refuse "gate_select says a=1 but $ladt is not a readable non-empty file"
+	   lah=$(sha256sum <"$ladt" | cut -d' ' -f1); rah=$(sed -n 's/^adt=//p' "$out/identity.txt" | head -1)
+	   [ -n "$rah" ] || refuse "local research/ipsw-x/d22ap.adt present (sha256 $lah) but identity.txt has no adt= line (stamp from before the ADT mount): the local gate runs the mkadt identity test; run tools/check-all.sh locally"
+	   [ "$rah" = "$lah" ] || refuse "local ADT sha256 $lah != container adt=$rah (the container did not test this ADT: none or other bytes); run tools/check-all.sh locally" ;;
+	*) refuse "gate_select --state gave an unexpected ADT flag '$ast'" ;;
+esac
+
+want=$(printf '%s\n%s\n' "$sha" "$(git -C "$wt" ls-tree -r HEAD tools | sha256sum)")
+[ "$want" = "$(cat "$out/commit.txt")" ] || refuse "commit.txt does not match target HEAD / tools tree"
+
+gl=$(cat "$out/GATE_LINE")
+case $gl in *$'\n'*) refuse "GATE_LINE has more than one line" ;; esac
+case $gl in *[!\ -~]*|*\\*) refuse "GATE_LINE has control or non-ASCII or backslash characters" ;; esac
+gre='^GATE PASS ([0-9a-f]{7,40})( .*)?$'
+[[ $gl =~ $gre ]] || refuse "GATE_LINE is not 'GATE PASS <hex> ...': ${gl:0:120}"
+gh=${BASH_REMATCH[1]}; tag=${BASH_REMATCH[2]}
+case $sha in "$gh"*) ;; *) refuse "GATE_LINE sha $gh is not a prefix of HEAD $sha" ;; esac
+# check-all.sh:76 writes exactly this note when --quick found no stamp and then ran the FULL gate (quick is cleared there); any other quick: text is a partial run
+rest=${tag/ quick: no usable stamp, ran full/}
+case $rest in *quick:*|*+dirty*|*" (see "*) refuse "GATE_LINE is a quick or dirty run: $gl" ;; esac
+# review gate-adt-mount-r1 F1: check-all.sh:166-170 tags a PASS "(not registered: ...)" when a tree WITH the ADT skipped a unit test (mkadt identity
+# skips without the file) or had no tree state: not a full PASS, so never a stamp
+case $tag in *"(not registered"*) refuse "GATE_LINE says the container gate skipped tests or had no tree state (not a full PASS): $gl" ;; esac
+[ "$(grep -E '^GATE (PASS|FAIL)' "$glog" | tail -n 1)" = "$gl" ] || refuse "gate.log last gate line differs from GATE_LINE (tampered or truncated log)"
+
+[ "$(git -C "$wt" rev-parse HEAD)" = "$sha" ] || refuse "target HEAD moved during the import"
+lsha=$(sha256sum <"$glog" | cut -d' ' -f1); now=$(date +%s)
+for f in gate.remote.log gate.remote.json gate.stamp gate.result; do [ ! -L "$so/$f" ] || refuse "$so/$f is a symlink"; done
+tmps=(); trap 'rm -f "${tmps[@]}"' EXIT
+put() { # NAME : stdin -> shim/out/NAME via mktemp + mv in the same dir
+	local t; t=$(mktemp "$so/.gate-import.XXXXXX") || infra "mktemp in $so failed"; tmps+=("$t")
+	cat >"$t" || infra "cannot write $t"; mv -f "$t" "$so/$1" || infra "cannot move into $so/$1"
+}
+put gate.remote.log <"$glog"
+python3 -I -c '
+import json,sys
+k=["runner","image","identity_sha256","gate_log_sha256","remote_job_commit","gate_line","result_line","out_dir","imported_by","imported_on","imported_at"]
+v=sys.argv[1:]
+d=dict(zip(k,v)); d["imported_at"]=int(d["imported_at"]); print(json.dumps(d))' \
+	"$runner" "$limg" "$ihex" "$lsha" "$sha" "$gl" "$res" "$out" "$(id -un)" "$(hostname)" "$now" | put gate.remote.json
+echo "$sha" | put gate.stamp
+printf 'GATE PASS %s%s %s\n' "$short" "$tag" "$now" | put gate.result
+gp=${GATE_PASS_DIR:-$HOME/.cache/pixelios/gate-pass}; st=$(cd "$wt" && python3 tools/gate_select.py --state 2>/dev/null); blob=$(git -C "$wt" hash-object tools/check-all.sh 2>/dev/null); reg=skipped
+if [ -n "$st" ] && [ -n "$blob" ] && { mkdir -p "$gp" && echo "$blob $st" >"$gp/$sha"; } 2>/dev/null; then reg=written; else echo "gate-import-remote: GAP: host gate-pass registry not written (no tree state or read-only $gp): the next quick gate may run full"; fi
+echo "gate-import-remote: host gate-pass registry $reg; gate.remote.log/json written"
+echo "$gl"   # T-0210: the validated GATE_LINE at line start, so the tick auto-merge (GATE_LINE_RE) sees an offloaded gate PASS in the gate log
+echo "RESULT: PASS gate-import-remote imported GATE PASS $short$tag sha=$sha image=$limg identity=sha256:${ihex:0:12} stamp=written registry=$reg"

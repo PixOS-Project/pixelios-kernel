@@ -293,7 +293,7 @@ int wlan_iso_run(void)
 	uint32_t before = 0, iso0 = 0, iso0b = 0, perst = 0, en = 0, after = 0, rb = 0, fin = 0;
 	struct smc_res rd = { 0, 0, 0, 0 }, rs = { 0, 0, 0, 0 }, rc = { 0, 0, 0, 0 };
 	int rok = 0, rok2 = 0, fin_ok, reached, ret, rel_ok;
-	const char *rel, *rest = "n/a";
+	const char *rel, *rest;
 
 	if (!counter_freq()) {
 		say_iso_refused("no timer, nothing sent");

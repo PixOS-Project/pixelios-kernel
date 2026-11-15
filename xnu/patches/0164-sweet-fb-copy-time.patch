@@ -1,0 +1,49 @@
+SWEET framebuffer panel copy timing (patch 0164, boot-arg sweetfb_copytime=1, default off): wall time of AppleCLCD::present() (row copies + the content-sample diagnostic), summed and logged every 40 presents as 'SWEET FB: panel copy: N presents (total T) avg A us max M us'; one 'SWEET FB: sweetfb_copytime on|off' line at the first present. Read-only, no register access. Reason: docs/research/78 (fork 0145 timing hunk, own code); settles whether the ~10 Hz panel copy is CPU-bound.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -627,6 +627,21 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	/*
++	 * Panel copy timing (patch 0164, boot-arg sweetfb_copytime=1, default off; docs/research/78 item "panel copy timing"): wall time of
++	 * this whole present() (layer lookup + row copies + the content-sample diagnostic below), summed and logged every 40 presents as
++	 * `SWEET FB: panel copy: ...`. Read-only: no register or memory outside this function's own statics is touched.
++	 */
++	static int ct_on = -1;
++	uint64_t ct_t0 = 0;
++	if (ct_on < 0) {
++		int v = 0;
++		ct_on = (PE_parse_boot_argn("sweetfb_copytime", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		IOLog("SWEET FB: sweetfb_copytime %s\n", ct_on ? "on: panel copy time logged every 40 presents" : "off");
++	}
++	if (ct_on) {
++		ct_t0 = mach_absolute_time();
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -757,6 +772,23 @@
+ 		}
+ 		s->release();
+ 	}
++	if (ct_on) {
++		static uint32_t ct_n;
++		static uint64_t ct_sum_ns, ct_max_ns, ct_total;
++		uint64_t ct_ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - ct_t0, &ct_ns);
++		ct_sum_ns += ct_ns;
++		if (ct_ns > ct_max_ns) {
++			ct_max_ns = ct_ns;
++		}
++		ct_total++;
++		if (++ct_n >= 40) {
++			IOLog("SWEET FB: panel copy (whole present(), incl. 64x64 diag, empty presents counted): %u presents (total %llu) avg %u us max %u us\n", ct_n, ct_total,
++			    (uint32_t)(ct_sum_ns / ct_n / 1000), (uint32_t)(ct_max_ns / 1000));
++			ct_n = 0;
++			ct_sum_ns = ct_max_ns = 0;
++		}
++	}
+ 	if (sweet_lat_state == 2) {
+ 		uint64_t pn;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &pn);

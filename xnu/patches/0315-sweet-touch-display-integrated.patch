@@ -1,0 +1,27 @@
+SWEET touch events: IsDisplayIntegrated + IsBuiltIn (patch 0315, ALL-ON T-36, research 140): UIKit types a touch Direct only when the top digitizer event has IsDisplayIntegrated (0xb0019) set, otherwise Indirect (UIKitCore 0x188dc8934 [bin], RM-00968); SpringBoard's SBHomeGesturePanGestureRecognizer allows Direct touches only (0x1c5841a40 [bin], RM-00988), so our touches (flag never set [read 0058/0069]) scroll apps but can never start the home gesture. Now SweetHIDTouch::touch sets IsDisplayIntegrated = 1 on the collection and every child and IsBuiltIn = 1 on the collection (backboardd mirrors both from the incoming top event, RM-00996/00997). Event fields only, no hardware access.
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -1289,6 +1289,14 @@
+ 		return;
+ 	}
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
++	/*
++	 * patch 0315 (ALL-ON T-36, research 140): UIKit makes a touch Direct only when the TOP digitizer event has
++	 * IsDisplayIntegrated (0xb0019) set, else Indirect (UIKitCore 0x188dc8934, RM-00968); SpringBoard's home pan
++	 * allows Direct touches only (SB 0x1c5841a40, RM-00988), so without it no home gesture. backboardd copies
++	 * IsDisplayIntegrated + IsBuiltIn from the incoming top event (RM-00996/00997). Event fields only, no hardware.
++	 */
++	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
++	collection->setIntegerValue(kIOHIDEventFieldIsBuiltIn, 1);
+ 
+ 	UInt32 cmask = 0;
+ 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+@@ -1319,6 +1327,7 @@
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);   /* patch 0315 */
+ 		collection->appendChild(child);
+ 		child->release();
+ 		cmask |= mask;

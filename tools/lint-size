@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""lint-size: modularity limits for NEW OR CHANGED files only (rule R29; gate step lint-size, it FAILS the gate). No pin list, no mass refactor: untouched legacy is ignored.
+
+  tools/lint-size [--root DIR] [--base REF]   scan the files changed since BASE (default: merge-base of HEAD and `trunk`, else HEAD~1; with none, only untracked files are checked and a GAP line says so), print findings,
+                                              last line RESULT: PASS|FAIL. Uncommitted and untracked changes count as changed.
+  tools/lint-size --check                     same as no flag (the spelling validate-repo.py and the gate-lint table use)
+  tools/lint-size --self-test                 fixtures + mutants (also run by tools/test_lint_size.py)
+
+Limits (TigerStyle subset; C functions: STYLE-C.md / tools/lint-c --style):
+  FILE_MAX = 800 lines   tools/ scripts (.py .sh, or an extensionless file with a python/sh shebang) and shim/ soc/ *.c *.h
+  FUNC_MAX = 100 lines   a Python function/method (ast, def line to last line) that has a changed line
+Findings (each names the do-instead):
+  FILE-NEW   a NEW file over FILE_MAX: split it into modules (tools/<name>_lib.py) before adding it.
+  FILE-GREW  a CHANGED file over FILE_MAX that got longer than at BASE: put the added code in a new module and import it; a changed legacy file may stay as long as it is, never longer.
+  FUNC-LONG  a Python function over FUNC_MAX lines that is new or got longer than at BASE (same idea as R27 for C): split it; an edit that does not lengthen a legacy long function is fine.
+PORT CODE WARNS (T-8fe9 M2, user 2026-11-03, RULES R31): a finding on port code (shim/ soc/ device/ *.c *.h) prints `WARN <finding>` and does not fail; tools/ stay blocking.
+Exit 0 PASS / 1 FAIL / 2 usage. Last line: RESULT: PASS|FAIL lint-size changed=N scanned=M findings=K warnings=W base=SHORTREF"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import ast, os, re, subprocess, sys, tempfile
+
+FILE_MAX = 800
+FUNC_MAX = 100
+SKIP = ("tools/third_party/", "__pycache__/", "shim/out/")
+PORT = ("shim/", "soc/", "device/")   # port code: findings warn (T-8fe9 M2), tools/ findings fail
+
+
+def git(root, *a):
+    r = subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout
+
+
+def resolve_base(root, base):
+    """-> a commit-ish; "" when there is no history to compare with."""
+    if base:
+        return base
+    rc, out = git(root, "merge-base", "HEAD", "trunk")
+    if rc == 0 and out.strip():
+        return out.strip()
+    rc, out = git(root, "rev-parse", "--verify", "-q", "HEAD~1")
+    return out.strip() if rc == 0 else ""
+
+
+def kind_of(root, p):
+    full = os.path.join(root, p)
+    if any(x in p for x in SKIP) or not os.path.isfile(full) or os.path.islink(full):
+        return None
+    if p.startswith("tools/"):
+        if p.endswith((".py", ".sh")):
+            return "py" if p.endswith(".py") else "sh"
+        if "/" in p[len("tools/"):]:
+            return None
+        with open(full, "rb") as f:
+            first = f.readline(200)
+        if first.startswith(b"#!") and b"python" in first:
+            return "py"
+        return "sh" if first.startswith(b"#!") and b"sh" in first else None
+    return "c" if p.startswith(PORT) and p.endswith((".c", ".h")) else None
+
+
+def nlines(raw):
+    return raw.count(b"\n") + (0 if raw.endswith(b"\n") or not raw else 1)
+
+
+def changed_files(root, base):
+    """-> {path: [(start, end) added/changed line ranges of the new side] or None when the whole file is new}."""
+    out = {}
+    if base:
+        rc, txt = git(root, "diff", "--name-status", "-z", base)
+        parts = txt.split("\0")
+        i = 0
+        while i + 1 < len(parts):
+            st, path = parts[i], parts[i + 1]
+            i += 2
+            if st[:1] in "RC":
+                i += 1; path = parts[i]; i += 0
+            if st[:1] == "D":
+                continue
+            out[path] = None if st[:1] == "A" else []
+        for path, v in list(out.items()):
+            if v is None:
+                continue
+            _, d = git(root, "diff", "-U0", base, "--", path)
+            for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", d, re.M):
+                st, ct = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+                if ct:
+                    v.append((st, st + ct - 1))
+    else:
+        print("LINT-SIZE GAP: no base ref (no `trunk` branch and no HEAD~1, e.g. a one-commit gate snapshot): nothing to compare, only untracked files are checked; pass --base REF to check a change")
+    _, un = git(root, "ls-files", "-z", "--others", "--exclude-standard")
+    for path in un.split("\0"):
+        if path:
+            out[path] = None
+    return out
+
+
+def tracked(root):
+    rc, txt = git(root, "ls-files", "-z")
+    if rc != 0:
+        raise SystemExit("lint-size: git ls-files failed in %s" % root)
+    return [p for p in txt.split("\0") if p]
+
+
+def base_raw(root, base, path):
+    if not base:
+        return None
+    r = subprocess.run(["git", "-C", root, "show", "%s:%s" % (base, path)], capture_output=True, timeout=60)
+    return r.stdout if r.returncode == 0 else None
+
+
+def base_lines(root, base, path):
+    raw = base_raw(root, base, path)
+    return None if raw is None else nlines(raw)
+
+
+def base_src(root, base, path):
+    raw = base_raw(root, base, path)
+    return raw.decode("utf-8", "replace") if raw else None
+
+
+def func_lens(src):
+    """-> {name: longest length in lines} of the Python functions in SRC."""
+    out = {}
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = max(out.get(n.name, 0), n.end_lineno - n.lineno + 1)
+    return out
+
+
+def long_funcs(src, ranges, old_src):
+    """-> [(name, first, length)] of Python functions over FUNC_MAX that contain a changed line and are new or longer than at base (an edit inside a legacy long function that
+    does not lengthen it is not flagged; ranges None = the whole file is new)."""
+    old = func_lens(old_src) if old_src else {}
+    out = []
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ln = n.end_lineno - n.lineno + 1
+            if ln > FUNC_MAX and ln > old.get(n.name, 0) and (ranges is None or any(a <= n.end_lineno and b >= n.lineno for a, b in ranges)):
+                out.append((n.name, n.lineno, ln))
+    return out
+
+
+def check(root, base=None):
+    base = resolve_base(root, base)
+    ch = changed_files(root, base)
+    finds, scanned = [], 0
+    for path, ranges in sorted(ch.items()):
+        kind = kind_of(root, path)
+        if not kind:
+            continue
+        scanned += 1
+        n0 = len(finds)
+        with open(os.path.join(root, path), "rb") as f:
+            raw = f.read()
+        n = nlines(raw)
+        if n > FILE_MAX:
+            if ranges is None:
+                finds.append("FILE-NEW %s lines=%d (limit %d): split it into modules (tools/<name>_lib.py) before adding it; a new tool starts from `tools/new-tool NAME --purpose ...`" % (path, n, FILE_MAX))
+            else:
+                was = base_lines(root, base, path)
+                if was is None or n > was:
+                    finds.append("FILE-GREW %s lines=%d (was %s at base, limit %d): put the added code in a new module and import it; a changed legacy file may not get longer" % (path, n, was, FILE_MAX))
+        if kind == "py":
+            try:
+                for name, first, ln in long_funcs(raw.decode("utf-8", "replace"), ranges, base_src(root, base, path) if ranges is not None else None):
+                    finds.append("FUNC-LONG %s:%d %s() is %d lines (limit %d) and has a changed line: split it into smaller functions" % (path, first, name, ln, FUNC_MAX))
+            except SyntaxError as e:
+                finds.append("PARSE %s: %s (cannot measure function length; fix the syntax)" % (path, e))
+        if kind == "c":   # T-8fe9 M2: port code warns, never fails
+            finds[n0:] = ["WARN " + f for f in finds[n0:]]
+    return finds, len(ch), scanned, base
+
+
+def self_test():
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        def g(*a): subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=d, check=True, capture_output=True)
+        def put(p, text):
+            os.makedirs(os.path.dirname(os.path.join(d, p)), exist_ok=True)
+            with open(os.path.join(d, p), "w") as f: f.write(text)
+        def kinds(): return sorted({" ".join(f.split()[:2]) if f.startswith("WARN ") else f.split()[0] for f in check(d)[0]})
+        def expect(name, want):
+            nonlocal ok
+            got = kinds()
+            if got != want:
+                ok = False; print("FAIL %s: expected %s got %s" % (name, want, got))
+        long_fn = "def f():\n" + "    pass\n" * (FUNC_MAX + 3)
+        g("init", "-q", "-b", "trunk")
+        put("tools/legacy_big.py", "x = 1\n" * (FILE_MAX + 50) + long_fn)       # legacy: over both limits, committed on trunk
+        put("tools/small.py", "def f():\n    return 1\n")
+        g("add", "-A"); g("commit", "-q", "-m", "base")
+        g("checkout", "-q", "-b", "work")
+        expect("untouched legacy is ignored", [])
+        put("tools/small.py", "def f():\n    return 2\n")
+        expect("small change passes", [])
+        put("tools/new_big.py", "x = 1\n" * (FILE_MAX + 1))
+        expect("new big file", ["FILE-NEW"])
+        put("tools/new_big.py", "x = 1\n" * FILE_MAX)
+        expect("new file at the limit", [])
+        put("tools/new_fn.py", long_fn)
+        expect("new long function", ["FUNC-LONG"])
+        os.remove(os.path.join(d, "tools/new_fn.py"))
+        with open(os.path.join(d, "tools/legacy_big.py"), "a") as f: f.write("y = 2\n")      # legacy grows (appended after the long function)
+        expect("changed legacy file grew", ["FILE-GREW"])
+        put("tools/legacy_big.py", "x = 1\n" * (FILE_MAX + 50) + long_fn.replace("pass", "pass  ", 1))   # same length, touches the long function
+        expect("legacy long function edited, not lengthened", [])
+        put("tools/legacy_big.py", "x = 1\n" * (FILE_MAX + 50) + long_fn + "    pass\n")   # the long function and the file both grow
+        expect("legacy long function lengthened", ["FILE-GREW", "FUNC-LONG"])
+        put("tools/legacy_big.py", "z = 0\n" + "x = 1\n" * (FILE_MAX + 49) + long_fn)       # same line count, change outside the long function
+        expect("legacy same length, change outside its long function", [])
+        put("shim/new_big.c", "int x;\n" * (FILE_MAX + 1))   # T-8fe9 M2: port code over the limit warns
+        expect("port code over the limit warns", ["WARN FILE-NEW"])
+        n_fail = len([f for f in check(d)[0] if not f.startswith("WARN ")])
+        if n_fail:
+            ok = False; print("FAIL port warn counted as a failure: %d" % n_fail)
+        os.remove(os.path.join(d, "shim/new_big.c"))
+    print("RESULT: %s lint-size self-test" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = None
+    for flag in ("--root", "--base"):
+        if flag in argv:
+            v = argv[argv.index(flag) + 1]
+            if flag == "--root": root = v
+            else: base = v
+    if [a for a in argv if a.startswith("-") and a not in ("--root", "--base", "--check")]:
+        print(__doc__.splitlines()[0]); return 2
+    finds, changed, scanned, b = check(root, base)
+    for f in finds:
+        print(f)
+    fails = [f for f in finds if not f.startswith("WARN ")]
+    print("RESULT: %s lint-size changed=%d scanned=%d findings=%d warnings=%d base=%s" % ("FAIL" if fails else "PASS", changed, scanned, len(fails), len(finds) - len(fails), b[:10] or "none"))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

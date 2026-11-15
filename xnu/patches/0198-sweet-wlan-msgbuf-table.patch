@@ -1,0 +1,319 @@
+SWEET WLAN msgbuf store-table interpreter (P-W3a, ticket T-12ad; engine only, no caller yet):
+bsd/dev/sweet_wlan_tbl.h replays a generated table of store / doorbell / restore / poll / delay / read rows through struct swg_bus
+(patch 0174's guarded accessors). The table comes from tools/wlan-tbl-gen and the proven L1-L22 run; every row must lie inside the
+reviewed envelope (swt_allowed) or the whole table is refused before the first store; every wait has a timeout and a WIFI GAP line;
+a failed run still runs the teardown rows. Pure header, not included by sweet_wlan.c yet (P-W3b wires it), so no behaviour change.
+Host tested: shim/wlan_tbl_host_test.c (7 mutants) and tools/replay wifi --baseline on its store log. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_wlan_tbl.h b/bsd/dev/sweet_wlan_tbl.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_tbl.h
+@@ -0,0 +1,307 @@
++/*
++ * Msgbuf store-table interpreter (P-W3a, xnu patch 0198; host tested by shim/wlan_tbl_host_test.c).
++ * It replays a GENERATED table (tools/wlan-tbl-gen from the proven L1-L22 run; rows: store, doorbell,
++ * restore, poll, delay, read, mark) through struct swg_bus, the guarded accessors of sweet_wlan_g2.h.
++ * It adds no store of its own: a row outside the reviewed envelope (swt_allowed, the classes of reviews
++ * 0174-g2-hwwrite-r4, 0174-w-d4b-hwwrite-r2, 0174-w-d4c-hwwrite-r2, 0174-w-d4d-hwwrite-r1,
++ * 0174-w-d4e-scan24-l21-hwwrite-r2) refuses the WHOLE table before the first store (swt_check), every
++ * wait has a timeout and a `WIFI GAP:` line, a failed run still executes the teardown rows.
++ * Log lines are the ones of the G2 writer (`G2 store NAME bp|host|off ...`), so tools/replay compares
++ * them with the proven run. Not wired into sweet_wlan.c yet (P-W3b); not run on hardware.
++ */
++#ifndef SWEET_WLAN_TBL_H
++#define SWEET_WLAN_TBL_H
++
++#include <stdint.h>
++#include "sweet_wlan_g2.h"
++
++enum { SWT_K_STORE = 1, SWT_K_DOORBELL, SWT_K_RESTORE, SWT_K_POLL, SWT_K_MARK, SWT_K_READ, SWT_K_DELAY };
++enum { SWT_SP_BP = 1, SWT_SP_HOST, SWT_SP_RC, SWT_SP_EP, SWT_SP_PCIE, SWT_SP_R1, SWT_SP_R2, SWT_SP_R3, SWT_SP_UNDO };
++enum { SWT_C_G2 = 1, SWT_C_D4B, SWT_C_D4C, SWT_C_D4D, SWT_C_D4E, SWT_C_RS };
++enum { SWT_OK = 0, SWT_E_ENV = 1, SWT_E_TMO, SWT_E_RESTORE, SWT_E_STORE, SWT_E_OLD, SWT_E_RB, SWT_E_FMT };
++
++#define SWT_F_W16      1u       /* 16-bit store, upper half kept */
++#define SWT_F_NOOLD    2u       /* the proven run logged no old word: not compared, not printed */
++#define SWT_NAME_LEN   28u
++#define SWT_DELAY_MAX  1000u    /* ms of one delay row [decision] */
++#define SWT_POLL_MAX   10000u   /* ms of one poll row [decision] */
++#define SWT_STEP_MS    10u      /* poll step [decision] */
++#define SWT_DB_OFF     SWG_DB0_OFF
++#define SWT_REG_OFF    0x84u    /* restore space 1: BAR2 window cfg (SWW_CFG_WIN2) */
++
++struct swt_row {
++	uint8_t kind, sp, cls, flags;   /* flags: SWT_F_* */
++	uint32_t addr, old, val, mask, timeout_ms, win;
++	char name[SWT_NAME_LEN];
++};
++
++struct swt_env {
++	uint32_t ram_end;       /* SWW_RAM_BASE + ram_bytes, as read */
++	uint32_t host_len;      /* the planned G1 block bytes */
++};
++
++struct swt_x {
++	const struct swg_bus *b;
++	struct swt_env env;
++	int (*restore)(void *ctx, int space, uint32_t win, uint32_t off, uint32_t val);
++	uint32_t win;           /* BAR2 window last selected */
++	uint32_t rc_old, ep_old;
++	unsigned stores, gaps;
++	int err;
++};
++
++static const char *swt_spname(int sp)
++{
++	return sp == SWT_SP_BP ? "bp" : sp == SWT_SP_HOST ? "host" : "off";
++}
++
++static int swt_busspace(int sp)
++{
++	switch (sp) {
++	case SWT_SP_BP: return SWG_SP_TCM;
++	case SWT_SP_HOST: return SWG_SP_HOST;
++	case SWT_SP_RC: return SWG_SP_RC;
++	case SWT_SP_EP: return SWG_SP_EP;
++	case SWT_SP_PCIE: return SWG_SP_PCIE;
++	}
++	return 0;
++}
++
++static int swt_gap(struct swt_x *x, int code, const char *why, unsigned i)
++{
++	x->gaps++;
++	if (x->err == SWT_OK) {
++		x->err = code;
++	}
++	printf("SWEET WLAN: WIFI GAP: table row %u: %s\n", i, why);
++	return -code;
++}
++
++/* the address envelope of a store row: the offsets the reviewed code uses (sweet_wlan_g2.h defines) */
++static int swt_off_ok(const struct swt_row *r)
++{
++	switch (r->sp) {
++	case SWT_SP_RC:
++	case SWT_SP_EP:
++		return r->addr == SWG_CMD_OFF;
++	case SWT_SP_PCIE:
++		return r->addr == SWG_HOSTREADY_OFF || r->addr == SWG_MBX_MASK_OFF || r->addr == SWG_DB0_OFF;
++	}
++	return 0;
++}
++
++/* 1 = row r lies inside the reviewed envelope; the tag of each class names its review above */
++static int swt_allowed(const struct swt_row *r, const struct swt_env *e)
++{
++	if (r->kind == SWT_K_MARK) {
++		return r->sp == SWT_SP_UNDO;
++	}
++	if (r->kind == SWT_K_RESTORE) {
++		return (r->sp == SWT_SP_R1 && (r->addr == SWT_REG_OFF || r->addr == 0x88u)) ||
++		    (r->sp == SWT_SP_R3 && r->addr == 0x800u);
++	}
++	if (r->kind == SWT_K_DELAY) {
++		return r->val > 0u && r->val <= SWT_DELAY_MAX;
++	}
++	if (r->kind == SWT_K_POLL || r->kind == SWT_K_READ) {
++		return r->sp == SWT_SP_PCIE && (r->addr == SWG_PCIE_STATUS_OFF || r->addr == SWG_MBX_MASK_OFF);
++	}
++	if (r->cls < SWT_C_G2 || r->cls > SWT_C_D4E || (r->addr & 3u) != 0u) {
++		return 0;
++	}
++	if (r->kind == SWT_K_DOORBELL) {
++		return r->sp == SWT_SP_PCIE && r->addr == SWT_DB_OFF &&
++		    ((r->val >> 16) == 0xFF00u || (r->val >> 16) == 0xDD02u);
++	}
++	if (r->sp == SWT_SP_BP) {
++		return r->cls == SWT_C_G2 && r->addr >= SWW_RAM_BASE && e->ram_end > SWW_RAM_BASE &&
++		    r->addr <= e->ram_end - 4u;
++	}
++	if (r->sp == SWT_SP_HOST) {
++		return r->addr + 4u <= e->host_len;
++	}
++	return swt_off_ok(r) && (r->cls == SWT_C_G2 || r->cls == SWT_C_D4B);
++}
++
++/* validates the whole table before the first store: envelope, timeouts, teardown rows */
++static int swt_check(struct swt_x *x, const struct swt_row *t, unsigned n)
++{
++	unsigned i;
++	int win = 0, w84 = 0, cmd = 0, undo = 0;
++
++	for (i = 0; i < n; i++) {
++		const struct swt_row *r = &t[i];
++
++		if (!swt_allowed(r, &x->env)) {
++			return swt_gap(x, SWT_E_ENV, "outside the reviewed envelope", i);
++		}
++		if (r->kind == SWT_K_POLL && (r->timeout_ms == 0u || r->timeout_ms > SWT_POLL_MAX)) {
++			return swt_gap(x, SWT_E_TMO, "poll without a valid timeout", i);
++		}
++		win |= r->sp == SWT_SP_BP && r->addr >= SWW_WIN_TAIL;
++		cmd |= r->sp == SWT_SP_RC || r->sp == SWT_SP_EP;
++		undo |= r->kind == SWT_K_MARK;
++		w84 |= r->kind == SWT_K_RESTORE && r->sp == SWT_SP_R1 && r->addr == SWT_REG_OFF && r->val == 0u;
++	}
++	if ((win && !w84) || (cmd && !undo)) {
++		return swt_gap(x, SWT_E_RESTORE, "teardown row missing (window restore or command undo)", n);
++	}
++	return 0;
++}
++
++static int swt_win(struct swt_x *x, uint32_t bp)
++{
++	uint32_t w = bp >= SWW_WIN_TAIL ? SWW_WIN_TAIL : 0u;
++
++	if (w == x->win) {
++		return 0;
++	}
++	if (x->b->wr(x->b->ctx, SWG_SP_WIN2, SWW_CFG_WIN2, w)) {
++		return -1;
++	}
++	x->win = w;
++	return 0;
++}
++
++static int swt_put(struct swt_x *x, const struct swt_row *r, uint32_t v)
++{
++	int sp = swt_busspace(r->sp);
++
++	if (r->sp == SWT_SP_BP && swt_win(x, r->addr)) {
++		return -1;
++	}
++	if ((r->flags & SWT_F_W16) != 0u) {
++		return x->b->wr16 == 0 ? -1 : x->b->wr16(x->b->ctx, sp, r->addr, (uint16_t)v);
++	}
++	return x->b->wr(x->b->ctx, sp, r->addr, v);
++}
++
++static int swt_store(struct swt_x *x, const struct swt_row *r, unsigned i)
++{
++	uint32_t old = 0, rb = 0, want;
++	int sp = swt_busspace(r->sp);
++
++	if (r->kind == SWT_K_DOORBELL) {
++		if (swt_put(x, r, r->val)) {
++			return swt_gap(x, SWT_E_STORE, "doorbell store refused", i);
++		}
++		printf("SWEET WLAN: G2 store %s off %#x := %#x (old and read-back not made, golden writes only)\n",
++		    r->name, r->addr, r->val);
++		return 0;
++	}
++	if (r->sp == SWT_SP_BP && swt_win(x, r->addr)) {
++		return swt_gap(x, SWT_E_STORE, "window select refused", i);
++	}
++	if (x->b->rd(x->b->ctx, sp, r->addr, &old) || ((r->flags & SWT_F_NOOLD) == 0u && old != r->old)) {
++		return swt_gap(x, SWT_E_OLD, "old value differs from the table", i);
++	}
++	x->rc_old = r->sp == SWT_SP_RC ? old : x->rc_old;
++	x->ep_old = r->sp == SWT_SP_EP ? old : x->ep_old;
++	if (swt_put(x, r, r->val)) {
++		return swt_gap(x, SWT_E_STORE, "store refused", i);
++	}
++	want = (r->flags & SWT_F_W16) != 0u ? (old & 0xFFFF0000u) | (r->val & 0xFFFFu) : r->val;
++	if (x->b->rd(x->b->ctx, sp, r->addr, &rb) || (rb & r->mask) != (want & r->mask)) {
++		return swt_gap(x, SWT_E_RB, "read-back differs", i);
++	}
++	x->stores++;
++	if ((r->flags & SWT_F_NOOLD) != 0u) {
++		printf("SWEET WLAN: G2 store %s %s %#x := %#x read back %#x\n", r->name, swt_spname(r->sp),
++		    r->addr, r->val, rb);
++		return 0;
++	}
++	printf("SWEET WLAN: G2 store %s %s %#x old %#x := %#x read back %#x%s\n", r->name, swt_spname(r->sp),
++	    r->addr, old, r->val, rb, (r->flags & SWT_F_W16) != 0u ? " (16-bit store, upper half unchanged)" : "");
++	return 0;
++}
++
++static int swt_poll(struct swt_x *x, const struct swt_row *r, unsigned i)
++{
++	uint32_t v = 0, left;
++
++	for (left = r->timeout_ms; ; left -= SWT_STEP_MS) {
++		if (x->b->rd(x->b->ctx, swt_busspace(r->sp), r->addr, &v) == 0 && (v & r->mask) == r->val) {
++			return 0;
++		}
++		if (left < SWT_STEP_MS) {
++			break;
++		}
++		x->b->delay_ms(x->b->ctx, SWT_STEP_MS);
++	}
++	return swt_gap(x, SWT_E_TMO, "poll timed out", i);
++}
++
++static int swt_restore(struct swt_x *x, const struct swt_row *r)
++{
++	int space = r->sp == SWT_SP_R1 ? 1 : r->sp == SWT_SP_R2 ? 2 : 3;
++	int ok = x->restore != 0 && x->restore(x->b->ctx, space, r->win, r->addr, r->val) == 0;
++
++	printf("SWEET WLAN: restore space %d win %#x off %#x := %#x %s\n", space, r->win, r->addr, r->val,
++	    ok ? "ok" : "FAILED");
++	return ok ? 0 : -SWT_E_RESTORE;
++}
++
++/* the command-register undo (G2 writer swg_undo): ep and rc get their entry words back */
++static int swt_undo(struct swt_x *x)
++{
++	int e = x->b->wr(x->b->ctx, SWG_SP_EP, SWG_CMD_OFF, x->ep_old);
++	int c = x->b->wr(x->b->ctx, SWG_SP_RC, SWG_CMD_OFF, x->rc_old);
++
++	if (e || c) {
++		printf("SWEET WLAN: WIFI GAP: G2 undo failed (ep %d, rc %d)\n", e, c);
++		x->gaps++;
++		return -SWT_E_RESTORE;
++	}
++	printf("SWEET WLAN: G2 undo ok (ep restored, rc restored)\n");
++	return 0;
++}
++
++static int swt_step(struct swt_x *x, const struct swt_row *r, unsigned i)
++{
++	uint32_t v = 0;
++
++	switch (r->kind) {
++	case SWT_K_STORE:
++	case SWT_K_DOORBELL:
++		return swt_store(x, r, i);
++	case SWT_K_POLL:
++		return swt_poll(x, r, i);
++	case SWT_K_DELAY:
++		x->b->delay_ms(x->b->ctx, r->val);
++		return 0;
++	case SWT_K_READ:
++		if (x->b->rd(x->b->ctx, swt_busspace(r->sp), r->addr, &v)) {
++			return swt_gap(x, SWT_E_STORE, "read refused", i);
++		}
++		printf("SWEET WLAN: G2 read %s off %#x = %#x\n", r->name, r->addr, v);
++		return 0;
++	}
++	return 0;
++}
++
++/* runs the table: 0 = all rows done; negative = the first failure (the rest of the work rows is skipped, the teardown rows still run) */
++static int swt_run(struct swt_x *x, const struct swt_row *t, unsigned n)
++{
++	unsigned i;
++	int rc = swt_check(x, t, n), td = 0;
++
++	if (rc) {
++		return rc;
++	}
++	for (i = 0; i < n && rc == 0; i++) {
++		if (t[i].kind != SWT_K_RESTORE && t[i].kind != SWT_K_MARK) {
++			rc = swt_step(x, &t[i], i);
++		}
++	}
++	for (i = 0; i < n; i++) {
++		if (t[i].kind == SWT_K_MARK) {
++			td |= swt_undo(x);
++		} else if (t[i].kind == SWT_K_RESTORE) {
++			td |= swt_restore(x, &t[i]);
++		}
++	}
++	printf("SWEET WLAN: table done: %u stores, %u gaps, rc %d, teardown %d\n", x->stores, x->gaps, rc, td);
++	return rc != 0 ? rc : td;
++}
++
++#endif

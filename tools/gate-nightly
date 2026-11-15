@@ -1,0 +1,93 @@
+#!/bin/bash
+# gate-nightly: the nightly L2 gate on trunk (T-db59, PLAN-GATE-LAYERS s.2 L2). The formal gate is L2 = the trunk merge SHA + this nightly; the result row lands in logs/gate-times.tsv.
+#   tools/gate-nightly [run] [--date YYYY-MM-DD] [--cold|--no-cold]   gate trunk HEAD in a persistent worktree: `tools/gate --formal --label nightly-DATE`
+#                                  (+ `tools/gate --cold --label nightly-cold-DATE` on Sundays, --cold forces it, --no-cold skips it). Prints the heavy-job launch RESULT; the gate itself runs detached (own systemd
+#                                  scope), its ledger row (label nightly-DATE) and its `RESULT: PASS|FAIL gate kind=formal elapsed=NNNs` line (logs/heavy-job/nightly-DATE/detach.log) appear when it ends.
+#   tools/gate-nightly install [--time HH:MM] [--print]   write ~/.config/systemd/user/pixos-gate-nightly.{service,timer} for THIS checkout (default 03:30, Persistent) and enable the timer
+#                                  (systemctl --user: no root); --print only prints the two units.
+# Worktree: ${GATE_NIGHTLY_WT:-${WORKTREE_ROOT:-$HOME/.t3/worktrees}/gate-nightly}, created once with tools/worktree-new (branch gate-nightly-wt), then `git checkout --detach trunk` each night
+# (refused when it has tracked changes). Kept between nights so shim/out and the xnu work tree stay warm (formal budget 600 s warm). GATE_DRY=1: print what would run, change nothing.
+# Exit codes and RESULT describe the LAUNCH only (tools/gate detaches; the gates then queue on the host gate lock): the formal gate's own result is its ledger row / detach.log, and the Sunday cold gate is launched whether or not the formal one later fails.
+# Exit 0 launched/dry/installed, 1 refused (dirty worktree, no trunk), 2 usage. Host only; no phone, no network, no root.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+here=$(cd "$(dirname "$0")" && pwd) || exit 2
+repo=$(dirname "$here")
+cmd=run; date=$(date +%F); cold=auto; time=03:30; printonly=0
+[ "${1:-}" = run ] || [ "${1:-}" = install ] && { cmd=$1; shift; }
+while [ $# -gt 0 ]; do
+	case $1 in
+	--date) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-nightly --date needs a value"; exit 2; }; date=$2; shift 2 ;;
+	--cold) cold=yes; shift ;;
+	--no-cold) cold=no; shift ;;
+	--time) [ $# -ge 2 ] || { echo "RESULT: ERROR gate-nightly --time needs a value"; exit 2; }; time=$2; shift 2 ;;
+	--print) printonly=1; shift ;;
+	*) echo "usage: tools/gate-nightly [run] [--date D] [--cold|--no-cold] | install [--time HH:MM] [--print]"; echo "RESULT: ERROR gate-nightly unknown argument '$1'"; exit 2 ;;
+	esac
+done
+case $date in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) echo "RESULT: ERROR gate-nightly --date '$date' is not YYYY-MM-DD"; exit 2 ;; esac
+[ "$(date -d "$date" +%F 2>/dev/null)" = "$date" ] || { echo "RESULT: ERROR gate-nightly --date '$date' is not a calendar date"; exit 2; }
+case $time in [0-2][0-9]:[0-5][0-9]) ;; *) echo "RESULT: ERROR gate-nightly --time '$time' is not HH:MM"; exit 2 ;; esac
+case $repo in *[!A-Za-z0-9._/+-]*) echo "RESULT: ERROR gate-nightly path '$repo' has a character outside [A-Za-z0-9._/+-] (it goes into a systemd unit)"; exit 2 ;; esac
+
+if [ "$cmd" = install ]; then
+	# the unit bakes in this checkout's path: a ticket worktree is deleted later and the timer would fire into nothing (review gate-l2-r1 F1)
+	mainclone=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && mainclone=$(dirname "$mainclone")
+	[ "$mainclone" = "$repo" ] || { echo "RESULT: ERROR gate-nightly install must run from the main clone ($mainclone), not from $repo: the unit would point into a worktree that gets deleted"; exit 2; }
+	svc="[Unit]
+Description=PixOS nightly formal gate on trunk (T-db59; tools/gate-nightly)
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $repo/tools/gate-nightly run"
+	tmr="[Unit]
+Description=PixOS nightly formal gate on trunk, daily $time
+[Timer]
+OnCalendar=*-*-* $time:00
+Persistent=true
+[Install]
+WantedBy=timers.target"
+	if [ $printonly = 1 ]; then printf '# pixos-gate-nightly.service\n%s\n# pixos-gate-nightly.timer\n%s\n' "$svc" "$tmr"; echo "RESULT: PASS gate-nightly install print time=$time"; exit 0; fi
+	d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+	mkdir -p "$d" && printf '%s\n' "$svc" >"$d/pixos-gate-nightly.service" && printf '%s\n' "$tmr" >"$d/pixos-gate-nightly.timer" || { echo "RESULT: ERROR gate-nightly cannot write $d"; exit 2; }
+	systemctl --user daemon-reload && systemctl --user enable --now pixos-gate-nightly.timer || { echo "RESULT: ERROR gate-nightly systemctl --user failed (units written to $d)"; exit 2; }
+	systemctl --user list-timers pixos-gate-nightly.timer --no-pager | head -3
+	echo "gate-nightly: the timer runs only while you are logged in unless lingering is on; as root once: loginctl enable-linger $USER (check: loginctl show-user $USER -p Linger)"
+	echo "RESULT: PASS gate-nightly installed time=$time units=$d"; exit 0
+fi
+
+main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "RESULT: ERROR gate-nightly $repo is not a git checkout"; exit 2; }
+main=$(dirname "$main")
+git -C "$repo" rev-parse -q --verify refs/heads/trunk >/dev/null || { echo "RESULT: FAIL gate-nightly no local trunk branch in $main (nothing to gate)"; exit 1; }
+sha=$(git -C "$repo" rev-parse trunk)
+wt=${GATE_NIGHTLY_WT:-${WORKTREE_ROOT:-$HOME/.t3/worktrees}/gate-nightly}
+label=nightly-$date
+if [ "$cold" = auto ]; then if [ "$(date -d "$date" +%u)" = 7 ]; then cold=yes; else cold=no; fi; fi
+if [ "${GATE_DRY:-}" = 1 ]; then
+	[ -d "$wt" ] && echo "git -C $wt checkout -q --detach $sha" || echo "$here/worktree-new gate-nightly-wt --dir $wt --base $sha"
+	echo "cd $wt && GATE_DRY=1 tools/gate --formal --label $label"
+	[ "$cold" = yes ] && echo "cd $wt && tools/gate --cold --label nightly-cold-$date"
+	echo "RESULT: PASS gate-nightly dry-run label=$label sha=${sha:0:12} cold=$cold"; exit 0
+fi
+if [ -d "$wt" ]; then
+	dirty=$(git -C "$wt" status --porcelain --untracked-files=no 2>&1) || { echo "RESULT: ERROR gate-nightly git status failed in $wt: $dirty"; exit 2; }
+	[ -z "$dirty" ] || { printf '%s\n' "$dirty" | head -5; echo "RESULT: FAIL gate-nightly $wt has tracked changes (listed above): no nightly gate started; clean it or remove the worktree"; exit 1; }
+	git -C "$wt" checkout -q --detach "$sha" || { echo "RESULT: FAIL gate-nightly checkout of $sha in $wt failed"; exit 1; }
+else
+	out=$("$here/worktree-new" gate-nightly-wt --dir "$wt" --base "$sha" 2>&1) || { printf '%s\n' "$out" | tail -5; echo "RESULT: FAIL gate-nightly tools/worktree-new could not create $wt"; exit 1; }
+fi
+# the host gate lock serializes the formal and the cold gate; a queued detached gate must wait for it (heavy-job's default wait is shorter than a formal gate)
+export HEAVY_JOB_WAIT=${HEAVY_JOB_WAIT:-7200}
+echo "gate-nightly: trunk ${sha:0:12} in $wt, label $label, cold=$cold"
+cd "$wt" || exit 2
+tools/gate --formal --label "$label"; rc=$?
+if [ $rc -eq 0 ] && [ "$cold" = yes ]; then
+	# tools/gate --cold never removes its worktree/branch/tmp dirs: drop the earlier weekly ones first (only the nightly-cold-* prefix; review gate-l2-r1 F2)
+	for w in $(git -C "$wt" worktree list --porcelain | sed -n 's|^worktree \(.*/cold-nightly-cold-[0-9-]*\)$|\1|p'); do
+		git -C "$wt" worktree remove --force "$w" && git -C "$wt" branch -D "$(basename "$w")" >/dev/null 2>&1; echo "gate-nightly: pruned old cold worktree $w"
+	done
+	find "${GATE_COLD_TMP:-/tmp}" -maxdepth 1 \( -name 'pixos-cold-mut.*' -o -name 'pixos-cold-memo.*' \) -mtime +5 -exec rm -rf -- {} + 2>/dev/null
+	tools/gate --cold --label "nightly-cold-$date"; rc=$?
+fi
+[ $rc -eq 0 ] && echo "RESULT: PASS gate-nightly launched label=$label sha=${sha:0:12} cold=$cold" || echo "RESULT: FAIL gate-nightly launch rc=$rc label=$label"
+exit $rc

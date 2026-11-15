@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# usbroot-service-install: install usbroot-host.py as a systemd service, ONCE (needs root); idempotent.
+# Usage: sudo tools/usbroot-service-install [--dry-run | --uninstall | --emit-unit FILE]
+#   --dry-run       print unit, env file, sudoers text and the actions; change nothing (works without root)
+#   --uninstall     stop, disable, remove unit + sudoers (keeps /etc/usbroot-host.env and logs)
+#   --emit-unit F   write only the unit text to F (for systemd-analyze verify); no root needed
+# Privileges (read from tools/usbroot-host.py): only CAP_NET_RAW for the AF_PACKET socket (lines 397, 532, 619), read-only
+# open of the image (line 91), read of /sys/class/net (lines 380, 387). The block cache (BlockCache) only holds read bytes in memory. No interface config, no /dev, no writes.
+# So the service runs as the repo owner with AmbientCapabilities=CAP_NET_RAW only; no root process at all.
+# The interface appears/disappears with the phone; the host script rebinds itself (usbroot-host.py:427-520), so
+# the service keeps running across phone reboots. Restart=always covers a crash.
+# Exit: 0 PASS, 1 FAIL, 2 usage/precondition.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -u
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+svc=usbroot-host
+unit=/etc/systemd/system/$svc.service
+envf=/etc/$svc.env
+sudoers=/etc/sudoers.d/$svc
+user=$(stat -c %U "$root")
+log=$root/logs/usbroot-host-service.log
+default_img=/tank/pixelios/ios-root4-inj6.img
+mode=install
+emit=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) mode=dry ;;
+    --uninstall) mode=uninstall ;;
+    --emit-unit) mode=emit; emit=${2:-}; [ -n "$emit" ] || { echo "RESULT: FAIL --emit-unit needs a file"; exit 2; }; shift ;;
+    *) echo "RESULT: FAIL unknown option $1 (usage: usbroot-service-install [--dry-run|--uninstall|--emit-unit FILE])"; exit 2 ;;
+  esac
+  shift
+done
+
+unit_text() {
+  cat <<UNIT
+[Unit]
+Description=PixOS USB-root block server (usbroot-host.py, raw EtherType 0x88B6)
+After=network.target
+
+[Service]
+Type=simple
+User=$user
+EnvironmentFile=$envf
+# stdout/stderr go to journald (StandardOutput) and, via tee, to the log file the no-root status tool reads.
+ExecStart=/usr/bin/bash -c 'exec python3 -u $root/tools/usbroot-host.py "\$\$IMG" --max-seconds 0 > >(tee -a $log) 2>&1'
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=$root/logs
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_PACKET AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$svc
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+env_text() { printf '# Root image served by usbroot-host.service. Edit freely (owned by %s), then: sudo systemctl restart %s\nIMG=%s\n' "$user" "$svc" "$default_img"; }
+sudoers_text() {
+  printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart %s, /usr/bin/systemctl start %s, /usr/bin/systemctl stop %s, /usr/bin/systemctl status %s\n' \
+    "$user" "$svc" "$svc" "$svc" "$svc"
+}
+
+if [ "$mode" = emit ]; then unit_text > "$emit"; echo "RESULT: PASS unit written to $emit"; exit 0; fi
+
+if [ "$mode" = dry ]; then
+  echo "== $unit =="; unit_text
+  echo "== $envf (created only if missing) =="; env_text
+  echo "== $sudoers (validated with visudo -cf before install) =="; sudoers_text
+  echo "== actions =="
+  echo "mkdir -p $root/logs; touch $log; chown $user $log"
+  echo "stop $svc if running; SIGTERM/SIGKILL stale sudo/python usbroot-host.py processes"
+  echo "install unit, env file (chown $user), sudoers (0440); systemctl daemon-reload; systemctl enable --now $svc; restart if it was running"
+  [ -f "$root/tools/usbroot-host.py" ] || echo "WARNING: $root/tools/usbroot-host.py missing"
+  [ -f "$default_img" ] || echo "WARNING: default image $default_img not found"
+  echo "RESULT: PASS dry-run (nothing changed)"; exit 0
+fi
+
+if [ "$(id -u)" != 0 ]; then
+  echo "usbroot-service-install must run as root. Run:"
+  echo "  sudo $root/tools/usbroot-service-install"
+  echo "RESULT: FAIL not root"; exit 2
+fi
+
+if [ "$mode" = uninstall ]; then
+  systemctl disable --now "$svc" 2>/dev/null
+  rm -f "$unit" "$sudoers"
+  systemctl daemon-reload
+  echo "kept $envf and $log"
+  echo "RESULT: PASS uninstalled"; exit 0
+fi
+
+[ -f "$root/tools/usbroot-host.py" ] || { echo "RESULT: FAIL $root/tools/usbroot-host.py missing"; exit 2; }
+command -v visudo >/dev/null || { echo "RESULT: FAIL visudo not found (refusing to install sudoers unchecked)"; exit 2; }
+tmp=$(mktemp) || exit 2
+trap 'rm -f "$tmp"' EXIT
+sudoers_text > "$tmp"
+visudo -cf "$tmp" >/dev/null || { echo "RESULT: FAIL sudoers snippet rejected by visudo"; exit 1; }
+
+mkdir -p "$root/logs"; touch "$log"; chown "$user" "$log"
+was_active=0
+systemctl is-active --quiet "$svc" && was_active=1
+systemctl stop "$svc" 2>/dev/null
+
+# Stale hand-started servers (same filter as usbroot-serve): only sudo/python processes. [u] keeps pgrep from matching itself.
+pids=()
+while read -r p; do
+  [ "$p" = "$$" ] && continue
+  case $(cat "/proc/$p/comm" 2>/dev/null) in sudo|python3|python) pids+=("$p") ;; esac
+done < <(pgrep -f '[u]sbroot-host\.py')
+if [ "${#pids[@]}" -gt 0 ]; then
+  kill -TERM "${pids[@]}" 2>/dev/null
+  sleep 2
+  for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null; echo "stale server stopped: $p"; done
+fi
+
+if [ ! -f "$envf" ]; then env_text > "$envf"; chown "$user" "$envf"; chmod 644 "$envf"; fi
+unit_text > "$unit"; chmod 644 "$unit"
+install -m 0440 -o root -g root "$tmp" "$sudoers"
+systemctl daemon-reload
+systemctl enable --now "$svc"
+[ "$was_active" = 1 ] && systemctl restart "$svc"
+sleep 2
+if systemctl is-active --quiet "$svc"; then
+  echo "RESULT: PASS $svc installed, enabled and active; status: $root/tools/usbroot-status"; exit 0
+fi
+echo "RESULT: FAIL $svc not active (systemctl status $svc)"; exit 1

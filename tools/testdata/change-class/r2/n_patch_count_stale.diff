@@ -1,0 +1,11 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+--- a/xnu/patches/0300-x.patch
++++ b/xnu/patches/0300-x.patch
+@@ -5,7 +5,8 @@
+  {
+  	ctx_a();
+  	ctx_b();
+ +	write32(0x1000, 1);
+++	printf("y");
+  	ctx_c();
+  	return 0;

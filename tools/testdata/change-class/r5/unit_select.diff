@@ -1,0 +1,7 @@
+diff --git a/tools/unit_select.py b/tools/unit_select.py
+--- a/tools/unit_select.py
++++ b/tools/unit_select.py
+@@ -1,2 +1,3 @@
+ import os
++x = 1
+ import re

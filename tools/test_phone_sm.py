@@ -7,10 +7,8 @@ binaries in a temporary directory prepended to PATH.
 
 from importlib.machinery import SourceFileLoader
 import importlib.util
-import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +23,11 @@ _spec = importlib.util.spec_from_loader("phone", SourceFileLoader("phone", PHONE
 phone = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(phone)
 
+# Import the shared fakes (tools/sim/fakephone.py)
+_fspec = importlib.util.spec_from_file_location("fakephone", os.path.join(REPO_ROOT, "tools", "sim", "fakephone.py"))
+fakephone = importlib.util.module_from_spec(_fspec)
+_fspec.loader.exec_module(fakephone)
+
 
 class PhoneStateMachineTest(unittest.TestCase):
     def setUp(self):
@@ -32,12 +35,13 @@ class PhoneStateMachineTest(unittest.TestCase):
         self.bin_dir = os.path.join(self.test_dir, "bin")
         os.makedirs(self.bin_dir, exist_ok=True)
 
-        self.state_file = os.path.join(self.test_dir, "state.json")
-        self.adb_log = os.path.join(self.test_dir, "adb.log")
-        self.fastboot_log = os.path.join(self.test_dir, "fastboot.log")
-
-        self.set_state({"state": "fastboot", "product": "bluejay"})
-        self._create_mock_binaries()
+        # SIM-1: the fakes live in tools/sim/fakephone.py; serial kept as the marker the tests assert never reaches the output
+        self.fake = fakephone.FakePhone(self.test_dir, serial="SECRET_SERIAL123")
+        self.fake.write_shims(self.bin_dir)
+        self.state_file = self.fake.state_file
+        self.adb_log = self.fake.adb_log
+        self.fastboot_log = self.fake.fastboot_log
+        self.reset_log = self.fake.reset_log
 
         self.orig_path = os.environ.get("PATH", "")
 
@@ -56,147 +60,31 @@ class PhoneStateMachineTest(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def set_state(self, state_dict):
-        with open(self.state_file, "w") as f:
-            json.dump(state_dict, f)
+        self.fake.set_state(state_dict)
+
+    def flip_after_probes(self, n, state_dict):
+        self.fake.flip_after_probes(n, state_dict)
+
+    def flip_on_reset(self, state_dict):
+        self.fake.flip_on_reset(state_dict)
 
     def get_state(self):
-        with open(self.state_file, "r") as f:
-            return json.load(f)
+        return self.fake.get_state()
 
-    def _create_mock_binaries(self):
-        # mock ping
-        ping_src = f"""#!/bin/bash
-state_file="{self.state_file}"
-st=$(grep -o '"state": "[^"]*"' "$state_file" | cut -d'"' -f4)
-if [ "$st" = "ios" ]; then
-    echo "PING 192.168.7.2 (192.168.7.2) 56(84) bytes of data."
-    echo "64 bytes from 192.168.7.2: icmp_seq=1 ttl=64 time=1.0 ms"
-    exit 0
-else
-    exit 1
-fi
-"""
-        self._write_executable("ping", ping_src)
-
-        # mock lsusb
-        lsusb_src = f"""#!/bin/bash
-state_file="{self.state_file}"
-st=$(grep -o '"state": "[^"]*"' "$state_file" | cut -d'"' -f4)
-case "$st" in
-    fastboot)
-        echo "Bus 001 Device 005: ID 18d1:4ee0 Google Inc. Nexus/Pixel (fastboot)" ;;
-    recovery)
-        echo "Bus 001 Device 005: ID 18d1:d001 Google Inc. Nexus/Pixel (recovery)" ;;
-    android|booting)
-        echo "Bus 001 Device 005: ID 18d1:4ee2 Google Inc. Nexus/Pixel (debug)" ;;
-    ios)
-        echo "Bus 001 Device 005: ID 1209:0001 Generic USB Ethernet" ;;
-    shim-probe)
-        echo "Bus 001 Device 005: ID 1209:0001 Generic CDC-ACM" ;;
-    hung)
-        echo "Bus 001 Device 005: ID 18d1:4ee2 Google Inc. Nexus/Pixel" ;;
-    other-device)
-        echo "Bus 001 Device 005: ID 18d1:4ee2 Google Inc. Nexus/Pixel" ;;
-    absent)
-        exit 0 ;;
-    *)
-        exit 0 ;;
-esac
-"""
-        self._write_executable("lsusb", lsusb_src)
-
-        # mock ip
-        ip_src = f"""#!/bin/bash
-state_file="{self.state_file}"
-st=$(grep -o '"state": "[^"]*"' "$state_file" | cut -d'"' -f4)
-if [ "$st" = "ios" ]; then
-    echo "2: usb0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 link/ether 02:00:5e:77:ee:01 brd ff:ff:ff:ff:ff:ff"
-else
-    echo "1: lo: <LOOPBACK,UP,LOWER_UP> link/loopback 00:00:00:00:00:00"
-fi
-"""
-        self._write_executable("ip", ip_src)
-
-        # mock adb
-        adb_src = f"""#!/bin/bash
-state_file="{self.state_file}"
-echo "$@" >> "{self.adb_log}"
-st=$(grep -o '"state": "[^"]*"' "$state_file" | cut -d'"' -f4)
-prod=$(grep -o '"product": "[^"]*"' "$state_file" | cut -d'"' -f4)
-[ -n "$prod" ] || prod="bluejay"
-
-case "$*" in
-    "devices")
-        echo "List of devices attached"
-        case "$st" in
-            recovery) echo -e "SECRET_SERIAL123\\trecovery" ;;
-            android|booting|other-device) echo -e "SECRET_SERIAL123\\tdevice" ;;
-        esac
-        ;;
-    "get-state")
-        case "$st" in
-            recovery) echo "recovery" ;;
-            android|booting|other-device) echo "device" ;;
-            *) exit 1 ;;
-        esac
-        ;;
-    *"getprop ro.product.device"*)
-        echo "$prod"
-        ;;
-    *"getprop sys.boot_completed"*)
-        if [ "$st" = "android" ]; then echo "1"; else echo "0"; fi
-        ;;
-    *"reboot bootloader"*)
-        # simulate transition
-        python3 -c "import json; p='{self.state_file}'; d=json.load(open(p)); d['state']='fastboot'; json.dump(d, open(p, 'w'))"
-        exit 0
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-"""
-        self._write_executable("adb", adb_src)
-
-        # mock fastboot
-        fastboot_src = f"""#!/bin/bash
-state_file="{self.state_file}"
-echo "$@" >> "{self.fastboot_log}"
-st=$(grep -o '"state": "[^"]*"' "$state_file" | cut -d'"' -f4)
-prod=$(grep -o '"product": "[^"]*"' "$state_file" | cut -d'"' -f4)
-[ -n "$prod" ] || prod="bluejay"
-
-case "$*" in
-    "devices")
-        if [ "$st" = "fastboot" ]; then
-            echo -e "SECRET_SERIAL123\\tfastboot"
-        fi
-        ;;
-    *"getvar product"*)
-        echo "product: $prod" >&2
-        ;;
-    "reboot")
-        python3 -c "import json; p='{self.state_file}'; d=json.load(open(p)); d['state']='android'; json.dump(d, open(p, 'w'))"
-        exit 0
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-"""
-        self._write_executable("fastboot", fastboot_src)
-
-        # fake sweet-reset-bl (AP-55): the real one sends UDP SWEET-RESET-BL to 192.168.7.2:5141 and resets a live phone run
-        self.reset_log = os.path.join(self.test_dir, "reset-bl.log")
-        self._write_executable("fake-sweet-reset-bl", f"#!/bin/bash\necho called >> \"{self.reset_log}\"\nexit 0\n")
-
-    def _write_executable(self, name, content):
-        path = os.path.join(self.bin_dir, name)
-        with open(path, "w") as f:
-            f.write(content)
-        st = os.stat(path)
-        os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        return path
+    def run_phone_until(self, args, marker, state_dict, timeout=60):
+        """Run tools/phone; when a stdout line contains marker, set the fake state to state_dict (the user acted after the prompt). Returns (returncode, stdout)."""
+        p = subprocess.Popen([PHONE_TOOL] + list(args), env=self.env, stdout=subprocess.PIPE, text=True)
+        lines = []
+        t0 = time.time()
+        for line in p.stdout:
+            lines.append(line)
+            if marker in line:
+                self.set_state(state_dict)
+            if time.time() - t0 > timeout:
+                p.kill()
+                break
+        p.wait()
+        return p.returncode, "".join(lines)
 
     def run_phone(self, *args, timeout=30):
         cmd = [PHONE_TOOL] + list(args)
@@ -223,33 +111,20 @@ esac
     def test_03_absent_then_recovery_to_fastboot(self):
         self.set_state({"state": "absent", "product": "bluejay"})
 
-        # Background thread to change state to recovery after 1 second
-        import threading
-        def delayed_appear():
-            time.sleep(1.0)
-            self.set_state({"state": "recovery", "product": "bluejay"})
-        th = threading.Thread(target=delayed_appear)
-        th.start()
+        self.flip_after_probes(3, {"state": "recovery", "product": "bluejay"})   # absent for the first 3 probes, then the phone appears
 
         res = self.run_phone("goto", "fastboot", "--timeout", "10")
-        th.join()
         self.assertEqual(res.returncode, 0)
         self.assertIn("RESULT: PASS state=fastboot target=fastboot", res.stdout)
 
-    # 4. ios -> fastboot via self-reset (state changes after N s)
+    # 4. ios -> fastboot via self-reset (state changes after the first probe)
     def test_04_ios_to_fastboot_self_reset(self):
         self.set_state({"state": "ios", "product": "bluejay"})
-        self.env["PHONE_BOUND_SCALE"] = "0.1"	# the ios wait bound is 90 s: 9 s here, the fake resets after 1 s
+        self.env["PHONE_BOUND_SCALE"] = "0.1"	# the ios wait bound is 90 s: 9 s here
 
-        import threading
-        def delayed_reset():
-            time.sleep(1.0)
-            self.set_state({"state": "recovery", "product": "bluejay"})
-        th = threading.Thread(target=delayed_reset)
-        th.start()
+        self.flip_on_reset({"state": "recovery", "product": "bluejay"})   # the phone comes back once tools/phone asked for the reset
 
         res = self.run_phone("goto", "fastboot", "--timeout", "15")
-        th.join()
         self.assertEqual(res.returncode, 0)
         self.assertIn("RESULT: PASS state=fastboot target=fastboot", res.stdout)
         self.assertIn("USBNET: sudo sh -c", res.stdout)
@@ -264,23 +139,36 @@ esac
         self.assertEqual(res.returncode, 2)
         self.assertIn("RESULT: ERROR", res.stdout)
 
+    # 4b. ios -> reset command -> absent for a while -> recovery -> fastboot: no button prompt while the phone is still off the bus
+    def test_04b_ios_reset_absent_then_recovery(self):
+        self.set_state({"state": "ios", "product": "bluejay"})
+        self.flip_on_reset({"state": "absent", "product": "bluejay"})	# the reset takes the phone off the bus (review boot-dev-merge F1)
+        self.env["PHONE_BOUND_SCALE"] = "0.1"	# wait bound 150 s -> 15 s; absent for 4 s (the old 1 s absent bound prompted at once)
+
+        import threading
+        def late_recovery():
+            time.sleep(4.0)
+            self.set_state({"state": "recovery", "product": "bluejay"})
+        th = threading.Thread(target=late_recovery)
+        th.start()
+        res = self.run_phone("goto", "fastboot", "--timeout", "30")
+        th.join()
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("RESULT: PASS state=fastboot target=fastboot", res.stdout)
+        self.assertNotIn("NEED USER", res.stdout)
+        with open(self.reset_log) as f:
+            calls = f.read().split()
+            self.assertEqual(calls, ["called"])	# the mock, never the real UDP sender; sent once: absent is a wait-only step, no reset loop
+
     # 5. hung -> NEED USER line then success after fake state changes
     def test_05_hung_need_user_and_recover(self):
         self.set_state({"state": "hung", "product": "bluejay"})
-        self.env["PHONE_BOUND_SCALE"] = "0.1"	# the hung bound is 10 s: 1 s here; the fake recovers after 3.5 s, so the prompt must have appeared
+        self.env["PHONE_BOUND_SCALE"] = "0.1"	# the hung bound is 10 s: 1 s here; the fake recovers when the prompt line is seen
 
-        import threading
-        def delayed_user_action():
-            time.sleep(3.5)
-            self.set_state({"state": "fastboot", "product": "bluejay"})
-        th = threading.Thread(target=delayed_user_action)
-        th.start()
-
-        res = self.run_phone("goto", "fastboot", "--timeout", "10")
-        th.join()
-        self.assertEqual(res.returncode, 0)
-        self.assertIn("NEED USER: hold Power+VolDown", res.stdout)
-        self.assertIn("RESULT: PASS state=fastboot target=fastboot", res.stdout)
+        rc, out = self.run_phone_until(["goto", "fastboot", "--timeout", "10"], "NEED USER: hold Power+VolDown", {"state": "fastboot", "product": "bluejay"})   # the user acts once the prompt is printed
+        self.assertEqual(rc, 0)
+        self.assertIn("NEED USER: hold Power+VolDown", out)
+        self.assertIn("RESULT: PASS state=fastboot target=fastboot", out)
 
     # 6. other-device refusal with ZERO adb/fastboot invocations afterwards
     def test_06_other_device_refusal_zero_commands(self):
@@ -293,6 +181,8 @@ esac
         res = self.run_phone("goto", "fastboot", "--timeout", "5")
         self.assertEqual(res.returncode, 1)
         self.assertIn("RESULT: FAIL state=other-device target=fastboot steps=0", res.stdout)
+        # the refusal's own message (tools/phone:587): without it a removed refusal would still end in the same RESULT line through the "unknown transition" layer (docs/reviews/sim-1-r1.md mutant D)
+        self.assertIn("Safety: other-device detected; refusing commands", res.stdout)
 
         # Check no reboot / mutation commands were sent
         if os.path.exists(self.adb_log):
@@ -368,6 +258,84 @@ esac
         if os.path.exists(self.adb_log):
             with open(self.adb_log) as f:
                 self.assertNotIn("reboot bootloader", f.read())
+
+    # 12. docs/reviews/sim-1-r1.md mutants A-D, F: tools/phone's other-device refusal is layered (observe_state, the goto refusals :587/:619, verify_bluejay_target, the unknown-transition table);
+    # test_06 only reaches the first layers, so these two tests pin the rest.
+    def _logs(self):
+        out = {}
+        for name, path in (("adb", self.adb_log), ("fastboot", self.fastboot_log)):
+            out[name] = ""
+            if os.path.exists(path):
+                with open(path) as f:
+                    out[name] = f.read()
+        return out
+
+    def _stub_phone_state(self, line):
+        """PHONE_STATE_BIN (tools/phone) answers `line` whatever the fake says (until the reboot): observe_state is made to see exactly that state."""
+        stub = os.path.join(self.bin_dir, "stub-phone-state")
+        with open(stub, "w") as f:
+            # until the fake adb has logged a `reboot bootloader`; afterwards the real tools/phone-state (on the fakes) takes over, so the run can end
+            f.write("#!/bin/bash\ngrep -qs 'reboot bootloader' '%s' && exec '%s'\necho '%s'\n" % (self.adb_log, os.path.join(REPO_ROOT, "tools", "phone-state"), line))
+        os.chmod(stub, 0o755)
+        self.env["PHONE_STATE_BIN"] = stub
+
+    def test_12a_android_goto_fastboot_sends_exactly_adb_reboot_bootloader(self):
+        # mutant C: the android -> fastboot step sends `fastboot reboot` (tools/phone:105) instead of `adb reboot bootloader`.
+        # The stub forces observe_state to `android`: with the fake alone the state reads `booting` (its combined getprop answer has no boot_completed), a different table row.
+        self.set_state({"state": "android", "product": "bluejay"})
+        self._stub_phone_state("RESULT: PASS state=android product=bluejay")
+        res = self.run_phone("goto", "fastboot", "--timeout", "10")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("RESULT: PASS state=fastboot target=fastboot steps=1", res.stdout)
+        logs = self._logs()
+        self.assertEqual([l for l in logs["adb"].splitlines() if "reboot" in l], ["reboot bootloader"])
+        self.assertNotIn("reboot", logs["fastboot"])
+
+    def test_12b_android_view_but_other_product_is_refused_before_any_reboot(self):
+        # mutants A, B, F: observe_state is made to say android/bluejay (a phone-state stub: the state changed between the observation and the command),
+        # while the device answers product `sweet` to the verify getprop. Only verify_bluejay_target in safe_device_cmd stands between the tool and `adb reboot bootloader`.
+        self.set_state({"state": "android", "product": "sweet"})
+        self._stub_phone_state("RESULT: PASS state=android product=bluejay")
+        res = self.run_phone("goto", "fastboot", "--timeout", "5")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("Device is not bluejay", res.stdout)
+        self.assertRegex(res.stdout, r"RESULT: FAIL state=other-device target=fastboot steps=1")
+        logs = self._logs()
+        self.assertIn("getprop ro.product.device", logs["adb"])   # the verify ran (so this test cannot pass without reaching the layer it pins)
+        self.assertNotIn("reboot", logs["adb"])
+        self.assertNotIn("reboot", logs["fastboot"])
+        self.assertNotIn("SECRET_SERIAL123", res.stdout)
+
+    # 13. 2026-11-09 gputest-cache1 park: right after the UDP reset the phone listed in recovery before adbd answered getprop; phone-state
+    # reported OTHER-DEVICE and goto refused at once. An unreadable product is `unverified`: no command, re-observe, then go on.
+    def _stub_unverified(self, n):
+        cnt = os.path.join(self.bin_dir, "unverified.count")
+        stub = os.path.join(self.bin_dir, "stub-phone-state-unverified")
+        with open(stub, "w") as f:
+            f.write("#!/bin/bash\nc=$(cat '%s' 2>/dev/null || echo 0); echo $((c+1)) > '%s'\n"
+                    "if [ \"$c\" -lt %d ]; then echo 'adb recovery: getprop gave no product yet (adbd starting?)'; echo 'RESULT: ERROR state=unknown product=unknown'; exit 2; fi\n"
+                    "exec '%s'\n" % (cnt, cnt, n, os.path.join(REPO_ROOT, "tools", "phone-state")))
+        os.chmod(stub, 0o755)
+        self.env["PHONE_STATE_BIN"] = stub
+
+    def test_13a_unverified_recovery_waits_then_reboots_to_fastboot(self):
+        self.set_state({"state": "recovery", "product": "bluejay"})
+        self._stub_unverified(3)
+        res = self.run_phone("goto", "fastboot", "--timeout", "30")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("RESULT: PASS state=fastboot target=fastboot steps=1", res.stdout)
+        self.assertEqual([l for l in self._logs()["adb"].splitlines() if "reboot" in l], ["reboot bootloader"])
+
+    def test_13b_never_verified_is_refused_without_any_command(self):
+        self.set_state({"state": "recovery", "product": "bluejay"})
+        self._stub_unverified(10 ** 6)
+        self.env["PHONE_BOUND_SCALE"] = "0.1"   # the 30 s settle: 3 s here
+        res = self.run_phone("goto", "fastboot", "--timeout", "20")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("never verified as bluejay", res.stdout)
+        logs = self._logs()
+        self.assertNotIn("reboot", logs["adb"])
+        self.assertNotIn("reboot", logs["fastboot"])
 
 
 if __name__ == "__main__":

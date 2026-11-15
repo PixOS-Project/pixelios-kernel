@@ -1,0 +1,39 @@
+{
+ "_doc": "Boot profiles of tools/resident (copy to $RESIDENT_DIR/profiles.json, fill the overlay paths; the real file is never tracked). Keys: intent (xrun --intent or null), xrun (extra xrun flags), args (boot-args), names (more sweetnull= program names; devd is always added), overlay (a tree with System/Library/xpc/launchd.plist; devd is staged into a copy), launchd_base (a plist when the overlay has none), ready (regexes the boot log must show before jobs start: the GPU boot nav unlocks the phone, hot navs need that; missing after ready_s = GAP), ready_s. A job picks one with --profile NAME, or --profile any (default: runs on whatever boot is up; a fresh session boots default_profile).",
+ "plain": {
+  "intent": null,
+  "xrun": [
+   "--cpus",
+   "8"
+  ],
+  "args": "sweetusb3=1 sweetbt=1 sweetbtkeepbaud=1 sweetbtpatchram=1 sweetbtlefeat=1 sweetcpuwatch=launchd,mediaserverd,bluetoothd",
+  "names": "bluetoothd,BlueTool,pixos-bluetool,bt-client,BTApp,btapp-launch,bt-logread",
+  "overlay": "<the BT overlay tree>"
+ },
+ "gpu": {
+  "intent": "gpu",
+  "xrun": [
+   "--compress"
+  ],
+  "args": "sweetnav=1",
+  "names": "",
+  "overlay": "<the GPU overlay tree: libsweetgl + fcapctl>",
+  "ready": [
+   "SWEET NAV: done"
+  ],
+  "ready_s": 600
+ },
+ "wlan": {
+  "intent": "wlan",
+  "xrun": [
+   "--wlan-hold",
+   "--wlan-level",
+   "2",
+   "--wlanfw",
+   "<wlanfw.bin>"
+  ],
+  "args": "<the Wi-Fi boot-args>",
+  "names": "",
+  "overlay": "<the Wi-Fi overlay tree>"
+ }
+}

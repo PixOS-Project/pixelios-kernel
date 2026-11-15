@@ -1,0 +1,8 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,6 +1,8 @@
+ static void f(uintptr_t base)
+ {
++	log_put_txt((char *)base, 64, 0, "x");
+ }

@@ -1,0 +1,358 @@
+SWEET Bluetooth: full-sequence replay probe + 0x200b status rewrite knob + full tx dump (patch 0217, ticket T-4c2c, W-BTUP; boot-arg sweetbtleprobe=2 gates the replay, sweetbtrw200b=1 the rewrite, default behaviour unchanged, sweetbtleprobe=1 unchanged). bt-up5 [obs 20261104T054627Z-bt-up5]: the 0216 matrix got 0x2007/0x200b status 0 after every LE command bluetoothd sends, yet bluetoothd's own run got 0x2007 status 0x0c at its command position 49 (right after vendor 0xfd48, decode of merged.log lines 1762-2046) and 0x200b status 0x0c at position ~67, then exits. The flip therefore sits in positions 21-48 (classic setup 0c33..0c52, 0c24/0c47/0c1c, vendor fd3c fce9 fce2 fd48). The replay (sweetbtleprobe=2) sends bluetoothd's commands 1..48 in order (byte for byte from the trace except the two payloads the trace cut at 24 bytes, 0c13 name and 0c52 EIR: visible prefix + zeros, announced by a `payload truncated` row) after the baud-probe Reset and sends the read-only 0x2007 after every step; the first status != 0 logs `BT PROBE: first-disallowed-after=<pos> op=<op>`, with two witnesses at the flip (bluetoothd's 0x200b, LE Set Scan Enable OFF once; never an enable). If no step flips, it asks 0x200b after the last step and again after a 25 s wait (timing hypothesis). sbu_cmd now takes payloads up to 255 bytes (was 8). Every replayed opcode was sent byte-exact to this ROM by bluetoothd itself in bt-up5 (fd3c/fce9/fce2/0c13/0c52 also in bt-up4; the fd48 payload differs per instance and the ROM answers 0x01; Opus review T-4c2c #3): volatile controller RAM state, cleared by the REG_ON power-cycle that follows the probe (same path as 0216). sweetbtrw200b=1: the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b is rewritten from 0x0c to 0x00, one `BT GAP:` row per rewrite (diagnostic knob that scores bluetoothd's alive_s and names its next exit cause, not a fix; the chip still refused the command; no register store; the HCI trace shows the chip's real bytes). The HCI trace now dumps host->chip packets longer than 24 bytes in full as `BT HCI: tx data@<offset>:` rows (<= 262 bytes), so the next replay is byte-exact (this dump also runs on every sweetbt=1 boot: log rows only, a third knob vs bt-up5). The rewrite parser resets its framing after an rx error and switches itself off on an ACL/SCO/ISO packet type (review T-4c2c #4). Applies after 0189, 0213, 0215 and 0216. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -485,6 +485,20 @@ sbu_trace(const char *dir, const uint8_t *p, size_t len)
+ 	}
+ 	hex[3 * k] = 0;
+ 	printf("BT HCI: %s %zu bytes: %s%s\n", dir, len, hex, len > k ? "..." : "");
++	/* patch 0217 (T-4c2c): bt-up5 [obs] cut 0c13 (252 B), 0c52 (245 B) and the long vendor commands at 24 bytes, so they could not be replayed byte-exact. A host->chip packet
++	 * (tx, at most 262 bytes: 4 header + 255 payload + margin) is dumped in full as continuation rows `BT HCI: tx data@<offset>:` (48 bytes each); rx stays at 24 bytes. */
++	if (len > k && dir[0] == 't' && len <= 262) {
++		for (size_t off = k; off < len; off += 48) {
++			char row[48 * 3 + 1];
++			size_t m = len - off < 48 ? len - off : 48;
++
++			for (size_t i = 0; i < m; i++) {
++				snprintf(row + 3 * i, 4, "%02x ", p[off + i]);
++			}
++			row[3 * m] = 0;
++			printf("BT HCI: tx data@%zu: %s\n", off, row);
++		}
++	}
+ }
+ 
+ /* ---- the sweet_bt_ops ---- */
+@@ -613,17 +627,15 @@ sbu_probe_one(const struct sbu_cand *c)
+ #define SBU_CMD_MS      500
+ #define SBU_PM_SUPP     72      /* Read Local Supported Commands returns status + 64 octets */
+ 
++/* caller guarantees par holds plen bytes (patch 0217: plen is any uint8_t, the old plen > 8 guard is gone) */
+ static int
+ sbu_cmd(uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *st, uint8_t *rp, size_t rpmax, size_t *rpn)
+ {
+-	uint8_t pkt[4 + 8], buf[280];
++	uint8_t pkt[4 + 255], buf[280];      /* patch 0217: payload up to the H4 maximum 255 (was 8) so bluetoothd's 245/248-byte commands can be replayed */
+ 	size_t n = 0;
+ 	int e;
+ 
+ 	*rpn = 0;
+-	if (plen > 8) {
+-		return EINVAL;
+-	}
+ 	{       /* bytes nobody asked for (a late event of the previous step) must not be silently eaten: log them (rule 8, review T-0c77 M3) */
+ 		unsigned stale = 0;
+ 
+@@ -816,6 +828,254 @@ sbu_le_probe(void)
+ 	}
+ }
+ 
++/*
++ * patch 0217 (T-4c2c, W-BTUP), boot-arg sweetbtleprobe=2: full-sequence replay. bt-up5 [obs 20261104T054627Z-bt-up5]: the matrix (0216) showed 0x2007/0x200b succeed after every
++ * LE command, but bluetoothd's own run got 0x2007 status 0x0c at its position 49 (right after the vendor command 0xfd48) and 0x200b status 0x0c at position ~67. This replays
++ * bluetoothd's own commands 1..48 of that instance (merged.log lines 1762-2046, in order, byte for byte except two cut payloads) and sends the read-only 0x2007 after every step:
++ * the first step after which the ROM says 0x0c names the culprit. All commands are ones bluetoothd sent byte-exact to this ROM in bt-up5 (fd3c/fce9/fce2/0c13/0c52 also in bt-up4; the fd48 payload differs per instance and the ROM answers 0x01) (volatile controller RAM state,
++ * REG_ON low clears it: the power-cycle after the probe). No new opcode, no scan/advertising enable, no flash, no patchram, no baud change. The two payloads the bt-up5 trace
++ * cut at 24 bytes (0x0c13 name, 0x0c52 EIR) replay with the visible prefix and zeros after it, announced by a `payload truncated` row (rule 8). Timing differs from bluetoothd
++ * (it pipelines several commands per ms; the replay waits for each answer): `replay timing` row says so; if no step flips, the probe waits 25 s and asks again (H-B).
++ */
++struct sbu_rstep {
++	uint16_t op;
++	uint8_t plen;           /* the length byte of the packet in the trace */
++	const char *hex;        /* the payload bytes visible in the trace; shorter than plen = the trace cut it (zero fill, announced) */
++};
++
++static const struct sbu_rstep sbu_rm[] = {
++	/*  1 */ { 0x0c03, 0, "" },
++	/*  2 */ { 0x1001, 0, "" },
++	/*  3 */ { 0x1002, 0, "" },
++	/*  4 */ { 0x1009, 0, "" },
++	/*  5 */ { 0x1003, 0, "" },
++	/*  6 */ { 0x1004, 1, "02" },
++	/*  7 */ { 0x2003, 0, "" },
++	/*  8 */ { 0x0c01, 8, "ff ff ff ff ff ff ff 3f" },
++	/*  9 */ { 0x2001, 8, "7f fa 86 3f 07 00 00 00" },
++	/* 10 */ { 0x0c56, 1, "01" },
++	/* 11 */ { 0x0c6d, 2, "01 01" },
++	/* 12 */ { 0x2060, 0, "" },
++	/* 13 */ { 0x202f, 0, "" },
++	/* 14 */ { 0x2031, 3, "00 02 02" },
++	/* 15 */ { 0x2024, 4, "fb 00 48 08" },
++	/* 16 */ { 0x201c, 0, "" },
++	/* 17 */ { 0x200f, 0, "" },
++	/* 18 */ { 0x1005, 0, "" },
++	/* 19 */ { 0x204a, 0, "" },
++	/* 20 */ { 0x2074, 2, "20 01" },
++	/* 21 */ { 0x0c33, 7, "f0 07 ff 01 00 01 00" },
++	/* 22 */ { 0x0c31, 1, "00" },
++	/* 23 */ { 0x0c5b, 1, "01" },
++	/* 24 */ { 0x0c7a, 1, "01" },
++	/* 25 */ { 0x080f, 2, "05 00" },
++	/* 26 */ { 0x0c16, 2, "a0 1f" },
++	/* 27 */ { 0x0c18, 2, "00 20" },
++	/* 28 */ { 0x0c1c, 4, "00 08 12 00" },
++	/* 29 */ { 0x0c1e, 4, "00 08 12 00" },
++	/* 30 */ { 0x0c26, 2, "60 00" },
++	/* 31 */ { 0x0c2a, 1, "00" },
++	/* 32 */ { 0x0c2f, 1, "00" },
++	/* 33 */ { 0x0c43, 1, "01" },
++	/* 34 */ { 0x0c45, 1, "02" },
++	/* 35 */ { 0x0c47, 1, "01" },
++	/* 36 */ { 0x0c49, 1, "01" },
++	/* 37 */ { 0x0c13, 248, "50 69 78 65 6c 20 36 61 00 00 00 00 00 00 00 00 00 00 00 00" },                     /* Write Local Name "Pixel 6a"; trace cut at 20 payload bytes */
++	/* 38 */ { 0x0c52, 241, "01 09 09 50 69 78 65 6c 20 36 61 0f 03 00 12 1f 11 2f 11 0a" },                     /* Write EIR; trace cut at 20 payload bytes */
++	/* 39 */ { 0x0c24, 3, "0c 02 00" },
++	/* 40 */ { 0xfd3c, 8, "ef 79 ff ff 09 00 00 00" },
++	/* 41 */ { 0x0c24, 3, "0c 02 60" },
++	/* 42 */ { 0x0c47, 1, "01" },
++	/* 43 */ { 0x0c24, 3, "0c 02 7a" },
++	/* 44 */ { 0x0c1c, 4, "00 08 12 00" },
++	/* 45 */ { 0xfce9, 5, "01 27 10 10 00" },
++	/* 46 */ { 0xfce2, 5, "0b 00 00 00 0c" },
++	/* 47 */ { 0xfce2, 5, "1c 00 00 00 0a" },
++	/* 48 */ { 0xfd48, 7, "01 01 35 1f c4 68 5f" },
++};
++#define SBU_RM_N        (sizeof(sbu_rm) / sizeof(sbu_rm[0]))
++
++/* "0b 00" -> bytes; returns the byte count, or (size_t)-1 on a malformed string (rule 8: the caller logs it, nothing is sent) */
++static size_t
++sbu_hexparse(const char *s, uint8_t *out, size_t max)
++{
++	size_t n = 0;
++
++	while (*s != 0) {
++		int hi, lo;
++
++		if (*s == ' ') {
++			s++;
++			continue;
++		}
++		hi = (s[0] >= '0' && s[0] <= '9') ? s[0] - '0' : (s[0] >= 'a' && s[0] <= 'f') ? s[0] - 'a' + 10 : -1;
++		lo = (hi < 0 || s[1] == 0) ? -1 : (s[1] >= '0' && s[1] <= '9') ? s[1] - '0' : (s[1] >= 'a' && s[1] <= 'f') ? s[1] - 'a' + 10 : -1;
++		if (lo < 0 || n >= max) {
++			return (size_t)-1;
++		}
++		out[n++] = (uint8_t)(hi << 4 | lo);
++		s += 2;
++	}
++	return n;
++}
++
++static void
++sbu_replay_probe(void)
++{
++	static const uint8_t par_rnd[7] = { 0x00, 0xe0, 0x01, 0x30, 0x00, 0x01, 0x00 };    /* bluetoothd's LE Set Scan Parameters, bt-up4/5 trace */
++	static const uint8_t par_off[2] = { 0x00, 0x00 };                                    /* LE Set Scan Enable: off (witness only, never enable) */
++	uint8_t par[255], rp[SBU_PM_SUPP], none[1] = { 0 }, st, s7, sb;
++	size_t rpn;
++	unsigned timeouts = 0, ran = 0, flip = 0, trunc = 0;
++	uint16_t flip_op = 0;
++	int e;
++
++	printf("BT PROBE: replay start (sweetbtleprobe=2, patch 0217): %zu steps of bluetoothd's bt-up5 instance-1 command sequence, 0x2007 after each; replay timing differs from bluetoothd (sequential, each answer awaited)\n", SBU_RM_N);
++	if ((e = sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn)) == 0) {
++		printf("BT PROBE: replay pos=0 baseline (unbooted ROM after the baud-probe Reset) 2007 status=%#04x (%s)\n", s7, sbu_pstatus(s7));
++	} else {
++		timeouts++;
++		printf("BT PROBE: replay pos=0 baseline 2007 NO ANSWER (error %d)\n", e);
++	}
++	for (size_t i = 0; i < SBU_RM_N; i++) {
++		const struct sbu_rstep *r = &sbu_rm[i];
++		unsigned pos = (unsigned)i + 1;
++		size_t known;
++		char hex[8 * 3 + 1];
++		size_t shown;
++
++		memset(par, 0, sizeof(par));
++		known = sbu_hexparse(r->hex, par, sizeof(par));
++		if (known == (size_t)-1 || known > r->plen) {
++			SBU_GAP(SG_OTHER, "replay pos=%u op=0x%04x: payload table row malformed (known %ld of %u); step skipped, the replay is incomplete", pos, r->op, (long)known, r->plen);
++			timeouts++;
++			continue;
++		}
++		if (known < r->plen) {
++			trunc++;
++			printf("BT PROBE: replay pos=%u op=0x%04x payload truncated: %zu of %u bytes known from the bt-up5 trace, the rest is zero (fidelity gap, not a byte-exact replay)\n", pos, r->op, known, r->plen);
++		}
++		shown = r->plen < 8 ? r->plen : 8;
++		for (size_t k = 0; k < shown; k++) {
++			snprintf(hex + 3 * k, 4, "%02x ", par[k]);
++		}
++		hex[3 * shown] = 0;
++		st = 0xff;
++		s7 = 0xff;
++		ran++;
++		if ((e = sbu_cmd(r->op, par, r->plen, &st, rp, sizeof(rp), &rpn)) != 0) {
++			timeouts++;
++			printf("BT PROBE: replay pos=%u op=0x%04x plen=%u par=[%s%s] NO ANSWER (error %d)\n", pos, r->op, r->plen, hex, r->plen > shown ? "..." : "", e);
++		}
++		ran++;
++		if ((e = sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn)) != 0) {
++			timeouts++;
++			printf("BT PROBE: replay pos=%u after op=0x%04x 2007 NO ANSWER (error %d)\n", pos, r->op, e);
++			continue;
++		}
++		printf("BT PROBE: replay pos=%u op=0x%04x plen=%u par=[%s%s] status=%#04x (%s) then 2007 status=%#04x (%s)%s\n", pos, r->op, r->plen, hex, r->plen > shown ? "..." : "", st, sbu_pstatus(st), s7, sbu_pstatus(s7),
++		    s7 == 0x0c ? " DISALLOWED" : "");
++		if (s7 != 0 && flip == 0) {
++			flip = pos;
++			flip_op = r->op;
++			printf("BT PROBE: first-disallowed-after=%u op=0x%04x (2007 status %#04x)\n", pos, r->op, s7);
++			/* witnesses at the flip: bluetoothd's own 0x200b, and Scan Enable OFF once (status 0 would mean a scan is running, 0x0c is the matrix baseline) */
++			sb = 0xff;
++			ran++;
++			if (sbu_cmd(0x200b, par_rnd, 7, &sb, rp, sizeof(rp), &rpn) == 0) {
++				printf("BT PROBE: at-flip 200b(bluetoothd random) status=%#04x (%s)\n", sb, sbu_pstatus(sb));
++			} else {
++				timeouts++;
++				printf("BT PROBE: at-flip 200b NO ANSWER\n");
++			}
++			sb = 0xff;
++			ran++;
++			if (sbu_cmd(0x200c, par_off, 2, &sb, rp, sizeof(rp), &rpn) == 0) {
++				printf("BT PROBE: at-flip 200c(scan enable OFF) status=%#04x (%s)\n", sb, sbu_pstatus(sb));
++			} else {
++				timeouts++;
++				printf("BT PROBE: at-flip 200c NO ANSWER\n");
++			}
++		}
++	}
++	if (flip == 0) {
++		/* H-B: no step flipped; bluetoothd's 0x200b came ~10 s after its 0x2007. Ask again after the last step, then after 25 s. */
++		sb = 0xff;
++		ran++;
++		if (sbu_cmd(0x200b, par_rnd, 7, &sb, rp, sizeof(rp), &rpn) == 0) {
++			printf("BT PROBE: no-flip after pos=%zu: 200b(bluetoothd random) status=%#04x (%s)\n", SBU_RM_N, sb, sbu_pstatus(sb));
++		} else {
++			timeouts++;
++			printf("BT PROBE: no-flip 200b NO ANSWER\n");
++		}
++		sbu.hw.msleep(25000);
++		s7 = sb = 0xff;
++		ran += 2;
++		if (sbu_cmd(0x2007, none, 0, &s7, rp, sizeof(rp), &rpn) == 0 && sbu_cmd(0x200b, par_rnd, 7, &sb, rp, sizeof(rp), &rpn) == 0) {
++			printf("BT PROBE: no-flip after 25 s wait: 2007 status=%#04x (%s) 200b status=%#04x (%s)\n", s7, sbu_pstatus(s7), sb, sbu_pstatus(sb));
++		} else {
++			timeouts++;
++			printf("BT PROBE: no-flip 25 s wait: NO ANSWER\n");
++		}
++	}
++	printf("BT PROBE: replay done: steps=%zu commands=%u no-answer=%u truncated-payloads=%u first-disallowed-after=%u op=0x%04x\n", SBU_RM_N, ran, timeouts, trunc, flip, flip_op);
++	if (timeouts != 0) {
++		SBU_GAP(SG_OTHER, "replay probe: %u steps got no answer or a malformed row; the bisect is incomplete", timeouts);
++	}
++}
++
++/*
++ * patch 0217, boot-arg sweetbtrw200b=1 (diagnostic knob, not a fix): the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b
++ * is rewritten from 0x0c (Command Disallowed) to 0x00. bt-up4/5 [obs]: bluetoothd exits right after that status [read from source: scan completion 0x1005798d4]. The rewrite scores
++ * alive_s and names bluetoothd's next exit cause; it is NOT a controller state change (no register store, the chip still refused the command). Each rewrite prints a `BT GAP:` row.
++ * Only the rx stream of the kctl path is touched; the probe (sbu_cmd) reads the FIFO itself and never sees a rewrite.
++ */
++static bool sbu_rw200b_on;
++static unsigned sbu_rw200b_n, sbu_rw_off, sbu_rw_plen, sbu_rw_other;
++static uint8_t sbu_rw_evt, sbu_rw_opl;
++static uint16_t sbu_rw_opc;
++
++static void
++sbu_rw200b(uint8_t *p, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		uint8_t b = p[i];
++
++		if (sbu_rw_off == 0) {
++			if (b == 0x04) {
++				sbu_rw_off = 1;
++			} else if (b == 0x02 || b == 0x03 || b == 0x05) {   /* ACL/SCO/ISO packet: its payload would be scanned for 0x04 and fake an event; the knob stops for the rest of the boot (review T-4c2c #4) */
++				sbu_rw200b_on = false;
++				SBU_GAP(SG_OTHER, "sweetbtrw200b: non-event packet type %#x: rewrite disabled for the rest of the boot", b);
++				return;
++			} else {        /* garbage: pass through, framing resumes at the next 0x04; counted loudly */
++				sbu_rw_other++;
++				SBU_GAP(SG_OTHER, "sweetbtrw200b: byte %#x outside an H4 event passed through unparsed (%u so far)", b, sbu_rw_other);
++			}
++			continue;
++		}
++		switch (sbu_rw_off) {
++		case 1: sbu_rw_evt = b; break;
++		case 2: sbu_rw_plen = b; break;
++		case 4: sbu_rw_opl = b; break;
++		case 5: sbu_rw_opc = (uint16_t)(sbu_rw_opl | (b << 8)); break;
++		case 6:
++			if (sbu_rw_evt == 0x0e && sbu_rw_plen >= 4 && sbu_rw_opc == 0x200b && b == 0x0c) {
++				p[i] = 0x00;
++				sbu_rw200b_n++;
++				printf("BT GAP: sweetbtrw200b=1 rewrote the status of the Command Complete for opcode 0x200b from 0x0c (command disallowed, the chip's real answer) to 0x00 for bluetoothd (x%u); diagnostic only, the controller refused the command\n", sbu_rw200b_n);
++			}
++			break;
++		default: break;
++		}
++		if (sbu_rw_off == 2u + sbu_rw_plen) {
++			sbu_rw_off = 0;
++		} else {
++			sbu_rw_off++;
++		}
++	}
++}
++
+ /* One polling pass (the rx thread calls it every tick): drain the RX FIFO into the connected control. Returns bytes queued. */
+ size_t sbu_rx_poll(void);
+ 
+@@ -832,6 +1092,10 @@ sbu_rx_poll(void)
+ 	if (err != 0) {
+ 		sbu.rx_err++;
+ 		SBU_GAP(SG_RXERR, "uart16 rx error flags %#x (overrun/frame/break); bytes may be lost", err);
++		if (sbu_rw200b_on && sbu_rw_off != 0) {     /* patch 0217: bytes may be lost, the H4 framing of the rewrite parser is no longer known: restart at the next 0x04 */
++			sbu_rw_off = 0;
++			SBU_GAP(SG_RXERR, "sweetbtrw200b: framing reset after rx error");
++		}
+ 	}
+ 	/* a FIFO that is completely full may read as count 0 (the full state is a separate UFSTAT bit [guess, not cited]), so RXDR counts as data too */
+ 	while (n < sizeof(buf) && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
+@@ -839,7 +1103,10 @@ sbu_rx_poll(void)
+ 	}
+ 	if (n != 0) {
+ 		sbu.rx_bytes += (uint32_t)n;
+-		sbu_trace("rx", buf, n);
++		sbu_trace("rx", buf, n);       /* the trace shows the chip's real bytes, before any sweetbtrw200b rewrite */
++		if (sbu_rw200b_on) {
++			sbu_rw200b(buf, n);
++		}
+ 		(void)sweet_bt_rx(buf, n);
+ 	}
+ 	return n;
+@@ -1029,8 +1296,12 @@ sweet_bt_uart_attach(void)
+ 			{       /* patch 0216 (T-0c77): boot-arg sweetbtleprobe=1; default behaviour unchanged. The rx thread is not running yet, so the probe owns the FIFO. */
+ 				int v = 0;
+ 
+-				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && v == 1) {
+-					sbu_le_probe();
++				if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2)) {
++					if (v == 2) {       /* patch 0217: full-sequence replay instead of the matrix */
++						sbu_replay_probe();
++					} else {
++						sbu_le_probe();
++					}
+ 					/* bluetoothd must meet the same ROM state as in bt-up4, not the probe's leftovers (written BD address, random address, LE mode): power-cycle and re-probe the baud (review T-0c77 M2) */
+ 					(void)sbu_power_off();
+ 					e = sbu_probe_one(&use[win]);
+@@ -1046,8 +1317,16 @@ sweet_bt_uart_attach(void)
+ 	if (!settled) {
+ 		int v = 0;
+ 
+-		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && v == 1) {
+-			printf("BT GAP: sweetbtleprobe=1 ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n");
++		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2)) {
++			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
++		}
++	}
++	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
++		int v = 0;
++
++		if (PE_parse_boot_argn("sweetbtrw200b", &v, sizeof(v)) && v == 1) {
++			sbu_rw200b_on = true;
++			printf("BT GAP: sweetbtrw200b=1 active: Command Complete status 0x0c for opcode 0x200b is rewritten to 0x00 on the way to bluetoothd (diagnostic knob, not a fix; one BT GAP row per rewrite)\n");
+ 		}
+ 	}
+ 	if (!settled && (sbu_power_on() != 0 || sbu_uart_open(115200) != 0)) {       /* 115200: A12 initial baud [guess], HAL string 115200 (AO:34) */

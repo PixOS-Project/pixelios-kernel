@@ -1,0 +1,95 @@
+SWEET bench end marker (patch 0155, flow v2 item 6): the Home-key bench (sweethidtest=N seconds, now sweethidcount=P presses, default 30) and the synthetic swipes of 0152 (sweetswipecount=K, default 400) print ONE final line `SWEET BENCH DONE: home-key presses P` / `SWEET BENCH DONE: swipes K` 6 s after the last release/swipe, so a run can end on it (--expect "SWEET BENCH DONE") instead of a fixed --duration. Applies on top of 0152. No hardware access.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -339,6 +339,7 @@
+ 	IOTimerEventSource *fTest;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	UInt32 fTestLimit;   /* patch 0155: events (2 per press) before the bench is done, boot-arg sweethidcount presses, default 30 */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -376,10 +377,12 @@
+ 	/* patch 0152: synthetic swipes (boot-arg sweetswipe=N seconds), a repeatable touch source for latency measurements */
+ 	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fSwipe;
+-	UInt32 fSwipeSecs, fSwipeStep, fSwipeCount;
++	UInt32 fSwipeSecs, fSwipeStep, fSwipeCount, fSwipeLimit;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++#define SWEET_SWIPE_STEPS 20
++#define SWEET_SWIPE_MAX 400   /* default number of swipes; boot-arg sweetswipecount overrides (patch 0155) */
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
+@@ -393,6 +396,9 @@
+ 	if (!IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
++	UInt32 presses = 30;
++	(void)PE_parse_boot_argn("sweethidcount", &presses, sizeof(presses));
++	fTestLimit = 2 * (presses ? presses : 30);
+ 	if (PE_parse_boot_argn("sweethidtest", &fTestSecs, sizeof(fTestSecs)) && fTestSecs) {
+ 		fTest = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::testFired);
+ 		if (fTest && _hidWorkLoop->addEventSource(fTest) == kIOReturnSuccess) {
+@@ -427,9 +433,18 @@
+ 	 * Home (Menu) press, then the release 100 ms later; Setup's "Hello"
+ 	 * screen waits for it. Even counts press, odd counts release.
+ 	 */
++	if (self->fTestCount >= self->fTestLimit) {
++		/* Patch 0154 (flow v2 item 6): one final line a run can end on (--expect / --stop-on), printed 6 s after the last release so the
++		 * per-second stat lines of the last animation (SWEET FPS/PERF/PACE/LAT) are already in the log. */
++		IOLog("SWEET BENCH DONE: home-key presses %u\n", self->fTestLimit / 2);
++		return;
++	}
+ 	bool press = (self->fTestCount & 1) == 0;
+ 	self->key(kHIDUsage_Csmr_Menu, press);
+-	if (++self->fTestCount < 60) {
++	self->fTestCount++;
++	if (self->fTestCount >= self->fTestLimit) {
++		sender->setTimeoutMS(6000);
++	} else {
+ 		sender->setTimeoutMS(press ? 100 : self->fTestSecs * 1000);
+ 	}
+ }
+@@ -460,6 +475,11 @@
+ 	if (PE_parse_boot_argn("sweetswipe", &sw, sizeof(sw)) && sw) {
+ 		fSwipeSecs = sw;
+ 		fSwipeStep = fSwipeCount = 0;
++		fSwipeLimit = SWEET_SWIPE_MAX;
++		UInt32 cnt = 0;
++		if (PE_parse_boot_argn("sweetswipecount", &cnt, sizeof(cnt)) && cnt && cnt <= SWEET_SWIPE_MAX) {
++			fSwipeLimit = cnt;
++		}
+ 		fSwipe = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::swipeFired);
+ 		if (fSwipe && _hidWorkLoop && _hidWorkLoop->addEventSource(fSwipe) == kIOReturnSuccess) {
+ 			fSwipe->setTimeoutMS(120 * 1000);
+@@ -469,8 +489,6 @@
+ 	return true;
+ }
+ 
+-#define SWEET_SWIPE_STEPS 20
+-#define SWEET_SWIPE_MAX 400
+ void
+ SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -479,7 +497,8 @@
+ 	static const int gx1[4] = { 540, 200, 900, 200 }, gy1[4] = { 900, 1200, 1200, 1200 };
+ 	unsigned g = self->fSwipeCount & 3, st = self->fSwipeStep;
+ 
+-	if (self->fSwipeCount >= SWEET_SWIPE_MAX) {
++	if (self->fSwipeCount >= self->fSwipeLimit) {
++		IOLog("SWEET BENCH DONE: swipes %u\n", self->fSwipeLimit);   /* patch 0155: the run's end marker, 6 s after the last swipe */
+ 		return;
+ 	}
+ 	if (st <= SWEET_SWIPE_STEPS) {
+@@ -492,7 +511,7 @@
+ 		self->touch(0, false, gx1[g], gy1[g]);
+ 		self->fSwipeStep = 0;
+ 		self->fSwipeCount++;
+-		sender->setTimeoutMS(self->fSwipeSecs * 1000);
++		sender->setTimeoutMS(self->fSwipeCount >= self->fSwipeLimit ? 6000 : self->fSwipeSecs * 1000);
+ 	}
+ }
+ 

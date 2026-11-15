@@ -1,0 +1,24 @@
+SWEET nav13 (patch 0257, T-98dd, G-10b-nav; input injection only): the about-open verify threshold of patch 0256 goes from 3 to 20 swaps in the 1800 ms settle window. Reason [obs nav12 20261108T103610Z, docs/reviews/T-c87c-proof.md s3]: about-open reps 0/1 animated with 64/67 swaps since the first About tap, rep 2 saw 8 swaps (late General page content, no busy bin) with 0 retries because 8 >= 3 passed the verify; the About page was not pushed (EVT flat across the tap). 20 sits between the settling 8 and the animated 64/67 (one sample per side: the threshold is a [guess] between them). Unchanged: at most 2 retries, retry coordinates, log lines (the retry line now says `(< 20)`). No register, no store to hardware, no GPU knob.
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index b7d71a2..dcdc0b6 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -800,15 +800,15 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * the row). Every decision is logged; the action markers of the first tap stay the only ones. Input injection only.
+ 		 */
+ 		uint64_t ad = sweet_fb_swap_count - self->fNavAboutSw0;
+-		if (ad < 3 && self->fNavAboutTaps < 2) {
++		if (ad < 20 && self->fNavAboutTaps < 2) {
+ 			self->fNavAboutTaps++;
+-			IOLog("SWEET NAV: about-open retry %u: %llu swaps since the first About tap (< 3), tap again at 500,%d\n", self->fNavAboutTaps, ad, self->fNavAboutTaps == 2 ? 400 : 370);
++			IOLog("SWEET NAV: about-open retry %u: %llu swaps since the first About tap (< 20), tap again at 500,%d\n", self->fNavAboutTaps, ad, self->fNavAboutTaps == 2 ? 400 : 370);
+ 			self->fNavStep = 0;
+ 			sender->setTimeoutMS(300);
+ 			return;
+ 		}
+ 		IOLog("SWEET NAV: about-open: %llu swaps since the first About tap, %u retries\n", ad, self->fNavAboutTaps);
+-		if (ad < 3) {
++		if (ad < 20) {
+ 			IOLog("SWEET GAP: NAV about-open: %llu swaps after %u retries, going on (about-open stays no-anim)\n", ad, self->fNavAboutTaps);
+ 		}
+ 		self->fNavAboutTaps = 0;

@@ -1,0 +1,345 @@
+SWEET HFS mount trace for USB-root probe 5 (patch 0171), opt-in: boot-arg sweethfstrace=N (N > 0; absent or 0 = off, nothing printed). Lines start with "SWEET HFSTRACE: [<ms since boot> ms]". HFS side (bsd/sweet_hfs/core, staged by 0026): hfs_mountfs enter/return (both exits), hfs_MountHFSPlusVolume enter/return at both call sites with elapsed ms, async bitmap scan thread create/registered and in the thread start/bitmap lock taken/ScanUnmapBlocks returned/returns, the synchronous scan branch, the hotfile interlock wait for the scan and hfs_recording_init enter/return (mount and rw-upgrade call sites). usbroot side (bsd/dev/sweet_usbroot.c, needs 0157/0158): the first N reads reaching ur_strategy with block, byte offset, size, host fills, ur_lock wait, total ms, thread id and error; N is capped at 4096 (loud clamp line) and the cap hit is logged. Read-only: printf only, no register access, no disk write, no change to any HFS decision. Clean room (idea only from research 97 5b.1). Not compiled yet (tools/xnu-local-build, AP-147) and not run on hardware.
+diff --git a/bsd/dev/sweet_usbroot.c b/bsd/dev/sweet_usbroot.c
+index 7b2b646..2d11444 100644
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -263,6 +263,15 @@ ur_uptime_ms(void)
+ }
+ #define UR_TRACE(fmt, ...) printf("SWEET USBROOT: [%llu ms] " fmt "\n", ur_uptime_ms(), ##__VA_ARGS__)
+ 
++/*
++ * SWEET HFS mount trace, read side (patch 0171, USB-root probe 5): with boot-arg sweethfstrace=N (N > 0) the first N reads that
++ * reach ur_strategy are logged ("SWEET HFSTRACE: ... read #i") with block, byte offset, size, ur_lock wait, total time, host
++ * fills and the calling thread id; the HFS side (bsd/sweet_hfs/core) logs the mount steps with the same prefix. Off without it.
++ */
++#define UR_HFSTRACE_MAX 4096u           /* our own cap on traced reads (log volume), not a hardware value */
++static uint32_t ur_hfstrace_max;        /* 0 = off; set once in ur_rootdev before the disk is published */
++static uint32_t ur_hfstrace_seq;        /* reads traced so far; under ur_lock */
++
+ /*
+  * One request/reply exchange into ur.buf. Returns 0 with *status set when the host answered (status may be a
+  * host error code), ETIMEDOUT after UR_TRIES unanswered attempts. ur_lock held.
+@@ -490,6 +499,8 @@ ur_strategy(buf_t bp)
+ 	daddr64_t blkno = buf_blkno(bp);
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t off = 0;
++	uint64_t ht0 = ur_hfstrace_max ? ur_uptime_ms() : 0, htl = 0;     /* patch 0171 trace: entry, lock taken */
++	uint32_t hseq = 0, hfills = 0;
+ 
+ 	buf_setresid(bp, count);
+ 	bool is_write = !(buf_flags(bp) & B_READ);
+@@ -514,6 +525,10 @@ ur_strategy(buf_t bp)
+ 		goto done;
+ 	}
+ 	lck_mtx_lock(&ur_lock);
++	if (ur_hfstrace_max && !is_write && ur_hfstrace_seq < ur_hfstrace_max) {
++		hseq = ++ur_hfstrace_seq;
++		htl = ur_uptime_ms();
++	}
+ 	if (is_write && ur.cow_writes < UR_COW_LOG_N) {
+ 		printf("SWEET USBROOT: cow write #%u lba %lld count %u flags 0x%x\n", ++ur.cow_writes, (long long)blkno, count,
+ 		    buf_flags(bp));
+@@ -534,6 +549,7 @@ ur_strategy(buf_t bp)
+ 		} else {
+ 			if (!ur.cache_valid || pos < ur.cache_off || pos >= ur.cache_off + ur.cache_len) {
+ 				error = ur_fill(pos & ~(uint64_t)(UR_READ_MIN - 1));
++				hfills++;
+ 				if (error) {
+ 					break;
+ 				}
+@@ -556,6 +572,14 @@ ur_strategy(buf_t bp)
+ 	}
+ 	lck_mtx_unlock(&ur_lock);
+ 	buf_unmap(bp);
++	if (hseq) {
++		uint64_t now = ur_uptime_ms();
++		printf("SWEET HFSTRACE: [%llu ms] read #%u blk %lld off 0x%llx count %u fills %u lockwait %llu ms took %llu ms tid %llu err %d\n",
++		    now, hseq, (long long)blkno, off, count, hfills, htl - ht0, now - ht0, thread_tid(current_thread()), error);
++		if (hseq == ur_hfstrace_max) {
++			printf("SWEET HFSTRACE: read trace cap %u reached, later usbroot reads are not traced\n", ur_hfstrace_max);
++		}
++	}
+ 
+ done:
+ 	if (error) {
+@@ -693,6 +717,13 @@ ur_rootdev(dev_t *dev)
+ 		return EPERM;
+ 	}
+ 	ur.active = true;
++	if (PE_parse_boot_argn("sweethfstrace", &ur_hfstrace_max, sizeof(ur_hfstrace_max)) && ur_hfstrace_max > 0) {
++		if (ur_hfstrace_max > UR_HFSTRACE_MAX) {
++			printf("SWEET HFSTRACE: sweethfstrace=%u clamped to %u traced reads\n", ur_hfstrace_max, UR_HFSTRACE_MAX);
++			ur_hfstrace_max = UR_HFSTRACE_MAX;
++		}
++		printf("SWEET HFSTRACE: [%llu ms] on: first %u usbroot reads + HFS mount steps (patch 0171)\n", ur_uptime_ms(), ur_hfstrace_max);
++	}
+ 	/* sweetusb=2 starts the USB device (sweet_usb_probe); 0/1 never would, so fail now instead of after a wait. */
+ 	PE_parse_boot_argn("sweetusb", &usb_mode, sizeof(usb_mode));
+ 	UR_TRACE("boot-arg sweetusb=%d", usb_mode);
+diff --git a/bsd/sweet_hfs/core/hfs_vfsops.c b/bsd/sweet_hfs/core/hfs_vfsops.c
+index 557430b..aec71b8 100644
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -110,6 +110,40 @@
+ #include "hfs_endian.h"
+ #include "hfs_hotfiles.h"
+ #include "hfs_quota.h"
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET (patch 0171): opt-in HFS mount trace for USB-root probe 5. Boot-arg sweethfstrace=N (N > 0) turns it on; absent or 0 = off,
++ * no line printed. Lines start with "SWEET HFSTRACE:" and carry milliseconds since boot and the thread id, so they line up with the
++ * read side in bsd/dev/sweet_usbroot.c (same boot-arg, first N reads). Read-only: no register access, no disk write.
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++static int sweet_hfstrace_state = -1;   /* -1 not parsed yet, 0 off, 1 on */
++int sweet_hfstrace_on(void);
++int
++sweet_hfstrace_on(void)
++{
++	if (sweet_hfstrace_state < 0) {
++		uint32_t n = 0;
++		sweet_hfstrace_state = (PE_parse_boot_argn("sweethfstrace", &n, sizeof(n)) && n > 0) ? 1 : 0;
++	}
++	return sweet_hfstrace_state;
++}
++uint64_t sweet_hfstrace_ms(void);
++uint64_t
++sweet_hfstrace_ms(void)
++{
++	uint64_t t = 0, ns = 0;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++#define SWEET_HFSTRACE(fmt, ...) do { \
++	if (sweet_hfstrace_on()) \
++		printf("SWEET HFSTRACE: [%llu ms] " fmt "\n", sweet_hfstrace_ms(), ##__VA_ARGS__); \
++} while (0)
++#endif
+ #include "hfs_btreeio.h"
+ #include "hfs_kdebug.h"
+ #include "hfs_cprotect.h"
+@@ -460,7 +494,15 @@ hfs_mount(struct mount *mp, vnode_t devvp, user_addr_t data, vfs_context_t conte
+ 				if (ISSET(hfsmp->hfs_flags, HFS_METADATA_ZONE)
+ 					&& (!ISSET(hfsmp->hfs_flags, HFS_SSD)
+ 						|| ISSET(hfsmp->hfs_flags, HFS_CS_HOTFILE_PIN))) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					uint64_t sweet_t_rec = sweet_hfstrace_ms();
++					SWEET_HFSTRACE("hfs_recording_init enter (rw upgrade) tid %llu", thread_tid(current_thread()));
++					int sweet_rec = hfs_recording_init(hfsmp);
++					SWEET_HFSTRACE("hfs_recording_init returned %d after %llu ms (rw upgrade)", sweet_rec,
++					    sweet_hfstrace_ms() - sweet_t_rec);
++#else
+ 					hfs_recording_init(hfsmp);
++#endif
+ 				}					
+ 				/* Force ACLs on HFS+ file systems. */
+ 				if (vfs_extendedsecurity(HFSTOVFS(hfsmp)) == 0) {
+@@ -1028,12 +1070,19 @@ void hfs_syncer(void *arg, __unused wait_result_t wr)
+  * an in-memory summary table of the state of the allocated blocks.
+  */
+ void hfs_scan_blocks (struct hfsmount *hfsmp) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint64_t sweet_t_scan = sweet_hfstrace_ms();
++	SWEET_HFSTRACE("bitmap scan thread started tid %llu", thread_tid(current_thread()));
++#endif
+ 	/*
+ 	 * Take the allocation file lock.  Journal transactions will block until
+ 	 * we're done here. 
+ 	 */
+ 	
+ 	int flags = hfs_systemfile_lock(hfsmp, SFL_BITMAP, HFS_EXCLUSIVE_LOCK);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("bitmap scan thread: bitmap lock taken after %llu ms", sweet_hfstrace_ms() - sweet_t_scan);
++#endif
+ 	
+ 	/* 
+ 	 * We serialize here with the HFS mount lock as we're mounting.
+@@ -1073,6 +1122,9 @@ void hfs_scan_blocks (struct hfsmount *hfsmp) {
+ 	 * allocator use, as configured.
+ 	 */
+ 	(void) ScanUnmapBlocks(hfsmp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("bitmap scan thread: ScanUnmapBlocks returned after %llu ms", sweet_hfstrace_ms() - sweet_t_scan);
++#endif
+ 
+ 	(void) hfs_lock_mount (hfsmp);
+ 	hfsmp->scan_var &= ~HFS_ALLOCATOR_SCAN_INFLIGHT;
+@@ -1083,6 +1135,9 @@ void hfs_scan_blocks (struct hfsmount *hfsmp) {
+ 	buf_invalidateblks(hfsmp->hfs_allocation_vp, 0, 0, 0);
+ 	
+ 	hfs_systemfile_unlock(hfsmp, flags);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("bitmap scan thread returns after %llu ms (bitmap lock released)", sweet_hfstrace_ms() - sweet_t_scan);
++#endif
+ 
+ }
+ 
+@@ -1116,6 +1171,9 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 	int isroot = !journal_replay_only && args == NULL;
+ 	u_int32_t device_features = 0;
+ 	int isssd;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint64_t sweet_t_mount = sweet_hfstrace_ms(), sweet_t_step = 0;
++#endif
+ 
+ 	ronly = mp && vfs_isrdonly(mp);
+ 	dev = vnode_specrdev(devvp);
+@@ -1126,6 +1184,10 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 	hfsmp = NULL;
+ 	mdbp = NULL;
+ 	minblksize = kHFSBlockSize;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("hfs_mountfs enter dev 0x%x ronly %d isroot %d replay_only %d tid %llu", (unsigned)dev, ronly, isroot,
++	    journal_replay_only, thread_tid(current_thread()));
++#endif
+ 
+ 	/* Advisory locking should be handled at the VFS layer */
+ 	if (mp)
+@@ -1663,7 +1725,14 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 			goto error_exit;
+ 		}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_t_step = sweet_hfstrace_ms();
++		SWEET_HFSTRACE("hfs_MountHFSPlusVolume enter (blksize %u)", log_blksize);
++#endif
+ 		retval = hfs_MountHFSPlusVolume(hfsmp, vhp, embeddedOffset, disksize, p, args, cred);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		SWEET_HFSTRACE("hfs_MountHFSPlusVolume returned %d after %llu ms", retval, sweet_hfstrace_ms() - sweet_t_step);
++#endif
+ 		/*
+ 		 * If the backend didn't like our physical blocksize
+ 		 * then retry with physical blocksize of 512.
+@@ -1752,7 +1821,14 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 			}
+ 
+ 			/* Try again with a smaller block size... */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			sweet_t_step = sweet_hfstrace_ms();
++			SWEET_HFSTRACE("hfs_MountHFSPlusVolume enter (retry, blksize %u)", log_blksize);
++#endif
+ 			retval = hfs_MountHFSPlusVolume(hfsmp, vhp, embeddedOffset, disksize, p, args, cred);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			SWEET_HFSTRACE("hfs_MountHFSPlusVolume (retry) returned %d after %llu ms", retval, sweet_hfstrace_ms() - sweet_t_step);
++#endif
+ 			if (retval && HFS_MOUNT_DEBUG) {
+ 				printf("hfs_MountHFSPlusVolume (late) returned %d\n",retval); 
+ 			}
+@@ -1862,6 +1938,9 @@ hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args,
+ 		(void) hfs_flushvolumeheader(hfsmp, HFS_FVH_WAIT);
+ 	}
+ 	hfs_free_data(mdbp, kMDBSize);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("hfs_mountfs returned 0 after %llu ms", sweet_hfstrace_ms() - sweet_t_mount);
++#endif
+ 	return (0);
+ 
+ error_exit:
+@@ -1884,6 +1963,9 @@ error_exit:
+ 		if (mp)
+ 			vfs_setfsprivate(mp, NULL);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	SWEET_HFSTRACE("hfs_mountfs returned %d after %llu ms (error_exit)", retval, sweet_hfstrace_ms() - sweet_t_mount);
++#endif
+ 	return (retval);
+ }
+ 
+diff --git a/bsd/sweet_hfs/core/hfs_vfsutils.c b/bsd/sweet_hfs/core/hfs_vfsutils.c
+index 21f0dd0..1dd1449 100644
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -69,6 +69,17 @@
+ #include "hfs_fsctl.h"
+ #include "hfs_cprotect.h"
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* SWEET (patch 0171): HFS mount trace helpers, defined in hfs_vfsops.c (boot-arg sweethfstrace=N, off without it). */
++#include <kern/thread.h>
++int sweet_hfstrace_on(void);
++uint64_t sweet_hfstrace_ms(void);
++#define SWEET_HFSTRACE(fmt, ...) do { \
++	if (sweet_hfstrace_on()) \
++		printf("SWEET HFSTRACE: [%llu ms] " fmt "\n", sweet_hfstrace_ms(), ##__VA_ARGS__); \
++} while (0)
++#endif
++
+ #include "FileMgrInternal.h"
+ #include "BTreesInternal.h"
+ #include "HFSUnicodeWrappers.h"
+@@ -677,6 +688,10 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		/*
+ 		 * Scan the bitmap asynchronously.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		uint64_t sweet_t_reg = sweet_hfstrace_ms();
++		SWEET_HFSTRACE("bitmap scan: async, creating the scan thread (ssd %d)", ISSET(hfsmp->hfs_flags, HFS_SSD) ? 1 : 0);
++#endif
+ 		kernel_thread_start ((thread_continue_t)hfs_scan_blocks, hfsmp,
+ 				&allocator_scanner);
+ 
+@@ -691,9 +706,17 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		}
+ 
+ 		hfs_unlock_mount(hfsmp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		SWEET_HFSTRACE("bitmap scan: thread registered after %llu ms (scan_var 0x%x, unlocked snapshot), mount continues", sweet_hfstrace_ms() - sweet_t_reg,
++		    hfsmp->scan_var);
++#endif
+ 
+ 		thread_deallocate (allocator_scanner);
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		uint64_t sweet_t_sync = sweet_hfstrace_ms();
++		SWEET_HFSTRACE("bitmap scan: synchronous in the mount thread (catalog overflow extents + journal)");
++#endif
+ 
+ 		/*
+ 		 * Initialize the summary table and then scan the bitmap
+@@ -706,6 +729,9 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		}
+ 
+ 		(void)ScanUnmapBlocks (hfsmp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		SWEET_HFSTRACE("bitmap scan: synchronous ScanUnmapBlocks returned after %llu ms", sweet_hfstrace_ms() - sweet_t_sync);
++#endif
+ 
+ 		/*
+ 		 * We need to set that the allocator scan is completed because
+@@ -983,11 +1009,19 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		// some older/slower machines, without this interlock, the bitmap
+ 		// would sometimes get corrupted at boot time.
+ 		//
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		uint64_t sweet_t_rec = sweet_hfstrace_ms();
++		SWEET_HFSTRACE("hotfile interlock: mount thread waits for the bitmap scan (scan_var 0x%x, unlocked snapshot)", hfsmp->scan_var);
++#endif
+ 		hfs_lock_mount(hfsmp);
+ 		while(!(hfsmp->scan_var & HFS_ALLOCATOR_SCAN_COMPLETED)) {
+ 			(void) msleep (&hfsmp->scan_var, &hfsmp->hfs_mutex, PINOD, "hfs_hotfile_bitmap_interlock", 0);
+ 		}
+ 		hfs_unlock_mount(hfsmp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		SWEET_HFSTRACE("hotfile interlock: bitmap scan complete after %llu ms wait", sweet_hfstrace_ms() - sweet_t_rec);
++		sweet_t_rec = sweet_hfstrace_ms();
++#endif
+ 		
+ 		/*
+ 		 * Note: at this point we are not allowed to fail the
+@@ -998,7 +1032,13 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 		 *       clean that up at this point.  Since HotFiles are
+ 		 *       optional, this is not a big deal.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		SWEET_HFSTRACE("hfs_recording_init enter (mount, hot file clustering) tid %llu", thread_tid(current_thread()));
++		int sweet_rec = hfs_recording_init(hfsmp);
++		SWEET_HFSTRACE("hfs_recording_init returned %d after %llu ms (mount)", sweet_rec, sweet_hfstrace_ms() - sweet_t_rec);
++#else
+ 		(void) hfs_recording_init(hfsmp);
++#endif
+ 	}
+ 
+ 	/* Force ACLs on HFS+ file systems. */

@@ -1,0 +1,117 @@
+SWEET nav9 (patch 0254, T-bf77, G-10b-nav; input injection only, log only): (1) the nav session checks its unlock swipe: when the settle window of the first-repetition unlock presented fewer than 30 swaps (healthy: about 150 in 3 s; stalled navw1/nav7/nav8: 0 [obs docs/reviews/T-bf77-proof.md]) it sends a wake tap (540,70 = status bar, 100 ms; nav9 [obs run 20261108T093325Z-gputest-nav9] used 540,1200, which launched Preferences from the home screen at +7.8 s and shifted the rep-0 Settings sequence: settings-open, general-open, about-open no-anim), waits 2 s and swipes again, at most 3 times, then goes on with a `SWEET GAP: NAV unlock` line; logs `SWEET NAV: unlock retry N ...` and `SWEET NAV: unlock window N swaps, wake taps M`; the begin/inputend/end markers of the unlock stay those of the first attempt. (nav8's pre-swipe gate, a swap within 2 s of the first action, passed on one stray swap 1.6 s earlier and did not fire: healthy runs also present 0 swaps before the swipe.) (2) settings-scroll-down is back to the nav5 drag 700 -> 1800 (patch 0251's 400 -> 2300 ended inside the home-gesture edge zone and left Settings in nav6 [obs]); patch 0253's extra settings-scroll-top action is not in this stack. sweet_fb_swap_count becomes a global read by the HID nav code. No register, no store to hardware.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 05bf7be..3ed6351 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -510,7 +510,8 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ extern "C" void flush_dcache64(addr64_t, unsigned, int);   /* osfmk/arm/caches_internal.h, virtual address with phys = 0 */
+ static uint32_t sweet_fb_present_count;
+-static uint64_t sweet_fb_swap_count;
++extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: read by the nav session of SweetHID.cpp (unlock check) */
++uint64_t sweet_fb_swap_count;
+ 
+ /*
+  * DPU register dump (patch 0165, boot-arg sweetdpudump=MASK, default 0 = off; docs/research/79, research 78 item "DPU read-only dump").
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f0b41a5..745ce39 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -388,6 +388,8 @@ public:
+ 	static void navFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fNav;
+ 	UInt32 fNavReps, fNavRep, fNavIdx, fNavStep, fNavRng;
++	UInt32 fNavWakeTaps, fNavWakeSt;   /* patch 0254: unlock retries (wake taps sent), 1 = the wake tap finger is down */
++	uint64_t fNavSw0;   /* patch 0254: swap count at the start of the unlock attempt */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -412,7 +414,7 @@ static const SweetNavAct sweetNavActs[] = {
+ 	{ "about-back",       1,    5, 1200,  700, 1200, 250, 1200 },   /* edge back-swipe [guess] */
+ 	{ "general-back",     1,    5, 1200,  700, 1200, 250, 1200 },
+ 	{ "settings-scroll-up", 1, 540, 1800, 540,  700, 350,  900 },
+-	{ "settings-scroll-down", 1, 540, 400, 540, 2300, 350,  900 },   /* patch 0251: 1900 px (was 1100) so the list is back at its top, rubber-banded: nav5 rep 2 left it ~1.5 rows down and general-open hit Display & Brightness [obs frames nav-r02-settings-open vs nav-r01-settings-open] */
++	{ "settings-scroll-down", 1, 540, 700, 540, 1800, 350,  900 },   /* patch 0254: the nav5 drag again (patch 0251's 400 -> 2300 ended at y 2300, inside the home-gesture edge zone, and left the Settings app in nav6 rep 0: nav6 frame nav-r00-settings-scroll-down [obs docs/reviews/T-41d7-proof.md]); no settings-scroll-top action (patch 0253 is not in this stack) */
+ 	{ "app-home",         1,  540, 2398,  540, 1200, 200, 1500 },   /* calibrated: 2350 does not work inside an app */
+ 	{ "app-launch",       0,  676, 1720,    0,    0, 100, 3000 },   /* Settings icon (page 1) from the home screen after app-home: the same tap as settings-open, which animated 3/3 in nav1 [obs]; no longer behind Spotlight (T-b872) */
+ 	{ "app-idle",         2,    0,    0,    0,    0,   0, 3000 },
+@@ -434,6 +436,7 @@ static SweetHIDTouch *gSweetTouch;
+ /* Patch 0152: host time (ns) of the latest finger-down, read by the latency probe of patch 0153 (SweetFramebuffer.cpp). 0 = none yet. */
+ extern "C" uint64_t sweet_touch_down_ns;
+ uint64_t sweet_touch_down_ns;
++extern "C" uint64_t sweet_fb_swap_count;   /* patch 0254: swaps presented so far, written by AppleCLCD::swap */
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -609,6 +612,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	 * sweetscript (all drive finger 0). Input injection only: no register, no store. */
+ 	UInt32 nav = 0, navs = 130;
+ 	fNavReps = fNavRep = fNavIdx = fNavStep = 0;
++	fNavWakeTaps = fNavWakeSt = 0;
++	fNavSw0 = 0;
+ 	fNavRng = 0x5eed1234;
+ 	fNav = NULL;
+ 	if (PE_parse_boot_argn("sweetnav", &nav, sizeof(nav)) && nav) {
+@@ -660,6 +665,12 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLog("SWEET NAV: done reps %u\n", self->fNavReps);   /* the host stops on this line */
+ 		return;
+ 	}
++	if (self->fNavWakeSt == 1) {   /* patch 0254: the wake tap finger is down: lift it, observe 2 s, then the unlock swipe runs again */
++		self->touch(0, false, 540, 70);
++		self->fNavWakeSt = 0;
++		sender->setTimeoutMS(2000);
++		return;
++	}
+ 	SweetNavAct act = sweetNavActs[i];
+ 	if (strcmp(act.name, "app-launch") == 0) {
+ 		/* patch 0250 (T-4604): every repetition taps the Clock icon (665,1158) of the home page the session is on after app-home. Patch 0247 tapped icon 0 at 398,300, which on the
+@@ -679,7 +690,10 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	const SweetNavAct *a = &act;
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+-	if (st == 0) {
++	if (st == 0 && i == 0) {
++		self->fNavSw0 = sweet_fb_swap_count;   /* patch 0254: swaps before this unlock attempt */
++	}
++	if (st == 0 && !(i == 0 && self->fNavWakeTaps > 0)) {   /* patch 0254: an unlock retry does not repeat the begin marker (the scorer sees one unlock action) */
+ 		IOLog("SWEET NAV: ACTION %s begin rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 		if (a == &act && strcmp(a->name, "app-launch") == 0) {
+ 			IOLog("SWEET NAV: app-launch icon Clock at %d,%d (rep %u)\n", (int)a->x0, (int)a->y0, self->fNavRep);
+@@ -700,11 +714,36 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 	}
+ 	if (st <= ticks + 1) {   /* finger up (or the wait started): observe the animation for `settle` ms */
+-		IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++		if (!(i == 0 && self->fNavWakeTaps > 0)) {
++			IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
++		}
+ 		self->fNavStep = ticks + 2;
+ 		sender->setTimeoutMS(a->settle);
+ 		return;
+ 	}
++	if (i == 0) {
++		/*
++		 * Patch 0254 (T-bf77, G-10b-nav): the unlock swipe is verified. nav8 [obs run 20261108T092212Z-gputest-nav8, T-bf77 boot 1] showed the pre-unlock display state cannot
++		 * tell a stalled boot from a healthy one (0 swaps in the 26 s before the swipe in nav3/5/6 AND in the stalled navw1/nav7/nav8), but the swipe itself can: a healthy
++		 * unlock presents about 150 swaps in 3 s, a stalled one 0, and the next tap (settings-open) then produced the first frames. If the settle window of the unlock swipe
++		 * presented fewer than 30 swaps the session sends a wake tap (540,70 = the status bar, a tap there is harmless on the lock and the home screen; 100 ms), waits 2 s and swipes again, at most 3 times, then goes on with a GAP line. Logs every
++		 * decision; the action markers of the first attempt stay the only ones. Input injection only.
++		 */
++		uint64_t d = sweet_fb_swap_count - self->fNavSw0;
++		if (d < 30 && self->fNavWakeTaps < 3) {
++			self->fNavWakeTaps++;
++			IOLog("SWEET NAV: unlock retry %u: %llu swaps in the unlock window (< 30), wake tap at 540,70 then the swipe again\n", self->fNavWakeTaps, d);
++			self->touch(0, true, 540, 70);
++			self->fNavWakeSt = 1;
++			self->fNavStep = 0;
++			sender->setTimeoutMS(100);
++			return;
++		}
++		IOLog("SWEET NAV: unlock window %llu swaps, wake taps %u\n", d, self->fNavWakeTaps);
++		if (d < 30) {
++			IOLog("SWEET GAP: NAV unlock: %llu swaps after %u wake taps, going on (rep 0 unlock / home-page rows will be no-anim)\n", d, self->fNavWakeTaps);
++		}
++	}
+ 	IOLog("SWEET NAV: ACTION %s end rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+ 	self->fNavStep = 0;
+ 	self->fNavIdx = i + 1;

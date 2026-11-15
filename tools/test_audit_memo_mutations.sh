@@ -4,12 +4,14 @@
 # source self-tests from a throwaway copy in a temp dir (never the repo tree, never shim/out, no build). The object self-test needs
 # an aarch64 objdump + a built shim/out/wlanlink.o; its mutants are NOT covered here (its key is the disasm text, see test_audit_memo.py).
 # Last line: RESULT: PASS mutants=N caught=N (exit 0) | RESULT: FAIL survived=NAMES (1) | RESULT: ERROR ... (2). Logs: logs/audit-memo-mut/<UTC>/
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
 cd "$(dirname "$0")/.." || exit 2
 root=$PWD; ts=$(date -u +%Y%m%dT%H%M%SZ); logd=$root/logs/audit-memo-mut/$ts; mkdir -p "$logd" || { echo "RESULT: ERROR no log dir"; exit 2; }
 w=$(mktemp -d) || exit 2; trap 'rm -rf "$w"' EXIT
 err() { echo "RESULT: ERROR $* (logs $logd)"; exit 2; }
 mkdir -p "$w/pristine/tools" "$w/pristine/soc/google/gs101" "$w/pristine/shim" "$w/run"
-for f in audit_memo.py test-bluejay-boot.py boards.py; do cp "tools/$f" "$w/pristine/tools/" || err "missing tools/$f"; done
+for f in audit_memo.py audit_pool.py audit_wlanh1.py gpuclk_audit.py mifclk_audit.py pmicsrc_audit.py test-bluejay-boot.py boards.py; do cp "tools/$f" "$w/pristine/tools/" || err "missing tools/$f"; done
 cp soc/google/gs101/wlan_seq.json "$w/pristine/soc/google/gs101/" && cp shim/wlanlink.c "$w/pristine/shim/" || err "missing inputs"
 cat >"$w/driver.py" <<'PY'
 import importlib.util, pathlib, sys

@@ -1,0 +1,465 @@
+SWEET nav tap hold + thread wait witness (patch 0249, T-10ba, G-10b-nav; R0 log only, no register or memory write outside the patch's own statics): (1) the SweetHIDTouch nav session (0243/0247) held every tap as a 100 ms drag from its (x0,y0) to the unused (x1,y1) = (0,0) of the table row and lifted the finger at 0,0 (observed: 12 'SWEET HID: touch 0 up at 0,0' lines in run 20261107T230750Z-gputest-nav3), so iOS never saw a tap and no app launched; a kind 0 action now holds the finger at (x0,y0) for all ticks and lifts it there, and logs 'SWEET NAV: tap hold X,Y ticks N' at the up event (swipes and waits unchanged); (2) boot-arg sweetthrwait=N (N ms, clamped to 2..50, default off: no thread, nothing printed; sweetthrcpu stays as it is) starts a second kernel thread (bsd/dev/sweet_thrwait.c, sweet_thrwait_start next to sweet_thrcpu_start in sweet_ufs, bsd/conf/files) that samples every thread of backboardd and SpringBoard every N ms under task_lock + splsched/thread_lock (sweet_thrwait_task and sweet_thrwait_slide in osfmk/kern/exception.c): thread->state, and for a TH_WAIT thread block_hint, wait_event and the user pc/lr of find_user_regs, read from the thread structure only (nothing the event or a port points to, no copyin), aggregated in a 512-entry static table keyed (pid, tid, hint, event, pc, lr), printed once per second as 'SWEET THRWAIT: t NS samples S waiting W running R entries E dropped D' plus up to 24 'SWEET THRWAIT: pid P tid T idx I hint H ev E pc PC lr LR n N' rows, 'SWEET THRWAIT: pid P slide S' once per process, loud one-time lines for a process not found / without a task / over 256 threads / a full table (dropped), 60000 lines per boot then 'cap reached'.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 88a3cf4..bf2a0ce 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_thrcpu.c			standard
+ bsd/dev/sweet_surfcpu.c		standard
++bsd/dev/sweet_thrwait.c		standard
+ bsd/dev/sweet_cpustat.c			standard
+ bsd/dev/sweet_el2.c			standard
+ bsd/dev/sweet_wlan_en0.c			standard
+diff --git a/bsd/dev/sweet_thrwait.c b/bsd/dev/sweet_thrwait.c
+new file mode 100644
+index 0000000..631a304
+--- /dev/null
++++ b/bsd/dev/sweet_thrwait.c
+@@ -0,0 +1,309 @@
++/*
++ * SWEET thread wait witness (patch 0249, T-10ba, boot-arg sweetthrwait=N, default off: no thread, nothing printed). R0: log only, no register writes.
++ *
++ * Why: the nav3 run showed the swap-return -> next-submit lag is wall time, not CPU (SWEETGL LAGPH wall_us 66393 against cpu_us 1637). This names what the
++ * threads of backboardd and SpringBoard wait on while it happens. A second kernel thread next to sweet_thrcpu.c (which is unchanged): every N ms (N = the boot-arg,
++ * clamped to 2..50) it reads, for every thread of both processes, the wait state straight from the thread structure (sweet_thrwait_task, osfmk/kern/exception.c):
++ * block_hint (what kind of primitive: block_hint.h), wait_event (the event value, NOT dereferenced) and the user pc / lr of the last kernel entry. The samples
++ * are aggregated in a static table; once per second:
++ *   SWEET THRWAIT: t <abs_ns> samples S waiting W running R entries E dropped D
++ *   SWEET THRWAIT: pid P tid 0x%llx idx I hint H ev 0x%llx pc 0x%llx lr 0x%llx n N        (up to 24 rows, highest n first)
++ * S = sampling rounds in the second, W / R = thread observations that were in TH_WAIT / not, E = table entries, D = waiting observations the full table could
++ * not take (loud, never silent). t = absolute time in ns, the clock `SWEET SWAPT: now` and `SWEET NAV: ... now` print (mach_absolute_time -> ns), so rows join
++ * the nav action markers. Once per process: `SWEET THRWAIT: pid P slide 0x%llx` (pc - slide = the unslid shared-cache address, as in sweet_crash_log).
++ * idx = position of the thread in the task's thread queue at its first sample of the second (= the tN of the SMP rows when the queue did not change).
++ * The pc / lr are the user registers of the last kernel entry of a thread that is blocked in the kernel, so pc is the syscall / trap return address, not a
++ * sample of what the thread was computing. hint 0 with ev 0x0 = the waitq already woke the thread but it has not run yet (exception.c comment).
++ * Cost [guess, not measured]: one proc_iterate + two task_lock walks per round; at N = 2 that is 500 rounds/s on a 6-core phone SoC. Read the run's own
++ * frame rate against the baseline before trusting a score taken with this on.
++ *
++ * Context and locking: as sweet_thrcpu.c (its own kernel thread; proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS), proc ref held per callout; the task's queue
++ * is walked under task_lock in sweet_thrwait_task; static buffers, single thread; every printf happens after all locks are dropped).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
++
++extern task_t proc_task(proc_t);
++extern char *proc_name_address(void *p);      /* bsd/kern/kern_proc.c:1390 */
++extern int sweet_thrwait_task(task_t task, uint64_t *out, int max, int *total);   /* osfmk/kern/exception.c, 6 words per thread */
++extern int sweet_thrwait_slide(task_t task, uint64_t *slide);                     /* osfmk/kern/exception.c */
++extern void sweet_thrwait_start(void);
++
++#define THW_TAB     512        /* aggregation table entries */
++#define THW_TOP     24         /* rows printed per second */
++#define THW_MAX_T   256        /* threads kept per process per round; more are counted in n and reported once */
++#define THW_CAP     60000      /* lines per boot */
++#define THW_MIN_MS  2
++#define THW_MAX_MS  50
++
++struct thw_ent {
++	uint64_t tid, ev, pc, lr;
++	uint32_t hint;
++	int32_t  pid;
++	int32_t  idx;
++	uint32_t n;                /* 0 = free slot */
++};
++
++/* THW-AGG-BEGIN: pure aggregation (no kernel calls); tools/test_thrwait_agg.sh cuts this block out of the patch and runs it on the host */
++static struct thw_ent thw_tab[THW_TAB];
++static uint32_t thw_used;      /* entries in use */
++static uint64_t thw_dropped;   /* waiting observations the full table could not take, this second */
++
++static uint32_t
++thw_hash(const struct thw_ent *e)
++{
++	uint64_t h = 1469598103934665603ULL;     /* FNV-1a style mix over the key words */
++	const uint64_t k[5] = { e->tid, e->ev, e->pc, e->lr, ((uint64_t)e->hint << 32) | (uint32_t)e->pid };
++
++	for (int i = 0; i < 5; i++) {
++		h ^= k[i];
++		h *= 1099511628211ULL;
++		h ^= h >> 29;
++	}
++	return (uint32_t)(h ^ (h >> 32));
++}
++
++/* One waiting observation: bump the entry with the same key (pid, tid, hint, ev, pc, lr) or take a free slot. Returns 0 counted, 1 table full (dropped). */
++static int
++thw_add(const struct thw_ent *e)
++{
++	uint32_t h = thw_hash(e) % THW_TAB;
++
++	for (uint32_t i = 0; i < THW_TAB; i++) {
++		struct thw_ent *t = &thw_tab[(h + i) % THW_TAB];
++
++		if (t->n == 0) {
++			*t = *e;
++			t->n = 1;
++			thw_used++;
++			return 0;
++		}
++		if (t->pid == e->pid && t->tid == e->tid && t->hint == e->hint && t->ev == e->ev && t->pc == e->pc && t->lr == e->lr) {
++			t->n++;
++			return 0;
++		}
++	}
++	thw_dropped++;
++	return 1;
++}
++
++/* Slots of the (at most THW_TOP) entries with the highest n, highest first (equal n: lower slot first). Returns how many. */
++static int
++thw_top(uint32_t *out)
++{
++	int cnt = 0;
++
++	for (uint32_t s = 0; s < THW_TAB; s++) {
++		int pos = cnt;
++
++		if (thw_tab[s].n == 0) {
++			continue;
++		}
++		if (cnt == THW_TOP && thw_tab[out[THW_TOP - 1]].n >= thw_tab[s].n) {
++			continue;
++		}
++		if (cnt < THW_TOP) {
++			cnt++;
++		} else {
++			pos = THW_TOP - 1;
++		}
++		while (pos > 0 && thw_tab[out[pos - 1]].n < thw_tab[s].n) {
++			out[pos] = out[pos - 1];
++			pos--;
++		}
++		out[pos] = s;
++	}
++	return cnt;
++}
++
++static void
++thw_clear(void)
++{
++	bzero(thw_tab, sizeof(thw_tab));
++	thw_used = 0;
++	thw_dropped = 0;
++}
++/* THW-AGG-END */
++
++struct thw_proc {
++	int pid;                   /* -1 = not found */
++	int n;                     /* threads in the queue */
++	int kept;                  /* min(n, THW_MAX_T) */
++	int no_task;               /* 1 = the proc has no task */
++	int slide_kr;              /* 0 ok, -1 no shared region (only read on the first round of a pid) */
++	uint64_t slide;
++	uint64_t ent[THW_MAX_T * 6];
++};
++
++static struct thw_proc thw_p[2];      /* [0] backboardd, [1] SpringBoard */
++static int thw_last_pid[2] = { -1, -1 };
++static uint32_t thw_period_ms;
++
++static int
++thw_callout(proc_t p, __unused void *arg)
++{
++	const char *nm = proc_name_address(p);
++	int which = (strncmp(nm, "backboardd", MAXCOMLEN) == 0) ? 0 : ((strncmp(nm, "SpringBoard", MAXCOMLEN) == 0) ? 1 : -1);
++	if (which >= 0) {
++		struct thw_proc *t = &thw_p[which];
++		task_t task = proc_task(p);
++		t->pid = proc_pid(p);
++		t->n = 0;
++		t->kept = 0;
++		t->no_task = (task == TASK_NULL);
++		t->slide_kr = 0;
++		t->slide = 0;
++		if (task != TASK_NULL) {
++			if (t->pid != thw_last_pid[which]) {
++				t->slide_kr = sweet_thrwait_slide(task, &t->slide);   /* once per pid, before the first sample */
++			}
++			(void)sweet_thrwait_task(task, t->ent, THW_MAX_T, &t->n);
++			t->kept = (t->n < THW_MAX_T) ? t->n : THW_MAX_T;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static uint64_t
++thw_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static void
++sweet_thrwait_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const char *const names[2] = { "backboardd", "SpringBoard" };
++	int nf_said[2] = { 0, 0 }, trunc_said[2] = { 0, 0 }, notask_said[2] = { 0, 0 }, noregs_said[2] = { 0, 0 };
++	unsigned lines = 0;
++	int cap_said = 0;
++	uint64_t last_print = thw_now_ns();
++	uint64_t rounds = 0, waiting = 0, running = 0;
++
++	thw_clear();
++	for (;;) {
++		uint32_t top[THW_TOP];
++		uint64_t now;
++
++		if (lines >= THW_CAP) {
++			if (!cap_said) {
++				cap_said = 1;
++				printf("SWEET THRWAIT: cap reached %d\n", THW_CAP);
++			}
++			delay_for_interval(1000, 1000 * 1000);   /* capped: idle (a kernel thread function must not return) */
++			continue;
++		}
++		delay_for_interval(thw_period_ms, 1000 * 1000);   /* ms; the same call and scale as bsd/dev/sweet_restart.c:138 */
++		thw_p[0].pid = thw_p[1].pid = -1;
++		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, thw_callout, NULL, NULL, NULL);
++		/* no lock held from here on */
++		rounds++;
++		for (int w = 0; w < 2; w++) {
++			struct thw_proc *t = &thw_p[w];
++			if (t->pid < 0) {
++				if (!nf_said[w]) {
++					nf_said[w] = 1;
++					printf("SWEET THRWAIT: %s not found\n", names[w]);
++					lines++;
++				}
++				continue;
++			}
++			if (t->no_task) {
++				if (!notask_said[w]) {
++					notask_said[w] = 1;
++					printf("SWEET THRWAIT: unavailable (%s pid %d has no task)\n", names[w], t->pid);
++					lines++;
++				}
++				continue;
++			}
++			if (t->pid != thw_last_pid[w]) {
++				thw_last_pid[w] = t->pid;
++				if (t->slide_kr == 0) {
++					printf("SWEET THRWAIT: pid %d slide 0x%llx\n", t->pid, t->slide);
++				} else {
++					printf("SWEET THRWAIT: pid %d slide unavailable (no shared region)\n", t->pid);
++				}
++				lines++;
++			}
++			if (t->n > t->kept && !trunc_said[w]) {
++				trunc_said[w] = 1;
++				printf("SWEET THRWAIT: %s pid %d has %d threads, only the first %d are sampled\n", names[w], t->pid, t->n, THW_MAX_T);
++				lines++;
++			}
++			for (int i = 0; i < t->kept; i++) {
++				const uint64_t *o = &t->ent[i * 6];
++				struct thw_ent e;
++
++				if (o[1] == 0) {
++					running++;
++					continue;
++				}
++				waiting++;
++				if (o[1] == 2 && !noregs_said[w]) {
++					noregs_said[w] = 1;
++					printf("SWEET THRWAIT: %s pid %d tid 0x%llx waits without a 64-bit user state: pc/lr print as 0 for such threads\n", names[w], t->pid, o[0]);
++					lines++;
++				}
++				e.tid = o[0];
++				e.hint = (uint32_t)o[2];
++				e.ev = o[3];
++				e.pc = o[4];
++				e.lr = o[5];
++				e.pid = t->pid;
++				e.idx = i;
++				e.n = 0;
++				(void)thw_add(&e);
++			}
++		}
++		now = thw_now_ns();
++		if (now - last_print >= 1000000000ULL) {
++			int nt = thw_top(top);
++
++			last_print = now;
++			printf("SWEET THRWAIT: t %llu samples %llu waiting %llu running %llu entries %u dropped %llu\n", now, rounds, waiting, running, thw_used, thw_dropped);
++			lines++;
++			for (int i = 0; i < nt && lines < THW_CAP; i++) {
++				const struct thw_ent *e = &thw_tab[top[i]];
++
++				printf("SWEET THRWAIT: pid %d tid 0x%llx idx %d hint %u ev 0x%llx pc 0x%llx lr 0x%llx n %u\n", e->pid, e->tid, e->idx, e->hint, e->ev, e->pc, e->lr, e->n);
++				lines++;
++			}
++			thw_clear();
++			rounds = waiting = running = 0;
++		}
++	}
++}
++
++void
++sweet_thrwait_start(void)
++{
++	int v = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("sweetthrwait", &v, sizeof(v)) || v == 0) {
++		return;
++	}
++	if (v < 0) {
++		printf("SWEET THRWAIT: sweetthrwait=%d ignored (a period in ms, %d..%d, is needed)\n", v, THW_MIN_MS, THW_MAX_MS);
++		return;
++	}
++	thw_period_ms = (uint32_t)v < THW_MIN_MS ? THW_MIN_MS : ((uint32_t)v > THW_MAX_MS ? THW_MAX_MS : (uint32_t)v);
++	if (thw_period_ms != (uint32_t)v) {
++		printf("SWEET THRWAIT: sweetthrwait=%d clamped to %u ms (%d..%d)\n", v, thw_period_ms, THW_MIN_MS, THW_MAX_MS);
++	}
++	printf("SWEET THRWAIT: period %u ms\n", thw_period_ms);
++	if (kernel_thread_start(sweet_thrwait_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET THRWAIT: unavailable (kernel_thread_start failed)\n");
++	}
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 03866da..64f1d6e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_thrcpu_start(void);   /* patch 0187, bsd/dev/sweet_thrcpu.c */
+ extern void sweet_surfcpu_start(void);  /* patch 0194, bsd/dev/sweet_surfcpu.c */
++extern void sweet_thrwait_start(void);  /* patch 0249, bsd/dev/sweet_thrwait.c */
+ extern void sweet_cpustat_start(void);
+ extern void sweet_el2_start(void);   /* bsd/dev/sweet_el2.c (patch 0180): boot-arg sweetel2=1 only */
+ /* B-M3 counters (sweet_cpustat.c): ios, cmds, bytes, busy abs, lock wait abs, longest command abs; updated under sweet_ufs_lock */
+@@ -786,6 +787,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	sweet_thrcpu_start();         /* no-op without boot-arg sweetthrcpu=1 */
+ 	sweet_surfcpu_start();        /* no-op without boot-arg sweetsurfcpu=1 / sweetthrsample= */
++	sweet_thrwait_start();        /* no-op without boot-arg sweetthrwait=N */
+ 	sweet_cpustat_start();
+ 	sweet_el2_start();
+ 	sweet_keys_gs101_start();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a707104..3a3847d 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -670,6 +670,13 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 		act.x0 = icons[k][0];
+ 		act.y0 = icons[k][1];
+ 	}
++	if (act.kind == 0) {
++		/* patch 0249 (T-10ba): a tap holds the finger at (x0,y0). The table rows of kind 0 carry x1=y1=0 (unused for a tap), and the drag interpolation below ran every tap
++		 * from (x0,y0) to (0,0) over ms/10 ticks and lifted the finger at 0,0: a 100 ms drag to the top-left corner, so iOS saw no tap [read from source: this function
++		 * before 0249; observed on hardware, run 20261107T230750Z-gputest-nav3: 12 `SWEET HID: touch 0 up at 0,0` lines, one per tap]. */
++		act.x1 = act.x0;
++		act.y1 = act.y0;
++	}
+ 	const SweetNavAct *a = &act;
+ 	unsigned ticks = a->kind == 2 ? 0 : (a->ms >= 10 ? a->ms / 10 : 1);
+ 	if (st == 0) {
+@@ -688,6 +695,9 @@ SweetHIDTouch::navFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (a->kind != 2 && st == ticks + 1) {
+ 		self->touch(0, false, a->x1, a->y1);
++		if (a->kind == 0) {
++			IOLog("SWEET NAV: tap hold %d,%d ticks %u\n", (int)a->x1, (int)a->y1, ticks);   /* patch 0249: the up event above is at the tap's own coordinates */
++		}
+ 	}
+ 	if (st <= ticks + 1) {   /* finger up (or the wait started): observe the animation for `settle` ms */
+ 		IOLog("SWEET NAV: ACTION %s inputend rep %u now %llu\n", a->name, self->fNavRep, sweetNavNs());
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index c3ede9c..9ce335c 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1169,6 +1169,84 @@ sweet_thrsample_task(task_t task, uint64_t tid, struct sweet_thrsmp *o)
+ 	return rc;
+ }
+ 
++/*
++ * SWEET thread wait witness (patch 0249, bsd/dev/sweet_thrwait.c, boot-arg sweetthrwait=N): one sample of every thread of `task` into `out`, 6 words per thread
++ * {tid, kind, hint, wait_event, pc, lr} for the first `max` threads in task->threads queue order; *total = number of threads in the queue. kind 0 = not in
++ * TH_WAIT (hint/event/pc/lr 0), 1 = TH_WAIT with a 64-bit user state (pc, lr from it), 2 = TH_WAIT without one (pc = lr = 0). Locking as in sweet_thrcpu_task above
++ * (task_lock around the queue walk: fill_taskthreadinfo, osfmk/kern/bsd_kern.c:1073-1112) and per thread splsched + thread_lock around the field reads, the
++ * discipline of thread_info_internal (osfmk/kern/thread.c:2057-2062, retrieve_thread_basic_info thread.c:1966). TH_WAIT, block_hint and wait_event are written
++ * together under the thread lock when a thread starts waiting (thread_mark_wait_locked osfmk/kern/sched_prim.c:1119-1129, waitq_thread_insert osfmk/kern/waitq.c:569,
++ * called with the thread locked from waitq.c:1383-1386), so a TH_WAIT read under the lock sees a matching hint and event. When the waitq wakes the thread
++ * (thread_clear_waitq_state, waitq.c:584-593) the event is reset to NO_EVENT64 (= 0, kern_types.h:80) and the hint to 0 while TH_WAIT stays set until the thread
++ * runs: such a row reads hint 0 ev 0x0. The hint is also reset when the thread is dispatched (sched_prim.c:925). TH_WAIT is set from assert_wait on, before the
++ * thread has switched out. Only values stored in the thread structure and in its saved user state (thread->machine.upcb, find_user_regs, osfmk/arm64/status.c:1688)
++ * are read: nothing the event, a port, a waitq or user memory points to is dereferenced or copied in (no copyin, no vm_map_read_user). The saved state is the one
++ * of the last kernel entry [guess: it is not rewritten while the thread waits; sweet_sample_task reads it the same way, under task_lock only]. No printf here.
++ * Returns 0.
++ */
++int sweet_thrwait_task(task_t task, uint64_t *out, int max, int *total);
++
++int
++sweet_thrwait_task(task_t task, uint64_t *out, int max, int *total)
++{
++	thread_t thread;
++	int idx = 0;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (idx < max) {
++			uint64_t *o = &out[idx * 6];
++			uint64_t tid = thread_tid(thread);
++			spl_t s = splsched();
++
++			thread_lock(thread);
++			if (thread->state & TH_WAIT) {
++				arm_saved_state_t *ss = find_user_regs(thread);
++
++				o[1] = 2;
++				o[2] = (uint64_t)thread->block_hint;
++				o[3] = (uint64_t)thread->wait_event;
++				o[4] = 0;
++				o[5] = 0;
++				if (ss != NULL && is_saved_state64(ss)) {
++					o[1] = 1;
++					o[4] = get_saved_state_pc(ss);
++					o[5] = get_saved_state_lr(ss);
++				}
++			} else {
++				o[1] = o[2] = o[3] = o[4] = o[5] = 0;
++			}
++			thread_unlock(thread);
++			splx(s);
++			o[0] = tid;
++		}
++		idx++;
++	}
++	*total = idx;
++	task_unlock(task);
++	return 0;
++}
++
++/*
++ * Shared-cache slide of `task` for the wait witness rows (patch 0249): vm_shared_region_get takes task_lock and the shared region lock itself and returns a
++ * referenced region (osfmk/vm/vm_shared_region.c:233-259), called from the sampler thread exactly as sweet_sample_task and sweet_thrsample_task above do,
++ * with the caller holding a proc reference. sr_slide: osfmk/vm/vm_shared_region.h:223. Returns 0 and *slide, or -1 when the task has no shared region.
++ */
++int sweet_thrwait_slide(task_t task, uint64_t *slide);
++
++int
++sweet_thrwait_slide(task_t task, uint64_t *slide)
++{
++	vm_shared_region_t sr = vm_shared_region_get(task);
++
++	if (sr == NULL) {
++		return -1;
++	}
++	*slide = sr->sr_slide;
++	vm_shared_region_deallocate(sr);
++	return 0;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t

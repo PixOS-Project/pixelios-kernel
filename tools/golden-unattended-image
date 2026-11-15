@@ -1,0 +1,321 @@
+#!/usr/bin/env -S python3 -I
+"""golden-unattended-image (TP-037 part 1): derive the golden-session boot image that pre-authorizes the host adb key.
+  tools/golden-unattended-image build [--out DIR] [--base IMG] [--key PUB] [--build cp3a|bp31] [--dry-run]
+  tools/golden-unattended-image verify IMG [--key PUB] [--build cp3a|bp31]
+--build (default cp3a) picks the PIN line of tools/fboot-android: cp3a = ^PIN=, bp31 = ^PIN_BP31= (a build whose pin is not a sha256 yet FAILs); bp31 build needs an explicit --base.
+Base = the TP-035 pinned Magisk image (sha256 must equal PIN in tools/fboot-android, read with ^PIN=). Adds to its ramdisk (lz4 legacy, newc):
+overlay.d/ + overlay.d/sbin/ (0750, only if absent), overlay.d/sbin/pixos_adb_keys (0644, the host PUBLIC adb key) and overlay.d/pixos-golden.rc (0644: adb key at post-fs-data; the pixos_bb service + debug.pixos.bb trigger for the two-boot busybox delivery; su policy for uid 2000 at sys.boot_completed=1; research 45).
+No busybox in the image: it overflows the AVB headroom (AP-150); tools/golden-pull su-prep pushes it.
+Existing cpio entries stay byte-identical; the base's AVB vbmeta + footer (from original_image_size on) is copied verbatim; the header, kernel, cmdline and os fields come from the base; repack = tools/third_party/mkbootimg.py (v4).
+Every build first runs the same pipeline with NO added entries and requires header+kernel+ramdisk pages byte-identical to the base (else FAIL, nothing written).
+Writes DIR/golden-unattended-<pin8>-<key8>.img + .img.sha256 + .img.manifest.json (no timestamps: same inputs = same sha256). Never flashes anything.
+Logs: logs/golden-unattended/<UTC stamp>/run.log. Last line RESULT: PASS|FAIL|ERROR reason (exit 0/1/2).
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import base64, hashlib, json, os, re, struct, subprocess, sys, tempfile, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOME = os.path.expanduser("~")
+LZ4_LEVEL = 12   # measured 2026-10-28: `lz4 -l -12` reproduces the base ramdisk (360841 bytes) exactly; -1..-11 and --favor-decompression-speed do not
+PAGE = 4096
+MKBOOTIMG = os.path.join(ROOT, "tools", "third_party", "mkbootimg.py")
+RC_NAME, KEY_NAME = "overlay.d/pixos-golden.rc", "overlay.d/sbin/pixos_adb_keys"
+RC = """\
+# PixOS golden-session overlay (TP-037 part 1). Tags: [read from source research 45 ...] = docs/research/45-magisk-su-unattended.md; [guess until S0-n] = not measured on the phone yet (rule 7).
+# init syntax: `exec [ <seclabel> [ <user> [ <group>* ] ] ] -- <command> [ <argument>* ]`; a double-quoted string is ONE token, ${prop} properties are expanded in arguments
+# [read from source AOSP system/core/init/README.md lines 8-10 (quoting) and 606-611 (exec), main branch fetched 2026-10-28]
+# ${MAGISKTMP} is not a property: magiskinit substitutes it textually before init parses this file (Magisk native/src/init/rootdir.cpp:98).
+on post-fs-data
+    # [guess until S0-1] adbd reads /data/misc/adb/adb_keys (AOSP adbd_auth.cpp:407-410); ${MAGISKTMP} holds the overlay.d/sbin files
+    mkdir /data/misc/adb 02750 system shell
+    copy ${MAGISKTMP}/pixos_adb_keys /data/misc/adb/adb_keys
+    chown system shell /data/misc/adb/adb_keys
+    chmod 0640 /data/misc/adb/adb_keys
+    # [guess until S0-2] init.usb.rc starts adbd on sys.usb.config=adb
+    setprop persist.sys.usb.config adb
+    setprop sys.usb.config adb
+
+# Two-boot busybox delivery [read from source research 45 "Two-boot delivery (2026-10-28)", Q2(a)]: the host (tools/golden-pull su-prep) pushes
+# /data/local/tmp/pixos_busybox and sets debug.pixos.bb=1; this service copies it to /data/magisk in the magisk domain. Not an init `copy`: init cannot open
+# shell_data_file (initp.te:650-651, domain.te:2136-2154) nor search adb_data_file after Magisk's policy (Magisk native/src/sepolicy/rules.rs:137).
+# The magisk domain is permissive (rules.rs:81-82) and init may run it (rules.rs:126); magiskd adopts /data/magisk -> /data/adb/magisk at its post-fs-data (core/bootstages.rs:43-55).
+# /data/adb is created by Magisk's own boot_complete on boot 1 (bootstages.rs:180-184), so this rc has no mkdir of it.
+# [guess until S0-3] the transition into u:r:magisk:s0 for /system/bin/sh, toybox cp/mv/chmod/mkdir on the image, `on property:debug.*` firing for a shell-set property.
+service pixos_bb /system/bin/sh -c "mkdir -p /data/magisk && cp /data/local/tmp/pixos_busybox /data/magisk/busybox.tmp && chmod 0755 /data/magisk/busybox.tmp && mv /data/magisk/busybox.tmp /data/magisk/busybox && rm -f /data/local/tmp/pixos_busybox && setprop debug.pixos.bb.done ok || setprop debug.pixos.bb.done fail"
+    user root
+    seclabel u:r:magisk:s0
+    oneshot
+    disabled
+
+on property:debug.pixos.bb=1
+    start pixos_bb
+
+# [read from source research 45 Q3/Q5] su policy for uid 2000 (shell) once magiskd is up; logging,notification = 0,0 (logging on loops the app fallback, research 45 Q3); [guess until S0-3] the quoted SQL parses as one argv
+on property:sys.boot_completed=1
+    # The exit status of `magisk --sqlite` carries no information (magisk.rs:253-262, db.rs:320-321) and boot 1's REPLACE always fails (no /data/adb yet, bootstages.rs:180-184): tools/golden-pull su-check reads the row back.
+    exec u:r:magisk:s0 root root -- ${MAGISKTMP}/magisk --sqlite "REPLACE INTO policies (uid,policy,until,logging,notification) VALUES(2000,2,0,0,0)"
+"""
+
+
+class Fail(Exception): pass
+class Err(Exception): pass
+
+
+class Log:
+    def __init__(self):
+        d = os.path.join(ROOT, "logs", "golden-unattended", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-%d" % os.getpid())
+        os.makedirs(d, exist_ok=True)
+        self.f = open(os.path.join(d, "run.log"), "a")
+    def __call__(self, m):
+        print(m); self.f.write(m + "\n"); self.f.flush()
+    def result(self, s):
+        self(s)
+
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+
+PIN_VARS = {"cp3a": "PIN", "bp31": "PIN_BP31"}   # variable names in tools/fboot-android (--build table); cp3a keeps the historical ^PIN= line
+
+
+def read_pin(build="cp3a"):
+    var = PIN_VARS.get(build)
+    if var is None: raise Err("unknown --build %r (cp3a|bp31)" % build)
+    try:
+        with open(os.path.join(ROOT, "tools", "fboot-android")) as f:
+            m = re.search(r"^%s=([0-9a-f]{64})\b" % var, f.read(), re.M)
+    except OSError as e:
+        raise Err("cannot read tools/fboot-android: %s" % e)
+    if not m: raise Err("no ^%s=<sha256> line in tools/fboot-android (build %s: pin not set yet?)" % (var, build))
+    return m.group(1)
+
+
+def parse_hdr(b):
+    if len(b) < 4096 or b[:8] != b"ANDROID!": raise Fail("not an Android boot image (magic)")
+    ksz, rsz, osv, hsz = struct.unpack_from("<IIII", b, 8)
+    ver = struct.unpack_from("<I", b, 40)[0]
+    if ver != 4: raise Fail("boot header version %d, need 4" % ver)
+    if hsz != 1584: raise Fail("header_size %d, need 1584" % hsz)
+    sig = struct.unpack_from("<I", b, 1580)[0]
+    if sig: raise Fail("signature_size %d != 0 (unsupported: would be dropped)" % sig)
+    ro = PAGE * (1 + (ksz + PAGE - 1) // PAGE)
+    end = ro + rsz
+    if end > len(b): raise Fail("ramdisk runs past the end of the image")
+    return dict(ksz=ksz, rsz=rsz, os=osv, cmdline=b[44:1580].split(b"\0", 1)[0], kernel=b[PAGE:PAGE + ksz],
+                ramdisk=b[ro:end], pages_end=PAGE * ((end + PAGE - 1) // PAGE))
+
+
+def run(cmd, inp=None):
+    try:
+        p = subprocess.run(cmd, input=inp, capture_output=True)
+    except OSError as e:
+        raise Err("cannot run %s: %s" % (cmd[0], e))
+    if p.returncode: raise Err("%s failed rc=%d: %s" % (cmd[0], p.returncode, p.stderr[-300:].decode("latin1")))
+    return p.stdout
+
+
+def cpio_split(raw):
+    """-> (entries [(name, ino, raw bytes)], trailer index, tail bytes after the trailer). Raw bytes are kept verbatim."""
+    ents, pos = [], 0
+    while True:
+        if raw[pos:pos + 6] != b"070701": raise Fail("cpio: bad newc magic at %d" % pos)
+        f = [int(raw[pos + 6 + 8 * i:pos + 14 + 8 * i], 16) for i in range(13)]
+        ns, fs = f[11], f[6]
+        name = raw[pos + 110:pos + 110 + ns - 1].decode("utf-8", "surrogateescape")
+        nend = (pos + 110 + ns + 3) & ~3
+        end = (nend + fs + 3) & ~3
+        if end > len(raw): raise Fail("cpio: entry %r runs past the end" % name)
+        ents.append((name, f[0], raw[pos:end])); pos = end
+        if name == "TRAILER!!!": return ents, len(ents) - 1, raw[pos:]
+
+
+def newc(name, ino, mode, data=b""):
+    nb = name.encode() + b"\0"
+    h = b"070701" + b"".join(b"%08X" % v for v in (ino, mode, 0, 0, 2 if mode & 0o170000 == 0o040000 else 1, 0, len(data), 0, 0, 0, 0, len(nb), 0))
+    h += nb; h += b"\0" * (-len(h) % 4)
+    return h + data + b"\0" * (-len(data) % 4)
+
+
+def make_ramdisk(rd, key, add):
+    raw = run(["lz4", "-d", "-c"], rd)
+    ents, ti, tail = cpio_split(raw)
+    names = {e[0] for e in ents}
+    new = []
+    if add:
+        for n in (KEY_NAME, RC_NAME):
+            if n in names: raise Fail("ramdisk already has %s (refusing to overwrite)" % n)
+        ino = max(e[1] for e in ents)
+        for d in ("overlay.d", "overlay.d/sbin"):
+            if d not in names:
+                ino += 1; new.append(newc(d, ino, 0o040750))
+        ino += 1; new.append(newc(KEY_NAME, ino, 0o100644, key))
+        ino += 1; new.append(newc(RC_NAME, ino, 0o100644, RC.encode()))
+    out = b"".join(e[2] for e in ents[:ti]) + b"".join(new) + ents[ti][2] + tail
+    if not add and out != raw: raise Err("cpio re-serialisation differs from the input (bug)")
+    return run(["lz4", "-l", "-%d" % LZ4_LEVEL, "-c"], out)
+
+
+def mkboot(h, ramdisk, tmp):
+    for n, d in (("k", h["kernel"]), ("r", ramdisk)):
+        with open(os.path.join(tmp, n), "wb") as f: f.write(d)
+    cmd = [sys.executable, MKBOOTIMG,  # no -I: mkbootimg imports its sibling gki/ package (trusted, in-repo tools/third_party)
+           "--header_version", "4", "--kernel", os.path.join(tmp, "k"), "--ramdisk", os.path.join(tmp, "r"),
+           "--cmdline", h["cmdline"].decode("ascii"), "--output", os.path.join(tmp, "o.img")]
+    if h["os"]:
+        v, p = h["os"] >> 11, h["os"] & 0x7ff
+        cmd += ["--os_version", "%d.%d.%d" % (v >> 14, (v >> 7) & 0x7f, v & 0x7f), "--os_patch_level", "%d-%02d" % (2000 + (p >> 4), p & 15)]
+    run(cmd)
+    with open(os.path.join(tmp, "o.img"), "rb") as f: return f.read()
+
+
+def avb_boundary(base):
+    """original_image_size from the AVB footer (last 64 bytes, avbtool.py AvbFooter: '!4s2LQQQ28x'); FAIL if there is no footer."""
+    if len(base) < 64 or base[-64:-60] != b"AVBf": raise Fail("base has no AVB footer (last 64 bytes lack AVBf)")
+    b = struct.unpack_from("!QQQ", base, len(base) - 64 + 12)[0]
+    if b % PAGE or b > len(base) - 64: raise Fail("AVB footer original_image_size %d is not a page boundary inside the image" % b)
+    return b
+
+
+def derive(base, key, log, add):
+    h = parse_hdr(base)
+    bnd = avb_boundary(base)
+    if bnd < h["pages_end"]: raise Fail("AVB original_image_size %d is inside the base's ramdisk pages (end %d)" % (bnd, h["pages_end"]))
+    def full(o):   # new pages, zero fill up to the AVB boundary, then the base's vbmeta + footer verbatim
+        ph = parse_hdr(o); used = ph["pages_end"]
+        if used > bnd: raise Fail("derived header+kernel+ramdisk pages end at %d, past the AVB boundary %d (headroom exceeded)" % (used, bnd))
+        return o[:used] + b"\0" * (bnd - used) + base[bnd:], PAGE * (1 + (ph["ksz"] + PAGE - 1) // PAGE) + ph["rsz"]
+    with tempfile.TemporaryDirectory() as tmp:
+        if not os.path.isfile(MKBOOTIMG): raise Err("missing %s" % MKBOOTIMG)
+        rt, _ = full(mkboot(h, make_ramdisk(h["ramdisk"], key, False), tmp))
+        log("round-trip (no added entries, lz4 -l -%d): whole image (%d bytes, incl. AVB vbmeta+footer from %d) %s" % (LZ4_LEVEL, len(base), bnd, "byte-identical" if rt == base else "DIFFERENT"))
+        if rt != base: raise Fail("round-trip mismatch: the pipeline does not reproduce the base image")
+        out, used = full(mkboot(h, make_ramdisk(h["ramdisk"], key, add), tmp))
+    log("derived ramdisk ends at byte %d, AVB boundary %d: headroom %d bytes (base ramdisk ended at %d)" % (used, bnd, bnd - used, PAGE * (1 + (h["ksz"] + PAGE - 1) // PAGE) + h["rsz"]))
+    return out
+
+
+def check_key(key, p):
+    """exactly one line: base64 of the 524-byte adb RSA pubkey struct [obs: the host adbkey.pub decodes to 524 bytes] + optional ' user@host'."""
+    if b"PRIVATE" in key or b"-----" in key: raise Fail("%s looks like a private key / PEM, refusing" % p)
+    lines = key.split(b"\n")
+    if lines[-1] == b"": lines.pop()
+    if len(lines) != 1: raise Fail("%s: not exactly one line" % p)
+    m = re.fullmatch(rb"([A-Za-z0-9+/]+={0,2})( \S+)?", lines[0])
+    try:
+        n = len(base64.b64decode(m.group(1), validate=True)) if m else -1
+    except ValueError:
+        n = -1
+    if n != 524: raise Fail("%s is not an adb public key line (base64 of 524 bytes + optional comment)" % p)
+
+
+def inputs(base_p, key_p, pin, log):
+    if not os.path.isfile(base_p): raise Fail("base image not found: %s" % base_p)
+    with open(base_p, "rb") as f: base = f.read()
+    if sha(base) != pin: raise Fail("base sha256 %s is not the pinned %s" % (sha(base), pin))
+    try:
+        with open(key_p, "rb") as f: key = f.read()
+    except OSError:
+        raise Fail("adb public key missing: %s" % key_p)
+    if not key.strip(): raise Fail("adb public key is empty: %s" % key_p)
+    check_key(key, key_p)
+    log("base sha256 = PIN; key sha256 prefix %s (%d bytes, never printed)" % (sha(key)[:8], len(key)))
+    return base, key
+
+
+def tool_blob():
+    try:
+        return subprocess.run(["git", "hash-object", os.path.abspath(__file__)], capture_output=True, text=True).stdout.strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def build(a, log):
+    out, base_p, key_p, dry = os.path.join(HOME, "pixelios-factory"), None, os.path.join(HOME, ".android", "adbkey.pub"), False
+    base_p = os.path.join(HOME, "pixelios-factory", "magisk_patched-30700_vxeG1.img")
+    build_name, base_set = "cp3a", any(x == "--base" for x in a)
+    i = 0
+    while i < len(a):
+        if a[i] in ("--out", "--base", "--key", "--build") and i + 1 < len(a):
+            if a[i] == "--build": build_name = a[i + 1]
+            elif a[i] == "--out": out = a[i + 1]
+            elif a[i] == "--base": base_p = a[i + 1]
+            else: key_p = a[i + 1]
+            i += 2
+        elif a[i] == "--dry-run": dry = True; i += 1
+        else: raise Err("unknown/incomplete argument %r" % a[i])
+    if build_name != "cp3a" and not base_set: raise Err("--build %s needs an explicit --base (the default base is the cp3a image)" % build_name)
+    pin = read_pin(build_name)
+    base, key = inputs(base_p, key_p, pin, log)
+    parse_hdr(base)
+    chk = out
+    while not os.path.isdir(chk): chk = os.path.dirname(os.path.abspath(chk))
+    try:
+        ing = subprocess.run(["git", "-C", chk, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True).stdout.strip() == "true"
+    except OSError as e:   # rule 8: an unchecked --out is refused, never skipped silently (r2 N3)
+        raise Err("cannot run git to check that --out %s is outside a git work tree: %s" % (out, e))
+    if ing: raise Fail("--out %s is inside a git work tree (the image holds the host key; keep it out of repos)" % out)
+    name = "golden-unattended-%s-%s.img" % (pin[:8], sha(key)[:8])
+    if dry:
+        # A26 (AP-150): the dry run derives the image in memory (temp dir, nothing written to --out) so the round-trip and AVB headroom checks that FAIL a real build also FAIL here
+        derive(base, key, log, True)
+        log("DRY-RUN: would write %s{,.sha256,.manifest.json}; ramdisk += %s %s (+ dirs if absent); lz4 -l -%d; round-trip and AVB headroom checked (nothing written)" % (os.path.join(out, name), KEY_NAME, RC_NAME, LZ4_LEVEL))
+        return "PASS dry-run"
+    img = derive(base, key, log, True)
+    isha = sha(img)
+    man = dict(image=name, image_sha256=isha, size=len(img), base_path=os.path.abspath(base_p), base_sha256=sha(base), key_path=os.path.abspath(key_p),
+               key_sha256=sha(key), overlay=[dict(name=KEY_NAME, mode="0644", sha256=sha(key)), dict(name=RC_NAME, mode="0644", sha256=sha(RC.encode())),
+               dict(name="overlay.d", mode="0750 (if absent)"), dict(name="overlay.d/sbin", mode="0750 (if absent)")], tool_blob=tool_blob(), lz4_level=LZ4_LEVEL)
+    os.makedirs(out, exist_ok=True)
+    p = os.path.join(out, name)
+    for path, data in ((p, img), (p + ".sha256", ("%s  %s\n" % (isha, name)).encode()), (p + ".manifest.json", (json.dumps(man, indent=1, sort_keys=True) + "\n").encode())):
+        with open(path + ".tmp", "wb") as f: f.write(data)
+        os.replace(path + ".tmp", path)
+    log("wrote %s sha256=%s" % (p, isha))
+    return "PASS built %s" % name
+
+
+def verify(a, log):
+    key_p = os.path.join(HOME, ".android", "adbkey.pub")
+    build_name = "cp3a"
+    while len(a) >= 3 and a[-2] in ("--key", "--build"):
+        if a[-2] == "--key": key_p = a[-1]
+        else: build_name = a[-1]
+        a = a[:-2]
+    if len(a) != 1: raise Err("usage: verify IMG [--key PUB] [--build cp3a|bp31]")
+    p = a[0]
+    try:
+        with open(p, "rb") as f: img = f.read()
+        with open(p + ".manifest.json") as f: man = json.load(f)
+        for k in ("image_sha256", "base_path", "base_sha256", "key_sha256"): man[k]
+    except (OSError, ValueError, KeyError) as e:
+        raise Fail("image or manifest unreadable/incomplete: %r" % (e,))
+    pin = read_pin(build_name)
+    if man["base_sha256"] != pin: raise Fail("manifest base sha256 %s != PIN" % man["base_sha256"])
+    if sha(img) != man["image_sha256"]: raise Fail("image sha256 %s != manifest %s" % (sha(img), man["image_sha256"]))
+    base, key = inputs(man["base_path"], key_p, pin, log)   # the CURRENT host key, not the manifest's key_path
+    if sha(key) != man["key_sha256"]: raise Fail("current key %s has sha256 %s, not the manifest's key_sha256 (image was built for another key)" % (key_p, sha(key)[:8]))
+    if derive(base, key, log, True) != img: raise Fail("rebuild from the manifest inputs differs from the image")
+    log("image_sha256=%s" % man["image_sha256"])
+    return "PASS verified %s" % man["image_sha256"][:16]
+
+
+def main():
+    try:
+        log = Log()
+    except OSError as e:
+        print("RESULT: ERROR cannot create the log dir: %s" % e); return 2
+    try:
+        if len(sys.argv) < 2 or sys.argv[1] not in ("build", "verify"): raise Err("usage: golden-unattended-image build [--out DIR] [--base IMG] [--key PUB] [--build cp3a|bp31] [--dry-run] | verify IMG [--key PUB] [--build cp3a|bp31]")
+        r = (build if sys.argv[1] == "build" else verify)(sys.argv[2:], log)
+        log("RESULT: " + r); return 0
+    except Fail as e:
+        log("RESULT: FAIL %s" % e); return 1
+    except Err as e:
+        log("RESULT: ERROR %s" % e); return 2
+    except Exception as e:   # rule 8: an internal error still ends in a RESULT line
+        log("RESULT: ERROR internal %s: %s" % (type(e).__name__, e)); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

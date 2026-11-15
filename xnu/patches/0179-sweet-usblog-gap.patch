@@ -1,0 +1,95 @@
+SWEET usb log GAP (patch 0179, rule 8): the live USB log thread (bsd/dev/sweet_usb.c ud_log_thread, patch 0075) lost data silently twice. (1) sweet_log_copy (bsd/dev/sweet_ufs.c) moves the reader past bytes the 4 MiB console ring already overwrote when the drain falls more than the ring behind; the caller now computes that jump (pos - n - before) and sends "SWEET GAP: usb log drain fell behind the console ring, at least N bytes lost (event E, T bytes lost so far)" as its own UDP datagram (never printf: the line would go into the ring this thread reads). (2) A chunk whose sock_send failed (no route/ARP yet) was dropped; pos now steps back so it is resent next round. sweet_log_copy and the QR reader (sweet_qr.c, qs_feed carries the offset) are unchanged. The count is a lower bound (a writer reserves ring space before it writes; bytes under a concurrent write are not counted, review usblog-gap-0179-r1 F2). The send loop is a static helper ud_log_drain (host test tools/test_usblog_gap_c.py). Not run on hardware.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 21ebc7d..4acb5f7 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1147,10 +1147,68 @@
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+ 
++static int
++ud_log_send(socket_t so, struct sockaddr_in *to, char *buf, size_t len)
++{
++	struct iovec iov = { .iov_base = buf, .iov_len = len };
++	struct msghdr msg = {
++		.msg_name = to, .msg_namelen = sizeof(*to),
++		.msg_iov = &iov, .msg_iovlen = 1,
++	};
++	size_t sent = 0;
++	return sock_send(so, &msg, 0, &sent);
++}
++
++/*
++ * PixOS patch 0179 (rule 8): sweet_log_copy moves pos past bytes the ring already overwrote;
++ * pos - n - before is that jump. Report it in its own datagram, not with printf (the line would
++ * go into the ring this reads). The count is a lower bound: a writer reserves ring space before
++ * it writes, so bytes under a concurrent write are not counted. State survives failed rounds.
++ */
++struct ud_log_gap {
++	uint64_t skipped, skipped_total;
++	uint32_t events;
++};
++
++static void
++ud_log_drain(socket_t so, struct sockaddr_in *to, uint64_t *pos, struct ud_log_gap *g, char *chunk, uint32_t chunk_max)
++{
++	static char gap[160];
++	uint32_t n;
++	uint64_t before = *pos;
++
++	while ((n = sweet_log_copy(pos, chunk, chunk_max)) > 0) {
++		g->skipped += *pos - n - before;
++		if (g->skipped != 0) {
++			int len = snprintf(gap, sizeof(gap), "\nSWEET GAP: usb log drain fell behind the console ring, "
++			    "at least %llu bytes lost (event %u, %llu bytes lost so far)\n", (unsigned long long)g->skipped,
++			    g->events + 1, (unsigned long long)(g->skipped_total + g->skipped));
++			if (len < 0) {
++				len = 0;
++			} else if (len >= (int)sizeof(gap)) {
++				len = (int)sizeof(gap) - 1;
++			}
++			if (ud_log_send(so, to, gap, (size_t)len) != 0) {
++				*pos -= n;      /* keep the chunk and the pending count for the next round */
++				break;
++			}
++			g->skipped_total += g->skipped;
++			g->events++;
++			g->skipped = 0;
++		}
++		if (ud_log_send(so, to, chunk, n) != 0) {
++			*pos -= n;      /* no route/ARP yet: resend this chunk later instead of dropping it */
++			break;
++		}
++		before = *pos;
++	}
++}
++
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	static char chunk[1400];
++	struct ud_log_gap g = { 0, 0, 0 };
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
+@@ -1170,18 +1228,7 @@
+ 			so = NULL;
+ 			continue;
+ 		}
+-		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+-			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+-			struct msghdr msg = {
+-				.msg_name = &to, .msg_namelen = sizeof(to),
+-				.msg_iov = &iov, .msg_iovlen = 1,
+-			};
+-			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
+-			}
+-		}
++		ud_log_drain(so, &to, &pos, &g, chunk, sizeof(chunk));
+ 	}
+ }
+ 

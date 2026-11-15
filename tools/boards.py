@@ -181,11 +181,67 @@ def _acpm_check(a):
 
 
 # DVFS (docs/research/25): channel and domain indexes are pinned like the rest of the ACPM block.
+# SLC service (SWEET PROBE, xnu patch 0363, docs/research/161 s.1): ACPM channels of the stock DT node slc-acpm (10) and its child `async` (11) [obs stock DT capture, research 161 s.1.1],
+# PT_VERSION 0xd005 and PT_VERSION_KNOWN 1 [src SG kernel/google-modules/soc/gs @ 20407875 drivers/soc/google/pt/slc_acpm.c:29-36, :160-195]. The ONLY SLC opcode the shim may ever build is PT_VERSION.
+_ACPM_SLC = {"ch_id": 10, "async_ch_id": 11, "pt_version": 0xd005, "known_major": 1}
 _ACPM_DVFS_CH = 1                                     # gs101.dtsi:720 (exynos_dm acpm-ipc-channel = <1>)
 _ACPM_DVFS_DOMS = {"CPUCL0": 2, "CPUCL1": 3, "CPUCL2": 4,   # dt-bindings/clock/gs101.h:305-307 (GET_IDX = id & 0xFFFF)
-                   "G3D": 5, "G3DL2": 6}                    # gs101-gpu.dtsi:46-47 (ACPM_DVFS_G3DL2 / _G3D); indices OBSERVED: fvmap header type == index (runs fvmap1, g0b)
+                   "G3D": 5, "G3DL2": 6,                    # gs101-gpu.dtsi:46-47 (ACPM_DVFS_G3DL2 / _G3D); indices OBSERVED: fvmap header type == index (runs fvmap1, g0b)
+                   "MIF": 0, "INT": 1}                      # dt-bindings/clock/gs101.h:303-304 [src]; OBSERVED: `SWEET FVMAP: dom 0 type=0 num_of_lv=13`, `dom 1 type=1 num_of_lv=7` (run gputest-bbb3-mem)
+_ACPM_DVFS_MEM = ("MIF", "INT")                             # --mif-clk only (T-5030): MIF may be asked its table TOP row only, INT is never requested (dvfs_set class 2 refuses it by class; ceiling = lowest row only stops a raise)
+_MIF_TOP_KHZ = 3172000                                      # fvmap dom 0 lv 0 = Linux gs101.dtsi:837 devfreq max_freq 3172000 [obs + src]
+# --mif-clk-level (ALL-ON T-02): the MIF operating points and the INT row Linux pairs with each, gs101.dtsi mif_int_map (devfreq_mif@17000010, lines 875-893, rows 878-890,
+# "mif_clk int_clk"; android.googlesource.com kernel/devices/google/gs101 android-gs-bluejay-6.1-android16 dts/gs101.dtsi, fetched 2026-11-12) [read from source]. The 13 MIF rows
+# equal the observed fvmap dom 0 rows (run gputest-bbb3-mem, soc.json acpm.dvfs MIF) and freq_info <421000 .. 3172000> (:837). A shim image asks MIF for ONE of these rows
+# (build.sh -DMIF_CLK_LEVEL_KHZ, validated by mif_clk_level). The INT column is kept as the citation only: this tree has no INT request, so no INT value is ever asked.
+_MIF_INT_MAP = ((3172000, 465000), (2730000, 465000), (2535000, 465000), (2288000, 465000), (2028000, 332000), (1716000, 332000), (1539000, 267000),
+                (1352000, 200000), (1014000, 155000), (845000, 155000), (676000, 155000), (546000, 100000), (421000, 100000))
 _ACPM_DVFS_GPU = ("G3D", "G3DL2")                           # --gpu-clk only: ceiling = the init level, never a CPU --dvfs target
 _ACPM_DVFS_MAXLV = 24
+
+# --gpu-clk-level (T-a214, T-50eb): the DT v2 operating points as (G3DL2, G3D) kHz, rows 0..11 in file order, read from source: Pixel kbase platform DT
+# gs101-gpu.dtsi:55-90 (gpu_dvfs_table_v2, columns "gpu0 clk" = G3DL2 = gpu0_cmu_cal_id, "gpu1 clk" = G3D = gpu1_cmu_cal_id, :46-47; local copy
+# ~/pixelios-artifacts/refs/kbase-bluejay/). Every value must be a row of the soc.json fvmap table of its domain (observed run g0b) and G3DL2 >= G3D (Linux
+# pixel_gpu_dvfs.c:105-114). A shim image may ask for ONE pair only: level N in 0.._GPU_CLK_LEVELS-1 AND both rates at or below _GPU_DVFS_CEIL.
+_GPU_DVFS_V2 = ((996000, 848000), (996000, 762000), (885000, 701000), (750000, 572000), (750000, 510000), (603000, 471000),
+                (603000, 400000), (603000, 351000), (434000, 302000), (434000, 251000), (302000, 202000), (302000, 151000))
+_GPU_CLK_LEVELS = 4                                 # --gpu-clk-level accepts 0..3; row 0 (G3D 848000) is above the stock max and refused below
+_GPU_DVFS_CEIL = {"G3D": 762000, "G3DL2": 996000}   # = DT v2 row 1 (996000 / 762000) = the stock maximum (gs101-gpu.dtsi:94 gpu_dvfs_max_freq 800000, pixel_gpu_dvfs.c:666,745-747); was row 3 (T-50eb); sprint-gpu 2026-11-08, docs/reviews/sprint-gpu-clk848-review.md (row 0 refused: above stock)
+# fvmap voltage of the ceiling pair's rows as (G3DL2 uV, G3D uV), OBSERVED run g0b (T-50eb log step 1, ticket archive; docs/research/27): G3DL2 750000 = 731250,
+# G3D 572000 = 662500. The shim compares the S2MPG11 OUT1 readback with them after the request (T-50eb review F1); 0 = unknown, the shim then says so (GPU GAP).
+# Rows 0..2 (sprint-gpu 2026-11-08): OBSERVED `SWEET FVMAP: dom 5 lv 0 rate=848000 volt=756250`, `lv 1 rate=762000 volt=718750`, `lv 2 rate=701000 volt=700000`,
+# `dom 6 lv 0 rate=996000 volt=775000`, `lv 1 rate=885000 volt=775000` (run 20261108T151209Z-gputest-nav20).
+_GPU_DVFS_UV = {(996000, 848000): (775000, 756250), (996000, 762000): (775000, 718750), (885000, 701000): (775000, 700000), (750000, 572000): (731250, 662500)}
+
+
+def _gpu_clk_pairs_check(dv):
+    """The DT pair table must only use fvmap rows, keep G3DL2 >= G3D, and its row _GPU_CLK_LEVELS-1 .. ceiling pair must exist."""
+    rows = {d["name"]: d["rates_khz"] for d in dv["domains"]}
+    for i, (l2, g3d) in enumerate(_GPU_DVFS_V2):
+        if l2 not in rows["G3DL2"] or g3d not in rows["G3D"]:
+            raise ValueError(f"gpu dvfs pair {i} ({l2}/{g3d}): not a row of the soc.json fvmap tables (G3DL2/G3D)")
+        if l2 < g3d:
+            raise ValueError(f"gpu dvfs pair {i} ({l2}/{g3d}): G3DL2 must be >= G3D (pixel_gpu_dvfs.c:105-114)")
+    if (_GPU_DVFS_CEIL["G3DL2"], _GPU_DVFS_CEIL["G3D"]) not in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]:
+        raise ValueError("the GPU ceiling pair must be one of the accepted DT pairs")
+    if (_GPU_DVFS_CEIL["G3DL2"], _GPU_DVFS_CEIL["G3D"]) not in _GPU_DVFS_UV:
+        raise ValueError("the GPU ceiling pair needs its observed fvmap voltages in _GPU_DVFS_UV (undervolt check, T-50eb review F1)")
+
+
+def gpu_clk_level(board, text):
+    """'N' (--gpu-clk-level) -> (G3DL2 kHz, G3D kHz). Refused with the reason unless N is 0..3 and the pair is at or below the reviewed ceilings."""
+    try:
+        n = int(str(text), 10)
+    except ValueError:
+        raise ValueError(f"--gpu-clk-level {text!r}: not a number (a DT pair index 0..{_GPU_CLK_LEVELS - 1})") from None
+    if not 0 <= n < _GPU_CLK_LEVELS:
+        raise ValueError(f"--gpu-clk-level {n}: only DT pair indexes 0..{_GPU_CLK_LEVELS - 1} are accepted (no other level was reviewed)")
+    l2, g3d = _GPU_DVFS_V2[n]
+    dv = BOARDS[board]["acpm"]["dvfs"]
+    _gpu_clk_pairs_check(dv)
+    if l2 > _GPU_DVFS_CEIL["G3DL2"] or g3d > _GPU_DVFS_CEIL["G3D"]:
+        raise ValueError(f"--gpu-clk-level {n}: pair {l2}/{g3d} kHz is above the ceiling {_GPU_DVFS_CEIL['G3DL2']}/{_GPU_DVFS_CEIL['G3D']} kHz (G3DL2/G3D)")
+    return l2, g3d
 
 
 # S2MPG11 registers read by --gpu-rails (GK include/linux/mfd/samsung/s2mpg11-register.h:26-100, regulator descriptors s2mpg11-regulator.c:226-275, group constants register.h:308-315,
@@ -263,14 +319,41 @@ def _acpm_dvfs_check(a):
             raise ValueError(f"acpm.dvfs {d['name']}: rates_khz must be 2..{_ACPM_DVFS_MAXLV} strictly decreasing positive integers")
         if d["ceiling_khz"] not in r:
             raise ValueError(f"acpm.dvfs {d['name']}: ceiling_khz {d['ceiling_khz']} is not one of the table rows")
-        if d["name"] in _ACPM_DVFS_GPU and (d["ceiling_khz"] != r[-1] or d["ceiling_khz"] != _GPU_PINS["clk_khz"]):
-            raise ValueError(f"acpm.dvfs {d['name']}: the GPU ceiling must be the firmware's init level {_GPU_PINS['clk_khz']} kHz = its last row (observed run g0b)")
+        if d["name"] in _ACPM_DVFS_GPU:
+            if d["ceiling_khz"] != _GPU_DVFS_CEIL[d["name"]]:
+                raise ValueError(f"acpm.dvfs {d['name']}: the GPU ceiling is pinned to {_GPU_DVFS_CEIL[d['name']]} kHz (tools/boards.py _GPU_DVFS_CEIL = the reviewed level pair, "
+                                 f"{d['ceiling_khz']} given); change the pin, its citation and the review together")
+            if _GPU_PINS["clk_khz"] not in r or _GPU_PINS["clk_khz"] > d["ceiling_khz"]:
+                raise ValueError(f"acpm.dvfs {d['name']}: the firmware's init level {_GPU_PINS['clk_khz']} kHz must be a table row at or below the ceiling (observed run g0b)")
+        if d["name"] == "MIF" and (d["ceiling_khz"] != _MIF_TOP_KHZ or r[0] != _MIF_TOP_KHZ):
+            raise ValueError(f"acpm.dvfs MIF: ceiling_khz {d['ceiling_khz']} and the first row {r[0]} are pinned to {_MIF_TOP_KHZ} kHz (the table TOP row, the only rate --mif-clk may ask; T-5030)")
+        if d["name"] == "MIF" and r != [m for m, _ in _MIF_INT_MAP]:
+            raise ValueError(f"acpm.dvfs MIF: rates_khz {r} != the gs101.dtsi mif_int_map rows {[m for m, _ in _MIF_INT_MAP]} (the allowlist of --mif-clk-level; tools/boards.py _MIF_INT_MAP, cited there)")
+        if d["name"] == "INT" and any(i not in r for _, i in _MIF_INT_MAP):
+            raise ValueError(f"acpm.dvfs INT: rates_khz {r} lacks a mif_int_map INT value (tools/boards.py _MIF_INT_MAP)")
+        if d["name"] == "INT" and d["ceiling_khz"] != r[-1]:
+            raise ValueError(f"acpm.dvfs INT: ceiling_khz {d['ceiling_khz']} must be the LOWEST row {r[-1]} (INT requests are refused by class in dvfs_set, the ceiling only stops a raise; T-5030)")
+    _gpu_clk_pairs_check(dv)
+
+
+def mif_clk_level(board, text):
+    """'KHZ' (--mif-clk-level) -> the kHz to ask MIF for. Refused with the reason unless KHZ is a plain decimal number that is exactly a row of the soc.json MIF table
+    (= the gs101.dtsi mif_int_map rows)."""
+    if not isinstance(text, str) or not text.isascii() or not text.isdigit() or str(int(text)) != text:
+        raise ValueError(f"--mif-clk-level {text!r}: not a plain decimal kHz number (a MIF table row)")
+    khz = int(text)
+    a = BOARDS[board]["acpm"]
+    _acpm_dvfs_check(a)
+    rows = [d["rates_khz"] for d in a["dvfs"]["domains"] if d["name"] == "MIF"][0]
+    if khz not in rows:
+        raise ValueError(f"--mif-clk-level {khz}: not a MIF table row; the rows are {rows} (gs101.dtsi mif_int_map, tools/boards.py _MIF_INT_MAP)")
+    return khz
 
 
 def dvfs_requests(board, csv):
     """'K0,K1,K2' (kHz, 0 = leave that cluster) -> three ints, each 0 or a row of the domain's table at or below its ceiling.
     The shim re-checks the same in acpm.c; refusing here keeps a bad request out of the image altogether."""
-    doms = [d for d in BOARDS[board]["acpm"]["dvfs"]["domains"] if d["name"] not in _ACPM_DVFS_GPU]	# CPU clusters only
+    doms = [d for d in BOARDS[board]["acpm"]["dvfs"]["domains"] if d["name"] not in _ACPM_DVFS_GPU + _ACPM_DVFS_MEM]	# CPU clusters only
     vals = [int(x) for x in csv.split(",")]
     if len(vals) != len(doms):
         raise ValueError(f"--dvfs needs {len(doms)} comma separated kHz values (CL0,CL1,CL2; 0 = leave), got {len(vals)}")
@@ -339,18 +422,118 @@ def _acpm_macros(v):
                 n("S11_ON_VSEL_MIN", _s11_vsel(_num(r["min_uv"]), s11))
                 n("S11_ON_VSEL_MAX", _s11_vsel(_num(r["max_uv"]), s11))
                 n("S11_ON_SOFT_US", r["soft_start_us"])
+    if "slc" in a:
+        sl = a["slc"]
+        for k, v in _ACPM_SLC.items():
+            if _num(sl[k]) != v:
+                raise ValueError(f"acpm.slc.{k} = {sl[k]!r}: pinned to {v:#x} (tools/boards.py _ACPM_SLC, cited there)")
+        if set(sl) != set(_ACPM_SLC):
+            raise ValueError(f"acpm.slc: keys {sorted(sl)} != {sorted(_ACPM_SLC)}")
+        n("SLC_CH", sl["ch_id"])
+        n("SLC_ASYNC_CH", sl["async_ch_id"])
+        out.append(f"#define ACPM_SLC_PT_VERSION {_num(sl['pt_version']):#x}")
+        n("SLC_KNOWN_MAJOR", sl["known_major"])
     if "dvfs" in a:
         _acpm_dvfs_check(a)
         doms = a["dvfs"]["domains"]
         n("DVFS_CH", a["dvfs"]["ch_id"])
-        n("DVFS_N", len([d for d in doms if d["name"] not in _ACPM_DVFS_GPU]))	# CPU clusters: what the touch probe iterates
+        n("DVFS_N", len([d for d in doms if d["name"] not in _ACPM_DVFS_GPU + _ACPM_DVFS_MEM]))	# CPU clusters: what the touch probe iterates
         n("DVFS_NALL", len(doms))									# all configured domains (CPU + GPU): the acpm.c tables
         out.append("#define ACPM_DVFS_GPU_IDXS " + ", ".join(str(d["idx"]) for d in doms if d["name"] in _ACPM_DVFS_GPU))
+        out.append("#define ACPM_DVFS_MEM_IDXS " + ", ".join(str(d["idx"]) for d in doms if d["name"] in _ACPM_DVFS_MEM))
+        n("DVFS_MIF_IDX", _ACPM_DVFS_DOMS["MIF"])
+        n("DVFS_MIF_KHZ", _MIF_TOP_KHZ)
+        # constant expression (usable in _Static_assert): the rows --mif-clk-level may ask
+        out.append("#define ACPM_DVFS_MIF_LEVEL_OK(k) (" + " || ".join(f"(k) == {m}" for m, _ in _MIF_INT_MAP) + ")")
         n("DVFS_MAXLV", _ACPM_DVFS_MAXLV)
         out.append("#define ACPM_DVFS_IDXS " + ", ".join(str(d["idx"]) for d in doms))
         out.append("#define ACPM_DVFS_CEILS " + ", ".join(str(d["ceiling_khz"]) for d in doms))
         out.append("#define ACPM_DVFS_NRS " + ", ".join(str(len(d["rates_khz"])) for d in doms))
         out.append("#define ACPM_DVFS_ROWS " + ", ".join("{ " + ", ".join(str(x) for x in d["rates_khz"]) + " }" for d in doms))
+        out.append(f"#define GPU_CLK_NLEVELS {_GPU_CLK_LEVELS}")
+        out.append("#define GPU_CLK_PAIRS " + ", ".join(f"{{ {l2}, {g3d} }}" for l2, g3d in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]))	# { G3DL2, G3D } kHz, gpuclk.c indexes it by GPU_CLK_LEVEL
+        out.append("#define GPU_CLK_UVS " + ", ".join("{ %d, %d }" % _GPU_DVFS_UV.get(pr, (0, 0)) for pr in _GPU_DVFS_V2[:_GPU_CLK_LEVELS]))	# { G3DL2, G3D } uV aligned with GPU_CLK_PAIRS, 0 = not observed
+    return out
+
+
+# --el2-trap stage-2 constants (docs/specs/SPEC-EL2-PROXY-PROBE.md "SPEC" = S/docs/specs/SPEC-EL2-PROXY-PROBE.md, section 3.3.3-3.3.7). Every field cites the spec line that cites the
+# Linux v6.6 / Arm source (L = raw.githubusercontent.com/torvalds/linux/v6.6/<path>); a constant that no cite covers is not here. soc.json cpu_id_aa64mmfr0 is the observed CPU fact.
+_EL2_GRANULE_SHIFT = 14      # 16K granule: SPEC 3.3.3 "L2[i] = block for IPA i << 25 (32 MiB blocks for 16K, as K/shim/mmu.c:21-23)", mmu.c PG_SHIFT 14 / BLK_SHIFT 25
+_EL2_TG0_16K = 2             # VTCR TG0 [15:14] = 2 (16K): SPEC 3.3.4 last bullet "TG0 [15:14] = 2 (16K)" [L pgtable-hwdef.h:199,208-264]
+_EL2_SL0_LVL2 = 1            # SL0 [7:6] = 1: start at level 2 for 16K: SPEC 3.3.4 [L kvm_arm.h:163-186 "Level 2 | 16K/64K = 1"]
+_EL2_IRGN0 = _EL2_ORGN0 = 0  # non-cacheable walks: SPEC 3.3.4 [L pgtable-hwdef.h:210,233]
+_EL2_SH0_INNER = 3           # SH0 [13:12] = 3: SPEC 3.3.4 last bullet
+_EL2_VS_8BIT = 0             # VS [19] = 0 (8-bit VMID): SPEC 3.3.4 last bullet
+_EL2_VTCR_RES1_BIT = 31      # RES1 bit 31: SPEC 3.3.4 last bullet [L kvm_arm.h:111-113,123-143]
+_EL2_PARANGE_40 = 2          # PARange 0b0010 = 40-bit [SPEC 1.3 web :1451-1454]; VTCR PS [18:16] = 2 = 40-bit (TCR_EL2_PS_40B) [SPEC 3.3.4, L kvm_arm.h:113]; only this encoding is cited
+# stage-2 descriptor fields [SPEC 3.3.3 "Descriptor fields", L arch/arm64/kvm/hyp/pgtable.c:15-17,32-37,45]: valid bit 0; type bit 1 (block 0, page/table 1); MemAttr [5:2]; S2AP_R bit 6; S2AP_W bit 7; SH [9:8] (inner = 3); AF bit 10; XN bit 54
+_EL2_MT_S2_NORMAL, _EL2_MT_S2_DEVICE_NGNRE = 0xF, 0x1   # [SPEC 3.3.3, L arch/arm64/include/asm/memory.h:149-150]
+
+
+def _el2_s2_values(v):
+    """Derived constants of the --el2-trap EL2 stage-2 map from the cited fields above, soc.json cpu_id_aa64mmfr0 and board.json dram_banks. Fails (ValueError) on a value no cite covers:
+    a granule/PARange the field tables were not read for, a bank that is not 32 MiB aligned (an L2 block would be partly Normal, partly Device: SPEC 3.3.3), banks that overlap, or an
+    address (bank top, xnu_ram top, any top-level soc/board *_base + *_size, fb_base) that does not fit in the 2^(64 - T0SZ) IPA space. Returns plain ints / tuples."""
+    mmfr0 = _num(v["cpu_id_aa64mmfr0"])
+    parange, tgran16, tgran16_2 = mmfr0 & 0xF, (mmfr0 >> 20) & 0xF, (mmfr0 >> 32) & 0xF
+    if parange != _EL2_PARANGE_40 or tgran16 != 1 or tgran16_2 != 0:
+        raise ValueError(f"cpu_id_aa64mmfr0 {mmfr0:#x}: PARange {parange} / TGran16 {tgran16} / TGran16_2 {tgran16_2}; SPEC 1.3 cites only PARange 2, TGran16 1, TGran16_2 0 (16K usable at stage 2)")
+    g = _EL2_GRANULE_SHIFT
+    idx_bits = g - 3                      # 8-byte descriptors: 2^(g-3) per table = 2048
+    blk_shift = g + idx_bits              # one L2 entry maps 2^25 = 32 MiB
+    ipa_bits = blk_shift + idx_bits       # SL0 = 1 (start level 2): one L2 table is the whole IPA space = 2^36
+    t0sz = 64 - ipa_bits
+    ps = parange
+    vtcr = (t0sz | (_EL2_SL0_LVL2 << 6) | (_EL2_IRGN0 << 8) | (_EL2_ORGN0 << 10) | (_EL2_SH0_INNER << 12) | (_EL2_TG0_16K << 14)
+            | (ps << 16) | (_EL2_VS_8BIT << 19) | (1 << _EL2_VTCR_RES1_BIT))
+    banks = sorted((int(b), int(n)) for b, n in v["dram_banks"])
+    if not banks:
+        raise ValueError("dram_banks is empty")
+    blk = 1 << blk_shift
+    for b, n in banks:
+        if n <= 0 or b % blk or n % blk:
+            raise ValueError(f"dram_banks {b:#x}+{n:#x}: not on 32 MiB (1 << {blk_shift}) boundaries")
+    for (b0, n0), (b1, _n1) in zip(banks, banks[1:]):
+        if b0 + n0 > b1:
+            raise ValueError(f"dram_banks {b0:#x}+{n0:#x} overlaps the bank at {b1:#x}")
+    tops = [b + n for b, n in banks]
+    xb, xn = v["xnu_ram"]
+    tops.append(int(xb) + int(xn))
+    for k, val in v.items():
+        if k.endswith("_base") and isinstance(val, int):
+            size = v.get(k[:-5] + "_size")
+            tops.append(val + (size if isinstance(size, int) else 1))
+    top = max(tops)
+    if top > 1 << ipa_bits:
+        raise ValueError(f"an address top {top:#x} exceeds the 2^{ipa_bits} IPA space of T0SZ {t0sz}")
+    # descriptors (valid | type | MemAttr | S2AP | SH | AF | XN)
+    def desc(mt, sh, xn, typ):
+        return 1 | (typ << 1) | (mt << 2) | (1 << 6) | (1 << 7) | (sh << 8) | (1 << 10) | (xn << 54)
+    # Normal + inner-shareable + executable for DRAM; Device-nGnRE + XN for the rest, S2AP RW and AF everywhere (SPEC 3.3.3). SPEC does not say SH for Device: left 0 (see commit message / report).
+    out = {"T0SZ": t0sz, "IPA_BITS": ipa_bits, "VTCR": vtcr, "GRANULE_SHIFT": g, "BLK_SHIFT": blk_shift, "TBL_ENTRIES": 1 << idx_bits,
+           "DESC_BLOCK_NORMAL": desc(_EL2_MT_S2_NORMAL, 3, 0, 0), "DESC_BLOCK_DEVICE": desc(_EL2_MT_S2_DEVICE_NGNRE, 0, 1, 0),
+           "DESC_PAGE_NORMAL": desc(_EL2_MT_S2_NORMAL, 3, 0, 1), "DESC_PAGE_DEVICE": desc(_EL2_MT_S2_DEVICE_NGNRE, 0, 1, 1),
+           "DESC_TABLE": 3, "DESC_INVALID": 0}
+    gicd = v["gicd_base"]
+    out["T2_IPA"] = gicd
+    out["T2_L2_IDX"] = gicd >> blk_shift
+    out["T2_L3_IDX"] = (gicd >> g) & ((1 << idx_bits) - 1)
+    out["BANKS"] = tuple(banks)
+    return out
+
+
+def _el2_macros(v):
+    """EL2_* macros for shim/el2.c / el2.S (--el2-trap); unused (so the image is unchanged) without the define."""
+    if "cpu_id_aa64mmfr0" not in v or "dram_banks" not in v:
+        return []
+    d = _el2_s2_values(v)
+    out = []
+    for k in ("T0SZ", "IPA_BITS", "GRANULE_SHIFT", "BLK_SHIFT", "TBL_ENTRIES", "T2_L2_IDX", "T2_L3_IDX"):
+        out.append(f"#define EL2_{k} {d[k]}")
+    for k in ("VTCR", "DESC_BLOCK_NORMAL", "DESC_BLOCK_DEVICE", "DESC_PAGE_NORMAL", "DESC_PAGE_DEVICE", "DESC_TABLE", "DESC_INVALID", "T2_IPA"):
+        out.append(f"#define EL2_{k} 0x{d[k]:X}UL")
+    out.append(f"#define EL2_DRAM_NBANKS {len(d['BANKS'])}")
+    out.append("#define EL2_DRAM_BANKS " + ", ".join("{ 0x%XUL, 0x%XUL }" % (b, n) for b, n in d["BANKS"]))
     return out
 
 
@@ -396,6 +579,7 @@ def c_header(board: str) -> str:
         lines += _touch_macros(values)
     if "acpm" in values:
         lines += _acpm_macros(values)
+    lines += _el2_macros(values)
     lines.append(f"#define BOARD_BLUEJAY {1 if this_soc == 'GS101' else 0}")
     lines.append(f"#define BOOT_HEADER_VERSION {values['boot_header_version']}")
     return "\n".join(lines) + "\n"
@@ -463,8 +647,23 @@ if __name__ == "__main__":
     parser.add_argument("--wlan-seq", action="store_true", help="write the --wlan-link table header (soc wlan_seq.json) instead of board_config.h")
     parser.add_argument("--get", metavar="KEY", help="print device_dir | soc_dir | any board value")
     parser.add_argument("--dvfs-check", metavar="K0,K1,K2", help="validate a --dvfs request, print the three values")
+    parser.add_argument("--mif-clk-level-check", metavar="KHZ", help="validate a --mif-clk-level request, print the kHz")
+    parser.add_argument("--mif-clk-levels", action="store_true", help="print the rows --mif-clk-level accepts")
+    parser.add_argument("--gpu-clk-level-check", metavar="N", help="validate a --gpu-clk-level request, print 'G3DL2_kHz G3D_kHz'")
     args = parser.parse_args()
-    if args.dvfs_check is not None:
+    if args.mif_clk_levels:
+        print(" ".join(str(m) for m, _ in _MIF_INT_MAP))
+    elif args.mif_clk_level_check is not None:
+        try:
+            print(mif_clk_level(args.board, args.mif_clk_level_check))
+        except (ValueError, KeyError) as exc:
+            raise SystemExit(f"error: {exc}")
+    elif args.gpu_clk_level_check is not None:
+        try:
+            print(" ".join(str(x) for x in gpu_clk_level(args.board, args.gpu_clk_level_check)))
+        except (ValueError, KeyError) as exc:
+            raise SystemExit(f"error: {exc}")
+    elif args.dvfs_check is not None:
         try:
             print(" ".join(str(x) for x in dvfs_requests(args.board, args.dvfs_check)))
         except (ValueError, KeyError) as exc:

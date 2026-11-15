@@ -92,6 +92,25 @@ int main(void)
 		       pa == MBOX + ACPM_INTGR1 || pa == MBOX + ACPM_INTCR0);
 	}
 	EXPECT(pmic[0x15] == 0xC0 && pmic[0x16] == 0x6C && pmic[0x52] == 0x10);
+	/* gpu_rails_uv (T-50eb review F1): same ten reads, OUT1 uV through the pointers (BUCK2S then BUCK8S); either pointer may be 0 */
+	{
+		uint32_t b2s = 1, b8s = 2;
+
+		setup(ESZ);
+		pmic[0x16] = 0x6C; pmic[0x26] = 0x50;
+		nl = 0;
+		EXPECT(gpu_rails_uv(&b2s, &b8s) == 0 && nbell == 10 && b2s == 875000 && b8s == 700000);
+		setup(ESZ); pmic[0x16] = 0x6C; pmic[0x26] = 0x50; b2s = 1; b8s = 2;
+		nl = 0;
+		EXPECT(gpu_rails_uv(0, &b8s) == 0 && b2s == 1 && b8s == 700000);
+		setup(ESZ); pmic[0x16] = 0x6C; pmic[0x26] = 0x50; b2s = 1; b8s = 2;
+		nl = 0;
+		EXPECT(gpu_rails_uv(&b2s, 0) == 0 && b2s == 875000 && b8s == 2);
+		/* a failed read leaves both untouched */
+		setup(ESZ); mode = M_RET; b2s = 1; b8s = 2;
+		nl = 0;
+		EXPECT(gpu_rails_uv(&b2s, &b8s) == 1 && b2s == 1 && b8s == 2);
+	}
 
 	/* off + the first failure stops the rest: the APM returns an error code for the first read */
 	setup(ESZ); mode = M_RET;

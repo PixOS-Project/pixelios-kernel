@@ -1,0 +1,118 @@
+#!/bin/bash
+# tools/gate: the one entry point for a gate run (PLAN-GATE-2X D6).
+#   tools/gate --quick --changed [--label NAME]     detached quick gate: check-all.sh --quick (the steps the diff since the nearest full PASS needs; skipped steps are listed)
+#   tools/gate --formal [--label NAME]              detached full gate: check-all.sh (every step)
+#   tools/gate --cold [--label L]                   COLD formal gate (PLAN-GATE-2X section 8, K0): a FRESH worktree of the current HEAD (tools/worktree-new, branch+dir cold-L under ~/.t3/worktrees),
+#                                                   two EMPTY cache dirs (mktemp -d under /tmp, or $GATE_COLD_TMP: a test hook) as GATE_MUT_CACHE (tools/wlan_mutant_cache.py:29) and PIXELIOS_AUDIT_MEMO_DIR (tools/audit_memo.py:16),
+#                                                   and that worktree's own formal gate with GATE_COLD=1 (detached through tools/heavy-job: systemd-run --scope hands the caller's environment on, observed
+#                                                   2026-10-31). The GATE line then carries ` cold=1`, the RESULT line `kind=formal cold=1`, the logs/gate-times.tsv row has cold=1 in its last column
+#                                                   (tools/gate-times keeps cold and warm medians apart; cold budget 1100 s). Refused when the checkout has uncommitted changes in tracked files (the run gates HEAD).
+#                                                   The commands to remove the worktree, its branch and the two dirs are PRINTED at the end, never run. Default L: a timestamp (every cold run is a new label).
+#   tools/gate --summary                            print the RESULT line of the last gate in this worktree (shim/out/gate.progress + gate.result)
+# The gate runs in its own systemd scope through `tools/heavy-job detach` (survives the end of the agent's thread); log
+# <main clone>/logs/heavy-job/<label>/detach.log. When the gate ends the log's last line is
+#   RESULT: PASS|FAIL gate kind=quick|formal elapsed=NNNs ran=N skipped=M slow=<step:obs/budget,..|-> base=<sha|->
+# built by tools/gate-summary; a step over its manifest budget shows in slow= (it never fails the gate). GATE_DRY=1 prints the command (also for the internal --run) and exits 0 without running anything.
+# T-1386: before any start the gate tooling (check-all.sh, heavy-job, ...) is compared with trunk's by tools/gate-trunk-check; behind trunk -> `RESULT: FAIL gate refused` (exit 1), see that tool's header.
+# Exit 0/1/2; the launch line is heavy-job's RESULT (--cold: the last line is gate's own RESULT after the cleanup commands). Run from any checkout of the repo.
+#
+# Persistent caches a gate step can read (grep of tools/, tools/check-all.sh, shim/build.sh, 2026-10-31) and what --cold does about each:
+#   1. wlan mutant cache   ~/.cache/pixelios/wlan-mutants   (tools/wlan_mutant_cache.py:21)      -> GATE_MUT_CACHE=<empty dir>
+#   2. audit memo          ${XDG_CACHE_HOME:-~/.cache}/pixelios/audit (tools/audit_memo.py:48)    -> PIXELIOS_AUDIT_MEMO_DIR=<empty dir>
+#   3. gate-pass registry  ${GATE_PASS_DIR:-~/.cache/pixelios/gate-pass}: read ONLY by `--quick` (tools/gate_select.py:183); a formal gate never reads it, it only WRITES it on a clean full PASS -> cannot warm a cold run, left alone
+#   4. host-tests stamp    ${XDG_CACHE_HOME:-~/.cache}/pixelios/host-tests (shim/build.sh:462): the gate's first build runs with PIXELIOS_HOST_TESTS=always (check-all.sh:169) and ignores it; later builds reuse the stamp THAT run wrote (same cold or warm) -> cannot warm
+#   5. xnu-build work tree $LOCALBUILD/work/gate-xnu: the gate step xnu-build (tools/check-all.sh:197) uses the FIXED label `gate-xnu`, so ONE persistent incremental tree serves every gate on this host (review gate-cold-k0-r1 F1:
+#                          an earlier version of this header wrongly said the label comes from the worktree name; only tools/gate-request's pre-step gate-xnu-build takes a per-gate label). A cold gate therefore has a WARM
+#                          xnu-build, deliberately: that tree is host infrastructure that every normal gate shares (like the pristine clone ~/pixelios-artifacts/xnu-pristine and the flex/bison hostroot), and a first-ever
+#                          xnu build on a host (step budget 2400 s) is not what a worker's gate pays. The cold baseline measures the caches a worker's gate really starts without (mutant cache, audit memo, fresh shim/out). Quote it so.
+#   6. in the worktree     shim/out, __pycache__, logs/: a new worktree starts without them (tools/worktree-new makes an empty logs/); the host gate lock /tmp/pixos-gate-host.lock is mutual exclusion, not a result cache
+#   No ccache/sccache/XDG pip cache is read by any step (grep found none).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+cd "$(dirname "$0")/.." || exit 2
+mode=; label=; kind=quick; cold=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	--quick|--changed) ;;
+	--formal) kind=formal ;;
+	--cold) kind=formal; cold=1 ;;
+	--label) shift; label=${1:-}; [ -n "$label" ] || { echo "RESULT: ERROR gate: --label needs a name"; exit 2; } ;;
+	--summary) mode=summary ;;
+	--run) mode=run ;;     # internal: what the detached scope executes
+	*) echo "usage: tools/gate --quick --changed [--formal] [--cold] [--label NAME] | --summary"; echo "RESULT: ERROR gate: unknown option '$1'"; exit 2 ;;
+	esac; shift
+done
+case $label in *[!A-Za-z0-9._-]*) echo "RESULT: ERROR gate: --label may hold only letters, digits . _ -"; exit 2 ;; esac
+if [ "$cold" = 1 ] && [ -n "$mode" ]; then echo "RESULT: ERROR gate: --cold starts a gate, it cannot be combined with --summary/--run"; exit 2; fi
+if [ -z "$label" ]; then if [ "$cold" = 1 ]; then label=$(date +%m%d-%H%M%S); else label=gate-$(basename "$PWD"); fi; fi
+if [ "$mode" = summary ]; then exec python3 tools/gate-summary; fi
+# T-1386: a gate runs this checkout's own check-all.sh/heavy-job; refuse when that gate tooling is behind trunk (tools/gate-trunk-check), so a gate fix reaches every branch. Not for --run (the check ran at launch).
+# GATE_DRY=1 only reports it (the dry run never starts a gate; tests of this tool in a branch behind trunk stay hermetic).
+if [ "$mode" != run ] && [ "${GATE_TRUNK_CHECKED:-}" != 1 ]; then   # GATE_TRUNK_CHECKED=1: set by --cold for the gate in its fresh worktree of this same HEAD (checked here already)
+	tc=$("$(dirname "$0")/gate-trunk-check" --repo "$PWD" 2>&1); trc=$?
+	printf '%s\n' "$tc"
+	if [ "$trc" != 0 ]; then
+		if [ "${GATE_DRY:-}" = 1 ]; then echo "gate: DRY: a real run would be refused (gate-trunk-check rc=$trc)"
+		else echo "RESULT: FAIL gate refused: gate-trunk-check rc=$trc (no gate started; merge trunk first, or GATE_TOOLING_OVERRIDE=\"why\")"; exit 1; fi
+	fi
+fi
+# Fail fast: the unit test files the change can break run BEFORE a gate (8+ min) is started (tools/affected-tests, the quick gate's own selection). Not for --run, GATE_DRY, or the cold gate's inner call.
+[ "$mode" = run ] && export GATE_AFFECTED_CHECKED=1   # the detached gate (and the unit tests it runs) never re-run the pre-check
+if [ "$mode" != run ] && [ "$mode" != summary ] && [ "${GATE_DRY:-}" != 1 ] && [ "${GATE_AFFECTED_CHECKED:-}" != 1 ]; then
+	if [ -n "${GATE_AFFECTED_SKIP:-}" ]; then echo "gate: GAP: affected-tests skipped on purpose: $GATE_AFFECTED_SKIP"
+	else
+		at=$("$(dirname "$0")/affected-tests" 2>&1); arc=$?
+		printf '%s\n' "$at" | tail -n 12
+		[ "$arc" = 0 ] || { echo "RESULT: FAIL gate refused: affected-tests rc=$arc (no gate started; fix the failing test files above, rerun tools/affected-tests; GATE_AFFECTED_SKIP=\"why\" skips it, logged)"; exit 1; }
+	fi
+fi
+# GATE_COLD=1 in the environment (set by --cold below for the worktree's own gate, never to be set by hand without the dirs): a formal gate whose caches are two EMPTY, distinct dirs. Otherwise the ledger would
+# call a warm run cold (the row is what the cold acceptance compares).
+if [ "${GATE_COLD:-}" = 1 ] && [ "$cold" = 0 ]; then
+	[ "$kind" = formal ] || { echo "RESULT: ERROR gate: GATE_COLD=1 means a formal gate (got kind=$kind)"; exit 2; }
+	for v in GATE_MUT_CACHE PIXELIOS_AUDIT_MEMO_DIR; do
+		d=${!v:-}
+		case $d in ''|0) echo "RESULT: ERROR gate: GATE_COLD=1 needs $v=<empty dir> (got '$d'): a cold run never reads a cache"; exit 2 ;; esac
+		[ -d "$d" ] || { echo "RESULT: ERROR gate: GATE_COLD=1 but $v=$d is not a directory"; exit 2; }
+		[ -z "$(ls -A -- "$d")" ] || { echo "RESULT: ERROR gate: GATE_COLD=1 but $v=$d is not empty (a used cache makes the run warm)"; exit 2; }
+	done
+	[ "$GATE_MUT_CACHE" != "$PIXELIOS_AUDIT_MEMO_DIR" ] || { echo "RESULT: ERROR gate: GATE_COLD=1 needs two distinct cache dirs"; exit 2; }
+fi
+if [ "$cold" = 1 ]; then
+	# the cold run gates HEAD in a fresh worktree: an edit in this checkout would not be in it
+	dirty=$(git status --porcelain --untracked-files=no 2>&1) || { echo "RESULT: ERROR gate: --cold needs a git checkout ($dirty)"; exit 2; }
+	[ -z "$dirty" ] || { printf '%s\n' "$dirty" | head -n 5; echo "RESULT: ERROR gate: --cold gates HEAD, and this checkout has uncommitted changes in tracked files (listed above): commit or stash them first"; exit 2; }
+	sha=$(git rev-parse HEAD) || { echo "RESULT: ERROR gate: no HEAD"; exit 2; }
+	wt=${WORKTREE_ROOT:-$HOME/.t3/worktrees}/cold-$label; br=cold-$label; inner=gate-cold-$label
+	if [ "${GATE_DRY:-}" = 1 ]; then
+		echo "tools/worktree-new $br --dir $wt --base $sha"
+		echo "d1=\$(mktemp -d "${GATE_COLD_TMP:-/tmp}/pixos-cold-mut.XXXXXX")   d2=\$(mktemp -d "${GATE_COLD_TMP:-/tmp}/pixos-cold-memo.XXXXXX")   (dry run: nothing is created)"
+		echo "env GATE_COLD=1 GATE_MUT_CACHE=\$d1 PIXELIOS_AUDIT_MEMO_DIR=\$d2 bash $wt/tools/gate --formal --label $inner"
+		echo "remove afterwards (never automatic): git -C $PWD worktree remove --force $wt; git -C $PWD branch -D $br; rm -rf -- \"\$d1\" \"\$d2\""
+		echo "RESULT: PASS gate dry-run kind=formal cold=1 label=$label"; exit 0
+	fi
+	wout=$(tools/worktree-new "$br" --dir "$wt" --base "$sha" 2>&1); wrc=$?
+	printf '%s\n' "$wout"
+	[ "$wrc" = 0 ] || { echo "RESULT: ERROR gate: tools/worktree-new rc=$wrc: no cold gate started (a rc=1 leaves the worktree: git worktree remove --force $wt; git branch -D $br)"; exit 2; }
+	d1=$(mktemp -d "${GATE_COLD_TMP:-/tmp}/pixos-cold-mut.XXXXXX") && d2=$(mktemp -d "${GATE_COLD_TMP:-/tmp}/pixos-cold-memo.XXXXXX") || { [ -z "${d1:-}" ] || rm -rf -- "$d1"; echo "RESULT: ERROR gate: mktemp -d under ${GATE_COLD_TMP:-/tmp} failed (worktree $wt exists)"; exit 2; }
+	echo "gate --cold: HEAD $sha, worktree $wt, GATE_MUT_CACHE=$d1 PIXELIOS_AUDIT_MEMO_DIR=$d2"
+	export GATE_AFFECTED_CHECKED=1 GATE_TRUNK_CHECKED=1   # the fresh worktree is this same HEAD: its gate skips the trunk check done above
+	env GATE_COLD=1 GATE_MUT_CACHE="$d1" PIXELIOS_AUDIT_MEMO_DIR="$d2" bash "$wt/tools/gate" --formal --label "$inner"; rc=$?
+	echo "gate --cold: log logs/heavy-job/$inner/detach.log in the main clone; the row lands in logs/gate-times.tsv with cold=1"
+	echo "gate --cold: remove when done (NOT done automatically): git -C $PWD worktree remove --force $wt; git -C $PWD branch -D $br; rm -rf -- $d1 $d2"
+	if [ "$rc" = 0 ]; then echo "RESULT: PASS gate cold launched label=$label worktree=$wt mut_cache=$d1 memo_dir=$d2"; else echo "RESULT: FAIL gate cold launch rc=$rc label=$label (nothing was removed; see the remove line above)"; fi
+	exit "$rc"
+fi
+if [ "$mode" = run ]; then
+	# GATE_DRY=1 covers --run too (review gate-2x-s2-r1 F6: a probe of --run queued a real gate): print, do not execute
+	if [ "${GATE_DRY:-}" = 1 ]; then echo "tools/check-all.sh$([ "$kind" = formal ] || echo ' --quick')"; echo "RESULT: PASS gate dry-run kind=$kind run"; exit 0; fi
+	export GATE_LABEL="$label"   # ledger label of the row (check-all.sh finish): the detached scope got --label, the row must carry it (T-db59: nightly-DATE)
+	if [ "$kind" = formal ]; then tools/check-all.sh; else tools/check-all.sh --quick; fi
+	rc=$?
+	python3 tools/gate-summary || true
+	exit "$rc"
+fi
+cmd=(tools/heavy-job detach --label "$label" -- bash "$PWD/tools/gate" "--$kind" --run --label "$label")
+[ "$kind" = quick ] && cmd=(tools/heavy-job detach --label "$label" -- bash "$PWD/tools/gate" --quick --changed --run --label "$label")
+if [ "${GATE_DRY:-}" = 1 ]; then printf '%q ' "${cmd[@]}"; echo; echo "RESULT: PASS gate dry-run kind=$kind label=$label"; exit 0; fi
+exec "${cmd[@]}"

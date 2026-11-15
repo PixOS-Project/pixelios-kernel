@@ -1,0 +1,32 @@
+#!/bin/sh
+# PixOS kernel repo pre-merge-commit (T-9745, audit row A04, AP-121/AP-07): a merge that brings in tools/ or docs/ changes runs
+# `python3 tools/validate-repo.py` on the merge result before git records the merge commit. Git runs this hook only for a clean (conflict-free) merge;
+# a conflicted merge concluded with `git commit` runs pre-commit instead (it does not run validate-repo, the formal gate does).
+# A merge that touches neither tools/ nor docs/ (shim, xnu, soc, device) is left to the formal gate: validate-repo takes ~10 s, the gate runs it anyway.
+# Do instead of merging first and finding out in the gate: on the branch, `set -o pipefail; python3 tools/validate-repo.py` -> RESULT: PASS, then merge.
+# Escape (loud, one command): PIXOS_NO_VALIDATE_MERGE="reason" git merge ...    (git merge --no-verify skips every merge hook; prefer the variable: it is printed)
+[ -n "${PIXOS_NO_VALIDATE_MERGE:-}" ] && { echo "pre-merge-commit: NOTE validate-repo skipped by PIXOS_NO_VALIDATE_MERGE=\"$PIXOS_NO_VALIDATE_MERGE\"" >&2; exit 0; }
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=
+# the index is the merge result: what it changes against HEAD is what this merge brings in
+if ! git diff --cached --name-only HEAD 2>/dev/null | grep -Eq '^(tools|docs)/'; then exit 0; fi
+V=$TOP/tools/validate-repo.py
+if [ -z "$TOP" ] || [ ! -f "$V" ] || ! command -v python3 >/dev/null 2>&1; then
+	echo "pre-merge-commit: NOTE validate-repo NOT run for this merge (${TOP:-no work tree}/tools/validate-repo.py or python3 missing); the formal gate still runs it" >&2
+	exit 0
+fi
+out=$(mktemp "${TMPDIR:-/tmp}/pre-merge-validate.XXXXXX") || { echo "pre-merge-commit: NOTE validate-repo NOT run (mktemp failed); the formal gate still runs it" >&2; exit 0; }
+(cd "$TOP" && python3 "$V") >"$out" 2>&1
+rc=$?
+if [ $rc = 0 ]; then
+	echo "pre-merge-commit: validate-repo $(tail -n 1 "$out")" >&2
+	rm -f "$out"
+	exit 0
+fi
+{
+	echo "pre-merge-commit: DENIED, validate-repo FAILED on the merge result (rc=$rc; AP-121: validate the branch before asking for or doing the merge)."
+	tail -n 15 "$out"
+	echo "  do instead: abort (git merge --abort), fix the branch until \`python3 tools/validate-repo.py\` prints RESULT: PASS, then merge again."
+	echo "  escape: PIXOS_NO_VALIDATE_MERGE=\"reason\" git merge ...   (printed in the output; the formal gate still runs validate-repo)"
+} >&2
+rm -f "$out"
+exit 1

@@ -1,0 +1,1264 @@
+sweet-wlan-irq-doorbell (lowclk 2026-11-13; design notes: lowclk irq study as corrected by study-check; write table: impl-writes): the Wi-Fi INTx doorbell "stage A" and a read-only logging mode, both behind boot-arg sweetwifiirq.
+sweetwifiirq absent or 0: nothing new runs, no register is read or written, no log line (an invalid value logs a GAP and counts as 0). Needs the keep thread (sweetwlankeep=1, sweetwlan=26); without it the boot-arg is ignored with a GAP.
+sweetwifiirq=2 (read-only): once a second in the keep thread, with the link up and the dongle awake (the gate: engine not stopped, no soft stop, d4sleep 0, bus not dead, the sw3_g2_ok link check), READ ELBI+0x000, ELBI+0x010 and BAR0 PCIe core +0xC30 and print
+`SWEET WLAN IRQ: ro elbi0=<x> en0=<x> c30=<x> rings_work=<0|1>` (rings_work = the drain of the same pass found items). Answers whether ELBI IRQ0 bit 14 is a latch or follows the line (study U-A). The judge table has no write row in this mode.
+sweetwifiirq=1 (stage A): the corrected enable order of study-check s.4, in the keep thread under the en0 lock: 0xC34 := 0, ack 0xC30 until zero (W1C of the bits read, drain between), ELBI IRQ0 W1C bit 14 only, GIC attach INTID 541 with the SPI DISABLED (patch 0346),
+ELBI IRQ0_EN |= bit 14 (read back), SPI enable, 0xC34 := 0xFFFF last (read back). ISR (interrupt context, ELBI only): read IRQ0, no bit 14 -> count `spurious` and mask; bit 14 -> W1C bit 14 only, set pending, wake the keep thread, return SWEET_SPI_DEFER (the GIC masks the level line).
+Thread (every pass, the 5 ms / 100 us poll is unchanged and stays the fallback): on a pending interrupt ack 0xC30 FIRST, then drain rings 2/3/4, re-read 0xC30 and loop (<= 8), then sweet_spi_unmask. Counters irqs / missed (the poll pass found ring work and no interrupt fired) / spurious / storm.
+Auto-off (back to pure polling, loud GAP, teardown): > 5000 ISR entries in a second (storm), 200 poll-found-work passes with zero interrupts ever, 3 ISR entries in a row without bit 14, 0xC30 stuck, any ISR ELBI error or judge refusal, SPI unmask failure. Teardown order (every step tried): ELBI IRQ0_EN bit 14 off, SPI detach, 0xC34 back to its value before arming (engine end: no BAR0, the engine's undo writes 0xC34 := 0).
+One summary line per 5 s: `SWEET WLAN IRQ: irqs N missed N spurious N storm N mode <ro|doorbell|off:<why>>`.
+Bus judges: the new header's own table (sweet_wlan_irq.h swi_rows[] + swi_value_ok: exact offsets, access types, value rules, per mode) is checked on EVERY access, including the ISR's; BAR0 stores additionally pass the engine's g2l[] judge, which gets three rows ONLY when sweetwifiirq=1
+(0xC34 := 0, 0xC34 := 0xFFFF, kind SW_G2K_MBX_ACK for 0xC30 W1C). The old review rule F9 (0xC34 unmask refused while an RC enable is set) is rewritten (sw3_g2_irq_off): with the doorbell armed, IRQ0_EN may read exactly bit 14 and IRQ1_EN/IRQ2_EN must read 0; otherwise unchanged.
+Files: new bsd/dev/sweet_wlan_irq.h (pure core between SWI_CORE_BEGIN/END, host test tools/test_wlan_irq_core.py), bsd/dev/sweet_wlan.c (judge rows, rewritten F9 rule, kernel accessors, keep thread hooks). Needs patch 0346 (sweet_spi_attach_off / enable / unmask / SWEET_SPI_DEFER). ORDER: after 0346, 0313.
+NOT RUN, NOT BUILT: the kernel glue has been syntax-checked with the real compile flags only; no register of this patch has ever been touched on hardware. The new write path is UNREVIEWED (AGENTS rule 8: it needs its one review before it boots).
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+index a627bce..77f91cb 100644
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -151,6 +151,31 @@ static void sw_en0_kick(void);
+ #define EN0_EF_ENQUEUE_MULTI IFEF_ENQUEUE_MULTI
+ #include "sweet_wlan_en0.h"
+ #include "sweet_wlan_en0_bus.h"
++/* patch 0347 (lowclk 2026-11-13): Wi-Fi INTx doorbell (boot-arg sweetwifiirq=1) and read-only IRQ logging (=2); absent or 0 = nothing below runs and no register is touched. The core (judge table, enable
++ * order, ISR/thread split, counters) is bsd/dev/sweet_wlan_irq.h, host tested by tools/test_wlan_irq_core.py; the kernel side of it (bus accessors, the GIC calls of patch 0346, the log lines) is the block after sw_en0_unlock. */
++#include "sweet_wlan_irq.h"
++static struct swi sw_irq;             /* the feature's state; sw_irq.mode is set once by sw_irq_mode() */
++static int sw_irq_rows_on;            /* the three g2l rows of sw_irq_rows() were added (sweetwifiirq=1 with the keep thread): only then may the doorbell mode arm */
++static int
++sw_irq_mode(void)
++{
++	static int mode = -1;
++	uint32_t v = 0;
++
++	if (mode < 0) {
++		mode = 0;
++		if (PE_parse_boot_argn("sweetwifiirq", &v, sizeof v) && v != 0u) {
++			if (v == 1u || v == 2u) {
++				mode = (int)v;
++			} else {
++				swl_gap("irq", "sweetwifiirq is not 0, 1 or 2: ignored", "medium");
++				printf("SWEET WLAN IRQ GAP: sweetwifiirq=%u is not 0, 1 or 2: ignored, polling only, no interrupt register is touched\n", v);
++			}
++		}
++		sw_irq.mode = (uint8_t)mode;
++	}
++	return mode;
++}
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* not declared by vm/pmap.h in this tree: same extern as patch 0028:81, 0067:12 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h, XNU-private */
+@@ -190,11 +215,13 @@ struct sw_g2w {
+ #define SW_G2K_BLOB     13      /* L22c (T-f6c1, sweetwlan=24): word i < rep of the payload buffer while clmload chunk `arg` is built: the expected value and the old value are derived from the CLM entry of the container (sw_g2_clm_word / sw_g2_clm_old), v != old, repeatable */
+ #define SW_G2K_E_ITEM   14      /* T-4a7f: a word of an event re-post after the escan request (L23, L24): ring-0 index i = the H2D-WR slot in host memory now (i < 128), the value is word k of the glue's own event post for counter g2ev at i, old 0, repeatable; word 4 (the buffer address) is ANY of the 8 event buffers (T-f1e2: the dongle chooses the buffer, LIFO, and the shim re-posts the consumed slot) */
+ #define SW_G2K_E_WR     15      /* T-4a7f: the H2D-WR slot low half old -> old + 1 (< 128, upper half kept) over a complete expected event post for counter g2ev (all ten words read back, word 4 any of the 8 event buffers), g2ev < the event cap; the store does g2ev++ */
++#define SW_G2K_MBX_ACK  16      /* patch 0347 (sweetwifiirq=1): PCIe core +0xC30 MAILBOXINT, write-1-to-clear of the bits the thread read in the same pass (value rule swi_ack_value_ok, sweet_wlan_irq.h), repeatable; the only row of this kind */
++#define SW_G2_MBX_BITS  0xFFFFu
+ #define SW_G2_E_PAYW    355u    /* words of the payload shadow: the longest payload is a clmload chunk, 8 ("clmload" NUL) + 12 (wl_dload_data header) + 1400 = 1420 B = 355 words (L22c); before it the escan: 86 B = 22 words, 102 B = 26 words at sweetwlan=24 (T-0fdd) */
+ #define SW_G2_CLMCHUNK  1400u   /* L22c: bytes of CLM per clmload request (MAX_CHUNK_LEN), restated from the header (R107 #5) */
+ #define SW_G2_CLMMAX    12u     /* L22c: chunks at most (15,932 B = 11 x 1400 + 532 is 12) */
+ #define SW_G2_MAX   1816u
+-_Static_assert(SW_G2_MAX >= 180u + 14u * 12u + 11u + 10u * 12u + 14u + 12u + 11u + 12u + 24u + 8u * (44u + 24u + 44u) + SW_G2_CLMMAX * (1u + 12u + 12u) + 2u * (12u + 12u) + 5u + 5u, "SW_G2_MAX holds the 180 entries of level 20 (49 + 14 + 40 + 61 exact, 16 masked DS-round entries, 22b), the L21 posts (14 x 12), the L22 payload words (11) and requests + re-posts (10 x 12), the L23 payload words (14), the escan request (12), the event re-post entries (11, T-4a7f: 10 words + the commit, repeatable) and the L24 calls (8 x (44 payload words + request + re-post + 44 key-zeroing words), T-4a7f), the L22c chunks (12 x (1 BLOB entry + request + re-post)), clmload_status and country (request + re-post + at most 5 payload words each)");        /* W-D4e: stored in the static sw_hw (sweet_wlan_init), not on the kernel stack */
++_Static_assert(SW_G2_MAX >= 180u + 14u * 12u + 11u + 10u * 12u + 14u + 12u + 11u + 12u + 24u + 8u * (44u + 24u + 44u) + SW_G2_CLMMAX * (1u + 12u + 12u) + 2u * (12u + 12u) + 5u + 5u + 3u /* patch 0347: sw_irq_rows */, "SW_G2_MAX holds the 180 entries of level 20 (49 + 14 + 40 + 61 exact, 16 masked DS-round entries, 22b), the L21 posts (14 x 12), the L22 payload words (11) and requests + re-posts (10 x 12), the L23 payload words (14), the escan request (12), the event re-post entries (11, T-4a7f: 10 words + the commit, repeatable) and the L24 calls (8 x (44 payload words + request + re-post + 44 key-zeroing words), T-4a7f), the L22c chunks (12 x (1 BLOB entry + request + re-post)), clmload_status and country (request + re-post + at most 5 payload words each)");        /* W-D4e: stored in the static sw_hw (sweet_wlan_init), not on the kernel stack */
+ #define SW_G2_DS_MAX    4u       /* 22b review 0174-w-d4e-scan24-hwwrite-r1 F3a: the glue's own cap of extra DS rounds per boot (3 ring-0 items each), restated (R107 #5); equals the header's SWG_D4_DS_MAX (asserted below) */
+ _Static_assert(SW_G2_DS_MAX == SWG_D4_DS_MAX, "the glue cap of DS rounds equals the header's");
+ #define SW3_DBI     16          /* patch 0174: the glue's own space for the RC DBI page (not one of the header's SWW_* spaces: swl_wr() can never name it) */
+@@ -837,6 +864,12 @@ sw3_g2_ok(struct sw_hw *h, int space, uint32_t win, uint32_t off, uint32_t v, in
+ 			}
+ 			continue;
+ 		}
++		if (e->kind == SW_G2K_MBX_ACK) {  /* patch 0347: the mailbox ack, only the bits read in this pass (the independent table of sweet_wlan_irq.h decides; this row only lets the bus judge pass it) */
++			if (vv != 0u && (vv & ~SW_G2_MBX_BITS) == 0u && swi_ack_value_ok(&sw_irq, vv)) {
++				return (int)i;
++			}
++			continue;
++		}
+ 		if (e->kind == SW_G2K_VER) {      /* W-D4e: the table value with bit 16 free (scan_ver major 2 or 3), the old word exact */
+ 			if ((vv & ~SW_G2_VERBIT) == (ev & ~SW_G2_VERBIT) && (old & e->omask) == eold) {
+ 				return (int)i;
+@@ -866,13 +899,20 @@ static int
+ sw3_g2_irq_off(struct sw_hw *h, uint32_t v)
+ {
+ 	uint32_t en0 = 0xFFFFFFFFu, en1 = 0xFFFFFFFFu, en2 = 0xFFFFFFFFu;
++	/* patch 0347 (the rewritten rule, study-check W2/s.4): with sweetwifiirq=1 the unmask is the LAST step of the arm sequence, after our own IRQ0_EN bit 14 and the SPI enable (sw_irq.elbi_on && sw_irq.spi_en). Then, and only then,
++	 * IRQ0_EN may read exactly bit 14 (INTA); IRQ1_EN and IRQ2_EN (link down, CPL timeout) must still read 0. With the boot-arg off these flags are 0 and the rule is the old one (all three 0). */
++	int db = sw_irq.mode == SWI_MODE_DB && sw_irq_rows_on && sw_irq.elbi_on && sw_irq.spi_en;
+ 
+ 	if (sw3_rd(h, SWW_ELBI, 0, SWW_RC_IRQ0_EN, &en0) != 0 || sw3_rd(h, SWW_ELBI, 0, SWW_RC_IRQ1_EN, &en1) != 0 || sw3_rd(h, SWW_ELBI, 0, SWW_RC_IRQ2_EN, &en2) != 0 ||
+-	    en0 != 0u || en1 != 0u || en2 != 0u) {
++	    (en0 != 0u && !(db && en0 == SWI_INTA)) || en1 != 0u || en2 != 0u) {
+ 		swl_gap("g2", "glue: 0xC34 unmask refused, RC irq enable set or unreadable", "high");
+ 		printf("SWEET WLAN: G2 glue: 0xC34 := %#x refused, RC irq enables %#x %#x %#x\n", v, en0, en1, en2);
+ 		return -1;
+ 	}
++	if (en0 != 0u) {
++		printf("SWEET WLAN: G2 glue: RC irq enables %#x 0 0 before the 0xC34 unmask (sweetwifiirq=1: IRQ0 bit 14 only, SPI enabled)\n", en0);
++		return 0;
++	}
+ 	printf("SWEET WLAN: G2 glue: RC irq enables 0 0 0 before the 0xC34 unmask\n");
+ 	return 0;
+ }
+@@ -1790,6 +1830,42 @@ sw_g2_d4e(struct sw_hw *h, int last)
+ 	}
+ 	return last;
+ }
++/* patch 0347: the three extra rows of sweetwifiirq=1, appended LAST (an earlier exact row matches first), all chained after the mailbox-mask row `m`, none once: 0xC34 := 0 (arm step 1, the engine's own undo keeps its row),
++ * 0xC34 := 0xFFFF (arm step 7 / restore), 0xC30 write-1-to-clear (kind SW_G2K_MBX_ACK). Added only when sweetwifiirq=1 AND the keep thread will exist (sweetwlankeep=1, sweetwlan=26); with sweetwifiirq=2 the thread only READS and no row is needed.
++ * A refusal here never fails the list: the feature turns itself off with a GAP and the list stays the one it was. Returns 0. */
++static int
++sw_irq_rows(struct sw_hw *h, int m)
++{
++	uint32_t keep = 0, n0 = h->g2n;
++	int mode = sw_irq_mode(), a, b, c;
++
++	if (mode == 0) {
++		return 0;
++	}
++	if (!(PE_parse_boot_argn("sweetwlankeep", &keep, sizeof keep) && keep == 1u && h->d4b >= 13)) {
++		swl_gap("irq", "sweetwifiirq needs sweetwlankeep=1 and sweetwlan=26", "medium");
++		printf("SWEET WLAN IRQ GAP: sweetwifiirq=%d ignored: it needs the keep thread (sweetwlankeep=1 with sweetwlan=26, d4b %d): no interrupt register is touched, no judge row added\n", mode, h->d4b);
++		sw_irq.mode = 0;
++		return 0;
++	}
++	if (mode != SWI_MODE_DB) {
++		return 0;
++	}
++	a = sw_g2_add(h, SWW_BAR0, SWW_WIN_PCIE, 0xC34u, 0u, 0xFFFFFFFFu, 0, 0, 0, m);
++	b = sw_g2_add(h, SWW_BAR0, SWW_WIN_PCIE, 0xC34u, SW_G2_D4_MASK, 0xFFFFFFFFu, 0, 0, 0, m);
++	c = sw_g2_add(h, SWW_BAR0, SWW_WIN_PCIE, 0xC30u, 0u, 0xFFFFFFFFu, 0, 0, 0, m);
++	if (a < 0 || b < 0 || c < 0) {
++		h->g2n = n0;
++		swl_gap("irq", "judge rows not added (list full): sweetwifiirq off", "high");
++		printf("SWEET WLAN IRQ GAP: the three bus-judge rows of sweetwifiirq=1 do not fit the G2 list: the feature is OFF, the list is unchanged\n");
++		sw_irq.mode = 0;
++		return 0;
++	}
++	h->g2l[c].kind = SW_G2K_MBX_ACK;
++	sw_irq_rows_on = 1;
++	return 0;
++}
++
+ /* W-D4b (SPEC-WIFI Q2-Q5, Q8): the extra entries of sweetwlan=14, built from the glue's OWN constants and its own copy of the G1 plan (the header computes the same words from swd4b_item_evbuf, R107 #5):
+  * Q2 mask := 0xFFFF (old 0, after the hostready entry `ready`: review r1 F7), Q3 the ten item words at ring 0's base (old 0, after the mask), Q4 H2D-WR slot 0 low half := 1 (old 0, upper half kept, after the last item word), Q5 doorbell 0
+  * (after the slot), Q8 0xC34 := 0 (any old, after the mask). Each once. 0 = built, -1 = list full. */
+@@ -1832,6 +1908,9 @@ sw_g2_d4(struct sw_hw *h, int ready)
+ 			bad |= sw_g2_ds(h, last) < 0;     /* 22b: the masked DS-round entries and the ring-2 read-index entries, LAST (an exact entry matches first), chained after the L16 C2 doorbell entry (review F2) */
+ 		}
+ 	}
++	if (!bad) {
++		(void)sw_irq_rows(h, m);        /* patch 0347: sweetwifiirq only; a no-op (no read, no row) without the boot-arg */
++	}
+ 	return bad ? -1 : 0;
+ }
+ 
+@@ -2358,6 +2437,357 @@ sw_en0_unlock(void)
+ 	}
+ }
+ 
++/* ---- patch 0347: the kernel side of sweet_wlan_irq.h (sweetwifiirq). Thread-context accessors run with the en0 lock held (the keep thread holds it around every bus call); the ISR accessors touch ELBI only. ----
++ * INTID 541 = SPI 509 + 32: the Wi-Fi PCIe node's interrupt, level-high [obs golden device tree pcie@14520000/interrupts = 0 0x1fd 4; live Android table "GICv3 541 Level exynos-pcie, dhdpcie:0001:01:00.0"; study-check item 1]. */
++#define SW_IRQ_INTID 541u
++extern int sweet_spi_attach_off(uint32_t intid, int (*fn)(void *, uint32_t), void *arg, uint32_t rb[4]);   /* pexpert/arm/pe_fiq.c (patch 0346) */
++extern int sweet_spi_enable(uint32_t intid, uint32_t *en);
++extern int sweet_spi_unmask(uint32_t intid);
++extern int sweet_spi_detach(uint32_t intid);                                                               /* patch 0272 */
++extern uint64_t sweet_spi_deferred, sweet_spi_unmasked, sweet_spi_unhandled;
++extern void sweet_spi_counts(uint32_t intid, uint64_t *handled, uint64_t *unhandled, uint32_t *unhandled_last);
++_Static_assert(SWI_MBX_INT == SWG_PCIE_STATUS_OFF, "the irq core's MAILBOXINT offset is the engine header's");
++_Static_assert(SWI_MBX_MASK == SWG_MBX_MASK_OFF, "the irq core's MAILBOXMASK offset is the engine header's");
++_Static_assert(SWI_MBX_ALL == SW_G2_D4_MASK, "the irq core's unmask value is the D4b mask value");
++
++static struct swi_ops sw_irq_ops;
++static struct swi_ops sw_irq_isr_ops;
++static int sw_irq_reported;
++
++/* the link check of sw3_g2_ok, as a function: ISO de-isolated, ELBI RDLH_LINKUP 0x2C8 L0, ATU regions 0 and 1 as programmed (all RC-local reads, no TLP). 0 = link known up */
++static int
++sw_irq_link_ok(struct sw_hw *h)
++{
++	uint32_t iso = 0, ltssm = 0, a0[7] = { 0 }, a1[7] = { 0 };
++	unsigned i;
++	int bad;
++
++	bad = sw3_rd(h, SWW_ISO, 0, 0, &iso) != 0 || sw3_rd(h, SWW_ELBI, 0, 0x2C8u, &ltssm) != 0;
++	for (i = 0; i < 7u; i++) {
++		bad |= sw3_rd(h, SWW_ATU, 0, 4u * i, &a0[i]) != 0 || sw3_rd(h, SWW_ATU, 0, 0x200u + 4u * i, &a1[i]) != 0;
++	}
++	return (bad || swl_pre_link(iso, ltssm, a0, a1) != 0) ? -1 : 0;
++}
++
++/* gate (thread): the engine runs, no soft stop, the dongle is not between a DS ack and its wake, the bus is not latched dead, the link is up */
++static int
++sw_irq_gate(void *cx)
++{
++	const struct swg_wx *x = &sw_gx;
++
++	if (x->stopped || x->d4dstop || x->d4sleep || sw_keep_live.dead) {
++		return -1;
++	}
++	return sw_irq_link_ok(cx);
++}
++
++/* thread context: ELBI by the mapped pointer (judged by swi_io), BAR0 only on the PCIe core page the doorbells already use (window already cfg 0x80 = PCIe: sw3_rd refuses otherwise, no window move here) */
++static int
++sw_irq_rd(void *cx, int sp, uint32_t off, uint32_t *v)
++{
++	struct sw_hw *h = cx;
++	volatile uint32_t *q;
++
++	if (sp == SWI_SP_ELBI) {
++		q = sw3_ptr(h, SWW_ELBI, off);
++		if (q == NULL) {
++			return -1;
++		}
++		*v = *q;
++		return 0;
++	}
++	if (sp == SWI_SP_BAR0) {
++		return sw_irq_link_ok(h) != 0 ? -1 : sw3_rd(h, SWW_BAR0, SWW_WIN_PCIE, off, v);
++	}
++	return -1;
++}
++
++/* ELBI stores bypass sw3_wr on purpose (it has no ELBI rows: ELBI is the RC wrapper, not the dongle): the swi_rows[] table and value rules are the judge. BAR0 stores go through the engine bus, i.e. sw3_wr's g2l[] judge
++ * (rows of sw_irq_rows) AND the link check before the store: two independent judges for the BAR0 words. */
++static int
++sw_irq_wr(void *cx, int sp, uint32_t off, uint32_t v)
++{
++	struct sw_hw *h = cx;
++	volatile uint32_t *q;
++
++	if (sp == SWI_SP_ELBI) {
++		q = sw3_ptr(h, SWW_ELBI, off);
++		if (q == NULL) {
++			return -1;
++		}
++		*q = v;
++		__builtin_arm_dsb(0xf);
++		return 0;
++	}
++	if (sp == SWI_SP_BAR0) {
++		if (h->cfg[SWW_CFG_WIN / 4] != SWW_WIN_PCIE) {      /* review 0346 F4: never let sw_g2_bar0 move the window for this feature (the 0xC34 teardown store has no read before it) */
++			swl_gap("irq", "BAR0 store refused: window is not the PCIe core", "high");
++			printf("SWEET WLAN IRQ GAP: BAR0 store at %#x refused: cfg 0x80 window %#x is not the PCIe core window, no window move by this feature\n", off, h->cfg[SWW_CFG_WIN / 4]);
++			return -1;
++		}
++		return sw_gb.wr(sw_gb.ctx, SWG_SP_PCIE, off, v);
++	}
++	return -1;
++}
++
++/* interrupt context: ELBI only; any other space is refused here as well (second layer behind swi_row_ok) */
++static int
++sw_irq_isr_rd(void *cx, int sp, uint32_t off, uint32_t *v)
++{
++	volatile uint32_t *q = sp == SWI_SP_ELBI ? sw3_ptr(cx, SWW_ELBI, off) : NULL;
++
++	if (q == NULL) {
++		return -1;
++	}
++	*v = *q;
++	return 0;
++}
++
++static int
++sw_irq_isr_wr(void *cx, int sp, uint32_t off, uint32_t v)
++{
++	volatile uint32_t *q = sp == SWI_SP_ELBI ? sw3_ptr(cx, SWW_ELBI, off) : NULL;
++
++	if (q == NULL) {
++		return -1;
++	}
++	*q = v;
++	__builtin_arm_dsb(0xf);
++	return 0;
++}
++
++static uint32_t
++sw_irq_drain(void *cx __unused)
++{
++	if (!sw_gx.stopped && !sw_gx.d4dstop) {
++		(void)swg_keep_r2(&sw_gx);
++	}
++	return en0_live_poll(&sw_keep_en, &sw_keep_live);
++}
++
++static void
++sw_irq_wake(void *cx __unused)
++{
++	thread_wakeup((event_t)&sw_keep.kick);        /* ISR safe: the Mali ISR wakes its thread the same way (patch 0272) */
++}
++
++static int
++sw_irq_spi_cb(void *arg __unused, uint32_t intid __unused)
++{
++	return swi_isr(&sw_irq, &sw_irq_isr_ops);
++}
++
++static int
++sw_irq_spi_attach(void *cx, uint32_t *en)
++{
++	uint32_t rb[4] = { 0 };
++	int r = sweet_spi_attach_off(SW_IRQ_INTID, sw_irq_spi_cb, cx, rb);
++
++	*en = rb[1];
++	printf("SWEET WLAN IRQ: attach INTID %u rc %d (SPI left disabled) group %u enabled %u icfgr %#x irouter %#x\n", SW_IRQ_INTID, r, rb[0], rb[1], rb[2], rb[3]);
++	return r;
++}
++
++static int
++sw_irq_spi_enable(void *cx __unused, uint32_t *en)
++{
++	return sweet_spi_enable(SW_IRQ_INTID, en);
++}
++
++static int
++sw_irq_spi_unmask(void *cx __unused)
++{
++	return sweet_spi_unmask(SW_IRQ_INTID);
++}
++
++static int
++sw_irq_spi_detach(void *cx __unused)
++{
++	return sweet_spi_detach(SW_IRQ_INTID);
++}
++
++/* every note of the core: the GAP texts are fixed strings (<= 63 chars, the key of the gap table) */
++static void
++sw_irq_note(void *cx __unused, int code, uint32_t a, uint32_t b)
++{
++	static const struct { int code; const char *txt; } t[] = {
++		{ SWI_G_GATE, "gate closed (link, DS state or bus), not armed" },
++		{ SWI_G_C34ORIG, "0xC34 is neither 0 nor 0xFFFF, not armed" },
++		{ SWI_G_RD, "a register read failed" },
++		{ SWI_G_WR, "a register write failed" },
++		{ SWI_G_REFUSED, "the swi judge refused an access" },
++		{ SWI_G_C30STUCK, "0xC30 not zero after ack and drain" },
++		{ SWI_G_ELBISTUCK, "IRQ0 bit 14 still set after its W1C" },
++		{ SWI_G_ENOTHER, "IRQ0_EN has bits other than 14 set" },
++		{ SWI_G_ATTACH, "GIC attach failed or SPI not left disabled" },
++		{ SWI_G_ENABLE, "GIC enable failed or not read back" },
++		{ SWI_G_VERIFY, "read-back differs from the value written" },
++		{ SWI_G_STORM, "storm, too many ISR entries in one second" },
++		{ SWI_G_NOIRQ, "200 poll passes found work, no interrupt" },
++		{ SWI_G_SPUR, "ISR entries without IRQ0 bit 14 in a row" },
++		{ SWI_G_ISRERR, "the ISR could not read or write ELBI" },
++		{ SWI_G_UNMASK, "SPI unmask failed" },
++		{ SWI_G_TEARDOWN, "a teardown step failed" },
++		{ SWI_G_EMPTY, "empty interrupts in a row (0xC30 0, no work): stuck line" },
++		{ SWI_G_GATECLOSE, "thread gate closed: no BAR0 access, SPI left masked" },
++		{ SWI_G_GATEOPEN, "thread gate open again, doorbell resumes" },
++	};
++	unsigned i;
++
++	if (code == SWI_N_STEP) {
++		printf("SWEET WLAN IRQ: arm step %u done (value %#x)\n", a, b);
++		return;
++	}
++	for (i = 0; i < sizeof t / sizeof t[0]; i++) {
++		if (t[i].code == code) {
++			swl_gap("irq", t[i].txt, "high");
++			printf("SWEET WLAN IRQ GAP: %s (a=%#x b=%#x)\n", t[i].txt, a, b);
++			return;
++		}
++	}
++	swl_gap("irq", "unknown note code", "high");
++	printf("SWEET WLAN IRQ GAP: unknown note code %d (a=%#x b=%#x)\n", code, a, b);
++}
++
++/* the doorbell mode went off (first time seen): one loud line, the poll goes on alone */
++static void
++sw_irq_report_off(void)
++{
++	if (sw_irq.why != SWI_Y_NONE && !sw_irq_reported) {
++		sw_irq_reported = 1;
++		swl_gap("irq", "doorbell mode off, polling only", "high");
++		printf("SWEET WLAN IRQ GAP: doorbell mode OFF (%s): ELBI IRQ0 bit 14 enable off, INTID %u detached, 0xC34 back to %#x; the 5 ms poll carries the data path alone\n", swi_mode_str(&sw_irq), SW_IRQ_INTID, sw_irq.c34_orig);
++	}
++}
++
++/* keep thread, before its loop (en0 is up): sweetwifiirq=1 runs the arm sequence under the lock; =2 only announces the read-only log */
++static void
++sw_irq_start(void)
++{
++	struct sw_hw *h = sw_gb.ctx;
++	int mode = sw_irq_mode(), r;
++
++	if (mode == 0 || h == NULL) {
++		return;
++	}
++	sw_irq_ops = (struct swi_ops){ .ctx = h, .rd = sw_irq_rd, .wr = sw_irq_wr, .gate = sw_irq_gate, .spi_attach_off = sw_irq_spi_attach, .spi_enable = sw_irq_spi_enable,
++		.spi_unmask = sw_irq_spi_unmask, .spi_detach = sw_irq_spi_detach, .drain = sw_irq_drain, .wake = sw_irq_wake, .note = sw_irq_note };
++	sw_irq_isr_ops = (struct swi_ops){ .ctx = h, .rd = sw_irq_isr_rd, .wr = sw_irq_isr_wr, .wake = sw_irq_wake };
++	if (mode == SWI_MODE_RO) {
++		printf("SWEET WLAN IRQ: sweetwifiirq=2 read-only logging: ELBI +0x000, +0x010 and BAR0 PCIe core +0xC30 are READ once a second while the link is up and the dongle awake; nothing is written, no interrupt is attached\n");
++		return;
++	}
++	if (!sw_irq_rows_on) {
++		swl_gap("irq", "doorbell rows missing, sweetwifiirq=1 off", "high");
++		printf("SWEET WLAN IRQ GAP: sweetwifiirq=1 without its bus-judge rows (see the line at list build): not armed\n");
++		sw_irq.mode = 0;
++		return;
++	}
++	sw_en0_lock();
++	r = swi_arm(&sw_irq, &sw_irq_ops);
++	sw_en0_unlock();
++	if (r == 0) {
++		printf("SWEET WLAN IRQ: doorbell ARMED: INTID %u (ELBI IRQ0_EN bit 14, GIC enabled, 0xC34 := 0xFFFF last), poll kept as fallback; irq storm limit %u/s, off after %u poll-found-work passes with no interrupt; the \"interrupts off\" GAP lines of D4b / EN7 / DP9 printed earlier are stale from here on\n", SW_IRQ_INTID, SWI_STORM_MAX, SWI_NOIRQ_MAX);
++	} else {
++		printf("SWEET WLAN IRQ GAP: arm refused at step %d (mode %s): teardown ran, the poll carries the data path alone\n", -r, swi_mode_str(&sw_irq));
++		sw_irq_report_off();
++	}
++}
++
++/* keep thread, lock held, before the drain: mode 1 = ack first (swi_pre); mode 2 = take the read-only sample when a second has passed (reads only). Returns 1 when a sample was taken (*ro filled), 2 when the gate skipped it */
++static int
++sw_irq_pre(struct swi_ro *ro, uint64_t *t_ro)
++{
++	static uint64_t iv;
++	uint64_t now;
++	int r;
++
++	if (sw_irq.mode == SWI_MODE_DB) {
++		(void)swi_pre(&sw_irq, &sw_irq_ops);
++		return 0;
++	}
++	if (sw_irq.mode != SWI_MODE_RO) {
++		return 0;
++	}
++	if (iv == 0) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &iv);
++	}
++	now = mach_absolute_time();
++	if (*t_ro != 0 && now - *t_ro < iv) {
++		return 0;
++	}
++	*t_ro = now;
++	r = swi_ro_sample(&sw_irq, &sw_irq_ops, ro);
++	return r == -1 ? 2 : 1;
++}
++
++/* keep thread, lock held, after the first drain (got items): mode 1 = the re-read loop, the unmask, the counters, the storm window; mode 2 = print the sample. Returns extra items drained */
++static uint32_t
++sw_irq_post(uint32_t got, int ro_have, const struct swi_ro *ro)
++{
++	uint32_t ex = 0;
++	uint64_t ns;
++
++	if (sw_irq.mode == SWI_MODE_DB) {
++		ex = swi_post(&sw_irq, &sw_irq_ops, got);
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		swi_tick(&sw_irq, &sw_irq_ops, (uint32_t)(ns / 1000000ull));
++		sw_irq_report_off();
++		return ex;
++	}
++	if (ro_have == 1) {
++		printf("SWEET WLAN IRQ: ro elbi0=%#x en0=%#x c30=%#x rings_work=%u%s\n", ro->elbi0, ro->en0, ro->c30, got != 0u ? 1u : 0u, ro->err != 0u ? " (a read failed: field 0xffffffff)" : "");
++		if (ro->err != 0u) {
++			swl_gap("irq", "ro sample read failed", "medium");
++		}
++	} else if (ro_have == 2) {
++		uint32_t n = sw_irq.ro_skip;
++
++		if ((n & (n - 1u)) == 0u) {       /* 1st, 2nd, 4th ... */
++			swl_gap("irq", "ro sample skipped, gate closed", "medium");
++			printf("SWEET WLAN IRQ GAP: ro sample skipped, link/DS/bus gate closed (x%u)\n", n);
++		}
++	}
++	return 0;
++}
++
++/* keep thread, outside the lock: the summary line every 5 s (both modes) */
++static void
++sw_irq_summary(uint64_t *t_irq5, uint64_t iv5)
++{
++	if (sw_irq.mode == 0 || mach_absolute_time() - *t_irq5 < iv5) {
++		return;
++	}
++	*t_irq5 = mach_absolute_time();
++	printf("SWEET WLAN IRQ: irqs %u missed %u spurious %u storm %u mode %s\n", sw_irq.irqs, sw_irq.missed, sw_irq.spurious, sw_irq.storm, swi_mode_str(&sw_irq));
++}
++
++/* the poll thread should not go to sleep over an interrupt that arrived during the pass (the ISR's wakeup came before the wait was asserted) */
++static int
++sw_irq_peek(void)
++{
++	return sw_irq.mode == SWI_MODE_DB && sw_irq.on && !sw_irq.gate_closed && (__atomic_load_n(&sw_irq.pend, __ATOMIC_ACQUIRE) != 0u || sw_irq.spurious != sw_irq.seen_spur);
++}
++
++/* every way out of the keep thread (sw_keep_end, lock held): study-check order, ELBI enable off, then SPI detach; no BAR0 access (the engine's own undo writes 0xC34 := 0 right after) */
++static void
++sw_irq_end(const char *why)
++{
++	uint64_t h = 0, u = 0;
++	uint32_t ul = 0;
++
++	if (sw_irq.mode != SWI_MODE_DB || sw_irq_ops.ctx == NULL || (!sw_irq.on && !sw_irq.elbi_on && !sw_irq.spi_att)) {
++		return;
++	}
++	swi_teardown(&sw_irq, &sw_irq_ops, 0);
++	if (sw_irq.why == SWI_Y_NONE) {
++		sw_irq.why = SWI_Y_END;
++	}
++	sweet_spi_counts(SW_IRQ_INTID, &h, &u, &ul);
++	printf("SWEET WLAN IRQ: end (%s): IRQ0 bit 14 enable off (left %u), INTID %u detached; irqs %u isr_total %u spurious %u missed %u acks %u unmasks %u refused %u gic_deferred %llu gic_unmasked %llu gic_unhandled %llu (last %u)\n", why,
++	    sw_irq.elbi_on, SW_IRQ_INTID, sw_irq.irqs, sw_irq.isr_total, sw_irq.spurious, sw_irq.missed, sw_irq.ack_writes, sw_irq.unmasks, sw_irq.refused, sweet_spi_deferred, sweet_spi_unmasked, u, ul);
++}
++
+ /* the hand-over checks that need no thread: 0 = en0_live_up will not refuse (the same checks, en0l_precheck prints its own GAP) and the station MAC is known */
+ static int
+ sw_keep_precheck(void)
+@@ -2436,6 +2866,7 @@ static void
+ sw_keep_end(struct swg_wx *x, const char *why)
+ {
+ 	sw_en0_lock();
++	sw_irq_end(why);                /* patch 0347: ELBI interrupt enable off and SPI detached BEFORE the engine's undo (no-op without sweetwifiirq=1) */
+ 	swl25_rj_wipe(&sw_rj, why);     /* patch 0282: the engine is going away, the kept PMK and join payload with it */
+ 	if (!x->stopped) {
+ 		x->fail = why;
+@@ -2462,8 +2893,12 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 	uint64_t t_alive = 0, iv_alive = 0, t_rssi = 0, iv_rssi = 0;
+ 	int32_t rssi_now = 0;
+ 	int rc, found, rr, rjx;
++	uint64_t t_ro = 0, t_irq5 = 0, iv_irq5 = 0;     /* patch 0347 */
++	struct swi_ro irq_ro;
++	int irq_ro_have = 0, irq_on_pass = 0;
+ 
+ 	memset(ubssid, 0, sizeof ubssid);
++	nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &iv_irq5);
+ 	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &iv_alive);
+ 	nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &iv_rssi);
+ 	while (!sw_keep.go) {
+@@ -2514,13 +2949,21 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 			printf("WIFI GAP: keep: registry BSD Name %s not set (rc %d)\n", nm, ra);
+ 		}
+ 	}
++	sw_irq_start();         /* patch 0347: sweetwifiirq=1 arm sequence / =2 announcement; returns at once without the boot-arg */
+ 	for (;;) {
+ 		sw_en0_lock();
+ 		t_p0 = mach_absolute_time();
++		irq_on_pass = sw_irq.mode != 0;
++		if (irq_on_pass) {
++			irq_ro_have = sw_irq_pre(&irq_ro, &t_ro);       /* patch 0347: mode 1 ack first, mode 2 the read-only sample */
++		}
+ 		if (!x->stopped && !x->d4dstop) {
+ 			(void)swg_keep_r2(x);
+ 		}
+ 		got = en0_live_poll(e, b);
++		if (irq_on_pass) {
++			got += sw_irq_post(got, irq_ro_have, &irq_ro);  /* patch 0347: re-read loop, unmask, counters, storm window / the ro line */
++		}
+ 		items += got;
+ 		busy = got != 0u || e->tx_blocked != 0u;
+ 		rr = 1;
+@@ -2592,6 +3035,7 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 		}
+ 		polls++;
++		sw_irq_summary(&t_irq5, iv_irq5);       /* patch 0347: one line per 5 s, only with sweetwifiirq */
+ 		if (x->stopped || x->d4dstop || b->dead || e->cons_fail) {     /* review perf-d F1: a refused consume commit ends the data path too */
+ 			break;
+ 		}
+@@ -2619,6 +3063,9 @@ sw_keep_thread(void *arg __unused, wait_result_t wr __unused)
+ 		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
+ 		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */
+ 		assert_wait_timeout((event_t)&sw_keep.kick, THREAD_UNINT, busy ? 100u : 5000u, NSEC_PER_USEC);
++		if (sw_irq_peek()) {            /* patch 0347: an interrupt came in during the pass (its wakeup preceded the wait): do not sleep through it */
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		}
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ 	printf("SWEET WLAN: en0 poll thread ends after %u polls: stopped=%d code=%d d4dstop=%u bus_dead=%u rx=%u tx=%u nquiet=%u gaps=%u: no further poll\n", polls, x->stopped, x->code, (unsigned)x->d4dstop,
+@@ -2659,6 +3106,9 @@ sw_keep_release(void)
+ {
+ 	if (sw_keep.armed) {
+ 		sw_keep.go = 1;
++	} else if (sw_irq_mode() != 0) {        /* patch 0347: the boot-arg names a feature of the keep thread, and there is none */
++		swl_gap("irq", "sweetwifiirq ignored: no keep thread", "medium");
++		printf("SWEET WLAN IRQ GAP: sweetwifiirq=%d ignored: the keep thread does not exist (needs sweetwlankeep=1, sweetwlan=26 and a finished L26): no interrupt register is touched\n", sw_irq_mode());
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_wlan_irq.h b/bsd/dev/sweet_wlan_irq.h
+new file mode 100644
+index 0000000..c842c1e
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_irq.h
+@@ -0,0 +1,677 @@
++/* sweet_wlan_irq.h - patch 0347 (lowclk 2026-11-13): the Wi-Fi INTx doorbell (stage A) and its read-only logging mode, behind boot-arg sweetwifiirq.
++ * Design notes: lowclk irq study as CORRECTED by study-check (ack order W1, enable order W2, threaded IRQ W3, shared SPI W4, link/DS W5, teardown order W6).
++ * sweetwifiirq absent or 0 = nothing in this file runs (every entry point returns before any hardware access). 2 = read-only logging: the only accesses are READS of
++ * ELBI+0x000, ELBI+0x010 and BAR0 PCIe core +0xC30, once a second. 1 = stage A: the corrected enable sequence, the ISR (ELBI only) and the thread (BAR0 only).
++ *
++ * The block between SWI_CORE_BEGIN and SWI_CORE_END is pure C (no kernel type, no printf, no MMIO): tools/test_wlan_irq_core.py compiles it with the host compiler
++ * and drives it with fake hardware. The kernel glue (struct swi_ops implementations, the SPI calls of patch 0346, the log lines) is in sweet_wlan.c.
++ *
++ * EVERY access goes through swi_io(): one table (swi_rows[], space/offset/access/mode) plus the value rules of swi_value_ok(), independent of the g2l[] judge of sweet_wlan.c
++ * (which has its own rows for the BAR0 words, added only for sweetwifiirq=1). A refused access is counted and never reaches the bus. Sources of each row: the comments below.
++ * Not run on hardware. */
++#ifndef SWEET_WLAN_IRQ_H
++#define SWEET_WLAN_IRQ_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* SWI_CORE_BEGIN */
++/* Registers. ELBI offsets: Pixel kernel pcie-exynos-rc.h PCIE_IRQ0 +0x000 (status, bit 14 = INTA), PCIE_IRQ0_EN +0x010 (bit 14 = INTA enable) [read refs/wlan-stage1/dwc-whi/pcie-exynos-rc.h:19-20,31-32; study-check item 3, 4].
++ * BAR0 PCIe core: MAILBOXINT +0xC30 (write-1-to-clear), MAILBOXMASK +0xC34, D2H doorbell bits 0..15 = 0xFFFF [read bwfm-host/if_bwfm_pci.h:55-74, if_bwfm_pci.c:2426-2434; study-check item 8, 9]. */
++#define SWI_ELBI_IRQ0     0x000u
++#define SWI_ELBI_IRQ0_EN  0x010u
++#define SWI_INTA          0x4000u   /* IRQ0 bit 14: INTA assert (status) / INTA enable (EN) */
++#define SWI_MBX_INT       0xC30u
++#define SWI_MBX_MASK      0xC34u
++#define SWI_MBX_ALL       0xFFFFu
++
++enum { SWI_SP_ELBI = 1, SWI_SP_BAR0 };          /* BAR0 = the PCIe core page (window already cfg 0x80 = PCIe, enforced by the glue) */
++enum { SWI_R = 1, SWI_W = 2 };
++enum { SWI_MODE_0 = 0, SWI_MODE_DB = 1, SWI_MODE_RO = 2 };
++enum { SWI_ISR_DONE = 0, SWI_ISR_MASK = 1, SWI_ISR_DEFER = 2 };  /* handler returns: 2 = SWEET_SPI_DEFER of patch 0346 */
++enum { SWI_E_REFUSED = -100, SWI_E_IO = -101 };
++
++/* why the doorbell mode is off (st->why); 0 = not off */
++enum { SWI_Y_NONE = 0, SWI_Y_GATE, SWI_Y_ARM, SWI_Y_STORM, SWI_Y_NOIRQ, SWI_Y_C30, SWI_Y_SPUR, SWI_Y_ISR, SWI_Y_LINK, SWI_Y_END, SWI_Y_UNMASK, SWI_Y_REFUSED, SWI_Y_EMPTY };
++
++/* notes to the glue (it prints them; every GAP-class code is a loud line + swl_gap): code, a, b */
++enum {
++	SWI_N_STEP = 1,        /* informational: arm step a done, value b */
++	SWI_G_GATE = 100,      /* link not known up / dongle not awake / bus dead: nothing touched */
++	SWI_G_C34ORIG,         /* 0xC34 neither 0 nor 0xFFFF (a = value): not armed */
++	SWI_G_RD,              /* read failed (a = step) */
++	SWI_G_WR,              /* write failed (a = step) */
++	SWI_G_REFUSED,         /* the swi judge refused (a = space, b = offset) */
++	SWI_G_C30STUCK,        /* 0xC30 not zero after the ack/drain loop (a = last value) */
++	SWI_G_ELBISTUCK,       /* IRQ0 bit 14 still set after its W1C (a = value read) */
++	SWI_G_ENOTHER,         /* IRQ0_EN has bits other than 14 set (a = value): not armed */
++	SWI_G_ATTACH,          /* GIC attach rc (a = rc, b = enable read-back) */
++	SWI_G_ENABLE,          /* GIC enable rc (a = rc, b = enable read-back) */
++	SWI_G_VERIFY,          /* read-back differs (a = want, b = got) */
++	SWI_G_STORM,           /* more ISR entries in one second than SWI_STORM_MAX (a = entries) */
++	SWI_G_NOIRQ,           /* SWI_NOIRQ_MAX poll passes found ring work and no interrupt ever fired (a = passes) */
++	SWI_G_SPUR,            /* SWI_SPUR_MAX ISR entries in a row without IRQ0 bit 14 (a = count) */
++	SWI_G_ISRERR,          /* the ISR could not read or write ELBI, or the judge refused there (a = count) */
++	SWI_G_UNMASK,          /* sweet_spi_unmask failed (a = rc) */
++	SWI_G_TEARDOWN,        /* a teardown step failed (a = step: 1 ELBI read, 2 ELBI write, 3 detach, 4 restore 0xC34) */
++	SWI_G_EMPTY,           /* SWI_EMPTY_MAX interrupts in a row whose thread pass found 0xC30 == 0 and no ring work: a stuck line (a = run, b = irqs so far) */
++	SWI_G_GATECLOSE,       /* thread gate closed after arming (engine stopped / DS / dead bus / link): no BAR0 access, no unmask, SPI left masked (a = closes so far) */
++	SWI_G_GATEOPEN         /* thread gate open again (a = closes so far) */
++};
++
++#define SWI_ACK_TRIES   8u      /* ack/drain rounds per pass before 0xC30 is called stuck [decision] */
++#define SWI_STORM_MAX   5000u   /* ISR entries in a one-second window above which the mode turns itself off [guess: the busy poll runs at most every 100 us = 10000 passes/s, one interrupt per pass; half of it] */
++#define SWI_NOIRQ_MAX   200u    /* poll passes that found ring work while NO interrupt ever fired, then off (task order; same number as the GPU's "200 jobs without a JOB interrupt", patch 0272) */
++#define SWI_SPUR_MAX    3u      /* ISR entries without IRQ0 bit 14 in a row [decision] */
++#define SWI_EMPTY_MAX   64u     /* interrupts in a row whose thread pass finds 0xC30 == 0 and no ring work, then off BEFORE the unmask (review 0346 F1; the value is a decision, 64 x 250 us = 16 ms of spin at most) */
++
++struct swi_ops {
++	void *ctx;
++	int (*rd)(void *ctx, int sp, uint32_t off, uint32_t *v);       /* 0 = ok */
++	int (*wr)(void *ctx, int sp, uint32_t off, uint32_t v);        /* 0 = ok, store done and ordered */
++	int (*gate)(void *ctx);                                         /* 0 = link up, dongle awake, bus alive */
++	int (*spi_attach_off)(void *ctx, uint32_t *enabled_rb);         /* GIC attach, SPI left disabled; *enabled_rb = ISENABLER bit read back; 0 = ok */
++	int (*spi_enable)(void *ctx, uint32_t *enabled_rb);             /* 0 = ok */
++	int (*spi_unmask)(void *ctx);                                   /* 0 = ok */
++	int (*spi_detach)(void *ctx);
++	uint32_t (*drain)(void *ctx);                                   /* the existing ring work (ring 2 + rings 3/4), returns the items found; thread context, en0 lock held */
++	void (*wake)(void *ctx);                                        /* wake the keep thread (ISR safe) */
++	void (*note)(void *ctx, int code, uint32_t a, uint32_t b);
++};
++
++struct swi {
++	uint8_t mode;                   /* SWI_MODE_*, set once */
++	volatile uint8_t on;            /* the doorbell is armed: the ISR works; 0 again at the first teardown */
++	uint8_t why;                    /* SWI_Y_*: set once, by the first disable */
++	uint8_t elbi_on, spi_att, spi_en;      /* what this file changed and not yet undone */
++	uint8_t c34_known, en_valid, c30_valid;
++	uint32_t c34_orig, c34_cur;     /* 0xC34 at arm time (0 or 0xFFFF) and as this file left it */
++	uint32_t en_last, c30_last;     /* the last values read, the base of the value rules (valid flags above; a write consumes them) */
++	/* ISR-written (single writer = the interrupt on the boot CPU) */
++	volatile uint32_t isr_total, irqs, spurious, isr_err, isr_off;
++	volatile uint32_t refused;      /* swi_io refusals (judge), ISR or thread: atomic add */
++	volatile uint32_t pend;         /* set by the ISR, taken by the thread */
++	/* thread-written */
++	uint32_t seen, seen_spur, spur_run, p_pend, p_defer;
++	uint32_t missed, storm, work_events, ack_writes, unmasks, loops, extra_items, ro_n, ro_skip;
++	uint32_t win_ms, win_isr;
++	uint32_t p_c30, empty_run, gate_closes;     /* p_c30: the 0xC30 value swi_pre read this pass (0xFFFFFFFF = not read); empty_run: see SWI_EMPTY_MAX */
++	uint8_t gate_closed, owe_unmask;            /* gate closed at the last thread pass; an unmask the closed gate postponed */
++};
++
++struct swi_ro { uint32_t elbi0, en0, c30; uint32_t err; };
++
++struct swi_row { uint8_t sp, acc, modes; uint16_t off; };
++#define SWI_MB(m) ((uint8_t)(1u << (m)))
++/* THE allowlist of this feature (independent of the bus judge): exactly these accesses, in these modes. Writes also need swi_value_ok(). */
++static const struct swi_row swi_rows[] = {
++	{ SWI_SP_ELBI, SWI_R, SWI_MB(SWI_MODE_DB) | SWI_MB(SWI_MODE_RO), SWI_ELBI_IRQ0 },       /* latch-or-level question (U-A): status read */
++	{ SWI_SP_ELBI, SWI_W, SWI_MB(SWI_MODE_DB),                       SWI_ELBI_IRQ0 },       /* W1C of bit 14 only */
++	{ SWI_SP_ELBI, SWI_R, SWI_MB(SWI_MODE_DB) | SWI_MB(SWI_MODE_RO), SWI_ELBI_IRQ0_EN },    /* enable read */
++	{ SWI_SP_ELBI, SWI_W, SWI_MB(SWI_MODE_DB),                       SWI_ELBI_IRQ0_EN },    /* bit 14 set (arm) or clear (teardown) only */
++	{ SWI_SP_BAR0, SWI_R, SWI_MB(SWI_MODE_DB) | SWI_MB(SWI_MODE_RO), SWI_MBX_INT },         /* MAILBOXINT read */
++	{ SWI_SP_BAR0, SWI_W, SWI_MB(SWI_MODE_DB),                       SWI_MBX_INT },         /* W1C of the bits read in the same pass */
++	{ SWI_SP_BAR0, SWI_R, SWI_MB(SWI_MODE_DB),                       SWI_MBX_MASK },        /* MAILBOXMASK read (arm: orig value, read-back) */
++	{ SWI_SP_BAR0, SWI_W, SWI_MB(SWI_MODE_DB),                       SWI_MBX_MASK },        /* := 0 (mask) or := 0xFFFF (unmask, last) */
++};
++
++/* The value rules. 1 = allowed. old-based rules use the value this file read last (valid flag), never a guess. */
++static int
++swi_value_ok(const struct swi *st, int sp, uint32_t off, uint32_t v)
++{
++	if (sp == SWI_SP_ELBI && off == SWI_ELBI_IRQ0) {
++		return v == SWI_INTA;                                   /* W1C: bit 14 and nothing else (study-check W4: not the whole status word) */
++	}
++	if (sp == SWI_SP_ELBI && off == SWI_ELBI_IRQ0_EN) {
++		if (!st->en_valid) {
++			return 0;
++		}
++		return (v == (st->en_last | SWI_INTA) && (st->en_last & ~SWI_INTA) == 0u) || v == (st->en_last & ~SWI_INTA);   /* set bit 14 over an otherwise clear word, or clear bit 14 only */
++	}
++	if (sp == SWI_SP_BAR0 && off == SWI_MBX_INT) {
++		return st->c30_valid && v != 0u && (v & ~SWI_MBX_ALL) == 0u && (v & ~st->c30_last) == 0u;   /* only bits read in this pass */
++	}
++	if (sp == SWI_SP_BAR0 && off == SWI_MBX_MASK) {
++		if (v == 0u) {
++			return 1;
++		}
++		/* the rewritten F9 rule (review 0174-w-d4b-hwwrite-r1 F9 said: never unmask while an RC enable is set): unmask only when BOTH halves of the path are armed
++		 * (IRQ0 bit 14 enabled by us and the SPI enabled) or both are off (restore to the state before this file ran) */
++		return v == SWI_MBX_ALL && ((st->elbi_on && st->spi_en) || (!st->elbi_on && !st->spi_en));
++	}
++	return 0;
++}
++
++/* for the bus judge row of sweet_wlan.c: same rule as above */
++static int
++swi_ack_value_ok(const struct swi *st, uint32_t v)
++{
++	return swi_value_ok(st, SWI_SP_BAR0, SWI_MBX_INT, v);
++}
++
++static int
++swi_row_ok(const struct swi *st, int sp, int acc, uint32_t off)
++{
++	unsigned i;
++
++	for (i = 0; i < sizeof swi_rows / sizeof swi_rows[0]; i++) {
++		if (swi_rows[i].sp == sp && swi_rows[i].acc == acc && swi_rows[i].off == off && (swi_rows[i].modes & SWI_MB(st->mode)) != 0u) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* THE access: judge, then bus. A write consumes the value it was judged against (en_valid, c30_valid): the next write needs a new read. */
++static int
++swi_io(struct swi *st, const struct swi_ops *o, int sp, int acc, uint32_t off, uint32_t *v)
++{
++	int rc;
++
++	if (!swi_row_ok(st, sp, acc, off) || (acc == SWI_W && !swi_value_ok(st, sp, off, *v))) {
++		__atomic_fetch_add(&st->refused, 1u, __ATOMIC_RELAXED);
++		return SWI_E_REFUSED;
++	}
++	if (acc == SWI_R) {
++		rc = o->rd(o->ctx, sp, off, v);
++		if (rc != 0) {
++			return SWI_E_IO;
++		}
++		if (sp == SWI_SP_ELBI && off == SWI_ELBI_IRQ0_EN) {
++			st->en_last = *v;
++			st->en_valid = 1;
++		} else if (sp == SWI_SP_BAR0 && off == SWI_MBX_INT) {
++			st->c30_last = *v;
++			st->c30_valid = 1;
++		}
++		return 0;
++	}
++	rc = o->wr(o->ctx, sp, off, *v);
++	if (rc != 0) {
++		return SWI_E_IO;
++	}
++	if (sp == SWI_SP_ELBI && off == SWI_ELBI_IRQ0_EN) {
++		st->en_valid = 0;
++	} else if (sp == SWI_SP_BAR0 && off == SWI_MBX_INT) {
++		st->c30_valid = 0;
++	}
++	return 0;
++}
++
++/* ---- ISR (interrupt context: no lock, no print, ELBI only, the judge and nothing else) ---- */
++static int
++swi_isr(struct swi *st, const struct swi_ops *o)
++{
++	uint32_t s = 0, w = SWI_INTA;
++
++	if (!st->on) {
++		st->isr_off++;
++		return SWI_ISR_MASK;                    /* disabled or never armed: let the dispatcher mask the line (patch 0272 safety net) */
++	}
++	st->isr_total++;
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0, &s) != 0) {
++		st->isr_err++;
++		return SWI_ISR_MASK;
++	}
++	if ((s & SWI_INTA) == 0u) {
++		st->spurious++;                         /* not ours (IRQ1/IRQ2 bits are never enabled here, study-check W4): the line may still be up, so MASK it; the thread decides */
++		if (o->wake != NULL) {
++			o->wake(o->ctx);                    /* so the thread unmasks (or turns the mode off) at once */
++		}
++		return SWI_ISR_DEFER;
++	}
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_W, SWI_ELBI_IRQ0, &w) != 0) {      /* W1C of bit 14 only */
++		st->isr_err++;
++		return SWI_ISR_MASK;
++	}
++	st->irqs++;
++	__atomic_store_n(&st->pend, 1u, __ATOMIC_RELEASE);
++	if (o->wake != NULL) {
++		o->wake(o->ctx);
++	}
++	return SWI_ISR_DEFER;                       /* the line may still be up until the thread acks 0xC30: mask at the GIC, the thread unmasks (patch 0346) */
++}
++
++static void
++swi_gap(const struct swi_ops *o, int code, uint32_t a, uint32_t b)
++{
++	if (o->note != NULL) {
++		o->note(o->ctx, code, a, b);
++	}
++}
++
++static void
++swi_say(const struct swi_ops *o, uint32_t step, uint32_t val)
++{
++	if (o->note != NULL) {
++		o->note(o->ctx, SWI_N_STEP, step, val);
++	}
++}
++
++/* the thread gate (review 0346 F2), one GAP per state change. 0 = open, -1 = closed: the caller does no BAR0 access and no unmask. */
++static int
++swi_gate_pass(struct swi *st, const struct swi_ops *o)
++{
++	if (o->gate(o->ctx) != 0) {
++		if (!st->gate_closed) {
++			st->gate_closed = 1;
++			st->gate_closes++;
++			swi_gap(o, SWI_G_GATECLOSE, st->gate_closes, 0u);
++		}
++		return -1;
++	}
++	if (st->gate_closed) {
++		st->gate_closed = 0;
++		swi_gap(o, SWI_G_GATEOPEN, st->gate_closes, 0u);
++	}
++	return 0;
++}
++
++/* ---- teardown: ALWAYS runs every step, in the order of study-check s.4: ELBI enable off, SPI detach, then (thread context, bus alive) 0xC34 back to its value before arming.
++ * bar0_ok = 0 when the bus is gone (engine end: the engine's own undo writes 0xC34 := 0). Every step is tried even when an earlier one failed. */
++static void
++swi_teardown(struct swi *st, const struct swi_ops *o, int bar0_ok)
++{
++	uint32_t en = 0, w;
++
++	st->on = 0;                                 /* from here the ISR only masks */
++	if (st->elbi_on) {
++		if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0_EN, &en) != 0) {
++			swi_gap(o, SWI_G_TEARDOWN, 1u, en);
++		} else {
++			w = en & ~SWI_INTA;
++			if (swi_io(st, o, SWI_SP_ELBI, SWI_W, SWI_ELBI_IRQ0_EN, &w) != 0) {
++				swi_gap(o, SWI_G_TEARDOWN, 2u, w);
++			} else {
++				st->elbi_on = 0;
++			}
++		}
++	}
++	if (st->spi_att) {
++		if (o->spi_detach(o->ctx) != 0) {
++			swi_gap(o, SWI_G_TEARDOWN, 3u, 0u);
++		}
++		st->spi_att = 0;
++		st->spi_en = 0;
++	}
++	if (bar0_ok && st->c34_known && st->c34_cur != st->c34_orig && !st->elbi_on && !st->spi_en) {
++		w = st->c34_orig;
++		if (swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_MASK, &w) != 0) {
++			swi_gap(o, SWI_G_TEARDOWN, 4u, w);
++		} else {
++			st->c34_cur = w;
++		}
++	}
++}
++
++/* first disable wins: records why, runs the teardown, tells the glue (the glue prints a loud line) */
++static void
++swi_disable(struct swi *st, const struct swi_ops *o, int why, int code, uint32_t a)
++{
++	if (st->why != SWI_Y_NONE) {
++		return;
++	}
++	st->why = (uint8_t)why;
++	if (code != 0) {
++		swi_gap(o, code, a, 0u);
++	}
++	swi_teardown(st, o, 1);
++}
++
++/* ack/drain loop (study-check W1): read 0xC30, W1C exactly the bits read, drain the rings, re-read, until zero. Returns 0 = zero reached, -1 = stuck/failed (caller disables), -2 = the gate closed after a drain (no more BAR0 access). *extra += drained items */
++static int
++swi_ack_loop(struct swi *st, const struct swi_ops *o, uint32_t *extra)
++{
++	uint32_t c = 0, n = 0;
++	int r;
++
++	for (;;) {
++		r = swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &c);
++		if (r != 0) {
++			swi_gap(o, r == SWI_E_REFUSED ? SWI_G_REFUSED : SWI_G_RD, SWI_SP_BAR0, SWI_MBX_INT);
++			return -1;
++		}
++		if (c == 0u) {
++			return 0;
++		}
++		if (n++ >= SWI_ACK_TRIES) {
++			swi_gap(o, SWI_G_C30STUCK, c, 0u);
++			return -1;
++		}
++		r = swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_INT, &c);
++		if (r != 0) {
++			swi_gap(o, r == SWI_E_REFUSED ? SWI_G_REFUSED : SWI_G_WR, SWI_SP_BAR0, SWI_MBX_INT);
++			return -1;
++		}
++		st->ack_writes++;
++		st->loops++;
++		if (extra != NULL) {
++			*extra += o->drain(o->ctx);
++		}
++		if (swi_gate_pass(st, o) != 0) {         /* the drain may have stopped the engine (swg_keep_r2): no further BAR0 access */
++			return -2;
++		}
++	}
++}
++
++/* ---- arm: the corrected stage-A write list (study-check s.4), in this order. 0 = armed; <0 = refused at step -N, the teardown ran and st->why is set.
++ * 0 gate; 1 0xC34 := 0; 2 0xC30 ack loop to 0; 3 ELBI IRQ0 W1C bit 14 (+ read-back clear); 4 GIC attach, SPI left disabled; 5 ELBI IRQ0_EN |= bit 14 (+ read-back);
++ * 6 SPI enable; 7 0xC34 := 0xFFFF LAST (+ read-back). */
++static int
++swi_arm(struct swi *st, const struct swi_ops *o)
++{
++	uint32_t v = 0, rb = 0, ex = 0;
++	int r, step = 0, why = SWI_Y_ARM;
++
++	if (st->mode != SWI_MODE_DB) {
++		return -100;
++	}
++	if (o->gate(o->ctx) != 0) {
++		swi_disable(st, o, SWI_Y_GATE, SWI_G_GATE, 0u);
++		return -100;
++	}
++	step = 1;
++	if (swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_MASK, &v) != 0) {
++		swi_gap(o, SWI_G_RD, 1u, 0u);
++		goto fail;
++	}
++	if (v != 0u && v != SWI_MBX_ALL) {
++		swi_gap(o, SWI_G_C34ORIG, v, 0u);
++		goto fail;
++	}
++	st->c34_orig = st->c34_cur = v;
++	st->c34_known = 1;
++	if (v != 0u) {
++		v = 0u;
++		if (swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_MASK, &v) != 0) {
++			swi_gap(o, SWI_G_WR, 1u, 0u);
++			goto fail;
++		}
++		st->c34_cur = 0u;
++	}
++	swi_say(o, 1u, 0u);
++	step = 2;
++	r = swi_ack_loop(st, o, &ex);
++	if (r != 0) {
++		why = r == -2 ? SWI_Y_GATE : SWI_Y_C30;
++		goto fail;
++	}
++	st->extra_items += ex;
++	swi_say(o, 2u, 0u);
++	step = 3;
++	v = 0u;
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0, &v) != 0) {
++		swi_gap(o, SWI_G_RD, 3u, 0u);
++		goto fail;
++	}
++	if ((v & SWI_INTA) != 0u) {
++		uint32_t w = SWI_INTA;
++
++		if (swi_io(st, o, SWI_SP_ELBI, SWI_W, SWI_ELBI_IRQ0, &w) != 0) {
++			swi_gap(o, SWI_G_WR, 3u, 0u);
++			goto fail;
++		}
++		v = 0u;
++		if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0, &v) != 0 || (v & SWI_INTA) != 0u) {
++			swi_gap(o, SWI_G_ELBISTUCK, v, 0u);
++			goto fail;
++		}
++	}
++	swi_say(o, 3u, v);
++	step = 4;
++	r = o->spi_attach_off(o->ctx, &rb);
++	if (r != 0 || rb != 0u) {
++		swi_gap(o, SWI_G_ATTACH, (uint32_t)r, rb);
++		st->spi_att = (uint8_t)(r == 0);        /* attached but read back enabled: the teardown must detach it */
++		st->spi_en = (uint8_t)(rb != 0u);
++		goto fail;
++	}
++	st->spi_att = 1;
++	swi_say(o, 4u, rb);
++	step = 5;
++	v = 0u;
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0_EN, &v) != 0) {
++		swi_gap(o, SWI_G_RD, 5u, 0u);
++		goto fail;
++	}
++	if ((v & ~SWI_INTA) != 0u) {
++		swi_gap(o, SWI_G_ENOTHER, v, 0u);
++		goto fail;
++	}
++	{
++		uint32_t w = v | SWI_INTA;
++
++		if (swi_io(st, o, SWI_SP_ELBI, SWI_W, SWI_ELBI_IRQ0_EN, &w) != 0) {
++			swi_gap(o, SWI_G_WR, 5u, 0u);
++			goto fail;
++		}
++		st->elbi_on = 1;                        /* set before the read-back: a failed read-back still owes a teardown */
++		v = 0u;
++		if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0_EN, &v) != 0 || v != w) {
++			swi_gap(o, SWI_G_VERIFY, w, v);
++			goto fail;
++		}
++	}
++	swi_say(o, 5u, v);
++	step = 6;
++	st->on = 1;                                 /* before the enable: the ISR may run at once */
++	rb = 0u;
++	r = o->spi_enable(o->ctx, &rb);
++	if (r != 0 || rb == 0u) {
++		swi_gap(o, SWI_G_ENABLE, (uint32_t)r, rb);
++		goto fail;
++	}
++	st->spi_en = 1;
++	swi_say(o, 6u, rb);
++	step = 7;
++	v = SWI_MBX_ALL;
++	if (swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_MASK, &v) != 0) {
++		swi_gap(o, SWI_G_WR, 7u, 0u);
++		goto fail;
++	}
++	st->c34_cur = SWI_MBX_ALL;
++	v = 0u;
++	if (swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_MASK, &v) != 0 || v != SWI_MBX_ALL) {
++		swi_gap(o, SWI_G_VERIFY, SWI_MBX_ALL, v);
++		goto fail;
++	}
++	swi_say(o, 7u, v);
++	return 0;
++fail:
++	swi_disable(st, o, why, 0, 0u);
++	return -step;
++}
++
++/* ---- thread, before the drain: ack first (W1). Returns 1 when the ISR fired (or an entry without bit 14 masked the line) since the last pass. */
++static int
++swi_pre(struct swi *st, const struct swi_ops *o)
++{
++	uint32_t c = 0, sp;
++
++	st->p_pend = 0;
++	st->p_defer = 0;
++	st->p_c30 = 0xFFFFFFFFu;
++	if (!st->on) {
++		return 0;
++	}
++	if (swi_gate_pass(st, o) != 0) {              /* gate first (review 0346 F2): closed = no BAR0 access; the interrupt stays pending for the next pass */
++		return 0;
++	}
++	st->p_pend = __atomic_exchange_n(&st->pend, 0u, __ATOMIC_ACQ_REL);
++	sp = st->spurious;
++	if (sp != st->seen_spur) {
++		st->p_defer = 1;
++		st->spur_run += sp - st->seen_spur;
++		st->seen_spur = sp;
++	}
++	if (st->owe_unmask) {                         /* a closed gate postponed the unmask of the line the ISR masked */
++		st->p_defer = 1;
++		st->owe_unmask = 0;
++	}
++	if (st->p_pend) {
++		st->p_defer = 1;
++		st->spur_run = 0;
++		if (swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &c) == 0) {
++			st->p_c30 = c;
++		}
++		if (st->p_c30 != 0xFFFFFFFFu && c != 0u) {
++			if (swi_io(st, o, SWI_SP_BAR0, SWI_W, SWI_MBX_INT, &c) == 0) {      /* the bits just read, before any ring is touched */
++				st->ack_writes++;
++			}
++		}
++	}
++	return (int)(st->p_pend | st->p_defer);
++}
++
++/* ---- thread, after the first drain (got = items it found): missed/auto-disable bookkeeping, the re-read loop, then the unmask. Returns extra items drained. */
++static uint32_t
++swi_post(struct swi *st, const struct swi_ops *o, uint32_t got)
++{
++	uint32_t ex = 0, now = st->isr_total, aw0;
++	int fired, r;
++
++	if (!st->on) {
++		return 0;
++	}
++	if (st->gate_closed) {                        /* gate first (review 0346 F2): nothing below touches BAR0 or the GIC while it is closed */
++		return 0;
++	}
++	if ((st->p_pend || st->p_defer || got != 0u) && swi_gate_pass(st, o) != 0) {      /* the engine may have stopped inside this pass */
++		if (st->p_defer) {
++			st->owe_unmask = 1;
++		}
++		return 0;
++	}
++	fired = now != st->seen;
++	st->seen = now;
++	if (got != 0u) {
++		st->work_events++;
++		if (!st->p_pend && !fired) {
++			st->missed++;                       /* the poll found work and no interrupt fired since the last pass */
++		}
++	}
++	if (st->isr_err != 0u) {
++		swi_disable(st, o, SWI_Y_ISR, SWI_G_ISRERR, st->isr_err);
++		return 0;
++	}
++	if (st->refused != 0u) {                    /* the judge refused something: a bug in this file, never silent */
++		swi_disable(st, o, SWI_Y_REFUSED, SWI_G_REFUSED, st->refused);
++		return 0;
++	}
++	if (st->spur_run >= SWI_SPUR_MAX) {
++		swi_disable(st, o, SWI_Y_SPUR, SWI_G_SPUR, st->spur_run);
++		return 0;
++	}
++	if (st->irqs == 0u && st->work_events >= SWI_NOIRQ_MAX) {
++		swi_disable(st, o, SWI_Y_NOIRQ, SWI_G_NOIRQ, st->work_events);
++		return 0;
++	}
++	aw0 = st->ack_writes;
++	if (st->p_pend || got != 0u) {
++		r = swi_ack_loop(st, o, &ex);
++		if (r == -2) {                          /* the gate closed during the loop: no unmask, owed for when it opens */
++			if (st->p_defer) {
++				st->owe_unmask = 1;
++			}
++			return ex;
++		}
++		if (r != 0) {
++			swi_disable(st, o, SWI_Y_C30, 0, 0u);
++			return ex;
++		}
++	}
++	/* F1 (review 0346): an interrupt whose pass finds 0xC30 == 0 (pre and loop) and no ring work is "empty"; SWI_EMPTY_MAX in a row = a line that stays asserted: off BEFORE the unmask so it cannot spin the thread */
++	if (st->p_pend && st->p_c30 == 0u && got == 0u && ex == 0u && st->ack_writes == aw0) {
++		st->empty_run++;
++	} else if (st->p_pend || got != 0u || ex != 0u) {
++		st->empty_run = 0;
++	}
++	if (st->empty_run >= SWI_EMPTY_MAX) {
++		swi_gap(o, SWI_G_EMPTY, st->empty_run, st->irqs);
++		swi_disable(st, o, SWI_Y_EMPTY, 0, 0u);
++		return ex;
++	}
++	st->extra_items += ex;
++	if (st->p_defer) {                          /* the line was masked by the ISR (deferred or entry without bit 14): re-enable it, last */
++		int r = o->spi_unmask(o->ctx);
++
++		if (r != 0) {
++			swi_disable(st, o, SWI_Y_UNMASK, SWI_G_UNMASK, (uint32_t)r);
++			return ex;
++		}
++		st->unmasks++;
++	}
++	return ex;
++}
++
++/* ---- once per pass: the storm window (ISR entries per second). now_ms = any monotonic millisecond clock */
++static void
++swi_tick(struct swi *st, const struct swi_ops *o, uint32_t now_ms)
++{
++	uint32_t d;
++
++	if (!st->on) {
++		return;
++	}
++	if (st->win_ms == 0u) {
++		st->win_ms = now_ms == 0u ? 1u : now_ms;
++		st->win_isr = st->isr_total;
++		return;
++	}
++	if (now_ms - st->win_ms >= 1000u) {
++		d = st->isr_total - st->win_isr;
++		st->win_ms = now_ms;
++		st->win_isr = st->isr_total;
++		if (d > SWI_STORM_MAX) {
++			st->storm++;
++			swi_disable(st, o, SWI_Y_STORM, SWI_G_STORM, d);
++		}
++	}
++}
++
++/* ---- mode 2: ONE read-only sample (no write exists in this mode: the judge has no W row for it). Returns 0 = all three read, -1 = gate closed (nothing touched), -2 = a read failed (field = 0xFFFFFFFF) */
++static int
++swi_ro_sample(struct swi *st, const struct swi_ops *o, struct swi_ro *r)
++{
++	r->elbi0 = r->en0 = r->c30 = 0xFFFFFFFFu;
++	r->err = 0;
++	if (st->mode != SWI_MODE_RO) {
++		return -1;
++	}
++	if (o->gate(o->ctx) != 0) {
++		st->ro_skip++;
++		return -1;
++	}
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0, &r->elbi0) != 0) {
++		r->elbi0 = 0xFFFFFFFFu;
++		r->err |= 1u;
++	}
++	if (swi_io(st, o, SWI_SP_ELBI, SWI_R, SWI_ELBI_IRQ0_EN, &r->en0) != 0) {
++		r->en0 = 0xFFFFFFFFu;
++		r->err |= 2u;
++	}
++	if (swi_io(st, o, SWI_SP_BAR0, SWI_R, SWI_MBX_INT, &r->c30) != 0) {
++		r->c30 = 0xFFFFFFFFu;
++		r->err |= 4u;
++	}
++	st->ro_n++;
++	return r->err != 0u ? -2 : 0;
++}
++
++/* the text after "mode " of the 5 s summary */
++static const char *
++swi_mode_str(const struct swi *st)
++{
++	static const char *const why[] = { "", "off:gate", "off:arm", "off:storm", "off:noirq", "off:c30stuck", "off:spurious", "off:isr", "off:link", "off:end", "off:unmask", "off:refused", "off:emptyirq" };
++
++	if (st->mode == SWI_MODE_RO) {
++		return "ro";
++	}
++	if (st->why != SWI_Y_NONE && st->why < sizeof why / sizeof why[0]) {
++		return why[st->why];
++	}
++	return st->on ? "doorbell" : (st->mode == SWI_MODE_DB ? "off:notarmed" : "off:0");
++}
++/* SWI_CORE_END */
++
++#endif /* SWEET_WLAN_IRQ_H */

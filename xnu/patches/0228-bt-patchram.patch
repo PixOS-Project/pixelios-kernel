@@ -1,0 +1,412 @@
+SWEET Bluetooth: patch 0218 (T-86c9/T-60ed, Opus-reviewed, ran in bt-up7p) carried unchanged in code onto the 0219-0226 lineage as 0228 (ticket T-0d4e, W-BTSCAN): the 0218 hunks re-based against the tree after 0226 (context only; 2 hunks needed fuzz 1, no line of code changed), so the download runs after the sweetbtleprobe=4 sweep and its final power-cycle and bluetoothd meets the patched controller. Original description follows.
+
+SWEET Bluetooth: stock BCM.hcd download into the controller RAM before bluetoothd starts (patch 0218, ticket T-86c9, W-BTUP; boot-arg sweetbtpatchram=1, default off, default behaviour unchanged; sub-knob sweetbtpatchrambaud=1 adds the HAL's 4 Mbaud step, default 115200). bt-up5/bt-up6 [obs 20261104T054627Z-bt-up5, 20261107T030249Z-bt-up6]: bluetoothd lives 23-24 s on the unpatched BCM4389 ROM (0x1001 rev word 0x2000 = build 0, HCI 5.1) while every stock capture shows rev 0x20cb = build 203, HCI 5.2 after the HAL's download (docs/research/BT-rom-vs-patched.md s.4-6; the 3039 records of the vendor BCM.hcd are byte-identical to the golden vendor snoop). After the baud probe settled (and after the 0216/0217 probes, if on), the backend sends the HAL sequence: HCI Reset, 0xfc79 (expect chip id 0xaa, build 0), [0xfc18 4 000 000 and the host UART follows], 0xfc2e download mode + 50 ms, the 3038 x 0xfc4c Write RAM records without Command Complete (RTS/CTS paced, only the first and last record enter the HCI trace so the 3000-transfer cap is left to bluetoothd), 0xfc4e Launch RAM with a Command Complete, [host back to 115200], 250 ms, Reset, 0xfc79 (expect build 203), 0x1001 (expect rev 0x20cb), 0xfc01 Write BD_ADDR with the synthetic 02:00:00:00:00:01 D-3 address and a 0x1009 read-back; no 0xfc27 LPM (host-wake irq not wired), logged as a deviation. Rows: `BT PROBE: patchram ...`, the summary `BT PROBE: patchram build=<n> hci_rev=0x<r> records=3039 sha256=<h>`; every missing Command Complete or status != 0 is a `BT GAP:` and stops the sequence, after which the controller is power-cycled back to the ROM for bluetoothd. The firmware is NOT in git: bsd/dev/sweet_bt_hcd.c is an empty slot (len 0 = the knob refuses with a `BT GAP:` and sends nothing); tools/bcm-hcd-stack generates a local-only patch that fills the slot from a gitignored BCM.hcd and prints its sha256. Before any byte is sent the image is scanned: only 0xfc4c writes and one final 0xfc4e launch of 4 bytes, lengths adding up to the file size (anything else, e.g. a flash/NVRAM opcode, is refused). sbu_tx is split into the traced sbu_tx and the untraced sbu_tx_raw. Volatile controller RAM only, cleared by REG_ON low [guess: no BCM4389 source says the patch does not persist]. Applies after 0189, 0213, 0215, 0216 and 0217. Review T-60ed (Opus round 1) fixes: the first/last stream record logs a header-only `BT HCI: tx ... (payload not logged)` row (no firmware bytes in logs/proofs); stream rx bytes or line errors, a launch that does not answer build 203 / rev 0x20cb, and a BD_ADDR read-back mismatch each stop the sequence (EIO -> power-cycle back to the ROM); the start row prints `stock=yes|no` against the stock sha256 and a GAP when no; attach-side recovery lives in sbu_patchram_attach() (host-tested); the knob logs a GAP also when attach returns before the download. Not run on hardware yet.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 88a3cf4..6b89694 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -127,6 +127,7 @@ bsd/dev/sweet_gpu_gs101.c		standard
+ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_bt_uart.c		standard
++bsd/dev/sweet_bt_hcd.c		standard
+ bsd/dev/sweet_gpu_job.c		standard
+ bsd/dev/sweet_mali.c		standard
+ bsd/dev/sweet_mmio_log.c		standard
+diff --git a/bsd/dev/sweet_bt_hcd.c b/bsd/dev/sweet_bt_hcd.c
+new file mode 100644
+index 0000000..9069ddf
+--- /dev/null
++++ b/bsd/dev/sweet_bt_hcd.c
+@@ -0,0 +1,9 @@
++/* PixOS: BCM4389 patchram image slot (patch 0218, T-86c9). EMPTY in git: no firmware lives in the repo (rule 4). tools/bcm-hcd-stack generates a patch that replaces the lines below
++ * with the BCM.hcd bytes for a local build; an empty slot makes the boot-arg sweetbtpatchram=1 refuse loudly. */
++#include <stdint.h>
++#include <stddef.h>
++const uint8_t sweet_bt_hcd_data[] = {
++	0
++};
++const size_t sweet_bt_hcd_len = 0;
++const char sweet_bt_hcd_sha256[] = "none";
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+index 4b335c1..cc688ab 100644
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -509,16 +509,10 @@ sbu_trace(const char *dir, const uint8_t *p, size_t len)
+ }
+ 
+ /* ---- the sweet_bt_ops ---- */
++/* patch 0218 (T-86c9): the byte loop of sbu_tx without the HCI trace line, so the 3038 patchram records do not use up the SBU_TRACE_MAX transfers bluetoothd needs */
+ static int
+-sbu_tx(const void *data, size_t len)
++sbu_tx_raw(const uint8_t *p, size_t len)
+ {
+-	const uint8_t *p = data;
+-
+-	if (!sbu.powered || !sbu.uart_ok) {
+-		SBU_GAP(SG_OTHER, "H4 tx of %zu bytes while the controller is not powered/opened; refused", len);
+-		return ENXIO;
+-	}
+-	sbu_trace("tx", p, len);
+ 	for (size_t i = 0; i < len; i++) {
+ 		if (sbu_wait(U_UFSTAT, SBU_UFSTAT_TXFULL, 0) != 0) {
+ 			SBU_GAP(SG_TXFULL, "uart16 tx fifo stayed full (flow control stuck?); %zu of %zu bytes sent", i, len);
+@@ -530,6 +524,19 @@ sbu_tx(const void *data, size_t len)
+ 	return 0;
+ }
+ 
++static int
++sbu_tx(const void *data, size_t len)
++{
++	const uint8_t *p = data;
++
++	if (!sbu.powered || !sbu.uart_ok) {
++		SBU_GAP(SG_OTHER, "H4 tx of %zu bytes while the controller is not powered/opened; refused", len);
++		return ENXIO;
++	}
++	sbu_trace("tx", p, len);
++	return sbu_tx_raw(p, len);
++}
++
+ /*
+  * BT-S4e probe: with the conflict word, one candidate clock is tried by what the chip does. H4 HCI Reset (01 03 0c 00) goes out at 115200 under the candidate
+  * divisor and the RX FIFO is read for the Command Complete event 04 0e 04 <ncmd> 03 0c <status>. No answer in two rounds of 300 ms = wrong clock (or a dead
+@@ -1289,6 +1296,299 @@ sbu_sweep(const struct sbu_cand *c)
+ 	return 0;
+ }
+ 
++/*
++ * patch 0218 (T-86c9, W-BTUP), boot-arg sweetbtpatchram=1 (default off): download the stock BCM4389 firmware patch (BCM.hcd, the file the Android HAL sends on every Bluetooth
++ * start) into the controller RAM before bluetoothd starts, in the HAL's own order, then read the version back. docs/research/BT-rom-vs-patched.md s.6-7: the 3039 records are
++ * byte-identical to the golden vendor snoop (3038 x 0xfc4c Write RAM, no Command Complete, then 0xfc4e Launch RAM `ff ff ff ff` with one). The image is NOT in git: it is
++ * built into sweet_bt_hcd.c from a gitignored file by tools/bcm-hcd-stack (empty = this knob refuses, rule 8). Controller writes: 0xfc4c/0xfc4e only (the scan below refuses
++ * every other opcode), 0xfc18 baud (sub-knob sweetbtpatchrambaud=1 only), 0xfc2e download mode, 0xfc01 Write BD_ADDR (synthetic D-3 address); all volatile controller RAM
++ * state that REG_ON low clears [guess: no BCM4389 source says the patch does not persist; every stock enable relies on it]. No 0xfc27 (LPM): the host-wake irq is not wired.
++ */
++extern const uint8_t sweet_bt_hcd_data[];
++extern const size_t sweet_bt_hcd_len;
++extern const char sweet_bt_hcd_sha256[];
++
++#define SBU_HCD_OP_WRITE        0xfc4c
++#define SBU_HCD_OP_LAUNCH       0xfc4e
++#define SBU_PR_REFUSED          (-1)    /* nothing was sent to the controller */
++#define SBU_HCD_STOCK_BUILD     203u    /* the stock BP31 BCM.hcd [obs golden vendor snoop: 0xfc79 build 203, 0x1001 rev word 0x20cb] */
++#define SBU_HCD_STOCK_REV       0x20cbu
++#define SBU_HCD_STOCK_SHA256    "450f8c66f76b96da65c83f5d380922f55e1e4a4e661cd61b0109c53249e0d8d1"
++
++/* The record stream is [op lo, op hi, plen, plen bytes]*: only 0xfc4c writes, one 0xfc4e launch (4 bytes) as the last record, and the lengths add up to the file size. */
++static int
++sbu_hcd_scan(unsigned *nwrite, unsigned *nlaunch, size_t *wbytes)
++{
++	size_t off = 0;
++
++	*nwrite = *nlaunch = 0;
++	*wbytes = 0;
++	while (off < sweet_bt_hcd_len) {
++		uint16_t op;
++		size_t pl;
++
++		if (sweet_bt_hcd_len - off < 3) {
++			SBU_GAP(SG_OTHER, "patchram image malformed: %zu trailing bytes at offset %zu are not a record header", sweet_bt_hcd_len - off, off);
++			return EINVAL;
++		}
++		op = (uint16_t)(sweet_bt_hcd_data[off] | (sweet_bt_hcd_data[off + 1] << 8));
++		pl = sweet_bt_hcd_data[off + 2];
++		if (sweet_bt_hcd_len - off < 3 + pl) {
++			SBU_GAP(SG_OTHER, "patchram image malformed: record at offset %zu claims %zu payload bytes, %zu left", off, pl, sweet_bt_hcd_len - off - 3);
++			return EINVAL;
++		}
++		if (op == SBU_HCD_OP_WRITE && *nlaunch == 0) {
++			(*nwrite)++;
++			*wbytes += pl;
++		} else if (op == SBU_HCD_OP_LAUNCH && *nlaunch == 0 && pl == 4 && off + 3 + pl == sweet_bt_hcd_len) {
++			(*nlaunch)++;
++		} else {
++			SBU_GAP(SG_OTHER, "patchram image refused: record at offset %zu has opcode 0x%04x plen %zu (only 0xfc4c writes and one final 0xfc4e launch of 4 bytes are allowed)", off, op, pl);
++			return EINVAL;
++		}
++		off += 3 + pl;
++	}
++	if (*nwrite == 0 || *nlaunch != 1) {
++		SBU_GAP(SG_OTHER, "patchram image refused: %u write records and %u launch records (need >= 1 and exactly 1)", *nwrite, *nlaunch);
++		return EINVAL;
++	}
++	return 0;
++}
++
++/* one command of the sequence: a missing Command Complete or a status != 0 is a BT GAP and stops the sequence (rule 8) */
++static int
++sbu_pr_cmd(const char *step, uint16_t op, const uint8_t *par, uint8_t plen, uint8_t *rp, size_t rpmax, size_t *rpn)
++{
++	static const uint8_t none[1] = { 0 };
++	uint8_t st = 0xff;
++	int e = sbu_cmd(op, par != NULL ? par : none, plen, &st, rp, rpmax, rpn);
++
++	if (e != 0) {
++		SBU_GAP(SG_OTHER, "patchram step %s op=0x%04x: no Command Complete (error %d); sequence stopped", step, op, e);
++		return e;
++	}
++	if (st != 0) {
++		SBU_GAP(SG_OTHER, "patchram step %s op=0x%04x: status %#04x (%s); sequence stopped", step, op, st, sbu_pstatus(st));
++		return EIO;
++	}
++	printf("BT PROBE: patchram step %s op=0x%04x status=0x00 ok\n", step, op);
++	return 0;
++}
++
++/* steps 1-4 of docs/research/BT-rom-vs-patched.md s.7: Reset, chip id + build (expect 0xaa and build 0), [4 Mbaud], download mode. fast = 0xfc18 4 000 000 first, the host follows. */
++static int
++sbu_pr_prepare(bool fast)
++{
++	static const uint8_t par_baud[6] = { 0x00, 0x00, 0x00, 0x09, 0x3d, 0x00 };     /* 0xfc18 as the HAL sends it (golden vnd rec 4): 4 000 000 baud = 0x003d0900 */
++	uint8_t rp[SBU_PM_SUPP];
++	size_t rpn;
++	int e;
++
++	if ((e = sbu_pr_cmd("reset-1", 0x0c03, NULL, 0, rp, sizeof(rp), &rpn)) != 0 || (e = sbu_pr_cmd("read-chip-id", 0xfc79, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if (rpn < 6) {
++		SBU_GAP(SG_OTHER, "patchram: 0xfc79 reply has %zu return bytes (need 6); sequence stopped", rpn);
++		return EPROTO;
++	}
++	printf("BT PROBE: patchram before: chip id=0x%02x build=%u (rev word %02x %02x)\n", rp[0], rp[4] | (rp[5] << 8), rp[4], rp[5]);
++	if (rp[0] != 0xaa) {
++		SBU_GAP(SG_OTHER, "patchram: chip id 0x%02x is not 0xaa, BCM.hcd is selected for 0xaa only; refused, nothing downloaded", rp[0]);
++		return EINVAL;
++	}
++	if ((rp[4] | (rp[5] << 8)) != 0) {
++		SBU_GAP(SG_OTHER, "patchram: the controller reports build %u before the download (expected 0 on a power-cycled ROM); continuing", rp[4] | (rp[5] << 8));
++	}
++	if (fast) {
++		if ((e = sbu_pr_cmd("baud-4M", 0xfc18, par_baud, sizeof(par_baud), rp, sizeof(rp), &rpn)) != 0 || (e = sbu_set_baud(4000000)) != 0) {
++			return e;
++		}
++	}
++	if ((e = sbu_pr_cmd("download-mode", 0xfc2e, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {      /* at 4 M this is also the proof that the baud change worked */
++		return e;
++	}
++	sbu.hw.msleep(50);      /* the HAL's first 0xfc4c follows 53 ms after the Command Complete (golden vnd rec 7-8); btbcm.c:173-184 waits 50 ms too */
++	return 0;
++}
++
++/* the 3038 Write RAM records, no Command Complete waited (chip 0xaa fast download, golden vnd rec 8-3045), RTS/CTS paced; the chip sends nothing, so any rx byte is reported */
++static int
++sbu_pr_stream(unsigned nwrite)
++{
++	uint8_t pkt[1 + 3 + 255];
++	size_t off = 0, sent = 0;
++	unsigned n = 0, unexpected = 0, rxerrs = 0;
++	int e;
++
++	while (n < nwrite) {
++		size_t pl = sweet_bt_hcd_data[off + 2];
++		uint32_t err = sbu_rd(SBU_UART + U_UERSTAT);
++		uint8_t first[4];
++		unsigned got = 0;
++
++		pkt[0] = 0x01;
++		memcpy(pkt + 1, sweet_bt_hcd_data + off, 3 + pl);
++		if (n == 0 || n + 1 == nwrite) {      /* header only, never the payload: the log goes into proofs and the firmware must not (rule 4, review T-60ed F4); the trace cap stays for bluetoothd */
++			printf("BT HCI: tx %zu bytes: patchram record %u/%u op=0x%04x plen=%zu (payload not logged)\n", 4 + pl, n + 1, nwrite, SBU_HCD_OP_WRITE, pl);
++		}
++		if ((e = sbu_tx_raw(pkt, 4 + pl)) != 0) {
++			SBU_GAP(SG_OTHER, "patchram stream stopped at record %u of %u (%zu payload bytes sent, error %d)", n + 1, nwrite, sent, e);
++			return e;
++		}
++		off += 3 + pl;
++		sent += pl;
++		n++;
++		if (err != 0) {
++			rxerrs++;
++			sbu.rx_err++;
++			SBU_GAP(SG_RXERR, "uart16 rx error flags %#x during the patchram stream (before record %u)", err, n);
++		}
++		while (got < 64 && ((sbu_rd(SBU_UART + U_UFSTAT) & SBU_UFSTAT_RXMASK) != 0 || (sbu_rd(SBU_UART + U_UTRSTAT) & SBU_UTRSTAT_RXDR) != 0)) {
++			uint8_t b = (uint8_t)sbu_rd(SBU_UART + U_URXH);
++
++			if (got < sizeof(first)) {
++				first[got] = b;
++			}
++			got++;
++			sbu.rx_bytes++;
++		}
++		if (got != 0) {
++			unexpected += got;
++			SBU_GAP(SG_OTHER, "patchram: %u unexpected rx bytes from the controller during the stream after record %u (first %02x): the stock capture shows no event for 0xfc4c", got, n, first[0]);
++		}
++		if (n % 500 == 0) {
++			printf("BT PROBE: patchram stream record %u/%u, %zu payload bytes sent\n", n, nwrite, sent);
++		}
++	}
++	printf("BT PROBE: patchram stream done: records=%u payload=%zu bytes unexpected-rx=%u rx-errors=%u\n", n, sent, unexpected, rxerrs);
++	if (unexpected != 0 || rxerrs != 0) {      /* the stock capture shows no event and no line error for 0xfc4c: the controller state is unknown, do not hand it to bluetoothd as patched (review T-60ed F5) */
++		SBU_GAP(SG_OTHER, "patchram stream had %u unexpected rx bytes and %u rx error flags: the controller state is unknown; sequence stopped", unexpected, rxerrs);
++		return EIO;
++	}
++	return 0;
++}
++
++/* returns 0 = patched and verified (the controller is powered, open at 115200, running the patch), SBU_PR_REFUSED = nothing sent, else an errno after the first controller write */
++static int
++sbu_patchram(const struct sbu_cand *cand)
++{
++	static const uint8_t par_bd[6] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x02 };       /* 02:00:00:00:00:01, the synthetic locally administered D-3 style address of the 0216 probe, LSB first */
++	uint8_t rp[SBU_PM_SUPP], bd[6];
++	size_t rpn, wbytes, launch_off;
++	unsigned nwrite, nlaunch, build, rev;
++	int fast = 0, v = 0, e;
++
++	if (sweet_bt_hcd_len == 0) {
++		SBU_GAP(SG_OTHER, "sweetbtpatchram=1 refused: this kernel was built without BCM_HCD (no firmware image embedded, tools/bcm-hcd-stack); nothing sent to the controller");
++		return SBU_PR_REFUSED;
++	}
++	if (sbu_hcd_scan(&nwrite, &nlaunch, &wbytes) != 0) {
++		return SBU_PR_REFUSED;
++	}
++	launch_off = sweet_bt_hcd_len - 7;
++	if (PE_parse_boot_argn("sweetbtpatchrambaud", &v, sizeof(v)) && v == 1) {
++		fast = 1;
++	}
++	printf("BT PROBE: patchram start (sweetbtpatchram=1, patch 0218): image %zu bytes, %u write records (%zu payload bytes) + %u launch, sha256=%s stock=%s, download baud %s\n",
++	    sweet_bt_hcd_len, nwrite, wbytes, nlaunch, sweet_bt_hcd_sha256, strcmp(sweet_bt_hcd_sha256, SBU_HCD_STOCK_SHA256) == 0 ? "yes" : "no", fast ? "4000000 (sweetbtpatchrambaud=1)" : "115200 (default; the HAL's 4 Mbaud step is off)");
++	if (strcmp(sweet_bt_hcd_sha256, SBU_HCD_STOCK_SHA256) != 0) {      /* review T-60ed F3: tools/bcm-hcd-stack enforces the stock hash by default; a build that overrode it is loud here and still has to reach build 203 / rev 0x20cb below */
++		SBU_GAP(SG_OTHER, "patchram: the embedded image sha256 %s is not the stock BCM.hcd (%s); continuing, the launch is only accepted at build %u rev 0x%04x", sweet_bt_hcd_sha256, SBU_HCD_STOCK_SHA256, SBU_HCD_STOCK_BUILD, SBU_HCD_STOCK_REV);
++	}
++	e = sbu_pr_prepare(fast != 0);
++	if (e != 0 && fast != 0 && e != EINVAL) {
++		SBU_GAP(SG_OTHER, "patchram: the 4 Mbaud download start failed (error %d): power-cycling the controller and starting over at 115200", e);
++		(void)sbu_power_off();
++		if ((e = sbu_probe_one(cand)) != 0) {
++			return e;
++		}
++		fast = 0;
++		e = sbu_pr_prepare(false);
++	}
++	if (e != 0 || (e = sbu_pr_stream(nwrite)) != 0) {
++		return e;
++	}
++	if ((e = sbu_pr_cmd("launch-ram", SBU_HCD_OP_LAUNCH, sweet_bt_hcd_data + launch_off + 3, 4, rp, sizeof(rp), &rpn)) != 0) {      /* the file's own 4 bytes (ff ff ff ff in the stock image) */
++		return e;
++	}
++	if (fast != 0 && (e = sbu_set_baud(115200)) != 0) {      /* the HAL goes back to 115200 right after the launch (golden gap 251 ms); the firmware starts there */
++		return e;
++	}
++	sbu.hw.msleep(250);
++	if ((e = sbu_pr_cmd("reset-2", 0x0c03, NULL, 0, rp, sizeof(rp), &rpn)) != 0 || (e = sbu_pr_cmd("read-chip-id-2", 0xfc79, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if (rpn < 6) {
++		SBU_GAP(SG_OTHER, "patchram: 0xfc79 reply after the launch has %zu return bytes (need 6)", rpn);
++		return EPROTO;
++	}
++	build = (unsigned)(rp[4] | (rp[5] << 8));
++	printf("BT PROBE: patchram after launch: chip id=0x%02x build=%u (rev word %02x %02x)\n", rp[0], build, rp[4], rp[5]);
++	if ((e = sbu_pr_cmd("read-local-version", 0x1001, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	if (rpn < 8) {
++		SBU_GAP(SG_OTHER, "patchram: 0x1001 reply has %zu return bytes (need 8)", rpn);
++		return EPROTO;
++	}
++	rev = (unsigned)(rp[1] | (rp[2] << 8));
++	printf("BT PROBE: patchram build=%u hci_rev=0x%04x records=%u sha256=%s hci_ver=0x%02x lmp_ver=0x%02x\n", build, rev, nwrite + nlaunch, sweet_bt_hcd_sha256, rp[0], rp[3]);
++	if (build == 0 || rev == 0x2000) {
++		SBU_GAP(SG_OTHER, "patchram: the controller still reports build %u rev 0x%04x after the launch: the download did not take effect", build, rev);
++		return EIO;
++	}
++	if (build != SBU_HCD_STOCK_BUILD || rev != SBU_HCD_STOCK_REV) {      /* review T-60ed F5: anything but the stock image's own answer is not "patched" (this also covers 0xfc79 build and 0x1001 rev disagreeing) */
++		SBU_GAP(SG_OTHER, "patchram: the controller reports build %u rev 0x%04x after the launch, the stock image gives build %u rev 0x%04x; not accepted as patched", build, rev, SBU_HCD_STOCK_BUILD, SBU_HCD_STOCK_REV);
++		return EIO;
++	}
++	if ((e = sbu_pr_cmd("write-bd-addr", 0xfc01, par_bd, sizeof(par_bd), rp, sizeof(rp), &rpn)) != 0 || (e = sbu_pr_cmd("read-bd-addr", 0x1009, NULL, 0, rp, sizeof(rp), &rpn)) != 0) {
++		return e;
++	}
++	memcpy(bd, rp, rpn < sizeof(bd) ? rpn : sizeof(bd));
++	if (rpn < 6 || memcmp(bd, par_bd, sizeof(bd)) != 0) {
++		printf("BT PROBE: patchram bd-addr readback DIFFERS from the synthetic address written (%zu bytes)\n", rpn);
++		SBU_GAP(SG_OTHER, "patchram: the 0x1009 read-back (%zu bytes) is not the 0xfc01 address just written; sequence stopped", rpn);
++		return EIO;
++	}
++	printf("BT PROBE: patchram bd-addr readback matches the synthetic address written (%zu bytes)\n", rpn);
++	SBU_GAP(SG_OTHER, "patchram: 0xfc27 LPM not sent (host-wake irq A25 not wired, dev-wake held high) and the HAL's second 4 Mbaud step skipped: deliberate deviations from the stock sequence");
++	return 0;
++}
++
++/* attach side of the knob (review T-60ed F7: a function the host test can call). 0 = go on to bluetoothd (patched, refused or ROM restored), else the backend must not start. */
++static int
++sbu_patchram_attach(const struct sbu_cand *cand)
++{
++	int e = sbu_patchram(cand);
++
++	if (e == 0) {
++		printf("BT UART: patchram download verified; bluetoothd will meet the patched controller\n");
++		return 0;
++	}
++	if (e == SBU_PR_REFUSED) {
++		printf("BT GAP: sweetbtpatchram=1 had no effect (refused, nothing sent); bluetoothd meets the unpatched ROM\n");
++		return 0;
++	}
++	printf("BT GAP: sweetbtpatchram=1 FAILED (error %d): power-cycling the controller back to the unpatched ROM for bluetoothd\n", e);
++	(void)sbu_power_off();
++	e = sbu_probe_one(cand);
++	if (e != 0) {
++		printf("BT GAP: backend not started after the failed patchram power-cycle (error %d); controller powered off\n", e);
++		return e;
++	}
++	return 0;
++}
++
++/* review T-60ed F8: the knob never goes silent when attach returns before the download (rule 8) */
++static void
++sbu_patchram_unused(const char *why)
++{
++	int v = 0;
++
++	if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1) {
++		printf("BT GAP: sweetbtpatchram=1 ignored: %s\n", why);
++	}
++}
++
+ /*
+  * patch 0217, boot-arg sweetbtrw200b=1 (diagnostic knob, not a fix): the rx stream to bluetoothd is parsed as H4 events and the status byte of a Command Complete for opcode 0x200b
+  * is rewritten from 0x0c (Command Disallowed) to 0x00. bt-up4/5 [obs]: bluetoothd exits right after that status [read from source: scan completion 0x1005798d4]. The rewrite scores
+@@ -1693,6 +1993,7 @@ sweet_bt_uart_attach(void)
+ 			}
+ 			if (e != 0) {
+ 				printf("BT GAP: uart16 baud probe: no candidate clock got an answer to HCI Reset (error %d); backend not started, controller powered off\n", e);
++				sbu_patchram_unused("no candidate clock answered HCI Reset");
+ 				return;
+ 			}
+ 			settled = true;
+@@ -1727,10 +2028,18 @@ sweet_bt_uart_attach(void)
+ 					printf("BT UART: controller power-cycled after the LE matrix: %s (error %d)\n", e == 0 ? "answered HCI Reset again" : "NO ANSWER", e);
+ 					if (e != 0) {
+ 						printf("BT GAP: backend not started after the LE matrix power-cycle; controller powered off\n");
++						sbu_patchram_unused("the controller did not answer after the 0216/0217 probe power-cycle");
+ 						return;
+ 					}
+ 				}
+ 			}
++			{       /* patch 0218 (T-86c9): boot-arg sweetbtpatchram=1; bluetoothd then meets the PATCHED controller (no power-cycle after a good download). Runs after the 0216/0217 probes and their power-cycle. */
++				int v = 0;
++
++				if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1 && sbu_patchram_attach(&use[win]) != 0) {
++					return;
++				}
++			}
+ 		}
+ 	}
+ 	if (!settled) {
+@@ -1739,6 +2048,10 @@ sweet_bt_uart_attach(void)
+ 		if (PE_parse_boot_argn("sweetbtleprobe", &v, sizeof(v)) && (v == 1 || v == 2 || v == 3 || v == 4)) {
+ 			printf("BT GAP: sweetbtleprobe=%d ignored: the baud probe did not settle the clock (the matrix needs the answered HCI Reset first)\n", v);
+ 		}
++		v = 0;
++		if (PE_parse_boot_argn("sweetbtpatchram", &v, sizeof(v)) && v == 1) {
++			printf("BT GAP: sweetbtpatchram=1 ignored: the baud probe did not settle the clock (the download needs the answered HCI Reset first)\n");
++		}
+ 	}
+ 	{       /* patch 0217 (T-4c2c): boot-arg sweetbtrw200b=1, diagnostic status rewrite on the rx stream; the thread below starts after this */
+ 		int v = 0;

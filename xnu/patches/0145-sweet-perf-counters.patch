@@ -1,0 +1,118 @@
+SWEET performance counters (patch 0145, boot-arg sweetperf=1, default off; G-10 / research 51 step 3): READ-ONLY accounting in the Mali job path (no register access, no new hardware write; review docs/reviews/0145-perf-counters.md SAFE WITH CONDITIONS, F1 and the boot-arg hoist applied): per second `SWEET PERF: gpu_jobs N busy_ms M max_job_us X submit_wait_ms W cpu_busy_pct P` = jobs finished, GPU busy time (submit -> completion seen), longest job, time submitters blocked behind the previous job (includes the ready check and lock contention, F2), and the CPU busy share from host_statistics64(HOST_CPU_LOAD_INFO).
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -16,6 +16,8 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
++#include <mach/host_info.h>
++#include <mach/mach_types.h>
+ #include <vm/vm_kern.h>
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+@@ -219,10 +221,34 @@
+ 	return !as_idle();
+ }
+ 
++/*
++ * Performance counters (patch 0145, boot-arg sweetperf=1, default off; G-10 / research 51): READ-ONLY accounting, no register access.
++ * Per second one line `SWEET PERF: gpu_jobs N busy_ms M max_job_us X submit_wait_ms W cpu_busy_pct P`: how many jobs finished, how long the
++ * GPU was busy with them (submit -> completion seen, includes <= 200 us poll latency), the longest job, how long submitters blocked in
++ * sweet_mali_submit behind the previous job (strictly one job in flight), and the busy share of all CPUs from the host CPU load ticks.
++ */
++extern host_t host_self(void);
++extern kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);   /* osfmk/kern/host.c, as used by bsd/kern/kern_memorystatus.c */
++static uint64_t perf_jobs, perf_busy_us, perf_max_us, perf_subwait_us, perf_start_us;
++static int perf_on = -1;
++
++static void
++perf_job_done(void)
++{
++	/* lock held, from finish(): perf_start_us is the submit time (sm.busy_start_us is re-armed after a hard stop, review 0145 F1) */
++	uint64_t d = now_us() - perf_start_us;
++	perf_jobs++;
++	perf_busy_us += d;
++	if (d > perf_max_us) {
++		perf_max_us = d;
++	}
++}
++
+ static void
+ finish(int failed)
+ {
+ 	/* lock held */
++	perf_job_done();
+ 	if (failed) {
+ 		sm.fail_seq[sm.busy_seq % 32] = sm.busy_seq;
+ 	}
+@@ -279,6 +305,46 @@
+ }
+ 
+ static void
++sm_perf_tick(void)
++{
++	static uint64_t last_us, last_idle, last_total;
++	static unsigned quiet;
++
++	if (perf_on < 0) {
++		int v = 0;
++		perf_on = (PE_parse_boot_argn("sweetperf", &v, sizeof(v)) && v != 0) ? 1 : 0;
++	}
++	if (!perf_on) {
++		return;
++	}
++	uint64_t now = now_us();
++	if (now - last_us < 1000000) {
++		return;
++	}
++	lck_mtx_lock(&sm_lock);
++	uint64_t jobs = perf_jobs, busy = perf_busy_us, mx = perf_max_us, sw = perf_subwait_us;
++	perf_jobs = perf_busy_us = perf_max_us = perf_subwait_us = 0;
++	lck_mtx_unlock(&sm_lock);
++
++	host_cpu_load_info_data_t li;
++	mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
++	int pct = -1;
++	if (host_statistics64(host_self(), HOST_CPU_LOAD_INFO, (host_info64_t)&li, &cnt) == KERN_SUCCESS) {
++		uint64_t idle = li.cpu_ticks[CPU_STATE_IDLE];
++		uint64_t total = (uint64_t)li.cpu_ticks[CPU_STATE_USER] + li.cpu_ticks[CPU_STATE_SYSTEM] + li.cpu_ticks[CPU_STATE_IDLE] + li.cpu_ticks[CPU_STATE_NICE];
++		if (last_total != 0 && total > last_total) {
++			pct = (int)(100 - (100 * (idle - last_idle)) / (total - last_total));
++		}
++		last_idle = idle;
++		last_total = total;
++	}
++	last_us = now;
++	if (jobs > 0 || (++quiet % 10) == 0) {
++		printf("SWEET PERF: gpu_jobs %llu busy_ms %llu max_job_us %llu submit_wait_ms %llu cpu_busy_pct %d\n", jobs, busy / 1000, mx, sw / 1000, pct);
++	}
++}
++
++static void
+ sm_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	for (;;) {
+@@ -294,6 +360,7 @@
+ 		}
+ 		(void)lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.thread, THREAD_UNINT, dl);
+ 		lck_mtx_unlock(&sm_lock);
++		sm_perf_tick();
+ 	}
+ }
+ 
+@@ -446,6 +513,7 @@
+ 		clock_interval_to_deadline(2000, NSEC_PER_USEC, &dl);
+ 		(void)lck_mtx_sleep_deadline(&sm_lock, LCK_SLEEP_DEFAULT, (event_t)&sm.seq_done, THREAD_UNINT, dl);
+ 	}
++	perf_subwait_us += now_us() - t0;
+ 	if (sm.dead) {
+ 		lck_mtx_unlock(&sm_lock);
+ 		return ENXIO;
+@@ -460,6 +528,7 @@
+ 	sm.stopped = 0;
+ 	sm.faulted = 0;
+ 	sm.busy_start_us = now_us();
++	perf_start_us = sm.busy_start_us;
+ 	wr(R_JS_BASE(slot) + JS_HEAD_NEXT, (uint32_t)jc);
+ 	wr(R_JS_BASE(slot) + JS_HEAD_NEXT + 4, (uint32_t)(jc >> 32));
+ 	wr(R_JS_BASE(slot) + JS_AFFINITY_NEXT, SHADERS);

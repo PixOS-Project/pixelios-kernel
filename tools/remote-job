@@ -1,0 +1,792 @@
+#!/bin/bash
+# remote-job: run one named host-only job (a job table, defined once below) on the second build host or on this host.
+#   tools/remote-job [--where auto|local|offload-host|lab-host] [--timeout S] [--keep] [--collect DIR] [--kill-orphan] JOB (--collect DIR only collects and exits, never submits; --kill-orphan WITHOUT --collect kills the orphan and then goes on to submit JOB)     [--commit GPUSHA] (jobs: wlan-mutants mutants-proof unit gate-pre gate-identity ci-local selftest selftest-fail)
+# DESIGN RULE (user): the remote host (offload-host) is never a dependency, it is pluggable. `auto` (default) probes it in <=5 s (ssh BatchMode,
+# ConnectTimeout=3; load <= 12; >= OFFLOAD_MIN_FREE_GB (20) free in $OFFLOAD_ROOT/work; $OFFLOAD_ROOT/work present). If unavailable it prints
+#   REMOTE: offload-host unavailable (<reason>), running local
+# (rule 8: loud) and runs the SAME job table entry on this host. Fallback to local happens ONLY when the remote died for infra reasons
+# (probe failed, ssh rc 255, scp failure, connection drop mid-run). A job that ran and FAILed is never re-run elsewhere (no fallback-shopping).
+# A drop AFTER the job started (T-4ecb) prints exactly one gap line (fell back to local, lost mid-job (<why>)) and adds `gaps=1` to the RESULT line; `--where auto` also passes
+# `--fallback-local` to the heavy-job offload slot, which does the same (`gaps=1`) when the host is lost between the caller's probe and the admission. Test: tools/test_offload_fallback.sh.
+# USES (per-use switches): every job has an offload use (build gate test sync ci, tools/offload-conf.sh): unit/gate-pre/gate-identity = gate, ci-local = ci, the rest = test. The web board's master row or the row of
+#   THAT use makes the probe fail with `OFFLOAD OFF: use=<use> ...`; `--where auto` then runs local (one REMOTE: line), an offload-only job refuses (no fallback). A job already on the host is never touched.
+# Remote: committed HEAD travels as a git bundle (dirty tracked files are refused), cloned into $OFFLOAD_ROOT/work/jobs/NAME/src, run under
+# `nice -n 19 ionice -c3 timeout`, job.log/job.rc/prov/out/ copied back to logs/remote-jobs/NAME/, remote job dir removed (unless --keep).
+# The remote shell is fish: every remote command is `bash -s` with the script on stdin. Nothing outside $OFFLOAD_ROOT/work is touched there.
+# Refuses any phone word (adb fastboot xrun phone probe-run ...) anywhere in the arguments and in REMOTE_JOB_HOST/SSH/SCP. Gates never call this tool.
+# Env: REMOTE_JOB_HOST (default OFFLOAD_HOST from tools/offload-host.conf; none = no offload host, runs local), REMOTE_JOB_SSH / REMOTE_JOB_SCP (default ssh / scp; the host test fakes them),
+#      REMOTE_JOB_MAXLOAD (12), REMOTE_JOB_MINFREE_GIB (5), REMOTE_JOB_GPU_REPO (local GPU repo clone, ci-local only).
+# gate-pre ALWAYS runs through the pinned container prefix built below (nice docker run --network=none ... pixos-gate:trixie-20261111, [obs] brief; recipe: tools/gate-image/; staged read-only test inputs + ping sysctl: tools/remote-job-inputs.sh, R13);
+#      REMOTE_JOB_GATE_PREFIX replaces it for the host test only. `formal` is earned ONLY when tools/gate-identity run inside the prefix produced
+#      out/identity.txt equal to the TOOL repo's tools/gate-identity.expected (never the commit under test's; the identity script is shipped from the tool repo too, REMOTE_JOB_REPO selects the commit under test) AND out/commit.txt matches the local HEAD; else `identity MISSING|MISMATCH, NOT formal`.
+#      REMOTE_JOB_IDENTITY_PROOF is gone (an env string could earn the word).
+#      ADT: when REPO/research/ipsw-x/d22ap.adt exists locally, gate-pre/gate-identity ship it to offload-host:$OFFLOAD_ROOT/work/adt/d22ap.adt (only when the remote sha256 differs; never in the bundle/git/image) and the
+#      container mounts it READ-ONLY at /job/research/ipsw-x/d22ap.adt (/job = the checkout; mkadt.py:46). Inside the container tmp/rj-adt appends ONE trailing `adt=<sha256>|none` line to identity.txt
+#      Golden traces (never in git/bundle/image, rule 4): the TS comes from GOLDEN= in the commit's tools/test_golden_gpu_analyze.py; when ~/pixelios-artifacts/golden/TS/{trace-gpu,trace-dpu}.txt exist locally and match that dir's SHA256SUMS they are shipped to offload-host:$OFFLOAD_ROOT/work/golden/TS (only when the sha256 differs) and mounted READ-ONLY at the same path under the in-container home; absent = loud REMOTE: line, no mount; a SHA256SUMS mismatch refuses the job (exit 2).
+#      (hashed with it in the label; the pin compare ignores that line; gate-identity itself is unchanged). Absent locally: no mount, adt=none. tools/gate-import-remote accepts an a=1 tree only on a matching adt=.
+# Jobs (offload-only = `--where local` is refused with a REMOTE: line and there is never a lab-host fallback):
+#   unit        offload-only. tools/gate-unit-shards (GATE_UNIT_SHARDS=3; check-all.sh has no way to run just the unit step); logs in out/unit-shards/.
+#   gate-pre    offload-only. tools/check-all.sh in the job dir: GATE_HOST_LOCK=0 + HEAVY_JOB_HELD=offload-gate-pre (F4), GATE_PASS_DIR under the job dir, GATE_MUT_CACHE=/mut-cache/<image id 12> = the PERSISTENT offload-host $OFFLOAD_ROOT/work/mut-cache-root/<image id 12> (TP-048, root mode 0700 mounted -v rw,Z at /mut-cache; one cache per gate image; survives jobs, keyed by content, spot-checked, quarantined to <id>.bad-<epoch> on a mismatch) (TMPDIR is the container's /tmp, NEVER inside the checkout, rj-check refuses a git work tree: AP-110), GATE_UNIT_SHARDS=3, GATE_MUT_VERDICTS (optional output: ABSENT is
+#               printed when the commit has no GATE_MUT_VERDICTS support), fake adb/fastboot (exit 127) first on PATH; GATE_STEP_TIMEOUT is NOT set
+#               (it overrides EVERY step budget incl. the 300 s ones [src check-all.sh:89]; the per-step defaults are kept). Before the gate starts, a check INSIDE the container
+#               (tmp/rj-check, written into the job dir) must prove: `type -aP adb fastboot` (bash has no command -v -a) resolves only to the job stub dir; /usr/bin /usr/local/bin /bin /sbin /usr/sbin
+#               hold no adb/fastboot/heimdall; /dev/bus/usb and /dev/ttyUSB* are absent; and the docker run line has no --device/--privileged/-v /dev. Any failure = job rc 93 =
+#               remote-job exit 2 with a REMOTE: line. The old repo scan for absolute adb/fastboot paths is GONE on purpose: it was a heuristic that refused harmless
+#               tests (tools/test_phone_guard.py); the control is now the environment (container has no phone tools, no USB devices, --network=none), not the text of the scripts.
+#               Fetches out/gate.log, identity.txt, commit.txt, verdicts.json. RESULT says `pre-validation (offload-host, NOT the gate)`; nothing is written to the lab-host
+#               gate stamp / gate-pass registry (the pass dir lives and dies in the remote job dir and is never copied back).
+#               RESULT tail `mutcache=HITS/FRESH/STATE warn=N` comes from the MUTCACHE line of out/gate-full.log; a missing line, STATE not ok, store_failed>0 or a spot-check MISMATCH
+#               prints `REMOTE: MUTCACHE ...` and counts in warn= (rule 8; no fallback to a per-job cache). `formal` provenance does not depend on the cache (gate-identity unchanged). warn= is ADVISORY (driver 20l, review offload-mutcache-r1 F4): tools/gate-import-remote imports a PASS with warn>0, because a cache fault only costs time and a spot-check MISMATCH already fails the gate (test_wlan_wr_mutants.py assertEqual on run_all.mismatch).
+#               wlan-mutants / mutants-proof run on the offload-host host itself (no container) with the default cache dir (~/.cache/pixelios/wlan-mutants), which is already persistent; unit does not run the mutants.
+#   test-run    offload-only. `test-run -- CMD...` (heavy-job --light routing, tools/heavy-job-offload.sh): CMD in the pinned gate image on the committed HEAD, --network=none, adb/fastboot stubs, only the checkout writable; job.log = CMD's output, job rc = CMD's rc.
+#   ci-local    offload-only. Input is a GPU-repo commit (--commit SHA, repo = $REMOTE_JOB_GPU_REPO), shipped as a bundle, checked out in
+#               $OFFLOAD_ROOT/work/ci-local/gpuci, then tools/ci-local --stage all; $OFFLOAD_ROOT/work/ci-local/artifacts/runs/<head12>-* copied to out/.
+# The bundle carries every ref (HEAD --branches --remotes refs/patch-numbers/*) so validate-repo sees the numbering state; tools/third_party is symlinked
+# from $OFFLOAD_ROOT/work/gate-k/tools/third_party. Each run has its own remote dir (jobs/NAME.<time>.<pid>) and a flock jobs/.NAME.lock (second run refuses).
+# TP-042 resubmit check (offload-host runs): before submitting JOB, $OFFLOAD_ROOT/work/jobs/JOB.<time>.<pid> dirs still on offload-host (no `keep` marker) and docker containers
+#      rj-JOB.* are listed (dir, job.rc, age, container; also `mut-cache-root/*.bad-*` quarantine dirs with age + size, listing only, never deleted); any = `RESULT: ERROR resubmit JOB has uncollected result|orphan ...` exit 2. `--collect DIR` COLLECTS ONLY AND EXITS (never submits; AP-194) - it copies
+#      job.log/job.rc/prov/out to logs/remote-jobs/JOB/DIR/ and removes the remote dir (refused while its runner or container is alive); `--kill-orphan` kills
+#      ONLY a container / process group of a JOB dir whose runner pid is dead (never another job; the dir stays, collect it). `--keep` writes the `keep` marker.
+#      Every run also holds a machine-wide flock jobs/.heavy.lock on offload-host (bounded wait REMOTE_JOB_HEAVY_WAIT, default 1800 s) besides the per-name flock.
+# LAB-HOST LANE (TP-050, R12): `--where lab-host` runs gate-pre (ONLY gate-pre among the offload-only jobs; the others refuse with a REMOTE: line) on THIS host as if it were the
+#      remote: same bundle/run_remote/collect/cleanup code and the same $OFFLOAD_ROOT/work/jobs layout and flocks, with ssh/scp replaced by tools/rj-local-transport (no sshd on lab-host).
+#      Container runtime = /usr/bin/podman only (rootless proved by `podman info`, else job rc 95); lab-host's rootful docker is never used (REMOTE_JOB_LAB_PODMAN replaces the path
+#      for the host test only, loud WARNING, basename must stay podman). The job holds tools/heavy-job (class gate, the same lock as a driver's local check-all) around the whole run
+#      (re-exec, RJ_LAB_HELD stops a loop); no offload-host queue. Admission = heavy-job's class-gate memory gate only (4 + 8 GB reserve, MemAvailable + ZFS ARC freeable; review r1 F2) (never throttles
+#      GATE_JOBS/GATE_MUT_JOBS). RESULT says where=lab-host and provenance=lab-host ... formal (lab-host container, ...); tools/gate-import-remote accepts exactly the two matching shapes.
+# XNU BUILD IN THE OFFLOAD-HOST SLOT (W35 R22 "lane jam", 20w): the offload-host route of gate-pre compiles HEAD's xnu/patches INSIDE the held offload-host slot (job script, after the container
+#      identity/ADT checks, before the gate), in the pinned image pixos-xnub:trixie-20261111 (tools/gate-image/Dockerfile.xnub) with the toolchain staged in $OFFLOAD_ROOT/work/xnub-art mounted at
+#      the in-container home pixelios-artifacts (the lab-host path, so absolute paths in the built deps stay valid), --network=none, fixed work-tree label offload-gate (warm ~63 s, cold 7-11 min). The offload-host
+#      route therefore NEVER takes the lab-host heavy-job lock (the old local pre-step waited on it behind 6+ jobs while offload-host idled; AP-257 text is the driver's). Afterwards every other work tree
+#      under xnub-art/localbuild/work is pruned (offload-host disk is small) with one `XNUB: pruned N work tree(s): ...` line. Failure = job rc 98 (`gate-pre: XNU stack did not build in the offload-host slot`),
+#      gate not run; missing image / toolchain dirs / $XA/git-mirror (the pinned stager sources, checked INSIDE the build container with the commit's tools/xnu-src-mirror env: same image/uid/git as the build; the build is offline) = rc 95 naming tools/offload-stage-xnub
+#      (run as `tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub`); a commit without tools/gate-xnu-build or tools/xnu-src-mirror, or whose stagers xnu-src-mirror cannot parse (RESULT: ERROR) = rc 98 naming the cause. The run line is
+#      tools/xnub-line.sh (its TEXT is passed as RJ_XNUB and shared with `tools/offload-stage-xnub --validate`). The XNUB: lines (image id, build RESULT, prune count) reach the console as `REMOTE: XNUB: ...`
+#      and the image id is `xnub=<id12>` on the RESULT line. An `rj-xnub-<job dir>` container counts as the job's container for --kill-orphan / --collect.
+#      REMOTE_JOB_XNUB_PREFIX replaces the whole docker prefix for the host test only. The `--where lab-host` lane keeps the LOCAL xnu pre-step (tools/gate-xnu-build on this host, BEFORE the lane's own lock: xnu-local-build then takes its own class-build heavy-job lock, so that lane waits on the local lock twice in a row, build then gate; review offload-xnub-r1 F10, left as is).
+# Last line: RESULT: PASS|FAIL remote-job ... provenance=... Exit 0 = job passed, 1 = job failed, 2 = infra / usage / refused.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+tooldir=$(cd "$(dirname "$0")/.." && pwd) || exit 2   # the repo that contains THIS tool: the only source of the identity script and its pin
+# REMOTE_JOB_REPO (default: tooldir): the repo whose HEAD is the commit under test, so a trunk tool can label a commit that predates tools/gate-identity
+cd "${REMOTE_JOB_REPO:-$tooldir}" || exit 2
+root=$PWD
+die() { echo "RESULT: ERROR remote-job${job:+ $job}: $*"; exit 2; }   # exit 2 = infra/usage/refused: ERROR, never FAIL (TP-042 review F2)
+
+# ---- the job table: name | command (bash, run in the repo root, $OUTD = output dir) | inputs (paths that must be committed for a remote run) | outputs (files expected in $OUTD)
+J='J=$(nproc); [ "$J" -gt 12 ] && J=12; export GATE_MUT_JOBS=$J; t="python3 -m unittest discover -s tools -p test_wlan_wr_mutants.py"'
+job_def() {
+	outs=; opt=; inputs=; offload_only=0; kind=kernel; deftmo=; note=; ouse="test"   # ouse = the offload USE of the job (tools/offload-conf.sh OFFLOAD_USES): the web board's per-use switch
+	case $1 in
+		wlan-mutants) cmd="$J; \$t"; inputs="tools xnu shim soc device" ;;   # the test reads xnu/patches and builds shim: uncommitted edits there must be refused remotely
+		mutants-proof)    # PLAN-FAST-GATE steps 5-6: cold run A (cold only if the verdict cache is empty), warm run B, verdict dumps must be equal
+			cmd="$J; GATE_MUT_VERDICTS=\"\$OUTD/A.json\" \$t || exit 1; GATE_MUT_VERDICTS=\"\$OUTD/B.json\" \$t || exit 1; python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:3]); sys.exit(0 if a==b else 1)' \"\$OUTD/A.json\" \"\$OUTD/B.json\" && echo 'MUTPROOF A==B'"
+			inputs="tools xnu shim soc device"; outs="A.json B.json" ;;
+		unit) offload_only=1; ouse=gate; inputs="tools xnu shim soc device"
+			cmd='export TMPDIR="$WD/tmp"; mkdir -p "$TMPDIR"; GATE_UNIT_SHARDS=3 GATE_UNIT_OUT="$OUTD/unit-shards" tools/gate-unit-shards' ;;
+		gate-pre) offload_only=1; ouse=gate; inputs="tools xnu shim soc device"; outs="gate.log gate-full.log"; opt="verdicts.json"; deftmo=21600; note="pre-validation (offload-host container, NOT formal)"
+			cmd='[ -e tools/third_party ] || { echo "gate-pre: tools/third_party missing on offload-host"; exit 98; }
+J=$PWD; mkdir -p stubs tmp rj-out
+ex=$(git rev-parse --git-path info/exclude); mkdir -p "$(dirname "$ex")"   # job scaffolding only, in the checkout-local exclude (never the commit'"'"'s .gitignore), so check-all.sh sees a clean tree and can stamp GATE PASS <sha> without +dirty
+printf "%s\n" /stubs/ /tmp/ /rj-out/ /gate-pass/ /mut-cache/ /tools/rj-fakeroot/ >>"$ex"
+for t in adb fastboot; do printf "#!/bin/sh\necho \"STUB %s: phone commands are refused in gate-pre\" >&2\nexit 127\n" "$t" >"stubs/$t"; chmod +x "stubs/$t"; done
+M=/job; [ -z "${RJ_GATE_PREFIX:-}" ] || M=$J
+# TP-048: the mutant verdict cache is PERSISTENT across gate-pres (content-keyed + spot-checked + quarantined by tools/wlan_mutant_cache.py): the ROOT $OFFLOAD_ROOT/work/mut-cache-root on offload-host, mode 0700, is mounted at /mut-cache
+# and the cache itself is the SUBDIR /mut-cache/<gate image id, 12 hex> (review offload-mutcache-r1 F1: quarantine() renames the cache dir, and a rename of a bind-mount point fails with EBUSY [obs unshare -rm];
+# F2: one cache per gate image, a rebuilt image with the same gcc banner starts empty). Quarantine = /mut-cache/<id>.bad-<epoch> on the same mount.
+# Host test (RJ_GATE_PREFIX): jobs/mut-cache-root next to the job dirs, never inside the checkout (AP-110). No fallback to a per-job dir: a broken cache must show in the MUTCACHE line (rule 8).
+MC=$RJW/mut-cache-root; GMC=/mut-cache; [ -z "${RJ_GATE_PREFIX:-}" ] || MC=$J/../../mut-cache-root
+mkdir -p -m 0700 "$MC" || { echo "gate-pre: cannot create the persistent mutant cache root $MC"; exit 94; }
+[ -z "${RJ_GATE_PREFIX:-}" ] || GMC=$(cd "$MC" && pwd)
+# HEAVY_JOB_HELD: the container (no shared HOME, an ephemeral ~/.cache) must count as "already inside heavy-job": the offload-host .heavy.lock + the queue slot taken on this side ARE the lock (TP-042 review F4)
+# GATE_JOBS=8 GATE_MUT_JOBS=12: the measured formal-gate sizing (dedicated box, nice 19); GATE_CPU_BUDGET would halve lane C and risk its 5400 s step cap (review gate-cpu-budget-r1 F2)
+export HEAVY_JOB_HELD=offload-gate-pre GATE_HOST_LOCK=0 GATE_XNU_BUILD=0 GATE_PASS_DIR="$M/gate-pass" GATE_UNIT_SHARDS=3 GATE_JOBS=8 GATE_MUT_JOBS=12 GATE_MUT_VERDICTS="$M/rj-out/verdicts.json"
+pf=()
+if [ -n "${RJ_GATE_PREFIX:-}" ]; then   # host test only: set -f so the words are never globbed
+	set -f; read -ra pf <<<"$RJ_GATE_PREFIX"; set +f; export PATH="$M/stubs:$PATH" GATE_IMAGE_ID=test-prefix GATE_MUT_CACHE="$GMC/test-prefix"; mkdir -p -m 0700 "$GMC/test-prefix"
+	mkdir -p "$J/../tmp"; export TMPDIR; TMPDIR=$(cd "$J/../tmp" && pwd)   # sibling of the checkout, never inside its work tree (AP-110)
+	FR=$J/tools/rj-fakeroot; mkdir -p "$FR/usr/bin" "$FR/dev"; ln -sf "$(type -P git)" "$FR/usr/bin/git"; CHK=(stubs "$FR/usr/bin" "$FR" "$FR/usr/bin")   # host test: fake root instead of the container fs
+else
+	IMG=pixos-gate:trixie-20261111;   # recipe (Dockerfile, hash-pinned requirements, verlist.sh): tools/gate-image/; the build context lives in $RJW/gate-image-20261111
+	DK=${RJ_DK:-$HOME/.local/bin/docker}
+		if [ -n "${RJ_DK:-}" ]; then [ "$("$DK" info --format "{{.Host.Security.Rootless}}" 2>/dev/null)" = true ] || { echo "gate-pre: $DK is not rootless podman (Host.Security.Rootless != true); lab-host never runs a rootful runtime"; exit 95; }; fi
+	GATE_IMAGE_ID=$("$DK" image inspect --format "{{.Id}}" "$IMG") || { echo "gate-pre: image $IMG not found on offload-host"; exit 95; }
+	export GATE_IMAGE_ID GATE_VERLIST=/gate-image/verlist.sh
+	MCID=${GATE_IMAGE_ID#sha256:}; MCID=${MCID:0:12}; [[ $MCID =~ ^[0-9a-z]+$ ]] || { echo "gate-pre: gate image id $GATE_IMAGE_ID gives no [0-9a-z] cache subdir name"; exit 95; }
+	export GATE_MUT_CACHE="$GMC/$MCID"; mkdir -p -m 0700 "$MC/$MCID" || { echo "gate-pre: cannot create the mutant cache $MC/$MCID"; exit 94; }; mkdir -p "$J/tmp/art" || { echo "gate-pre: cannot create $J/tmp/art"; exit 94; }
+	pf=(nice -n 19 "$DK" run --rm --name "rj-${WD##*/}" --network=none --userns=keep-id --user 1000:1000 -e HOME=/home/user --sysctl "net.ipv4.ping_group_range=1000 1000")   # R13: ICMP datagram sockets for gid 1000 (test_pixping Host), private netns so nothing leaves; "0 2147483647" is refused by rootless crun (IDs unmapped), "0 65535" gives EACCES (range checked on host-translated gids) [obs 2026-11-11]
+	for v in $(compgen -e | grep "^GATE_[A-Z_]*$"); do pf+=(-e "$v"); done
+	pf+=(-e HEAVY_JOB_HELD)
+	am=()   # the Apple ADT (never in git/bundle/image): shipped by remote-job to $RJW/adt, mounted READ-ONLY at the path mkadt.py:46 reads (REPO/research/ipsw-x/d22ap.adt; the checkout is /job)
+	if [ -n "${RJ_ADT:-}" ]; then
+		A=$RJW/adt/d22ap.adt; [ -s "$A" ] || { echo "gate-pre: ADT $A missing on offload-host"; exit 96; }
+		mkdir -p research/ipsw-x; : >research/ipsw-x/d22ap.adt   # mount point only (research/ is gitignored); created ONLY when mounting, an empty file would be a fake ADT
+		am=(-v "$A:/job/research/ipsw-x/d22ap.adt:ro,Z")
+	fi
+	gm=()   # golden traces (never in git/bundle/image): shipped to $RJW/golden/TS, sha256 re-checked here against the host values, mounted READ-ONLY where the test expands ~/pixelios-artifacts/golden/TS
+	if [ -n "${RJ_GOLDEN:-}" ]; then
+		GD=$RJW/golden/$RJ_GOLDEN
+		for gp in $RJ_GOLDEN_SHA; do
+			gn=${gp%%:*}; gh=${gp#*:}; gf=$GD/trace-$gn.txt
+			[ -f "$gf" ] && [ ! -L "$gf" ] || { echo "gate-pre: golden $gf missing on offload-host"; exit 96; }
+			[ "$(sha256sum <"$gf" | cut -d" " -f1)" = "$gh" ] || { echo "gate-pre: golden $gf sha256 differs from the host value $gh"; exit 96; }
+		done
+		case $RJ_GOLDEN_SHA in gpu:*" dpu:"*) ;; *) echo "gate-pre: golden RJ_GOLDEN_SHA incomplete ($RJ_GOLDEN_SHA)"; exit 96 ;; esac
+		mkdir -p "$J/tmp/art/golden/$RJ_GOLDEN" || { echo "gate-pre: cannot create the golden mount point $J/tmp/art/golden/$RJ_GOLDEN"; exit 94; }   # created HERE (owned by us): a mount point podman creates is a sub-uid dir the host cannot remove, so the finished job dir stayed as an orphan [obs offload-host f3x 2026-10-31]
+		gm=(-v "$GD:/home/user/pixelios-artifacts/golden/$RJ_GOLDEN:ro,Z")
+	fi
+	sm=()   # super tools (T-78bc): shipped to $RJW/super-tools, mounted READ-ONLY; the three tools that look for the super repo take the paths from env
+	if [ -n "${RJ_SUPER:-}" ]; then
+		for st in wake triage-settle-guard; do [ -f "$RJW/super-tools/$st" ] && [ ! -L "$RJW/super-tools/$st" ] || { echo "gate-pre: super tool $RJW/super-tools/$st missing on the remote host"; exit 96; }; done
+		sm=(-v "$RJW/super-tools:/super-tools:ro,Z" -e JOB_WAKE_TOOL=/super-tools/wake -e PHONE_LOCK_WAKE=/super-tools/wake -e AGENT_GUARD_TRIAGE_MOD=/super-tools/triage-settle-guard)
+	fi
+	pf+=("${sm[@]}")
+	xm=()   # T-78bc: tools/stack-apply needs the pristine XNU clone and the pinned stager mirror, and the container has no network: mount the staged copies (the xnub staging tool) READ-ONLY below the container artifacts dir (the HOME the run line sets + /pixelios-artifacts); mount points created HERE like the golden one. Absent = loud WARN (stack-apply then prints "NOT RUN: no network" and the GATE line is not importable)
+	ca=; for xe in "${pf[@]}"; do case $xe in HOME=*) ca=${xe#HOME=} ;; esac; done; ca=$ca/pixelios-artifacts
+	for xd in xnu-pristine git-mirror; do
+		if [ -d "$RJW/xnub-art/$xd" ]; then
+			mkdir -p "$J/tmp/art/$xd" || { echo "gate-pre: cannot create the mount point $J/tmp/art/$xd"; exit 94; }
+			xm+=(-v "$RJW/xnub-art/$xd:$ca/$xd:ro,Z")
+		else echo "gate-pre: WARN $RJW/xnub-art/$xd missing on the remote host (run the xnub staging tool named by the rc 95 message): tools/stack-apply will be NOT RUN (no network) and the gate line will not import"; fi
+	done
+	pf+=("${xm[@]}"); [ -z "${RJ_INPUTS:-}" ] || { eval "$RJ_INPUTS"; rj_input_mounts; }   # R13: RJ_INPUTS = the TEXT of rj_input_mounts in tools/remote-job-inputs.sh (set by stage_inputs)
+	pf+=(-e PATH=/job/stubs:/usr/local/bin:/usr/bin:/bin -v "$RJW/opt:/home/user/.local/opt:ro,Z" -v "$RJW/gate-image-20261111:/gate-image:ro,Z" -v "$RJW/gate-k/tools/third_party:$RJW/gate-k/tools/third_party:ro,Z" -v "$J:/job:rw,Z" -v "$MC:/mut-cache:rw,Z" -v "$J/tmp/art:/home/user/pixelios-artifacts:rw,Z" "${am[@]}" "${gm[@]}" -w /job "$IMG")   # ~/pixelios-artifacts writable: a golden mount below it would make the parent root-owned and tools/stack-apply (mkdir $ARTIFACTS/scratch under set -e) failed [obs offload-host f3 #2 2026-10-31]
+	CHK=(stubs /usr/local/bin:/usr/bin:/bin "" /usr/bin:/usr/local/bin:/bin:/sbin:/usr/sbin)
+fi
+for w in "${pf[@]}"; do case $w in --device|--device=*|--privileged|--privileged=*|/dev|/dev/*|/dev:*|/dev/*:*) echo "REMOTE: gate-pre REFUSED, container run line maps host devices ($w); no USB/phone device may reach the gate"; exit 93 ;; esac; done
+cat >"$J/tmp/rj-check" <<"EOC"
+stub=$PWD/$1; PATH=$stub:$2; root=$3; IFS=: read -ra bd <<<"$4"
+bad() { echo "REMOTE: gate-pre REFUSED before the gate: $*"; exit 93; }
+[ -d "$stub" ] || bad "stub dir $stub missing"
+for t in adb fastboot; do
+	mapfile -t r < <(type -aP "$t"); [ "${#r[@]}" -gt 0 ] || bad "$t does not resolve (stub missing)"
+	for x in "${r[@]}"; do [ "$x" = "$stub/$t" ] || bad "$t resolves to $x, not the stub"; done
+done
+for d in "${bd[@]}"; do for t in adb fastboot heimdall; do [ ! -e "$d/$t" ] && [ ! -L "$d/$t" ] || bad "$d/$t exists in the container"; done; done
+[ ! -e "$root/dev/bus/usb" ] || bad "$root/dev/bus/usb is mapped into the container"
+compgen -G "$root/dev/ttyUSB*" >/dev/null && bad "ttyUSB device mapped into the container"
+t=${TMPDIR:-/tmp}; type -P git >/dev/null || bad "git missing in the container (cannot check TMPDIR)"
+! git -C "$t" rev-parse >/dev/null 2>&1 || bad "TMPDIR $t is inside a git work tree (tests would see the outer repo, AP-110)"
+echo "gate-pre: container check ok (adb/fastboot only stubs, no USB devices, run line has no --device/--privileged)"
+EOC
+"${pf[@]}" bash tmp/rj-check "${CHK[@]}"; crc=$?; [ $crc = 0 ] || { echo "REMOTE: gate-pre container check failed (rc $crc), gate NOT started"; exit 93; }
+{ git rev-parse HEAD; git ls-tree -r HEAD tools | sha256sum; } >"$OUTD/commit.txt"
+[ -n "${RJ_ID:-}" ] || { echo "gate-pre: tool-side gate-identity overlay missing (RJ_ID empty)"; exit 97; }
+printf "%s\n" "$RJ_ID" >tmp/rj-identity   # overlay: the TOOL repo'"'"'s gate-identity, never the commit under test'"'"'s; "." = the commit checkout to hash
+"${pf[@]}" bash tmp/rj-identity . >"$OUTD/identity.txt" 2>"$OUTD/identity.err"
+cat >tmp/rj-adt <<"EOA"
+f=research/ipsw-x/d22ap.adt
+if [ -s "$f" ]; then echo "adt=$(sha256sum <"$f" | cut -d" " -f1)"; else echo adt=none; fi
+EOA
+"${pf[@]}" bash tmp/rj-adt >>"$OUTD/identity.txt" 2>>"$OUTD/identity.err"   # computed INSIDE the container from what it can see, not from the host claim; gate-identity and its lines stay unchanged
+if [ -n "${RJ_XNUB:-}" ]; then   # offload-host route only: RJ_XNUB is empty on the lab-host lane (local pre-step there) and for gate-identity (no gate, no build); it carries the TEXT of tools/xnub-line.sh
+	eval "$RJ_XNUB"   # xnub_argv + XNUB_LB_REQUIRED: the same text tools/offload-stage-xnub --validate evaluates (review offload-xnub-r1 F6)
+	XA=$RJW/xnub-art; XIMG=pixos-xnub:trixie-20261111; XDK=${RJ_DK:-$HOME/.local/bin/docker}; xr=/job; xf=(); xid=none
+	STG="run tools/heavy-job offload-host run --owner NAME --label xnub-stage -- tools/offload-stage-xnub"
+	[ -z "${RJ_XNUB_PREFIX:-}" ] || xr=$J
+	xnub_argv "$XDK" "$XIMG" "$XA" "$J" "${WD##*/}" "$xr"; xf=("${XF[@]}")
+	if [ -n "${RJ_XNUB_PREFIX:-}" ]; then   # host test only: set -f so the words are never globbed
+		set -f; read -ra xf <<<"$RJ_XNUB_PREFIX"; set +f
+		echo "XNUB: WARNING docker prefix replaced by REMOTE_JOB_XNUB_PREFIX (host test only)"
+	else
+		xnub_check_art gate-pre "$XDK" "$XIMG" "$XA" "$STG" || exit $?   # shared with tools/xnu-remote-build (tools/xnub-line.sh)
+	fi
+	for w in "${xf[@]}"; do case $w in --device|--device=*|--privileged|--privileged=*|/dev|/dev/*|/dev:*|/dev/*:*) echo "REMOTE: gate-pre REFUSED, XNU build run line maps host devices ($w); no USB/phone device may reach the build"; exit 93 ;; esac; done
+	[ -f tools/gate-xnu-build ] || { echo "gate-pre: REFUSED rc 98: the commit under test has no tools/gate-xnu-build (it predates TP-039), so its XNU stack cannot be built in the offload-host slot; the offload-host route has no tool-side fallback and no local pre-step. Label a newer commit, or use --where lab-host (that lane still builds locally with the tool-side tools/gate-xnu-build)"; exit 98; }
+	if [ -z "${RJ_XNUB_PREFIX:-}" ]; then   # the offline build (--network=none) reads the pinned sources from $XA/git-mirror (tools/xnu-src-mirror, review offload-xnub-r1 F1); without them stager 0019 dies with "network?"
+		xnub_check_mirror gate-pre "$XA" xnu/patches "$STG" || exit $?   # runs in the build container (XF from xnub_argv above), not on the offload-host host: offload-xnub-r2 F1/F5 (rc 95 incomplete, rc 98 stagers do not parse)
+	fi
+	echo "XNUB: image $xid"
+	echo "gate-pre: building HEAD xnu/patches as XNU inside the offload-host slot (label offload-gate)"
+	"${xf[@]}" "${XB[@]}" >"$OUTD/xnu-build.log" 2>&1; xrc=$?
+	xres=$(grep -a "^RESULT:" "$OUTD/xnu-build.log" | tail -n 1)
+	echo "XNUB: build rc=$xrc ${xres:-RESULT: none}"
+	W=$XA/localbuild/work
+	xnub_prune "$W" offload-gate || exit $?   # shared guarded prune (tools/xnub-line.sh); prints the XNUB: pruned line
+	sz=$(du -sm "$W/offload-gate" 2>/dev/null | cut -f1); echo "XNUB: work tree offload-gate size=${sz:-missing}MB"
+	printf "%s\n" "$xid" >"$OUTD/xnub-image.txt"
+	if [ "$xrc" != 0 ]; then
+		tail -n 12 "$OUTD/xnu-build.log"
+		[ ! -f "$W/.offload_host-gate.gate-xnu-build.log" ] || { echo "---- $W/.offload_host-gate.gate-xnu-build.log (last 3000 lines)"; tail -n 3000 "$W/.offload_host-gate.gate-xnu-build.log"; } >>"$OUTD/xnu-build.log"
+		echo "${xres:-RESULT: ERROR xnu-build: no RESULT line (rc $xrc)}"
+		echo "gate-pre: XNU stack did not build in the offload-host slot"; exit 98
+	fi
+	[[ $xres == "RESULT: PASS xnu-build"* ]] || { echo "${xres:-no RESULT line}"; echo "gate-pre: XNU stack did not build in the offload-host slot (build rc 0 without a PASS xnu-build line)"; exit 98; }
+	{ echo "$xres"; echo "XNUB: image $xid"; } | tee "$OUTD/gate.log"   # the gate tee below appends: the verdict file shows RESULT: PASS xnu-build sha=... first
+fi
+cat >tmp/rj-gate <<"EOG"
+tools/check-all.sh; rc=$?
+# R12: the container cgroup memory.peak, read INSIDE the container after the gate (with --rm the cgroup is gone at exit and an outside sampler only sees a lower bound); includes page cache charged to THIS container (a lower bound when the cache is already warm from a sibling container). warn= on the RESULT line counts mutcache WARNs only, a missing peak shows as mempeak=UNKNOWN + the REMOTE line
+cat "${RJ_MEMPEAK_FILE:-/sys/fs/cgroup/memory.peak}" >rj-out/memory.peak 2>/dev/null || echo unavailable >rj-out/memory.peak
+exit $rc
+EOG
+[ -z "${RJ_INPUTS:-}" ] || [ -z "${XA:-}" ] || rj_gate_tree "$XA/localbuild/work/offload-gate/xnu"; "${pf[@]}" bash tmp/rj-gate 2>&1 | tee -a "$OUTD/gate.log"; rc=${PIPESTATUS[0]}
+[ ! -f rj-out/memory.peak ] || cp rj-out/memory.peak "$OUTD/memory.peak"
+[ ! -f rj-out/verdicts.json ] || cp rj-out/verdicts.json "$OUTD/verdicts.json"
+[ ! -f shim/out/gate.log ] || cp shim/out/gate.log "$OUTD/gate-full.log"   # check-all prints ONE line on stdout; the full log is shim/out/gate.log (rule 8: a failed gate must be importable)
+u=$(git status --porcelain 2>&1); if [ -z "$u" ]; then echo "gate-pre: tree status after gate: clean"; else echo "gate-pre: tree status after gate: $(printf "%s\n" "$u" | wc -l) untracked/changed"; printf "%s\n" "$u" | head -10 | sed "s/^/gate-pre:   /"; fi
+[ "$rc" = 0 ] || grep -h "^SHARD FAIL" shim/out/gate/unit.log >>"$OUTD/gate.log" 2>/dev/null
+[ ! -d shim/out/gate ] || tar -czf "$OUTD/gate-logs.tgz" --exclude="*-[0-9]" shim/out/gate 2>/dev/null   # step logs, not the build dirs
+exit $rc' ;;
+		ci-local) offload_only=1; ouse=ci; kind=gpu; deftmo=10800; note="ci-local (GPU-repo CI on offload-host, not a kernel gate)"   # GPU 2026-10-29: the generic "(pre-validation)" label read like a gate verdict
+			cmd='R=$RJW/ci-local/artifacts/runs; touch "$WD/start"
+bash -c ". $RJW/ci-local/env.sh && cd $RJW/ci-local && nice -n 19 tools/ci-local --stage all --cpus 4 --timeout 7200 $RJW/ci-local/gpuci"; rc=$?
+n=0; for d in $(find "$R" -mindepth 1 -maxdepth 1 -type d -name "${GPU_SHA:0:12}-*" -newer "$WD/start" 2>/dev/null); do cp -r "$d" "$OUTD/" && n=$((n+1)); done   # this run only; failure artifacts kept
+echo "ci-local: rc=$rc, $n new artifact dir(s) copied"
+[ $rc != 0 ] || [ $n -gt 0 ] || { echo "ci-local: passed but wrote no new artifacts"; rc=97; }; exit $rc' ;;
+		test-run) offload_only=1; ouse="test"; inputs="tools xnu shim soc device"; deftmo=7200; note="host test (offload-host container, NOT a gate)"   # heavy-job --light routing (tools/heavy-job-offload.sh): `test-run -- CMD...`, CMD in RJ_TESTCMD
+			cmd='[ -n "${RJ_TESTCMD:-}" ] || { echo "test-run: no command (RJ_TESTCMD empty)"; exit 94; }
+J=$PWD; mkdir -p stubs tmp
+ex=$(git rev-parse --git-path info/exclude); mkdir -p "$(dirname "$ex")"; printf "%s\n" /stubs/ /tmp/ >>"$ex"
+for t in adb fastboot; do printf "#!/bin/sh\necho \"STUB %s: phone commands are refused in test-run\" >&2\nexit 127\n" "$t" >"stubs/$t"; chmod +x "stubs/$t"; done
+printf "%s\n" "$RJ_TESTCMD" >tmp/rj-testcmd; pf=()
+if [ -n "${RJ_GATE_PREFIX:-}" ]; then set -f; read -ra pf <<<"$RJ_GATE_PREFIX"; set +f; export PATH="$J/stubs:$PATH"   # host test only
+else   # the same pinned image and run line as gate-pre: --network=none, no devices, only the checkout writable
+	IMG=pixos-gate:trixie-20261111; DK=${RJ_DK:-$HOME/.local/bin/docker}
+	"$DK" image inspect "$IMG" >/dev/null 2>&1 || { echo "test-run: image $IMG not found on offload-host"; exit 95; }
+	pf=(nice -n 19 "$DK" run --rm --name "rj-${WD##*/}" --network=none --userns=keep-id --user 1000:1000 -e HOME=/home/user -e PATH=/job/stubs:/usr/local/bin:/usr/bin:/bin -v "$RJW/gate-k/tools/third_party:$RJW/gate-k/tools/third_party:ro,Z" -v "$J:/job:rw,Z" -w /job "$IMG")
+fi
+for w in "${pf[@]}"; do case $w in --device|--device=*|--privileged|--privileged=*|/dev|/dev/*|/dev:*|/dev/*:*) echo "REMOTE: test-run REFUSED, container run line maps host devices ($w)"; exit 93 ;; esac; done
+"${pf[@]}" bash tmp/rj-testcmd; exit $?' ;;
+		gate-identity)   # gate-pre's container prefix + checks, but only tools/gate-identity runs (no gate): cheap proof that 'formal' can be earned
+			job_def gate-pre; local ck='"${pf[@]}" bash tmp/rj-gate 2>&1 | tee -a "$OUTD/gate.log"; rc=${PIPESTATUS[0]}'
+			[[ $cmd == *"$ck"* ]] || { echo "remote-job: internal: gate-pre command changed, gate-identity cannot derive from it"; exit 2; }
+			cmd=${cmd/"$ck"/rc=0}
+			 outs="identity.txt"; opt=; deftmo=900; note="identity check only, no gate ran" ;;
+		# no `gate` job: check-all.sh runs phone-state/hang-recover/probe-run steps; gates never go to offload-host (review remote-job-r1 finding 5)
+		selftest) cmd='echo selftest ok'; inputs=tools ;;            # cheap smoke job (also what the host test runs)
+		selftest-fail) cmd='echo selftest failing; exit 7'; inputs=tools ;;
+		*) return 1 ;;
+	esac
+}
+
+# ---- phone words: refused anywhere in the arguments (rule 2)
+phone_scan() {   # args: strings to tokenise; dies on any phone word
+	local words w
+	read -ra words <<<"$(printf '%s ' "$@" | tr ';&|()`$"{}<>=\\\n'"'" ' ')"
+	for w in "${words[@]}"; do
+		case ${w##*/} in
+			adb|fastboot|xrun|probe-run|fboot.sh|plock.sh|phone-lock|fflash-userdata.sh|fboot-android|golden-pull|phone|phone-*|hang-recover|to-fastboot.sh|pstore-pull*)
+				die "refused: '${w##*/}' is a phone word; phone jobs run on this host under tools/phone-lock" ;;
+		esac
+	done
+}
+phone_scan "$@"
+[ "${1:-}" != --scan-only ] || { echo "remote-job: scan-only: no phone word in the arguments"; exit 0; }   # heavy-job-offload.sh asks BEFORE it takes the host queue slot (the phone word list lives only here)
+
+origargs=("$@")   # TP-042: the queue re-exec passes the original arguments
+where=auto; tmo=; keep=0; job=; commit=; collect=; killorph=0; wakehook=; testargs=()
+while [ $# -gt 0 ]; do
+	case $1 in
+		--where) where=${2:-}; shift 2 ;;
+		--timeout) tmo=${2:-}; shift 2 ;;
+		--keep) keep=1; shift ;;
+		--collect) collect=${2:-}; [ -n "$collect" ] || die "--collect needs a DIR (JOB.<time>.<pid>); nothing submitted"; shift 2 ;;   # review r2 F1: an empty DIR must not fall through to a submit
+		--kill-orphan) killorph=1; shift ;;
+		--wake-hook) wakehook=${2:-}; [[ $wakehook =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "--wake-hook needs a plain hook label (letters, digits, . _ -; file ~/.t3/scratch_sec/LABEL.hook, docs/recipes/local-webhook.md)"; shift 2 ;;
+		--commit) commit=${2:-}; shift 2 ;;
+		--) shift; testargs=("$@"); break ;;   # test-run only: the command to run in the container (phone words are refused above, before this parse)
+		-*) die "usage: tools/remote-job [--where auto|local|offload-host|lab-host] [--timeout S] [--keep] [--collect DIR] [--kill-orphan] JOB (unknown option '$1')" ;;
+		*) [ -z "$job" ] || die "usage: one JOB only (got '$job' and '$1')"; job=$1; shift ;;
+	esac
+done
+[ -n "$job" ] || die "usage: tools/remote-job [--where auto|local|offload-host|lab-host] [--timeout S] [--keep] [--collect DIR] [--kill-orphan] JOB"
+# T-afd9 (R4): --wake-hook HOOK: when THIS process ends (any exit, rc kept) it runs tools/job-wake HOOK JOB RC = one POST to the owner's webhook (event `job JOB rc=N`); WAKE ok / WAKE FAIL
+# lines go to stdout after the RESULT line and never change the exit code. The re-exec through heavy-job (queue slot, gate lock) is then NOT a real `exec` (it would drop the trap and a refused
+# admission would wake nobody): with a hook set, the function `exec` below shadows the builtin for those two call sites and the hook is stripped from the re-exec'd arguments, so exactly this outermost process wakes, once.
+# T-fb2c: no --wake-hook given: the hook `queue claim` registered for THIS thread (thread-<id>.hook, from T3CODE_THREAD_ID) is the default, so the job end wakes the same thread
+if [ -z "$wakehook" ] && [ -n "${T3CODE_THREAD_ID:-}" ]; then wk_d=thread-${T3CODE_THREAD_ID//[^A-Za-z0-9._-]/-}; [ ! -f "${WAKE_SECRETS_DIR:-$HOME/.t3/scratch_sec}/$wk_d.hook" ] || wakehook=$wk_d; fi
+if [ -n "$wakehook" ]; then
+	wk_args=(); wk_skip=0
+	for wk_a in "${origargs[@]}"; do
+		if [ $wk_skip = 1 ]; then wk_skip=0; elif [ "$wk_a" = --wake-hook ]; then wk_skip=1; else wk_args+=("$wk_a"); fi
+	done
+	origargs=("${wk_args[@]}")
+	rj_wake() { local wrc=$?; trap - EXIT; "$tooldir/tools/job-wake" "$wakehook" "$job" "$wrc" || true; exit "$wrc"; }
+	trap rj_wake EXIT
+	exec() { "$@"; exit $?; }   # shadows the builtin only while a hook is set; the re-exec'd run ends here and the EXIT trap wakes with its rc
+fi
+case $where in auto|local|offload-host|lab-host) ;; *) die "bad --where '$where' (auto|local|offload-host|lab-host)" ;; esac
+job_def "$job" || die "unknown job '$job'"
+if [ "$job" = test-run ]; then [ "${#testargs[@]}" -gt 0 ] || die "usage: tools/remote-job test-run -- CMD..."; elif [ "${#testargs[@]}" -gt 0 ]; then die "usage: '-- CMD' is only for the test-run job"; fi
+testcmd=; [ "${#testargs[@]}" = 0 ] || testcmd=$(printf '%q ' "${testargs[@]}")
+if [ -n "$collect" ]; then   # --collect only collects (AP-194): it needs offload-host and can never reach a submit or a local run
+	[ "$where" != local ] || die "--collect needs offload-host (--where local refused; nothing submitted)"
+	[ "$where" = lab-host ] || where=offload-host   # lab-host keeps its name: the collect then runs through the local transport
+fi
+tmo=${tmo:-${deftmo:-7200}}; [[ $tmo =~ ^[1-9][0-9]{0,5}$ ]] || die "bad --timeout '$tmo' (seconds)"
+if [ "$offload_only" = 1 ]; then
+	[ "$where" != local ] || { echo "REMOTE: $job runs on offload-host only; --where local refused (no lab-host fallback; only gate-pre may run on lab-host with --where lab-host)"; die "refused: $job is offload-only"; }
+	[ "$where" != lab-host ] || [ "$job" = gate-pre ] || { echo "REMOTE: $job runs on offload-host only; --where lab-host refused (only gate-pre may run on lab-host)"; die "refused: $job is offload-only"; }
+	[ "$where" = lab-host ] || where=offload-host
+fi
+hl=0   # lab-host lane (TP-050): internally the offload-host route with a local transport; hl=1 switches transport, container runtime, lock, labels
+if [ "$where" = lab-host ]; then hl=1; where=offload-host; fi
+gsha=; gprefix=; rjid=; adt_on=; xnub_on=; xnub_prefix=; adt_f=$root/research/ipsw-x/d22ap.adt
+if { [ "$job" = gate-pre ] || [ "$job" = gate-identity ]; } && [ -s "$adt_f" ]; then adt_on=1; fi   # ADT present locally: ship + mount it (the formal stamp can then be imported into an a=1 tree)
+gi_on=; gi_rsha=; gi_rpath=; sup_on=; sup_d=   # super-repo tools the unit tests need (T-78bc): tools/wake (test_job_wake, test_phone_lock_wake) and tools/triage-settle-guard (test_agent_guard); the container only has the kernel clone
+if [ "$job" = gate-pre ]; then
+	sup_d=${REMOTE_JOB_SUPER_TOOLS:-}
+	[ -n "$sup_d" ] || { sup_c=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); [ -z "$sup_c" ] || sup_d=$(dirname "$(dirname "$(dirname "$sup_c")")")/tools; }
+	if [ -f "$sup_d/wake" ] && [ -f "$sup_d/triage-settle-guard" ]; then sup_on=1; else echo "remote-job: WARN super tools wake/triage-settle-guard not found (${sup_d:-no git common dir}; set REMOTE_JOB_SUPER_TOOLS): the three unit files that need them will fail in the container (loud, not skipped)"; fi
+fi
+golden_ts=; golden_sha=
+if [ "$job" = gate-pre ] || [ "$job" = gate-identity ]; then   # golden traces for test_golden_gpu_analyze RealGoldenChecks (4(c)); never in git/bundle/image (rule 4)
+	g_ts=$(git show HEAD:tools/test_golden_gpu_analyze.py 2>/dev/null | sed -n 's#^GOLDEN = os.path.expanduser("~/pixelios-artifacts/golden/\([^"/]*\)").*#\1#p' | head -n 1)
+	g_dir=$HOME/pixelios-artifacts/golden/$g_ts
+	if [[ $g_ts =~ ^[0-9]{8}T[0-9]{6}Z$ ]] && [ -f "$g_dir/trace-gpu.txt" ] && [ -f "$g_dir/trace-dpu.txt" ]; then
+		for g_n in gpu dpu; do
+			g_f=$g_dir/trace-$g_n.txt; g_h=$(sha256sum <"$g_f" | cut -d' ' -f1)
+			g_e=$(awk -v f="trace-$g_n.txt" '$2==f || $2=="*" f {print $1}' "$g_dir/SHA256SUMS" 2>/dev/null | head -n 1)
+			if [ "$g_e" != "$g_h" ]; then echo "REMOTE: golden $g_f sha256 $g_h does not match $g_dir/SHA256SUMS (${g_e:-no line}); refusing, nothing shipped"; die "refused: golden $g_f fails its SHA256SUMS"; fi
+			golden_sha="${golden_sha:+$golden_sha }$g_n:$g_h"
+		done
+		golden_ts=$g_ts
+	elif [[ ! $g_ts =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+		echo "REMOTE: golden TS invalid or unparsed ('$g_ts' from GOLDEN= in HEAD:tools/test_golden_gpu_analyze.py): nothing shipped or mounted; RealGoldenChecks will skip and check-all.sh will not register the PASS"
+	else
+		echo "REMOTE: golden traces absent locally ($g_dir): test_golden_gpu_analyze RealGoldenChecks will skip and check-all.sh will not register the PASS"
+	fi
+fi
+if [ "$job" = gate-pre ] || [ "$job" = gate-identity ]; then   # test-only prefix override; the real container prefix is built inside the job command
+	gprefix=${REMOTE_JOB_GATE_PREFIX:-}; phone_scan "$gprefix"
+	if [ "$job" = gate-pre ] && [ "$hl" = 0 ]; then   # in-slot XNU build: offload-host route of gate-pre only; xnub_on = the TEXT of tools/xnub-line.sh (the line tools/offload-stage-xnub --validate shares, review offload-xnub-r1 F6)
+		xnub_on=$({ printf 'LAB_HOME=%q\n' "${LAB_HOME:-$HOME}"; cat "$tooldir/tools/xnub-line.sh"; } 2>/dev/null) && [ -n "$xnub_on" ] || die "tool-side tools/xnub-line.sh missing in $tooldir"
+		xnub_prefix=${REMOTE_JOB_XNUB_PREFIX:-}; phone_scan "$xnub_prefix"
+		[ -z "$xnub_prefix" ] || echo "REMOTE: WARNING XNU build docker prefix replaced by REMOTE_JOB_XNUB_PREFIX (host test only)"
+	fi
+	rjid=$(cat "$tooldir/tools/gate-identity" 2>/dev/null) && [ -n "$rjid" ] || die "tool-side tools/gate-identity missing in $tooldir"
+	[ -z "${REMOTE_JOB_IDENTITY_PROOF:-}" ] || echo "REMOTE: WARNING REMOTE_JOB_IDENTITY_PROOF is ignored (only tools/gate-identity earns 'formal')"
+fi
+if [ "$job" = test-run ]; then gprefix=${REMOTE_JOB_GATE_PREFIX:-}; phone_scan "$gprefix"; fi   # host test only (the real run line is built inside the job command)
+if [ "$kind" = gpu ]; then
+	[[ $commit =~ ^[0-9a-f]{7,40}$ ]] || die "$job needs --commit GPUSHA (hex)"
+	gpurepo=${REMOTE_JOB_GPU_REPO:-}; [ -d "$gpurepo" ] || die "$job needs REMOTE_JOB_GPU_REPO (a local clone of the GPU repo)"
+	gsha=$(git -C "$gpurepo" rev-parse --verify -q "$commit^{commit}") || die "commit $commit not in $gpurepo"
+	[ -n "$(git -C "$gpurepo" branch -a --contains "$gsha" 2>/dev/null)" ] || die "commit $gsha is on no branch of $gpurepo (the bundle carries branches)"
+else [ -z "$commit" ] || die "--commit is only for ci-local"; fi
+
+. "$tooldir/tools/offload-conf.sh"; offload_conf_load "$tooldir"; . "$tooldir/tools/remote-job-inputs.sh"   # T-dd93: host/root/lab home come from tools/offload-host.conf (gitignored) or the environment
+host=${REMOTE_JOB_HOST:-${OFFLOAD_HOST:-}}; ssh_=${REMOTE_JOB_SSH:-ssh}; scp_=${REMOTE_JOB_SCP:-scp}
+hw=${REMOTE_JOB_HEAVY_WAIT:-1800}; [[ $hw =~ ^[0-9]+$ ]] || die "bad REMOTE_JOB_HEAVY_WAIT"
+maxload=${REMOTE_JOB_MAXLOAD:-12}
+# R64: offload-host keeps its work root on /mnt/offload-data. OFFLOAD_ROOT (tools/offload-host.conf; no default) is the ONE configurable root (tools/offload-sync mirrors the repos in it); the jobs, caches,
+# images and staged toolchains live in $OFFLOAD_ROOT/work. The remote scripts get it as the exported RJW (sshc prepends it to every script); the lab-host lane keeps $HOME/work/pixos.
+offload_root=${OFFLOAD_ROOT:-}
+[ -n "$offload_root" ] || { offload_root=/offload-root/unset; [ "$hl" = 1 ] || host=; }   # no OFFLOAD_ROOT = no offload host (probe says so); the lab lane never uses it
+[[ $offload_root =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] && [[ /$offload_root/ != */../* ]] || die "bad OFFLOAD_ROOT '$offload_root' (absolute, >= 2 components of [A-Za-z0-9._-])"
+rwork=$offload_root/work
+[ "$hl" = 0 ] || rwork=$HOME/work/pixos
+if [ "$hl" = 1 ]; then minfree=${REMOTE_JOB_MINFREE_GIB:-5}; else minfree=${REMOTE_JOB_MINFREE_GIB:-${OFFLOAD_MIN_FREE_GB:-20}}; fi   # R64: below this much free space on the offload-host root the job does not start there
+[[ $minfree =~ ^[0-9]+$ ]] || die "bad OFFLOAD_MIN_FREE_GB/REMOTE_JOB_MINFREE_GIB '$minfree'"
+[ -z "$host" ] || [[ $host =~ ^[A-Za-z0-9._@][A-Za-z0-9._@-]*$ ]] || die "bad REMOTE_JOB_HOST '$host'"
+phone_scan "$ssh_" "$scp_" "$host" "${REMOTE_JOB_RSYNC:-rsync}"
+hl_ssh() { "$tooldir/tools/rj-local-transport" ssh "$@"; }
+hl_scp() { "$tooldir/tools/rj-local-transport" scp "$@"; }
+hlpodman=
+if [ "$hl" = 1 ]; then   # the "remote" is this host: local transport, never the REMOTE_JOB_SSH/SCP fakes or a real ssh
+	[ -x "$tooldir/tools/rj-local-transport" ] || die "lab-host: $tooldir/tools/rj-local-transport missing"
+	[ -z "${REMOTE_JOB_SSH:-}${REMOTE_JOB_SCP:-}${REMOTE_JOB_HOST:-}" ] || echo "REMOTE: WARNING REMOTE_JOB_SSH/SCP/HOST are ignored for --where lab-host (local transport)"
+	host=lab-host; ssh_=hl_ssh; scp_=hl_scp
+	hlpodman=/usr/bin/podman
+	if [ -n "${REMOTE_JOB_LAB_PODMAN:-}" ]; then   # review lab-host-lane-r1 F4: a fake runtime only inside the host test (RJ_HOST_TEST=1), never in production
+		[ "${RJ_HOST_TEST:-}" = 1 ] || die "lab-host: REMOTE_JOB_LAB_PODMAN is a host-test hook (needs RJ_HOST_TEST=1); the runtime is always /usr/bin/podman"
+		hlpodman=$REMOTE_JOB_LAB_PODMAN; echo "REMOTE: WARNING podman path replaced by REMOTE_JOB_LAB_PODMAN=$hlpodman (host test only)"
+	fi
+	[ "${hlpodman##*/}" = podman ] || die "lab-host: container runtime must be podman (got '$hlpodman'); the rootful docker of this host is never used"
+	# the probe wants $HOME/work/pixos (a hand-made dir on offload-host); on lab-host nothing made it, so the first lane run died in the probe (20q 2026-10-29, "no ~/work/pixelios-work")
+	[ -d "$HOME/work/pixos" ] || { mkdir -p "$HOME/work/pixos" || die "lab-host: cannot create $HOME/work/pixos"; echo "REMOTE: lab-host: created $HOME/work/pixos (first lane run on this host)"; }
+	# offload-host has hand-made gate prerequisites under ~/work/pixelios-work (gate-k/tools/third_party, opt, gate-image-<tag> = build context); the lane run 2 died on 'tools/third_party missing' (rc 98).
+	# Seed each one the first time from this host's own copies, loudly, and refuse when the source is missing. Symlink for opt (host toolchains), copies for the other two (a worktree may vanish).
+	# A copy goes to DEST.new.PID and is moved into place (an interrupted cp never leaves a half dir that passes the guard); the guard is a marker file inside DEST (review lab-host-bootstrap-r1 F1/F2).
+	hlp=$HOME/work/pixos
+	hl_seed() {   # SRC DEST MARKER: copy the tree (links followed: a worktree's tools/third_party is a link into the main clone), only when DEST is absent; an existing DEST without MARKER is refused, never overwritten
+		if [ -e "$2" ] || [ -L "$2" ]; then [ -f "$2/$3" ] || die "lab-host: $2 exists but has no $3 (half-copied seed?): remove it by hand and rerun"; return 0; fi
+		mkdir -p "$(dirname "$2")" && rm -rf "$2.new.$$" && cp -rL "$1" "$2.new.$$" && [ -f "$2.new.$$/$3" ] && mv "$2.new.$$" "$2" || { rm -rf "$2.new.$$"; die "lab-host: cannot seed $2 from $1 (no $3 in the copy)"; }
+		echo "REMOTE: lab-host: seeded $2 from $1 (first lane run)"
+	}
+	if [ -L "$hlp/opt" ] && [ ! -d "$hlp/opt/" ]; then die "lab-host: $hlp/opt is a dangling link; remove it by hand and rerun"
+	elif [ ! -e "$hlp/opt" ]; then
+		[ -d "$HOME/.local/opt" ] || die "lab-host: $HOME/.local/opt missing, cannot seed $hlp/opt (toolchains for the gate)"
+		ln -s "$HOME/.local/opt" "$hlp/opt" || die "lab-host: cannot link $hlp/opt"; echo "REMOTE: lab-host: linked $hlp/opt -> $HOME/.local/opt (first lane run)"
+	fi
+	[ -f "$tooldir/tools/gate-image/verlist.sh" ] || [ -f "$hlp/gate-image-20261111/verlist.sh" ] || die "lab-host: $tooldir/tools/gate-image missing, cannot seed $hlp/gate-image-20261111"
+	hl_seed "$tooldir/tools/gate-image" "$hlp/gate-image-20261111" verlist.sh
+	if [ ! -e "$hlp/gate-k/tools/third_party" ]; then   # untracked: lives in the main kernel clone, not in a worktree
+		tps=$tooldir/tools/third_party
+		[ -f "$tps/mkbootimg.py" ] || tps=$(cd "$tooldir" && cd "$(git rev-parse --git-common-dir)/.." 2>/dev/null && pwd)/tools/third_party
+		[ -f "$tps/mkbootimg.py" ] || die "lab-host: no tools/third_party in $tooldir or the main clone, cannot seed $hlp/gate-k/tools/third_party"
+	fi
+	[ -e "$hlp/gate-k/tools/third_party" ] || hl_seed "$tps" "$hlp/gate-k/tools/third_party" mkbootimg.py
+	[ -f "$hlp/gate-k/tools/third_party/mkbootimg.py" ] || die "lab-host: $hlp/gate-k/tools/third_party has no mkbootimg.py (half-copied seed?): remove it by hand and rerun"
+	phone_scan "$hlpodman"
+fi
+sshopt=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+sshc() { { printf 'export RJW=%q\n' "$rwork"; cat; } | "$ssh_" "${sshopt[@]}" "$host" "$@"; }   # every remote script is `bash -s` on stdin; RJW = the work root there (R64)
+probe() {   # prints the reason on failure; returns 0 when offload-host is usable
+	local out load free mount off
+	[ -n "$host" ] || { echo "OFFLOAD GAP: no offload host configured (set OFFLOAD_HOST and OFFLOAD_ROOT in tools/offload-host.conf, template tools/offload-host.conf.example)"; return 1; }
+	if [ "$hl" = 0 ] && off=$(offload_off_reason "$tooldir" "$ouse"); then echo "OFFLOAD OFF: use=$ouse switched off by order, nothing new is routed to the offload host: $off"; return 1; fi   # T-ee35 + per-use switch
+	out=$(sshc bash -s 2>&1 <<'P'
+d=$RJW
+[ -d "$d" ] || { echo "no work root $d on offload-host"; exit 3; }
+echo "load=$(cut -d' ' -f1 "${REMOTE_LOADAVG:-/proc/loadavg}") free=$(df -Pk "$d" | awk 'NR==2{print int($4/1048576)}') mount=$(df -Pk "$d" | awk 'NR==2{print $6}')"
+P
+	) || { echo "ssh probe failed: ${out:0:80}"; return 1; }
+	out=$(tail -1 <<<"$out")
+	[[ $out =~ ^load=([0-9.]+)\ free=([0-9]+)\ mount=(.+)$ ]] || { echo "probe gave '${out:0:80}'"; return 1; }
+	load=${BASH_REMATCH[1]}; free=${BASH_REMATCH[2]}; mount=${BASH_REMATCH[3]}
+	awk -v l="$load" -v m="$maxload" 'BEGIN{exit !(l<=m)}' || { echo "load $load > $maxload"; return 1; }
+	[ "$free" -ge "$minfree" ] || { echo "OFFLOAD-HOST GAP: $mount ${free}G free < ${minfree}G (work root $rwork)"; return 1; }
+	return 0
+}
+
+# TP-039 / AP-147 / TP-042 review r2 F5: the gate never compiles the kernel; HEAD's xnu/patches are compiled before the gate instead of losing a 25 min gate.
+# W35 R22 2026-10-29 "lane jam": the OFFLOAD-HOST route (hl=0) compiles inside its held offload-host slot (job script, pixos-xnub image), so it never takes the lab-host heavy-job lock (the old local pre-step
+# waited on it behind 6+ jobs while offload-host idled; the guard commit fa9adde that refused a held ticket is gone with it). The LAB-HOST lane (hl=1) is already on this host
+# and keeps the local pre-step here, ~17 s warm. It runs BEFORE the lane's own gate lock (it is NOT under that lock; xnu-local-build takes its own class-build heavy-job lock, so this lane waits on the local lock twice in a row, review offload-xnub-r1 F10), so a broken stack fails in seconds. RJ_PRECHECKED stops the re-exec repeating it.
+if [ "$job" = gate-pre ] && [ -z "${RJ_PRECHECKED:-}" ] && [ -z "$collect" ] && [ "$killorph" = 0 ]; then
+	if [ "$hl" = 1 ]; then
+		xb=${REMOTE_JOB_XNU_BUILD:-$tooldir/tools/gate-xnu-build}
+		[ -z "${REMOTE_JOB_XNU_BUILD:-}" ] || echo "REMOTE: WARNING xnu-build pre-check replaced by REMOTE_JOB_XNU_BUILD=$xb (host test only)"
+		echo "remote-job: gate-pre: compiling HEAD's xnu/patches as XNU first ($xb)"
+		xo=$("$xb" --repo "$root" --always 2>&1); xrc=$?   # --always: the container gate skips its xnu-build step (GATE_XNU_BUILD=0), so a patch tree equal to trunk's must still be built here (gate-xnu-step-r1 F1, AP-257)
+		tail -n 12 <<<"$xo"
+		[ "$xrc" = 0 ] || die "gate-pre refused before shipping: the XNU stack did not build locally ($(grep '^RESULT:' <<<"$xo" | tail -n 1)); fix it first (AP-147)"
+	else echo "remote-job: gate-pre: offload-host route: the XNU build runs inside the offload-host slot (no lab-host lock, no local pre-step)"; fi
+	# W26 ask 2026-10-29: a stale TOOLS.md/census failed the container gate after 147 s of offload-host time (21h a725733); run the census the way the
+	# container sees it (no super repo: snapshot mode) here, in ~4 s, and refuse loudly before the queue
+	# the commit's own tool-census, as the container runs it (r2 F1: under REMOTE_JOB_REPO the trunk copy can differ)
+	tc=${REMOTE_JOB_CENSUS:-$root/tools/tool-census}
+	[ -z "${REMOTE_JOB_CENSUS:-}" ] || echo "REMOTE: WARNING census pre-check replaced by REMOTE_JOB_CENSUS=$tc (host test only)"
+	tcr=(python3 "$tc"); [ -z "${REMOTE_JOB_CENSUS:-}" ] || tcr=("$tc")   # python3 like validate-repo in the container (r3 F2: no -x dependence); the test fake is a script
+	[ -f "$tc" ] || { echo "REMOTE: WARNING census pre-check SKIPPED: $tc missing (commit predates tools/tool-census)"; tcr=(true); }
+	# review census-render-stable-r1 F4: the census reads the working tree; untracked docs/ or .claude files are not in the bundle (tools/ ones are refused below)
+	ut=$(cd "$root" && git status --porcelain --untracked-files=all -- docs .claude | grep -c '^??')
+	[ "$ut" = 0 ] || echo "REMOTE: WARNING $ut untracked file(s) in docs/ or .claude: the census pre-check sees them, the container does not"
+	co=$(cd "$root" && TOOL_CENSUS_KERNEL="$root" TOOL_CENSUS_SUPER=/nonexistent "${tcr[@]}" --check 2>&1); crc=$?   # KERNEL=$root: tool-census defaults to its own checkout, which differs under REMOTE_JOB_REPO (r2 F1)
+	[ "$crc" = 0 ] || { grep -v '^WARN\|^NOTE' <<<"$co" | tail -n 6; die "gate-pre refused before shipping: tool-census --check (container view) failed ($(grep '^RESULT:' <<<"$co" | tail -n 1)); run tools/tool-census --write and commit"; }
+	# AP-379 class, 2nd generator: a stale tools/gate-manifest.json failed test_gate_select after 542 s of offload-host time; the commit's own gate-manifest, from "$root"
+	gm=${REMOTE_JOB_GATE_MANIFEST:-$root/tools/gate-manifest}
+	[ -z "${REMOTE_JOB_GATE_MANIFEST:-}" ] || echo "REMOTE: WARNING gate-manifest pre-check replaced by REMOTE_JOB_GATE_MANIFEST=$gm (host test only)"
+	gmr=(python3 "$gm"); [ -z "${REMOTE_JOB_GATE_MANIFEST:-}" ] || gmr=("$gm")   # python3 like the census line (the tool is a python script); the test fake is a script
+	[ -f "$gm" ] || { echo "REMOTE: WARNING gate-manifest pre-check SKIPPED: $gm missing (commit predates tools/gate-manifest)"; gmr=(true); }
+	# gate-manifest globs the working tree (xnu/patches/*.patch, tools/test_*.py); untracked tools/ files are refused below, so refuse untracked patches here (T-1a6e): the bundle lacks them, the manifest glob sees them
+	up=$(cd "$root" && git status --porcelain --untracked-files=all -- xnu/patches | grep -c '^??')
+	[ "$up" = 0 ] || die "gate-pre refused before shipping: $up untracked file(s) in xnu/patches/ (the gate-manifest glob sees them, the shipped commit does not); git add + commit or remove them"
+	go=$(cd "$root" && "${gmr[@]}" --check 2>&1); grc=$?
+	[ "$grc" = 0 ] || { tail -n 6 <<<"$go"; die "gate-pre refused before shipping: tools/gate-manifest --check failed ($(grep '^RESULT:' <<<"$go" | tail -n 1)); run tools/gate-manifest --write and commit"; }
+	export RJ_PRECHECKED=1
+fi
+
+# TP-042 OFFLOAD-HOST QUEUE: every route that may reach offload-host takes the machine-wide FIFO slot first (tools/heavy-job offload-host run: FIFO + admission on
+# offload-host load/memory/rj- containers/foreign heavy processes). The child sees OFFLOAD_QUEUE_HELD and goes on. --where local never queues; --collect and
+# --kill-orphan take no CPU and must work while the slot is busy or refused (r2 F1: the orphan they kill is what makes admission refuse), so they never queue.
+# --where auto: this probe decision is FINAL (r2 F2): "offload-host unavailable" here means where=local, the later probe can never route to offload-host unqueued.
+[ "$where" != offload-host ] || maxload=1000000   # the queue admission replaces the load threshold on offload-host routes; the disk/presence check stays
+if [ "$where" != local ] && [ "$hl" = 0 ] && [ -z "${OFFLOAD_QUEUE_HELD:-}" ] && [ -z "$collect" ] && [ "$killorph" = 0 ]; then
+	qgo=1
+	if [ "$where" = auto ]; then
+		qreason=$(timeout 5 bash -c "$(declare -p ssh_ host maxload minfree tooldir rwork hl ouse OFFLOAD_USES; declare -f sshc probe hl_ssh hl_scp offload_off_reason); probe" 2>&1) || { qgo=0; where=local; fallback=${qreason:-probe timed out}; echo "REMOTE: offload-host unavailable ($fallback), running local (decided before the queue)"; }
+	fi
+	[ "$where" != auto ] || export HEAVY_JOB_FALLBACK_LOCAL=1   # T-4ecb: same as --fallback-local (kept off the exec line below)
+	[ $qgo = 0 ] || HEAVY_JOB_QUIET=1 exec "$tooldir/tools/heavy-job" offload-host run --owner "${REMOTE_JOB_OWNER:-${USER:-unknown}}" --label "rj-$job" --use "$ouse" -- "$tooldir/tools/remote-job" "${origargs[@]}"
+fi
+# LAB-HOST LOCK (TP-050): the job holds the SAME lock a driver's local check-all holds, by running under tools/heavy-job (class gate: one lock file, the load/PSI/memory
+# gate, a log under logs/heavy-job/). Chosen over opening the lock file here because heavy-job's lock file name, holder line, nesting rule and gate are then one definition.
+# No offload-host queue slot: the offload-host FIFO is for offload-host. --collect / --kill-orphan take no CPU and never wait for the lock.
+# Admission (review lab-host-lane-r1 F2): ONE memory check, heavy-job's class-gate default (need 4 + reserve 8 GB, MemAvailable + ZFS ARC freeable),
+# the same rule a local check-all meets; no own floor here (the old mem-gb 12 + reserve 8 = 20 GB double count). Never throttles GATE_JOBS/GATE_MUT_JOBS.
+# RJ_LAB_HELD is trusted only when the lock really is held for this label by an ancestor of this process (F1: setting it by hand skips nothing).
+hlab=rj-$job-lab-host
+hl_lock_ok() {
+	local lf=${HEAVY_JOB_LOCK:-$HOME/.cache/pixelios/heavy-job.lock} l c p q hb=${HEAVY_JOB_HELD:-}
+	# hb = the label heavy-job exported: rj-JOB-lab-host, or an OUTER heavy-job label when the lane runs nested in one (review lab-host-lane-r2: nesting)
+	[ -n "$hb" ] || { echo "HEAVY_JOB_HELD is empty"; return 1; }
+	read -r l c p _ <"$lf" 2>/dev/null || { echo "no holder line in $lf"; return 1; }
+	{ [ "$l" = "$hb" ] && [[ $p =~ ^[0-9]+$ ]]; } || { echo "holder of $lf is '$l $c $p', not HEAVY_JOB_HELD=$hb"; return 1; }
+	command -v flock >/dev/null || { echo "flock missing, cannot prove the lock"; return 1; }   # r2: fail closed
+	[ -r "$lf" ] || { echo "$lf unreadable"; return 1; }
+	if flock -n "$lf" true; then echo "$lf is not locked"; return 1; fi
+	q=$$
+	while [[ $q =~ ^[0-9]+$ ]] && [ "$q" -gt 1 ]; do [ "$q" = "$p" ] && return 0; q=$(ps -o ppid= -p "$q" 2>/dev/null | tr -d ' '); done
+	echo "holder pid $p is not an ancestor of $$"; return 1
+}
+if [ "$hl" = 1 ] && [ -z "$collect" ] && [ "$killorph" = 0 ]; then
+	if [ -z "${RJ_LAB_HELD:-}" ]; then
+		[ -x "$tooldir/tools/heavy-job" ] || die "lab-host: $tooldir/tools/heavy-job missing, cannot take the local gate lock"
+		HEAVY_JOB_QUIET=1 RJ_LAB_HELD=1 exec "$tooldir/tools/heavy-job" run --class gate --label "$hlab" --wait "$hw" -- "$tooldir/tools/remote-job" "${origargs[@]}"
+	fi
+	why=$(hl_lock_ok) || die "lab-host: RJ_LAB_HELD is set but the heavy-job lock is not held for this run ($why); gate NOT started"
+fi
+ldir=$root/logs/remote-jobs/$job; rdir=$rwork/jobs/$job.$(date +%s).$$   # own remote dir per run
+mkdir -p "$ldir" || die "cannot create $ldir"
+rm -rf "${ldir:?}/out" "$ldir/job.log" "$ldir/job.rc" "$ldir/prov"
+
+# runner: the same script runs the job here or there. Args via %q-quoted variables on its first lines.
+hlx=; [ "$hl" = 0 ] || hlx=" RJ_DK=$(printf %q "$hlpodman")"   # lab-host: the container runtime path reaches the job script (offload-host: nothing appended)
+runner() {   # $1 = work dir (job.log, job.rc, prov, out/), $2 = 1 when on the remote (sources $OFFLOAD_ROOT/work/env.sh if present)
+	printf 'WD=%q; OUTD=$WD/out; JOBCMD=%q; TMO=%q; REMOTE=%q; export RJ_TESTCMD=%q GPU_SHA=%q RJ_GATE_PREFIX=%q RJ_ID=%q RJ_ADT=%q RJ_GOLDEN=%q RJ_GOLDEN_SHA=%q RJ_XNUB=%q RJ_XNUB_PREFIX=%q RJ_SUPER=%q RJ_INPUTS=%q RJ_ROOT_SHA=%q RJ_ROOT_PATH=%q%s\n' "$1" "$cmd" "$tmo" "$2" "$testcmd" "$gsha" "$gprefix" "$rjid" "$adt_on" "$golden_ts" "$golden_sha" "$xnub_on" "$xnub_prefix" "$sup_on" "$gi_on" "$gi_rsha" "$gi_rpath" "$hlx"
+	cat <<'RUN'
+case $WD in /*) ;; *) WD=$HOME/$WD ;; esac; OUTD=$WD/out
+export OUTD WD; mkdir -p "$OUTD"
+nr=(nice -n 19); command -v ionice >/dev/null 2>&1 && nr+=(ionice -c3)
+gccv=$(gcc -dumpversion 2>/dev/null | cut -d. -f1); glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2)
+echo "host=$(hostname) gcc=${gccv:-none} glibc=${glibc:-unknown} nice=$("${nr[@]}" nice)" >"$WD/prov"
+pre=; [ "$REMOTE" = 1 ] && pre='[ -f "$RJW/env.sh" ] && source "$RJW/env.sh"; '
+# GNU timeout moves itself (and the job) into a new process group: record the JOB group so the kill reaches it (review r2 cond. 3)
+jc='echo $(ps -o pgid= -p $$ | tr -d " ") >"$WD/jpg"; '
+"${nr[@]}" timeout -k 30 "$TMO" bash -c "$jc$pre$JOBCMD" >"$WD/job.log" 2>&1 </dev/null; echo $? >"$WD/job.rc"
+RUN
+}
+
+sha=$(git rev-parse HEAD 2>/dev/null) || die "not a git checkout"
+dirty=$(git status --porcelain --untracked-files=no | wc -l)   # local/fallback runs execute the working tree, not HEAD
+started=0
+bundle=; sp=
+dkk='$HOME/.local/bin/docker'; [ "$hl" = 0 ] || dkk=$hlpodman   # offload-host: expanded remotely as before; lab-host: podman only
+remote_cleanup() {   # kill BOTH remote process groups (runner pid file, job group jpg), the container, remove the remote dir; loud on any failure
+	local o
+	o=$(sshc bash -s 2>&1 <<<"d=\"$rdir\"; gs=; for f in pid jpg; do g=\$(cat \"\$d/\$f\" 2>/dev/null); case \$g in ''|*[!0-9]*) ;; *) kill -KILL -- \"-\$g\" 2>/dev/null; gs=\"\$gs \$g\" ;; esac; done
+\"$dkk\" kill \"rj-${rdir##*/}\" >/dev/null 2>&1
+\"$dkk\" kill \"rj-xnub-${rdir##*/}\" >/dev/null 2>&1
+[ -z \"\$gs\" ] || sleep 1
+for g in \$gs; do kill -0 -- \"-\$g\" 2>/dev/null && echo \"REMOTE: WARNING process group \$g survived SIGKILL (offload-host:$rdir)\"; done
+rm -rf \"\$d\"") || echo "REMOTE: WARNING could not kill/remove the remote job offload-host:$rdir; it may still run"
+	grep -h '^REMOTE:' <<<"$o"
+	return 0
+}
+on_signal() {   # Ctrl-C / TERM / HUP / PIPE: kill the ssh, the remote job groups, remove the remote dir and the bundle (review r2 cond. 4)
+	trap - INT TERM HUP; trap '' PIPE   # PIPE: stdout/stderr were a tee that is gone (heavy-job aborted, scope stopped); a write error here must not end the cleanup
+	[ "${1:-}" != PIPE ] || exec >&2   # our output pipe is dead: say it on stderr (the job log when heavy-job runs us), the RESULT line may not reach anyone
+	echo "REMOTE: remote-job interrupted, cleaning up"
+	[ -z "$sp" ] || kill "$sp" 2>/dev/null
+	[ -z "$bundle" ] || { rm -f "$bundle"; echo "remote-job: removed $bundle"; }
+	if [ "$started" = 1 ]; then remote_cleanup; echo "REMOTE: remote job group killed and offload-host:$rdir removed (the flock dies with the job)"; fi
+	die "interrupted"
+}
+trap on_signal INT TERM HUP; trap "on_signal PIPE" PIPE   # SIGPIPE used to kill remote-job silently, leaving the remote job running and its result uncollected
+lockref=0; gaps=0; fallback=${fallback:-}; rc=; prov=; t0=$(date +%s)
+gapw=$(sed -n 's/.*--where auto|local|\([a-z-]*\)|.*/\1/p' "${BASH_SOURCE[0]}" | head -1); gapw=${gapw:-offload}   # the host word, read from the usage line so no host literal is added here
+fell_back() {   # T-4ecb rule 8: transport lost AFTER the job started: one loud GAP line, counted as gaps=N in the RESULT line
+	gaps=1; echo "${gapw^^} GAP: fell back to local, the offload host was lost mid-job ($1)"; echo "REMOTE: $gapw died mid-job ($1), running local"
+}
+
+# TP-042 resubmit check. Remote script runs as `bash -s` on stdin (fish). rc: 0 = clear, 1 = infra (reason in $why), exit 2 = refused.
+rj_check() {
+	local o ents e d have f lines=0 n_res=0 n_orph=0 s
+	o=$({ printf 'job=%q; killorph=%q\n' "$job" "$killorph"
+		[ "$hl" = 0 ] || printf 'rjdk=%q\n' "$hlpodman"
+	cat <<'CHK'
+d=$RJW/jobs; now=$(date +%s)
+dk=${rjdk:-}; [ -n "$dk" ] || { dk=$HOME/.local/bin/docker; [ -x "$dk" ] || dk=$(command -v docker || { rc=$?; [ $rc = 1 ] || echo "remote-job GAP: command -v docker failed rc=$rc" >&2; }); }
+cn=; [ -z "$dk" ] || cn=$("$dk" ps --format '{{.Names}}' 2>/dev/null)
+for p in "$d/$job".[0-9]*.[0-9]*; do
+	[ -d "$p" ] || continue; [ ! -e "$p/keep" ] || continue
+	b=${p##*/}; pid=$(cat "$p/pid" 2>/dev/null); jpg=$(cat "$p/jpg" 2>/dev/null)
+	alive=0; case $pid in ''|*[!0-9]*) ;; *) kill -0 "$pid" 2>/dev/null && alive=1 ;; esac
+	galive=0; case $jpg in ''|*[!0-9]*) ;; *) kill -0 -- "-$jpg" 2>/dev/null && galive=1 ;; esac
+	cl=; for cc in "rj-$b" "rj-xnub-$b"; do grep -qx "$cc" <<<"$cn" && cl="$cl,$cc"; done   # the gate container AND the in-slot XNU build container (review offload-xnub-r1 F5)
+	cont=${cl#,}; cont=${cont:-none}
+	act=
+	if [ "$killorph" = 1 ] && [ $alive = 0 ]; then   # only this dir's own container/group, and only when its runner pid is dead
+		[ "$cont" = none ] || { for cc in ${cont//,/ }; do "$dk" kill "$cc" >/dev/null 2>&1; done; act="$act killed-container"; cont=none; }
+		[ $galive = 0 ] || { kill -KILL -- "-$jpg" 2>/dev/null; act="$act killed-group"; galive=0; }
+	fi
+	have=; for f in job.log job.rc prov out; do [ ! -e "$p/$f" ] || have="$have,$f"; done
+	echo "ENTRY $b rc=$(cat "$p/job.rc" 2>/dev/null || echo none) age=$((now - $(stat -c %Y "$p")))s runner_alive=$alive group_alive=$galive container=$cont have=${have#,}${act:+ action=$act}"
+done
+for p in "$RJW"/mut-cache-root/*.bad-*; do   # TP-048: quarantined mutant caches, listed only (pruning is TP-033)
+	[ -d "$p" ] || continue
+	echo "BADCACHE ${p##*/} age=$((now - $(stat -c %Y "$p")))s size=$(du -sk "$p" | cut -f1)KiB"
+done
+CHK
+	} | sshc bash -s 2>&1) || { why="resubmit check ssh failed: ${o:0:80}"; return 1; }
+	ents=$(grep '^ENTRY ' <<<"$o")
+	grep '^BADCACHE ' <<<"$o" | sed "s#^BADCACHE #REMOTE: MUTCACHE quarantined dir $([ "$hl" = 1 ] && echo lab-host || echo offload-host):$rwork/mut-cache-root/#" || true
+	if [ -n "$collect" ]; then
+		[[ $collect =~ ^$job\.[0-9]+\.[0-9]+$ ]] || die "bad --collect '$collect' (want $job.<time>.<pid>)"
+		e=$(grep "^ENTRY $collect " <<<"$ents") || die "--collect $collect: no such dir on offload-host (or it has a keep marker)"
+		grep -q 'runner_alive=0 group_alive=0 container=none' <<<"$e" || { echo "$e"; echo "RESULT: ERROR resubmit $job: --collect $collect refused, its runner or container is still alive"; exit 2; }
+		have=$(sed -n 's/.* have=\([^ ]*\).*/\1/p' <<<"$e")
+		d=$ldir/$collect; mkdir -p "$d" || die "cannot create $d"
+		for f in ${have//,/ }; do
+			"$scp_" -q -r "${sshopt[@]}" "$host:$rwork/jobs/$collect/$f" "$d/" >/dev/null 2>&1 || { echo "RESULT: ERROR resubmit $job: collect of $collect/$f failed, remote dir kept"; exit 2; }
+		done
+		sshc bash -s <<<"rm -rf \"\$RJW/jobs/$collect\"" >/dev/null 2>&1 || { echo "RESULT: ERROR resubmit $job: collected $collect to $d but could not remove the remote dir"; exit 2; }
+		echo "remote-job: collected offload-host:$collect -> $d (have: ${have:-nothing}) and removed the remote dir"
+		echo "RESULT: PASS collected $collect -> $d (no job submitted)"; exit 0   # --collect only collects (AP-194): never falls through to the submit
+	fi
+	while IFS= read -r e; do
+		[ -n "$e" ] || continue
+		grep -q ' runner_alive=1 ' <<<"$e" && continue   # a RUNNING job is not a leftover: the per-name flock below refuses it with "already running" (keeps that message)
+		echo "REMOTE: $e"
+		if grep -q ' rc=none ' <<<"$e"; then n_orph=$((n_orph + 1)); else n_res=$((n_res + 1)); fi
+	done <<<"$ents"
+	lines=$((n_res + n_orph)); [ "$lines" -gt 0 ] || return 0; s="uncollected result"; [ "$n_res" -gt 0 ] || s="orphan"
+	[ "$n_orph" -gt 0 ] && [ "$n_res" -gt 0 ] && s="uncollected result|orphan"
+	echo "RESULT: ERROR resubmit $job has $s ($lines dir(s) on offload-host; use --collect DIR, --kill-orphan, or --keep on the earlier run)"; exit 2
+}
+
+run_remote() {   # 0 = job ran (rc in job.rc), 1 = infra problem (reason in $why)
+	why=
+	for i in $inputs; do
+		[ -z "$(git status --porcelain --untracked-files=normal -- "$i")" ] || { why="uncommitted changes in $i: the bundle carries commits only"; return 1; }
+	done
+	if [ "$kind" != gpu ]; then   # every tracked path must be clean, not only the inputs (review r2 cond. 8)
+		[ -z "$(git status --porcelain --untracked-files=no)" ] || { why="uncommitted tracked changes (git status --porcelain): the bundle carries commits only"; return 1; }
+	fi
+	[ "$job" != gate-pre ] || stage_inputs; bundle=$(mktemp "${TMPDIR:-/tmp}/remote-job.XXXXXX.bundle") || { why="mktemp failed"; return 1; }
+	if [ "$kind" = gpu ]; then git -C "$gpurepo" bundle create -q "$bundle" --branches --remotes 2>/dev/null
+	else git bundle create -q "$bundle" HEAD --branches --remotes --glob=refs/patch-numbers 2>/dev/null; fi || { rm -f "$bundle"; bundle=; why="git bundle failed"; return 1; }
+	started=1
+	sshc bash -s <<<"mkdir -p \"$rdir\"" >/dev/null 2>&1 || { rm -f "$bundle"; bundle=; why="ssh mkdir failed"; return 1; }
+	"$scp_" -q "${sshopt[@]}" "$bundle" "$host:$rdir/repo.bundle" >/dev/null 2>&1 & sp=$!; wait "$sp"; local s=$?; sp=; rm -f "$bundle"; bundle=
+	[ $s = 0 ] || { why="scp of the bundle failed (rc $s)"; return 1; }
+	if [ -n "$adt_on" ]; then   # outside the job dir: survives the job cleanup, copied only when the remote sha256 differs; never in the bundle, git or an image
+		local lh rh
+		lh=$(sha256sum <"$adt_f" | cut -d' ' -f1)
+		rh=$(sshc bash -s <<<'f=$RJW/adt/d22ap.adt; [ -f "$f" ] && sha256sum <"$f" | cut -d" " -f1; exit 0' 2>/dev/null | tail -1)
+		if [ "$rh" != "$lh" ]; then
+			echo "remote-job: shipping the ADT to offload-host:$rwork/adt (sha256 $lh; remote ${rh:-none})"
+			sshc bash -s <<<'mkdir -p "$RJW/adt"' >/dev/null 2>&1 || { why="ssh mkdir adt failed"; return 1; }
+			"$scp_" -q "${sshopt[@]}" "$adt_f" "$host:$rwork/adt/d22ap.adt.new.$$" >/dev/null 2>&1 || { why="scp of the ADT failed"; return 1; }
+			sshc bash -s <<<"cd \"\$RJW/adt\" && [ ! -L d22ap.adt.new.$$ ] && mv -f d22ap.adt.new.$$ d22ap.adt" >/dev/null 2>&1 || { why="ssh mv adt failed"; return 1; }
+		fi
+	fi
+	if [ -n "$sup_on" ]; then   # outside the job dir like the ADT; two small stdlib tools, always re-copied (their text is the test input), mounted read-only at /super-tools
+		local st
+		sshc bash -s <<<'mkdir -p "$RJW/super-tools"' >/dev/null 2>&1 || { why="ssh mkdir super-tools failed"; return 1; }
+		for st in wake triage-settle-guard; do
+			"$scp_" -q "${sshopt[@]}" "$sup_d/$st" "$host:$rwork/super-tools/$st.new.$$" >/dev/null 2>&1 || { why="scp of super tool $st failed"; return 1; }
+			sshc bash -s <<<"cd \"\$RJW/super-tools\" && [ ! -L $st.new.$$ ] && mv -f $st.new.$$ $st" >/dev/null 2>&1 || { why="ssh mv super tool $st failed"; return 1; }
+		done
+		echo "remote-job: shipped super tools (wake, triage-settle-guard) to the remote host work dir $rwork/super-tools"
+	fi
+	if [ -n "$golden_ts" ]; then   # outside the job dir; only the two traces, copied only when the remote sha256 differs
+		local gp gn gh grh
+		sshc bash -s <<<"mkdir -p \"\$RJW/golden/$golden_ts\"" >/dev/null 2>&1 || { why="ssh mkdir golden failed"; return 1; }
+		for gp in $golden_sha; do
+			gn=${gp%%:*}; gh=${gp#*:}
+			grh=$(sshc bash -s <<<"f=\$RJW/golden/$golden_ts/trace-$gn.txt; [ -f \"\$f\" ] && sha256sum <\"\$f\" | cut -d' ' -f1; exit 0" 2>/dev/null | tail -1)
+			if [ "$grh" != "$gh" ]; then
+				echo "remote-job: shipping golden trace-$gn.txt to offload-host:$rwork/golden/$golden_ts (sha256 $gh; remote ${grh:-none})"
+				"$scp_" -q "${sshopt[@]}" "$g_dir/trace-$gn.txt" "$host:$rwork/golden/$golden_ts/trace-$gn.txt.new.$$" >/dev/null 2>&1 || { why="scp of golden $gn failed"; return 1; }
+				sshc bash -s <<<"cd \"\$RJW/golden/$golden_ts\" && [ ! -L trace-$gn.txt.new.$$ ] && mv -f trace-$gn.txt.new.$$ trace-$gn.txt" >/dev/null 2>&1 || { why="ssh mv golden $gn failed"; return 1; }
+			fi
+		done
+	fi
+	# one ssh: clone, then run; any nonzero ssh rc (255 = connection) is infra, because the runner itself exits 0 whatever the job did
+	{ printf 'set -e; cd "%s"; echo $$ >pid; exec 9>"$RJW/jobs/.%s.lock"\nflock -n 9 || { echo "REMOTE: job %s already running on offload-host (lock)"; exit 99; }\nexec 8>>"$RJW/jobs/.heavy.lock"; flock -n 8 || echo "REMOTE: offload-host heavy lock held by: $(cat "$RJW/jobs/.heavy.lock" 2>/dev/null); waiting up to %s s"\nflock -w %s 8 || { echo "REMOTE: offload-host heavy lock held (waited %s s)"; exit 97; }\necho "%s $$" >"$RJW/jobs/.heavy.lock"\n' "$rdir" "$job" "$job" "$hw" "$hw" "$hw" "$job"
+	  if [ "$kind" = gpu ]; then   # update the ci-local GPU clone to the requested commit
+		printf 'g=$RJW/ci-local/gpuci; nd=$(git -C "$g" status --porcelain | wc -l); [ "$nd" = 0 ] || echo "REMOTE: gpuci clone was dirty ($nd entries), resetting to the commit"; git -C "$g" reset -q --hard; git -C "$g" clean -fdxq; git -C "$g" for-each-ref --format="%%(refname)" refs/rj-bundle | xargs -r -n1 git -C "$g" update-ref -d; git -C "$g" fetch -q "$PWD/repo.bundle" "+refs/*:refs/rj-bundle/*"; git -C "$g" checkout -q --detach %q\n' "$gsha"
+	  else   # every ref mirrored (validate-repo reads the other branches and the reservation refs); tools/third_party linked in ONLY when the commit does not carry it (T-93e6 vendored it: `ln -s` onto the tracked dir made untracked tools/third_party/third_party = +dirty and a wrong identity hash; T-78bc)
+		printf 'git init -q src; git -C src symbolic-ref HEAD refs/heads/rj-none; git -C src fetch -q ../repo.bundle "+refs/*:refs/*"; git -C src checkout -q --detach %q\n' "$sha"
+		printf 'tp=$RJW/gate-k/tools/third_party; [ -d "$tp" ] && [ ! -e src/tools/third_party ] && ln -s "$tp" src/tools/third_party\ncd src\n'
+	  fi
+	  echo 'set +e'
+	  runner "$rdir" 1; echo 'exit 0'; } | sshc setsid -w bash -s >"$ldir/ssh.out" 2>&1 &
+	sp=$!; wait "$sp"; s=$?; sp=   # background + wait: a trapped signal interrupts `wait`, not a foreground child
+	grep -h '^REMOTE:' "$ldir/ssh.out"
+	[ $s != 97 ] || { lockref=1; why="offload-host heavy lock not free within ${hw}s"; return 1; }
+	[ $s != 99 ] || { lockref=1; why="job already running on offload-host (lock)"; return 1; }
+	[ $s = 0 ] || { why="ssh run failed (rc $s): $(grep -h REMOTE: "$ldir/ssh.out" | tail -1)"; return 1; }
+	"$scp_" -q -r "${sshopt[@]}" "$host:$rdir/job.log" "$host:$rdir/job.rc" "$host:$rdir/prov" "$host:$rdir/out" "$ldir/" >/dev/null 2>&1 || { why="copy-back failed"; return 1; }
+	return 0
+}
+
+run_local() { runner "$ldir" 0 | (cd "$root" && bash -s); }
+
+ran=
+if [ "$where" != local ]; then
+	if [ "$where" = auto ]; then
+		reason=$(timeout 5 bash -c "$(declare -p ssh_ host maxload minfree tooldir rwork hl ouse OFFLOAD_USES; declare -f sshc probe hl_ssh hl_scp offload_off_reason); probe" 2>&1) && usable=1 || usable=0
+		if [ $usable = 0 ]; then fallback=${reason:-probe timed out}; fi
+	else reason=$(timeout 5 bash -c "$(declare -p ssh_ host maxload minfree tooldir rwork hl ouse OFFLOAD_USES; declare -f sshc probe hl_ssh hl_scp offload_off_reason); probe" 2>&1) && usable=1 || { usable=0; fallback=${reason:-probe timed out}; }; fi   # --where offload-host: disk/presence check only (maxload lifted, queue admission decides load)
+	[ -z "$collect" ] || [ "${usable:-0}" = 1 ] || die "offload-host unreachable: cannot collect, nothing submitted (${fallback:-probe failed})"
+	if [ "${usable:-0}" = 1 ] && ! rj_check; then
+		if [ "$where" = offload-host ]; then echo "REMOTE: offload-host run failed ($why), no fallback"; die "offload-host resubmit check failed for infra reasons ($why)"; fi
+		fallback=$why; usable=0; echo "REMOTE: offload-host unavailable ($why), running local"
+	fi
+	[ -z "$collect" ] || die "--collect: the collect block did not exit (internal error); nothing submitted"
+	if [ "${usable:-0}" = 1 ]; then
+		if run_remote; then ran=offload-host
+		elif [ $lockref = 1 ]; then echo "REMOTE: $why: operator error, not an outage; no local fallback"; [ $started = 1 ] && remote_cleanup; die "$why"
+		elif [ "$where" = offload-host ]; then echo "REMOTE: offload-host run failed ($why), no fallback"; [ $started = 1 ] && remote_cleanup; die "offload-host run failed for infra reasons ($why), not falling back (--where offload-host)"
+		else [ $started = 1 ] && remote_cleanup; fallback=$why; fell_back "$why"; fi
+	elif [ "$where" = auto ] && [ -n "$fallback" ]; then echo "REMOTE: offload-host unavailable ($fallback), running local"; fi
+fi
+if [ -z "$ran" ]; then
+	[ "$where" != offload-host ] || { lane=offload-host; [ "$hl" != 1 ] || lane=lab-host; echo "REMOTE: $lane unavailable (${fallback:-?}), no fallback"; die "$lane unavailable (${fallback:-?}) and --where $lane given"; }
+	rm -rf "${ldir:?}/out" "$ldir/job.log" "$ldir/job.rc" "$ldir/prov" "$ldir/ssh.out"   # no stale partial copy-back
+	run_local || die "local runner failed"; ran=local
+fi
+
+[ "$ran" = offload-host ] && [ "$keep" = 1 ] && { sshc bash -s <<<"touch \"$rdir/keep\"" >/dev/null 2>&1 || echo "remote-job: WARNING could not write the keep marker in offload-host:$rdir"; }
+[ "$ran" = offload-host ] && [ "$keep" != 1 ] && { sshc bash -s <<<"rm -rf \"$rdir\"" >/dev/null 2>&1 || echo "remote-job: WARNING could not remove offload-host:$rdir"; }
+rc=$(cat "$ldir/job.rc" 2>/dev/null); [[ $rc =~ ^[0-9]+$ ]] || die "no job rc ($ran run)"
+prov=$(cat "$ldir/prov" 2>/dev/null); gccv=$(sed -n 's/.* gcc=\([^ ]*\) .*/\1/p' <<<"$prov")
+rn=offload-host; [ "$hl" = 0 ] || rn=lab-host; ranlab=$ran; [ "$ran" != offload-host ] || ranlab=$rn   # label host name (lab-host lane); offload-host strings unchanged
+if [ "$ran" = offload-host ] && [ -n "$note" ]; then label="$rn gcc$gccv ${note//offload-host/$rn}"
+elif [ "$ran" = offload-host ]; then label="$rn gcc$gccv (pre-validation)"; else label="local gcc$gccv${fallback:+ (fallback: $fallback)}"; fi
+el=$(( $(date +%s) - t0 ))
+mkdir -p "$ldir/out"; vnote=; missing=
+if { [ "$job" = gate-pre ] || [ "$job" = gate-identity ]; } && [ "$ran" = offload-host ]; then
+	# identity: formal only when the container's own tools/gate-identity output equals the committed expectation AND the remote checkout is this HEAD
+	idf=$ldir/out/identity.txt; exp=$(cat "$tooldir/tools/gate-identity.expected" 2>/dev/null); idnote=   # the TOOL repo's pin, never the commit under test's
+	if [ ! -s "$idf" ]; then idnote="identity MISSING"
+	elif [ -z "$exp" ] || grep -q TODO <<<"$exp"; then idnote="identity MISMATCH (tool-side tools/gate-identity.expected missing or has TODO fields)"
+	elif [ "$(grep -c '^adt=' "$idf")" != 1 ] || [ "$(tail -n 1 "$idf" | grep -c '^adt=')" != 1 ]; then idnote="identity MISMATCH (no single trailing adt= line: the container did not record the ADT state)"
+	elif ! diff -u <(echo "$exp") <(grep -v '^adt=' "$idf") >"$ldir/identity.diff"; then idnote="identity MISMATCH (see $ldir/identity.diff)"
+	elif ! printf '%s\n%s\n' "$sha" "$(git ls-tree -r HEAD tools | sha256sum)" | diff -q - "$ldir/out/commit.txt" >/dev/null 2>&1; then idnote="identity MISMATCH (remote checkout is not this HEAD/tools tree)"
+	fi
+	if [ -n "$idnote" ]; then label="$rn gcc$gccv pre-validation ($rn container, $idnote, NOT formal)"
+	else label="$rn gcc$gccv formal ($rn container, identity sha256:$(sha256sum <"$idf" | cut -d' ' -f1), image $(sed -n 's/^image=//p' "$idf" | head -1))"; fi
+	if [ "$job" = gate-identity ]; then   # no gate ran: show what gate-pre would be labelled, never call this run formal
+		echo "REMOTE: gate-pre on this commit would be labelled: $label"
+		case $label in *"NOT formal"*) label="$rn gcc$gccv identity check only (NOT formal: $idnote)" ;; *) label="$rn gcc$gccv identity check only, identity OK (no gate ran, not a gate result)" ;; esac
+	else grep -E '^GATE (PASS|FAIL)' "$ldir/out/gate.log" 2>/dev/null | tail -1 >"$ldir/out/GATE_LINE"; fi   # verbatim, for the stamp importer (we write no stamp)
+	if [ -n "$opt" ] && [ ! -f "$ldir/out/$opt" ]; then
+		if git grep -q GATE_MUT_VERDICTS HEAD -- tools/check-all.sh 'tools/*.py'; then missing="$missing $opt(supported by this commit but not written)"
+		else vnote=" verdicts: ABSENT (commit lacks GATE_MUT_VERDICTS support)"; fi
+	fi
+fi
+for o in $outs; do [ -f "$ldir/out/$o" ] || missing="$missing $o"; done
+shadirty=; [ "$ran" = local ] && [ "$dirty" != 0 ] && shadirty="-dirty($dirty)"; [ "$ran" = offload-host ] && shadirty=" tree=clean-at-bundle"
+[ "$ran" = offload-host ] && shalab=$sha || shalab=$sha$shadirty
+xn=; if [ "$job" = gate-pre ] && [ "$ran" = offload-host ] && [ -n "$xnub_on" ]; then   # in-slot XNU build (review offload-xnub-r1 F3, F8): its XNUB: lines reach the console on every outcome, the build container image id goes into the RESULT line
+	grep -ah '^XNUB:' "$ldir/job.log" 2>/dev/null | sed 's/^/REMOTE: /'
+	xnid=$(head -n 1 "$ldir/out/xnub-image.txt" 2>/dev/null); xnid=${xnid#sha256:}
+	if [[ $xnid =~ ^[0-9a-z]+$ ]]; then xn=" xnub=${xnid:0:12}"
+	else xn=" xnub=UNKNOWN"; echo "REMOTE: XNUB image id not recorded (${xnid:-out/xnub-image.txt missing}): the job stopped before the in-slot build, or the file was not copied back (WARN)"; fi
+fi
+mcn=; if [ "$job" = gate-pre ]; then   # TP-048 rule 8: the persistent mutant cache must be visible in every gate-pre RESULT, and a bad state counted
+	mcw=0; mcl=$(grep -a -o 'MUTCACHE cache=[a-z]* hits=[0-9]* fresh=[0-9]* stored=[0-9]* store_failed=[0-9]*.*' "$ldir/out/gate-full.log" 2>/dev/null | tail -n 1)
+	if [ -z "$mcl" ]; then mcw=1; mch="?"; mcf="?"; mcs=missing; echo "REMOTE: MUTCACHE line missing in out/gate-full.log (cache state unknown, WARN)$([ "$rc" = 0 ] || echo "; the gate failed (rc=$rc), lane C may have been stopped before the mutants ran")"
+	else
+		mch=$(sed 's/.* hits=\([0-9]*\).*/\1/' <<<"$mcl"); mcf=$(sed 's/.* fresh=\([0-9]*\).*/\1/' <<<"$mcl"); mcs=$(sed 's/^MUTCACHE cache=\([a-z]*\) .*/\1/' <<<"$mcl"); mcsf=$(sed 's/.* store_failed=\([0-9]*\).*/\1/' <<<"$mcl")
+		case $mcs in ok|on) ;; *) mcw=$((mcw + 1)); echo "REMOTE: MUTCACHE state cache=$mcs (not ok): the persistent cache is not usable (WARN): $mcl" ;; esac
+		[ "$mcsf" = 0 ] || { mcw=$((mcw + 1)); echo "REMOTE: MUTCACHE store_failed=$mcsf (WARN): $mcl"; }
+	fi
+	if grep -aq 'MUTCACHE MISMATCH\| MISMATCH$' "$ldir/out/gate-full.log" 2>/dev/null; then   # review r1 F1: say "quarantined" only when the test said it renamed the dir
+		mcw=$((mcw + 1)); mcq=$(grep -a -o 'MUTCACHE MISMATCH: cache dir renamed [^ ]*' "$ldir/out/gate-full.log" | grep -v 'renamed None$' | tail -n 1)   # quarantine() returns None when the dir was already gone (r2 F3)
+		if [ -n "$mcq" ]; then echo "REMOTE: MUTCACHE spot-check MISMATCH, the cache dir was quarantined: $rn:$rwork/mut-cache-root/${mcq##*/} (WARN)"
+		else echo "REMOTE: MUTCACHE spot-check MISMATCH and the cache was NOT quarantined ($(grep -a -o 'MUTCACHE MISMATCH: quarantine failed.*' "$ldir/out/gate-full.log" | tail -n 1 | cut -c1-120)): delete $rn:$rwork/mut-cache-root/<image id> by hand before the next gate-pre (WARN)"; fi
+	fi
+	mcn=" mutcache=$mch/$mcf/$mcs warn=$mcw"
+	mpk=$(head -n 1 "$ldir/out/memory.peak" 2>/dev/null)   # R12: container cgroup memory.peak in bytes (page cache included), read inside the container at gate end
+	if [[ $mpk =~ ^[0-9]+$ ]]; then mcn="$mcn mempeak=${mpk}B"
+	else mcn="$mcn mempeak=UNKNOWN"; echo "REMOTE: memory.peak not recorded (${mpk:-out/memory.peak missing}): no cgroup v2 memory.peak in the container, or the container was killed before the gate ended (WARN)"; fi
+fi
+[ "$gaps" = 0 ] || xn="$xn gaps=$gaps"   # T-4ecb: a fall-back is counted in the RESULT line
+common="$job where=$ranlab sha=$shalab$([ "$ran" = offload-host ] && echo "$shadirty")${gsha:+ gpu=${gsha:0:12}} elapsed=${el}s$mcn$xn $prov provenance=$label$vnote log=$ldir/job.log"
+finish() { echo "$1" | tee "$ldir/out/RESULT"; }   # the RESULT line is also persisted for the stamp importer
+if [ "$rc" != 0 ]; then
+	tail -20 "$ldir/job.log"
+	[ "$rc" != 93 ] || { echo "REMOTE: $job refused before the gate started (container check, rc 93)"; finish "RESULT: FAIL remote-job refused (container check) $common"; exit 2; }
+	why="job rc $rc"; [ "$rc" = 124 ] && why="job timed out after $tmo s (rc 124)"
+	finish "RESULT: FAIL remote-job $why $common"; exit 1
+fi
+[ -z "$missing" ] || { finish "RESULT: FAIL remote-job job ok but outputs missing:$missing $common"; exit 1; }
+finish "RESULT: PASS remote-job $common"

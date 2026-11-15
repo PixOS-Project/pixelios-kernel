@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""hot: hot reload for the sprint threads. Boot once with devd in the overlay, then iterate on userland without a reboot.
+
+  hot stage --into TREE [--launchd-base PLIST] [--drop-job LABEL]...
+      Adds devd + pixps to an overlay tree that `tools/xrun --overlay TREE` boots (any thread's tree: pixping-stage's,
+      the GPU libsweetgl tree, an empty dir). Writes into TREE:
+        usr/local/bin/devd              devd built from tools/devd.c (tools/devd-stage build + acceptance checks)
+        usr/local/bin/pixps             process lister (tools/pixps.c): devd has no shell, `hot restart` needs pids
+        private/var/dev/devd.key        the SHARED host key <kernel clone>/logs/devd/devd.key (reused when valid, created
+                                        once otherwise), so every thread's tree carries the same key and one host key
+                                        file authenticates whichever tree booted last
+        System/Library/xpc/launchd.plist  the tree's own plist (pixping-stage writes one) or --launchd-base, plus the job
+                                        org.pixelios.devd; --drop-job removes jobs another thread's overlay left there
+      The phone root is shared: an overlay file stays on userdata after the boot (`SWEET DEV: skipped ... (identical)`
+      next time), so a job one thread staged runs in the other thread's boots until a plist without it is written.
+      A tree with no plist needs --launchd-base (refused otherwise: devd would never start).
+
+  hot ping                               devd answers? (no lock needed)
+  hot push SRC DST | pull SRC DST | run /abs/prog ARGS... | signal PID SIG     forwarded to tools/devsh
+  hot ps [NAME]                          devsh run /usr/local/bin/pixps [NAME]
+  hot restart NAME [--sig N]             signal every process named NAME (default 15 = TERM; launchd restarts KeepAlive jobs)
+  hot swap SRC DST [--restart NAME]      push SRC to DST, then restart NAME (default: basename of DST)
+
+Phone commands (all but ping/stage) need the phone lock token of YOUR running boot: $PHONE_LOCK_TOKEN if set, else
+--owner NAME (or $HOT_OWNER): the token is read from the live lock only when its owner is exactly NAME and its holder
+pid is alive (the boot you started under `tools/phone-lock run --owner NAME -- tools/xrun ...`). Another owner's lock
+is refused. The run plan devsh needs ($DEVSH_RUNPLAN) defaults to the super repo docs/runplans/sprint-hot-reload.md.
+Keep the boot up for the session: xrun --duration S (no --expect that ends it early); the boot args need
+sweetnull=devd,<your names> for devd's and your programs' stdout in the USB log (tools/devsh needs ue0 192.168.7.2).
+
+  hot session start --owner NAME --overlay TREE --kernel K [--intent gpu|wlan|...] [--max S] [--names a,b] [--args "..."] [--compress] [--camera]
+      ONE held boot for a hot-reload session (user 2026-11-09): stages devd into TREE, then
+      `tools/phone-lock run --owner NAME --wait 3600 --max S --detach -- tools/xrun --kernel K --overlay TREE --duration S-180
+      --hard-timeout S-120 --restart S-60,bootloader --args "sweetnull=devd,<names> ..." --label hot-NAME` (no --expect: the boot stays
+      up; the hard limit and the phone-lock tick end it if you forget). Prints DETACHED id=.. and the next commands.
+  hot session end --owner NAME [--reason "..."]   = tools/phone-lock end --owner NAME (the phone parks in fastboot)
+  hot session status --owner NAME                 the live run dir (the --session of tools/live-cut) and the lock
+
+SHARED session (several threads on one held boot; tools/hot_shared.py): `hot session start ... --shared [--turn-max S]` marks the session
+shareable (kernel path + sha256 + overlay in <phone lock dir>.shared/session.json). Another owner attaches with
+  hot join --owner ME [--kernel K]   GUEST: refused without a running shared session or when K's sha256 differs from the session kernel
+  hot leave --owner ME               drop the guest (releases its turn)
+  hot turn status                    who holds the turn, the FIFO queue, the guests
+A guest (and the owner, while the session is shared) may push/pull/swap/run/restart/ps/signal and `live-cut --owner ME begin|end`; every command
+(or a live-cut begin..end) waits its turn in a FIFO queue, one at a time, capped at --turn-max (default 600 s; --turn-wait S = how long I wait).
+A guest never ends the session (only the owner's `hot session end` or --max does). Guest pushes land in the standard-root ledger like the owner's.
+Logs: turns.log and pushes.log in the session run dir.
+
+Nothing but the forwarded devsh commands touches the phone. Last line RESULT: PASS|FAIL|ERROR hot ...; exit 0/1/2.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, plistlib, re, shutil, subprocess, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hot_shared as hs  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name, fname):
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(HERE, fname))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+ds = _load('devd_stage_for_hot', 'devd-stage')
+Fail, Err = ds.Fail, ds.Err
+KEY_RE = re.compile(r'[0-9a-f]{64}\n?')
+PLIST_REL = 'System/Library/xpc/launchd.plist'
+DEFAULT_LOCK_DIR = os.path.join(ds.HOME, 'pixelios-artifacts/phone.lock')
+DEFAULT_RUNPLAN = os.path.join(ds.HOME, '.t3/projects/pixelios/docs/runplans/sprint-hot-reload.md')
+BUILD_DIR = os.path.join(ds.HOME, 'pixelios-artifacts/hot-build')
+PIXPS = os.environ.get('HOT_PIXPS', '/usr/local/bin/pixps')   # HOT_PIXPS: host tests only (devd --test-mode runs below /tmp/)
+
+
+def key_path():
+    return os.environ.get('DEVD_KEY_FILE') or os.path.join(ds.kernel_root(), 'logs/devd/devd.key')
+
+
+def shared_key(path):
+    """The shared devd key text (64 hex + newline). Reuses a valid 0600 file of ours; creates it only when absent."""
+    if os.path.exists(path):
+        st = os.stat(path)
+        if st.st_uid != os.getuid() or (st.st_mode & 0o077):
+            raise Err('hot: key file %s must be ours with mode 0600 (is %o); fix it, never loosen devsh' % (path, st.st_mode & 0o777))
+        with open(path) as f:
+            text = f.read()
+        if not KEY_RE.fullmatch(text):
+            raise Err('hot: key file %s is not 64 lowercase hex chars; delete it to make a new one (every staged tree then needs re-staging)' % path)
+        print('key: reused %s (not printed)' % path)
+        return text.rstrip('\n') + '\n'
+    text = os.urandom(32).hex() + '\n'
+    ds.write_secret(path, text)
+    print('key: NEW key %s (0600, not printed); trees staged before carry the old key and need re-staging' % path)
+    return text
+
+
+def merge_plist(pl, drops):
+    """Drop jobs by Label, add the devd job unless present. Returns info lines; an asked drop that is absent is a GAP line."""
+    jobs = pl.get('LaunchDaemons')
+    if not isinstance(jobs, dict):
+        raise Err('hot: launchd plist has no LaunchDaemons dict (not a combined launchd cache)')
+    info = []
+    for label in drops:
+        keys = [k for k, v in jobs.items() if isinstance(v, dict) and v.get('Label') == label]
+        if not keys:
+            info.append('SWEET GAP: hot stage: --drop-job %s not in the plist (nothing removed)' % label)
+        for k in keys:
+            del jobs[k]
+            info.append('launchd: dropped job %s (%s)' % (label, k))
+    if ds.JOB_KEY in jobs or any(isinstance(j, dict) and j.get('Label') == ds.JOB_LABEL for j in jobs.values()):
+        info.append('launchd: %s already in the plist, kept' % ds.JOB_LABEL)
+    else:
+        ds.add_job(pl)
+        info.append('launchd: added %s (%d jobs now)' % (ds.JOB_KEY, len(jobs)))
+    return info
+
+
+def build_pixps(work):
+    pp = _load('pixping_stage_for_hot', 'pixping-stage')
+    return pp.build(os.path.join(HERE, 'pixps.c'), work, name='pixps')
+
+
+def install(src, dst, mode):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+    os.chmod(dst, mode)
+
+
+def cmd_stage(a):
+    tree = os.path.abspath(a.into)
+    if not os.path.isdir(tree):
+        raise Err('hot stage: --into %s is not a directory' % tree)
+    tree_plist = os.path.join(tree, PLIST_REL)
+    has_plist = os.path.isfile(tree_plist)
+    if has_plist and a.launchd_base:
+        raise Err('hot stage: %s already has %s; give --launchd-base only for a tree without one' % (tree, PLIST_REL))
+    if not has_plist and not a.launchd_base:
+        raise Err('hot stage: %s has no %s and no --launchd-base given: devd would be on the root but never started' % (tree, PLIST_REL))
+    base = tree_plist if has_plist else a.launchd_base
+    if not os.path.isfile(base):
+        raise Err('hot stage: --launchd-base %s is not a file' % base)
+    with open(base, 'rb') as f:
+        pl = plistlib.load(f)
+    info = merge_plist(pl, a.drop_job or [])
+    key = shared_key(key_path())
+    work = a.build_dir
+    devd, dinfo = ds.build(os.path.join(HERE, 'devd.c'), os.path.join(work, 'devd'))
+    pixps, pinfo = build_pixps(work)
+    for l in dinfo + pinfo:
+        print(l)
+    install(devd, os.path.join(tree, 'usr/local/bin/devd'), 0o755)
+    install(pixps, os.path.join(tree, 'usr/local/bin/pixps'), 0o755)
+    ds.write_secret(os.path.join(tree, 'private/var/dev/devd.key'), key)
+    os.makedirs(os.path.dirname(tree_plist), exist_ok=True)
+    with open(tree_plist, 'wb') as f:
+        f.write(plistlib.dumps(pl, fmt=plistlib.FMT_BINARY))
+    os.chmod(tree_plist, 0o644)
+    for l in info:
+        print(l)
+    print('tree: %s   boot it: tools/xrun ... --overlay %s --duration S --args "... sweetnull=devd,<names>"' % (tree, tree))
+    print('RESULT: PASS hot stage tree=%s launchd=%s' % (tree, 'tree' if has_plist else 'base'))
+    return 0
+
+
+def lock_token(owner, lock_dir=None):
+    """Token of the live phone lock if its owner is exactly `owner` and the holder pid is alive."""
+    lock_dir = lock_dir or os.environ.get('PHONE_LOCK_DIR') or DEFAULT_LOCK_DIR
+    info_file = os.path.join(lock_dir, 'info.json')
+    try:
+        with open(info_file) as f:
+            info = json.load(f)
+    except FileNotFoundError:
+        raise Fail('hot: the phone lock is free (no %s): start your boot first (phone-lock run --owner %s -- tools/xrun ...)' % (info_file, owner))
+    except (OSError, ValueError) as e:
+        raise Fail('hot: cannot read %s: %s' % (info_file, e))
+    if info.get('owner') != owner:
+        raise Fail('hot: the phone lock is held by owner %r, not %r: refused (never act inside another thread\'s boot)' % (info.get('owner'), owner))
+    pid = info.get('pid')
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        raise Fail('hot: lock holder pid %r of owner %s is not alive (stale lock)' % (pid, owner))
+    except PermissionError:   # lint-silent: expected EPERM from kill(pid, 0) means the pid exists (alive, other uid)
+        pass
+    tok = info.get('token')
+    if not tok:
+        raise Fail('hot: the lock of owner %s has no token (a bare `acquire`?); use phone-lock run' % owner)
+    return tok
+
+
+# Push targets with a proven rollback (super docs/runplans/sprint-hot-reload.md "Paths and rollback"; devd-r3): the RUN roots, and of
+# /usr/lib/ only libsweetgl.dylib, which the GPU overlay writes back on every boot. dyld/libSystem/launchd.plist stay overlay-only.
+PUSH_PREFIXES = ('/usr/local/', '/private/var/dev/')
+PUSH_EXACT = ('/usr/lib/libsweetgl.dylib', '/Applications/BTApp.app/BTApp',   # BTApp + its debug plist: xnu patch 0280 + devd k_allow
+              '/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist')
+TEST_PREFIX = '/tmp/'   # devd --test-mode roots; accepted only with DEVSH_TEST_LOOPBACK=1 (host tests)
+
+
+def check_push_dst(dst):
+    ok = dst in PUSH_EXACT or dst.startswith(PUSH_PREFIXES) or (os.environ.get('DEVSH_TEST_LOOPBACK') == '1' and dst.startswith(TEST_PREFIX))
+    if not ok:
+        raise Fail('hot: push to %s refused: hot pushes only below %s or to %s (rollback proven, sprint-hot-reload.md); put other files '
+                   'in the overlay tree and boot' % (dst, ' '.join(PUSH_PREFIXES), ' '.join(PUSH_EXACT)))
+
+
+def devsh_env(a, need_lock):
+    env = dict(os.environ)
+    env['DEVD_KEY_FILE'] = key_path()
+    env.setdefault('DEVSH_RUNPLAN', DEFAULT_RUNPLAN)
+    owner = a.owner or env.get('HOT_OWNER')
+    if need_lock and hs.active_or_none():   # a shared session runs: identity is the owner NAME (turn queue), the token comes from the live lock
+        if not owner:
+            raise Fail('hot: a shared hot session runs: pass --owner NAME / $HOT_OWNER (the session owner, or a guest after `hot join`)')
+        try:
+            env['PHONE_LOCK_TOKEN'] = hs.token_for(owner)
+        except hs.Refused as e:
+            raise Fail('hot: %s' % e)
+    elif need_lock and not env.get('PHONE_LOCK_TOKEN'):
+        if not owner:
+            raise Fail('hot: phone command needs $PHONE_LOCK_TOKEN or --owner NAME / $HOT_OWNER (the owner of your running boot)')
+        env['PHONE_LOCK_TOKEN'] = lock_token(owner)
+    return env
+
+
+def devsh(env, args, capture=False):
+    cmd = [sys.executable, os.path.join(HERE, 'devsh')] + args
+    if capture:
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
+    return subprocess.run(cmd, env=env).returncode, '', ''
+
+
+def parse_ps(text, name=None):
+    """pixps lines 'PID PPID UID COMM' (devsh adds its RESULT line) -> [(pid, comm)]."""
+    out = []
+    for line in text.splitlines():
+        m = re.fullmatch(r'(\d+) (\d+) (\d+) (.+)', line.strip())
+        if m and (name is None or m.group(4) == name[:16]):
+            out.append((int(m.group(1)), m.group(4)))
+    return out
+
+
+def cmd_restart(a, env, name=None):
+    name = name or a.name
+    rc, out, err = devsh(env, ['run', PIXPS, name[:16]], capture=True)
+    procs = parse_ps(out, name)
+    if rc != 0 or not procs:
+        sys.stdout.write(out + err)
+        raise Fail('hot restart: no running process named %s (pixps rc %d)' % (name, rc))
+    bad = 0
+    for pid, comm in procs:
+        r, o, e = devsh(env, ['signal', str(pid), str(a.sig)], capture=True)
+        print('signal %s[%d] %d: %s' % (comm, pid, a.sig, 'ok' if r == 0 else 'FAILED ' + (o + e).strip()[-200:]))
+        bad += r != 0
+    if bad:
+        raise Fail('hot restart: %d of %d signals failed' % (bad, len(procs)))
+    print('RESULT: PASS hot restart %s pids=%s sig=%d (a KeepAlive job comes back from launchd; a one-shot job does not: hot run it)'
+          % (name, ','.join(str(p) for p, _ in procs), a.sig))
+    return 0
+
+
+SESSION_WAIVERS = {"XRUN_NO_RUNPLAN": "user 2026-11-08 no run plans", "PREFLIGHT_GATE_WAIVER": "user 2026-11-02 + 2026-11-08"}
+
+
+def cmd_session(a):
+    root = os.path.dirname(HERE)
+    pl = os.path.join(HERE, 'phone-lock')
+    if a.scmd == 'end':
+        act = hs.active_or_none()
+        if act and a.owner != act[0]['owner']:   # a guest (or anyone else) never ends the owner's session
+            raise Fail('hot session end: %s cannot end the shared session of %s (guests only `hot leave --owner %s`); only the owner or the --max timer ends it' % (
+                a.owner, act[0]['owner'], a.owner))
+        rc = subprocess.run([sys.executable, pl, 'end', '--owner', a.owner, '--reason', a.reason or 'hot session done']).returncode
+        if rc == 0 and hs.record() and hs.record()['owner'] == a.owner:
+            hs.unmark()
+        return rc
+    if a.scmd == 'status':
+        act = hs.active_or_none()
+        if act:
+            _, st, guests = hs.status()
+            print('shared session of %s: kernel %s sha256 %s, guests %s, turn holder %s, queue %s' % (
+                act[0]['owner'], act[0]['kernel'], act[0]['kernel_sha'][:12], guests or 'none', st.get('holder'), [q['name'] for q in st['queue']]))
+        runs = os.path.join(root, 'logs', 'runs')
+        live = sorted((d for d in (os.listdir(runs) if os.path.isdir(runs) else []) if d.endswith('-hot-' + re.sub(r'[^A-Za-z0-9._-]', '_', a.owner))), reverse=True)
+        print('session run dir: %s' % (os.path.join(runs, live[0]) if live else 'none yet'))
+        return subprocess.run([sys.executable, pl, 'status']).returncode
+    if not a.max or not 600 <= a.max <= 7200:
+        raise Fail('hot session start: --max must be 600..7200 s (the phone-lock cap)')
+    for f in (a.kernel, a.overlay):
+        if not os.path.exists(f):
+            raise Fail('hot session start: %s does not exist' % f)
+    st = argparse.Namespace(into=a.overlay, launchd_base=a.launchd_base, drop_job=None, build_dir=BUILD_DIR)
+    if cmd_stage(st) != 0:
+        raise Fail('hot session start: hot stage --into %s failed' % a.overlay)
+    names = ','.join(['devd'] + [n for n in (a.names or '').split(',') if n])
+    args = ('sweetnull=%s %s' % (names, a.args or '')).strip()
+    xr = [os.path.join(HERE, 'xrun'), '--kernel', a.kernel, '--overlay', a.overlay, '--duration', str(a.max - 180),
+          '--hard-timeout', str(a.max - 120), '--restart', '%d,bootloader' % (a.max - 60), '--args', args,
+          '--label', 'hot-' + re.sub(r'[^A-Za-z0-9._-]', '_', a.owner)]
+    if a.intent:
+        xr += ['--intent', a.intent]
+        if a.intent == 'gpu':   # user 2026-11-11 via the coordinator: xrun's gpu default stop 'SWEET NAV: done reps 3' would end a hot session after its first nav pass (alcum1)
+            xr += ['--stop-on', 'SWEETGPU-NEVER-MATCH-hot-session']
+    if a.compress:
+        xr.append('--compress')
+    if not a.camera:
+        xr.append('--no-camera')
+    env = ['env'] + ['%s=%s' % kv for kv in SESSION_WAIVERS.items() if not os.environ.get(kv[0])]
+    cmd = [sys.executable, pl, 'run', '--owner', a.owner, '--wait', '3600', '--max', str(a.max), '--detach', '--'] + env + xr
+    print('hot session: ' + ' '.join(cmd[2:])[:400])
+    if a.shared:
+        if not 30 <= a.turn_max <= 3600:
+            raise Fail('hot session start: --turn-max must be 30..3600 s')
+        rec = hs.mark_shared(a.owner, a.kernel, a.overlay, a.max, a.turn_max, os.path.join(root, 'logs', 'runs'))
+        print('shared: marked (kernel sha256 %s, turn cap %ds); guests: tools/hot join --owner THEM --kernel %s' % (rec['kernel_sha'][:12], a.turn_max, a.kernel))
+    r = subprocess.run(cmd, cwd=root)
+    if r.returncode != 0 and a.shared:
+        hs.unmark()
+    if r.returncode == 0:
+        print('next: tools/live-cut begin it-1 | tools/hot --owner %s swap SRC DST --restart NAME | tools/hot --owner %s run /usr/local/bin/PROG '
+              '| tools/live-cut end it-1 | tools/hot session end --owner %s' % (a.owner, a.owner, a.owner))
+    return r.returncode
+
+
+def cmd_join(a):
+    me = a.owner or os.environ.get('HOT_OWNER')
+    if not me:
+        raise Fail('hot join: needs --owner NAME (your thread name)')
+    rec, notes = hs.join(me, a.kernel)
+    for n in notes:
+        print(n)
+    print('joined the shared hot session of %s as guest %s (kernel %s sha256 %s, turn cap %ss, one iteration at a time, FIFO)' % (
+        rec['owner'], me, rec['kernel'], rec['kernel_sha'][:12], rec.get('turn_max')))
+    print('use: tools/hot --owner %s push SRC DST | swap SRC DST --restart NAME | run /abs/prog ARGS | tools/live-cut --owner %s begin|end LABEL ; '
+          'leave: tools/hot leave --owner %s ; you cannot end or reboot the session' % (me, me, me))
+    print('RESULT: PASS hot join owner=%s session=%s' % (me, rec['owner']))
+    return 0
+
+
+def cmd_leave(a):
+    me = a.owner or os.environ.get('HOT_OWNER')
+    if not me:
+        raise Fail('hot leave: needs --owner NAME')
+    hs.leave(me)
+    print('RESULT: PASS hot leave owner=%s (guest dropped, turn released; your pushes stay in the standard-root ledger: the next boot undoes them)' % me)
+    return 0
+
+
+def cmd_turn(a):
+    rec, st, guests = hs.status()
+    print('shared session of %s; guests %s; turn holder %s (cap %ss); queue %s' % (rec['owner'], guests or 'none', st.get('holder'), rec.get('turn_max'), [q['name'] for q in st['queue']]))
+    print('RESULT: PASS hot turn status')
+    return 0
+
+
+NAV_FLAGS = {0x100: 'capture repetition', 0x200: 'scanout tap', 0x400: 'App-Library-only pass'}
+
+
+def nav_check(value):
+    """kern.sweetnavrun value check (patch 0275 navRestart: reps = low byte 1..5, flags 0x100/0x200/0x400). Returns (int, text) or raises Fail."""
+    try:
+        v = int(value, 0)
+    except ValueError:
+        raise Fail('hot nav: %r is not a number' % value)
+    reps, flags = v & 0xff, v & ~0xff
+    if not 1 <= reps <= 5:
+        raise Fail('hot nav: 0x%x has %d repetitions; the kernel refuses anything but 1..5 in the low byte (EINVAL). '
+                   'The App-Library-only pass is 0x401, a capture session 0x303' % (v, reps))
+    bad = flags & ~sum(NAV_FLAGS)
+    if bad:
+        raise Fail('hot nav: 0x%x has unknown flag bits 0x%x (known: %s)' % (v, bad, ', '.join('0x%x %s' % kv for kv in NAV_FLAGS.items())))
+    return v, '%d rep(s)%s' % (reps, ''.join(' + ' + t for f, t in NAV_FLAGS.items() if v & f))
+
+
+def dispatch(a, env):
+    if a.cmd == 'ping':
+        return devsh(env, ['ping'])[0]
+    if a.cmd in ('push', 'pull'):
+        return devsh(env, [a.cmd, a.src, a.dst])[0]
+    if a.cmd == 'run':
+        return devsh(env, ['run'] + a.prog)[0]
+    if a.cmd == 'signal':
+        return devsh(env, ['signal', a.pid, a.signo])[0]
+    if a.cmd == 'ps':
+        return devsh(env, ['run', PIXPS] + ([a.name[:16]] if a.name else []))[0]
+    if a.cmd == 'restart':
+        return cmd_restart(a, env)
+    if a.cmd == 'nav':   # user 2026-11-11 via the coordinator: the nav value check lives in the tool (alcum1 sent 0x400 and was refused)
+        v, what = nav_check(a.value)
+        rc, out, err = devsh(env, ['run', '/usr/local/bin/fcapctl', 'nav', '0x%x' % v], capture=True)
+        sys.stdout.write(out + err)
+        if rc != 0 or 'nav session started' not in out:
+            raise Fail('hot nav: kern.sweetnavrun 0x%x (%s) not started (rc %d; needs fcapctl in the overlay; EBUSY = a nav session still runs)' % (v, what, rc))
+        print('RESULT: PASS hot nav 0x%x (%s) started; wait for "SWEET NAV: done" in the run\'s usbnet.log' % (v, what))
+        return 0
+    if a.cmd == 'swap':
+        rc = devsh(env, ['push', a.src, a.dst])[0]
+        if rc != 0:
+            raise Fail('hot swap: push %s -> %s failed (rc %d), nothing restarted' % (a.src, a.dst, rc))
+        return cmd_restart(a, env, a.rname or os.path.basename(a.dst))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument('--owner', help='owner name of your running boot\'s phone lock (else $HOT_OWNER)')
+    ap.add_argument('--turn-wait', type=float, default=1800, help='shared session: seconds I wait for my turn (default 1800)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('stage')
+    s.add_argument('--into', required=True)
+    s.add_argument('--launchd-base')
+    s.add_argument('--drop-job', action='append')
+    s.add_argument('--build-dir', default=BUILD_DIR)
+    sub.add_parser('ping')
+    for c, n in (('push', 2), ('pull', 2)):
+        p = sub.add_parser(c)
+        p.add_argument('src')
+        p.add_argument('dst')
+    p = sub.add_parser('run')
+    p.add_argument('prog', nargs=argparse.REMAINDER)
+    p = sub.add_parser('signal')
+    p.add_argument('pid')
+    p.add_argument('signo')
+    p = sub.add_parser('ps')
+    p.add_argument('name', nargs='?')
+    p = sub.add_parser('nav')
+    p.add_argument('value', help='kern.sweetnavrun: reps 1..5 in the low byte | 0x100 capture | 0x200 tap | 0x400 App-Library-only (e.g. 0x401)')
+    p = sub.add_parser('restart')
+    p.add_argument('name')
+    p.add_argument('--sig', type=int, default=15)
+    p = sub.add_parser('swap')
+    p.add_argument('src')
+    p.add_argument('dst')
+    p.add_argument('--restart', dest='rname')
+    p.add_argument('--sig', type=int, default=15)
+    p = sub.add_parser('join')
+    p.add_argument('--kernel', help='your kernel image: must have the same sha256 as the session kernel')
+    sub.add_parser('leave')
+    p = sub.add_parser('turn')
+    p.add_argument('what', choices=('status',))
+    for p in sub.choices.values():   # `hot join --owner ME` as well as `hot --owner ME join`
+        if p.prog.split()[-1] != 'session':
+            p.add_argument('--owner', dest='owner', default=argparse.SUPPRESS)
+    se = sub.add_parser('session')
+    ssub = se.add_subparsers(dest='scmd', required=True)
+    ss = ssub.add_parser('start')
+    ss.add_argument('--owner', required=True)
+    ss.add_argument('--overlay', required=True)
+    ss.add_argument('--kernel', required=True)
+    ss.add_argument('--intent')
+    ss.add_argument('--max', type=int, default=7200)
+    ss.add_argument('--names', help='more sweetnull names (comma separated) for your programs\' stdout in the USB log')
+    ss.add_argument('--args', help='more boot-args')
+    ss.add_argument('--launchd-base', help='as hot stage --launchd-base (a tree without its own launchd.plist)')
+    ss.add_argument('--compress', action='store_true')
+    ss.add_argument('--camera', action='store_true', help='keep the ESP camera capture (default off in a session)')
+    ss.add_argument('--shared', action='store_true', help='let other owners join as guests on the same kernel (hot join); iterations take turns')
+    ss.add_argument('--turn-max', type=int, default=hs.DEFAULT_TURN_MAX, help='shared: per-turn cap in seconds (default 600)')
+    for n in ('end', 'status'):
+        x = ssub.add_parser(n)
+        x.add_argument('--owner', required=True)
+        if n == 'end':
+            x.add_argument('--reason')
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == 'stage':
+            return cmd_stage(a)
+        if a.cmd == 'session':
+            return cmd_session(a)
+        if a.cmd == 'join':
+            return cmd_join(a)
+        if a.cmd == 'leave':
+            return cmd_leave(a)
+        if a.cmd == 'turn':
+            return cmd_turn(a)
+        if a.cmd in ('push', 'swap'):
+            check_push_dst(a.dst)
+        if a.cmd == 'nav':
+            nav_check(a.value)   # refuse a bad value before any phone step
+        env = devsh_env(a, need_lock=a.cmd != 'ping')
+        owner = a.owner or os.environ.get('HOT_OWNER')
+        if a.cmd == 'ping' or not (owner and hs.active_or_none()):
+            return dispatch(a, env)
+        rl = hs.role(owner)
+        with hs.turn(owner, a.turn_wait):
+            hs.note_push(owner, rl, a.cmd, [getattr(a, k) for k in ('src', 'dst', 'name', 'pid', 'signo') if getattr(a, k, None)] + (getattr(a, 'prog', None) or []))
+            return dispatch(a, env)
+    except Fail as e:
+        print('RESULT: FAIL ' + str(e))
+        return 1
+    except hs.Refused as e:
+        print('RESULT: FAIL hot: ' + str(e))
+        return 1
+    except (Err, OSError, plistlib.InvalidFileException, ValueError) as e:
+        print('RESULT: ERROR ' + str(e))
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

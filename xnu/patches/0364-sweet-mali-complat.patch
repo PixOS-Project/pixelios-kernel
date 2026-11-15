@@ -1,0 +1,279 @@
+sweet-mali-complat (lowclk 2026-11-15, research 162 U1 / lever 2): LOG ONLY per-job completion latency of the Mali driver, boot-arg sweetcomplat=1 (absent / 0 = off, byte-identical behavior; any other value a GAP line and off). No register access, no new hardware write, no new firmware command: the only additions are mach_absolute_time() stamps and counters, so there is nothing for AGENTS rule 8 to review.
+Stamps (bsd/dev/sweet_mali.c): t_isr = mach_absolute_time() at sm_isr entry of a non-spurious JOB interrupt (one cmpxchg of a 64-bit stamp, no lock, no allocation, no printf in the ISR); t_end = when check_job() returns in sm_thread (finish() has completed the job and started the next parked job, if any); t_start = right after the JS_COMMAND_NEXT START write of the first job started inside that check_job() (sm_start_locked or the overlap start sm_start_ov_locked), armed only inside the sm_thread check_job window. Per completed job: done = t_end - t_isr; per check_job that started a job: start = t_start - t_isr.
+Output: once per second `SWEET PERF: complat n N p50 P p90 Q max M us start_n S start_p50 A start_p90 B start_max C us noirq X nodone Y neg Z sat W over V drop_total T` from two fixed 512-bin 1 us histograms updated under sm_lock by sm_thread (last bin = saturated, p90/max then report the true max). Rule 7: samples that cannot be attributed are counted and printed (noirq = completion by the 2 ms fallback/poll without an ISR stamp; nodone = stamp with no completion; neg; sat; over = more than 8 jobs in one check_job; drop_total cumulative); a GAP is printed when sweetcomplat=1 runs without the JOB interrupt. The SWEET SWAPT row is NOT changed.
+Host test: tools/test_sweet_complat364.py compiles the pure block between COMPLAT-PURE-BEGIN/END out of this patch text and mutates every check. Not run on hardware.
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -22,6 +22,7 @@ extern void thread_terminate_self(void);
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
+ #include <os/atomic_private.h>   /* patch 0271 */
++#include <mach/mach_time.h>   /* patch 0364: mach_absolute_time() for the ISR stamp */
+ static uint64_t sm_bom_n[3], sm_bom_us[3], sm_bom_max[3], sm_bom_pg[3];   /* patch 0271: BO map / unmap / import counters (sweet_mali_perf_bo) */
+ /* patch 0272: Mali interrupt mode state (sm_isr, sm_irq_setup, sm_thread, sm_perf_tick) */
+ static int sm_irq_on;
+@@ -295,6 +296,164 @@ static uint64_t swt_busy_cum, swt_wait_cum, swt_call1, swt_calll, swt_done;
+  * fragment on JS0). With overlap the per-slot sums add up to more than the wall time. */
+ static uint64_t slot_busy_us[2], slot_jobs[2], slot_hist[2][7];
+ 
++/*
++ * Patch 0364 (lowclk 2026-11-15, LOG ONLY, no register access, no new hardware write; research 162 U1/lever 2): per-job completion latency, boot-arg sweetcomplat=1
++ * (absent / 0 = off, byte-identical behavior: one never-taken branch per ISR, per sm_thread wake and per job start; any other value = GAP + off).
++ *   t_isr   mach_absolute_time() at sm_isr entry of a JOB interrupt (the first one since sm_thread last consumed it; the ISR masks the line, so one per wake)
++ *   t_end   mach_absolute_time() when check_job() returns: finish() has completed the job(s) AND started the next parked job, if any
++ *   t_start mach_absolute_time() right after the JS_COMMAND_NEXT=START write of the first job started inside that check_job() (sm_start_locked or sm_start_ov_locked)
++ * Per completed job: done latency = t_end - t_isr. Per check_job() that started a job: start latency = t_start - t_isr. Samples go to two fixed 1 us histograms
++ * (512 bins, the last one = saturated), updated by sm_thread under sm_lock; the ISR does one cmpxchg of a 64-bit stamp and nothing else (no allocation, no lock, no printf).
++ * Samples that cannot be attributed are COUNTED, never silent (rule 7): noirq = job completed by the 2 ms fallback / poll (no ISR stamp pending), nodone = an ISR stamp
++ * was consumed but no job completed (e.g. the JS1 done bit of an overlapped job, or an ISR racing the loop top), neg = negative interval, sat = saturated bin
++ * (value printed for p90/max is the true max then), over = more than CL_MAXJ jobs in one check_job. Printed once per second by sm_thread: `SWEET PERF: complat ...`.
++ */
++/* COMPLAT-PURE-BEGIN (host test tools/test_sweet_complat364.py compiles this block between the markers) */
++#define CL_BINS 512u
++#define CL_MAXJ 8u
++struct cl_hist {
++	uint32_t bin[CL_BINS];
++	uint32_t n, sat, maxv;
++};
++struct cl_state {
++	struct cl_hist done, start;
++	uint32_t noirq, nodone, neg, over;
++	uint64_t drop_total;
++};
++
++static void
++cl_hist_add(struct cl_hist *h, uint64_t us)
++{
++	uint32_t v = us >= 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)us;
++	uint32_t b = v >= CL_BINS - 1 ? CL_BINS - 1 : v;
++	h->bin[b]++;
++	h->n++;
++	if (b == CL_BINS - 1) {
++		h->sat++;
++	}
++	if (v > h->maxv) {
++		h->maxv = v;
++	}
++}
++
++/* value (us) at rank ceil(n * num / den); 0 when empty; the saturated bin reports the true max */
++static uint32_t
++cl_hist_pct(const struct cl_hist *h, uint32_t num, uint32_t den)
++{
++	if (h->n == 0 || den == 0) {
++		return 0;
++	}
++	uint64_t rank = ((uint64_t)h->n * num + den - 1) / den;
++	uint64_t acc = 0;
++	if (rank == 0) {
++		rank = 1;
++	}
++	for (uint32_t b = 0; b < CL_BINS; b++) {
++		acc += h->bin[b];
++		if (acc >= rank) {
++			return b == CL_BINS - 1 ? h->maxv : b;
++		}
++	}
++	return h->maxv;
++}
++
++/* one check_job(): isr_ns 0 = no ISR stamp was pending; start_ns 0 = no job was started; njobs = jobs completed inside it */
++static void
++cl_account(struct cl_state *s, uint64_t isr_ns, uint64_t end_ns, uint64_t start_ns, uint32_t njobs)
++{
++	if (njobs == 0) {
++		if (isr_ns != 0) {
++			s->nodone++;
++			s->drop_total++;
++		}
++		return;
++	}
++	if (njobs > CL_MAXJ) {
++		s->over += njobs - CL_MAXJ;
++		s->drop_total += njobs - CL_MAXJ;
++		njobs = CL_MAXJ;
++	}
++	if (isr_ns == 0) {
++		s->noirq += njobs;
++		s->drop_total += njobs;
++		return;
++	}
++	if (end_ns < isr_ns) {
++		s->neg += njobs;
++		s->drop_total += njobs;
++		return;
++	}
++	for (uint32_t j = 0; j < njobs; j++) {
++		cl_hist_add(&s->done, (end_ns - isr_ns) / 1000);
++	}
++	if (start_ns != 0) {
++		if (start_ns >= isr_ns) {
++			cl_hist_add(&s->start, (start_ns - isr_ns) / 1000);
++		} else {
++			s->neg++;
++			s->drop_total++;
++		}
++	}
++}
++
++/* per-second reset; the cumulative drop count survives */
++static void
++cl_reset(struct cl_state *s)
++{
++	uint64_t d = s->drop_total;
++	bzero(s, sizeof(*s));
++	s->drop_total = d;
++}
++/* COMPLAT-PURE-END */
++
++static int cl_on, cl_armed;
++static uint64_t cl_isr_t0, cl_start_t0, cl_done_n, cl_last_us;
++static struct cl_state cl_st;
++
++static uint64_t
++cl_ns(uint64_t abs)
++{
++	uint64_t ns = 0;
++	if (abs != 0) {
++		absolutetime_to_nanoseconds(abs, &ns);
++	}
++	return ns;
++}
++
++/* sm_thread, lock held, around ONE check_job(): t_isr = the stamp the ISR left (0 = none) */
++static void
++cl_account_job(uint64_t t_isr, uint64_t jobs_before)
++{
++	cl_armed = 0;
++	cl_account(&cl_st, cl_ns(t_isr), cl_ns(mach_absolute_time()), cl_ns(cl_start_t0), (uint32_t)(cl_done_n - jobs_before));
++}
++
++/* sm_thread, lock NOT held: once per second print and reset */
++static void
++cl_tick(void)
++{
++	if (!cl_on) {
++		return;
++	}
++	uint64_t now = now_us();
++	if (now - cl_last_us < 1000000) {
++		return;
++	}
++	cl_last_us = now;
++	lck_mtx_lock(&sm_lock);
++	struct cl_state *s = &cl_st;
++	uint32_t n = s->done.n, p50 = cl_hist_pct(&s->done, 1, 2), p90 = cl_hist_pct(&s->done, 9, 10), mx = s->done.maxv;
++	uint32_t sn = s->start.n, sp50 = cl_hist_pct(&s->start, 1, 2), sp90 = cl_hist_pct(&s->start, 9, 10), smx = s->start.maxv;
++	uint32_t sat = s->done.sat + s->start.sat, noirq = s->noirq, nodone = s->nodone, neg = s->neg, over = s->over;
++	uint64_t dt = s->drop_total;
++	cl_reset(s);
++	lck_mtx_unlock(&sm_lock);
++	if (n || sn || noirq || nodone || neg || over || sat) {
++		printf("SWEET PERF: complat n %u p50 %u p90 %u max %u us start_n %u start_p50 %u start_p90 %u start_max %u us noirq %u nodone %u neg %u sat %u over %u drop_total %llu\n", n, p50, p90, mx, sn, sp50, sp90,
++		    smx, noirq, nodone, neg, sat, over, dt);
++	}
++}
++
+ static void
+ perf_job_done_at(uint64_t start_us, uint64_t seq, unsigned slot)
+ {
+@@ -305,6 +464,7 @@ perf_job_done_at(uint64_t start_us, uint64_t seq, unsigned slot)
+ 	slot_jobs[slot & 1]++;
+ 	slot_hist[slot & 1][hb]++;
+ 	perf_jobs++;
++	cl_done_n++;   /* patch 0364: monotonic, lock held; the per-second perf_jobs is reset by sm_perf_tick */
+ 	perf_busy_us += d;
+ 	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
+ 	perf_fine[d >= 1000 ? PERF_FINE_N - 1 : d / 50]++;   /* patch 0212 */
+@@ -395,6 +555,9 @@ sm_start_ov_locked(uint64_t jc, uint64_t seq)
+ 	wr(R_JS_BASE(1) + JS_AFFINITY_NEXT + 4, 0);
+ 	wr(R_JS_BASE(1) + JS_CONFIG_NEXT, JS_CONFIG_VAL);
+ 	wr(R_JS_BASE(1) + JS_COMMAND_NEXT, JS_CMD_START);
++	if (cl_armed && cl_start_t0 == 0) {   /* patch 0364, log only */
++		cl_start_t0 = mach_absolute_time();
++	}
+ 	ovl_started++;
+ 	return 0;
+ }
+@@ -934,6 +1097,7 @@ static int
+ sm_isr(void *arg, uint32_t intid __unused)
+ {
+ 	uintptr_t which = (uintptr_t)arg;
++	uint64_t t_in = cl_on ? mach_absolute_time() : 0;   /* patch 0364 */
+ 	if (!sm.up || sm.dead || sm.g == NULL) {
+ 		return 1;
+ 	}
+@@ -942,6 +1106,9 @@ sm_isr(void *arg, uint32_t intid __unused)
+ 			sm_irq_spur++;
+ 			return 0;
+ 		}
++		if (cl_on) {   /* patch 0364: stamp of the first non-spurious JOB interrupt since sm_thread consumed it (t_isr taken at entry); no lock, no printf */
++			(void)os_atomic_cmpxchg(&cl_isr_t0, 0, t_in, relaxed);
++		}
+ 		sm.g[R_JOB_MASK / 4] = 0;
+ 		sm_irq_job++;
+ 	} else {
+@@ -1042,14 +1209,34 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 			printf("SWEET MALI GAP: sweetmaliovl=%u is not 0 or 1, ignored, overlap stays off\n", pv);
+ 		}
+ 	}
++	if (PE_parse_boot_argn("sweetcomplat", &pv, sizeof(pv))) {   /* patch 0364, log only */
++		if (pv == 1) {
++			cl_on = 1;
++			printf("SWEET MALI: completion latency log ON (sweetcomplat=1): SWEET PERF: complat once per second, JOB interrupt entry -> check_job done / next job started\n");
++		} else if (pv != 0) {
++			printf("SWEET MALI GAP: sweetcomplat=%u is not 0 or 1, ignored, the completion latency log stays off\n", pv);
++		}
++	}
+ 	sm_irq_setup();   /* patch 0272 */
++	if (cl_on && !sm_irq_on) {
++		printf("SWEET MALI GAP: sweetcomplat=1 needs the JOB interrupt (sweetmaliirq=1 and attach accepted): no ISR stamps, every completion will count as noirq\n");
++	}
+ 	for (;;) {
+ 		uint64_t dl;
+ 		lck_mtx_lock(&sm_lock);
+ 		(void)os_atomic_xchg(&sm_irq_pend, 0u, relaxed);
++		uint64_t t_isr = cl_on ? os_atomic_xchg(&cl_isr_t0, 0, relaxed) : 0;   /* patch 0364 */
+ 		if (sm.busy) {
+ 			uint64_t before = sm.seq_done;
++			uint64_t cl_jobs0 = cl_done_n;
++			if (cl_on) {
++				cl_start_t0 = 0;
++				cl_armed = 1;
++			}
+ 			check_job();
++			if (cl_on) {
++				cl_account_job(t_isr, cl_jobs0);
++			}
+ 			if (sm_irq_on && sm.seq_done != before) {
+ 				sm_irq_jobs_seen += sm.seq_done - before;
+ 				if (sm_irq_jobs_seen >= 200 && sm_irq_job == 0) {
+@@ -1062,6 +1249,9 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 				}
+ 			}
+ 		}
++		if (cl_on && !sm.busy && t_isr != 0) {   /* patch 0364: a JOB interrupt stamp with no job in flight: counted */
++			cl_account(&cl_st, cl_ns(t_isr), 0, 0, 0);
++		}
+ 		sm_irq_arm(sm.busy != 0);
+ 		if (sm.busy) {
+ 			clock_interval_to_deadline(sm_irq_on ? 2000 : poll_us, NSEC_PER_USEC, &dl);
+@@ -1074,6 +1264,7 @@ sm_thread(void *arg __unused, wait_result_t w __unused)
+ 		}
+ 		lck_mtx_unlock(&sm_lock);
+ 		sm_perf_tick();
++		cl_tick();   /* patch 0364 */
+ 		sm_submit_tm_tick();
+ 	}
+ }
+@@ -1474,6 +1665,9 @@ sm_start_locked(uint64_t jc, unsigned slot, uint64_t seq)
+ 	wr(R_JS_BASE(slot) + JS_CONFIG_NEXT, sm_js_config);
+ 	sm.busy = 1;
+ 	wr(R_JS_BASE(slot) + JS_COMMAND_NEXT, JS_CMD_START);
++	if (cl_armed && cl_start_t0 == 0) {   /* patch 0364, log only: only inside the sm_thread check_job() window */
++		cl_start_t0 = mach_absolute_time();
++	}
+ 	return 0;
+ }
+ 

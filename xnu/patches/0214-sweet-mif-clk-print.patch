@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -268,6 +268,37 @@
+ 		}
+ 	}
+ 	{
++		/*
++		 * --mif-clk (T-5030): the shim read ACPM DVFS dom 0 (MIF = DRAM controller) and dom 1 (INT) with FREQ_GET, asked MIF for its table top row once and
++		 * appended the results to the command line (shim/mifclk.c); the shim console never reaches the host in a handover boot. 0 = not read.
++		 * sweetmifrc: 0 request sent and answered, 1 refused or failed, 2 MIF already at the top (nothing asked), 3 a GET failed (nothing asked),
++		 * 4 a gate refused (nothing sent). Log only: nothing is written here.
++		 */
++		static const char *const nm[5] = { "sweetmif0b", "sweetmif1b", "sweetmif0a", "sweetmif1a", "sweetmifrc" };
++		uint32_t m[5] = { 0, 0, 0, 0, 0 };
++		bool any = false;
++
++		for (unsigned int k = 0; k < 5; k++) {
++			if (PE_parse_boot_argn(nm[k], &m[k], sizeof(m[k]))) {
++				any = true;
++			}
++		}
++		if (any) {
++			IOLog("SWEET DVFS: dom 0 get khz=%u when=before (MIF, read by the shim)\n", m[0]);
++			IOLog("SWEET DVFS: dom 1 get khz=%u when=before (INT, read by the shim)\n", m[1]);
++			IOLog("SWEET DVFS: dom 0 get khz=%u when=after (MIF, after the request)\n", m[2]);
++			IOLog("SWEET DVFS: dom 1 get khz=%u when=after (INT, after the request)\n", m[3]);
++			IOLog("SWEET DVFS: mif-clk rc=%u\n", m[4]);
++			if (m[4] != 0 && m[4] != 2) {
++				IOLog("SWEET GAP: DVFS mif-clk rc=%u (1 request refused or failed, 3 a GET failed, 4 a gate refused): see the shim console / pstore\n", m[4]);
++			} else if (m[4] == 0 && (m[2] == 0 || m[3] == 0)) {
++				IOLog("SWEET GAP: DVFS mif-clk request sent but the readback is missing (dom 0 %u, dom 1 %u kHz)\n", m[2], m[3]);
++			}
++		} else {
++			IOLog("SWEET DVFS: no sweetmif* boot-arg (shim not built with --mif-clk, or no room on the command line: see the shim GAP line): MIF/INT not read\n");
++		}
++	}
++	{
+ 		unsigned int busy_s = 0;
+ 		if (PE_parse_boot_argn("sweetbusy", &busy_s, sizeof(busy_s)) && busy_s != 0) {
+ 			for (unsigned int n = 0; n < 3; n++) {

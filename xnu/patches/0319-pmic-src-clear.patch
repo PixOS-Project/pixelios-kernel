@@ -1,0 +1,68 @@
+SWEET PMIC SRC CLEAR print (patch 0319, ALL-ON tracker T-02/T-24, docs/research/142-s2mpg-offsrc-clear.md). Log only, no hardware access, no new bus traffic: bsd/dev/sweet_chg_i2c.c prints the outcome of the shim's --pmic-src-clear step (shim/pmicsrc_clear.c: FUNC_WRITE of 0 to S2MPG10 OFFSRC 0xf / PWRONSRC 0xe and S2MPG11 OFFSRC 0xd after the reads, one read-back each), handed over as the decimal boot-arg sweetpsclr=N (0 all three written and both OFFSRC read back 0 (the S10 PWRONSRC read-back is only reported, sweetpspw=0xNN, never an error: it can be the live power-on reason of this boot); 1..3 the write of step N-1 refused or not confirmed (it may still have run, see the shim PMIC SRC STATE line); 4..6 the read-back of step N-4 failed; 7, 9 an OFFSRC read-back (step N-7) was not 0; 10 not attempted). Prints SWEET PMIC SRC CLEAR: rc=N (meaning) and, for any non-zero rc, a SWEET PMIC GAP line. No sweetpsclr boot-arg (shim without --pmic-src-clear, or an older shim): no line, reader-only boots are unchanged. The 0318 SRC line now says 'read by the shim before any clear' instead of 'not cleared' (true in both modes). Applies after 0318. Host test: shim/pmicsrc_clear_host_test.c (token format), kernel string check: tools/build-xnu-image.sh refuses --pmic-src-clear without 'sweetpsclr' in the kernel. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_chg_i2c.c b/bsd/dev/sweet_chg_i2c.c
+--- a/bsd/dev/sweet_chg_i2c.c
++++ b/bsd/dev/sweet_chg_i2c.c
+@@ -541,6 +541,46 @@
+ 	o[4] = 0;
+ }
+ 
++/*
++ * Patch 0319 (ALL-ON T-02/T-24, docs/research/142): the shim built with --pmic-src-clear wrote 0 to S2MPG10 OFFSRC 0xf / PWRONSRC 0xe and S2MPG11 OFFSRC 0xd after it read them (the values above
++ * are the ones read BEFORE that) and read each back once; it hands the outcome over as sweetpsclr=N (DECIMAL; shim/pmicsrc.h): 0 all three written and read back 0; 1..3 the write of step N-1
++ * refused or not confirmed (may still have run; 0 S10 OFFSRC, 1 S10 PWRONSRC, 2 S11 OFFSRC; later steps not sent); 4..6 the read-back of step N-4 failed; 7, 9 the read-back of OFFSRC (step N-7) was not 0, the S10 PWRONSRC read-back is NOT an error (sweetpspw=0xNN, reported); 10 not attempted. No
++ * sweetpsclr boot-arg (shim without --pmic-src-clear): no line. This only prints: no hardware access here.
++ */
++static const char *
++i2c_psclr_meaning(uint32_t c)
++{
++	if (c == 0) {
++		return "all three latches written 0 and read back 0";
++	} else if (c <= 3) {
++		return "a write was refused or not confirmed, it may still have run (step rc-1: 0 S10 OFFSRC, 1 S10 PWRONSRC, 2 S11 OFFSRC), later steps not sent";
++	} else if (c <= 6) {
++		return "the writes were done, the read-back of step rc-4 failed";
++	} else if (c <= 9) {
++		return "the write was accepted but an OFFSRC latch read back non-zero (step rc-7: 0 S10, 2 S11)";
++	} else if (c == 10) {
++		return "not attempted: an ACPM gate refused, a read failed or the token buffer was too small, nothing written";
++	}
++	return "unknown code";
++}
++
++static void
++i2c_pmic_src_clear_log(void)
++{
++	uint32_t clr = 0, pw = 0;
++	char h[5];
++
++	if (!PE_parse_boot_argn("sweetpsclr", &clr, sizeof(clr))) {
++		return;
++	}
++	/* sweetpspw: the S2MPG10 PWRONSRC read back after the write 0; reported only (it can be the live power-on reason of this boot), ERR = not read */
++	i2c_hex8(h, PE_parse_boot_argn("sweetpspw", &pw, sizeof(pw)), pw & 0xffu);
++	i2c_log("SWEET PMIC SRC CLEAR: rc=%u (%s) PWRONSRC after clear=%s\n", clr, i2c_psclr_meaning(clr), h);
++	if (clr != 0) {
++		i2c_log("SWEET PMIC GAP: PMIC SRC CLEAR rc=%u (%s): the reset-source latches were not all cleared and verified, see the shim console / pstore\n", clr, i2c_psclr_meaning(clr));
++	}
++}
++
+ static void
+ i2c_pmic_src_log(void)
+ {
+@@ -563,13 +603,14 @@
+ 	for (k = 0; k < 2; k++) {
+ 		i2c_hex8(h[4 + k], have11, (w11 >> (8 - 8 * k)) & 0xffu);
+ 	}
+-	i2c_log("SWEET PMIC SRC: s2mpg10 STATUS1=%s STATUS2=%s PWRONSRC=%s OFFSRC=%s s2mpg11 STATUS1=%s OFFSRC=%s rc=%u (read by the shim, not cleared)\n",
++	i2c_log("SWEET PMIC SRC: s2mpg10 STATUS1=%s STATUS2=%s PWRONSRC=%s OFFSRC=%s s2mpg11 STATUS1=%s OFFSRC=%s rc=%u (read by the shim before any clear)\n",
+ 	    h[0], h[1], h[2], h[3], h[4], h[5], haverc ? rc : 0xffffu);
+ 	if (!haverc) {
+ 		i2c_log("SWEET PMIC GAP: sweetpsrc missing (the shim always appends it with sweetps10/sweetps11): the read result code is unknown\n");
+ 	} else if (rc != 0) {
+ 		i2c_log("SWEET PMIC GAP: PMIC SRC rc=%u (1..6 the read of register index rc-1 failed and the later ones were skipped, 7 an ACPM gate refused): registers shown ERR have no value, see the shim console / pstore\n", rc);
+ 	}
++	i2c_pmic_src_clear_log();
+ 	i2c_log("SWEET PMIC GAP: s2mpg10 INT1..INT6[0x0-0x5] s2mpg11 INT1..INT6[0x0-0x5] not read (clear on read)\n");
+ }
+ 

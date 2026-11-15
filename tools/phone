@@ -11,6 +11,7 @@ Output: <= 6 short lines, last line:
   RESULT: PASS|FAIL|PARTIAL|ERROR state=<final> target=<target> steps=<n>
 Exit codes: 0 PASS / 1 FAIL or PARTIAL / 2 ERROR.
 Details logged to logs/phone/<timestamp>/phone.log.
+Sim seam (env only, default unchanged, prints `SIM SEAM ACTIVE: PIXOS_SLEEP_SCALE=V` on stderr): PIXOS_SLEEP_SCALE=F multiplies the 0.5 s poll of `goto` (tools/simseams.py; floor 5 ms); a bad value is exit 2 at start, before any command.
 
 Hardware and protocol citations:
   - Shim USB gadget VID:PID 1209:0001 (CDC-ACM serial log, /dev/ttyACM*):
@@ -40,6 +41,9 @@ import re
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import simseams  # noqa: E402  (test seam PIXOS_SLEEP_SCALE: the goto poll below; default = real time)
 
 ALLOWED_TARGETS = {"fastboot", "recovery", "android", "ios", "absent"}
 # Test hook only: multiplies the wait bounds that decide when to ask the user (the unit tests cannot wait 90 s).
@@ -528,6 +532,7 @@ def observe_state(logger=None):
 
     # Parse RESULT: PASS|FAIL|ERROR state=<state> product=<prod>
     m = re.search(r"^RESULT:\s+([A-Z]+)\s+state=(\w+)\s+product=(\w+)", ps_out, re.M)
+    probe_error = bool(m) and m.group(1) == "ERROR"
     if m:
         _, ps_state, ps_prod = m.groups()
         if logger:
@@ -552,6 +557,13 @@ def observe_state(logger=None):
         has_fb_dev = (rc_fb == 0 and bool(re.search(r"^\S+\s+fastboot", fb_out, re.M)))
 
     if has_adb_dev or has_fb_dev:
+        # 2026-11-09 (gputest-cache1 park): a device that answers adb/fastboot but whose product could not be READ yet (phone-state probe
+        # error, e.g. adbd still starting in recovery right after a reset) is not verified, not known to be another device. goto sends
+        # nothing to it and re-observes for UNVERIFIED_SETTLE_S; only a product that reads as something else is other-device at once.
+        if probe_error:
+            if logger:
+                logger.log("observe_state: adb/fastboot answer but the product is not readable yet -> state=unverified")
+            return "unverified"
         return "other-device"
 
     if usb_has_google:
@@ -560,9 +572,12 @@ def observe_state(logger=None):
     return "absent"
 
 
+UNVERIFIED_SETTLE_S = 30   # gputest-cache1: recovery -> product readable took < 12 s after the reset (logs/phone 2026-11-09T213333Z vs 213515Z)
+
+
 def cmd_state(args, logger):
     state = observe_state(logger=logger)
-    verdict = "FAIL" if state in ("other-device", "hung") else "PASS"
+    verdict = "FAIL" if state in ("other-device", "hung", "unverified") else "PASS"
     return make_report(logger, verdict, state, "none", 0)
 
 
@@ -587,12 +602,14 @@ def cmd_goto(args, logger):
 
     # Check transition table
     trans = TRANSITION_TABLE.get((state, target))
-    if trans is None:
+    if trans is None and state != "unverified":   # unverified: the loop below waits for the product (no command meanwhile)
         msg = f"unknown transition: needs measuring ({state} -> {target})"
         logger.log(msg)
         return make_report(logger, "FAIL", state, target, 0, [msg])
 
     if args.dry_run:
+        if trans is None:
+            return make_report(logger, "PASS", state, target, 0, ["dry-run: the device is not verified yet; would wait up to %d s, no command" % UNVERIFIED_SETTLE_S])
         logger.log(f"dry-run: planned {len(trans['steps'])} step(s) to transition {state} -> {target}")
         return make_report(logger, "PASS", state, target, 0, ["dry-run: no commands executed"])
 
@@ -613,8 +630,12 @@ def cmd_goto(args, logger):
             return make_report(logger, "PASS", state, target, steps_done)
         if state == "other-device":
             return make_report(logger, "FAIL", state, target, steps_done, ["Safety: other-device detected; refusing commands"])
+        if state == "unverified" and (time.time() - state_since) >= UNVERIFIED_SETTLE_S * BOUND_SCALE:
+            return make_report(logger, "FAIL", "other-device", target, steps_done,
+                               ["Safety: a device on USB was never verified as bluejay in %d s; refusing commands" % UNVERIFIED_SETTLE_S])
 
-        cur_trans = TRANSITION_TABLE.get((state, target))
+        # unverified: no step, no command; the poll at the bottom of the loop, then observe again
+        cur_trans = {"steps": []} if state == "unverified" else TRANSITION_TABLE.get((state, target))
         if cur_trans is None:
             msg = f"unknown transition: needs measuring ({state} -> {target})"
             return make_report(logger, "FAIL", state, target, steps_done, [msg])
@@ -624,7 +645,9 @@ def cmd_goto(args, logger):
                 break
             # A wait-only step (cmd None) names how long the phone's own reset normally takes (bound_s): ask the user only after
             # that, never at once (the phone may be about to reset by itself).
-            if step.get("user_action") and (step.get("cmd") or (time.time() - state_since) >= step.get("bound_s", 0) * BOUND_SCALE):
+            # after our own reset command the phone is off the bus ~90 s before recovery shows (review reset-to-fastboot F3): wait that long
+            wait_bound = max(step.get("bound_s", 0), 150) if (steps_done and state == "absent") else step.get("bound_s", 0)
+            if step.get("user_action") and (step.get("cmd") or (time.time() - state_since) >= wait_bound * BOUND_SCALE):
                 logger.emit_user_prompt(step["user_action"])
             cmd = step.get("cmd")
             if cmd:
@@ -638,7 +661,7 @@ def cmd_goto(args, logger):
                 if state == target:
                     return make_report(logger, "PASS", state, target, steps_done)
 
-        time.sleep(0.5)
+        simseams.poll(0.5)
 
     state = observe_state(logger=logger)
     verdict = "PASS" if state == target else "FAIL"
@@ -663,6 +686,7 @@ def cmd_self_test(args, logger):
 
 
 def main(argv=None):
+    simseams.scale()   # a bad PIXOS_SLEEP_SCALE is exit 2 now, before any adb/fastboot command (review xrun-seams-r1 F6)
     if argv is None:
         argv = sys.argv[1:]
 

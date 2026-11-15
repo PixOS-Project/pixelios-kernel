@@ -1,0 +1,434 @@
+SWEET dev overlay v2 (patch 0154, on top of 0117): zlib-compressed entries, bounded streaming inflate.
+Archive version 2 stores each entry as u64 inflated size + one zlib stream (tools/mkdevoverlay.py --compress); version 1 is unchanged and still accepted.
+Uses libkern inflate (libkern/zlib/inflate.c, option zlib; _inflate/_inflateInit_/_inflateEnd are in the built kernel: llvm-nm of
+localbuild/out/kernel.development.sweet). Memory: two 1 MiB chunks plus ~40 KiB of inflate state; the inflated file is never held whole.
+Bounds: stored length <= 48 MiB, inflated size per entry and sum <= 40 MiB (else the archive is refused whole); per entry a verify pass
+(stream well-formed, exactly the declared size, no trailing bytes, crc32 over the inflated bytes) runs BEFORE anything is written, then
+compare and write passes re-inflate (the write pass re-checks the crc and never renames on a mismatch). Hardware-writing path (writes userdata files): review docs/reviews/devoverlay-z-1.md SAFE WITH CONDITIONS; round-1 findings 1-3 fixed, build and device proof pending.
+
+diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
+--- a/bsd/dev/sweet_devoverlay.c
++++ b/bsd/dev/sweet_devoverlay.c
+@@ -5,10 +5,15 @@
+  * /chosen/memory-map RAMDisk, tools/mkdevoverlay.py) starts with a valid SWEETDEV archive.
+  *
+  * Archive (little-endian; offsets from the start of the RAM disk; trailing bytes are ignored):
+- *   header 16 bytes: "SWEETDEV" | u32 version (1) | u32 count (<= 4096)
++ *   header 16 bytes: "SWEETDEV" | u32 version (1 or 2) | u32 count (<= 4096)
+  *   per entry, starting 16-byte aligned:
+  *     u16 pathlen (1..1000) | u16 mode (<= 0777) | u32 uid | u32 gid | u32 crc32(data) | u64 size
+  *     path (pathlen bytes, no NUL), zero pad to 16, data (size bytes), zero pad to 16
++ *   version 2 (patch 0154): "size" is the STORED length and the stored data is u64 inflated size (<= 40 MiB)
++ *     | one zlib stream (RFC 1950, libkern inflate, streamed in 1 MiB chunks, never held whole). crc32 is over the INFLATED
++ *     bytes. Limits: stored length <= 48 MiB, sum of inflated sizes <= 40 MiB (else the archive is refused whole); an
++ *     entry whose stream is bad, ends early, yields more or fewer bytes than declared, has trailing bytes or a bad crc
++ *     is refused alone, before anything is written (a verify pass, then a compare pass and a write pass).
+  * The kernel never trusts the archive: the whole structure is walked first (magic, version, count,
+  * every length against the remaining bytes, no overflow) and nothing is written if that fails.
+  * A bad crc or path only skips that entry.
+@@ -40,6 +45,10 @@
+ #include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
++#include <libkern/zlib.h>
++
++#define SD_ALLOC(n)  kalloc_data((n), Z_WAITOK | Z_ZERO)   /* NULL-checked here; the stock zcalloc would bzero(NULL) */
++#define SD_FREE(p, n) kfree_data((p), (n))
+ 
+ extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
+ extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg, enum uio_seg segflg, int unlink_flags);
+@@ -48,11 +57,14 @@ extern int sweet_vfs_mkdir(vfs_context_t ctx, const char *path, int mode);
+ 
+ /* host-test begin (tools/test_devoverlay_kernel.py compiles everything up to "host-test end" on the host) */
+ #define SD_VERSION   1u
++#define SD_VERSION2  2u
+ #define SD_HDR       16u
+ #define SD_ENT       24u
+ #define SD_MAXCOUNT  4096u
+ #define SD_MAXPATH   1000u
+ #define SD_CHUNK     (1u << 20)
++#define SD_MAXINF    (40ull << 20)       /* v2: inflated size of one entry and of the whole archive */
++#define SD_MAXZ      (48ull << 20)       /* v2: stored length of one entry (40 MiB + deflate worst-case overhead) */
+ #define SD_MAXDEV    16
+ 
+ enum { K_DIR, K_NAME, K_EXACT };
+@@ -65,7 +77,10 @@ static const struct { const char *pfx; int kind; } sd_allow[] = {
+ struct sd_ent {
+ 	const uint8_t *path, *data;
+ 	uint32_t plen, mode, uid, gid, crc;
+-	uint64_t size;
++	uint64_t size;                  /* stored length */
++	uint64_t usize;                 /* bytes after inflate (v1: == size) */
++	const uint8_t *zdata;           /* v2: the zlib stream */
++	bool z;
+ };
+ 
+ static uint32_t sd_crc_tab[256];
+@@ -75,9 +90,9 @@ static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1]
+ static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
+ 
+ static uint32_t
+-sd_crc32(const uint8_t *p, uint64_t n)
++sd_crc32_cont(uint32_t crc, const uint8_t *p, uint64_t n)
+ {
+-	uint32_t c = 0xffffffffu;
++	uint32_t c = ~crc;
+ 	if (!sd_crc_tab[1]) {
+ 		for (uint32_t i = 0; i < 256; i++) {
+ 			uint32_t v = i;
+@@ -93,9 +108,15 @@ sd_crc32(const uint8_t *p, uint64_t n)
+ 	return ~c;
+ }
+ 
++static uint32_t
++sd_crc32(const uint8_t *p, uint64_t n)
++{
++	return sd_crc32_cont(0, p, n);
++}
++
+ /* Parse the entry at *offp (overflow-safe against len); advance *offp. */
+ static int
+-sd_next(const uint8_t *b, uint64_t len, uint64_t *offp, struct sd_ent *e)
++sd_next(const uint8_t *b, uint64_t len, uint32_t ver, uint64_t *offp, struct sd_ent *e)
+ {
+ 	uint64_t off = *offp;
+ 	if (off > len || len - off < SD_ENT) {
+@@ -114,6 +135,18 @@ sd_next(const uint8_t *b, uint64_t len, uint64_t *offp, struct sd_ent *e)
+ 		return EINVAL;
+ 	}
+ 	e->data = b + off;
++	e->usize = e->size; e->zdata = NULL; e->z = false;
++	if (ver == SD_VERSION2) {
++		if (e->size < 8 || e->size > SD_MAXZ) {
++			return EINVAL;
++		}
++		e->usize = rd64(e->data);
++		if (e->usize > SD_MAXINF) {
++			return EINVAL;
++		}
++		e->zdata = e->data + 8;
++		e->z = true;
++	}
+ 	off = (off + e->size + 15) & ~15ull;
+ 	if (off > len) {
+ 		return EINVAL;
+@@ -122,31 +155,154 @@ sd_next(const uint8_t *b, uint64_t len, uint64_t *offp, struct sd_ent *e)
+ 	return 0;
+ }
+ 
+-/* Header check: 0 and *count, or EINVAL. */
++/* Header check: 0, *ver and *count, or EINVAL. */
+ static int
+-sd_hdr(const uint8_t *b, uint64_t len, uint32_t *count)
++sd_hdr(const uint8_t *b, uint64_t len, uint32_t *ver, uint32_t *count)
+ {
+-	if (len < SD_HDR || memcmp(b, "SWEETDEV", 8) != 0 || rd32(b + 8) != SD_VERSION || rd32(b + 12) > SD_MAXCOUNT) {
++	if (len < SD_HDR || memcmp(b, "SWEETDEV", 8) != 0 || (rd32(b + 8) != SD_VERSION && rd32(b + 8) != SD_VERSION2) ||
++	    rd32(b + 12) > SD_MAXCOUNT) {
+ 		return EINVAL;
+ 	}
++	*ver = rd32(b + 8);
+ 	*count = rd32(b + 12);
+ 	return 0;
+ }
+ 
+ /* Walk every entry once; 0 only if the whole structure fits. */
+ static int
+-sd_walk(const uint8_t *b, uint64_t len, uint32_t count)
++sd_walk(const uint8_t *b, uint64_t len, uint32_t ver, uint32_t count)
+ {
+-	uint64_t off = SD_HDR;
++	uint64_t off = SD_HDR, total = 0;
+ 	struct sd_ent e;
+ 	for (uint32_t i = 0; i < count; i++) {
+-		if (sd_next(b, len, &off, &e)) {
++		if (sd_next(b, len, ver, &off, &e)) {
+ 			return EINVAL;
+ 		}
++		if (e.z) {
++			total += e.usize;               /* each <= 40 MiB (the per-entry cap in sd_next, which must stay) and at most 4096 of them: no wrap */
++			if (total > SD_MAXINF) {
++				return EINVAL;
++			}
++		}
++	}
++	return 0;
++}
++
++/* Checked allocator for inflate (stock zcalloc would bzero(NULL) on failure); a 16-byte header remembers the size. */
++static voidpf
++sd_zalloc(voidpf opaque, uInt items, uInt size)
++{
++	(void)opaque;
++	uint64_t n = (uint64_t)items * size + 16;
++	if (n > (1u << 24)) {
++		return Z_NULL;
++	}
++	uint8_t *p = SD_ALLOC((size_t)n);
++	if (!p) {
++		return Z_NULL;
++	}
++	*(uint64_t *)(void *)p = n;
++	return p + 16;
++}
++
++static void
++sd_zfree(voidpf opaque, voidpf ptr)
++{
++	(void)opaque;
++	if (ptr) {
++		uint8_t *p = (uint8_t *)ptr - 16;
++		SD_FREE(p, (size_t)*(uint64_t *)(void *)p);
++	}
++}
++
++/* Sequential reader of one entry's bytes (v1: a copy, v2: bounded streaming inflate). Never produces more than usize. */
++struct sd_rd {
++	const struct sd_ent *e;
++	z_stream zs;
++	uint64_t off;
++};
++
++static int
++sd_rd_open(struct sd_rd *r, const struct sd_ent *e)
++{
++	memset(r, 0, sizeof(*r));
++	r->e = e;
++	if (!e->z) {
++		return 0;
++	}
++	r->zs.zalloc = sd_zalloc;
++	r->zs.zfree = sd_zfree;
++	r->zs.next_in = (Bytef *)(uintptr_t)e->zdata;
++	r->zs.avail_in = (uInt)(e->size - 8);          /* size <= SD_MAXZ was checked in sd_next */
++	return inflateInit(&r->zs) == Z_OK ? 0 : ENOMEM;
++}
++
++/* Exactly n bytes (n <= SD_CHUNK, off + n <= usize) into out, or EIO/EINVAL. */
++static int
++sd_rd_get(struct sd_rd *r, uint8_t *out, uint32_t n)
++{
++	if (n > SD_CHUNK || n > r->e->usize - r->off) {
++		return EINVAL;
++	}
++	if (!r->e->z) {
++		memcpy(out, r->e->data + r->off, n);
++		r->off += n;
++		return 0;
++	}
++	r->zs.next_out = out;
++	r->zs.avail_out = n;
++	while (r->zs.avail_out) {
++		uInt ai = r->zs.avail_in, ao = r->zs.avail_out;
++		int rc = inflate(&r->zs, Z_NO_FLUSH);
++		if (rc == Z_STREAM_END ? r->zs.avail_out != 0 : rc != Z_OK) {
++			return EIO;                                 /* bad stream, or it ends before the declared size */
++		}
++		if (r->zs.avail_in == ai && r->zs.avail_out == ao) {
++			return EIO;                                 /* no progress: truncated stream (never loop) */
++		}
+ 	}
++	r->off += n;
+ 	return 0;
+ }
+ 
++/* Release inflate; for v2 also require the stream to be complete with nothing after it. */
++static int
++sd_rd_close(struct sd_rd *r, int err)
++{
++	if (r->e->z && r->zs.state) {
++		if (!err) {
++			uint8_t one;
++			r->zs.next_out = &one;
++			r->zs.avail_out = 1;
++			if (r->off != r->e->usize || inflate(&r->zs, Z_NO_FLUSH) != Z_STREAM_END || r->zs.avail_out != 1 || r->zs.avail_in != 0) {
++				err = EIO;                              /* more output than declared, trailing bytes, or no end marker */
++			}
++		}
++		inflateEnd(&r->zs);
++	}
++	return err;
++}
++
++/* 1 if the entry's bytes (inflated for v2) have the declared crc; v2 also checks the stream is well formed and exactly usize long. */
++static int
++sd_verify(const struct sd_ent *e, uint8_t *buf)
++{
++	if (!e->z) {
++		return sd_crc32(e->data, e->size) == e->crc;
++	}
++	struct sd_rd r;
++	uint32_t crc = 0;
++	int err = sd_rd_open(&r, e);
++	for (uint64_t off = 0; off < e->usize && !err; ) {
++		uint32_t n = (uint32_t)MIN(e->usize - off, (uint64_t)SD_CHUNK);
++		if ((err = sd_rd_get(&r, buf, n)) == 0) {
++			crc = sd_crc32_cont(crc, buf, n);
++		}
++		off += n;
++	}
++	return sd_rd_close(&r, err) == 0 && crc == e->crc;
++}
++
+ /* Sanitised copy for logging (the path is untrusted until validated). */
+ static void
+ sd_show(const struct sd_ent *e, char *out, size_t cap)
+@@ -321,7 +477,7 @@ sd_rm(const char *p)
+ 	return unlink1(sd_ctx, NULLVP, CAST_USER_ADDR_T(p), UIO_SYSSPACE, 0);
+ }
+ 
+-/* Does the existing regular file equal e->data? 1 yes, 0 no/unreadable. */
++/* Does the existing regular file equal the entry's (inflated) bytes? 1 yes, 0 no/unreadable. buf is 2 * SD_CHUNK. */
+ static int
+ sd_same(const char *path, const struct sd_ent *e, uint8_t *buf)
+ {
+@@ -329,22 +485,27 @@ sd_same(const char *path, const struct sd_ent *e, uint8_t *buf)
+ 	if (vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, sd_ctx)) {
+ 		return 0;
+ 	}
+-	int same = 1;
+-	for (uint64_t off = 0; off < e->size && same; ) {
+-		uint32_t n = (uint32_t)MIN(e->size - off, (uint64_t)SD_CHUNK);
++	struct sd_rd r;
++	int same = 1, err = sd_rd_open(&r, e);
++	for (uint64_t off = 0; off < e->usize && same && !err; ) {
++		uint32_t n = (uint32_t)MIN(e->usize - off, (uint64_t)SD_CHUNK);
+ 		int resid = 0;
++		if ((err = sd_rd_get(&r, buf + SD_CHUNK, n)) != 0) {
++			break;
++		}
+ 		if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, (off_t)off, UIO_SYSSPACE, IO_NOAUTH,
+-		    vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx)) || resid || memcmp(buf, e->data + off, n)) {
++		    vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx)) || resid || memcmp(buf, buf + SD_CHUNK, n)) {
+ 			same = 0;
+ 		}
+ 		off += n;
+ 	}
++	(void)sd_rd_close(&r, err ? err : (same ? 0 : EIO));
+ 	vnode_close(vp, FREAD, sd_ctx);
+-	return same;
++	return same && !err;
+ }
+ 
+ static int
+-sd_write_tmp(const char *tmp, const struct sd_ent *e)
++sd_write_tmp(const char *tmp, const struct sd_ent *e, uint8_t *buf)
+ {
+ 	vnode_t vp;
+ 	/* A stale tmp (maybe a hard link to something else) must never be written through: remove it, create exclusively. */
+@@ -353,16 +514,27 @@ sd_write_tmp(const char *tmp, const struct sd_ent *e)
+ 	if (err) {
+ 		return err;
+ 	}
+-	for (uint64_t off = 0; off < e->size && !err; ) {
+-		uint32_t n = (uint32_t)MIN(e->size - off, (uint64_t)SD_CHUNK);
++	struct sd_rd r;
++	uint32_t crc = 0;                              /* the verify pass crc, re-checked over the bytes actually written */
++	err = sd_rd_open(&r, e);
++	for (uint64_t off = 0; off < e->usize && !err; ) {
++		uint32_t n = (uint32_t)MIN(e->usize - off, (uint64_t)SD_CHUNK);
+ 		int resid = 0;
+-		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(e->data + off), (int)n, (off_t)off, UIO_SYSSPACE,
+-		    IO_NODELOCKED | IO_UNIT | IO_NOAUTH, vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx));
++		err = sd_rd_get(&r, buf, n);
++		if (!err) {
++			crc = sd_crc32_cont(crc, buf, n);
++			err = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, (int)n, (off_t)off, UIO_SYSSPACE,
++			    IO_NODELOCKED | IO_UNIT | IO_NOAUTH, vfs_context_ucred(sd_ctx), &resid, vfs_context_proc(sd_ctx));
++		}
+ 		if (!err && resid) {
+ 			err = EIO;
+ 		}
+ 		off += n;
+ 	}
++	err = sd_rd_close(&r, err);
++	if (!err && crc != e->crc) {
++		err = EIO;                                  /* the rename is never reached with bytes that were not crc-checked */
++	}
+ 	if (!err) {
+ 		struct vnode_attr va;
+ 		VATTR_INIT(&va);
+@@ -398,8 +570,8 @@ sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
+ 	if (!why && !restore && e->mode > 0777) {
+ 		why = "mode above 0777";
+ 	}
+-	if (!why && !restore && sd_crc32(e->data, e->size) != e->crc) {
+-		why = "crc mismatch";
++	if (!why && !restore && !sd_verify(e, buf)) {
++		why = e->z ? "bad stream or crc mismatch" : "crc mismatch";
+ 	}
+ 	if (why) {
+ 		printf("SWEET DEV: refused %s (%s)\n", shown, why);
+@@ -451,12 +623,12 @@ sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
+ 		sd_nr++;
+ 		return;
+ 	}
+-	if (serr == 0 && sz == e->size && sd_same(path, e, buf)) {
+-		printf("SWEET DEV: skipped %s %llu bytes (identical) %llu ms\n", shown, e->size, now_ms() - t0);
++	if (serr == 0 && sz == e->usize && sd_same(path, e, buf)) {
++		printf("SWEET DEV: skipped %s %llu bytes (identical) %llu ms\n", shown, e->usize, now_ms() - t0);
+ 		sd_ns++;
+ 		return;
+ 	}
+-	int err = sd_write_tmp(tmp, e);
++	int err = sd_write_tmp(tmp, e, buf);
+ 	bool moved = false;
+ 	if (!err && serr == 0 && (oerr == ENOENT)) {       /* first replacement: keep the original */
+ 		err = sweet_vfs_rename(sd_ctx, path, orig);
+@@ -472,7 +644,7 @@ sd_one(const struct sd_ent *e, bool restore, uint8_t *buf)
+ 		sd_nr++;
+ 		return;
+ 	}
+-	printf("SWEET DEV: wrote %s %llu bytes%s %llu ms\n", shown, e->size, moved ? " (original kept)" : "", now_ms() - t0);
++	printf("SWEET DEV: wrote %s %llu bytes%s %llu ms\n", shown, e->usize, moved ? " (original kept)" : "", now_ms() - t0);
+ 	sd_nw++;
+ }
+ 
+@@ -500,14 +672,14 @@ sweet_devoverlay_run(void)
+ 		printf("SWEET DEV: sweetdev=%s but no SWEETDEV archive in a RAM disk; nothing done\n", arg);
+ 		return;
+ 	}
+-	uint32_t count = 0;
++	uint32_t count = 0, ver = 0;
+ 	uint64_t off = SD_HDR;
+ 	struct sd_ent e;
+-	if (sd_hdr(b, len, &count)) {
++	if (sd_hdr(b, len, &ver, &count)) {
+ 		printf("SWEET DEV: bad archive header (version %u count %u); nothing done\n", rd32(b + 8), rd32(b + 12));
+ 		return;
+ 	}
+-	if (sd_walk(b, len, count)) {
++	if (sd_walk(b, len, ver, count)) {
+ 		printf("SWEET DEV: bad archive (an entry runs past the end); nothing done\n");
+ 		return;
+ 	}
+@@ -516,17 +688,17 @@ sweet_devoverlay_run(void)
+ 		printf("SWEET DEV: root is not mounted read-write (rootrw=1); nothing done\n");
+ 		return;
+ 	}
+-	uint8_t *buf = kalloc_data(SD_CHUNK, Z_WAITOK);
++	uint8_t *buf = kalloc_data(2 * SD_CHUNK, Z_WAITOK);   /* two chunks: inflate/compare scratch */
+ 	if (!buf) {
+ 		printf("SWEET DEV: out of memory\n");
+ 		return;
+ 	}
+ 	sd_ctx = vfs_context_kernel();
+ 	uint64_t t0 = now_ms();
+-	printf("SWEET DEV: %s %u entries from a %llu byte archive\n", restore ? "restore" : "copy", count, len);
++	printf("SWEET DEV: %s %u entries (v%u) from a %llu byte archive\n", restore ? "restore" : "copy", count, ver, len);
+ 	off = SD_HDR;
+ 	for (uint32_t i = 0; i < count; i++) {
+-		if (sd_next(b, len, &off, &e) == 0) {
++		if (sd_next(b, len, ver, &off, &e) == 0) {
+ 			sd_one(&e, restore, buf);
+ 		}
+ 	}
+@@ -536,7 +708,7 @@ sweet_devoverlay_run(void)
+ 			printf("SWEET DEV: sync error %d\n", se);
+ 		}
+ 	}
+-	kfree_data(buf, SD_CHUNK);
++	kfree_data(buf, 2 * SD_CHUNK);
+ 	printf("SWEET DEV: done: %u written, %u skipped, %u refused/failed, %llu ms\n", sd_nw, sd_ns, sd_nr, now_ms() - t0);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

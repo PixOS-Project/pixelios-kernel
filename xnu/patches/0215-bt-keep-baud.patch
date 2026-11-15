@@ -1,0 +1,36 @@
+SWEET Bluetooth: keep the UART baud when bluetoothd asks for 2.4 Mbaud (patch 0215, ticket T-258f, W-BTUP; boot-arg sweetbtkeepbaud=1, default behaviour unchanged). bt-up3 [obs 20261104T022602Z-bt-up3]: with patch 0213 bluetoothd connects and sends HCI Reset + Read Local Version, but its TIOCSETA (cfsetspeed 2400000) moved the host UART to UBRDIV 4 while the chip, never booted by BlueTool (chip-boot skip, T-2420), still talks 115200: Reset got no answer, the next command read 8 zero bytes with rx error flags 0xc, bluetoothd exited with code 1 after ~24 s. With the boot-arg sbu_termios_set (bsd/dev/sweet_bt_uart.c) logs a loud BT GAP line and does not touch UBRDIV/UFRACVAL (one register store fewer, no new store); the reported termios speed is the real one. Applies after 0189 and 0213. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt_uart.c b/bsd/dev/sweet_bt_uart.c
+--- a/bsd/dev/sweet_bt_uart.c
++++ b/bsd/dev/sweet_bt_uart.c
+@@ -665,7 +665,20 @@ sbu_termios_set(const void *buf, size_t len)
+ 	if (t->c_iflag != 0 || t->c_oflag != 0 || t->c_lflag != 0) {
+ 		SBU_GAP(SG_OTHER, "TIOCSETA iflag %#lx oflag %#lx lflag %#lx ignored (raw 8N1 only; reported back as zero)", (unsigned long)t->c_iflag, (unsigned long)t->c_oflag, (unsigned long)t->c_lflag);
+ 	}
+-	if ((e = sbu_set_baud((uint32_t)t->c_ospeed)) != 0) {       /* baud first: a refused speed leaves UMCON untouched */
++	/*
++	 * patch 0215 (T-258f, W-BTUP), boot-arg sweetbtkeepbaud=1: do NOT move the host UART off its current baud. bt-up3 [obs 20261104T022602Z-bt-up3]:
++	 * bluetoothd's TIOCSETA asks 2400000 baud (cfsetspeed 0x249f00, binary 0x100066c40), the host went to UBRDIV 4, but with the chip-boot skip
++	 * (T-2420) nobody ran BlueTool's patchram + baud-change VSC, so the controller still talks 115200: the HCI Reset got no answer and the next
++	 * command read 8 zero bytes with frame/overrun flags. Without the boot-arg the behaviour is unchanged. One store fewer, never a new one.
++	 */
++	static int keep = -1;
++	if (keep < 0) {
++		int v = 0;
++		keep = (PE_parse_boot_argn("sweetbtkeepbaud", &v, sizeof(v)) && v == 1) ? 1 : 0;
++	}
++	if (keep == 1) {
++		SBU_GAP(SG_OTHER, "TIOCSETA speed %lu NOT applied (sweetbtkeepbaud=1): the controller was not booted, it still talks %u baud; UBRDIV/UFRACVAL unchanged", (unsigned long)t->c_ospeed, sbu.baud);
++	} else if ((e = sbu_set_baud((uint32_t)t->c_ospeed)) != 0) {       /* baud first: a refused speed leaves UMCON untouched */
+ 		return e;
+ 	}
+ 	bool afc = (t->c_cflag & (CRTS_IFLOW | CCTS_OFLOW)) == (CRTS_IFLOW | CCTS_OFLOW);
+@@ -674,7 +687,7 @@ sbu_termios_set(const void *buf, size_t len)
+ 	}
+ 	sbu.tio.c_iflag = sbu.tio.c_oflag = sbu.tio.c_lflag = 0;
+ 	sbu.tio.c_cflag = CS8 | CREAD | CLOCAL | (afc ? (CRTS_IFLOW | CCTS_OFLOW) : 0);      /* the effective state, not the request */
+-	sbu.tio.c_ispeed = sbu.tio.c_ospeed = t->c_ospeed;
++	sbu.tio.c_ispeed = sbu.tio.c_ospeed = keep == 1 ? sbu.baud : t->c_ospeed;
+ 	return 0;
+ }
+ 

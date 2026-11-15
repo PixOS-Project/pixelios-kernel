@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,5 +10,6 @@
+ __attribute__((section(".text.boot"), noreturn)) void early_entry(void)
+ {
+ 	foo();
++	ramlog_line("early");
+ 	bar();
+ 	for (;;) ;
+ }

@@ -1,0 +1,13 @@
+SWEET dev overlay: allow exactly the MobileGestalt cache plist (patch 0317, ALL-ON T-36/T-37, research 141). The phone's MG cache was written under 0289 (float dot pitch) and stays valid across kernels (CacheVersion = build, fixed CacheUUID), so main-screen-pitch never reaches 0316's integer 458 and every home swipe springs back. An overlay can now replace that one file (e.g. with an empty plist, which MG rejects as invalid and then computes live; nothing rewrites it). Not a whiteout path (sd_wh_allow unchanged). tools/devd.c k_allow[] and tools/mkdevoverlay.py ALLOW carry the same entry (H3). File writes on userdata only, no hardware register.
+
+diff --git a/bsd/dev/sweet_devoverlay.c b/bsd/dev/sweet_devoverlay.c
+--- a/bsd/dev/sweet_devoverlay.c
++++ b/bsd/dev/sweet_devoverlay.c
+@@ -84,6 +84,7 @@
+ 	{ "/System/Library/LaunchDaemons/org.pixelios.", K_NAME },
+ 	{ "/Applications/BTApp.app/BTApp", K_EXACT },                                          /* patch 0280 */
+ 	{ "/private/var/mobile/Library/Preferences/com.apple.MobileBluetooth.debug.plist", K_EXACT },
++	{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist", K_EXACT },   /* patch 0317 */
+ };
+ /* patch 0280: the only paths a whiteout may remove (a subset of sd_allow[]) */
+ static const struct { const char *pfx; int kind; } sd_wh_allow[] = {

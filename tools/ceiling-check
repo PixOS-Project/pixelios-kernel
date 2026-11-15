@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""tools/ceiling-check: run a ceiling replay script on a BASELINE run and check it reproduces the scored number first (T-d4d9).
+
+usage: tools/ceiling-check --script S --run-dir DIR --scored N [--tol T]
+
+Why: a ceiling ("how high can this knob lift the number, with the cause removed") is only believable if the SAME script, with nothing removed, reproduces the number the
+baseline run really scored (the oracle; pattern of docs/reviews/T-fabe-analysis.py). The script is run as `python3 -I S DIR` and prints two lines (anything else is ignored):
+    ORACLE <number>     the scored metric recomputed from the baseline logs with the cause left in
+    CEILING <number>    the same metric with the cause removed
+The check passes when |ORACLE - scored| <= tol (default 0.05) and a CEILING line exists. Output: one line
+    RESULT: PASS ceiling-check script=S ceiling=C oracle=O scored=N
+which the run plan quotes on its `Ceiling check:` line (tools/run-preflight c_ceiling). Read only; no hardware.
+Exit: 0 PASS, 1 FAIL (oracle mismatch, no lines, script failed), 2 usage/ERROR."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os, re, subprocess, sys
+
+NUM = r"[-+]?\d+(?:\.\d+)?"
+
+
+def main(argv):
+    a = {}
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--script", "--run-dir", "--scored", "--tol") and i + 1 < len(argv):
+            a[argv[i]] = argv[i + 1]
+            i += 2
+        else:
+            print("usage: tools/ceiling-check --script S --run-dir DIR --scored N [--tol T]\nRESULT: ERROR bad argument %s" % argv[i])
+            return 2
+    if not all(k in a for k in ("--script", "--run-dir", "--scored")):
+        print("usage: tools/ceiling-check --script S --run-dir DIR --scored N [--tol T]\nRESULT: ERROR missing --script/--run-dir/--scored")
+        return 2
+    try:
+        scored, tol = float(a["--scored"]), float(a.get("--tol", "0.05"))
+    except ValueError:
+        print("RESULT: ERROR --scored/--tol must be numbers")
+        return 2
+    if not os.path.isfile(a["--script"]) or not os.path.isdir(a["--run-dir"]):
+        print("RESULT: ERROR script or run dir not found (%s, %s)" % (a["--script"], a["--run-dir"]))
+        return 2
+    try:
+        p = subprocess.run([sys.executable, "-I", a["--script"], a["--run-dir"]], capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("RESULT: FAIL ceiling-check script=%s timeout 300 s" % a["--script"])
+        return 1
+    if p.returncode:
+        print("RESULT: FAIL ceiling-check script=%s rc=%d: %s" % (a["--script"], p.returncode, (p.stderr.strip().splitlines() or ["no stderr"])[-1][:200]))
+        return 1
+    o = re.findall(r"^ORACLE[ \t]+(" + NUM + ")\\b", p.stdout, re.M)
+    c = re.findall(r"^CEILING[ \t]+(" + NUM + ")\\b", p.stdout, re.M)
+    if not o or not c:
+        print("RESULT: FAIL ceiling-check script=%s printed %s (needs `ORACLE <n>` and `CEILING <n>` lines)" % (a["--script"], "no ORACLE line" if not o else "no CEILING line"))
+        return 1
+    oracle, ceil = float(o[-1]), float(c[-1])
+    if abs(oracle - scored) > tol:
+        print("RESULT: FAIL ceiling-check script=%s oracle=%s scored=%s |diff|=%.4g > tol %g: the script does not reproduce the baseline number, so its ceiling=%s is unproven" % (a["--script"], o[-1], a["--scored"], abs(oracle - scored), tol, c[-1]))
+        return 1
+    print("RESULT: PASS ceiling-check script=%s ceiling=%s oracle=%s scored=%s" % (a["--script"], c[-1], o[-1], a["--scored"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

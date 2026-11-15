@@ -1,0 +1,40 @@
+#!/bin/bash
+# Gate step `inputs` (AP-11, AP-144; docs/research/ap-enforcement-audit.md row AP-144+AP-11): do the gitignored inputs resolve in THIS worktree?
+#   research/ipsw-x/d22ap.adt      (the ONE untracked input, Apple-derived, hard rule 4; non-empty regular file; without it mkadt silently drops the /product node: 13364 B instead of 16048 B, SpringBoard crash loop, tools/run-preflight c_adt)
+# It must be a non-empty regular FILE after resolving links (a directory, an empty file or a dangling link is missing; the same test as tools/run-preflight c_adt).
+# tools/third_party (AOSP mkbootimg/avbtool/gki) is VENDORED in git since T-93e6, so a plain `git worktree add` has it; only the ADT needs `research` linked (tools/worktree-new links research and .env). Exit 0 PASS, 1 FAIL. Last line: RESULT: PASS|FAIL inputs ...
+# "do instead" names only what is missing, one `ln -sfn` per input, and says so when the path exists as a real file/directory (ln would nest or fail) or the main clone has none.
+# Escape: GATE_NO_INPUTS="reason" -> PASS "SKIPPED by GATE_NO_INPUTS=reason" (the check-all.sh GATE line repeats it, and that PASS is not stamped or registered as a clean full gate).
+# The reason must hold a letter or digit: a blank/whitespace/quote-only reason is RESULT: FAIL (an empty variable is no escape: the checks run).
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+cd "$(dirname "$0")/.." || exit 2
+if [ -n "${GATE_NO_INPUTS:-}" ]; then
+	case ${GATE_NO_INPUTS//[^[:alnum:]]/} in
+	"") echo "RESULT: FAIL inputs GATE_NO_INPUTS needs a reason (it holds no letter or digit); GATE_NO_INPUTS=\"why\" tools/check-all.sh ..."; exit 1 ;;
+	esac
+	echo "RESULT: PASS inputs SKIPPED by GATE_NO_INPUTS=$GATE_NO_INPUTS"; exit 0
+fi
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null); [ -n "$main" ] || main="<main clone>"
+bad=0
+# missing_input PATH LINKTARGET WHY: PATH is not a non-empty file here -> say why, and the one command that fixes it (only when it applies)
+missing_input() {
+	local f=$1 link=$2 why=$3
+	bad=1
+	echo "MISSING INPUT $f (in $PWD)"
+	echo "  why: $why"
+	if [ -L "$link" ] && [ ! -e "$link" ]; then echo "  do instead: ln -sfn $main/$link $link   (the link there is dangling)"
+	elif [ -L "$link" ]; then echo "  do instead: $link is a link to $(readlink "$link") which has no usable $f; fix that target or ln -sfn $main/$link $link"
+	elif [ -e "$link" ]; then echo "  do instead: $link exists here as a real file or directory without a usable $f; fix or move it away, then ln -sfn $main/$link $link"
+	elif [ ! -e "$main/$link" ]; then echo "  do instead: the main clone ($main) has no $link either; restore research/ipsw-x there"
+	else echo "  do instead: ln -sfn $main/$link $link"; fi
+}
+if [ ! -f research/ipsw-x/d22ap.adt ] || [ ! -s research/ipsw-x/d22ap.adt ]; then
+	missing_input research/ipsw-x/d22ap.adt research "mkadt only WARNS and builds an ADT without the /product node (13364 B instead of 16048 B); SpringBoard then crash-loops (AP-144, tools/run-preflight c_adt)"
+fi
+if [ "$bad" = 1 ]; then
+	echo "  escape: GATE_NO_INPUTS=\"reason\" tools/check-all.sh ... (printed on the GATE line, never stamped or registered); there is no other bypass. tools/worktree-new links research for a new worktree"
+	echo "RESULT: FAIL inputs missing the gitignored input above"
+	exit 1
+fi
+echo "RESULT: PASS inputs research/ipsw-x/d22ap.adt resolves"

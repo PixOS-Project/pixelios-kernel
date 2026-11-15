@@ -1,0 +1,11 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,5 +1,6 @@
+ 	if (a)
+ 		foo();
++	if (dbg) {
++		printf("x");
++	}
+ 	else
+ 		power_off();

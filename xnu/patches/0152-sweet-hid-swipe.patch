@@ -1,0 +1,86 @@
+SWEET synthetic swipes (patch 0152, boot-arg sweetswipe=N, default off; G-10 touch latency): every N seconds (first at 120 s after the touch service starts) SweetHIDTouch injects a 160 ms swipe (20 steps of 8 ms): up from the bottom edge (y 2350 to 900: the lockscreen unlock needs the home indicator area, a start at y 2000 did not unlock in g68), then left/right/left on the home screen, through the normal touch() path, so lag can be measured without a person. Also records the host time of the latest finger-down (sweet_touch_down_ns) for the latency probe 0153. No hardware access.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -372,12 +372,21 @@
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
++public:
++	/* patch 0152: synthetic swipes (boot-arg sweetswipe=N seconds), a repeatable touch source for latency measurements */
++	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fSwipe;
++	UInt32 fSwipeSecs, fSwipeStep, fSwipeCount;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/* Patch 0152: host time (ns) of the latest finger-down, read by the latency probe of patch 0153 (SweetFramebuffer.cpp). 0 = none yet. */
++extern "C" uint64_t sweet_touch_down_ns;
++uint64_t sweet_touch_down_ns;
++
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
+@@ -445,9 +454,48 @@
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
++	/* Patch 0152: boot-arg sweetswipe=N injects a 160 ms swipe every N seconds (first one 120 s after the touch service starts):
++	 * up from the bottom (unlock), then left / right / left across the home screen; finger 0, away from the panel edges. */
++	UInt32 sw = 0;
++	if (PE_parse_boot_argn("sweetswipe", &sw, sizeof(sw)) && sw) {
++		fSwipeSecs = sw;
++		fSwipeStep = fSwipeCount = 0;
++		fSwipe = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::swipeFired);
++		if (fSwipe && _hidWorkLoop && _hidWorkLoop->addEventSource(fSwipe) == kIOReturnSuccess) {
++			fSwipe->setTimeoutMS(120 * 1000);
++			IOLog("SWEET HID: synthetic swipes every %u s\n", sw);
++		}
++	}
+ 	return true;
+ }
+ 
++#define SWEET_SWIPE_STEPS 20
++#define SWEET_SWIPE_MAX 400
++void
++SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	static const int gx0[4] = { 540, 900, 200, 900 }, gy0[4] = { 2350, 1200, 1200, 1200 };
++	static const int gx1[4] = { 540, 200, 900, 200 }, gy1[4] = { 900, 1200, 1200, 1200 };
++	unsigned g = self->fSwipeCount & 3, st = self->fSwipeStep;
++
++	if (self->fSwipeCount >= SWEET_SWIPE_MAX) {
++		return;
++	}
++	if (st <= SWEET_SWIPE_STEPS) {
++		int x = gx0[g] + (gx1[g] - gx0[g]) * (int)st / SWEET_SWIPE_STEPS;
++		int y = gy0[g] + (gy1[g] - gy0[g]) * (int)st / SWEET_SWIPE_STEPS;
++		self->touch(0, true, x, y);
++		self->fSwipeStep = st + 1;
++		sender->setTimeoutMS(8);
++	} else {
++		self->touch(0, false, gx1[g], gy1[g]);
++		self->fSwipeStep = 0;
++		self->fSwipeCount++;
++		sender->setTimeoutMS(self->fSwipeSecs * 1000);
++	}
++}
++
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ {
+@@ -530,6 +578,11 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
+ 
++	if (!was && down) {
++		uint64_t dn;
++		absolutetime_to_nanoseconds(now, &dn);
++		sweet_touch_down_ns = dn;
++	}
+ 	if (was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");

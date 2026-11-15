@@ -1,0 +1,12 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,5 +1,6 @@
+ {
++	if (d) {
++		uint32_t g = 0;
++	}
++	if (try_read32(base, &g)) {
++	}
+ 	foo();
+ }

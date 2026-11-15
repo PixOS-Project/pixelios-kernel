@@ -1,0 +1,54 @@
+SWEET WLAN firmware keep-alive (patch 0313, ALL-ON T-32, docs/research/138-wlan-keepalive.md): the house AP aged the idle phone out after ~22 min [obs 2026-11-11]; the keep thread now sends ONE new firmware command, WLC_SET_VAR mkeep_alive (11-byte v1 header, 30000 ms, id 0, null frame; shim/sweet_wlan_join_fw.h swj_mkeep_alive_cmd, step swl25_ka_step in sweet_wlan_l25_hs.h, L25 whitelist row 20 + chk 6 in sweet_wlan_l25_wl.h, all three carried by patch 0206), once at the start of the keep loop and again after every keep rejoin UP. A firmware STATUS error is a GAP line and changes nothing else; a firmware TIMEOUT (no completion) is a soft stop that is cleared and turns the keep-alive off, but the L25 judge still counts the ioctl as in transit, so the next keep ioctl (the RSSI refresh) is refused: the same class as the RSSI refresh and the scan (review 0313 F3). A ring 2 that never goes idle ends the wait with a GAP after 12 s. Boot-arg sweetwlanka (string): exactly 0 turns it off (GAP), exactly 1 or absent = on, any other string is ignored with a GAP naming it. This patch is only the glue in bsd/dev/sweet_wlan.c; it applies after 0292/0293.
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -2286,6 +2286,9 @@
+ /* patch 0292 (WIFI-COVERAGE D3/D4, Settings > Wi-Fi lists networks): the keep-phase scan state (sweet_wlan_l25_hs.h swl25_sc_*). Set 10 reaches sweet_wlan_keep_scan_request from the iOS ioctl thread (through sweet_wlan_a80211.c); that sets ONE flag and touches no engine state, no lock.
+  * The keep thread does the rest in sw_keep_thread: swl25_sc_step under the en0 lock (the one firmware command, WLC_SET_VAR escan, judged by the L25 whitelist), the events through sw_scan_sink, the hand-over to iOS outside the lock. */
+ static struct swl25_sc sw_sc;
++/* ALL-ON T-32 (research 138): the firmware NULL-frame keep-alive, ONE new firmware command (SET_VAR mkeep_alive, sweet_wlan_l25_hs.h swl25_ka_step, judged by L25 whitelist row 20), sent by the keep thread under the en0 lock: armed at the start of the keep loop (join, 4-way and key install are done)
++ * and again after every `keep rejoin UP`; a firmware status error is a GAP and changes nothing, a firmware TIMEOUT leaves the ioctl in transit for the L25 judge (the next keep ioctl is refused, the same class as the RSSI refresh and the scan; review 0313 F3). Boot-arg sweetwlanka=0 turns it off (GAP line), default on. */
++static struct swl25_ka sw_ka;
+ 
+ static void
+ sw_scan_sink(void *cx __unused, uint32_t status, const uint8_t *res, uint32_t len)
+@@ -2483,6 +2486,12 @@
+ 	}
+ 	x->scansink = sw_scan_sink;       /* patch 0292: the ESCAN_RESULT events of a live scan go to the Apple80211 radio's scratch table (only while sc_on is set) */
+ 	x->scancx = NULL;
++	{       /* ALL-ON T-32: boot-arg sweetwlanka, read as a STRING (PE_parse_boot_arg_str; PE_parse_boot_argn into a char[] is a trap, AP-71): absent or "1" = on, exactly "0" = off with a GAP, any other string is ignored with a GAP naming it; armed for the first pass of the loop below */
++		char kas[8];
++
++		kas[0] = '\0';
++		(void)swl25_ka_init(&sw_ka, PE_parse_boot_arg_str("sweetwlanka", kas, sizeof kas) ? kas : NULL);
++	}
+ 	if (sw_rj.armed) {      /* patch 0282: EAPOL frames reach the host supplicant while a re-join is KEYING; otherwise en0 drops them with a counted GAP */
+ 		e->eapol = swl25_rj_eapol;
+ 		e->eapol_ctx = &sw_rj;
+@@ -2532,6 +2541,10 @@
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns_now);
+ 			(void)swl25_sc_step(x, &sw_sc, ns_now / 1000000ull);        /* a negative value is a stopped bus: x->stopped ends the loop below; a soft stop inside the escan ioctl is cleared by the step (scan off, one GAP) */
+ 		}
++		if (!x->stopped && !x->d4dstop && !b->dead) {   /* ALL-ON T-32: the keep-alive, one step per pass after the scan step (busy while a scan runs) and before the re-join step (it sends only while the link is UP and the re-join machine idle); a negative value is a stopped bus: x->stopped ends the loop below; a firmware error or a soft stop is logged by the step and never changes the link */
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns_now);
++			(void)swl25_ka_step(x, &sw_ka, ns_now / 1000000ull, !swl25_sc_idle(&sw_sc));
++		}
+ 		if (x->klink != 0u && swl25_sc_idle(&sw_sc) && !x->stopped && !x->d4dstop && !b->dead) {        /* patch 0282: the re-join machine (DOWN -> JOINING -> KEYING -> UP), only this thread uses the engine; blocks like the RSSI refresh for the few ioctls of one step */
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns_now);
+ 			rjx = swl25_rj_step(x, &sw_rj, ns_now / 1000000ull, SWL25_RJ_BUSY_ARG(&sw_rj, en0_tx_busy(e, e->eapol_slot)), (int)e->eapol_last_ok);
+@@ -2559,6 +2572,7 @@
+ 		}
+ 		if (rjup) {             /* patch 0282 (W-D6 boot B): the re-join is done (new 4-way, keys installed). iOS is told outside the lock: the radio answers joined again and posts ASSOC_DONE (LINK_CHANGED isLinkDown 0), en0 gets IFF_RUNNING + KEV_DL_LINK_ON (configd re-reads the media status and IPConfiguration runs DHCP again) */
+ 			rjup = 0u;
++			swl25_ka_arm(&sw_ka);   /* ALL-ON T-32: a new association: send the keep-alive again (the next pass) */
+ 			rc = sweet_wlan_a80211_kept_up(ubssid, uchan, urssi, uok);
+ 			if (rc != 0) swl_gap("keep", "link UP not delivered to Apple80211 (see the GAP line above)", "high");
+ 			en0_link_only(e, 1u);
+@@ -2600,6 +2614,7 @@
+ 			printf("SWEET WLAN: keep events decoded=%u undecoded=%u reposted=%u link=%s up_events_while_down=%u\n", x->kev_n, x->kev_gap, x->kev_rp, x->klink ? "DOWN" : "UP", x->kl_up_n);
+ 			printf("SWEET WLAN: keep rejoin state=%u armed=%u attempts=%u up=%u failed=%u eapol rx=%u tx=%u dropped=%u tx_failed=%u\n", (unsigned)x->rj_state, (unsigned)sw_rj.armed, sw_rj.n, sw_rj.n_up, sw_rj.n_fail, e->eapol_rx, e->eapol_tx, e->eapol_drop, e->eapol_txfail);
+ 			printf("SWEET WLAN: keep scan state=%u off=%u requests=%u started=%u done=%u timeout=%u link_lost=%u failed=%u refused=%u stray_events=%u\n", (unsigned)sw_sc.state, (unsigned)sw_sc.off, sw_sc.n_req, sw_sc.n_start, sw_sc.n_done, sw_sc.n_timeout, sw_sc.n_lost, sw_sc.n_failed, sw_sc.n_refused, x->sc_stray);
++			printf("SWEET WLAN: keep-alive state due=%u off=%u armed=%u set=%u failed=%u\n", (unsigned)sw_ka.due, (unsigned)sw_ka.off, sw_ka.n_arm, sw_ka.n_set, sw_ka.n_fail);
+ 		}
+ 		/* patch 0273 (Part A): event-driven poll. After a pass that handled items (or with frames still queued) the next pass comes 100 us later; an idle pass sleeps 5 ms (the old
+ 		 * fixed period); en0_output wakes the thread at once (EN0_KICK). A wakeup between the unlock above and this wait is lost and costs at most that one sleep. */

@@ -1,0 +1,137 @@
+sweet-pcsamp-procs (lowclk 2026-11-14, tracker L-08 follow-up): boot-arg sweetpcsampproc=a,b,c makes the 0263 CPU PC sampler (sweetpcsamp=N) watch up to 3 other processes
+instead of backboardd / SpringBoard / Preferences. Why [observed, f1aa]: the process snapshot sampler 0054 cannot see a running thread (no saved user state), 23 of 27 coreduetd samples read pc 0x0;
+the PC sampler reads the interrupted state in the IPI, so it can see coreduetd's busy thread, MobileTimer and Preferences during the 1-3 s waits after an app open. R0: read-only sampler, no
+register access, no hardware write; the only new input is a boot-arg string (PE_parse_boot_arg_str, force-string, max_len copy, read from pexpert/gen/bootargs.c xnu-8796).
+Syntax: comma list, up to 3 names, compared like 0263 (strncmp(p_comm, name, MAXCOMLEN), so a name is at most MAXCOMLEN = 16 characters). Absent: today's three processes, rows and header
+byte for byte as before (keys bb sb pf). Set: slot keys are p0 p1 p2 in every row and in the header (`t N rounds R reached C hits H p0 A p1 B p2 C entries E dropped D`) and one line at start,
+`SWEET PCSAMP: slots p0=<name> p1=<name> p2=<name>` (an unused slot prints `-` and matches nothing; the period line then says `processes as in the slots line (boot-arg sweetpcsampproc)`).
+GAPs (rule 7): `SWEET GAP: sweetpcsampproc '<arg>': ...` for an empty entry (skipped), a name longer than MAXCOMLEN (skipped), more than 3 entries (the first 3 valid names are used), no valid name
+(the three defaults are used, keys still p0 p1 p2) and an argument cut at 127 characters. Host: tools/test_pcsamp_procs_core.py compiles the SWEET_PCSAMP_PARSE block of this patch; tools/pcsamp-sym
+reads both header forms and maps p0/p1/p2 through the slots line. Not run on hardware (tag: guess until a boot shows the rows).
+diff --git a/bsd/dev/sweet_pcsamp.c b/bsd/dev/sweet_pcsamp.c
+index 0e6ed01..055475c 100644
+--- a/bsd/dev/sweet_pcsamp.c
++++ b/bsd/dev/sweet_pcsamp.c
+@@ -45,8 +45,58 @@ extern void sweet_pcsamp_start(void);
+ #define PCS_MIN_MS  1
+ #define PCS_MAX_MS  50
+ 
+-static const char *const pcs_names[PCS_NP] = { "backboardd", "SpringBoard", "Preferences" };
+-static const char *const pcs_short[PCS_NP] = { "bb", "sb", "pf" };
++#define PCS_NM      (MAXCOMLEN + 1)
++#define PCS_ARGLEN  128
++
++/* SWEET_PCSAMP_PARSE_BEGIN (host test tools/test_pcsamp_procs_core.py compiles this block with a C compiler; no kernel header is used inside it) */
++#define PCS_G_EMPTY 1u   /* an empty entry (",," or a leading / trailing comma) */
++#define PCS_G_LONG  2u   /* an entry longer than MAXCOMLEN (it can never equal a p_comm) */
++#define PCS_G_MANY  4u   /* more than 3 entries */
++/*
++ * Split a comma list into up to `np` names of at most `nm - 1` characters each. Empty and too-long entries are skipped and reported in *gaps; entries
++ * after the np-th valid one are dropped (more than np entries sets PCS_G_MANY). Unused out[] slots are "" (they match nothing). Returns the number of names taken.
++ */
++static int
++sweet_pcsamp_parse_procs(const char *s, char out[][PCS_NM], int np, unsigned *gaps)
++{
++	int taken = 0, entries = 0;
++
++	*gaps = 0;
++	for (int i = 0; i < np; i++) {
++		out[i][0] = '\0';
++	}
++	for (;;) {
++		size_t len = 0;
++
++		while (s[len] != ',' && s[len] != '\0') {
++			len++;
++		}
++		entries++;
++		if (len == 0) {
++			*gaps |= PCS_G_EMPTY;
++		} else if (len > PCS_NM - 1) {
++			*gaps |= PCS_G_LONG;
++		} else if (taken < np) {
++			for (size_t i = 0; i < len; i++) {
++				out[taken][i] = s[i];
++			}
++			out[taken][len] = '\0';
++			taken++;
++		}
++		if (s[len] == '\0') {
++			break;
++		}
++		s += len + 1;
++	}
++	if (entries > np) {
++		*gaps |= PCS_G_MANY;
++	}
++	return taken;
++}
++/* SWEET_PCSAMP_PARSE_END */
++
++static char pcs_names[PCS_NP][PCS_NM] = { "backboardd", "SpringBoard", "Preferences" };
++static const char *pcs_short[PCS_NP] = { "bb", "sb", "pf" };   /* p0 p1 p2 with boot-arg sweetpcsampproc (patch 0353) */
+ 
+ struct pcs_ent {
+ 	uint64_t tid, pc, lr, kpc;
+@@ -130,7 +180,7 @@ pcs_callout(proc_t p, __unused void *arg)
+ 	const char *nm = proc_name_address(p);
+ 
+ 	for (int w = 0; w < PCS_NP; w++) {
+-		if (strncmp(nm, pcs_names[w], MAXCOMLEN) == 0) {
++		if (pcs_names[w][0] != '\0' && strncmp(nm, pcs_names[w], MAXCOMLEN) == 0) {   /* an unused slot ("") matches nothing */
+ 			task_t task = proc_task(p);
+ 
+ 			pcs_pid[w] = proc_pid(p);
+@@ -183,8 +233,8 @@ sweet_pcsamp_thread(__unused void *arg, __unused wait_result_t wr)
+ 				struct { uint64_t tid; uint32_t w, n, user; } tt[PCS_TTOP * 4];
+ 				int ntt = 0;
+ 
+-				printf("SWEET PCSAMP: t %llu rounds %llu reached %llu hits %llu bb %llu sb %llu pf %llu entries %u dropped %llu\n",
+-				    now, rounds, reached, hits, perproc[0], perproc[1], perproc[2], pcs_used, pcs_dropped);
++				printf("SWEET PCSAMP: t %llu rounds %llu reached %llu hits %llu %s %llu %s %llu %s %llu entries %u dropped %llu\n",
++				    now, rounds, reached, hits, pcs_short[0], perproc[0], pcs_short[1], perproc[1], pcs_short[2], perproc[2], pcs_used, pcs_dropped);
+ 				lines++;
+ 				/* per-thread totals */
+ 				for (uint32_t s = 0; s < PCS_TAB; s++) {
+@@ -356,7 +406,40 @@ sweet_pcsamp_start(void)
+ 	if (pcs_period_ms != (uint32_t)v) {
+ 		printf("SWEET PCSAMP: sweetpcsamp=%d clamped to %u ms (%d..%d)\n", v, pcs_period_ms, PCS_MIN_MS, PCS_MAX_MS);
+ 	}
+-	printf("SWEET PCSAMP: period %u ms, processes backboardd SpringBoard Preferences\n", pcs_period_ms);
++	int custom = 0;
++
++	{
++		char argbuf[PCS_ARGLEN];
++
++		argbuf[0] = '\0';
++		if (PE_parse_boot_arg_str("sweetpcsampproc", argbuf, (int)sizeof(argbuf))) {
++			custom = 1;
++			static const char *const pshort[PCS_NP] = { "p0", "p1", "p2" };
++			char names[PCS_NP][PCS_NM];
++			unsigned gaps;
++			int n = sweet_pcsamp_parse_procs(argbuf, names, PCS_NP, &gaps);
++
++			if (strlen(argbuf) >= sizeof(argbuf) - 1) {
++				printf("SWEET GAP: sweetpcsampproc '%s' may be truncated at %d characters\n", argbuf, PCS_ARGLEN - 1);
++			}
++			if (gaps != 0) {
++				printf("SWEET GAP: sweetpcsampproc '%s':%s%s%s (%s)\n", argbuf, (gaps & PCS_G_EMPTY) ? " empty entry skipped;" : "",
++				    (gaps & PCS_G_LONG) ? " name longer than MAXCOMLEN skipped;" : "", (gaps & PCS_G_MANY) ? " more than 3 entries, first 3 valid used;" : "",
++				    n > 0 ? "using the valid names" : "no valid name, using the default processes");
++			}
++			if (n > 0) {
++				for (int i = 0; i < PCS_NP; i++) {
++					strlcpy(pcs_names[i], names[i], PCS_NM);
++				}
++			}
++			for (int i = 0; i < PCS_NP; i++) {
++				pcs_short[i] = pshort[i];
++			}
++			printf("SWEET PCSAMP: slots p0=%s p1=%s p2=%s\n", pcs_names[0][0] ? pcs_names[0] : "-", pcs_names[1][0] ? pcs_names[1] : "-",
++			    pcs_names[2][0] ? pcs_names[2] : "-");
++		}
++	}
++	printf("SWEET PCSAMP: period %u ms, processes %s\n", pcs_period_ms, custom ? "as in the slots line (boot-arg sweetpcsampproc)" : "backboardd SpringBoard Preferences");
+ 	if (kernel_thread_start(sweet_pcsamp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {

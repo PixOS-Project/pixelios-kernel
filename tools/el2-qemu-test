@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""QEMU nested-fault test of the --el2-trap EL2 code (spec S/docs/specs/SPEC-EL2-PROXY-PROBE.md section 3.3.2 test bullet, B3q) and its mutants.
+
+Builds the REAL shim/el2.S, el2h.c, el2.c with the harness shim/el2_qemu_test.S (+ el2_qemu_cfg.c, el2_qemu.ld) for `qemu-system-aarch64 -M virt,virtualization=on -cpu max`, runs one QEMU per
+fixture, stops it after a fixed wall time and reads PC from the monitor. Every fixture ends in a labelled `b .`; PC is compared with the ELF symbols (nm): returned = el2_test_done, a park = the park
+label of that reason. A timeout alone is never a pass (a PC anywhere else is a FAIL). Never uses /tmp: scratch is ~/pixelios-artifacts/scratch/el2-qemu (build) and el2-mut2 (mutants).
+
+  tools/el2-qemu-test                run the fixtures against the unmutated sources            -> PASS / FAIL
+  tools/el2-qemu-test --mutants      also run the mutants of the spec (each flips one fixture)  -> each must FAIL its fixture (or fail to build)
+Ends with a RESULT: line; exit 0 = PASS, 1 = a fixture failed / a mutant survived, 2 = usage or environment error.
+"""
+import argparse
+import concurrent.futures as cf
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRATCH = pathlib.Path(os.environ.get("PIXOS_EL2_QEMU_DIR", os.path.expanduser("~/pixelios-artifacts/scratch")))
+FIXTURE_ADDR = 0x47fff000
+WAIT_S = float(os.environ.get("PIXOS_EL2_QEMU_WAIT", "2.5"))
+SRC = ["console.h", "el2.S", "el2_abi.h", "el2.h", "el2.c", "el2h.c", "el2_qemu_test.S", "el2_qemu_cfg.c", "el2_qemu.ld"]
+# fixture number -> (spec name, expected symbol where PC must be)
+FIXTURES = {0: ("control", "el2_test_done"), 1: ("(i) el2_ld32 RAM control + hole", "el2_test_done"), 2: ("(ii) EL1 load, stage-2 trap, faulted emulated read", "el2_test_done"),
+            4: ("(iv) EC forced to 0x24 at entry 4", "el2_park_ec"), 5: ("(v) guard clear, real fault at el2_ld32_try", "el2_park_guard"),
+            6: ("(vi) guard set, real fault elsewhere", "el2_park_elr"), 7: ("(vii) branch to VBAR_EL2+0x280", "el2_park_vec"),
+            8: ("(viii) EL1 hvc #0x5345 report answered", "el2_test_done"), 9: ("(ix) hvc wrong imm / wrong id: GAP + x0 untouched", "el2_test_done"),
+            10: ("(x) EL1 loads from a Normal and a Device block, no abort reaches EL2", "el2_test_done")}
+RES_FIXTURES = {0, 8, 9, 10}	# the EL2_RESIDENT build has no trap page: only the control, the report fixtures and (x) apply (review el2-b2-report-r1 F8)
+# (id, regex in el2.S/el2h.c, replacement, file, fixtures that must FAIL (or "build"))  -- each mutant flips one fixture [SPEC 3.3.2 mutant table]
+MUTANTS = [
+    ("elr-try4", r"adr\tx17, el2_ld32_try", "adr\tx17, el2_ld32_after", "el2.S", {1, 2}),	# ELR compared with try+4: the guarded load is no longer recognised, (i) parks instead of returning
+    ("guard-not-set", r"\tmov\tw2, #1\n\tstr\tw2, \[x3\]\n\tdsb\tsy", "\tdsb\tsy", "el2.S", {1, 2}),	# el2_ld32 never sets the guard: entry 4 parks at el2_park_guard in (i)
+    ("ec-check-removed", r"\tcmp\tx16, #0x25[^\n]*\n\tb\.ne\tel2_park_ec\n", "", "el2.S", {4}),	# (iv) returns
+    ("guard-check-removed", r"\tcmp\tw16, #1\n\tb\.ne\tel2_park_guard[^\n]*\n", "", "el2.S", {5}),	# (v) returns
+    ("elr-check-removed", r"\tcmp\tx16, x17[^\n]*\n\tb\.ne\tel2_park_elr\n", "", "el2.S", {6}),	# (vi) returns
+    ("w0-not-cleared", r"\tmov\tw0, wzr[^\n]*\n", "", "el2.S", {1}),	# a faulted load leaves w0 undefined: (i) checks w0 == 0
+    ("no-elr-restore", r"\tmsr\telr_el2, x0\n\tmsr\tspsr_el2, x1\n", "", "el2.S", {2}),	# entry 8 never restores ELR/SPSR_EL2: EL1 resumes at the helper's ELR (inside EL2 code)
+    ("elr-not-advanced", r"f->elr \+= 4;", "f->elr += 0;", "el2h.c", {2}),	# the load re-runs: traps != 1 (and the bound clears VM at 64)
+    ("report-imm-removed", r" && \(esr & 0xFFFFu\) == EL2_HVC_IMM_REPORT", "", "el2.c", {9}),	# a wrong imm is answered: (ix) sees x0 changed
+    ("report-id-removed", r" && x0 == EL2_REPORT_FN", " && (x0 | 1)", "el2.c", {9}),	# a wrong id is answered
+    ("report-gap-counted", r"\t\tel2_reports\+\+;\n", "\t\tel2_reports++;\n\t\tel2_gaps++;\n", "el2h.c", {8}),	# an answered call counted as a gap: (viii) sees gaps 3
+    ("report-clobbers-x5", r"\t\tf->x\[4\] = el2_bound;\n", "\t\tf->x[4] = el2_bound;\n\t\tf->x[5] = 0;\n", "el2h.c", {8}),	# the report overwrites a caller register: (viii) checks x5..x18 (review r1 F8)
+    ("res-map-invalid", r"l2\[i\] = ipa \| \(range_in_bank\(c, ipa, ipa \+ BLK_SIZE\) \? EL2_DESC_BLOCK_NORMAL : EL2_DESC_BLOCK_DEVICE\);", "l2[i] = ipa * 0;", "el2h.c", {8, 9, 10}, True),	# EL2_RESIDENT map with no valid block: EL1 cannot even run (F8)
+    ("slot-overflow", r"\tmrs\tx16, esr_el2\n", "\tmrs\tx16, esr_el2\n\t.rept 40\n\tnop\n\t.endr\n", "el2.S", {"build"}),	# entry 4 grows past 0x80: the vent macro must refuse to assemble (r5 F6)
+]
+
+
+def sh(*cmd, cwd=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr)
+
+
+def tool(name):
+    for pre in ("aarch64-linux-gnu-", "aarch64-none-elf-"):
+        if shutil.which(pre + name):
+            return pre + name
+    p = pathlib.Path.home() / ".local/opt/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf/bin" / ("aarch64-none-elf-" + name)
+    if p.exists():
+        return str(p)
+    sys.exit("RESULT: ERROR no aarch64 cross toolchain (CROSS_PREFIX)")
+
+
+class BuildError(Exception):
+    pass
+
+
+def build(d: pathlib.Path, resident=False):
+    """build the harness ELF in d (sources already copied); returns the elf path"""
+    gcc, nm = tool("gcc"), tool("nm")
+    rc, out = sh(sys.executable, str(ROOT / "tools/boards.py"), "bluejay", str(d / "board_config.h"))
+    if rc:
+        raise BuildError("boards.py: " + out)
+    flags = ["-O2", "-ffreestanding", "-nostdlib", "-fno-pic", "-march=armv8-a+crc", "-mgeneral-regs-only", "-mstrict-align", "-fno-stack-protector", "-Wall", "-Wextra", "-Werror",
+             "-I.", "-include", "board_config.h", "-DEL2_TRAP"] + (["-DEL2_RESIDENT"] if resident else [])
+    objs = []
+
+    def cc(src, obj, extra=()):
+        rc, out = sh(gcc, *flags, *extra, "-c", src, "-o", obj, cwd=d)
+        if rc:
+            raise BuildError(f"{src}: {out.strip()[:400]}")
+        objs.append(obj)
+
+    cc("el2.S", "el2_asm.o")
+    rc, out = sh(nm, "el2_asm.o", cwd=d)
+    syms = {t[2]: int(t[0], 16) for t in (l.split() for l in out.splitlines()) if len(t) == 3}
+    try_off = syms["el2_ld32_try"] - syms["el2_ld32"]		# the harness reaches the non-global label as el2_ld32 + offset (read with nm, not typed)
+    cc("el2_qemu_test.S", "harness.o", [f"-DLD32_TRY_OFF={try_off}"])
+    for f in ("el2.c", "el2h.c", "el2_qemu_cfg.c"):
+        cc(f, f[:-2] + ".o")
+    rc, out = sh(gcc, *flags, "-static", "-T", "el2_qemu.ld", "-Wl,--build-id=none", "-Wl,--no-warn-rwx-segments", "-Wl,-N", *objs, "-o", "el2_qemu.elf", cwd=d)
+    if rc:
+        raise BuildError("link: " + out.strip()[:400])
+    return d / "el2_qemu.elf"
+
+
+def elf_syms(elf):
+    rc, out = sh(tool("nm"), str(elf))
+    return {t[2]: int(t[0], 16) for t in (l.split() for l in out.splitlines()) if len(t) == 3}
+
+
+def run_fixture(elf, n):
+    """one QEMU for fixture n; returns the PC after WAIT_S seconds (an int) or a string on a monitor/parse error"""
+    import time
+    cmd = ["qemu-system-aarch64", "-M", "virt,virtualization=on", "-cpu", "max", "-m", "128", "-display", "none", "-serial", "none", "-monitor", "stdio", "-kernel", str(elf),
+           "-device", f"loader,addr={FIXTURE_ADDR:#x},data={n},data-len=4"]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        time.sleep(WAIT_S)
+        out, _ = p.communicate("stop\ninfo registers\nquit\n", timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return "qemu monitor timeout"
+    out = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out)
+    m = re.search(r"\bPC=([0-9a-f]{16})", out)
+    if not m:
+        return "no PC in the monitor output: " + out[-200:].replace("\n", " | ")
+    return int(m.group(1), 16)
+
+
+def classify(syms, pc):
+    if isinstance(pc, str):
+        return pc
+    names = [k for k, v in syms.items() if v == pc and (k.startswith("el2_park_") or k.startswith("el2_test_"))]
+    return names[0] if names else f"PC={pc:#x} (no park/test label)"
+
+
+def run_all(elf, only=None):
+    only = set(FIXTURES) if only is None else only
+    syms = elf_syms(elf)
+    need = {FIXTURES[n][1] for n in only}
+    missing = need - syms.keys()
+    if missing:
+        return {n: f"symbol {sorted(missing)} missing" for n in only}
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {n: ex.submit(run_fixture, elf, n) for n in sorted(only)}
+        return {n: classify(syms, f.result()) for n, f in futs.items()}
+
+
+def verdicts(res):
+    """{fixture: (ok, got)}: ok iff PC is exactly the fixture's expected label"""
+    return {n: (res[n] == FIXTURES[n][1], res[n]) for n in res}
+
+
+def copy_sources(d: pathlib.Path):
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    for f in SRC:
+        shutil.copy(ROOT / "shim" / f, d / f)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--mutants", action="store_true", help="also run the mutants of the spec's 3.3.2 table (scratch copies under ~/pixelios-artifacts/scratch/el2-mut2)")
+    ap.add_argument("--only", help="run only this mutant id")
+    a = ap.parse_args()
+    if not shutil.which("qemu-system-aarch64"):
+        print("RESULT: ERROR qemu-system-aarch64 not found")
+        return 2
+    d = SCRATCH / "el2-qemu"
+    copy_sources(d)
+    try:
+        elf = build(d)
+    except BuildError as e:
+        print(f"RESULT: FAIL unmutated build: {e}")
+        return 1
+    v = verdicts(run_all(elf))
+    bad = [n for n, (ok, _g) in v.items() if not ok]
+    for n, (ok, got) in sorted(v.items()):
+        print(f"{'PASS' if ok else 'FAIL'} fixture {FIXTURES[n][0]}: expected {FIXTURES[n][1]}, PC at {got}")
+    if bad:
+        print(f"RESULT: FAIL unmutated fixtures {bad} did not end where the spec says")
+        return 1
+    d2 = SCRATCH / "el2-qemu-res"
+    copy_sources(d2)
+    try:
+        elf2 = build(d2, resident=True)
+    except BuildError as e:
+        print(f"RESULT: FAIL unmutated EL2_RESIDENT build: {e}")
+        return 1
+    v2 = verdicts(run_all(elf2, RES_FIXTURES))
+    for n, (ok, got) in sorted(v2.items()):
+        print(f"{'PASS' if ok else 'FAIL'} EL2_RESIDENT fixture {FIXTURES[n][0]}: expected {FIXTURES[n][1]}, PC at {got}")
+    if any(not ok for ok, _g in v2.values()):
+        print("RESULT: FAIL unmutated EL2_RESIDENT fixtures did not end where the spec says")
+        return 1
+    survivors = []
+    if a.mutants:
+        for mid, pat, rep, fname, must_fail, *rest in MUTANTS:
+            res = bool(rest)		# EL2_RESIDENT build and fixtures
+            if a.only and a.only != mid:
+                continue
+            md = SCRATCH / "el2-mut2" / mid
+            copy_sources(md)
+            src = (md / fname).read_text()
+            new, n = re.subn(pat, rep, src, count=1)
+            if n == 0:
+                print(f"RESULT: ERROR mutant {mid}: pattern did not match {fname} (a vacuous mutant would prove nothing)")
+                return 2
+            (md / fname).write_text(new)
+            try:
+                melf = build(md, resident=res)
+            except BuildError as e:
+                if must_fail == {"build"} and "el2 vector slot > 0x80" in str(e):
+                    print(f"KILLED mutant {mid}: does not assemble: el2 vector slot > 0x80")
+                else:
+                    print(f"{'SURVIVED' if must_fail == {'build'} else 'ERROR'} mutant {mid}: build failed for another reason: {str(e)[:200]}")
+                    survivors.append(mid)
+                continue
+            if must_fail == {"build"}:
+                print(f"SURVIVED mutant {mid}: it assembled (the slot-size guard did not fire)")
+                survivors.append(mid)
+                continue
+            mv = verdicts(run_all(melf, RES_FIXTURES if res else None))
+            flipped = sorted(n for n, (ok, _g) in mv.items() if not ok)
+            others_ok = all(mv[n][0] for n in mv if n not in must_fail)
+            if set(must_fail) <= set(flipped):
+                print(f"KILLED mutant {mid}: fixtures {flipped} FAIL ({', '.join(f'{FIXTURES[n][0]} -> {mv[n][1]}' for n in flipped)}){'' if others_ok else '; NOTE other fixtures also changed'}")
+            else:
+                print(f"SURVIVED mutant {mid}: fixtures {sorted(must_fail)} must FAIL but {flipped or 'none'} did")
+                survivors.append(mid)
+    if survivors:
+        print(f"RESULT: FAIL mutants survived: {survivors}")
+        return 1
+    print(f"RESULT: PASS {len(FIXTURES)} fixtures + {len(RES_FIXTURES)} EL2_RESIDENT fixtures ended at their labels" + (f", {len([m for m in MUTANTS if not a.only or a.only == m[0]])} mutants killed" if a.mutants else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

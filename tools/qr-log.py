@@ -107,6 +107,37 @@ def frames(cv2, args):
         yield cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
 
 
+class NavSnap:
+    """T-b872: one camera frame per nav action. Follows the run's usbnet.log; every `SWEET NAV: ACTION <name> end rep R` marker (patch 0243) queues one frame,
+    saved as <dir>/nav-rRR-<name>.jpg from the first camera frame at least `lag` s after the marker was read (the action's settle time has passed; the
+    camera and the panel lag a little). tools/gpu-nav-score --frames DIR counts them. A marker without a frame stays visible as frames=K/N < N, never silent."""
+    PAT = re.compile(rb"SWEET NAV: ACTION (\S+) end rep (\d+)")
+
+    def __init__(self, log, outdir, lag=0.5, now=time.time):
+        self.log, self.dir, self.lag, self.now = log, outdir, lag, now
+        self.off, self.pending, self.saved = 0, [], 0
+
+    def poll(self):
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self.off)
+                data = f.read()
+        except OSError:  # lint-silent: expected the run dir exists before usbnet.log does (poll again); a log that never appears shows as frames=0/N in tools/gpu-nav-score
+            return
+        nl = data.rfind(b"\n") + 1      # only whole lines
+        self.off += nl
+        for m in self.PAT.finditer(data[:nl]):
+            self.pending.append((self.now() + self.lag, int(m.group(2)), m.group(1).decode("ascii", "replace")))
+
+    def step(self, img, imwrite):
+        self.poll()
+        while self.pending and self.pending[0][0] <= self.now():
+            _t, rep, name = self.pending.pop(0)
+            os.makedirs(self.dir, exist_ok=True)
+            imwrite(os.path.join(self.dir, "nav-r%02d-%s.jpg" % (rep, name)), img)
+            self.saved += 1
+
+
 class Run:
     """Camera frames in, QL1 snapshots / the QL2 stream out. Decoding runs on worker threads; frames that arrive while all are busy are dropped."""
 
@@ -194,17 +225,25 @@ class Run:
     def run(self):
         a = self.a
         from concurrent.futures import ThreadPoolExecutor
-        busy = threading.Semaphore(a.workers)
+        busy = threading.Semaphore(max(1, a.workers))
         t_save = 0.0
         until = getattr(a, "until_file", None)
-        with ThreadPoolExecutor(a.workers) as ex:
+        if a.workers == 0:      # frames only: the USB log is the channel, decoding cost ~2-3 cores for nothing (AP-114 follow-up); never silent (rule 8)
+            print("QR DECODE OFF (--workers 0): saving camera frames only, no QR log will be written", flush=True)
+        with ThreadPoolExecutor(max(1, a.workers)) as ex:
+            navsnap = NavSnap(a.nav_log, a.nav_dir) if getattr(a, "nav_log", None) else None
             for img in frames(self.cv2, a):
                 if until and os.path.exists(until):
                     break
+                if navsnap:
+                    navsnap.step(img, self.cv2.imwrite)
                 if a.save_dir and time.time() - t_save >= a.save_every:
                     t_save = time.time()
                     os.makedirs(a.save_dir, exist_ok=True)
                     self.cv2.imwrite(os.path.join(a.save_dir, "f%s.jpg" % time.strftime("%H%M%S")), img)
+                if a.workers == 0:
+                    self.n_img += 1
+                    continue
                 if a.images or a.video:
                     busy.acquire()          # files: decode every one, in order
                 elif not busy.acquire(blocking=False):
@@ -221,6 +260,9 @@ class Run:
                 self.tick()
                 if self.result is not None:
                     break
+        if a.workers == 0:
+            print("QR DECODE OFF: %d frames seen, none decoded" % self.n_img, flush=True)
+            return 0
         self.tick(final=True)
         if self.result is not None:
             return self.result
@@ -260,6 +302,10 @@ def selftest():
     want = "".join(c if (c == "\n" or 0x20 <= ord(c) < 0x7f) else ("." if ord(c) < 0x20 else "?") for c in text)
     assert out == want, "selftest: text mismatch"
     print("selftest QL1 OK:", len(out), "bytes from", len(glob.glob(d + "/f*.pgm")), "frames")
+    d0 = tempfile.mkdtemp(prefix="qrlog0-")     # --workers 0: frames saved, nothing decoded, no qr- file, rc 0
+    a0 = argparse.Namespace(images=d + "/f*.pgm", video=None, camera=0, esp=None, save_dir=d0 + "/s", save_every=0, out=d0, tiles=1, workers=0)
+    assert run(a0) == 0 and glob.glob(d0 + "/s/f*.jpg") and not glob.glob(d0 + "/qr-*"), "selftest: --workers 0 decoded or saved nothing"
+    print("selftest --workers 0 OK: frames only")
     qrl2.selftest(images=True)
     return 0
 
@@ -280,15 +326,19 @@ if __name__ == "__main__":
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs"))
     ap.add_argument("--save-dir", help="also keep a frame every --save-every seconds (to read panics by eye)")
     ap.add_argument("--save-every", type=float, default=4)
+    ap.add_argument("--nav-log", help="usbnet.log of the run: save one camera frame per `SWEET NAV: ACTION <name> end rep R` marker (T-b872, needs --nav-dir)")
+    ap.add_argument("--nav-dir", help="directory for the nav-rRR-<action>.jpg frames of --nav-log")
     ap.add_argument("--keep-going", action="store_true", help="keep decoding successive snapshots (distinct sid), save each, stop on SIGTERM/--until-file")
     ap.add_argument("--until-file", help="stop when this file exists")
     ap.add_argument("--follow", action="store_true", help="QL2: do not stop when the stream is complete (the log keeps growing)")
     ap.add_argument("--tiles", type=int, default=2, help="QR codes expected per screen (QL2 default 2)")
-    ap.add_argument("--workers", type=int, default=2, help="decoder threads (frames arriving while all are busy are dropped)")
+    ap.add_argument("--workers", type=int, default=2, help="decoder threads (frames arriving while all are busy are dropped); 0 = save frames only, no decoding (USB-log runs: xrun --reader '--workers 0')")
     ap.add_argument("--average", type=int, default=1, help="when a frame does not decode, average it with up to N-1 similar recent ones")
     ap.add_argument("--status-every", type=float, default=5.0)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
+    if bool(a.nav_log) != bool(a.nav_dir):
+        sys.exit("--nav-log and --nav-dir go together")
     if a.esp == "":
         a.esp = os.environ.get("CAM_HOST") or sys.exit("no CAM_HOST in .env (tools/envfile.py path shows the file used)")
     sys.exit(selftest() if a.selftest else run(a))

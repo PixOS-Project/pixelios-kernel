@@ -2,7 +2,12 @@
 """run-preflight: read-only checks before a hardware run (TP-024). Host only; never touches the phone, no adb/fastboot.
 
   tools/run-preflight [--json] [--root-sha SHA] [--margin S] [--writer --changed-vs "LABEL: ONE VARIABLE"] -- tools/xrun|tools/probe-run ARGS...
-  tools/run-preflight --gen-bootargs [--check] [--pristine DIR]   regenerate tools/bootargs-known.txt (--check: exit 1 if stale)
+  tools/run-preflight --gen-bootargs [--check [--patches-only]] [--pristine DIR]   regenerate tools/bootargs-known.txt (--check: exit 1 if stale;
+                                        --patches-only: no pristine tree, recheck only the xnu/patches rows; caller tools/validate-repo.py, gate)
+  tools/run-preflight --userdata-check   (tools/xrun, before the build; first prints `FLASH: last=UTC reason=TEXT today=N` or `FLASH: none recorded`, R54) exit 2 unless the newest flashed-userdata.txt line is an iOS root flash
+                                        (64-hex sha256; `erased ...` from tools/fboot-android or no file = ERROR); bypass XRUN_USERDATA_BYPASS="reason >= 10 chars"
+  tools/run-preflight --gate-check ram|flash   (T-f32e) only the gate rule: exit 0 and `RESULT: PASS gate admitted-by=quick|formal|waiver` / exit 1 `RESULT: FAIL gate: why`.
+                                        ram = tools/xrun, tools/probe-run (fastboot boot); flash = tools/fflash-userdata.sh (a quick gate is refused)
   tools/run-preflight --self-test
 
 Checks (each names the antipattern that motivates it; SKIP = not enough verified information, never a silent pass):
@@ -14,22 +19,41 @@ Checks (each names the antipattern that motivates it; SKIP = not enough verified
             (tools/runs stats --args --all-worktrees; probe-run writes run.args since review B2) + --margin (default 60 s, a guess) (AP-14/AP-22)
   form      every --expect containing "LINK summary" has "restore=ok" and "stopped=none" or "stopped=... row=N" (CR-08, review W3A-4 F1: a bare
             "LINK summary reached=S23" also matches stopped=fault|timeout and restore=FAILED); --writer needs --changed-vs "<label>: <variable>" (CR-08)
-  gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it) AND the work tree is clean (review B3)
-  root      newest line of flashed-userdata.txt has sha256 == --root-sha (SKIP without --root-sha)
+  cmdline   xrun: the exact boot-args line of this run, from `tools/xrun --print-bootargs ARGS` (TP-040: xrun's own flag handling incl. the
+            sweetremote=1 it adds itself (AP-154), then build-xnu-image.sh's XNU_IMAGE_ARGS_ONLY hook) must fit mkpayload's field (its BOOT_LINE_LENGTH,
+            imported, incl. the NUL: 2048 with xnu patch 0320, 1024 with 0176 alone, 608 before; tools/mkpayload.py); the detail lists the implicit boot-args counted. Fails BEFORE the flash/build.
+  adt       xrun without --adt: research/ipsw-x/d22ap.adt must resolve in this worktree, else mkadt silently drops /product (AP-144, TP-038 a)
+  platform  xrun: that same boot-args line has unentitled_ios_sim_launch=1 (every token of that name, none other) AND the --kernel file's
+            "@(#)VERSION:" string ends in a DEVELOPMENT_* objroot (pristine config/version.c:39, config/newvers.pl:19,73). Without both,
+            xnu-8796 refuses every iOS binary spawned without a spawn-attr platform, launchd included (EACCES, WRONG_PLATFORM:
+            pristine bsd/kern/kern_exec.c:7391-7413; the tunable exists only #if DEBUG || DEVELOPMENT, :195-197, :7395; research 97 5a.1).
+            A missing --kernel file is SKIP (xrun itself refuses it, tools/xrun:48), never PASS.
+  gate      shim/out/gate.result is "GATE PASS <HEAD short hash>" (AP-21; check-all.sh writes it) AND the work tree is clean (review B3). A `quick:` PASS (tools/gate --quick --changed)
+            is enough for these RAM-boot tools ONLY together with shim/out/lint-first.result `LINT-FIRST PASS <HEAD>` (tools/gate-lint-first); the detail says admitted-by=quick|formal
+            (T-f32e, user order 2026-11-02, RULES R28); a flash or a trunk merge still needs the formal gate; PREFLIGHT_GATE_WAIVER="reason >= 10 chars" (USER-approved runs only, per command) skips this check only, printed as GATE WAIVED and marked gate_waiver in the xrun summary
+  root      newest line of flashed-userdata.txt is an iOS root flash whose sha256 == --root-sha (an `erased` line FAILs; SKIP without --root-sha)
   lock      phone lock free or held by the caller (tools/phone-lock status/check)
+  recovery  xrun: a USB-free self-reset is armed (--restart S>0 or --args sweetrestart=S) or the run plan has a line `no-recovery: <why, >= 10 chars>` (T-322d;
+            also refused by tools/xrun through --intent-check, exit 2). Covers an XNU-stage hang only: sweetrestart is armed in XNU (xnu patch 0083), the shim arms no
+            reset and disables the bootloader watchdogs (shim/shim.c disable_bluejay_watchdog); a shim-stage hang needs the PR-4 petted watchdog (T-5d2f).
 Known gaps (LOW): xrun wall time is not compared; probe runs from before run.args existed have no history; the three userland boot-args (wdt_test,
 ignition_level, launchd_unsecure_cache) FAIL until a cited bootargs-extra.txt entry exists (spec-conformant).
 Not implemented (no verified source yet, listed as SKIP): image meta vs HEAD, --overlay after migration finished, the build's recorded root.
 Last line: RESULT: PASS | FAIL <check>: <reason>   Exit 0 pass / 1 a check failed / 2 bad arguments or internal error.
-Env (tests): PREFLIGHT_ROOT repo root, PREFLIGHT_KNOWN/PREFLIGHT_EXTRA name lists, ARTIFACTS, FLASH_STATE, RUNS_ROOT, PHONE_LOCK_DIR.
+Env (tests): PREFLIGHT_ROOT repo root, PREFLIGHT_KNOWN/PREFLIGHT_EXTRA name lists, ARTIFACTS, FLASH_STATE, FLASH_REASONS, RUNS_ROOT, PHONE_LOCK_DIR.
 """
-import json, os, re, shlex, subprocess, sys
+import glob, hashlib, json, os, re, shlex, subprocess, sys; sys.argv[1:2] in (["-h"], ["--help"]) and (print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + __doc__.strip()), sys.exit(0))   # T-7dff:help: -h/--help before any side effect (R29: this file may not grow)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("PREFLIGHT_ROOT") or os.path.dirname(HERE)
 KNOWN = os.environ.get("PREFLIGHT_KNOWN") or os.path.join(HERE, "bootargs-known.txt")
 EXTRA = os.environ.get("PREFLIGHT_EXTRA") or os.path.join(HERE, "bootargs-extra.txt")
 PRISTINE = os.environ.get("XNU_PRISTINE") or os.path.expanduser("~/pixelios-artifacts/xnu-pristine")  # docs/LOCAL-BUILD.md:41
+
+sys.path.insert(0, HERE)
+import run_preflight_flash  # noqa: E402  R54 FLASH line (R29: this file may not grow)
+from run_preflight_ceiling import filled_words; from run_preflight_plancheck import c_ceiling  # noqa: E402,E702  T-d4d9/T-dd8e: filled_words; the CEILING check then the PLAN-CHECK gate (R29: this file may not grow)
+from mkpayload import BOOT_LINE_LENGTH  # noqa: E402  one source: the field mkpayload packs (and the shim/XNU patch 0176 read; tools/test_bootline_layout.py)
 
 
 class Bad(Exception):
@@ -85,16 +109,25 @@ def names_in(text):
     return names
 
 
-def generate(pristine):
+def generate(pristine, base=None):
+    """-> bootargs-known.txt text. base = the committed file's text: its `xnu` rows stand in for the pristine walk (--patches-only; the
+    pristine tree is pinned, so only xnu/patches can make the file stale; the gate container has no pristine tree, 21i 2026-10-29)"""
     found = {}
-    if not os.path.isdir(pristine):
+    if base is not None:
+        for l in base.splitlines():
+            f = l.split("\t")
+            if len(f) == 2 and f[1] == "xnu":
+                found[f[0]] = "xnu"
+        if not found:
+            raise Bad("--patches-only: %s holds no xnu rows; regenerate with the pristine tree (--gen-bootargs --pristine DIR)" % KNOWN)
+    elif not os.path.isdir(pristine):
         raise Bad("pristine xnu tree not found: %s (set XNU_PRISTINE or --pristine)" % pristine)
-    for dp, _, fs in os.walk(pristine):
+    for dp, _, fs in os.walk(pristine) if base is None else []:
         for f in fs:
             if f.endswith((".c", ".h", ".cpp")):
                 try:
                     txt = open(os.path.join(dp, f), errors="replace").read()
-                except OSError:
+                except OSError:   # lint-silent: expected a source file that cannot be read contributes no names
                     continue
                 for n in names_in(txt):
                     found.setdefault(n, "xnu")
@@ -105,13 +138,23 @@ def generate(pristine):
                               if l.startswith("+") and not l.startswith("+++"))
             for n in names_in(added):
                 found.setdefault(n, "patch:" + f.split("-")[0])
-    return "".join("%s\t%s\n" % (n, found[n]) for n in sorted(found))
+    xnu = sorted(n for n in found if found[n] == "xnu")
+    return (XNU_PIN % hashlib.sha256("\n".join(xnu).encode()).hexdigest() +
+            "".join("%s\t%s\n" % (n, found[n]) for n in sorted(found)))
+
+
+# first line of bootargs-known.txt: hash of the xnu rows of the pristine walk, so --patches-only cannot pass a hand-added or deleted xnu row
+# (review bootargs-gate-r1 F1); only --gen-bootargs with the pristine tree writes it
+XNU_PIN = "# xnu-rows-sha256 %s (tools/run-preflight --gen-bootargs from the pristine tree; do not edit)\n"
 
 
 def read_names(path):
     try:
         return {l.split("\t")[0].split("#")[0].strip() for l in open(path) if l.strip() and not l.startswith("#")} - {""}
-    except OSError:
+    except FileNotFoundError:   # None = missing; c_bootargs FAILs loudly when KNOWN is None   # lint-silent: expected a missing file is the documented None (never flashed / KNOWN checked by caller)
+        return None
+    except OSError as _err:
+        print(f"run-preflight GAP: OSError ignored in read_names(): {_err}", file=sys.stderr)
         return None
 
 
@@ -119,14 +162,17 @@ def uncited(path):
     """bootargs-extra.txt rule 'no citation, no entry': names on lines without '# text'"""
     try:
         return [l.split("#")[0].strip() for l in open(path) if l.strip() and not l.startswith("#") and not re.search(r"#\s*\S", l)]
-    except OSError:
+    except FileNotFoundError:   # lint-silent: expected a missing bootargs-extra.txt has no entries, so none without a citation
+        return []
+    except OSError as _err:
+        print(f"run-preflight GAP: OSError ignored in uncited(): {_err}: the citation rule was NOT checked", file=sys.stderr)
         return []
 
 
 # ---- checks (each returns (status, detail), status PASS|FAIL|SKIP) ---------------------------------------------------
 def opts(argv):
     """-> dict name -> list of values for the options this tool cares about (xrun/probe-run); unknown options are ignored."""
-    want = {"--args", "--expect", "--stop-on", "--label", "--timeout", "--hard-timeout", "--overlay", "--build-args", "--intent"}
+    want = {"--args", "--expect", "--stop-on", "--label", "--timeout", "--hard-timeout", "--overlay", "--build-args", "--intent", "--kernel", "--cpus", "--restart"}
     o, i = {}, 0
     while i < len(argv):
         if argv[i] in want and i + 1 < len(argv):
@@ -150,6 +196,95 @@ def c_bootargs(tool, o):
         if n and n not in known and n not in extra:
             bad.append(n)
     return ("FAIL", "boot-arg(s) not parsed by xnu-8796 + patches (nor in bootargs-extra.txt): " + " ".join(bad)) if bad else ("PASS", "")
+
+
+_LINES = {}
+
+
+def built_line(argv):
+    """-> (boot-args line, implicit args, None) from `tools/xrun --print-bootargs ARGS` (TP-040: the single source, incl. what xrun adds on its
+    own, e.g. sweetremote=1, tools/xrun:55), or (None, None, why it refused). Cached per argv: c_cmdline and c_platform share one call."""
+    key = tuple(argv)
+    if key not in _LINES:
+        r = subprocess.run(["bash", os.path.join(HERE, "xrun"), "--print-bootargs", *argv], capture_output=True, text=True)
+        line = [l for l in r.stdout.splitlines() if l.startswith("boot-args: ")]
+        imp = [l[len("implicit: "):] for l in r.stdout.splitlines() if l.startswith("implicit: ")]
+        if (r.returncode and not (r.returncode == 2 and "REFUSED: boot-args are" in r.stderr)) or not line or not imp:   # rc 2 + REFUSED = length (0320 F5)
+            _LINES[key] = (None, None, "xrun --print-bootargs refused the flags: "
+                           + ((r.stderr.strip().splitlines() or ["rc %d, no boot-args/implicit line" % r.returncode])[-1])[:200])
+        else:
+            _LINES[key] = (line[0][len("boot-args: "):], imp[0], None)
+    return _LINES[key]
+
+
+def c_cmdline(tool, argv):
+    """xrun only: the boot-args line this run would build (built_line) against mkpayload's limit."""
+    if tool != "xrun":
+        return "SKIP", "no xrun"
+    line, imp, why = built_line(argv)
+    if line is None:
+        return "FAIL", why
+    n, lim = len(line.encode()), BOOT_LINE_LENGTH - 1
+    note = "" if imp == "none" or not [a for a in imp.split() if not a.startswith("--")] else "; implicit: " + ", ".join("%s (+%d)" % (a, len(a) + 1) for a in imp.split() if not a.startswith("--"))   # --rails etc.: xrun flags, not boot-arg bytes
+    return ("FAIL", "boot-args are %d bytes, the limit is %d (mkpayload refuses; %d over)%s" % (n, lim, n - lim, note)) if n > lim else ("PASS", "%d/%d bytes%s" % (n, lim, note))
+
+
+def c_adt(tool, argv):
+    """xrun without --adt runs tools/mkadt.py, which only WARNS and drops the /product node when research/ipsw-x/d22ap.adt is missing
+    (tools/mkadt.py:46-53): 13364 B instead of 16048 B, SpringBoard crash-looped in g111/g111b/g111c (AP-144, TP-038 a). A new worktree lacks
+    the gitignored research/ link: fail here with the fix command."""
+    if tool != "xrun":
+        return "SKIP", "no xrun"
+    if "--adt" in argv:
+        return "PASS", "--adt given (mkadt is not run)"
+    want = os.path.join(ROOT, "research", "ipsw-x", "d22ap.adt")
+    if os.path.isfile(want) and os.path.getsize(want) > 0:   # review dev-speed-gaps-r1 F5: an empty file is no ADT
+        return "PASS", "research/ipsw-x/d22ap.adt resolves"
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    main = os.path.dirname(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else "<kernel clone>"
+    if os.path.realpath(main) == os.path.realpath(ROOT):
+        return "FAIL", "%s missing or empty in the kernel clone itself: restore research/ipsw-x (AP-144)" % want
+    return "FAIL", ("%s missing or empty: mkadt would build an ADT without the /product node (13364 B, SpringBoard crash loop, AP-144); "
+                    "fix: ln -s %s/research %s/research (tools/worktree-new links it)" % (want, main, ROOT))
+
+
+SIM_ARG = "unentitled_ios_sim_launch"   # pristine bsd/kern/kern_exec.c:196 TUNABLE(bool, ..., "unentitled_ios_sim_launch", false)
+VERSION_TAG = b"@(#)VERSION: "         # pristine config/version.c:39 __kernelVersionString, ends in ":<objroot>" = .../<CONFIG>_<ARCH>[_<MACHINE>]
+
+
+def kernel_config(path):
+    """-> (config word, objroot tail) from the kernel's @(#)VERSION string, or (None, why)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    at = data.find(VERSION_TAG)
+    if at < 0:
+        return None, "no '@(#)VERSION:' string in %s (not an xnu kernel?)" % path
+    end = data.find(b"\0", at)
+    tail = data[at:end if end > 0 else at + 512].decode("ascii", "replace").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return tail.split("_", 1)[0], tail
+
+
+def c_platform(tool, argv, o):
+    """xrun only: unentitled_ios_sim_launch=1 in the built line and a DEVELOPMENT kernel (research 97 5a.1); either missing = launchd EACCES."""
+    if tool != "xrun":
+        return "SKIP", "no xrun"
+    line, _, why = built_line(argv)
+    if line is None:
+        return "FAIL", "cannot check %s: %s" % (SIM_ARG, why)
+    toks = [t for t in line.split() if t.lstrip("-").split("=", 1)[0] == SIM_ARG]
+    if not toks or any(t != SIM_ARG + "=1" for t in toks):
+        return "FAIL", ("boot-args %s (need exactly %s=1): xnu refuses iOS launchd without it (EACCES WRONG_PLATFORM, kern_exec.c:7393-7413)"
+                        % ("lack " + SIM_ARG if not toks else "have " + " ".join(toks), SIM_ARG))
+    k = (o.get("--kernel") or [None])[-1]
+    if not k or not os.path.isfile(k):
+        return "SKIP", "%s=1 ok; kernel config NOT checked: --kernel %s is not a file (xrun refuses it, tools/xrun:48)" % (SIM_ARG, k)
+    cfg, tail = kernel_config(k)
+    if cfg is None:
+        return "FAIL", tail
+    if cfg not in ("DEVELOPMENT", "DEBUG"):   # review usbroot-hfs-trace-r1 F1: the tunable exists in both configs
+        return "FAIL", ("kernel config %s (%s), not DEVELOPMENT/DEBUG: %s is compiled only #if DEBUG || DEVELOPMENT (kern_exec.c:195-197,7395), "
+                        "iOS launchd would get EACCES WRONG_PLATFORM" % (cfg, tail, SIM_ARG))
+    return "PASS", "%s=1, kernel %s" % (SIM_ARG, tail)
 
 
 def c_syntax(tool, o):
@@ -251,38 +386,121 @@ def head():
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def c_gate(tool, o):
+FULL_RAN_TAG = " quick: selected all steps, ran full"   # tools/check-all.sh fullnote: a quick run that selected every step is a full run
+
+
+def gate_kind(line):
+    """formal | quick for a gate.result line: only a `quick: ran N of M steps` line (or `quick: <failed step>`) is quick; tools/check-all.sh writes
+    FULL_RAN_TAG on a quick run that selected every step and counts it as a full one."""
+    return "quick" if " quick:" in line and FULL_RAN_TAG not in line else "formal"
+
+
+def lint_first_ok(h):
+    """The first half of a quick admission (T-f32e): tools/gate-lint-first wrote `LINT-FIRST PASS <HEAD> ...` (shim/out/lint-first.result) for this exact clean head."""
+    try:
+        line = open(os.path.join(ROOT, "shim", "out", "lint-first.result")).readline().strip()
+    except OSError:
+        return False, "no shim/out/lint-first.result: run tools/gate-lint-first before the quick gate (quick admission of a RAM-boot run, T-f32e)"
+    m = re.match(r"LINT-FIRST (PASS|FAIL) (\S+)", line)
+    if not m:
+        return False, "lint-first.result says %r" % line[:40]
+    if m.group(1) != "PASS":
+        return False, "newest gate-lint-first result is FAIL " + m.group(2)
+    if m.group(2) != h:
+        return False, "newest LINT-FIRST PASS is %s but HEAD is %s (stale or +dirty): rerun tools/gate-lint-first" % (m.group(2), h)
+    return True, ""
+
+
+def gate_admission(ram):
+    """-> (status, detail, admitted_by). The ONE gate rule for a phone run (user order 2026-11-02, T-f32e, RULES R28):
+    a clean-tree `GATE PASS <HEAD>` of the FORMAL gate admits anything; a `quick:` GATE PASS <HEAD> admits only a RAM boot (ram=True: tools/xrun, tools/probe-run,
+    fastboot boot, no flash) and only together with a `LINT-FIRST PASS <HEAD>` stamp; a userdata flash (ram=False, tools/fflash-userdata.sh) needs the formal gate.
+    A user waiver (PREFLIGHT_GATE_WAIVER) skips the stamp check only (admitted-by=waiver)."""
+    why = os.environ.get("PREFLIGHT_GATE_WAIVER")   # one-off USER waiver of the gate stamp only (user, 2026-10-27, F3); per command, never exported; every other check still runs
+    if why is not None:
+        if len(why.strip()) < 10:
+            return "FAIL", "PREFLIGHT_GATE_WAIVER needs a reason of >= 10 characters (who waived, which run)", None
+        print("run-preflight: GATE WAIVED: " + why, file=sys.stderr)
+        return "PASS", " GATE WAIVED: " + why + " admitted-by=waiver", "waiver"
     h = head()
     if not h:
-        return "FAIL", "not a git checkout"
+        return "FAIL", "not a git checkout", None
     try:
         line = open(os.path.join(ROOT, "shim", "out", "gate.result")).readline().strip()
     except OSError:
-        return "FAIL", "no shim/out/gate.result: run tools/check-all.sh (AP-21)"
+        return "FAIL", "no shim/out/gate.result: run tools/check-all.sh (AP-21)", None
     m = re.match(r"GATE (PASS|FAIL) (\S+)", line)
     if not m:
-        return "FAIL", "gate.result says %r (gate running or unreadable)" % line[:40]
+        return "FAIL", "gate.result says %r (gate running or unreadable)" % line[:40], None
     if m.group(1) != "PASS":
-        return "FAIL", "newest gate result is FAIL " + m.group(2)
+        return "FAIL", "newest gate result is FAIL " + m.group(2), None
     if m.group(2) != h:
-        return "FAIL", "newest GATE PASS is %s but HEAD is %s (stale or +dirty)" % (m.group(2), h)
+        return "FAIL", "newest GATE PASS is %s but HEAD is %s (stale or +dirty)" % (m.group(2), h), None
     st = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--untracked-files=normal"], capture_output=True, text=True)
     if st.returncode != 0 or st.stdout.strip():
-        return "FAIL", "tree changed since the gate (git status not clean): rerun tools/check-all.sh (AP-21)"
-    return "PASS", (" note: the gate was a --quick run" if " quick:" in line else "")
+        return "FAIL", "tree changed since the gate (git status not clean): rerun tools/check-all.sh (AP-21)", None
+    kind = gate_kind(line)
+    if kind == "formal":
+        return "PASS", " admitted-by=formal", "formal"
+    if not ram:
+        return "FAIL", "the newest GATE PASS %s is a --quick run: a userdata flash needs the formal gate (tools/gate --formal, user order 2026-11-02)" % h, None
+    ok, why = lint_first_ok(h)
+    if not ok:
+        return "FAIL", why, None
+    return "PASS", " admitted-by=quick (RAM boot: gate-lint-first PASS + quick gate PASS on %s; the formal gate stays required for a userdata flash and a trunk merge)" % h, "quick"
+
+
+def c_gate(tool, o):
+    st, d, _ = gate_admission(True)   # tools/xrun and tools/probe-run only ever `fastboot boot` (RAM), never flash
+    return st, d
+
+
+def flash_state_last():
+    """Newest non-empty line of flashed-userdata.txt, split; None when the file is missing or empty. Line kinds: `<sha256> <date> <img>`
+    (tools/fflash-userdata.sh, an iOS root) and `erased <date> fboot-android` (tools/fboot-android --erase-userdata: Android userdata)."""
+    path = os.environ.get("FLASH_STATE") or os.path.join(os.environ.get("ARTIFACTS") or os.path.expanduser("~/pixelios-artifacts"), "flashed-userdata.txt")
+    try:
+        lines = [l.split() for l in open(path, errors="replace") if l.strip()]
+    except FileNotFoundError:   # never flashed: the documented None   # lint-silent: expected a missing file is the documented None (never flashed / KNOWN checked by caller)
+        return None
+    except OSError as _err:
+        print(f"run-preflight GAP: OSError ignored in flash_state_last(): {_err}", file=sys.stderr)
+        return None
+    return lines[-1] if lines else None
+
+
+def is_ios_flash(last):
+    return bool(last) and re.fullmatch(r"[0-9a-f]{64}", last[0]) is not None
 
 
 def c_root(tool, o, root_sha):
     if not root_sha:
         return "SKIP", "no --root-sha"
-    path = os.environ.get("FLASH_STATE") or os.path.join(os.environ.get("ARTIFACTS") or os.path.expanduser("~/pixelios-artifacts"), "flashed-userdata.txt")
-    try:
-        last = [l.split() for l in open(path) if l.strip()][-1]   # format <sha256> <date> <img> (tools/fflash-userdata.sh:21)
-    except (OSError, IndexError):
+    last = flash_state_last()
+    if not last:
         return "FAIL", "no flashed-userdata.txt entry"
+    if not is_ios_flash(last):   # `erased ...` (Android userdata): never a prefix match ("erased".startswith("e"))
+        return "FAIL", "newest flashed-userdata.txt line is not an iOS root flash: '%s'" % " ".join(last)[:80]
     if not last[0].startswith(root_sha.lower()):
         return "FAIL", "flashed root is %s, the run expects %s" % (last[0][:12], root_sha[:12])
     return "PASS", ""
+
+
+def c_userdata():
+    """tools/xrun before the build: the userdata on the phone must be an iOS root (newest flashed-userdata.txt line is a 64-hex sha256), not the
+    Android userdata a golden run left (`erased ...`, tools/fboot-android) or an unknown state (no file). Per-command bypass
+    XRUN_USERDATA_BYPASS="reason >= 10 chars", printed loudly; xrun marks it as userdata_bypass in the run summary (rule 8)."""
+    why = os.environ.get("XRUN_USERDATA_BYPASS")
+    if why is not None:
+        if len(why.strip()) < 10:
+            return ("FAIL", "userdata: XRUN_USERDATA_BYPASS needs a reason of >= 10 characters")
+        print("USERDATA BYPASS: " + why, file=sys.stderr)
+        return ("PASS", "bypassed")
+    last = flash_state_last()
+    if is_ios_flash(last):
+        return ("PASS", " ".join(last)[:120])
+    return ("FAIL", "userdata: newest flashed-userdata.txt line is '%s' (Android/erased userdata: re-flash the iOS root with tools/fflash-userdata.sh first)"
+            % (" ".join(last) if last else "<missing or empty file>")[:120])
 
 
 def c_lock(tool, o):
@@ -325,6 +543,15 @@ def c_intent(argv, name, label=None):
         return ("FAIL", "unknown --intent %s (known: %s)" % (name, " ".join(sorted(tab))))
     t = tab[name]
     miss = [f for f in t["require_flags"] if f not in flags] + [a for a in t["require_args"] if a not in toks]
+    miss += ["%s %s" % kv for kv in t.get("require_opts", {}).items() if (opts(argv).get(kv[0]) or [None])[-1] != kv[1]]
+    sa = dict(t.get("single_args", {}))
+    for fl, ov in t.get("single_args_with", {}).items():   # a flag that changes the required value (el2: --el2-b3 runs with sweetel2=2)
+        if fl in flags:
+            sa.update(ov)
+    for k, v in sa.items():   # exactly one K= token and it is K=V (PE_parse_boot_argn: the last one wins, so a duplicate is ambiguous)
+        found = [x for x in " ".join(opts(argv).get("--args", [])).split() if x.startswith(k + "=")]
+        if found != ["%s=%s" % (k, v)]:
+            miss.append("exactly one %s=%s (found %s)" % (k, v, " ".join(found) or "none"))
     bad = [f for f in t["forbid_flags"] if f in flags] + [a for a in t["forbid_args"] if a in toks]
     if miss or bad:
         return ("FAIL", "intent %s: " % name + ("missing %s" % " ".join(miss) if miss else "") + (" " if miss and bad else "") + ("forbidden %s" % " ".join(bad) if bad else ""))
@@ -334,12 +561,220 @@ def c_intent(argv, name, label=None):
 def run_checks(tool, argv, root_sha, margin, writer=False, changed_vs=None):
     o = opts(argv)
     res = [("bootargs",) + c_bootargs(tool, o), ("syntax",) + c_syntax(tool, o), ("reach",) + c_reach(tool, o),
+           ("cmdline",) + c_cmdline(tool, argv), ("adt",) + c_adt(tool, argv), ("platform",) + c_platform(tool, argv, o),
            ("form",) + c_form(tool, o, writer, changed_vs),
            ("timeout",) + c_timeout(tool, o, margin, argv), ("gate",) + c_gate(tool, o), ("root",) + c_root(tool, o, root_sha),
            ("lock",) + c_lock(tool, o)]
     if "--intent" in o:
         res.append(("intent",) + c_intent(argv, o["--intent"][-1]))
+    if tool == "xrun":   # T-322d; probe-run has its own --timeout and no restart option
+        lab = (o.get("--label") or [""])[-1]
+        plan = find_plan(lab)[0] if re.fullmatch(r"[A-Za-z0-9._-]+", lab or "") and not lab.startswith(".") else None
+        res.append(("recovery",) + c_recovery(argv, plan))
     return res, skip_notes(tool, o)
+
+
+def runplan_dir():
+    return os.environ.get("PIXOS_RUNPLAN_DIR") or os.path.expanduser("~/.t3/projects/pixelios/docs/runplans")
+
+
+def find_plan(label):
+    """-> (plan path or None, error text or ""): the exact <label>.md, else the one *.md whose first line names the label."""
+    d = runplan_dir()
+    word = re.compile(r"(?<![A-Za-z0-9._-])" + re.escape(label) + r"(?![A-Za-z0-9._-])")
+    plan = None
+    if os.path.isdir(d):
+        if os.path.isfile(os.path.join(d, label + ".md")):   # F1: the exact <label>.md wins over any first-line mention
+            plan = os.path.join(d, label + ".md")
+        else:
+            hit = [n for n in sorted(os.listdir(d)) if n.endswith(".md") and n != "TEMPLATE.md" and word.search(open(os.path.join(d, n), errors="replace").readline())]
+            if len(hit) > 1:
+                return None, "runplan: ambiguous plan for label '%s' (first line names it in: %s); name one <label>.md" % (label, " ".join(hit))
+            plan = os.path.join(d, hit[0]) if hit else None
+    if not plan:
+        return None, "runplan: no plan for label '%s' in %s (<label>.md, or a *.md whose first line names it; template TEMPLATE.md)" % (label, d)
+    return plan, ""
+
+
+RESTART_RX = re.compile(r"[1-9][0-9]*(,bootloader)?")   # tools/xrun --restart S[,bootloader] = boot-arg sweetrestart= (xnu patch 0083 parses digits, optional ,bootloader)
+NO_RECOVERY_RX = re.compile(r"^\W*no-recovery\W*:[ \t]*(\S[^\n]{9,})$", re.I | re.M)
+
+
+def c_recovery(argv, plan=None):
+    """T-322d: every phone boot arms a self-reset that needs no USB link, or the run plan says why not -> (status, detail).
+    Read from source: sweetrestart is armed in XNU (SweetPlatformExpert::start -> sweet_restart_start, xnu patch 0083) and fires from a polled kernel thread;
+    the shim never arms any reset and disable_bluejay_watchdog() (shim/shim.c) switches the bootloader's watchdogs off. So this covers an XNU-stage hang,
+    NOT a hang in the shim before XNU (that needs the petted watchdog of PR-4/T-5d2f); the PASS detail says so (rule 8)."""
+    o = opts(argv)
+    vals = [v for v in o.get("--restart", [])]
+    toks = [t.split("=", 1)[1] for a in o.get("--args", []) for t in a.split() if t.startswith("sweetrestart=")]
+    if (vals and RESTART_RX.fullmatch(vals[-1])) or (toks and RESTART_RX.fullmatch(toks[-1])) or (not vals and not toks and o.get("--intent", [""])[-1] == "gpu"):   # gpu intent: xrun arms --restart 640,bootloader itself
+        return "PASS", "sweetrestart armed (XNU-stage timer only; a shim-stage hang before XNU is NOT covered: PR-4 watchdog, T-5d2f)"
+    m = NO_RECOVERY_RX.search(open(plan, errors="replace").read()) if plan else None
+    if m:
+        print("run-preflight: NO RECOVERY: %s says: %s" % (plan, m.group(1).strip()), file=sys.stderr)
+        return "PASS", "no-recovery: " + m.group(1).strip()
+    return "FAIL", ("recovery: no USB-free recovery path armed (no --restart S / sweetrestart=S): a hang before USB comes up leaves the phone off the bus until someone holds Power+VolDown. "
+                    "Do instead: add --restart S (S > 0, e.g. the planned run time + 60) or put a line `no-recovery: <why, >= 10 chars>` in the run plan")
+
+
+def c_runplan(label, argv, intent=None):
+    """AGENTS rule 9: no phone run without a run-plan file (docs/runplans) naming the label, with a Questions table, holding every --expect/--expect-absent regex verbatim -> (status, detail)."""
+    why = os.environ.get("XRUN_NO_RUNPLAN")
+    if why is not None:
+        if len(why.strip()) < 10:
+            return ("FAIL", "runplan: XRUN_NO_RUNPLAN needs a reason of >= 10 characters")
+        print("run-preflight: RUNPLAN BYPASS: " + why, file=sys.stderr)
+        return ("PASS", "bypassed")
+    if not label or label == "run":
+        return ("FAIL", "runplan: a run needs --label NAME and a run plan docs/runplans/NAME.md (template: docs/runplans/TEMPLATE.md)")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", label) or label.startswith("."):   # r2 N1: the label is joined into a path
+        return ("FAIL", "runplan: label '%s' must match [A-Za-z0-9._-]+ and not start with '.'" % label)
+    plan, err = find_plan(label)
+    if err:
+        return ("FAIL", err)
+    text = open(plan, errors="replace").read()
+    m = re.search(r"^## Questions[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    rows = [l for l in (m.group(1).splitlines() if m else []) if l.strip().startswith("|") and not re.fullmatch(r"[|\s:-]+", l.strip())]
+    # F7: some data row has a non-empty Prediction (3rd) and regex (5th) cell (docs/runplans/TEMPLATE.md columns)
+    def filled(r):
+        cs = [x.strip() for x in r.strip().strip("|").split("|")]
+        return len(cs) >= 5 and bool(cs[2]) and bool(cs[4])
+    if len(rows) < 2 or not any(filled(r) for r in rows[1:]):
+        return ("FAIL", "runplan: %s has no '## Questions' table with a data row with filled Prediction and regex cells (no question = no run)" % plan)
+    c = re.search(r"^## Command[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    scope = (m.group(1) if m else "") + "\n" + (c.group(1) if c else "")   # F2: the regexes must be in these two sections, not anywhere in the file
+    miss = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--expect", "--expect-absent", "--stop-on", "--fail-on") and i + 1 < len(argv):
+            if not argv[i + 1].strip():
+                miss.append("%s '' (empty)" % argv[i])
+            elif argv[i + 1] not in scope:
+                miss.append("%s '%s'" % (argv[i], argv[i + 1]))
+            i += 2
+        else:
+            i += 1
+    if miss:
+        return ("FAIL", "runplan: %s lacks %d regex(es) verbatim in its Questions table or Command section: %s" % (plan, len(miss), "; ".join(miss)))
+    ev = re.search(r"^\W*Evidence order\W*:[ \t]*(\S[^\n]*)$", text, re.I | re.M)   # docs/PORT-METHOD.md "Evidence order": a WARN, never a refusal
+    if not ev or re.search(r"because\s*<", ev.group(1)):
+        print("run-preflight: RUNPLAN WARN: %s has no filled 'Evidence order: steps 1-2 cannot answer because <reason>' line (docs/PORT-METHOD.md \"Evidence order\"; docs/runplans/TEMPLATE.md)" % plan, file=sys.stderr)
+    st, why = c_method(plan, text, runplan_dir())
+    if st != "FAIL":
+        st, why = c_ceiling(plan, text, intent, runplan_dir())
+    return (st, why if st == "FAIL" else plan)
+
+def c_method(plan, text, d):
+    """docs/recipes/port-new-block.md steps 6/7/9 as a refusal (T-336d, user 2026-10-31 "a recipe will not hold"):
+    c_block: a `Phase: P-X` line naming a GOALS*.md phase row with a demo, an oracle and an "N boots" budget;
+    c_tiers: a `Lower tiers tried:` block with T0:, T1:, T2: lines (>= 3 words each: the result, or why the tier cannot answer);
+    c_budget: run plans naming that phase <= N, unless this plan has `Re-cut by: T-xxxx` (the plan ticket that re-cut the phase).
+    Plans listed in <plans>/.pre-method.txt (written before 2026-10-31; only shrinks) are exempt, loudly."""
+    base = os.path.basename(plan)
+    pre = os.path.join(d, ".pre-method.txt")
+    if os.path.isfile(pre) and base in {l.strip() for l in open(pre) if l.strip() and not l.startswith("#")}:
+        print("run-preflight: METHOD EXEMPT: %s is in %s (pre-recipe plan; no Phase/Lower tiers checks)" % (base, pre), file=sys.stderr)
+        return ("PASS", "")
+    tip = " (docs/runplans/TEMPLATE.md; recipe docs/recipes/port-new-block.md)"
+    m = re.search(r"^\W*Phase\W*:[ \t]*([A-Z]{1,4}-[A-Za-z0-9]+)\b", text, re.M)
+    if not m:
+        return ("FAIL", "c_block: %s has no 'Phase: P-<X>' line naming its GOALS phase row%s" % (plan, tip))
+    ph = m.group(1)
+    gd = os.environ.get("PIXOS_GOALS_DIR") or os.path.dirname(os.path.abspath(d))
+    row = None
+    for g in sorted(glob.glob(os.path.join(gd, "GOALS*.md"))):
+        for l in open(g, errors="replace"):
+            cs = [x.strip() for x in l.strip().strip("|").split("|")] if l.lstrip().startswith("|") else []
+            if cs and cs[0] == ph:
+                row = (g, cs)
+    if not row:
+        return ("FAIL", "c_block: phase %s has no row in %s/GOALS*.md (port-new-block step 6: a phase row with demo, oracle, budget comes first)" % (ph, gd))
+    g, cs = row
+    bm = re.search(r"(\d+)\s*boots?\b", " ".join(cs[1:]))
+    if len(cs) < 3 or not cs[1] or not cs[2] or not bm:
+        return ("FAIL", "c_block: GOALS row %s (%s) lacks a demo, an oracle or an 'N boots' budget cell" % (ph, os.path.basename(g)))
+    bad = c_spec_strategy(plan, text, d, tip)
+    if bad:
+        return ("FAIL", bad)
+    t = re.search(r"^\W*Lower tiers tried\W*:[^\n]*\n((?:[ \t]*[-*]?[ \t]*\W*T[0-9][^\n]*\n?)*)", text, re.M | re.I)
+    tiers = {k: v for k, v in re.findall(r"\bT([0-2])\W*:[ \t]*([^\n]*)", t.group(1) if t else "")}
+    miss = [("T" + k) for k in "012" if filled_words(tiers.get(k, "")) < 3]
+    if miss:
+        return ("FAIL", "c_tiers: %s 'Lower tiers tried:' lacks filled %s lines (port-new-block step 7: T0 host test, T1 replay, T2 hot reload before a boot; a tier that cannot answer says why)%s" % (plan, "/".join(miss), tip))
+    n = 0
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".md") and f != "TEMPLATE.md":
+            if re.search(r"^\W*Phase\W*:[ \t]*" + re.escape(ph) + r"\b", open(os.path.join(d, f), errors="replace").read(), re.M):
+                n += 1
+    if n > int(bm.group(1)) and not re.search(r"^\W*Re-cut by\W*:[ \t]*T-[0-9a-f]{4}\b", text, re.M):
+        return ("FAIL", "c_budget: %d run plans name phase %s, budget %s boots (GOALS %s): port-new-block step 9: a spent budget = a plan ticket re-cuts the phase; then add 'Re-cut by: T-xxxx' to this plan" % (n, ph, bm.group(1), os.path.basename(g)))
+    return c_nine_b(plan, text, d, ph, tip)
+
+
+def c_spec_strategy(plan, text, d, tip):
+    """c_block part 2 (port-new-block steps 2/3): the plan's `Block: <BLOCK>` line names docs/specs/SPEC-<BLOCK>.md; its `## 0. Strategy` section must exist and carry a
+    `Replay tool: tools/<name>` line naming a tool that exists on trunk (ROOT/tools/<name>). The phase->block mapping is that line (docs/runplans/TEMPLATE.md), never guessed.
+    Returns the refusal text or ''. Specs dir: $PIXOS_SPECS_DIR or <docs>/specs."""
+    m = re.search(r"^\W*Block\W*:[ \t]*([A-Z][A-Z0-9-]*)\b", text, re.M)
+    if not m:
+        return "c_block: %s has no 'Block: <BLOCK>' line (the block whose docs/specs/SPEC-<BLOCK>.md s.0 holds the strategy and the replay tool)%s" % (plan, tip)
+    blk = m.group(1)
+    sd = os.environ.get("PIXOS_SPECS_DIR") or os.path.join(os.environ.get("PIXOS_GOALS_DIR") or os.path.dirname(os.path.abspath(d)), "specs")
+    spec = os.path.join(sd, "SPEC-%s.md" % blk)
+    if not os.path.isfile(spec):
+        return "c_block: block %s has no %s (port-new-block step 2: the spec, with s.0 Strategy, comes before the first run plan)" % (blk, spec)
+    sec = re.search(r"^##[ \t]+0\.?[ \t]+Strategy\b[^\n]*\n(.*?)(?=^##[ \t]|\Z)", re.sub(r"<!--.*?-->", "", open(spec, errors="replace").read(), flags=re.S), re.M | re.S)
+    if not sec:
+        return "c_block: %s has no '## 0. Strategy' section (port-new-block step 2: port a whole driver as a unit, or re-derive from a trace; the rejected alternative and why)" % spec
+    if filled_words(re.sub(r"Replay tool:[^\n]*", "", sec.group(1))) < 10:
+        return "c_block: %s '## 0. Strategy' is empty or a placeholder (< 10 words: the chosen strategy, the rejected alternative and why)" % spec
+    rt = re.search(r"^\W*Replay tool\W*:[ \t]*`?(tools/[A-Za-z0-9_.-]+)`?", sec.group(1), re.M)
+    if not rt:
+        return "c_block: %s '## 0. Strategy' has no 'Replay tool: tools/<name>' line (port-new-block step 3: the host tool that replays or diffs the golden, e.g. tools/trace-diff)" % spec
+    if not os.path.isfile(os.path.join(ROOT, rt.group(1))):
+        return "c_block: %s names '%s' as the replay tool but %s does not exist on this tree (port-new-block step 3: the tool comes before the S3 runs)" % (spec, rt.group(1), os.path.join(ROOT, rt.group(1)))
+    return ""
+
+
+def result_fails(path):
+    """(has_result, unpredicted_fail_rows) of a run plan. A `## Result` row is RUN when its status cell (2nd) is filled (not empty, a <placeholder> or the header); any status that
+    does not start with PASS (FAIL, FAILED, PARTIAL, BLOCKED, NO BOOT ...) is a failure; it is PREDICTED iff the Questions row with the SAME id has a Prediction cell (3rd) that
+    starts with `FAIL` (docs/runplans/TEMPLATE.md "NOT PREDICTED"); ids are compared as text ("C5", "10, 11" included). Every other failure is a surprise."""
+    text = open(path, errors="replace").read()
+    def table(head):
+        m = re.search(r"^##[ \t]+" + head + r"\b[^\n]*\n(.*?)(?=^##[ \t]|\Z)", text, re.M | re.S)
+        out = {}
+        for l in (m.group(1) if m else "").splitlines():
+            cs = [c.strip() for c in l.strip().strip("|").split("|")] if l.lstrip().startswith("|") else []
+            if cs and cs[0] and not re.fullmatch(r"[-: ]+|#", cs[0]):
+                out[cs[0]] = cs
+        return out
+    q, r = table("Questions"), table("Result")
+    ran = {n: c for n, c in r.items() if len(c) > 1 and c[1] and not c[1].startswith("<") and not re.fullmatch(r"(?i)pass\s*/\s*fail", c[1])}
+    bad = [n for n, c in ran.items() if not re.match(r"\W*PASS\b", c[1], re.I) and not (n in q and len(q[n]) > 2 and re.match(r"\W*FAIL\b", q[n][2], re.I))]
+    return bool(ran), bad
+
+
+def c_nine_b(plan, text, d, ph, tip):
+    """port-new-block step 9 / PNB-9b: the third boot of a phase is refused when the last two RUN plans of that phase (by mtime; the plan being checked excluded) each have a
+    FAIL row the plan did not predict ("two boots in a row with a FAIL row the spec did not predict = spec first"). Escape: this plan says `Spec first: <what changed in the
+    spec, >= 3 words, citing SPEC-<BLOCK> / a docs/ path / T-id / sha>` or `Re-cut by: T-xxxx`."""
+    me = os.path.basename(plan)
+    ran = []
+    for f in os.listdir(d):
+        pth = os.path.join(d, f)
+        if f.endswith(".md") and f != "TEMPLATE.md" and f != me and re.search(r"^\W*Phase\W*:[ \t]*" + re.escape(ph) + r"\b", open(pth, errors="replace").read(), re.M):
+            has, bad = result_fails(pth)
+            if has:
+                ran.append((os.path.getmtime(pth), f, bad))
+    last = sorted(ran)[-2:]
+    if len(last) < 2 or not all(b for _, _, b in last):
+        return ("PASS", "")
+    sf = re.search(r"^\W*Spec first\W*:[ \t]*(\S[^\n]*)$", text, re.M)
+    if (sf and filled_words(sf.group(1)) >= 3 and re.search(r"SPEC-[A-Z0-9-]+|docs/\S+|\bT-[0-9a-f]{4}\b|\b[0-9a-f]{7,40}\b", sf.group(1))) or re.search(r"^\W*Re-cut by\W*:[ \t]*T-[0-9a-f]{4}\b", text, re.M):
+        return ("PASS", "")
+    return ("FAIL", "c_nine_b: phase %s: the last two run plans (%s) each have a FAIL row their plan did not predict: port-new-block step 9 / PORT-METHOD rule 4: spec first. Add 'Spec first: <what the spec now says>' (or 'Re-cut by: T-xxxx') to %s, or predict the failure ('FAIL: <why>' as the Prediction)%s" % (ph, ", ".join(f for _, f, _ in last), me, tip))
 
 
 def main(argv):
@@ -355,15 +790,33 @@ def main(argv):
             pr = PRISTINE
             if "--pristine" in argv:
                 pr = argv[argv.index("--pristine") + 1]
-            text = generate(pr)
+            cur = open(KNOWN).read() if os.path.exists(KNOWN) else ""
+            po = "--patches-only" in argv
+            if po and "--check" not in argv:
+                raise Bad("--patches-only needs --check (writing needs the pristine tree)")
+            if po and "--pristine" in argv:
+                raise Bad("--patches-only reads no pristine tree; drop --pristine or --patches-only")
+            text = generate(pr, cur if po else None)
+            if po and text.split("\n", 1)[0] != cur.split("\n", 1)[0]:
+                print("RESULT: FAIL bootargs-known.txt xnu rows differ from the pinned xnu-rows-sha256 (hand edit, or a file from before the pin): "
+                      "regenerate with the pristine tree (tools/run-preflight --gen-bootargs)")
+                return 1
             if "--check" in argv:
-                cur = open(KNOWN).read() if os.path.exists(KNOWN) else ""
-                print("RESULT: %s bootargs-known.txt %s" % (("PASS", "in sync") if cur == text else ("FAIL", "stale: rerun --gen-bootargs")))
+                print("RESULT: %s bootargs-known.txt %s%s" % ((("PASS", "in sync") if cur == text else ("FAIL", "stale: rerun --gen-bootargs")) +
+                                                             (" (patches-only: xnu rows taken from the file)" if po else "",)))
                 return 0 if cur == text else 1
             with open(KNOWN, "w") as f:
                 f.write(text)
             print("wrote %s (%d names)\nRESULT: PASS" % (KNOWN, text.count("\n")))
             return 0
+        if argv[:1] == ["--gate-check"] and len(argv) == 2 and argv[1] in ("ram", "flash"):   # T-f32e: tools/xrun (ram: the admitted-by mark), tools/fflash-userdata.sh (flash: formal only)
+            st, d, by = gate_admission(argv[1] == "ram")
+            print("RESULT: %s gate%s" % (("PASS", d) if st == "PASS" else ("FAIL", ": " + d)))
+            return 0 if st == "PASS" else 1
+        if argv == ["--userdata-check"]:   # called by tools/xrun before the build
+            st, d = run_preflight_flash.userdata(c_userdata)   # prints the FLASH line before the RESULT line (R54, rule 8)
+            print("RESULT: %s %s" % (("PASS", "userdata " + d) if st == "PASS" else ("ERROR", d)))
+            return 0 if st == "PASS" else 2
         if argv[:1] == ["--intent-check"] and len(argv) > 3 and argv[2] == "--label":   # called by tools/xrun: --intent-check NAME --label L -- tools/xrun ARGS
             st, d = c_intent(argv[argv.index("--") + 1:], argv[1], argv[3])
             if d.startswith("warning"):
@@ -371,6 +824,15 @@ def main(argv):
             if st == "FAIL":
                 print("RESULT: ERROR %s (tools/run-intents.json)" % d)
                 return 2
+            st, d = c_runplan(argv[3], argv[argv.index("--") + 1:], argv[1])
+            if st == "FAIL":
+                print("RESULT: ERROR " + d)
+                return 2
+            rst, rd = c_recovery(argv[argv.index("--") + 1:], None if d == "bypassed" else d)   # T-322d: after the plan check, whose PASS detail is the plan path
+            if rst == "FAIL":
+                print("RESULT: ERROR " + rd)
+                return 2
+            print("run-preflight: RECOVERY: " + rd, file=sys.stderr)
             return 0
         js, root_sha, margin, i, writer, changed_vs = False, None, 60.0, 0, False, None
         while i < len(argv) and argv[i] != "--":
@@ -387,7 +849,7 @@ def main(argv):
                     margin = float(argv[i + 1])
                 i += 2
             else:
-                raise Bad("unknown option %s" % argv[i])
+                raise Bad("unknown option %s (valid options: --json --writer --root-sha SHA --margin S --changed-vs REF -- tools/xrun|tools/probe-run ARGS...; -h prints the header)" % argv[i])
         rest = argv[i + 1:]
         if i >= len(argv) or not rest or os.path.basename(rest[0]) not in ("xrun", "probe-run"):
             raise Bad("usage: run-preflight [--json] [--root-sha SHA] [--margin S] -- tools/xrun|tools/probe-run ARGS...")

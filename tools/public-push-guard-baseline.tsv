@@ -1,0 +1,2 @@
+# tools/public-push-guard-baseline.tsv (T-6070): findings of the tip tree that exist today, RULE<TAB>FILE<TAB>COUNT, no values. Written by `public-push-guard gate --write-baseline`.
+# The gate step public-guard fails on any finding above this list and on any entry above the actual count: the list only shrinks. Rule e (.env values) is never listed. Relocation: T-dd93.

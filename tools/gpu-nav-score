@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""gpu-nav-score v2: G-10b nav bench scorer (T-5020 v1, T-b872 v2): cuts SWEET FPS lines by SWEET NAV action markers (patch 0243) and prints the per-action
+table and RESULT: PASS gpu-nav; called by hand and by the nav run scripts (docs/runplans/gputest-nav2.md)
+
+  tools/gpu-nav-score RUN_DIR|usbnet.log [--min-busy N] [--allow-unmeasured] [--rate dist4k|distinct] [--frames DIR [--require-frames]]
+  tools/gpu-nav-score --self-test                         synthetic logs with known answers (also run by tools/test_gpu_nav_score.py)
+Last line of a score: `RESULT: PASS gpu-nav actions=N worst_gap_ms=M p5_min=F p50_min=P unmeasured=none|a(r/R),b(r/R) partial=none|c(r/R)[ frames=K/N] rate=dist4k|distinct`
+(headline numbers: actions that animated in EVERY repetition; `unmeasured` = a REQUIRED action that did not, FAIL; `partial` = another action that animated in some) | `RESULT: FAIL gpu-nav <reason>`
+(exit 1).
+
+Inputs: per-second `SWEET FPS: swaps S distinct D max_gap_ms G` (patch 0141, boot-arg sweetfps=1; the kernel prints a line only for a second that had a distinct
+frame, an idle second prints every 10th) and the action markers of patch 0243 `SWEET NAV: ACTION <name> begin|inputend|end rep R now NS` (boot-arg sweetnav=R).
+Both carry the host receive timestamp (first column, epoch seconds, UDP arrival, ~ms accurate); a FPS line stamped t covers [t-1, t]. Core Animation swaps every
+vsync even when nothing changes, so only `distinct` (frames whose content changed) counts as a rendered frame.
+
+v2 (T-b872; v1 pooled every bin that merely touched an action window, so the p5 of settings-open was the first bin of general-open and worst_gap was idle time):
+  OWNER   a bin belongs to the action whose window holds the most of it, >= 0.5 s (v1: any overlap): the window runs from `begin` to the next action's begin (the
+          animation goes on through the think time), at most 1 s past `end`. A bin mostly in an idle stretch is nobody's. Resolution is 1 s: a bin that holds the
+          end of one action and the start of the next counts for the one with more of it.
+  BUSY    an owned bin with distinct >= --min-busy: an animation ran in it. fps p50 / p5 are over the busy bins of the action (1 s resolution), LEAD bins
+          (below) and TAIL bins (the next FPS line is > 1.6 s later: the animation stopped inside the second) excluded: they are partial seconds, so their count
+          understates the rate (the 5-distinct bins of nav1). A repetition with no whole-second bin falls back to its lead / tail bins as its rate.
+  GAPS    max_gap_ms is the longest gap between distinct frames since the LAST distinct frame, so the first frame after an idle stretch carries the idle time
+          (the 29950 ms of unlock, the 1.8 s of general-open). A busy bin whose previous FPS line is > 1.6 s earlier is a LEAD bin: its gap goes to lead_ms
+          (input to first frame, an upper bound), never into worst_gap_ms. worst_gap_ms is the largest gap over the non-lead busy bins: jank inside an animation.
+  REQUIRED actions (REQUIRED below: they must animate in EVERY repetition; a tap that missed looks like no animation, so it is never a silent 0): a required action
+          with a repetition that has no busy bin is `unmeasured` and the score FAILS, unless --allow-unmeasured (historical runs: it stays in the RESULT line).
+  RATE    --rate dist4k (default, T-10ba) | distinct: which per-second series is the fps behind p50 / p5. dist4k = the dense 64x64 `distinct4k` of sweetfps=2 (xnu patch 0247),
+          which counts new frames the 32x32 `distinct` misses (nav3: app-home 36 vs 25); a log without distinct4k on every FPS line (nav2 and older, sweetfps=1) falls back to
+          `distinct` with a NOTE line, and the RESULT line says which one was used (rate=). The bins, owners, BUSY test (distinct >= --min-busy) and gaps are the same for both,
+          so `--rate distinct` reproduces the numbers of every earlier score.
+  FRAMES  --frames DIR: one camera frame per (rep, action) end marker named nav-rRR-<action>.jpg (tools/qr-log.py --nav-log); `frames=K/N` in the RESULT line,
+          --require-frames fails when one is missing."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import os, re, statistics as st, sys
+
+# actions that must animate in every repetition (a missing animation = the tap/swipe did not do its job, or the GPU never drew it)
+REQUIRED = ("home-page-next", "home-page-prev", "settings-open", "general-open", "about-open", "app-home", "spotlight-open", "app-launch")
+LEAD_S = 1.6      # previous FPS line further back than this = idle stretch before the bin
+OWN_S = 0.5       # seconds of a 1 s bin inside the window for the action to own it
+EXT_S = 1.0       # a window extends past its end marker to the next action's begin, at most this long
+
+
+def pct(a, p):
+    a = sorted(a)
+    k = (len(a) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(a) - 1)
+    return a[f] + (a[c] - a[f]) * (k - f)
+
+
+def parse(raw):
+    marks, fps, gaps = [], [], []
+    for ln in raw.split("\n"):
+        m = re.match(r"^(\d+\.\d+)\t(.*)$", ln)
+        if not m:
+            continue
+        t, body = float(m.group(1)), m.group(2)
+        m = re.search(r"SWEET NAV: ACTION (\S+) (begin|inputend|end) rep (\d+) now (\d+)", body)
+        if m:
+            marks.append((t, m.group(1), m.group(2), int(m.group(3)), int(m.group(4))))
+            continue
+        m = re.search(r"SWEET FPS: swaps (\d+) distinct (\d+) max_gap_ms (\d+)(?: distinct4k (\d+) small_chg (\d+))?", body)
+        if m:
+            # (t, swaps, distinct, max_gap_ms, distinct4k|None, small_chg|None): the last two exist only under sweetfps=2 (xnu patch 0247, T-3c9c)
+            fps.append((t, int(m.group(1)), int(m.group(2)), int(m.group(3)), None if m.group(4) is None else int(m.group(4)),
+                        None if m.group(5) is None else int(m.group(5))))
+            continue
+        if "SWEET GAP:" in body and "sweetnav" in body:
+            gaps.append(body.strip())
+    return marks, fps, gaps
+
+
+def windows(marks):
+    w, order, open_ = {}, [], {}
+    for (t, name, kind, rep, ns) in marks:
+        key = (rep, name)
+        if kind == "begin":
+            open_[key] = t
+            if key not in order:
+                order.append(key)
+        elif kind == "end" and key in open_:
+            w[key] = (open_.pop(key), t)
+    return w, order, sorted(open_)
+
+
+def score(marks, fps, min_busy, use4k=False):
+    w, order, dropped = windows(marks)
+    fps = sorted(fps, key=lambda x: x[0])
+    prev = {x[0]: (fps[i - 1][0] if i else None) for i, x in enumerate(fps)}
+    nxt_t = {x[0]: (fps[i + 1][0] if i + 1 < len(fps) else None) for i, x in enumerate(fps)}
+    # a window runs to the next action's begin (the animation goes on through the think time) but at most EXT_S past its end marker
+    order = [k for k in order if k in w]
+    begins = sorted(w[k][0] for k in order)
+    ext = {}
+    for k in order:
+        b, e = w[k]
+        nxt = [x for x in begins if x > b]
+        ext[k] = (b, min(e + EXT_S, nxt[0]) if nxt else e + EXT_S)
+    owned = {k: [] for k in order}
+    for x in fps:
+        best = max(order, key=lambda k: min(x[0], ext[k][1]) - max(x[0] - 1.0, ext[k][0]), default=None)
+        if best is not None and min(x[0], ext[best][1]) - max(x[0] - 1.0, ext[best][0]) >= OWN_S:
+            owned[best].append(x)
+    rows = []
+    for key in order:
+        own = owned[key]
+        busy = [x for x in own if x[2] >= min_busy]
+        lead = [x for x in busy if prev[x[0]] is None or x[0] - prev[x[0]] > LEAD_S]
+        cont = [x for x in busy if x not in lead]
+        tail = [x for x in cont if nxt_t[x[0]] is None or nxt_t[x[0]] - x[0] > LEAD_S]   # the animation stopped inside this second: a partial bin
+        inner = [x for x in cont if x not in tail]
+        # lead and tail bins are partial seconds (the animation starts / stops inside them): a rate only when no whole second ran
+        rate = [x[2] for x in (inner or (cont + lead))]
+        use = inner or (cont + lead)
+        # `busy` stays the 32x32 distinct series (what counts as animated, the dense-witness table); `rate` is the series behind p50 / p5 (--rate; use4k only when every FPS line has distinct4k)
+        sel = [x[4] for x in use] if use4k else rate
+        rows.append(dict(rep=key[0], name=key[1], secs=len(own), busy=rate, rate=sel, swp=[x[1] for x in use], d4k=[x[4] for x in use if x[4] is not None],
+                         small=[x[5] for x in use if x[5] is not None], lead=max([x[3] for x in lead], default=0),
+                         worst=max([x[3] for x in cont], default=0), p50=(st.median(sel) if sel else None),
+                         p5=(pct(sel, 5) if sel else None)))
+    return rows, dropped
+
+
+def fmt(v):
+    return "-" if v is None else "%.1f" % v
+
+
+def frame_count(marks, fdir):
+    """(have, want): one nav-rRR-<action>.jpg per (rep, action) that has an end marker."""
+    want = sorted({(r, n) for (_t, n, k, r, _ns) in marks if k == "end"})
+    have = [x for x in want if os.path.exists(os.path.join(fdir, "nav-r%02d-%s.jpg" % x))]
+    return len(have), len(want)
+
+
+def run(raw, min_busy, out, allow_unmeasured=False, fdir=None, require_frames=False, rate="dist4k"):
+    marks, fps, gaps = parse(raw)
+    out("markers %d fps lines %d" % (len(marks), len(fps)))
+    for g in gaps:
+        out("kernel gap line: " + g[:200])
+    if not marks:
+        out("RESULT: FAIL gpu-nav no SWEET NAV markers (boot-arg sweetnav=R missing or the nav session never started)")
+        return 1
+    if not fps:
+        out("RESULT: FAIL gpu-nav no SWEET FPS lines (boot-arg sweetfps=1 missing)")
+        return 1
+    mode = rate
+    if rate == "dist4k":
+        n4 = sum(1 for x in fps if x[4] is not None)
+        if n4 != len(fps):
+            mode = "distinct"
+            out("NOTE: --rate dist4k asked, but only %d of %d SWEET FPS lines carry distinct4k (boot-arg sweetfps=2, xnu patch 0247); scoring with rate=distinct (the 32x32 series), "
+                "not comparable one-to-one with a dist4k score" % (n4, len(fps)))
+    elif rate != "distinct":
+        out("RESULT: FAIL gpu-nav unknown --rate %s (dist4k|distinct)" % rate)
+        return 1
+    out("rate series behind fps p50 / p5: %s" % mode)
+    rows, dropped = score(marks, fps, min_busy, mode == "dist4k")
+    if dropped:
+        out("unfinished actions (run stopped inside them): " + ", ".join("rep%d/%s" % k for k in dropped))
+    out("%-4s %-22s %5s %5s %8s %8s %12s %8s" % ("rep", "action", "bins", "busy", "fps p50", "fps p5", "worst_gap_ms", "lead_ms"))
+    for r in rows:
+        out("%-4d %-22s %5d %5d %8s %8s %12d %8d%s" % (r["rep"], r["name"], r["secs"], len(r["busy"]), fmt(r["p50"]), fmt(r["p5"]), r["worst"], r["lead"],
+                                                     "" if r["busy"] else "  no-anim"))
+    out("per action over all repetitions (busy bins pooled; anim = repetitions that animated):")
+    out("%-22s %6s %5s %8s %8s %12s %8s" % ("action", "anim", "busy", "fps p50", "fps p5", "worst_gap_ms", "lead_ms"))
+    names = []
+    for r in rows:
+        if r["name"] not in names:
+            names.append(r["name"])
+    agg = []
+    for n in names:
+        rs = [r for r in rows if r["name"] == n]
+        busy = [x for r in rs for x in r["busy"]]
+        rt = [x for r in rs for x in r["rate"]]
+        d = dict(name=n, busy=busy, swp=[x for r in rs for x in r["swp"]], d4k=[x for r in rs for x in r["d4k"]], small=[x for r in rs for x in r["small"]], reps=len(rs), anim=sum(1 for r in rs if r["busy"]), worst=max(r["worst"] for r in rs), lead=max(r["lead"] for r in rs),
+                 p50=(st.median(rt) if rt else None), p5=(pct(rt, 5) if rt else None))
+        agg.append(d)
+        out("%-22s %3d/%-2d %5d %8s %8s %12d %8d%s" % (n, d["anim"], d["reps"], len(busy), fmt(d["p50"]), fmt(d["p5"]), d["worst"], d["lead"],
+                                                     "" if busy else "  no-anim"))
+    dense = [d for d in agg if d["d4k"]]
+    if dense:
+        # T-3c9c W1: the same rate bins, but counted by the dense 64x64 witness. 4k/swaps >= 0.9 = the 32x32 hash undercounts (nearly every swap is a new frame)
+        out("dense witness (sweetfps=2, rate bins pooled; 4k/swaps >= 0.90 = the 32x32 sample undercounts new frames):")
+        out("%-22s %5s %9s %9s %9s %8s %9s" % ("action", "bins", "swaps p50", "dist p50", "dist4k p50", "4k/swaps", "small p50"))
+        for d in dense:
+            sw, d32, d4 = st.median(d["swp"]), st.median(d["busy"]) if d["busy"] else 0.0, st.median(d["d4k"])
+            out("%-22s %5d %9.1f %9.1f %9.1f %8.2f %9.1f" % (d["name"], len(d["d4k"]), sw, d32, d4, d4 / sw if sw else 0.0, st.median(d["small"]) if d["small"] else 0.0))
+    scored = [d for d in agg if d["busy"] and d["anim"] == d["reps"]]   # headline numbers: actions that animated in EVERY repetition
+    part = [d for d in agg if d["busy"] and d["anim"] < d["reps"] and d["name"] not in REQUIRED]
+    if not scored:
+        out("RESULT: FAIL gpu-nav actions=0 nothing animated (every action no-anim: wrong coordinates or the UI never drew)")
+        return 1
+    um = [d for d in agg if d["name"] in REQUIRED and d["anim"] < d["reps"]]
+    umtxt = ",".join("%s(%d/%d)" % (d["name"], d["anim"], d["reps"]) for d in um) or "none"
+    wa = max(scored, key=lambda d: d["worst"])
+    la = min(scored, key=lambda d: d["p5"])
+    lo = min(scored, key=lambda d: d["p50"])
+    out("worst action by gap: %s (%d ms); lowest p5: %s (%.1f fps); lowest p50: %s (%.1f fps)" % (wa["name"], wa["worst"], la["name"], la["p5"], lo["name"], lo["p50"]))
+    tail = ""
+    if fdir:
+        have, want = frame_count(marks, fdir)
+        tail = " frames=%d/%d" % (have, want)
+        if require_frames and have < want:
+            out("RESULT: FAIL gpu-nav frames=%d/%d: a camera frame per action end marker is required (--require-frames)" % (have, want))
+            return 1
+    if um and not allow_unmeasured:
+        out("RESULT: FAIL gpu-nav unmeasured=%s: a required action did not animate in every repetition (wrong coordinates / app state; --allow-unmeasured for a historical run)" % umtxt)
+        return 1
+    ptxt = ",".join("%s(%d/%d)" % (d["name"], d["anim"], d["reps"]) for d in part) or "none"
+    out("RESULT: PASS gpu-nav actions=%d worst_gap_ms=%d p5_min=%.1f p50_min=%.1f unmeasured=%s partial=%s%s rate=%s" % (len(scored), wa["worst"], la["p5"], lo["p50"], umtxt, ptxt, tail, mode))
+    return 0
+
+
+def synth(drop_launch=False, dense=False):
+    """Two reps. page-scroll: busy bins 50 and 40 fps (gap 40 / 90 ms) + an idle-lead bin stamped after 3 s of idle (gap 2000, 5 distinct: a LEAD bin, not
+    jank) + a straddling bin (0.2 s inside the window: not owned); idle-tap: one distinct frame (no-anim, not required); app-launch (required) animates 30/32 fps
+    unless drop_launch (then no busy bin: unmeasured)."""
+    L = []
+    def mk(t, a, k, r):
+        L.append("%.3f\tSWEET NAV: ACTION %s %s rep %d now %d" % (t, a, k, r, int(t * 1e9)))
+    def fp(t, d, g):
+        L.append("%.3f\tSWEET FPS: swaps 60 distinct %d max_gap_ms %d%s" % (t, d, g, (" distinct4k %d small_chg 1" % min(60, d + 10)) if dense else ""))
+    t = 1000.0
+    for r in (0, 1):
+        if r == 0:
+            fp(t + 0.2, 22, 100)   # tail of the previous action: 0.2 s of this bin inside page-scroll's window, not owned
+        mk(t, "page-scroll", "begin", r); fp(t + 1.0, 50, 40); fp(t + 2.0, 40, 90); mk(t + 2.0, "page-scroll", "end", r)
+        mk(t + 3.0, "idle-tap", "begin", r); fp(t + 4.0, 1, 0); mk(t + 4.0, "idle-tap", "end", r)
+        mk(t + 5.0, "app-launch", "begin", r)
+        if not drop_launch:
+            fp(t + 6.0, 30, 70); fp(t + 7.0, 32, 60)
+        mk(t + 7.0, "app-launch", "end", r)
+        fp(t + 10.5, 5, 2000)  # first frame of the next rep after idle: starts inside no window except the next page-scroll begin below
+        t += 10.0
+    return "\n".join(L) + "\n"
+
+
+def self_test():
+    got = []
+    ok = True
+    # busy-only gaps: page-scroll worst 90 (the 2000 ms lead bin is not jank), p5 40 (the 22-distinct tail bin is nobody's), page-scroll rate = the interior 50 fps bin (the 40 fps bin is a tail bin: the next line is 2 s later); app-launch has only a lead (30) and a tail (32) bin, so both are its rate, p50 31
+    rc = run(synth(), 3, got.append)
+    want = "RESULT: PASS gpu-nav actions=2 worst_gap_ms=90 p5_min=30.0 p50_min=31.0 unmeasured=none partial=none rate=distinct"
+    ok = ok and rc == 0 and got[-1] == want and any("idle-tap" in x and "no-anim" in x for x in got)
+    # a log without distinct4k (nav2 style) asked for the default dist4k falls back to distinct, says so in a NOTE line, and the RESULT line names the series used
+    ok = ok and any(x.startswith("NOTE: --rate dist4k asked") for x in got)
+    # a required action that did not animate must FAIL, not score silently
+    got2 = []
+    rc2 = run(synth(drop_launch=True), 3, got2.append)
+    ok = ok and rc2 == 1 and got2[-1].startswith("RESULT: FAIL gpu-nav unmeasured=app-launch(0/2)")
+    # the same run scores for a historical comparison with the flag, and says so
+    got3 = []
+    rc3 = run(synth(drop_launch=True), 3, got3.append, allow_unmeasured=True)
+    ok = ok and rc3 == 0 and "unmeasured=app-launch(0/2)" in got3[-1] and got3[-1].startswith("RESULT: PASS gpu-nav actions=1 ")
+    # the dense suffix of patch 0247 must not change the score and must add a table whose 4k column is the suffix (page-scroll interior bin: distinct 50 -> dense 60)
+    got5 = []
+    rc5 = run(synth(dense=True), 3, got5.append, rate="distinct")
+    ok = ok and rc5 == 0 and got5[-1] == want and any(x.startswith("page-scroll") and x.split()[2:6] == ["60.0", "50.0", "60.0", "1.00"] for x in got5) and any("dense witness" in x for x in got5)
+    ok = ok and not any("dense witness" in x for x in got)
+    # the default is dist4k: the same dense log scores on the 4k series (page-scroll interior bin 50 -> 60, app-launch 30 / 32 -> 40 / 42), no NOTE, rate=dist4k at the end
+    got6 = []
+    rc6 = run(synth(dense=True), 3, got6.append)
+    want4k = "RESULT: PASS gpu-nav actions=2 worst_gap_ms=90 p5_min=40.0 p50_min=41.0 unmeasured=none partial=none rate=dist4k"
+    ok = ok and rc6 == 0 and got6[-1] == want4k and not any(x.startswith("NOTE:") for x in got6) and got6[-1] != got5[-1]
+    ok = ok and any(x.startswith("page-scroll") and "2/2" in x and x.split()[3:5] == ["60.0", "60.0"] for x in got6) and any(x.startswith("app-launch") and "2/2" in x and x.split()[3:5] == ["41.0", "40.0"] for x in got6)
+    rc4 = run("", 3, got.append)   # no markers must FAIL loudly, never PASS
+    ok = ok and rc4 == 1 and got[-1].startswith("RESULT: FAIL gpu-nav no SWEET NAV markers")
+    if not ok:
+        print("\n".join(got + got2 + got3 + got5 + got6))
+        print("want: " + want)
+    print("RESULT: %s gpu-nav-score self-test" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    min_busy, fdir = 3, None
+    flags = {a for a in argv if a in ("--allow-unmeasured", "--require-frames")}
+    argv = [a for a in argv if a not in flags]
+    rate = "dist4k"
+    for opt in ("--min-busy", "--frames", "--rate"):
+        if opt in argv:
+            i = argv.index(opt)
+            if i + 1 >= len(argv):
+                print("RESULT: FAIL gpu-nav %s needs a value" % opt)
+                return 2
+            v = argv[i + 1]
+            argv = argv[:i] + argv[i + 2:]
+            if opt == "--min-busy":
+                min_busy = int(v)
+            elif opt == "--rate":
+                if v not in ("dist4k", "distinct"):
+                    print("RESULT: FAIL gpu-nav --rate %s (dist4k|distinct)" % v)
+                    return 2
+                rate = v
+            else:
+                fdir = v
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        print(__doc__)
+        return 2
+    p = args[0]
+    if os.path.isdir(p):
+        p = os.path.join(p, "usbnet.log")
+    print("log", p)
+    return run(open(p, "rb").read().decode("latin1"), min_busy, print, "--allow-unmeasured" in flags, fdir, "--require-frames" in flags, rate)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

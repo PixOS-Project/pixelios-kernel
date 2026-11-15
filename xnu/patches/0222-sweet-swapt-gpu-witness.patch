@@ -1,0 +1,105 @@
+SWEET per-swap GPU witnesses (patch 0222, T-42ce, LOG ONLY: no register access, no behaviour change; boot-arg sweetpace=1 as patch 0186): the SWEET SWAPT line gains `busy_us W wait_us W call1 NS calll NS done NS` = GPU job busy time and submit-blocked time summed since the previous swap, the entry time of the first and of the latest sweet_mali_submit call and of the latest completion seen (uptime ns, 0 = none; call1 0 = no job since the previous swap). Separates "late start" (call1 far after the previous swap or the vsync) from "long render" (busy_us, done - call1) for the 20-33 ms swap-gap tail (docs/reviews/T-23cb-proof.md; CA a3 is only the display time, docs/research/T-42ce-ca-vsync-callback-a3.md). Lock-free reads as sweet_mali_seq_peek; values can be one job stale. Code: bsd/dev/sweet_mali.c, bsd/dev/sweet_mali.h, iokit/Kernel/arm/SweetFramebuffer.cpp. Needs patches 0145, 0186, 0212.
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -266,6 +266,17 @@
+ #define HO_NB 7
+ static uint64_t perf_fine[PERF_FINE_N], perf_last_done_us, ho_n, ho_sum, ho_max, ho_far, ho_hist[HO_NB];
+ 
++/*
++ * Per-swap witnesses (patch 0221, T-42ce, LOG ONLY, no register access): monotonic sums and stamps, written under sm_lock with plain atomic stores, read lock-free by
++ * sweet_mali_swap_peek from the framebuffer swap path (SWEET SWAPT, boot-arg sweetpace=1). All times are uptime microseconds (now_us()). A value can be one job stale.
++ *   swt_busy_cum   sum of job busy time (submit -> completion seen), same measure as SWEET PERF busy_ms
++ *   swt_wait_cum   sum of the time submitters blocked behind the previous job (same measure as SWEET PERF submit_wait_ms)
++ *   swt_call1      entry time of the first sweet_mali_submit call since the last peek (0 = none): the GPU-side "render started" stamp
++ *   swt_calll      entry time of the latest submit call
++ *   swt_done       time the latest job completion was seen
++ */
++static uint64_t swt_busy_cum, swt_wait_cum, swt_call1, swt_calll, swt_done;
++
+ static void
+ perf_job_done(void)
+ {
+@@ -276,6 +287,8 @@
+ 	perf_hist[d < 100 ? 0 : d < 250 ? 1 : d < 500 ? 2 : d < 1000 ? 3 : d < 2000 ? 4 : d < 4000 ? 5 : 6]++;
+ 	perf_fine[d >= 1000 ? PERF_FINE_N - 1 : d / 50]++;   /* patch 0212 */
+ 	perf_last_done_us = now_us();
++	__atomic_store_n(&swt_busy_cum, swt_busy_cum + d, __ATOMIC_RELEASE);   /* patch 0221 */
++	__atomic_store_n(&swt_done, perf_last_done_us, __ATOMIC_RELEASE);
+ 	if (d >= PERF_LONG_US) {   /* patch 0210, lock held */
+ 		if (perf_long_n < PERF_LONG_N) {
+ 			perf_long[perf_long_n].seq = sm.busy_seq;
+@@ -694,6 +707,21 @@
+ 	return 0;
+ }
+ 
++/* patch 0221: lock-free snapshot of the per-swap witnesses (see swt_* above); call1 is taken and cleared (the caller is the single swap path), times in ns. 0 ok, ENXIO not up/dead. */
++int
++sweet_mali_swap_peek(struct sweet_mali_swap_peek *p)
++{
++	if (!sm.up || sm.dead) {
++		return ENXIO;
++	}
++	p->busy_us = __atomic_load_n(&swt_busy_cum, __ATOMIC_ACQUIRE);
++	p->wait_us = __atomic_load_n(&swt_wait_cum, __ATOMIC_ACQUIRE);
++	p->done_ns = __atomic_load_n(&swt_done, __ATOMIC_ACQUIRE) * 1000;
++	p->calll_ns = __atomic_load_n(&swt_calll, __ATOMIC_ACQUIRE) * 1000;
++	p->call1_ns = __atomic_exchange_n(&swt_call1, 0, __ATOMIC_ACQ_REL) * 1000;
++	return 0;
++}
++
+ /*
+  * SWEET MEM (patch 0212, T-bbb3, log only; ticket question: is memory the clock-independent limiter of the GPU path?). One kernel thread, started once after every
+  * selected CPU is up (SweetCPU.cpp, before launchd), binds itself to each online CPU in turn and measures cached kernel memory (kalloc_data, normal WB): read (sum of 64-bit
+@@ -1007,6 +1035,11 @@
+ 		c_lp = thread_get_runtime_self();
+ 	}
+ 	perf_subwait_us += now_us() - t0;
++	__atomic_store_n(&swt_wait_cum, swt_wait_cum + (now_us() - t0), __ATOMIC_RELEASE);   /* patch 0221, lock held */
++	if (__atomic_load_n(&swt_call1, __ATOMIC_RELAXED) == 0) {
++		__atomic_store_n(&swt_call1, t0, __ATOMIC_RELEASE);
++	}
++	__atomic_store_n(&swt_calll, t0, __ATOMIC_RELEASE);
+ 	if (sm.dead) {
+ 		lck_mtx_unlock(&sm_lock);
+ 		return ENXIO;
+--- a/bsd/dev/sweet_mali.h
++++ b/bsd/dev/sweet_mali.h
+@@ -34,6 +34,12 @@
+ int sweet_mali_wait(uint64_t seq, uint64_t timeout_us);
+ /* patch 0186: read-only, lock-free peek for logging (may be one job stale): last submitted and last completed seqno. 0 ok, ENXIO driver not up or dead. */
+ int sweet_mali_seq_peek(uint64_t *submitted, uint64_t *done);
++/* patch 0221 (log only): lock-free per-swap witnesses. busy_us/wait_us are monotonic sums (job busy; submitters blocked behind the previous job); call1_ns = entry of the first
++ * submit since the previous peek (0 = no submit), calll_ns = latest submit entry, done_ns = latest completion seen (all uptime ns, 0 = none yet). 0 ok, ENXIO not up or dead. */
++struct sweet_mali_swap_peek {
++	uint64_t busy_us, wait_us, call1_ns, calll_ns, done_ns;
++};
++int sweet_mali_swap_peek(struct sweet_mali_swap_peek *p);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -701,10 +701,20 @@
+ 			uint64_t tn, sq = 0, dn = 0;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &tn);
+ 			int ok = (sweet_mali_seq_peek(&sq, &dn) == 0);
++			struct sweet_mali_swap_peek sp;
++			int okp = (sweet_mali_swap_peek(&sp) == 0);   /* patch 0221 (T-42ce): per-swap GPU witnesses */
++			static uint64_t swapt_busy_prev, swapt_wait_prev;
+ 			swapt_lines++;
+-			if (ok) {
+-				IOLog("SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq %llu gpu_done %llu\n", (uint32_t)sweet_fb_swap_count, tn,
+-				    sweet_fb_last_vsync_ns, swapt_prev_ns, sq, dn);
++			if (ok && okp) {
++				/* busy/wait = sums since the previous SWAPT line (us); call1/calll/done = first/last submit entry and last completion since boot (ns, 0 = none; call1 0 = no job this frame) */
++				IOLog("SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq %llu gpu_done %llu busy_us %llu wait_us %llu call1 %llu calll %llu done %llu\n",
++				    (uint32_t)sweet_fb_swap_count, tn, sweet_fb_last_vsync_ns, swapt_prev_ns, sq, dn, sp.busy_us - swapt_busy_prev,
++				    sp.wait_us - swapt_wait_prev, sp.call1_ns, sp.calll_ns, sp.done_ns);
++				swapt_busy_prev = sp.busy_us;
++				swapt_wait_prev = sp.wait_us;
++			} else if (ok) {
++				IOLog("SWEET SWAPT: n %u now %llu vsync %llu prev %llu gpu_seq %llu gpu_done %llu busy_us - wait_us - call1 - calll - done -\n",
++				    (uint32_t)sweet_fb_swap_count, tn, sweet_fb_last_vsync_ns, swapt_prev_ns, sq, dn);
+ 			} else {
+ 				if (!swapt_unavail_said) {
+ 					swapt_unavail_said = 1;

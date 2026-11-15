@@ -454,13 +454,99 @@ static void test_unknown_requests_stall(void)
 	assert(req(0x80, 0xFE, 0, 0, 0, &data, &len) == USBPROTO_STALL);
 	/* Vendor request. */
 	assert(req(0x40, 0x00, 0, 0, 0, &data, &len) == USBPROTO_STALL);
-	/* SET_DESCRIPTOR is not implemented. */
+	/* SET_DESCRIPTOR is refused with a stall. */
 	assert(req(0x00, 0x07, 0, 0, 0, &data, &len) == USBPROTO_STALL);
 	/* Class requests must target the control interface 0. */
 	assert(req(0x21, 0x22, 3, 1, 0, &data, &len) == USBPROTO_STALL);
 	/* Device-to-host class direction is not supported. */
 	assert(req(0x21, 0x21, 0, 0, 7, &data, &len) == USBPROTO_STALL);
 }
+
+#ifdef USB_GADGET_SS
+/* ---- SuperSpeed set (USB_GADGET_SS) ---- */
+static void test_superspeed(void)
+{
+	static const uint8_t want_dev[18] = {
+		0x12, 0x01, 0x20, 0x03, 0x02, 0x00, 0x00, 0x09,
+		0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x01,
+	};
+	static const uint8_t want_bos[22] = {
+		5, 0x0f, 22, 0, 2,
+		7, 0x10, 2, 0, 0, 0, 0,
+		10, 0x10, 3, 0, 0x0f, 0x00, 1, 0, 0, 0,
+	};
+	const uint8_t *d = 0;
+	uint16_t n = 0, off = 0, bulk = 0, comp = 0;
+	uint8_t hs_dev[18], hs_cfg[67];
+
+	/* HS first: bytes served now must equal bytes served after SS reset */
+	usbproto_init(&st);
+	assert(st.ss == 0);
+	assert(req(0x80, 6, 0x0100, 0, 64, &d, &n) == USBPROTO_OK_DATA_IN);
+	memcpy(hs_dev, d, 18);
+	assert(req(0x80, 6, 0x0200, 0, 255, &d, &n) == USBPROTO_OK_DATA_IN && n == 67);
+	memcpy(hs_cfg, d, 67);
+	assert(req(0x80, 6, 0x0f00, 0, 255, &d, &n) == USBPROTO_STALL);	/* BOS at HS */
+	assert(req(0x80, 6, 0x0600, 0, 10, &d, &n) == USBPROTO_OK_DATA_IN);	/* qualifier at HS */
+	assert(req(0x00, 0x30, 0, 0, 6, &d, &n) == USBPROTO_STALL);	/* SET_SEL at HS */
+	assert(req(0x00, 0x31, 100, 0, 0, &d, &n) == USBPROTO_STALL);
+	assert(req(0x00, 3, 48, 0, 0, &d, &n) == USBPROTO_STALL);
+
+	st.ss = 1;
+	assert(req(0x80, 6, 0x0100, 0, 64, &d, &n) == USBPROTO_OK_DATA_IN && n == 18);
+	assert(memcmp(d, want_dev, 18) == 0);
+	assert(req(0x80, 6, 0x0100, 0, 8, &d, &n) == USBPROTO_OK_DATA_IN && n == 8);
+	assert(req(0x80, 6, 0x0f00, 0, 255, &d, &n) == USBPROTO_OK_DATA_IN && n == 22);
+	assert(memcmp(d, want_bos, 22) == 0);
+	assert(req(0x80, 6, 0x0f00, 0, 5, &d, &n) == USBPROTO_OK_DATA_IN && n == 5);
+	assert(req(0x80, 6, 0x0600, 0, 10, &d, &n) == USBPROTO_STALL);	/* qualifier */
+	assert(req(0x80, 6, 0x0700, 0, 255, &d, &n) == USBPROTO_STALL);	/* other speed */
+	assert(req(0x80, 6, 0x0301, 0x0409, 255, &d, &n) == USBPROTO_OK_DATA_IN &&
+	       d == usbproto_string1_desc);
+
+	/* config: wTotalLength == real length == array size, bLength walk */
+	assert(req(0x80, 6, 0x0200, 0, 255, &d, &n) == USBPROTO_OK_DATA_IN);
+	assert(n == USBPROTO_SS_CONFIG_DESC_LEN && n == 85);
+	assert(d[2] == 85 && d[3] == 0 && d[8] == 62);
+	for (off = 0; off < n; off += d[off]) {
+		assert(d[off] != 0 && off + d[off] <= n);
+		if (d[off + 1] == 5 && (d[off + 2] == 0x01 || d[off + 2] == 0x81)) {
+			assert(d[off + 4] == 0x00 && d[off + 5] == 0x04);	/* 1024 */
+			assert(d[off + d[off] + 0] == 6 && d[off + d[off] + 1] == 0x30);
+			assert(d[off + d[off] + 2] == 0);	/* bMaxBurst 0 */
+			bulk++;
+		}
+		if (d[off + 1] == 5 && d[off + 2] == 0x83) {
+			/* interrupt: wMaxPacketSize 8, companion wBytesPerInterval 8 */
+			assert(d[off + 4] == 8 && d[off + 5] == 0);
+			assert(d[off + 7] == 6 && d[off + 8] == 0x30);
+			assert(d[off + 11] == 8 && d[off + 12] == 0);
+			comp++;
+		}
+	}
+	assert(off == n && bulk == 2 && comp == 1);
+	/* interface 0 bytes up to the interrupt endpoint equal the HS set */
+	assert(memcmp(d + 9, hs_cfg + 9, 28) == 0);
+
+	/* USB 3 standard requests */
+	assert(req(0x00, 0x30, 0, 0, 6, &d, &n) == USBPROTO_OK_SET_SEL);
+	assert(req(0x00, 0x30, 0, 0, 5, &d, &n) == USBPROTO_STALL);
+	assert(req(0x00, 0x31, 100, 0, 0, &d, &n) == USBPROTO_OK_ISOCH_DELAY);
+	assert(req(0x00, 0x31, 100, 0, 2, &d, &n) == USBPROTO_STALL);
+	assert(req(0x00, 3, 48, 0, 0, &d, &n) == USBPROTO_STALL);	/* SET U1_ENABLE */
+	assert(req(0x00, 1, 49, 0, 0, &d, &n) == USBPROTO_STALL);	/* CLEAR U2_ENABLE */
+	assert(memcmp(st.line_coding, "\x00\xC2\x01\x00\x00\x00\x08", 7) == 0);
+
+	/* back to HS: bytes exactly as before */
+	st.ss = 0;
+	assert(req(0x80, 6, 0x0100, 0, 64, &d, &n) == USBPROTO_OK_DATA_IN);
+	assert(memcmp(d, hs_dev, 18) == 0);
+	assert(req(0x80, 6, 0x0200, 0, 255, &d, &n) == USBPROTO_OK_DATA_IN && n == 67);
+	assert(memcmp(d, hs_cfg, 67) == 0);
+	usbproto_init(&st);
+	assert(st.ss == 0);
+}
+#endif
 
 int main(void)
 {
@@ -480,6 +566,9 @@ int main(void)
 	test_set_line_coding();
 	test_set_control_line_state();
 	test_unknown_requests_stall();
+#ifdef USB_GADGET_SS
+	test_superspeed();
+#endif
 	printf("PASS usbproto host test: descriptor bytes, config walk "
 	       "(2 interfaces, 3 endpoints), string UTF-16, ep0 requests, "
 	       "truncation, deferred address, stalls\n");

@@ -209,6 +209,7 @@ static uint32_t upiu_submit(const struct ufs_dma *dma, enum upiu_type type, uint
 
 	ufs_wr(REG_UTRLDBR, bit);
 	uint64_t start = ticks();
+	/* bounded: ticks() - start > counter_freq() (1 s) returns 1 below */
 	for (;;) {
 		uint32_t dbr = ufs_rd(REG_UTRLDBR);
 		if (!(dbr & bit))
@@ -303,13 +304,13 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
 	uint32_t blocks = (nent * 128 + BLOCK - 1) / BLOCK;
 	for (uint32_t b = 0; b < blocks; b++) {
-		if (read_blocks(entry_lba + b, 1, ents + b * BLOCK)) {
+		if (read_blocks(entry_lba + b, 1, ents + (uintptr_t)b * BLOCK)) {
 			con_str("UFS PART", "read error");
 			return;
 		}
 	}
 	for (uint32_t i = 0; i < nent; i++) {
-		const uint8_t *e = ents + i * 128;
+		const uint8_t *e = ents + (uintptr_t)i * 128;
 		uint64_t first = le64(e + 32), last = le64(e + 40);
 		if (!first)
 			continue;
@@ -440,6 +441,7 @@ static unsigned uput_dec(char *dst, unsigned cap, unsigned pos, unsigned v)
 	do {
 		tmp[n++] = (char)('0' + v % 10);
 		v /= 10;
+		/* bounded: v /= 10 reaches 0 in <= 10 digits */
 	} while (v);
 	while (n > 0 && pos + 1 < cap)
 		dst[pos++] = tmp[--n];
@@ -495,6 +497,7 @@ static int ufs_slot_clear(const char *label)
 {
 	ufs_wr(REG_UTRLCLR, 3);
 	uint64_t start = ticks();
+	/* bounded: ticks() - start > counter_freq() (1 s) returns 0 below */
 	while (ufs_rd(REG_UTRLDBR) & 3) {
 		if (ticks() - start > counter_freq()) {
 			con_hex2(label, "dbr stuck=", ufs_rd(REG_UTRLDBR), "is=", ufs_rd(REG_IS));
@@ -525,6 +528,7 @@ static int ufs_takeover_list(const struct ufs_dma *dma, const char *label)
 	if (stale) {
 		ufs_wr(REG_UTRLCLR, stale);	/* BROKEN_REQ_LIST_CLR: write 1 */
 		uint64_t start = ticks();
+		/* bounded: ticks() - start > counter_freq() (1 s) returns 0 below */
 		while (ufs_rd(REG_UTRLDBR)) {
 			if (ticks() - start > counter_freq()) {
 				con_str(label, "stale doorbell stuck: stop");
@@ -704,7 +708,7 @@ static void ufs_full_sequence(struct ufs_attempt *a)
 		return;
 	uint32_t blocks = (nent * 128 + BLOCK - 1) / BLOCK;
 	for (uint32_t b = 0; b < blocks; b++) {
-		if (read_blocks_dma(&a->dma, a->dword_gran, 0, elba + b, 1, a->dma.entries + b * BLOCK) == 1) {
+		if (read_blocks_dma(&a->dma, a->dword_gran, 0, elba + b, 1, a->dma.entries + (uintptr_t)b * BLOCK) == 1) {
 			ufs_dump_state(a->label, &a->dma);
 			ufs_slot_clear(a->label);
 			return;
@@ -712,7 +716,7 @@ static void ufs_full_sequence(struct ufs_attempt *a)
 	}
 	uint64_t ud_first = 0, ud_last = 0;
 	for (uint32_t i = 0; i < nent; i++) {
-		const uint8_t *e = a->dma.entries + i * 128;
+		const uint8_t *e = a->dma.entries + (uintptr_t)i * 128;
 		uint64_t first = le64(e + 32), last = le64(e + 40);
 		if (!first)
 			continue;
@@ -846,7 +850,8 @@ void test_ufs_bluejay(uintptr_t dtb)
 	else
 		con_hex2("UFS MAP", "banks=", mm.n_banks, "rsv=", mm.n_reserved);
 
-	extern char _head[], _end[], _stack_top[];
+	/* Linker-script symbols: _head = start.S:4 label (ENTRY, shim.ld:1), _stack_top = shim.ld:15, _end = shim.ld:19; names fixed by start.S/shim.ld/build.sh. */
+	extern char _head[], _end[], _stack_top[]; // NOLINT(bugprone-reserved-identifier)
 	uintptr_t sp = (uintptr_t)&cap;	/* somewhere inside the primary stack */
 	report_placement("IMG", (uintptr_t)_head, (uintptr_t)_end - (uintptr_t)_head, &mm);
 	report_placement("STK", sp, (uintptr_t)_stack_top - sp, &mm);

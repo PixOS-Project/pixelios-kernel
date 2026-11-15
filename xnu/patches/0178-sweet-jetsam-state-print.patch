@@ -1,0 +1,95 @@
+sweet-jetsam-state-print (research 50 item 7, driverkitd sig 9): READ-ONLY diagnostic, extends 0127. Two SWEET JETSAM lines:
+(1) in the fatal kill branch of memorystatus_on_ledger_footprint_exceeded, after 0127's line: the jetsam state that made the limit fatal
+(memlimit_active/fatal as passed by the ledger callback, p_memstat_memlimit_active/inactive, effective/requested priority,
+p_memstat_dirty, p_memstat_state) and the footprint parts in KB (internal, internal_compressed, iokit_mapped, page_table; accessors in
+osfmk/kern/bsd_kern.c:594-650, declared osfmk/kern/task.h:976-984);
+(2) in task_set_phys_footprint_limit_internal (osfmk/kern/task.c), every CHANGE of a task's phys_footprint limit (the unchanged early
+return prints nothing): name[pid], old -> new MB (-1 = none), active, fatal, footprint KB; printed after task_unlock. The -1 (remove)
+branch prints when the stored limit or the active/fatal flag changes (review r1 F4). The kill line also prints the cached p_memstat_memlimit (F6).
+Question it answers: is driverkitd inactive (fatal 6 MB InactiveHard from the D22 jetsam plist) because launchd never marks it
+dirty/active on this port, or does stock behave the same and the 4,028,544 B AppleBCMWLAN dext read (x0 0x3d7880 at the kill) is what
+differs? Changes no limit, no flag and no kill decision. Guarded by ARM64_BOARD_CONFIG_SWEET. Not compiled locally, not run on hardware.
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index be37106..f399a8d 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -4257,6 +4257,15 @@ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_
+ 			    p->p_name, proc_getpid(p),
+ 			    get_task_phys_footprint_limit(proc_task(p)) >> 20,
+ 			    get_task_phys_footprint(proc_task(p)) >> 20);
++			/* 0178: which jetsam state made the limit fatal, and what the footprint is made of (KB) */
++			printf("SWEET JETSAM: %s[%d] kill state: memlimit_active %d fatal %d limits cur %d active %d inactive %d MB "
++			    "prio eff %d req %d dirty 0x%x state 0x%x; KB internal %llu compressed %llu iokit_mapped %llu page_table %llu\n",
++			    p->p_name, proc_getpid(p), (int)memlimit_is_active, (int)memlimit_is_fatal,
++			    p->p_memstat_memlimit, p->p_memstat_memlimit_active, p->p_memstat_memlimit_inactive,
++			    p->p_memstat_effectivepriority, p->p_memstat_requestedpriority,
++			    p->p_memstat_dirty, p->p_memstat_state,
++			    get_task_internal(proc_task(p)) >> 10, get_task_internal_compressed(proc_task(p)) >> 10,
++			    get_task_iokit_mapped(proc_task(p)) >> 10, get_task_page_table(proc_task(p)) >> 10);
+ 		}
+ #endif
+ 		jetsam_reason = os_reason_create(OS_REASON_JETSAM, JETSAM_REASON_MEMORY_PERPROCESSLIMIT);
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 67c5f79..ade34d4 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -6922,6 +6922,19 @@ task_convert_phys_footprint_limit(
+ }
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0178: log every change of a task's phys_footprint limit (who, when, active/fatal), printed after task_unlock */
++static void
++sweet_jetsam_limit_log(task_t task, ledger_amount_t old, int new_limit_mb, boolean_t is_active, boolean_t is_fatal)
++{
++	void *bsd_info = get_bsdtask_info(task);
++	printf("SWEET JETSAM: limit %s[%d] %lld -> %d MB active %d fatal %d footprint %llu KB\n",
++	    bsd_info ? proc_name_address(bsd_info) : "?", task_pid(task),
++	    (old == LEDGER_LIMIT_INFINITY) ? -1LL : (long long)(old >> 20), new_limit_mb,
++	    (int)is_active, (int)is_fatal, get_task_phys_footprint(task) >> 10);
++}
++#endif
++
+ kern_return_t
+ task_set_phys_footprint_limit_internal(
+ 	task_t task,
+@@ -6932,6 +6945,9 @@ task_set_phys_footprint_limit_internal(
+ {
+ 	ledger_amount_t old;
+ 	kern_return_t ret;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	boolean_t sweet_flags_changed;
++#endif
+ 
+ 	ret = ledger_get_limit(task->ledger, task_ledgers.phys_footprint, &old);
+ 
+@@ -6959,9 +6975,19 @@ task_set_phys_footprint_limit_internal(
+ 		    max_task_footprint ? (uint8_t)max_task_footprint_warning_level : 0);
+ 
+ 		task_lock(task);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_flags_changed = (task_get_memlimit_is_active(task) != memlimit_is_active) ||
++		    (task_get_memlimit_is_fatal(task) != memlimit_is_fatal);
++#endif
+ 		task_set_memlimit_is_active(task, memlimit_is_active);
+ 		task_set_memlimit_is_fatal(task, memlimit_is_fatal);
+ 		task_unlock(task);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_flags_changed ||
++		    old != (max_task_footprint ? (ledger_amount_t)max_task_footprint : LEDGER_LIMIT_INFINITY)) {
++			sweet_jetsam_limit_log(task, old, -1, memlimit_is_active, memlimit_is_fatal);
++		}
++#endif
+ 
+ 		return KERN_SUCCESS;
+ 	}
+@@ -6994,6 +7020,9 @@ task_set_phys_footprint_limit_internal(
+ 	}
+ 
+ 	task_unlock(task);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_jetsam_limit_log(task, old, new_limit_mb, memlimit_is_active, memlimit_is_fatal);
++#endif
+ 
+ 	return KERN_SUCCESS;
+ }

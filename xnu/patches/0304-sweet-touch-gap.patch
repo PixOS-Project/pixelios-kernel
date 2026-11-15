@@ -1,0 +1,23 @@
+SWEET TOUCH: patch 0304 (demo 2026-11-11, user: touch is a default for every boot), rule 7 GAP lines: 'TOUCH GAP: controller did not answer at boot' when the FTM5 identify fails, and 'TOUCH GAP: sweettouch=N: touch driver switched off by boot-arg' when sweettouch<=0 is passed. Log lines only: no register, bus or firmware access added. Applies after 0088-0095.
+
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index 8b37930..df8c82f 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -1125,6 +1125,8 @@ tg_run(void)
+ 	}
+ 	if (!ok) {
+ 		printf("SWEET TOUCH: phase 1 result: chip did not answer; nothing else is touched\n");
++		/* patch 0304: rule 7 - touch is a default for every boot, so a silent controller is a GAP, not a quiet log line */
++		printf("TOUCH GAP: controller did not answer at boot (identify failed): no touch input this boot; check the rails (shim --touch-probe=rails) and sweettouchmux/clk/cs/poke\n");
+ 		return;
+ 	}
+ 	if (tg.mode < 2) {
+@@ -1188,6 +1190,7 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouch", &mode, sizeof(mode));
+ 	if (mode <= 0) {
+ 		printf("SWEET TOUCH: gs101 driver disabled (sweettouch=%d)\n", mode);
++		printf("TOUCH GAP: sweettouch=%d: touch driver switched off by boot-arg (default is on): no touch input this boot\n", mode);
+ 		return;
+ 	}
+ 	if (mode > 2) {

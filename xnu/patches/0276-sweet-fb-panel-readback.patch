@@ -1,0 +1,179 @@
+SWEET panel readback (patch 0276, sprint GPU 2026-11-09; user: prove frames from the scanout itself, camera only as fallback): read-only sysctl kern.sweetpanel returns the panel memory the display controller scans out (8 x u32 header 'SPNL', w, h, row bytes, logical offset x/y, presents, swaps; then w*4-byte rows), read after a CPU cache clean+invalidate of its range so the bytes are DRAM's, serialised with the vsync-timer panel copy by one lock; sweet_panel_snapshot(label) keeps half-resolution copies in a ring of 32 slots (kern.sweetpanelsel picks one, kern.sweetpanelcount counts). Read only: no register, no store to hardware.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -52,6 +52,16 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/sysctl.h>
++
++/* patch 0276 (sprint GPU 2026-11-09, user: frame proof without depending on the camera): read-only sysctl kern.sweetpanel returns the panel memory
++ * (what the display controller scans out) after a CPU cache clean+invalidate of its range, so the bytes are DRAM's. Header 8 x u32: 'SPNL', width,
++ * height, row bytes, logical offset x, y, presents copied so far, swaps so far (low 32). Serialised with the panel copy of the vsync timer. Read only:
++ * no register, no store to hardware (the cache clean is CPU cache maintenance). */
++class AppleCLCD;
++static void sweet_panel_register(AppleCLCD *fb);
++static void sweet_panel_lock(void);
++static void sweet_panel_unlock(void);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -133,6 +143,8 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	int panelReadback(void *req);   /* patch 0276 */
++	void panelSnapshot(const char *label);   /* patch 0276 */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -253,6 +265,7 @@
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	sweet_panel_register(this);   /* patch 0276 */
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -451,7 +464,9 @@
+ 	fb->fVsyncIdle = !again;
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		sweet_panel_lock();   /* patch 0276: a panel readback never sees half a copy */
+ 		fb->present(rec);
++		sweet_panel_unlock();
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	if (again) {
+@@ -1422,3 +1437,131 @@
+ 	return ret;
+ }
+ #endif /* SWEET */
++
++/* ---- patch 0276: panel readback ---- */
++static AppleCLCD *gSweetPanelFB;
++static IOLock *gSweetPanelLock;
++static void
++sweet_panel_register(AppleCLCD *fb)
++{
++	gSweetPanelLock = IOLockAlloc();
++	gSweetPanelFB = fb;
++}
++static void
++sweet_panel_lock(void)
++{
++	if (gSweetPanelLock) {
++		IOLockLock(gSweetPanelLock);
++	}
++}
++static void
++sweet_panel_unlock(void)
++{
++	if (gSweetPanelLock) {
++		IOLockUnlock(gSweetPanelLock);
++	}
++}
++/* Snapshots taken by the kernel at the moment of a capture request (patch 0275 calls sweet_panel_snapshot): a ring of 32 half-resolution slots
++ * (2x2 box average of the panel, BGRA), allocated at the first snapshot (32 x 2.6 MB). kern.sweetpanelsel = -1 (live, full resolution) or a slot
++ * number; kern.sweetpanelcount = snapshots taken so far (slot = n % 32). */
++#define SWEET_PANEL_SLOTS 32
++static uint8_t *gSweetSnap[SWEET_PANEL_SLOTS];
++static char gSweetSnapLbl[SWEET_PANEL_SLOTS][48];
++static uint32_t gSweetSnapN, gSweetSnapW, gSweetSnapH, gSweetSnapPres[SWEET_PANEL_SLOTS];
++static int gSweetPanelSel = -1;
++SYSCTL_INT(_kern, OID_AUTO, sweetpanelsel, CTLFLAG_RW | CTLFLAG_LOCKED, &gSweetPanelSel, 0, "patch 0276: -1 live panel, else snapshot slot");
++SYSCTL_UINT(_kern, OID_AUTO, sweetpanelcount, CTLFLAG_RD | CTLFLAG_LOCKED, &gSweetSnapN, 0, "patch 0276: panel snapshots taken");
++
++void
++AppleCLCD::panelSnapshot(const char *label)
++{
++	if (fPixels == 0 || fWidth < 2 || fHeight < 2) {
++		return;
++	}
++	uint32_t w = fWidth / 2, h = fHeight / 2, slot = gSweetSnapN % SWEET_PANEL_SLOTS;
++	if (gSweetSnap[slot] == NULL) {
++		gSweetSnap[slot] = (uint8_t *)IOMallocData((vm_size_t)w * h * 4);
++		if (gSweetSnap[slot] == NULL) {
++			IOLog("SWEET GAP: FB panel snapshot slot %u: no memory\n", slot);
++			return;
++		}
++	}
++	sweet_panel_lock();
++	flush_dcache64((addr64_t)fPixels, (unsigned)((uint64_t)fRowBytes * fHeight), FALSE);
++	for (uint32_t y = 0; y < h; y++) {
++		const uint8_t *r0 = (const uint8_t *)(fPixels + (uint64_t)(2 * y) * fRowBytes), *r1 = r0 + fRowBytes;
++		uint8_t *d = gSweetSnap[slot] + (uint64_t)y * w * 4;
++		for (uint32_t x = 0; x < w; x++) {
++			for (int c = 0; c < 4; c++) {
++				d[4 * x + c] = (uint8_t)((r0[8 * x + c] + r0[8 * x + 4 + c] + r1[8 * x + c] + r1[8 * x + 4 + c] + 2) / 4);
++			}
++		}
++	}
++	uint32_t pres = sweet_fb_present_count;
++	sweet_panel_unlock();
++	gSweetSnapW = w;
++	gSweetSnapH = h;
++	gSweetSnapPres[slot] = pres;
++	strlcpy(gSweetSnapLbl[slot], label ? label : "", sizeof(gSweetSnapLbl[slot]));
++	gSweetSnapN++;
++	IOLog("SWEET FB: panel snapshot %u slot %u label %s presents %u\n", gSweetSnapN - 1, slot, gSweetSnapLbl[slot], pres);
++}
++
++int
++AppleCLCD::panelReadback(void *reqv)
++{
++	struct sysctl_req *req = (struct sysctl_req *)reqv;
++	int sel = gSweetPanelSel;
++	if (sel >= 0) {   /* a stored snapshot: header 'SPNH', w, h, row bytes, logical offset x/y of the FULL panel, presents, slot; 48-byte label; pixels */
++		if (sel >= SWEET_PANEL_SLOTS || gSweetSnap[sel] == NULL) {
++			return ENOENT;
++		}
++		uint32_t sh[8] = { 0x484e5053u, gSweetSnapW, gSweetSnapH, gSweetSnapW * 4, (uint32_t)fOffX, (uint32_t)fOffY, gSweetSnapPres[sel], (uint32_t)sel };
++		size_t stotal = sizeof(sh) + 48 + (size_t)gSweetSnapW * 4 * gSweetSnapH;
++		if (req->oldptr == USER_ADDR_NULL) {
++			return SYSCTL_OUT(req, NULL, stotal);
++		}
++		int e = SYSCTL_OUT(req, sh, sizeof(sh));
++		if (!e) e = SYSCTL_OUT(req, gSweetSnapLbl[sel], 48);
++		if (!e) e = SYSCTL_OUT(req, gSweetSnap[sel], (size_t)gSweetSnapW * 4 * gSweetSnapH);
++		return e;
++	}
++	uint32_t hdr[8] = { 0x4c4e5053u /* 'SPNL' */, fWidth, fHeight, fWidth * 4, (uint32_t)fOffX, (uint32_t)fOffY, sweet_fb_present_count, (uint32_t)sweet_fb_swap_count };
++	size_t total = sizeof(hdr) + (size_t)fWidth * 4 * fHeight;
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, total);
++	}
++	if (fPixels == 0) {
++		return ENODEV;
++	}
++	sweet_panel_lock();
++	flush_dcache64((addr64_t)fPixels, (unsigned)((uint64_t)fRowBytes * fHeight), FALSE);   /* clean+invalidate: read DRAM, what the display reads */
++	int err = SYSCTL_OUT(req, hdr, sizeof(hdr));
++	for (uint32_t y = 0; y < fHeight && err == 0; y++) {
++		err = SYSCTL_OUT(req, (const void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++	}
++	sweet_panel_unlock();
++	return err;
++}
++static int
++sweet_panel_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr) {
++		return EPERM;
++	}
++	if (gSweetPanelFB == NULL) {
++		return ENODEV;
++	}
++	return gSweetPanelFB->panelReadback(req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetpanel, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_panel_sysctl, "S",
++    "sweet panel memory readback (patch 0276)");
++
++extern "C" void
++sweet_panel_snapshot(const char *label)   /* patch 0276: called by the nav capture repetition (SweetHID.cpp, patch 0275) */
++{
++	if (gSweetPanelFB != NULL) {
++		gSweetPanelFB->panelSnapshot(label);
++	}
++}

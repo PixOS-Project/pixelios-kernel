@@ -117,5 +117,6 @@ static inline const char *gpu_gate_name(enum gpu_gate g)
 int try_read32(uintptr_t address, uint32_t *value);
 
 void gpu_probe_cmu(void);	/* the CMU_G3D part again (read-only; prints nothing but PMU_G3D_STAT if the top domain is off) */
+int gpu_probe_pmu_on(void);	/* read-only: 1 only if PMU_G3D_STAT and PMU_EMB_STAT both read with bit 0 set (printed); 0 otherwise and in non-GPU builds (gpuclk.c, review M1) */
 void gpu_probe_shaders(void);	/* read-only: SHADER/TILER/L2 READY + SHADER_PWRTRANS, only if both PMU domains are on (--gpu-rail-on, before the restore) */
 void gpu_probe(void);	/* prints PMU/CMU state, then GPU registers only if the gate is open */

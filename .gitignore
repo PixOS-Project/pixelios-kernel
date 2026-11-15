@@ -1,8 +1,8 @@
 # build output and local state
 shim/out/
 logs/
+/logs
 .env
-tools/third_party
 __pycache__/
 *.pyc
 # device dumps: persist/modemst/fsg hold IMEI + calibration; the live device tree holds the serial
@@ -10,9 +10,16 @@ backup/
 dtb/
 recovery/
 # Apple artifacts and local research
-/research/
+/research
 *.ipsw
 *.dmg
 *.im4p
 .site/
 site/
+# agent hook copies written by tools/install-hooks (never committed)
+.claude/
+tools/public-push-guard.urls
+
+# T-dd93: private offload host values (tools/offload-host.conf.example is the committed template)
+tools/offload-host.conf
+tools/public-push-guard.identities

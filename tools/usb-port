@@ -1,0 +1,56 @@
+#!/bin/bash
+# Which USB port the phone is on, from sysfs (read-only; no adb/fastboot, never touches the phone). AP-177.
+#   tools/usb-port [--args "BOOT-ARGS"]
+# Prints one line per Google device (idVendor 18d1): `usb-port: <busid> speed=<Mb/s> product=<idProduct>`.
+# With --args (tools/xrun passes the boot-args that reach XNU: its sweetusb= base word (2 with usbnet, else 0) + the final boot-args, before the build and the phone lock):
+#   gadget = the LAST word sweetusb=V is exactly sweetusb=2 (the gs101 USB gadget; XNU keeps the last value). Without a gadget nothing below is judged
+#   (RESULT ... gadget=off), except that a malformed sweetusb3 word is always an ERROR.
+#   sweetusb3: the LAST word `sweetusb3` / `sweetusb3=V` wins (XNU: bare word = 1, last assignment wins; read pexpert/gen/bootargs.c). Only exactly sweetusb3=0
+#   and sweetusb3=1 are accepted (a bare word counts as 1); ANY other form (=2, =10, =01, =0x1, =, =x) is RESULT: ERROR on every link
+#   ("use sweetusb3=0 or 1"): XNU parses numbers, patch 0173 treats everything but 1 as SuperSpeed off with a GAP line, this tool does not guess. Default 1 (patch 0173 / user order R27).
+#   gadget, speed >= 5000, usb3 = 1  -> PASS
+#   gadget, speed >= 5000, usb3 = 0  -> PASS + loud `USB3 WARN: sweetusb3=0 opt-out on a 5000 Mb/s link: HS-only gadget, expect 0 B of USB log (AP-177)` (explicit opt-out, user order R27)
+#   gadget, speed <  5000, usb3 = 1  -> PASS + loud `USB3 WARN: SuperSpeed requested on a 480 Mb/s link (BUS): XNU connects at high speed (usb3-ss-1)`
+#   The RESULT line carries the effective sweetusb3=0|1 (tools/xrun marks sweetusb3=0 as OPT-OUT in the run summary).
+# Last line: RESULT: PASS|ERROR ... ; exit 0, or 2 when there is no 18d1 device, more than one, or a malformed sweetusb3 word.
+# Env (tests): SYSFS_USB (default /sys/bus/usb/devices). Sim seam (docs/plans/PLAN-SIM.md SIM-R5): XRUN_SYSFS_USB, the same override tools/xrun and tools/xrun_report.py read; SYSFS_USB wins when both are set;
+#   an active XRUN_SYSFS_USB prints `SIM SEAM ACTIVE: XRUN_SYSFS_USB=DIR` on stderr (stdout, the part tools/xrun parses, is unchanged). Unset = unchanged.
+# T-7dff:help: -h/--help prints this header and exits 0 before anything runs
+case "${1:-}" in -h|--help) printf 'usage: %s\n' "${0##*/}"; sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0;; esac
+set -uo pipefail
+[ -z "${XRUN_SYSFS_USB:-}" ] || echo "SIM SEAM ACTIVE: XRUN_SYSFS_USB=$XRUN_SYSFS_USB" >&2
+sys=${SYSFS_USB:-${XRUN_SYSFS_USB:-/sys/bus/usb/devices}}
+args=""; have=0
+while [ $# -gt 0 ]; do case "$1" in
+	--args) [ $# -ge 2 ] || { echo "RESULT: ERROR --args needs a value"; exit 2; }; args=$2; have=1; shift 2 ;;
+	*) echo "RESULT: ERROR unknown argument '$1' (usage: tools/usb-port [--args \"BOOT-ARGS\"])"; exit 2 ;; esac; done
+gadget=0; usb3=1; optout=""
+if [ "$have" = 1 ]; then
+	last=""; read -ra words <<< "$args"
+	for w in ${words[@]+"${words[@]}"}; do case "$w" in
+		sweetusb=*) [ "$w" = sweetusb=2 ] && gadget=1 || gadget=0 ;;
+		sweetusb3|sweetusb3=*) last=$w ;; esac; done   # last one wins, like the XNU parser (review r1 F4); a bare word is 1 (getval, bootargs.c:483-484)
+	case "$last" in
+		""|sweetusb3|sweetusb3=1) usb3=1 ;;
+		sweetusb3=0) usb3=0; optout=$last ;;
+		*) echo "RESULT: ERROR usbport: unsupported '$last' (only exactly sweetusb3=0 or sweetusb3=1 are accepted; XNU parses numbers, =01/=0x1/=2/=10/= are not guessed): use sweetusb3=0 or 1"; exit 2 ;; esac
+fi
+n=0; bus=""; speed=""
+for d in "$sys"/*; do
+	[ "$(cat "$d/idVendor" 2>/dev/null)" = 18d1 ] || continue
+	b=${d##*/}; s=$(cat "$d/speed" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null)
+	echo "usb-port: $b speed=${s:-?} product=${p:-?}"
+	n=$((n + 1)); bus=$b; speed=$s
+done
+[ "$n" = 1 ] || { echo "RESULT: ERROR usbport: $n Google (18d1) USB devices in $sys, need exactly one (phone off the bus, or a second phone attached)"; exit 2; }
+[[ "$speed" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "RESULT: ERROR usbport $bus: unreadable speed '$speed'"; exit 2; }
+mbps=${speed%%.*}
+if [ "$have" = 1 ]; then
+	if [ "$gadget" = 0 ]; then echo "RESULT: PASS usbport $bus speed=$speed gadget=off (no sweetusb=2: sweetusb3 not judged)"; exit 0; fi
+	if [ "$mbps" -ge 5000 ] && [ "$usb3" = 0 ]; then
+		echo "USB3 WARN: $optout opt-out on a $speed Mb/s link: HS-only gadget, expect 0 B of USB log (AP-177)"; fi
+	if [ "$mbps" -lt 5000 ] && [ "$usb3" = 1 ]; then
+		echo "USB3 WARN: SuperSpeed requested on a $speed Mb/s link ($bus): XNU connects at high speed (usb3-ss-1)"; fi
+	echo "RESULT: PASS usbport $bus speed=$speed sweetusb3=$usb3"; exit 0
+fi
+echo "RESULT: PASS usbport $bus speed=$speed"

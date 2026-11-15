@@ -1,0 +1,126 @@
+SWEET Bluetooth kctl stream type + socket witnesses (patch 0213, ticket T-258f, W-BTUP; docs/research/BT-S5-bluetoothd-transport-open.md). T0 (capstone of the stock binaries): bluetoothd (0x100066cd8) and BlueTool (0x10001da70) both call socket(PF_SYSTEM = 32, SOCK_STREAM = 1, SYSPROTO_CONTROL = 2), not SOCK_DGRAM as patch 0189 assumed; ctl_setup_kctl (bsd/kern/kern_control.c) returns EPROTOTYPE for a control registered without CTL_FLAG_REG_SOCK_STREAM before our connect callback runs, so bluetoothd's connect failed with no BT GAP line and it crashed with reason 1201 (bt-up2). Knob: both controls (com.apple.uart.bluetooth, com.apple.uart.sk.bluetooth) are registered with CTL_FLAG_REG_SOCK_STREAM (no register store, no hardware access). Witnesses (printf only, first 32/64 lines, bluetoothd and BlueTool only in kern_control.c): 'BT KCTL: <proc>[pid] socket attach / ioctl CTLIOCGINFO / connect ... error N' in kern_control.c and one 'BT KCTL: <proc> connect/getsockopt/setsockopt/send/disconnect' line per callback in sweet_bt.c. Applies after 0189. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -49,6 +49,17 @@ static struct {
+ } sbt;
+ 
+ /* One loud line per kind at the first 8 calls, then at every power of two, with the running count (rule 8, AP-102). */
++/* patch 0213 witness (T-258f): one line per kctl callback, first 32 per call site, with the calling process name; log only */
++#define SBT_TRACE(fmt, ...) do { \
++	static int n_; \
++	if (n_ < 32) { \
++		char pn_[20]; \
++		n_++; \
++		proc_selfname(pn_, sizeof(pn_)); \
++		printf("BT KCTL: %s " fmt "\n", pn_, ##__VA_ARGS__); \
++	} \
++} while (0)
++
+ #define SBT_GAP(slot, fmt, ...) do { \
+ 	uint32_t n_ = __atomic_add_fetch(&sbt.gap_n[slot], 1, __ATOMIC_RELAXED); \
+ 	if (n_ <= 8 || (n_ & (n_ - 1)) == 0) { \
+@@ -101,6 +112,7 @@ sbt_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
+ {
+ int i = sbt_index(ref);
+ 
++	SBT_TRACE("connect %s sc_id %u sc_unit %u", i == 0 ? SBT_CTL_PLAIN : i == 1 ? SBT_CTL_SK : "?", sac->sc_id, sac->sc_unit);
+ 	if (i < 0) {
+ 		return EINVAL;
+ 	}
+@@ -124,6 +136,7 @@ sbt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
+ #pragma unused(unit, unitinfo)
+ 	int i = sbt_index(ref);
+ 
++	SBT_TRACE("disconnect control %d", i);
+ 	if (i >= 0 && __atomic_exchange_n(&sbt.busy[i], 0, __ATOMIC_ACQ_REL)) {
+ 		__atomic_store_n(&sbt.uart_busy, 0, __ATOMIC_RELEASE);      /* only the holder frees the UART */
+ 	}
+@@ -136,6 +149,7 @@ sbt_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
+ #pragma unused(ref, unit, unitinfo, flags)
+ 	errno_t err = 0;
+ 
++	SBT_TRACE("send first mbuf %zu bytes", mbuf_len(m));
+ 	if (sbt.ops == NULL || sbt.ops->tx == NULL) {
+ 		SBT_GAP(G_TX, "kctl read/write path absent (H4 bytes not relayed)");
+ 		err = ENXIO;
+@@ -152,6 +166,7 @@ static errno_t
+ sbt_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
+ {
+ #pragma unused(ref, unit, unitinfo)
++	SBT_TRACE("setsockopt opt %#x len %zu", (unsigned)opt, len);
+ 	if ((u_int32_t)opt != SBT_TIOCSETA) {
+ 		SBT_GAP(G_OPT, "kctl setsockopt %#x unknown (only TIOCSETA is a row); refused", (unsigned)opt);
+ 		return ENOPROTOOPT;
+@@ -171,6 +186,7 @@ static errno_t
+ sbt_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
+ {
+ #pragma unused(ref, unit, unitinfo)
++	SBT_TRACE("getsockopt opt %#x len %zu", (unsigned)opt, *len);
+ 	if ((u_int32_t)opt != SBT_TIOCGETA) {
+ 		SBT_GAP(G_OPT, "kctl getsockopt %#x unknown (only TIOCGETA is a row); refused", (unsigned)opt);
+ 		return ENOPROTOOPT;
+@@ -279,7 +295,10 @@ sweet_bt_init(void)
+ 
+ 		bzero(&reg, sizeof(reg));
+ 		strlcpy(reg.ctl_name, names[i], sizeof(reg.ctl_name));
+-		reg.ctl_flags = 0;      /* no CTL_FLAG_PRIVILEGED: bluetoothd runs as mobile (O13); SOCK_DGRAM [bin M10] */
++		/* no CTL_FLAG_PRIVILEGED: bluetoothd runs as mobile (O13). CTL_FLAG_REG_SOCK_STREAM (patch 0213, T-258f): bluetoothd (0x100066cd8) and BlueTool (0x10001da70)
++		 * both call socket(PF_SYSTEM, SOCK_STREAM = 1, SYSPROTO_CONTROL); a control without this flag only accepts SOCK_DGRAM and ctl_setup_kctl returns
++		 * EPROTOTYPE before our connect callback runs (bt-up2: connect failed silently -> reason 1201) [read from source: capstone of both binaries + kern_control.c:441] */
++		reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+ 		reg.ctl_connect = sbt_connect;
+ 		reg.ctl_disconnect = sbt_disconnect;
+ 		reg.ctl_send = sbt_send;
+diff --git a/bsd/kern/kern_control.c b/bsd/kern/kern_control.c
+--- a/bsd/kern/kern_control.c
++++ b/bsd/kern/kern_control.c
+@@ -291,10 +291,31 @@ kcb_delete(struct ctl_cb *kcb)
+  * detach not necessary
+  * we need a pcb for the per socket mutex
+  */
++/*
++ * patch 0213 (T-258f, W-BTUP): witness for the Bluetooth daemons' kctl socket lifecycle (socket attach, ioctl, connect result with errno),
++ * bluetoothd 1201 = one of socket/CTLIOCGINFO/connect failed and none of them logged. Log only, first 64 lines, only for the bluetoothd and BlueTool processes.
++ */
++static void
++sweet_kctl_witness(const char *what, struct socket *so, unsigned long arg, int error)
++{
++	static int n;
++	char pname[20];
++
++	proc_selfname(pname, sizeof(pname));
++	if (strncmp(pname, "bluetoothd", 10) != 0 && strncmp(pname, "BlueTool", 8) != 0) {
++		return;
++	}
++	if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) >= 64) {
++		return;
++	}
++	printf("BT KCTL: %s[%d] %s so_type %d arg %#lx error %d\n", pname, proc_selfpid(), what, so != NULL ? so->so_type : -1, arg, error);
++}
++
+ static int
+ ctl_attach(struct socket *so, int proto, struct proc *p)
+ {
+ #pragma unused(proto, p)
++	sweet_kctl_witness("socket attach", so, (unsigned long)proto, 0);
+ 	struct ctl_cb *kcb = 0;
+ 
+ 	kcb = kalloc_type(struct ctl_cb, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+@@ -659,6 +680,7 @@ end:
+ 		lck_mtx_unlock(&ctl_mtx);
+ 	}
+ out:
++	sweet_kctl_witness("connect", so, (nam != NULL && nam->sa_len == sizeof(struct sockaddr_ctl)) ? ((struct sockaddr_ctl *)(void *)nam)->sc_id : 0, error);
+ 	ctl_kcb_done_clearing(kcb);
+ 	ctl_kcb_decrement_use_count(kcb);
+ 	return error;
+@@ -1478,6 +1500,7 @@ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+ 	}
+ 	}
+ 
++	sweet_kctl_witness(cmd == CTLIOCGINFO ? "ioctl CTLIOCGINFO" : "ioctl", so, cmd, error);
+ 	return error;
+ }
+ 

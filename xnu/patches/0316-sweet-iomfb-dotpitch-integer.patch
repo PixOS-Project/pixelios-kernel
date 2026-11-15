@@ -1,0 +1,19 @@
+SWEET IOMFB GetDotPitch (selector 28) back to the integer 458 ppi (patch 0316, ALL-ON T-36 + T-37, research 141): MobileGestalt reads the value as an unsigned ppi and SpringBoard computes points per mm from it; 0289's float bits gave a ~1.35e8 pt minimum home-swipe travel (every home swipe sprang back) and main-screen class -1. Reverts only the selector-28 line of 0289; SWEET_FB_DOT_PITCH_MM_BITS stays defined (unused). No hardware access.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1359,7 +1359,13 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH_MM_BITS;   /* patch 0289: float bits, was the integer 458 */
++		/*
++		 * patch 0316 (ALL-ON T-36/T-37, research 141): back to the INTEGER ppi. MobileGestalt reads the dot pitch as an unsigned ppi
++		 * (MainScreenStaticInfo, RM-00959) and SpringBoard derives points/mm from it (ucvtf / 25.4 / nativeScale, SB 0x1c5d23d64);
++		 * 0289's float bits (0x3d632878 = 1030957176 as an integer) made the home-gesture minimum travel ~1.35e8 pt, so every lift
++		 * returned to the app (SB 0x1c5ae5b2c), and the main-screen class -1. 458 gives class 15 and ~6 pt/mm.
++		 */
++		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:

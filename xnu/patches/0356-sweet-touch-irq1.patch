@@ -1,0 +1,915 @@
+sweet-touch-irq1 (lowclk 2026-11-14; design: docs/research/155-touch-ftm5-interrupt.md sections 3, 5, 6 "Stage 1"): FTM5 touch interrupt STAGE 1 behind boot-arg sweettouchirq=1: the touch thread waits on the gpa9[0] level-low EINT (GIC INTID 67 = SPI 35) instead of the 8 ms poll. Stage 0 (patch 0355, sweettouchirq=2) stays exactly as it is.
+Sources [read]: research 155 with its citations; Linux v6.17 drivers/pinctrl/samsung/pinctrl-exynos.c (exynos_irq_mask :58-87 EMASK |= bit, exynos_irq_ack :89-110 EPEND := bit as a plain store, exynos_irq_unmask :112-152 level types ack first then EMASK &= ~bit, exynos_irq_set_type :154-210 ECON: con &= ~(EXYNOS_EINT_CON_MASK << shift); con |= trig << shift with shift = EXYNOS_EINT_CON_LEN * hwirq) and pinctrl-exynos.h (refs copy refs/wlan-stage1/linux-pinctrl-exynos.h:44-50: EXYNOS_EINT_LEVEL_LOW = 0, EXYNOS_EINT_CON_MASK = 0xF, EXYNOS_EINT_CON_LEN = 4; :20 EXYNOS_PIN_CON_FUNC_EINT = 0xf); gs101 pinctrl-gs.c:79 (gpa9: pad base 0xC0, eint_offset 0x18); gs101-pinctrl.dtsi:92-105 (gpa9 per-pin SPI 35, level high); fts_touch ftm5/fts.c:5303-5304 (the vendor driver requests level low, oneshot, threaded). ENCODING of ECON level low: the pin 0 field (bits [3:0], 4 bits per pin, mask 0xF) := EXYNOS_EINT_LEVEL_LOW = 0; the field is 4 bits wide in the source, so this patch writes the 4-bit nibble, not bits [2:0]. Hardware facts observed by stage 0 on the phone (boot 9ec5): ECON 0, EFLTCON 0, EMASK 0xff, EPEND 0, pad CON func 0, DAT idle 1, the line low while the FIFO holds events and high when empty (87689 of 87689 empty passes high).
+sweettouchirq absent or 0 = behaviour unchanged byte for byte: no mapping, no register access, no GIC call, no log line, the poll loop unchanged (the only added statements that run are flag tests of tg_sti1.mode). sweettouchirq=2 = patch 0355's stage 0, unchanged. sweettouchirq=1 = stage 1 (stage-0 counters do not run). Any other value = `TOUCH GAP: sweettouchirq=%d: unknown value ...`, treated as 0 (0355's "stage 1 not in this patch" text is no longer reachable: the glue gives sti_arg only the value 2).
+Arm (touch thread only, once, after the scan enable, after the controller-ready event of the existing reset path was seen, behind the existing AP-owns-the-bus mux check; the core refuses otherwise with a GAP and writes nothing): reads CON, DAT, ECON, EFLTCON, EMASK, EPEND and logs them; refuses (GAP, nothing written) if the pad CON func is not 0 or all four EINT words read 0xffffffff. Then, in this order, each a read-modify-write of pin 0's field with read-back: (a) EMASK bit 0 := 1; (b) CON [3:0] := 0xF; (c) ECON [3:0] := 0 (level low); (d) EPEND := 0x1 (W1C); then log DAT; (e) GIC attach INTID 67 DISABLED (patch 0346 sweet_spi_attach_off); (f) EMASK bit 0 := 0; (g) state ARMED, GIC enable (sweet_spi_enable; the enable bit must read back 1). Any failure tears down exactly the steps done and logs a GAP.
+ISR (interrupt context): EMASK bit 0 := 1, EPEND := 0x1, publish the sequence number, thread_wakeup of the touch thread, return 0. No SPI access, no log call, no GIC call (the host test traps all three). A write failure or more than 1000 entries in one second: off_req, return 1 (the dispatcher masks the INTID), the thread disarms. An entry in any state other than ARMED (the line went low in the teardown gap before the mask store; review 0356 F1) does the same EMASK bit 0 := 1 store and returns 1, never 0 with the level still asserted. Thread (every pass): drain the FIFO as before; classify the pass by the sequence number (interrupt wake or safety-timeout drain); if the ISR ran since the last unmask: EPEND := 0x1, then EMASK bit 0 := 0 (Linux order), no read-back (the line may fire at once); a drain error (n < 0) is never followed by an unmask, and 10 drain errors in a row turn the mode off (review F2); after a successful unmask one DAT read: low with no interrupt entered since = counted (rechk_low) and one more drain at once (review F3). The wait while armed is assert_wait with a 100 ms safety timeout, re-checked against the sequence number before the block (no lost wakeup); the first drain after a wake is immediate. Not armed = today's loop exactly (1 ms with events, 8 ms idle).
+Auto-off to polling, each with a GAP line (rule 7) and the summary row's reason: storm (more than 200 interrupt wakes with an empty FIFO in one second, or more than 1000 ISR entries in one second); line stuck low (DAT low after 3 empty drains in a row; research 155 U6: if DAT does not show the pad with CON = 0xF this trips and the log says so); no interrupt (10 safety-timeout drains in ONE 10 s window that found events although no interrupt came; the numbers 3, 10 and 1000 are GUESSES); any register read or write failure, refusal or read-back mismatch; GIC attach or enable failure; ISR error. Disarm order (every exit): EMASK bit 0 := 1, GIC detach, ECON back to the value read at arm, CON back to the value read at arm (0), EPEND := 0x1; every step is tried whatever failed before. Exits: auto-off (thread), clean stop (sweet_clean_stop calls sweet_touch_irq1_quiesce: no more arming, the touch thread disarms at its next pass, waits up to 500 ms), every OTHER reset path (sweet_machine_reset_x, second statement after the pets stop): sweet_touch_irq1_mask_off = lock-free, no print, no GIC call, the ONE write EMASK bit 0 := 1, and only if the line was ever unmasked.
+Summary row every 10 s: `SWEET TOUCH IRQ: irqs N empty N wakes N tmo_drains N tmo_found N storm N mode irq|off:<why>`.
+HARDWARE WRITES OF THIS PATCH [the only new ones; all in bsd/dev/sweet_touch_irq1.h through sti1_rmw, one allowlist sti1_rows[] + the value rules of sti1_wr_ok; the kernel store tg_sti1_wr in sweet_touch_gs101.c has a second, independent allowlist: offsets 0x0C0, 0x718, 0x918, 0xA18 and EPEND value 1 only]: CON 0x174D00C0 [3:0] := 0xF at arm / back to the arm-time value (0) at disarm; ECON 0x174D0718 [3:0] := 0 at arm / back to the arm-time value at disarm; EMASK 0x174D0918 bit 0 := 1 (arm, ISR, disarm, reset path) and := 0 (arm, thread after each ISR); EPEND 0x174D0A18 := 0x1 (arm, ISR, thread, disarm). Every RMW preserves the other seven pins' bits exactly (checked by the judge). NOT written: EFLTCON 0x174D0828 (read only), PUD 0x174D00C8, DRV, any other pin, the SPI/USI/CMU words, gpp23/gpp26. GIC: attach_off, enable, detach of INTID 67 through the patch 0346 helpers only. The EMASK word is shared by eight pins but written by nobody else in XNU; ISR and thread never write it at the same time by construction (header comment of sweet_touch_irq1.h).
+Files: new bsd/dev/sweet_touch_irq1.h (pure core between STI1_CORE_BEGIN/END, host test tools/test_touch_irq1_core.py with a fake gpa9 bank, fake FTM5 and fake GIC), bsd/dev/sweet_touch_gs101.c (boot-arg, ops, ISR trampoline, sleep, arm and loop hooks, quiesce, reset hook), bsd/dev/sweet_restart.c (two calls). Needs patch 0346 (sweet_spi_attach_off/enable/detach) and 0355. Diffed against the k11 tree (0355 applied). ORDER: after 0355.
+NOT RUN ON HARDWARE (the kernel glue is built but not host-run). The new write path is UNREVIEWED: it needs the rule-8 Opus review (AGENTS.md rule 8) before it boots. Unknowns that only the boot settles: whether DAT shows the pad with CON = 0xF (U6), whether EPEND latches a level that is still low (U4: the safety timeout covers it), whether the EINT window answers writes from XNU (U3 was read-only), the three GUESS thresholds.
+diff --git a/bsd/dev/sweet_restart.c b/bsd/dev/sweet_restart.c
+index 3a48096..e9cf30d 100644
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -49,6 +49,7 @@ extern void sweet_thermal_start(void); /* bsd/dev/sweet_thermal.c (patch 0336) *
+ extern void sweet_stall_tick(int src);
+ extern void sweet_wdt_poll(int may_arm);
+ extern void sweet_wdt_stop_pets(void);   /* patch 0333: one atomic store, stops every pet/arm/timer tick for good */
++extern void sweet_touch_irq1_mask_off(void);   /* bsd/dev/sweet_touch_gs101.c (patch 0356): lock-free EMASK bit 0 := 1 of the touch interrupt, only when it was unmasked */
+ extern void sweet_ufs_irq_ie_off(void);   /* bsd/dev/sweet_ufs.c (patch 0354): lock-free IE := 0 when the UFS completion interrupt is on */
+ 
+ static uint64_t
+@@ -87,6 +88,7 @@ sweet_machine_reset_x(int to_bootloader, int test_skip_swreset)
+ 	uint64_t rc;
+ 
+ 	sweet_wdt_stop_pets();
++	sweet_touch_irq1_mask_off();    /* patch 0356: lock-free EMASK bit 0 := 1 (touch interrupt), only when it is on; no print, no lock, no GIC call */
+ 	sweet_ufs_irq_ie_off();         /* patch 0354: lock-free IE := 0 (UFS completion interrupt), only when it is on; no print, no lock; after the pets stop so a stall here cannot keep them alive */
+ 	if (to_bootloader) {
+ 		rc = sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
+@@ -168,6 +170,7 @@ sweet_restart_poll(void)
+ 
+ extern int sync_internal(void);
+ extern void sweet_ufs_irq_quiesce(void);   /* bsd/dev/sweet_ufs.c (patch 0354) */
++extern void sweet_touch_irq1_quiesce(void);   /* bsd/dev/sweet_touch_gs101.c (patch 0356) */
+ static volatile int sweet_sync_done;
+ 
+ static void
+@@ -195,6 +198,7 @@ sweet_clean_stop(void)
+ 		}
+ 	}
+ 	printf("SWEET RESTART: sync %s after %d ms\n", sweet_sync_done ? "done" : "TIMED OUT", i * 100);
++	sweet_touch_irq1_quiesce();     /* patch 0356: the touch thread disarms (mask, GIC detach, ECON/CON back, EPEND clear); a no-op unless sweettouchirq=1 armed it */
+ 	sweet_ufs_irq_quiesce();        /* patch 0354: IE back to 0 and the GIC handler detached before the reset; a no-op unless sweetufsirq=1 armed it */
+ }
+ 
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index f7e9ff1..01cb6a0 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -86,12 +86,17 @@
+ #include "sweet_touch_poke.h"
+ #define STI_LOG(...) printf(__VA_ARGS__)   /* patch 0355 */
+ #include "sweet_touch_irq0.h"
++#define STI1_LOG(...) printf(__VA_ARGS__)   /* patch 0356 */
++#include "sweet_touch_irq1.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern int sweet_spi_attach_off(uint32_t intid, int (*fn)(void *, uint32_t), void *arg, uint32_t rb[4]);   /* pexpert/arm/pe_fiq.c (patch 0346) */
++extern int sweet_spi_enable(uint32_t intid, uint32_t *en);
++extern int sweet_spi_detach(uint32_t intid);
+ void sweet_touch_gs101_init(void);
+ 
+ #define TG_COMPAT        "google,gs101-ftm5-spi"
+@@ -192,6 +197,123 @@ tg_sti_rd(void *ctx, uint32_t off, uint32_t *v)
+ }
+ static const struct sti_ops tg_sti_ops = { .ctx = NULL, .rd = tg_sti_rd };
+ 
++/* patch 0356 (sweettouchirq=1, stage 1): the interrupt mode. The cores' judge (sweet_touch_irq1.h) decides every access; the ops below are the bus. tg_sti1_wr is the ONLY store of this feature and has its own
++ * second allowlist (offsets and the EPEND value), independent of the core's table: a write the core would let through to any other offset or value is refused here too. */
++static struct sti1 tg_sti1;
++static bool tg_sti1_mux_ok;     /* set after tg_report_and_check_mux() passed in tg_run: the AP owns the touch bus */
++static int
++tg_sti1_rd(void *ctx, uint32_t off, uint32_t *v)
++{
++	(void)ctx;
++	if (!tg.alive) {
++		return -1;
++	}
++	*v = *(volatile uint32_t *)(tg.alive + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return 0;
++}
++static int
++tg_sti1_wr(void *ctx, uint32_t off, uint32_t v)
++{
++	(void)ctx;
++	if (!tg.alive) {
++		return -1;
++	}
++	if (off != 0x0C0u && off != 0x718u && off != 0x918u && off != 0xA18u) {   /* CON, ECON, EMASK, EPEND of gpa9: nothing else */
++		return -2;
++	}
++	if (off == 0xA18u && v != 1u) {                                           /* EPEND is write-one-to-clear of pin 0 only */
++		return -2;
++	}
++	*(volatile uint32_t *)(tg.alive + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++static int tg_sti1_isr_k(void *arg, uint32_t intid);
++static int
++tg_sti1_attach(void *ctx, uint32_t rb[4])
++{
++	(void)ctx;
++	return sweet_spi_attach_off(STI1_INTID, tg_sti1_isr_k, NULL, rb);
++}
++static int
++tg_sti1_enable(void *ctx, uint32_t *en)
++{
++	(void)ctx;
++	return sweet_spi_enable(STI1_INTID, en);
++}
++static int
++tg_sti1_detach(void *ctx)
++{
++	(void)ctx;
++	return sweet_spi_detach(STI1_INTID);
++}
++static uint64_t
++tg_sti1_now(void *ctx)
++{
++	uint64_t ns;
++	(void)ctx;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++static void
++tg_sti1_wake(void *ctx)
++{
++	(void)ctx;
++	thread_wakeup((event_t)&tg.sleep_chan);   /* ISR safe: the Wi-Fi and Mali ISRs wake their threads the same way */
++}
++static const struct sti1_ops tg_sti1_ops = {
++	.ctx = NULL, .rd = tg_sti1_rd, .wr = tg_sti1_wr, .spi_attach_off = tg_sti1_attach, .spi_enable = tg_sti1_enable,
++	.spi_detach = tg_sti1_detach, .now = tg_sti1_now, .wake = tg_sti1_wake,
++};
++/* interrupt context: sti1_isr only (mask, EPEND W1C, sequence, wakeup); no print, no SPI, no GIC call */
++static int
++tg_sti1_isr_k(void *arg, uint32_t intid)
++{
++	(void)arg;
++	(void)intid;
++	return sti1_isr(&tg_sti1, &tg_sti1_ops);
++}
++
++/* the armed thread's wait: assert_wait, then the no-lost-wakeup re-check, then block; the ISR's thread_wakeup on the same event ends it early */
++static void
++tg_sti1_sleep(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(sti1_wait_ms(&tg_sti1, 0), NSEC_PER_MSEC, &deadline);   /* armed: STI1_SAFETY_MS */
++	(void)assert_wait_deadline(&tg.sleep_chan, THREAD_UNINT, deadline);
++	if (sti1_wake_pending(&tg_sti1)) {
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		return;
++	}
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* sweet_clean_stop (sweet_restart.c): no arming from now on, the touch thread disarms at its next pass (it is woken); waits up to 500 ms. A no-op unless sweettouchirq=1 armed it. */
++void sweet_touch_irq1_quiesce(void);
++void
++sweet_touch_irq1_quiesce(void)
++{
++	if (!sti1_quiesce_begin(&tg_sti1)) {
++		return;
++	}
++	thread_wakeup((event_t)&tg.sleep_chan);
++	for (int i = 0; i < 50 && !sti1_off(&tg_sti1); i++) {
++		delay_for_interval(10, 1000 * 1000);
++	}
++	if (!sti1_off(&tg_sti1)) {
++		printf("TOUCH GAP: sweettouchirq=1: quiesce: the touch thread did not disarm within 500 ms; the reset path masks the line (EMASK bit 0 := 1)\n");
++	}
++}
++
++/* sweet_machine_reset_x (sweet_restart.c), EVERY software reset path: lock-free, no print, no GIC call; EMASK bit 0 := 1 only if the line was ever unmasked */
++void sweet_touch_irq1_mask_off(void);
++void
++sweet_touch_irq1_mask_off(void)
++{
++	sti1_reset_mask(&tg_sti1, &tg_sti1_ops);
++}
++
+ static uint32_t
+ tg_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -1140,6 +1262,7 @@ tg_run(void)
+ 		}
+ 		return;
+ 	}
++	tg_sti1_mux_ok = true;    /* patch 0356: the bus check above passed (the only way to get here) */
+ 	(void)tg_cmu_enable();    /* an aborted sequence is reported; the identify below shows whether it mattered */
+ 	tg_poke_run();            /* sweettouchpoke, if given: after the driver's own clock writes, before the SPI setup */
+ 	if (!tg_spi_setup()) {
+@@ -1176,7 +1299,8 @@ tg_run(void)
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: phase 2: reset pulse, scan enable, poll\n");
+-	if (!tg.reset_done && !tg_reset_and_ready(&logged)) {
++	bool irq1_ready = tg.reset_done;   /* patch 0356: the controller-ready event was seen (sweettouchcs=1 path or the reset below) */
++	if (!tg.reset_done && !(irq1_ready = tg_reset_and_ready(&logged))) {
+ 		printf("SWEET TOUCH: no controller-ready event after the reset pulse (GUESS: continuing)\n");
+ 	}
+ 	if (!tg_enable_scan()) {
+@@ -1184,8 +1308,17 @@ tg_run(void)
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: scanning, %dx%d raw -> %ux%u\n", (int)tg.max_x + 1, (int)tg.max_y + 1, tg.width, tg.height);
++	if (tg_sti1.mode == 1) {   /* patch 0356 stage 1: arm only now (scan enabled, controller ready, mux check passed), from this thread only */
++		if (tg.irq.bank_pa == STI1_PAD_PA && !tg.alive) {
++			tg.alive = tg_map(tg.irq.bank_pa - 0x0C0u, 0x1000);
++		}
++		(void)sti1_arm(&tg_sti1, &tg_sti1_ops, irq1_ready, tg_sti1_mux_ok, tg.irq.bank_pa, tg.irq.pin);
++	}
+ 	for (;;) {
+ 		int irq0_dat = sti_dat(&tg_sti, &tg_sti_ops);   /* patch 0355: one DAT read before the drain; -1 = stage 0 off */
++		if (tg_sti1.mode == 1) {
++			sti1_pass_begin(&tg_sti1, &tg_sti1_ops);    /* patch 0356 */
++		}
+ 		int n = tg_drain(&logged);
+ 		if (irq0_dat >= 0) {
+ 			sti_loop_obs(&tg_sti, irq0_dat, n, tg_now_us());
+@@ -1200,7 +1333,14 @@ tg_run(void)
+ 		} else {
+ 			errors = 0;
+ 		}
+-		tg_sleep_ms(n > 0 ? 1 : 8);
++		if (tg_sti1.mode == 1) {
++			sti1_pass_end(&tg_sti1, &tg_sti1_ops, n, tg_now_us() * 1000u);   /* patch 0356 */
++		}
++		if (tg_sti1.mode == 1 && sti1_armed(&tg_sti1)) {
++			tg_sti1_sleep();    /* patch 0356: wake by interrupt, safety timeout STI1_SAFETY_MS */
++		} else {
++			tg_sleep_ms(n > 0 ? 1 : 8);
++		}
+ 	}
+ }
+ 
+@@ -1247,10 +1387,11 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
+ 	(void)PE_parse_boot_argn("sweettouchcs", &cs, sizeof(cs));
+-	{   /* patch 0355: sweettouchirq 0/absent = unchanged, 2 = read-only stage 0, 1 or other = GAP (stage 1 not in this patch) */
++	{   /* patch 0355/0356: sweettouchirq 0/absent = unchanged, 2 = read-only stage 0 (0355), 1 = interrupt stage 1 (0356), other = GAP, treated as 0 */
+ 		int irq0 = 0;
+ 		bool irq0_given = PE_parse_boot_argn("sweettouchirq", &irq0, sizeof(irq0));
+-		sti_arg(&tg_sti, irq0_given, irq0);
++		sti_arg(&tg_sti, irq0_given && irq0 == 2, irq0);
++		sti1_arg(&tg_sti1, irq0_given, irq0);
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouchpoke", tg.poke, sizeof(tg.poke));   /* longer values are cut: poke_parse then sees > 240 chars */
+ 	if (delay_s < 0 || delay_s > 3600) {
+diff --git a/bsd/dev/sweet_touch_irq1.h b/bsd/dev/sweet_touch_irq1.h
+new file mode 100644
+index 0000000..960f9d7
+--- /dev/null
++++ b/bsd/dev/sweet_touch_irq1.h
+@@ -0,0 +1,651 @@
++/*
++ * sweet_touch_irq1.h - FTM5 touch interrupt, STAGE 1 (patch 0356, boot-arg sweettouchirq=1): the touch thread sleeps on the gpa9[0] level-low EINT instead of the 8 ms poll.
++ *
++ * Spec: docs/research/155-touch-ftm5-interrupt.md sections 3, 5, 6. Stage 0 (patch 0355, sweettouchirq=2) measured the pad: ECON 0, EFLTCON 0, EMASK 0xff, EPEND 0, CON func 0, DAT idle 1, the line low while the FIFO holds events.
++ * Linux reference (the register recipe, read from source): drivers/pinctrl/samsung/pinctrl-exynos.c v6.17 exynos_irq_mask :58-87 (EMASK |= 1<<hwirq), exynos_irq_ack :89-110 (EPEND := 1<<hwirq, plain store),
++ *   exynos_irq_unmask :112-152 (level types: ack first, then EMASK &= ~(1<<hwirq)), exynos_irq_set_type :154-210 (ECON: con &= ~(EXYNOS_EINT_CON_MASK << shift); con |= trig << shift, shift = 4 * hwirq);
++ *   drivers/pinctrl/samsung/pinctrl-exynos.h (refs copy ~/pixelios-artifacts/refs/wlan-stage1/linux-pinctrl-exynos.h :44-50): EXYNOS_EINT_LEVEL_LOW = 0, EXYNOS_EINT_CON_MASK = 0xF, EXYNOS_EINT_CON_LEN = 4,
++ *   :20 EXYNOS_PIN_CON_FUNC_EINT = 0xf. Register addresses: research 155 s.3 (pinctrl-gs.c:79 gpa9 bank: pad base 0xC0, eint_offset 0x18; exynos7 chip ECON 0x700, EMASK 0x900, EPEND 0xA00).
++ *   The vendor driver requests the line level-low, oneshot, threaded (fts_touch ftm5/fts.c:5303-5304). ECON field width: the source masks 4 bits per pin (0xF), not 3: this file writes the 4-bit nibble.
++ *
++ * The pure core (between STI1_CORE_BEGIN and STI1_CORE_END) is compiled and run by tools/test_touch_irq1_core.py with a fake gpa9 bank, a fake FTM5 and a fake GIC.
++ *
++ * EVERY hardware access of this feature goes through sti1_rd / sti1_rmw (one allowlist, sti1_rows[], plus the value rules of sti1_wr_ok, independent of the driver's own tg_rd/tg_wr):
++ *   write rows (pin 0 of gpa9 ONLY, each a read-modify-write that keeps the other seven pins' bits exactly, except EPEND which is a plain write-one-to-clear store of exactly 0x1):
++ *     CON    0x0C0 bits [3:0]: 0xF (EINT function) while arming, back to the value read at arm (0) while disarming
++ *     ECON   0x718 bits [3:0]: 0 (level low) while arming, back to the value read at arm while disarming
++ *     EMASK  0x918 bit 0:      1 = masked (always allowed once the feature has touched anything), 0 = unmasked (only after attach, CON, ECON, EPEND clear, never during a shutdown)
++ *     EPEND  0xA18 write 0x1 (W1C)
++ *   read rows: CON, DAT 0x0C4, ECON, EFLTCON 0x828, EMASK, EPEND. EFLTCON has NO write row (it is never written). PUD 0x0C8, DRV and every other word: no row.
++ *   GIC: INTID 67 (SPI 35) through the patch 0346 helpers: attach DISABLED, enable after the line is unmasked, detach at disarm (not on the reset path).
++ * Concurrency of the EMASK word (no lock is possible in the ISR): the ISR only ever SETS bit 0 and only while the line is unmasked; the thread only ever CLEARS bit 0 and only while the ISR has run since its last clear
++ * (the line is then masked, so the ISR cannot run); the ISR publishes its sequence number AFTER its stores. Nobody else in XNU writes this bank (research 155 s.5 item 4).
++ * The ISR makes NO SPI access and NO log call (the host test traps both). Not run on hardware.
++ */
++#ifndef SWEET_TOUCH_IRQ1_H
++#define SWEET_TOUCH_IRQ1_H
++#include <stddef.h>
++#include <stdint.h>
++#ifndef STI1_LOG
++#error "define STI1_LOG(...) before including sweet_touch_irq1.h"
++#endif
++/* STI1_CORE_BEGIN */
++#define STI1_PAD_PA        0x174D00C0ull   /* gpa9 bank CON register: board.json touch_pin_irq = gpa9[0], soc.json gpa9_bank [research 155 s.1] */
++#define STI1_INTID         67u             /* SPI 35 + 32 [research 155 s.1; gs101-pinctrl.dtsi:92-105 IRQ_ALIVE_EINT35] */
++#define STI1_OFF_CON       0x0C0u
++#define STI1_OFF_DAT       0x0C4u
++#define STI1_OFF_ECON      0x718u          /* 0x700 + eint_offset 0x18 */
++#define STI1_OFF_EFLTCON   0x828u          /* 0x800 + fltcon_offset 0x28: READ ONLY */
++#define STI1_OFF_EMASK     0x918u          /* 0x900 + 0x18 */
++#define STI1_OFF_EPEND     0xA18u          /* 0xA00 + 0x18 */
++#define STI1_FUNC_EINT     0xFu            /* EXYNOS_PIN_CON_FUNC_EINT */
++#define STI1_ECON_LEVEL_LOW 0u             /* EXYNOS_EINT_LEVEL_LOW */
++#define STI1_SAFETY_MS     100u            /* the armed thread's wait: a missed interrupt is found by the timeout drain at the latest after this (brief) */
++#define STI1_SUMMARY_NS    10000000000ull  /* one summary row every 10 s */
++#define STI1_WIN_NS        1000000000ull   /* the storm windows: one second */
++#define STI1_STORM_EMPTY   200u            /* interrupt wakes with an empty FIFO per second above which the mode turns itself off (brief) */
++#define STI1_STUCK_K       3u              /* GUESS: drains in a row that find the FIFO empty with the line still low */
++#define STI1_NOIRQ_N       10u             /* GUESS: safety-timeout drains that found events although no interrupt came, within ONE window of STI1_TMO_WIN_NS */
++#define STI1_ISR_STORM     1000u           /* GUESS: ISR entries per second (a hard cap on top of the thread's rule; a real touch burst is far below) */
++#define STI1_TMO_WIN_NS    10000000000ull  /* the missed-interrupt count is per 10 s window */
++#define STI1_ERR_N         10u             /* GUESS: drain errors in a row, then back to polling */
++#define STI1_TMO_LOG       5u              /* GAP lines for timeout drains that found events: the first 5 */
++
++enum { STI1_S_OFF = 0, STI1_S_ARMING, STI1_S_ARMED, STI1_S_DISARMING };
++enum { STI1_Y_NONE = 0, STI1_Y_STORM, STI1_Y_STUCK, STI1_Y_NOIRQ, STI1_Y_BUS, STI1_Y_REFUSED, STI1_Y_RB, STI1_Y_ATTACH, STI1_Y_ENABLE, STI1_Y_ISR, STI1_Y_QUIESCE, STI1_Y_PRE };
++enum { STI1_R = 1, STI1_W = 2 };
++
++struct sti1_ops {
++	void *ctx;
++	int (*rd)(void *ctx, uint32_t off, uint32_t *v);           /* 0 = ok */
++	int (*wr)(void *ctx, uint32_t off, uint32_t v);            /* 0 = ok; store done and ordered (dsb) */
++	int (*spi_attach_off)(void *ctx, uint32_t rb[4]);          /* patch 0346 sweet_spi_attach_off(67): SPI left DISABLED; 0 = ok else the helper's rc */
++	int (*spi_enable)(void *ctx, uint32_t *en);                /* patch 0346 sweet_spi_enable(67); *en = the enable bit read back */
++	int (*spi_detach)(void *ctx);                              /* patch 0346 sweet_spi_detach(67) */
++	uint64_t (*now)(void *ctx);                                /* ns; ISR safe */
++	void (*wake)(void *ctx);                                   /* thread_wakeup of the touch thread; ISR safe */
++};
++
++struct sti1 {
++	int mode;                       /* 0 = off (behaviour unchanged), 1 = stage 1 requested; set once by sti1_arg */
++	volatile int state;             /* STI1_S_* */
++	volatile int why;               /* STI1_Y_*: first reason the mode is off (0 = none yet) */
++	volatile int off_req;           /* the ISR asks the thread to disarm (the thread owns every other state change) */
++	volatile int quiesce;           /* clean stop / reset: no arm, disarm at the next pass */
++	volatile int unmasked;          /* the line has been unmasked and not masked again since (the reset path then writes the mask) */
++	int mask_done, con_set, econ_set, pend_done, att;   /* steps of the arm that have been done (the disarm undoes exactly these) */
++	uint32_t con_orig, econ_orig;   /* pin 0 fields read at arm */
++	volatile uint32_t isr_total, isr_seq, isr_err;
++	uint64_t win_start;             /* ISR window */
++	uint32_t win_n;
++	uint32_t last_seq, unm_seq, wakes, empty, tmo_drains, tmo_found, storm_n, low_run, refused, err_run, tmo_win_n, rechk_low;
++	uint64_t tmo_win_start;         /* the missed-interrupt window */
++	volatile int redo;              /* the DAT re-check after an unmask found the line low and no interrupt: drain again at once */
++	uint64_t twin_start;            /* thread storm window */
++	uint32_t twin_n;
++	uint64_t sum_ns;
++	int sum_init, settle;
++};
++
++/* boot-arg value as PE_parse_boot_argn gave it: 0 / absent = off, 1 = stage 1, 2 = patch 0355's stage 0 (not handled here), anything else = GAP, off */
++static void
++sti1_arg(struct sti1 *st, int present, int val)
++{
++	st->mode = 0;
++	if (!present || val == 0 || val == 2) {
++		return;
++	}
++	if (val == 1) {
++		st->mode = 1;
++		return;
++	}
++	STI1_LOG("TOUCH GAP: sweettouchirq=%d: unknown value (0 = polled, 1 = interrupt, 2 = read-only measurement), treated as 0\n", val);
++}
++
++static const char *
++sti1_why_str(int y)
++{
++	switch (y) {
++	case STI1_Y_STORM:   return "storm";
++	case STI1_Y_STUCK:   return "line-stuck-low";
++	case STI1_Y_NOIRQ:   return "no-interrupt";
++	case STI1_Y_BUS:     return "register-access-failed";
++	case STI1_Y_REFUSED: return "write-refused";
++	case STI1_Y_RB:      return "readback-mismatch";
++	case STI1_Y_ATTACH:  return "gic-attach";
++	case STI1_Y_ENABLE:  return "gic-enable";
++	case STI1_Y_ISR:     return "isr-error";
++	case STI1_Y_QUIESCE: return "restart";
++	case STI1_Y_PRE:     return "not-armed";
++	default:             return "none";
++	}
++}
++
++/* first reason wins (the ISR and the thread may both set one) */
++static void
++sti1_why(struct sti1 *st, int y)
++{
++	int zero = 0;
++	(void)__atomic_compare_exchange_n(&st->why, &zero, y, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++/* The allowlist: nothing outside these rows is ever accessed. mask = the bits of the word that belong to pin 0 (the only bits a write may change). */
++struct sti1_row { uint32_t off; uint32_t acc; uint32_t mask; };
++static const struct sti1_row sti1_rows[] = {
++	{ STI1_OFF_CON,     STI1_R | STI1_W, 0xFu },
++	{ STI1_OFF_DAT,     STI1_R,          0u },
++	{ STI1_OFF_ECON,    STI1_R | STI1_W, 0xFu },
++	{ STI1_OFF_EFLTCON, STI1_R,          0u },
++	{ STI1_OFF_EMASK,   STI1_R | STI1_W, 0x1u },
++	{ STI1_OFF_EPEND,   STI1_R | STI1_W, 0x1u },
++};
++
++static const struct sti1_row *
++sti1_row(uint32_t off)
++{
++	for (size_t i = 0; i < sizeof sti1_rows / sizeof sti1_rows[0]; i++) {
++		if (sti1_rows[i].off == off) {
++			return &sti1_rows[i];
++		}
++	}
++	return NULL;
++}
++
++/* The value rules of the write rows (a write that fails here never reaches the bus). oldw = the word as read (unused for EPEND, a plain store), neww = the word to store. */
++static int
++sti1_wr_ok(const struct sti1 *st, uint32_t off, uint32_t oldw, uint32_t neww)
++{
++	const struct sti1_row *r = sti1_row(off);
++	int s = st->state;
++	uint32_t f;
++
++	if (r == NULL || !(r->acc & STI1_W)) {
++		return 0;
++	}
++	if (off == STI1_OFF_EPEND) {
++		return neww == 1u && s != STI1_S_OFF && (s != STI1_S_ARMING || st->econ_set);
++	}
++	if (((oldw ^ neww) & ~r->mask) != 0u) {   /* the other pins' bits are preserved exactly */
++		return 0;
++	}
++	f = neww & r->mask;
++	switch (off) {
++	case STI1_OFF_CON:
++		return (f == STI1_FUNC_EINT && s == STI1_S_ARMING && st->mask_done && !st->con_set && st->con_orig == 0u) ||
++		       (f == st->con_orig && st->con_set && s == STI1_S_DISARMING);
++	case STI1_OFF_ECON:
++		return (f == STI1_ECON_LEVEL_LOW && s == STI1_S_ARMING && st->con_set && !st->econ_set) ||
++		       (f == st->econ_orig && st->econ_set && s == STI1_S_DISARMING);
++	case STI1_OFF_EMASK:
++		if (f == 1u) {
++			return s != STI1_S_OFF || st->unmasked;
++		}
++		return (s == STI1_S_ARMING || s == STI1_S_ARMED) && st->att && st->con_set && st->econ_set && st->pend_done && !st->off_req && !st->quiesce;
++	default:
++		return 0;
++	}
++}
++
++/* read through the allowlist: 0 ok, -1 bus failure, -2 refused. isr = interrupt or reset context: never logs. */
++static int
++sti1_rd(struct sti1 *st, const struct sti1_ops *o, uint32_t off, uint32_t *v, int isr)
++{
++	const struct sti1_row *r = sti1_row(off);
++
++	*v = 0;
++	if (r == NULL || !(r->acc & STI1_R) || (off & 3u) != 0u) {
++		st->refused++;
++		if (!isr) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: read of alive offset %#x refused (not on the read allowlist)\n", off);
++		}
++		return -2;
++	}
++	if (o->rd == NULL || o->rd(o->ctx, off, v) != 0) {
++		if (!isr) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: read of alive offset %#x failed\n", off);
++		}
++		return -1;
++	}
++	return 0;
++}
++
++/* One write: read-modify-write of pin 0's field (EPEND: the plain store of 1). field = the new value of the pin 0 field, already in bit position 0. verify = read the word back and compare the field.
++ * 0 ok, -1 bus failure, -2 refused by the judge, -3 read-back mismatch. isr = interrupt or reset context: never logs. */
++static int
++sti1_rmw(struct sti1 *st, const struct sti1_ops *o, uint32_t off, uint32_t field, int verify, int isr)
++{
++	const struct sti1_row *r = sti1_row(off);
++	uint32_t oldw = 0, neww, rb;
++
++	if (r == NULL || !(r->acc & STI1_W) || (field & ~r->mask) != 0u) {
++		st->refused++;
++		if (!isr) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: write of alive offset %#x value %#x refused (no write row or value outside pin 0's field)\n", off, field);
++		}
++		return -2;
++	}
++	if (off == STI1_OFF_EPEND) {
++		neww = field;
++	} else {
++		int rc = sti1_rd(st, o, off, &oldw, isr);
++		if (rc != 0) {
++			return rc;
++		}
++		neww = (oldw & ~r->mask) | field;
++	}
++	if (!sti1_wr_ok(st, off, oldw, neww)) {
++		st->refused++;
++		if (!isr && !st->quiesce) {   /* during a restart request the refusal is expected: the caller reports the restart */
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: write of alive offset %#x word %#x -> %#x refused by the value rules (state %d)\n", off, oldw, neww, st->state);
++		}
++		return -2;
++	}
++	if (o->wr == NULL || o->wr(o->ctx, off, neww) != 0) {
++		if (!isr) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: write of alive offset %#x failed\n", off);
++		}
++		return -1;
++	}
++	if (verify && off != STI1_OFF_EPEND) {
++		int rc = sti1_rd(st, o, off, &rb, isr);
++		if (rc != 0) {
++			return rc;
++		}
++		if (((rb ^ neww) & r->mask) != 0u) {
++			if (!isr) {
++				STI1_LOG("TOUCH GAP: sweettouchirq=1: read-back of alive offset %#x is %#x, wrote %#x\n", off, rb, neww);
++			}
++			return -3;
++		}
++	}
++	return 0;
++}
++
++static int
++sti1_rc_why(const struct sti1 *st, int rc)
++{
++	if (st->quiesce) {
++		return STI1_Y_QUIESCE;   /* a restart request made the judge refuse the step: the reason is the restart, not a bad write */
++	}
++	return rc == -2 ? STI1_Y_REFUSED : rc == -3 ? STI1_Y_RB : STI1_Y_BUS;
++}
++
++/* Teardown, every step tried whatever failed before (idempotent): mask, GIC detach, ECON and CON back to the values read at arm, EPEND clear. Thread context only. */
++static void
++sti1_teardown(struct sti1 *st, const struct sti1_ops *o)
++{
++	int rc;
++
++	st->state = STI1_S_DISARMING;
++	if (st->mask_done) {
++		rc = sti1_rmw(st, o, STI1_OFF_EMASK, 1u, 1, 0);
++		if (rc == 0) {
++			st->unmasked = 0;
++		} else {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: teardown: EMASK bit 0 := 1 failed (%d), the line may stay unmasked until the reset path masks it\n", rc);
++		}
++	}
++	if (st->att) {
++		rc = o->spi_detach != NULL ? o->spi_detach(o->ctx) : -1;
++		if (rc != 0) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: teardown: GIC detach of INTID %u returned %d\n", STI1_INTID, rc);
++		}
++		st->att = 0;
++	}
++	if (st->econ_set) {
++		rc = sti1_rmw(st, o, STI1_OFF_ECON, st->econ_orig, 1, 0);
++		if (rc != 0) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: teardown: ECON back to %#x failed (%d)\n", st->econ_orig, rc);
++		}
++		st->econ_set = 0;
++	}
++	if (st->con_set) {
++		rc = sti1_rmw(st, o, STI1_OFF_CON, st->con_orig, 1, 0);
++		if (rc != 0) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: teardown: CON back to %#x failed (%d)\n", st->con_orig, rc);
++		}
++		st->con_set = 0;
++	}
++	if (st->pend_done) {
++		rc = sti1_rmw(st, o, STI1_OFF_EPEND, 1u, 0, 0);
++		if (rc != 0) {
++			STI1_LOG("TOUCH GAP: sweettouchirq=1: teardown: EPEND clear failed (%d)\n", rc);
++		}
++		st->pend_done = 0;
++	}
++	st->mask_done = 0;
++	st->state = STI1_S_OFF;
++}
++
++/* Back to polling with a loud line (thread context). reason = the first reason wins for the summary row. A restart (QUIESCE) is a note, not a GAP. */
++static void
++sti1_fail(struct sti1 *st, const struct sti1_ops *o, int y)
++{
++	sti1_why(st, y);
++	if (y == STI1_Y_QUIESCE) {
++		STI1_LOG("SWEET TOUCH IRQ: restart: interrupt mode off before the reset (irqs %u wakes %u tmo_found %u)\n", st->isr_total, st->wakes, st->tmo_found);
++	} else {
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: interrupt mode OFF (%s): irqs %u empty %u wakes %u tmo_drains %u tmo_found %u storm %u: back to polling (1 ms with events, 8 ms idle)\n",
++		    sti1_why_str(st->why), st->isr_total, st->empty, st->wakes, st->tmo_drains, st->tmo_found, st->storm_n);
++	}
++	sti1_teardown(st, o);
++}
++
++/* Arm, once, from the touch thread. Preconditions: the controller-ready event was seen (ready), the AP owns the bus (mux_ok), the irq pad is gpa9[0] (bank_pa, pin).
++ * Order: mask -> CON := 0xF -> ECON := level low -> EPEND clear -> GIC attach (disabled) -> unmask -> GIC enable. 0 = armed. Any failure tears down what was done and logs the GAP. */
++static int
++sti1_arm(struct sti1 *st, const struct sti1_ops *o, int ready, int mux_ok, uint64_t bank_pa, uint32_t pin)
++{
++	uint32_t con, dat, econ, eflt, emask, epend, rb[4] = { 0, 0, 0, 0 }, en = 0;
++	int rc;
++
++	if (st->mode != 1 || st->state != STI1_S_OFF) {
++		return -1;
++	}
++	if (st->quiesce) {
++		sti1_why(st, STI1_Y_QUIESCE);
++		STI1_LOG("SWEET TOUCH IRQ: restart already requested, not armed\n");
++		return -1;
++	}
++	if (!ready || !mux_ok || bank_pa != STI1_PAD_PA || pin != 0u) {
++		sti1_why(st, STI1_Y_PRE);
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: not armed, polling: controller-ready %s, AP owns the bus %s, irq pad bank %#llx pin %u (need gpa9[0] = %#llx pin 0)\n", ready ? "seen" : "NOT seen",
++		    mux_ok ? "yes" : "NO", (unsigned long long)bank_pa, pin, (unsigned long long)STI1_PAD_PA);
++		return -1;
++	}
++	if (sti1_rd(st, o, STI1_OFF_CON, &con, 0) || sti1_rd(st, o, STI1_OFF_DAT, &dat, 0) || sti1_rd(st, o, STI1_OFF_ECON, &econ, 0) ||
++	    sti1_rd(st, o, STI1_OFF_EFLTCON, &eflt, 0) || sti1_rd(st, o, STI1_OFF_EMASK, &emask, 0) || sti1_rd(st, o, STI1_OFF_EPEND, &epend, 0)) {
++		sti1_why(st, STI1_Y_BUS);
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: not armed, polling: an initial read failed (nothing was written)\n");
++		return -1;
++	}
++	if (econ == 0xFFFFFFFFu && eflt == 0xFFFFFFFFu && emask == 0xFFFFFFFFu && epend == 0xFFFFFFFFu) {
++		sti1_why(st, STI1_Y_BUS);
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: not armed, polling: all four EINT words read 0xffffffff (window not answering, nothing was written)\n");
++		return -1;
++	}
++	if ((con & 0xFu) != 0u) {
++		sti1_why(st, STI1_Y_PRE);
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: not armed, polling: pad CON func is %#x, not 0 (input); the restore value is only ever 0 (nothing was written)\n", con & 0xFu);
++		return -1;
++	}
++	st->con_orig = con & 0xFu;
++	st->econ_orig = econ & 0xFu;
++	STI1_LOG("SWEET TOUCH IRQ: arming: econ %#x [pin0 %u] efltcon %#x emask %#x [bit0 %u] epend %#x [bit0 %u] con %#x [func %#x] dat %u\n", econ, econ & 0xFu, eflt, emask, emask & 1u, epend, epend & 1u, con, con & 0xFu, dat & 1u);
++	st->state = STI1_S_ARMING;
++	/* a. mask */
++	rc = sti1_rmw(st, o, STI1_OFF_EMASK, 1u, 1, 0);
++	if (rc) {
++		sti1_fail(st, o, sti1_rc_why(st, rc));
++		return -1;
++	}
++	st->mask_done = 1;
++	/* b. pad function EINT */
++	rc = sti1_rmw(st, o, STI1_OFF_CON, STI1_FUNC_EINT, 1, 0);
++	if (rc) {
++		sti1_fail(st, o, sti1_rc_why(st, rc));
++		return -1;
++	}
++	st->con_set = 1;
++	/* c. trigger level low */
++	rc = sti1_rmw(st, o, STI1_OFF_ECON, STI1_ECON_LEVEL_LOW, 1, 0);
++	if (rc) {
++		sti1_fail(st, o, sti1_rc_why(st, rc));
++		return -1;
++	}
++	st->econ_set = 1;
++	/* d. clear a stale pending bit */
++	rc = sti1_rmw(st, o, STI1_OFF_EPEND, 1u, 0, 0);
++	if (rc) {
++		sti1_fail(st, o, sti1_rc_why(st, rc));
++		return -1;
++	}
++	st->pend_done = 1;
++	if (sti1_rd(st, o, STI1_OFF_DAT, &dat, 0) == 0) {
++		STI1_LOG("SWEET TOUCH IRQ: after CON := 0xF, ECON := level low, EPEND clear: dat %u (research 155 U6: DAT must still show the pad)\n", dat & 1u);
++	}
++	/* e. GIC attach, the SPI stays disabled */
++	rc = o->spi_attach_off != NULL ? o->spi_attach_off(o->ctx, rb) : -1;
++	STI1_LOG("SWEET TOUCH IRQ: attach INTID %u rc %d igroupr %#x isenabler %#x icfgr %#x irouter %#x\n", STI1_INTID, rc, rb[0], rb[1], rb[2], rb[3]);
++	if (rc != 0) {
++		sti1_fail(st, o, STI1_Y_ATTACH);
++		return -1;
++	}
++	st->att = 1;
++	/* f. unmask (EPEND was cleared in d; the GIC is still disabled, nothing can fire yet) */
++	st->unmasked = 1;
++	rc = sti1_rmw(st, o, STI1_OFF_EMASK, 0u, 1, 0);
++	if (rc) {
++		sti1_fail(st, o, sti1_rc_why(st, rc));
++		return -1;
++	}
++	/* g. enable the SPI: the first interrupt can come from here on, so the state is ARMED before it */
++	st->last_seq = __atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE);
++	st->unm_seq = st->last_seq;
++	st->settle = 1;
++	st->state = STI1_S_ARMED;
++	rc = o->spi_enable != NULL ? o->spi_enable(o->ctx, &en) : -1;
++	if (rc != 0 || en != 1u) {
++		STI1_LOG("TOUCH GAP: sweettouchirq=1: GIC enable of INTID %u: rc %d, enable bit read back %u\n", STI1_INTID, rc, en);
++		sti1_fail(st, o, STI1_Y_ENABLE);
++		return -1;
++	}
++	STI1_LOG("SWEET TOUCH IRQ: ARMED INTID %u level-low gpa9[0]: safety wait %u ms, thread drains, ISR masks and clears EPEND only\n", STI1_INTID, STI1_SAFETY_MS);
++	return 0;
++}
++
++/* The interrupt handler (interrupt context): no lock, no log, no SPI, no GIC call. Linux order for a level oneshot interrupt: mask, ack (EPEND W1C), wake the thread. The sequence number is published
++ * AFTER both stores so the thread never sees it before the line is masked. Returns 0 = handled (the source is gone), 1 = error, storm or a late entry outside ARMED (the dispatcher masks the INTID; the thread disarms). */
++static int
++sti1_isr(struct sti1 *st, const struct sti1_ops *o)
++{
++	uint64_t now;
++
++	__atomic_fetch_add(&st->isr_total, 1u, __ATOMIC_RELAXED);
++	if (st->state != STI1_S_ARMED) {
++		/* a late entry (the line went low before the teardown's mask store, review 0356 F1): remove the source here, with the same allowlisted store as below, and return 1 so the dispatcher
++		 * masks INTID 67 at the distributor too; returning 0 with the level still asserted would re-enter forever */
++		(void)sti1_rmw(st, o, STI1_OFF_EMASK, 1u, 0, 1);
++		return 1;
++	}
++	if (sti1_rmw(st, o, STI1_OFF_EMASK, 1u, 0, 1) != 0 || sti1_rmw(st, o, STI1_OFF_EPEND, 1u, 0, 1) != 0) {
++		st->isr_err++;
++		sti1_why(st, STI1_Y_ISR);
++		st->off_req = 1;
++		__atomic_fetch_add(&st->isr_seq, 1u, __ATOMIC_RELEASE);
++		o->wake(o->ctx);
++		return 1;
++	}
++	now = o->now(o->ctx);
++	if (now - st->win_start >= STI1_WIN_NS) {
++		st->win_start = now;
++		st->win_n = 0;
++	}
++	if (++st->win_n > STI1_ISR_STORM) {
++		st->storm_n++;
++		sti1_why(st, STI1_Y_STORM);
++		st->off_req = 1;
++		__atomic_fetch_add(&st->isr_seq, 1u, __ATOMIC_RELEASE);
++		o->wake(o->ctx);
++		return 1;
++	}
++	__atomic_fetch_add(&st->isr_seq, 1u, __ATOMIC_RELEASE);
++	o->wake(o->ctx);
++	return 0;
++}
++
++static int
++sti1_armed(const struct sti1 *st)
++{
++	return st->mode == 1 && st->state == STI1_S_ARMED;
++}
++
++/* the thread's wait: while armed the safety timeout, else today's 1 ms with events / 8 ms idle */
++static unsigned
++sti1_wait_ms(const struct sti1 *st, int n)
++{
++	if (sti1_armed(st)) {
++		return STI1_SAFETY_MS;
++	}
++	return n > 0 ? 1u : 8u;
++}
++
++/* called by the thread between assert_wait and thread_block: an interrupt that ran since the last accounted pass must not be slept through (no lost wakeup) */
++static int
++sti1_wake_pending(const struct sti1 *st)
++{
++	return sti1_armed(st) && (__atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE) != st->last_seq || st->off_req || st->quiesce || st->redo);
++}
++
++/* thread, top of a pass: a shutdown request (ISR error/storm, clean stop) is carried out here, by the one thread that owns the state */
++static void
++sti1_pass_begin(struct sti1 *st, const struct sti1_ops *o)
++{
++	if (st->mode != 1) {
++		return;
++	}
++	if (st->state == STI1_S_ARMED && (st->off_req || st->quiesce)) {
++		sti1_fail(st, o, st->off_req ? STI1_Y_ISR : STI1_Y_QUIESCE);
++	}
++}
++
++static void
++sti1_summary(struct sti1 *st)
++{
++	if (st->state == STI1_S_ARMED) {
++		STI1_LOG("SWEET TOUCH IRQ: irqs %u empty %u wakes %u tmo_drains %u tmo_found %u storm %u mode irq\n", st->isr_total, st->empty, st->wakes, st->tmo_drains, st->tmo_found, st->storm_n);
++	} else {
++		STI1_LOG("SWEET TOUCH IRQ: irqs %u empty %u wakes %u tmo_drains %u tmo_found %u storm %u mode off:%s\n", st->isr_total, st->empty, st->wakes, st->tmo_drains, st->tmo_found, st->storm_n, sti1_why_str(st->why));
++	}
++}
++
++/* thread, after the drain of a pass: n = events handled (0 = empty, < 0 = bus error of the drain); now_ns = the clock. Classifies the pass, applies the auto-off rules, then (still armed) acknowledges and unmasks. */
++static void
++sti1_pass_end(struct sti1 *st, const struct sti1_ops *o, int n, uint64_t now_ns)
++{
++	if (st->mode != 1) {
++		return;
++	}
++	if (st->state == STI1_S_ARMED) {
++		uint32_t cur = __atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE);   /* ONE load for the classification and the unmask below; an ISR after it is seen by sti1_wake_pending */
++		int irq = cur != st->last_seq;    /* an interrupt ran since the last accounted pass (also one that ran DURING this drain: it is not a missed edge) */
++		int first = st->settle;
++
++		st->settle = 0;
++		st->redo = 0;
++		st->last_seq = cur;
++		if (n < 0) {
++			if (++st->err_run >= STI1_ERR_N) {                  /* review 0356 F2: a failing drain is never followed by an unmask; 10 in a row = back to polling */
++				sti1_fail(st, o, STI1_Y_BUS);
++			}
++		} else {
++			st->err_run = 0;
++		}
++		if (n >= 0) {
++			if (irq) {
++				st->wakes++;
++				if (n == 0) {
++					st->empty++;
++					if (now_ns - st->twin_start >= STI1_WIN_NS) {
++						st->twin_start = now_ns;
++						st->twin_n = 0;
++					}
++					if (++st->twin_n > STI1_STORM_EMPTY) {
++						st->storm_n++;
++						sti1_fail(st, o, STI1_Y_STORM);
++					}
++				}
++			} else if (!first) {
++				st->tmo_drains++;
++				if (n > 0) {
++					st->tmo_found++;
++					if (st->tmo_found <= STI1_TMO_LOG) {
++						STI1_LOG("TOUCH GAP: sweettouchirq=1: safety-timeout drain found %d event(s) with no interrupt (missed edge %u of %u allowed)\n", n, st->tmo_found, STI1_NOIRQ_N);
++					}
++					if (now_ns - st->tmo_win_start >= STI1_TMO_WIN_NS) {
++						st->tmo_win_start = now_ns;
++						st->tmo_win_n = 0;
++					}
++					if (++st->tmo_win_n >= STI1_NOIRQ_N) {
++						sti1_fail(st, o, STI1_Y_NOIRQ);
++					}
++				}
++			}
++		}
++		if (st->state == STI1_S_ARMED && n == 0) {      /* the FIFO is empty: the line must be high; low K passes in a row = stuck or inverted */
++			uint32_t d;
++			int rc = sti1_rd(st, o, STI1_OFF_DAT, &d, 0);
++			if (rc) {
++				sti1_fail(st, o, sti1_rc_why(st, rc));
++			} else if ((d & 1u) == 0u) {
++				if (++st->low_run >= STI1_STUCK_K) {
++					sti1_fail(st, o, STI1_Y_STUCK);
++				}
++			} else {
++				st->low_run = 0;
++			}
++		} else if (n > 0) {
++			st->low_run = 0;
++		}
++		if (st->state == STI1_S_ARMED && n >= 0 && !st->off_req && !st->quiesce) {
++			if (cur != st->unm_seq) {                   /* the ISR ran since the last unmask: the line is masked. Linux order: EPEND W1C, then unmask */
++				int rc = sti1_rmw(st, o, STI1_OFF_EPEND, 1u, 0, 0);
++				if (rc == 0) {
++					rc = sti1_rmw(st, o, STI1_OFF_EMASK, 0u, 0, 0);   /* no read-back: the line may fire (and the ISR set the bit again) the moment it is unmasked */
++				}
++				if (rc) {
++					sti1_fail(st, o, sti1_rc_why(st, rc));
++				} else {
++					uint32_t d;
++
++					st->unm_seq = cur;
++					/* research 155 s.6 step 3 / review F3: one DAT read after the unmask. Low with no interrupt entered since the unmask = the line did not fire (U4): count it and drain once more at once */
++					rc = sti1_rd(st, o, STI1_OFF_DAT, &d, 0);
++					if (rc) {
++						sti1_fail(st, o, sti1_rc_why(st, rc));
++					} else if ((d & 1u) == 0u && __atomic_load_n(&st->isr_seq, __ATOMIC_ACQUIRE) == cur) {
++						st->rechk_low++;
++						st->redo = 1;
++					}
++				}
++			}
++		}
++	}
++	if (!st->sum_init) {
++		st->sum_init = 1;
++		st->sum_ns = now_ns;
++	} else if (now_ns - st->sum_ns >= STI1_SUMMARY_NS) {
++		st->sum_ns = now_ns;
++		sti1_summary(st);
++	}
++}
++
++/* clean stop (thread context of the stopper): no more arming, the touch thread disarms at its next pass. 1 = the caller should wait for sti1_off(). */
++static int
++sti1_quiesce_begin(struct sti1 *st)
++{
++	if (st->mode != 1) {
++		return 0;
++	}
++	st->quiesce = 1;
++	return st->state != STI1_S_OFF;
++}
++
++static int
++sti1_off(const struct sti1 *st)
++{
++	return st->state == STI1_S_OFF;
++}
++
++/* EVERY other software reset (reboot(2), panic, sweetrestart, watchdog handler): lock-free, no log, no GIC call; the one write that makes the reset start with the line masked: EMASK bit 0 := 1,
++ * only if this feature ever unmasked it. Through the same judge row as the teardown. */
++static void
++sti1_reset_mask(struct sti1 *st, const struct sti1_ops *o)
++{
++	if (st->mode != 1 || !st->unmasked) {
++		return;
++	}
++	(void)sti1_rmw(st, o, STI1_OFF_EMASK, 1u, 0, 1);
++}
++/* STI1_CORE_END */
++#endif /* SWEET_TOUCH_IRQ1_H */

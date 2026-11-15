@@ -1,0 +1,4 @@
+diff --git a/shim/x.c b/tools/x.c
+similarity index 100%
+rename from shim/x.c
+rename to tools/x.c

@@ -1,0 +1,15 @@
+diff --git a/xnu/patches/0300-x.patch b/xnu/patches/0300-x.patch
+new file mode 100644
+--- /dev/null
++++ b/xnu/patches/0300-x.patch
+@@ -0,0 +1,10 @@
++desc
++
++diff --git a/osfmk/conf/Makefile b/osfmk/conf/Makefile
++--- a/osfmk/conf/Makefile
+++++ b/osfmk/conf/Makefile
++@@ -10,3 +10,4 @@
++ a
+++{
+++}
++ b

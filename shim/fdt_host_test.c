@@ -5,7 +5,8 @@
 #include "fdt.h"
 #include "fdt_test_builder.h"
 
-void con_str(const char *label, const char *s) { (void)label; (void)s; }
+static int gap_lines;	/* ALL-ON T-06: 'FDT GAP' lines printed by fdt.c */
+void con_str(const char *label, const char *s) { (void)s; if (!strncmp(label, "FDT GAP", 7)) gap_lines++; }
 void con_hex(const char *label, uint64_t v) { (void)label; (void)v; }
 
 /* The builder now lives in fdt_test_builder.h (shared with
@@ -357,8 +358,34 @@ static void test_collect_reserved_overflow(void)
 	assert(mm.n_reserved == 1 && mm.n_reserved_dropped == 0);
 }
 
+/* ALL-ON T-06: a malformed tree reads as "not found" AND says so; a valid tree without the item stays quiet */
+static void test_malformed_gap(void)
+{
+	struct fdt_builder b;
+	b_init(&b);
+	b_begin_node(&b, "");
+	b_prop_u32(&b, "#address-cells", 2);	/* a non-empty strings block: the header check refuses strings == end */
+	b_end_node(&b);
+	uintptr_t good = b_finish(&b);
+	uint64_t v = 0;
+	struct fdt_video vid;
+	gap_lines = 0;
+	assert(!fdt_memory_contains(good, 0x880000000ULL, 0x1000));
+	assert(!fdt_chosen_u64(good, "linux,initrd-start", &v));
+	assert(!fdt_framebuffer(good, &vid));
+	assert(gap_lines == 0);
+	static uint32_t bad[16];	/* zero magic */
+	assert(!fdt_memory_contains((uintptr_t)bad, 0x880000000ULL, 0x1000));
+	assert(gap_lines == 1);
+	assert(!fdt_chosen_u64((uintptr_t)bad, "linux,initrd-start", &v));
+	assert(gap_lines == 2);
+	assert(!fdt_framebuffer((uintptr_t)bad, &vid));
+	assert(gap_lines == 3);
+}
+
 int main(void)
 {
+	test_malformed_gap();
 	test_original_case();
 	test_gs101_memory_cells();
 	test_reserved_memory_cells();

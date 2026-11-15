@@ -1,0 +1,21 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -10,6 +10,7 @@ void g(void)
+ 	if (b) {
+ 		bar();
+ 		baz();
++		printf("b\n");
+ 	}
+ #endif
+
+@@ -40,6 +41,9 @@ void f(int a, int dbg)
+ 	(void)dbg;
+ 	if (a)
+ 		foo();
++	if (dbg) {
++		printf("dbg\n");
++	}
+ 	else
+ 		off();
+ }

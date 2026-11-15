@@ -2,11 +2,13 @@
 """phone-guard: Claude Code PreToolUse hook for Bash (TP-020). Denies hand-typed device commands.
 
 The tools (xrun, probe-run, fboot.sh, fflash-userdata.sh, phone) hold the phone lock and check bluejay; a raw `fastboot flash ...` or
-`adb reboot ...` in an agent's Bash call skips both. Read-only queries (fastboot devices/getvar, adb devices/get-state) pass.
+`adb reboot ...` in an agent's Bash call skips both. Read-only queries (fastboot devices/getvar, adb devices/get-state) are not blocked HERE (this hook guards writes), but agent-guard E24 denies the readiness ones (devices, get-state): use `tools/phone state`.
 A guard rail against accidents, NOT a sandbox: indirection (variables, $(...), python subprocess) is not followed.
 Stdin: the hook JSON. Stdout: a deny decision, or nothing (allow). Always exit 0. Test: tools/test_phone_guard.py.
 Wire it in .claude/settings.json: hooks.PreToolUse[{matcher "Bash", command "python3 $CLAUDE_PROJECT_DIR/pixos-project/pixelios-kernel/tools/phone-guard"}].
 """
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
 import json, os, re, shlex, sys
 
 READ_ONLY = {"fastboot": {"devices", "getvar", "--version", "version", "help", "--help"},
@@ -16,7 +18,7 @@ WRAP = {"sudo", "env", "exec", "nohup", "time", "timeout", "nice", "stdbuf", "se
 KEYWORDS = {"then", "do", "else", "elif", "while", "until", "if", "!", "{", "}"}
 FLAG_ARG = {"-s", "-t", "-H", "-P", "-p"}  # global options that take a value
 WHY = ("hand-typed %s: use the built tools (tools/xrun, tools/probe-run, tools/fboot.sh, tools/fflash-userdata.sh, tools/phone) -- they hold the "
-       "phone lock and verify bluejay (AGENTS.md 'Use the tools'). Read-only queries (fastboot devices|getvar, adb devices|get-state) are allowed.")
+       "phone lock and verify bluejay (AGENTS.md 'Use the tools'). Readiness queries (fastboot devices, adb devices|get-state) are not blocked here but agent-guard E24 denies them: use tools/phone state.")
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
@@ -38,7 +40,7 @@ def segments(cmd):
                 seg = []
             else:
                 seg.append(t)
-    except ValueError:
+    except ValueError:   # lint-silent: expected an unbalanced quote in the model-written command: the segments parsed so far are judged (comment)
         pass  # unbalanced quote: judge what was parsed so far
     if seg:
         yield seg
@@ -86,15 +88,120 @@ def offending(cmd, depth=0):
         return " ".join([prog] + rest[:3])
     return None
 
+BOOT_TOOLS = {"xrun", "probe-run", "fboot.sh"}
+NO_BOOT_FLAGS = {"-h", "--help", "--dry-run", "--print-bootargs"}
+STALE_WHY = ("T-03ff: %s is a checkout whose tools/build-xnu-image.sh has no --panic-spin check (%s): a boot from it can spin on a panic screen until the user resets the phone "
+             "(runs 20261107T140408Z and 141227Z-wlan-runG2-join25 booted debug=0xc). Do instead: merge trunk into that branch (`git -C %s merge trunk`, or rebase), then run the tool again; "
+             "a deliberate spin is `tools/xrun ... --args 'debug=0xc' --panic-spin \"<reason>\"` on a merged branch.")
+SAFETY_WHY = ("RULES H9 (user 2026-11-12, docs/SAFETY-CHECKLIST.md): %s is a checkout without tools/safety-check: a boot from it runs with no battery-temperature "
+              "park, no silent-boot alert and no pre-boot checks (the phone reached 51.6 C in resident-204614-b1). Do instead: merge trunk into that branch "
+              "(`git -C %s merge trunk`, or `tools/tools-sync pull` there), then run the tool again.")
+
+
+def _calls(cmd, cwd, names, depth=0):
+    """(tool basename, checkout root, the words after the tool) of every NAMES tool named with a path in CMD. Follows `cd DIR` segments from CWD and
+    bash -c strings; a bare tool name (PATH) is not judged."""
+    cur = cwd or os.getcwd()
+    for w in segments(cmd):
+        i = 0
+        while i < len(w):
+            t = w[i]
+            b = os.path.basename(t)
+            if b in KEYWORDS or b in WRAP or re.match(r"^[A-Za-z_]\w*=", t) or (t.startswith("-") and i) or (i and re.fullmatch(r"\d+[smhd]?", t)):
+                i += 1
+                continue
+            break
+        if i >= len(w):
+            continue
+        prog, rest = os.path.basename(w[i]), w[i + 1:]
+        if prog == "cd" and rest:
+            cur = os.path.normpath(os.path.join(cur, os.path.expanduser(rest[0])))
+            continue
+        if prog in ("bash", "sh", "zsh", "dash") and depth < 3:
+            for k, x in enumerate(rest):
+                if x in ("-c", "-lc", "-ic") and rest[k + 1:k + 2]:
+                    yield from _calls(rest[k + 1], cur, names, depth + 1)
+                    break
+        cands = [w[i]] + (rest if prog in ("bash", "sh", "zsh", "dash", "phone-lock", "python3") else [])
+        for k, x in enumerate(cands):
+            if os.path.basename(x) not in names or "/" not in x:
+                continue
+            yield os.path.basename(x), os.path.dirname(os.path.dirname(os.path.normpath(os.path.join(cur, os.path.expanduser(x))))), w[i + 1:] if k == 0 else cands[k + 1:]
+            break
+
+
+def stale_boot(cmd, cwd, depth=0):
+    """T-03ff: the checkout root of a boot tool (xrun, probe-run, fboot.sh) named with a path in CMD whose tools/build-xnu-image.sh lacks the --panic-spin check: the deny text;
+    else RULES H9 (unsafe_tree); else None. A root with no build script is not judged for T-03ff."""
+    for _tool, root, after in _calls(cmd, cwd, BOOT_TOOLS, depth):
+        if NO_BOOT_FLAGS & set(after):
+            continue
+        try:
+            with open(os.path.join(root, "tools", "build-xnu-image.sh"), errors="replace") as fh:
+                txt = fh.read()
+        except OSError:   # lint-silent: expected the root has no tools/build-xnu-image.sh (a fixture or the super repo): nothing to judge, the build step itself enforces
+            continue
+        if "--panic-spin" not in txt:
+            m = re.search(r'^args="debug=(\S+)', txt, re.M)
+            return STALE_WHY % (root, "its default boot-args are debug=%s" % m.group(1) if m else "no debug= default found", root)
+    return unsafe_tree(cmd, cwd)
+
+
+# RULES H9: what starts (or feeds) a boot, by tool: None = every call but NO_BOOT_FLAGS; a tuple = only these first words after the tool
+SAFETY_STARTS = {"xrun": None, "fboot.sh": None, "hot": ("session", "join"), "resident": ("submit", "start", "_serve")}
+
+
+def resident_tree():
+    """The checkout root that serves the live resident session (its _serve process), or None when no session runs."""
+    art = os.environ.get("ARTIFACTS") or os.path.expanduser("~/pixelios-artifacts")
+    try:
+        with open(os.path.join(art, "resident", "session.json")) as fh:
+            ses = json.load(fh)
+        if ses.get("state") == "ended" or not ses.get("pid"):
+            return None
+        with open("/proc/%d/cmdline" % int(ses["pid"]), "rb") as fh:
+            words = fh.read().decode("utf-8", "replace").split("\0")
+    except (OSError, ValueError):   # lint-silent: expected no session file or the session process is gone: no live session to judge
+        return None
+    if "_serve" not in words:
+        return None
+    for x in words:
+        if x.endswith("/tools/resident"):
+            return os.path.dirname(os.path.dirname(x))
+    return None
+
+
+def unsafe_tree(cmd, cwd):
+    """RULES H9: the deny text when CMD starts a boot (xrun, fboot.sh, hot session/join, resident submit/start) that a checkout WITHOUT tools/safety-check would
+    serve: the tool's own checkout, and for resident submit also the checkout of the LIVE session (it boots with its own tools, not the submitter's). Else None.
+    Only kernel checkouts (a root with tools/xrun) are judged."""
+    for tool, root, after in _calls(cmd, cwd, set(SAFETY_STARTS)):
+        if NO_BOOT_FLAGS & set(after):
+            continue
+        first = next((x for x in after if not x.startswith("-")), "")
+        if SAFETY_STARTS[tool] is not None and first not in SAFETY_STARTS[tool]:
+            continue
+        roots = [root] + ([resident_tree()] if tool == "resident" and first == "submit" else [])
+        for r in roots:
+            if r and os.path.exists(os.path.join(r, "tools", "xrun")) and not os.path.exists(os.path.join(r, "tools", "safety-check")):
+                return SAFETY_WHY % (r, r) + (" (that checkout serves the live resident session: end it with `tools/resident end --reason ...` and start it from a merged tree)" if r != root else "")
+    return None
+
 
 def main():
     try:
         d = json.load(sys.stdin)
-    except ValueError:
+    except ValueError as _err:
+        print(f"phone-guard GAP: hook input is not JSON ({_err}): command not judged", file=sys.stderr)
         return 0
     if d.get("tool_name") != "Bash":
         return 0
-    bad = offending((d.get("tool_input") or {}).get("command", ""))
+    cmd = (d.get("tool_input") or {}).get("command", "")
+    stale = stale_boot(cmd, d.get("cwd") or os.getcwd())
+    if stale:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": stale}}))
+        return 0
+    bad = offending(cmd)
     if bad:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                   "permissionDecisionReason": WHY % ("`%s`" % bad)}}))

@@ -1,0 +1,160 @@
+sweet-cntvct-checkpoints (boot-speed, docs/research/45-fast-boot-claims-and-xnu-gap.md s3 items 3/4): CNTVCT stamps at ten early-boot
+points, so the ~34 s between shim jump and the first kernel_bootstrap lines can be split on the next run. Boot-arg sweetcntvct=1 prints
+them; DEFAULT (no boot-arg) = the stamps are stored (one register read each, no I/O) and nothing is printed, so behaviour is unchanged.
+Stamps (index: place): 0 arm_init entry (after mark 1); 1 after PE_init_platform(FALSE) (mark 2; boot-args readable from here);
+2/3 before/after arm_vm_init; 4 after serial_init; 5 after "kprintf initialized" (mark 20); 6/7 before/after the first printf in
+kernel_bootstrap (startup.c); 8/9 before/after pmap_bootstrap (arm_vm_init.c, inside arm_vm_init). Dump: ck0-5 by kprintf right
+after the first kprintf (arm_init.c), then ck0-9 again by printf after kernel_bootstrap's first printf (reaches the console ring and
+the USB replay). Each line: "SWEET CNTVCT ckN=<raw ticks> hz=<timebase_frequency_hz>"; host converts ticks/hz.
+Facts, read from source (xnu-8796.141.3 with the stack applied): clock = ml_get_hwclock() (osfmk/arm64/machine_routines.c:2082, ISB +
+CNTVCT_EL0 read :2070-2077, declared arm/machine_routines.h:758), the same clock as patch 0115 (sweetlogts), so the stamps line up with
+the [SSSSS.mmm] prefixes. hz = 0 before pe_identify_machine (0115 header): the raw ticks are the datum. Boot-args are NULL until
+PE_init_platform (0115 header; the dump checks PE_state.bootArgs). kprintf is declared pexpert/pexpert.h:233 (a no-op if
+CONFIG_NO_KPRINTF_STRINGS, :241-244: then only the printf dump appears). The stamp array is a static in sweet_early.c (SWEET only;
+no-op inlines in sweet_early.h otherwise). Not verified on hardware. Shim-side stamps (research 45 s3 items 1-2) are a separate shim
+change and not in this patch.
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -348,6 +348,7 @@
+ 	unsigned int dt_entry_size = 0;
+ 
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
++	sweet_cntvct_stamp(0);
+ 
+ 	arm_setup_pre_sign();
+ 
+@@ -366,6 +367,7 @@
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
+ 	sweet_early_mark(2, "PE_init_platform done");
++	sweet_cntvct_stamp(1);
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -522,7 +524,9 @@
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ 	sweet_early_mark(7, "entering arm_vm_init");
++	sweet_cntvct_stamp(2);
+ 	arm_vm_init(xmaxmem, args);
++	sweet_cntvct_stamp(3);
+ 	sweet_early_mark(15, "arm_vm_init returned");
+ 
+ 	if (debug_boot_arg) {
+@@ -539,9 +543,12 @@
+ 	sweet_early_mark(16, "calling serial_init");
+ 	const unsigned int serial_exists = serial_init();
+ 	sweet_early_mark(19, "serial_init returned");
++	sweet_cntvct_stamp(4);
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
++	sweet_cntvct_stamp(5);
++	sweet_cntvct_dump(0, 6, 1);
+ 	if (serial_exists) {
+ 		sweet_early_disable();
+ 	}
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2294,7 +2294,9 @@
+ #endif
+ #endif
+ 	sweet_early_mark(12, "calling pmap_bootstrap");
++	sweet_cntvct_stamp(8);
+ 	pmap_bootstrap(dynamic_memory_begin);
++	sweet_cntvct_stamp(9);
+ 	sweet_early_mark(13, "pmap_bootstrap done");
+ 
+ 	disable_preemption();
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,6 +10,8 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
+@@ -140,4 +142,39 @@
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++
++/*
++ * Early CNTVCT checkpoints (patch 0125, research 45 s3 item 3). Raw ticks go into a static array (no printf, no boot-arg
++ * read, so it is safe before the console exists); sweet_cntvct_dump prints them only with boot-arg sweetcntvct=1.
++ */
++#define SWEET_CNTVCT_N 16
++static uint64_t sweet_cntvct_ck[SWEET_CNTVCT_N];
++
++void
++sweet_cntvct_stamp(unsigned int idx)
++{
++	if (idx < SWEET_CNTVCT_N) {
++		sweet_cntvct_ck[idx] = ml_get_hwclock();
++	}
++}
++
++/* serial != 0: kprintf (safe right after "kprintf initialized"); else printf (kernel_bootstrap, console ring). */
++void
++sweet_cntvct_dump(unsigned int from, unsigned int to, int serial)
++{
++	int on = 0;
++	if (PE_state.bootArgs == NULL || !PE_parse_boot_argn("sweetcntvct", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	for (unsigned int i = from; i < to && i < SWEET_CNTVCT_N; i++) {
++		if (sweet_cntvct_ck[i] == 0) {
++			continue;
++		}
++		if (serial) {
++			kprintf("SWEET CNTVCT ck%u=%llu hz=%lu\n", i, sweet_cntvct_ck[i], gPEClockFrequencyInfo.timebase_frequency_hz);
++		} else {
++			printf("SWEET CNTVCT ck%u=%llu hz=%lu\n", i, sweet_cntvct_ck[i], gPEClockFrequencyInfo.timebase_frequency_hz);
++		}
++	}
++}
+ #endif /* SWEET */
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,8 @@
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++void sweet_cntvct_stamp(unsigned int idx);
++void sweet_cntvct_dump(unsigned int from, unsigned int to, int serial);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -19,6 +21,8 @@
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_cntvct_stamp(unsigned int idx) { (void)idx; }
++static inline void sweet_cntvct_dump(unsigned int from, unsigned int to, int serial) { (void)from; (void)to; (void)serial; }
+ #endif
+ 
+ #endif
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -116,6 +116,7 @@
+ #include <machine/pmap.h>
+ #include <machine/commpage.h>
+ #include <machine/machine_routines.h>
++#include <arm64/sweet_early.h>
+ #include <libkern/version.h>
+ #include <pexpert/device_tree.h>
+ #include <sys/codesign.h>
+@@ -426,7 +427,10 @@
+ 	thread_t        thread;
+ 	char            namep[16];
+ 
++	sweet_cntvct_stamp(6);
+ 	printf("%s\n", version); /* log kernel version */
++	sweet_cntvct_stamp(7);
++	sweet_cntvct_dump(0, 16, 0);
+ 
+ 	scale_setup();
+ 

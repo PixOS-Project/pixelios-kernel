@@ -1,0 +1,34 @@
+sweet-hfs-dataprotect-class (driverkitd sig 9 root cause, research 50 item 7 + docs/research/driverkitd-dext-read.md): sweet_hfs is built
+with CONFIG_PROTECT undefined (bsd/sweet_hfs/sweet_hfs_compat.h:12), which also drops hfs_vnop_getattr's va_dataprotect_class answer.
+fcntl(F_GETPROTECTIONCLASS) then fails ENOTSUP (bsd/kern/kern_descrip.c F_GETPROTECTIONCLASS case), and Foundation's
+_NSReadBytesFromFileWithExtendedAttributes treats a failed F_GETPROTECTIONCLASS as "not safe to map", so every
+NSDataReadingMappedIfSafe read becomes malloc+read. driverkitd's "Realize dext" reads the 4,028,544 B AppleBCMWLAN dext that way and
+crosses its 6 MB InactiveHard jetsam limit (SWEET JETSAM ... footprint 7 MB, x0 0x3d7880).
+Fix: in the !CONFIG_PROTECT build answer class 0, exactly what upstream HFS answers for a file without a cprotect entry (the
+CONFIG_PROTECT block right above). Read-only getattr change; no write path, no limit change. One SWEET HFS line on first use (rule 8).
+diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
+--- a/bsd/sweet_hfs/core/hfs_vnops.c
++++ b/bsd/sweet_hfs/core/hfs_vnops.c
+@@ -1154,6 +1154,22 @@
+     		vap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;
+     		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+     	} 	
++#else
++	/*
++	 * SWEET (0181): CONFIG_PROTECT is off here (sweet_hfs_compat.h), but upstream HFS
++	 * answers class 0 for a file without a cprotect entry, i.e. on any unprotected
++	 * mount (block above). Without it fcntl(F_GETPROTECTIONCLASS) fails with ENOTSUP
++	 * (kern_descrip.c) and Foundation's NSDataReadingMappedIfSafe never maps a file.
++	 */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
++		static int sweet_dataprotect_logged;
++		if (!sweet_dataprotect_logged) {
++			sweet_dataprotect_logged = 1;
++			printf("SWEET HFS: va_dataprotect_class answered 0 (no content protection, upstream unprotected-mount value)\n");
++		}
++		vap->va_dataprotect_class = 0;
++		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	}
+ #endif
+ 	if (VATTR_IS_ACTIVE(vap, va_write_gencount)) {
+ 		if (ubc_is_mapped_writable(vp)) {

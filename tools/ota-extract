@@ -1,0 +1,285 @@
+#!/usr/bin/env -S python3 -I
+"""ota-extract: pull named partition images out of a FULL Android A/B OTA zip (TP-049). stdlib only, read-only on the zip, never executes anything from it.
+
+  tools/ota-extract OTA.zip --part NAME [--part NAME ...] --out DIR [--list]
+
+The zip is untrusted input. payload.bin is read in place (the entry must be STORED; no full extraction to disk).
+Writes DIR/NAME.img for each --part, DIR/SHA256SUMS and DIR/manifest.txt (partition, size, sha256, build fingerprint from META-INF/com/android/metadata,
+payload_properties.txt copied verbatim). Each image must match new_partition_info.size + .hash of the payload manifest, else FAIL and the file is deleted.
+Last line RESULT: PASS|FAIL|ERROR reason (exit 0/1/2). No phone, no network.
+
+Format facts, all [read from source: AOSP platform/system/update_engine, branch android14-release, fetched 2026-10-29]:
+  payload_consumer/payload_constants.cc:24-27,47  kBrilloMajorPayloadVersion = 2 (min = max supported); kDeltaMagic = "CrAU"; kMaxPayloadHeaderSize = 24; kFullPayloadMinorVersion = 0 (:29)
+  payload_consumer/payload_metadata.cc:34-48,92,108,126  header = magic[4] | version u64 BE | manifest_size u64 BE | metadata_signature_size u32 BE (version 2) | manifest | metadata signature;
+      manifest offset = 4+8+8+4 = 24; metadata_size = 24 + manifest_size
+  payload_consumer/delta_performer.cc:458,481,1244  blobs start after metadata_size + metadata_signature_size; operation.data_offset is relative to that point
+  payload_consumer/delta_performer.cc:874-876,891-897  REPLACE/REPLACE_BZ/REPLACE_XZ carry a blob; ZERO/DISCARD have no data_offset/data_length
+  payload_consumer/extent_writer.cc:25-35  the blob bytes fill dst_extents in order, extent i takes num_blocks*block_size bytes at start_block*block_size (a sparse-hole start_block is skipped)
+  update_metadata.proto (message: field numbers)
+      DeltaArchiveManifest: block_size=3 (default 4096), minor_version=12 (default 0), partitions=13
+      PartitionUpdate: partition_name=1, new_partition_info=7, operations=8
+      PartitionInfo: size=1, hash=2 (sha256)
+      InstallOperation: type=1, data_offset=2, data_length=3, dst_extents=6, data_sha256_hash=8; Type REPLACE=0 REPLACE_BZ=1 SOURCE_COPY=4 SOURCE_BSDIFF=5 ZERO=6 DISCARD=7 REPLACE_XZ=8
+          PUFFDIFF=9 BROTLI_BSDIFF=10 ZUCCHINI=11 LZ4DIFF_BSDIFF=12 LZ4DIFF_PUFFDIFF=13
+      Extent: start_block=1, num_blocks=2
+A minor_version other than 0 is an incremental payload: FAIL. Any op other than REPLACE/REPLACE_BZ/REPLACE_XZ/ZERO in a requested partition: FAIL naming it.
+"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "".join(l[2:] for l in open(__file__).readlines()[1:60] if l.startswith("# "))).strip()); raise SystemExit(0)
+import bz2, hashlib, lzma, os, re, struct, subprocess, sys, zipfile
+
+SPARSE_HOLE = (1 << 64) - 1   # kSparseHole = numeric_limits<uint64_t>::max() [read from source: payload_consumer/payload_constants.h:86]
+OPNAME = {0: "REPLACE", 1: "REPLACE_BZ", 4: "SOURCE_COPY", 5: "SOURCE_BSDIFF", 6: "ZERO", 7: "DISCARD", 8: "REPLACE_XZ", 9: "PUFFDIFF", 10: "BROTLI_BSDIFF",
+          11: "ZUCCHINI", 12: "LZ4DIFF_BSDIFF", 13: "LZ4DIFF_PUFFDIFF"}
+OK_OPS = (0, 1, 6, 8)
+
+
+class Fail(Exception): pass
+class Err(Exception): pass
+
+
+def varint(b, i):
+    v = s = 0
+    while True:
+        if i >= len(b): raise Fail("truncated protobuf varint")
+        c = b[i]; i += 1
+        v |= (c & 0x7F) << s; s += 7
+        if not c & 0x80: return v, i
+        if s > 70: raise Fail("protobuf varint too long")
+
+
+def fields(b):
+    """Yield (field number, wire type, value): ints for varint/fixed, bytes for length-delimited."""
+    i = 0
+    while i < len(b):
+        key, i = varint(b, i); fn, wt = key >> 3, key & 7
+        if wt == 0: v, i = varint(b, i)
+        elif wt == 1: v = int.from_bytes(b[i:i + 8], "little"); i += 8
+        elif wt == 5: v = int.from_bytes(b[i:i + 4], "little"); i += 4
+        elif wt == 2:
+            n, i = varint(b, i)
+            if i + n > len(b): raise Fail("truncated protobuf length-delimited field")
+            v = b[i:i + n]; i += n
+        else: raise Fail("unsupported protobuf wire type %d" % wt)
+        yield fn, wt, v
+
+
+def parse_extent(b):
+    st = nb = 0
+    for fn, _, v in fields(b):
+        if fn == 1: st = v
+        elif fn == 2: nb = v
+    return st, nb
+
+
+def parse_op(b):
+    o = {"type": None, "off": None, "len": None, "ext": [], "sha": None}
+    for fn, _, v in fields(b):
+        if fn == 1: o["type"] = v
+        elif fn == 2: o["off"] = v
+        elif fn == 3: o["len"] = v
+        elif fn == 6: o["ext"].append(parse_extent(v))
+        elif fn == 8: o["sha"] = v
+    if o["type"] is None: raise Fail("InstallOperation without type")
+    return o
+
+
+def parse_part(b):
+    p = {"name": None, "size": None, "hash": None, "ops": []}
+    for fn, _, v in fields(b):
+        if fn == 1: p["name"] = v.decode("utf-8", "replace")
+        elif fn == 7:
+            for f2, _, v2 in fields(v):
+                if f2 == 1: p["size"] = v2
+                elif f2 == 2: p["hash"] = v2
+        elif fn == 8: p["ops"].append(parse_op(v))
+    return p
+
+
+def parse_manifest(b):
+    m = {"block_size": 4096, "minor": 0, "parts": []}
+    for fn, _, v in fields(b):
+        if fn == 3: m["block_size"] = v
+        elif fn == 12: m["minor"] = v
+        elif fn == 13: m["parts"].append(parse_part(v))
+    return m
+
+
+class Payload:
+    """payload.bin read in place from the zip (stored entry)."""
+    def __init__(self, zpath):
+        self.f = open(zpath, "rb")
+        try: z = zipfile.ZipFile(self.f)
+        except zipfile.BadZipFile as e: raise Err("not a zip: %s" % e)
+        self.z = z
+        try: zi = z.getinfo("payload.bin")
+        except KeyError: raise Err("no payload.bin in the zip (not an A/B OTA)")
+        if zi.compress_type != zipfile.ZIP_STORED: raise Fail("payload.bin is not STORED in the zip (compress_type %d): refusing, no full extraction" % zi.compress_type)
+        self.f.seek(zi.header_offset); lh = self.f.read(30)
+        if len(lh) != 30 or lh[:4] != b"PK\x03\x04": raise Fail("bad local zip header for payload.bin")
+        nlen, elen = struct.unpack("<HH", lh[26:30])
+        self.base = zi.header_offset + 30 + nlen + elen; self.size = zi.file_size
+        h = self.rd(0, 24)
+        if h[:4] != b"CrAU": raise Fail("payload.bin magic is %r, not CrAU" % h[:4])
+        ver, msize, sigsize = struct.unpack(">QQI", h[4:24])
+        if ver != 2: raise Fail("payload file_format_version %d, only 2 is supported" % ver)
+        if 24 + msize + sigsize > self.size: raise Fail("manifest/signature sizes exceed payload.bin")
+        self.man = parse_manifest(self.rd(24, msize))
+        self.blobs = 24 + msize + sigsize
+
+    def rd(self, off, n):
+        if off < 0 or n < 0 or off + n > self.size: raise Fail("read of %d bytes at %d outside payload.bin (%d)" % (n, off, self.size))
+        self.f.seek(self.base + off); b = self.f.read(n)
+        if len(b) != n: raise Fail("short read from the zip")
+        return b
+
+    def text(self, name):
+        try: return self.z.read(name).decode("utf-8", "replace")
+        except KeyError: return None   # lint-silent: expected a zip member that is absent is None, the callers check it
+
+
+def fingerprint(meta):
+    for ln in (meta or "").splitlines():
+        if ln.startswith("post-build="): return ln.split("=", 1)[1]
+    return "unknown (no post-build= in META-INF/com/android/metadata)"
+
+
+def write_zeros(f, n):
+    while n > 0:
+        c = min(n, 1 << 20); f.write(bytes(c)); n -= c
+
+
+MAX_PART = 16 << 30
+WFLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+
+def check_out(out):
+    """F1 (hard rule 4): refuse an --out inside any git work tree; F2: refuse a symlinked --out. Fail closed."""
+    if os.path.islink(out): raise Fail("--out %s is a symlink: refused" % out)
+    anc = os.path.abspath(out)
+    while not os.path.isdir(anc): anc = os.path.dirname(anc)
+    def git(*a): return subprocess.run(["git", "-C", anc] + list(a), capture_output=True, text=True)
+    try: r = git("rev-parse", "--is-inside-work-tree")
+    except OSError as e: raise Err("cannot run git to check --out (fail closed): %s" % e)
+    if r.returncode == 0 and r.stdout.strip() == "true":
+        top = git("rev-parse", "--show-toplevel").stdout.strip() or "?"
+        raise Fail("--out %s is inside the git work tree %s: refused (hard rule 4: no firmware in git)" % (out, top))
+    if r.returncode != 0 and "not a git repository" not in r.stderr:
+        raise Err("git rev-parse failed for --out ancestor %s (fail closed): %s" % (anc, r.stderr.strip()))
+
+
+def extract(pl, p, path, bs):
+    size = p["size"]
+    if size is None or p["hash"] is None: raise Fail("%s: manifest has no new_partition_info size/hash" % p["name"])
+    for i, o in enumerate(p["ops"]):
+        if o["type"] not in OK_OPS: raise Fail("%s: op %d is %s (only REPLACE, REPLACE_BZ, REPLACE_XZ, ZERO are supported)" % (p["name"], i, OPNAME.get(o["type"], "type %d" % o["type"])))
+    if size > MAX_PART: raise Fail("%s: manifest size %d exceeds the %d byte cap: refused" % (p["name"], size, MAX_PART))
+    part = path + ".part"
+    for q in (path, part):
+        if os.path.islink(q): raise Fail("%s is a symlink: refused" % q)
+        if os.path.exists(q): os.unlink(q)   # stale regular file
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)   # O_NOFOLLOW: symlink check
+        with os.fdopen(fd, "wb") as f:
+            f.truncate(size)
+            for i, o in enumerate(p["ops"]):
+                t = o["type"]; want = sum(n for s, n in o["ext"]) * bs
+                for s, n in o["ext"]:   # review golden-bp31-r2 F3: every extent and the op total are bounded by the partition BEFORE any decompression
+                    if s != SPARSE_HOLE and (s + n) * bs > size: raise Fail("%s: op %d extent %d+%d blocks is beyond the partition size %d" % (p["name"], i, s, n, size))
+                if t != 6 and want > size: raise Fail("%s: op %d extents hold %d bytes, more than the partition size %d: refused" % (p["name"], i, want, size))
+                if t == 6:
+                    if o["off"] is not None or o["len"] is not None: raise Fail("%s: ZERO op %d carries a blob" % (p["name"], i))
+                    data = None
+                else:
+                    if o["off"] is None or o["len"] is None: raise Fail("%s: op %d has no data_offset/data_length" % (p["name"], i))
+                    blob = pl.rd(pl.blobs + o["off"], o["len"])
+                    if o["sha"]:
+                        if hashlib.sha256(blob).digest() != o["sha"]: raise Fail("%s: op %d data_sha256_hash mismatch" % (p["name"], i))
+                    try:
+                        if t == 0: data = blob
+                        else:   # F3: bounded output (want+1), must end exactly at the stream end
+                            d = bz2.BZ2Decompressor() if t == 1 else lzma.LZMADecompressor()
+                            data = d.decompress(blob, max_length=want + 1)
+                            if len(data) > want: raise Fail("%s: op %d (%s) expands beyond its extents (%d bytes): refused" % (p["name"], i, OPNAME[t], want))
+                            if not d.eof: raise Fail("%s: op %d (%s) stream is not at EOF after %d bytes" % (p["name"], i, OPNAME[t], len(data)))
+                            if d.unused_data: raise Fail("%s: op %d (%s) has %d bytes after the compressed stream: refused" % (p["name"], i, OPNAME[t], len(d.unused_data)))
+                    except (OSError, ValueError, EOFError, lzma.LZMAError) as e:
+                        raise Fail("%s: op %d (%s) does not decompress: %s" % (p["name"], i, OPNAME[t], e))
+                    if len(data) != want: raise Fail("%s: op %d data is %d bytes, its extents hold %d" % (p["name"], i, len(data), want))
+                pos = 0
+                for s, n in o["ext"]:
+                    ln = n * bs
+                    if s != SPARSE_HOLE:
+                        if (s + n) * bs > size: raise Fail("%s: op %d extent %d+%d blocks is beyond the partition size %d" % (p["name"], i, s, n, size))
+                        f.seek(s * bs)
+                        if data is None: write_zeros(f, ln)
+                        else: f.write(data[pos:pos + ln])
+                    pos += ln
+            f.flush(); os.fsync(f.fileno())
+        h = hashlib.sha256()
+        if os.path.getsize(part) != size: raise Fail("%s: written size %d != new_partition_info.size %d" % (p["name"], os.path.getsize(part), size))
+        with open(part, "rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""): h.update(c)
+        got_sha = h.digest()
+        if got_sha != p["hash"]:   # HASH-CHECK (mutant target of tools/test_ota_extract.py)
+            raise Fail("%s: sha256 %s != new_partition_info.hash %s" % (p["name"], got_sha.hex(), p["hash"].hex()))
+        os.rename(part, path)   # F4: final name only after the sha matched
+        return got_sha.hex()
+    except BaseException:
+        if os.path.lexists(part): os.unlink(part)
+        raise
+
+
+def main(argv):
+    parts, out, lst, zpath = [], None, False, None
+    a = list(argv)
+    while a:
+        x = a.pop(0)
+        if x in ("--part", "--out"):
+            if not a: raise Err("%s needs a value" % x)
+            v = a.pop(0)
+            if x == "--part": parts.append(v)
+            else: out = v
+        elif x == "--list": lst = True
+        elif x.startswith("-"): raise Err("unknown argument %r" % x)
+        elif zpath is None: zpath = x
+        else: raise Err("more than one OTA path")
+    if not zpath: raise Err("usage: ota-extract OTA.zip --part NAME [--part NAME ...] --out DIR [--list]")
+    if not lst and not (parts and out): raise Err("need --part NAME and --out DIR (or --list)")
+    for n in parts:
+        if not re.fullmatch(r"[a-z0-9_]{1,40}", n): raise Err("bad --part name %r" % n)
+    pl = Payload(zpath); m = pl.man
+    if m["minor"] != 0: raise Fail("minor_version %d: this is an incremental OTA, only full payloads (minor 0) are supported" % m["minor"])
+    byname = {p["name"]: p for p in m["parts"]}
+    if lst:
+        for p in m["parts"]:
+            c = {}
+            for o in p["ops"]: c[OPNAME.get(o["type"], "type%d" % o["type"])] = c.get(OPNAME.get(o["type"], "type%d" % o["type"]), 0) + 1
+            print("%-24s size=%s ops=%s" % (p["name"], p["size"], ",".join("%s:%d" % kv for kv in sorted(c.items())) or "none"))
+        if not parts: return "PASS listed %d partitions (block_size %d, minor 0)" % (len(m["parts"]), m["block_size"])
+    for n in parts:
+        if n not in byname: raise Fail("partition %r is not in the payload (have: %s)" % (n, ", ".join(sorted(byname))))
+    check_out(out)
+    os.makedirs(out, exist_ok=True)
+    for nm in ("SHA256SUMS", "manifest.txt"):   # F2: no stale/symlinked manifest after a failed run
+        q = os.path.join(out, nm)
+        if os.path.lexists(q): os.unlink(q)
+    fp = fingerprint(pl.text("META-INF/com/android/metadata")); props = pl.text("payload_properties.txt")
+    res = []
+    for n in parts:
+        sha = extract(pl, byname[n], os.path.join(out, n + ".img"), m["block_size"])
+        res.append((n, byname[n]["size"], sha)); print("%s.img size %d sha256 %s (matches new_partition_info)" % (n, byname[n]["size"], sha))
+    with os.fdopen(os.open(os.path.join(out, "SHA256SUMS"), WFLAGS, 0o600), "w") as f:
+        for n, s, h in res: f.write("%s  %s.img\n" % (h, n))
+    with os.fdopen(os.open(os.path.join(out, "manifest.txt"), WFLAGS, 0o600), "w") as f:
+        f.write("fingerprint %s\n" % fp)
+        for n, s, h in res: f.write("partition %s size %d sha256 %s\n" % (n, s, h))
+        f.write("payload_properties.txt:\n%s\n" % (props if props is not None else "(absent)"))
+    if props is None: print("OTA GAP: payload_properties.txt absent from the zip", file=sys.stderr)
+    return "PASS extracted %s fingerprint %s" % (",".join(parts), fp)
+
+
+if __name__ == "__main__":
+    try: msg = main(sys.argv[1:]); print("RESULT: " + msg); sys.exit(0)
+    except Fail as e: print("RESULT: FAIL %s" % e); sys.exit(1)
+    except (Err, OSError) as e: print("RESULT: ERROR %s" % e); sys.exit(2)

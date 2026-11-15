@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""frame-split: replay the frame-stat lines of an EXISTING run dir and print the per-second frame split (G-10b, research 113 s.2-3).
+Host only, read-only, never touches the phone.
+
+  python3 -I tools/frame-split [--json] [--join-perf] RUNDIR_OR_LABEL...
+
+A label (e.g. 20261026T081916Z-gputest48-fps) resolves to logs/runs/<label> (env RUNS_ROOT: <RUNS_ROOT>/logs/runs).
+Reads RUNDIR/usbnet.log, fallback RUNDIR/merged.log. Line formats (observed, real logs):
+  <host_ts>\t[ <kernel_s>] SWEET FPS: swaps N distinct M max_gap_ms G          (one per second)
+  <host_ts>\t[ <kernel_s>] SWEET PERF: gpu_jobs J busy_ms B max_job_us U submit_wait_ms W cpu_busy_pct C [cpus ...]
+  <host_ts>\t[ <kernel_s>] SWEET PACE: swaps N gap_ms <10:a ... >=100:f since_vsync_ms avg A max X
+Definitions (research 113 s.2): busy second = swaps >= 12 and distinct > 0; idle second = swaps < 12 (swaps >= 12 and distinct == 0
+is neither, counted as "other"). Statistics are over busy (or idle) seconds, one value per FPS line.
+--join-perf (s.3): each busy FPS second with distinct >= 8 is joined to the PERF line nearest in host time within +-1 s; per distinct
+frame = PERF counter / FPS distinct of the same pair. All three are printed: median of the per-second ratios ("per-sec"), ratio of
+medians ("of-medians") and sum/sum ("of-sums"), because the note does not say which it used. Missing line kinds print n/a.
+P-G0 (PLAN-60FPS, kernel patch 0186 + userland FLUSHT): SWEET SWAPT / SWEET PROCCPU / SWEETGL: FLUSHT lines (host ts and "|backboardd| " prefixes
+allowed) give section "P-G0 split" (swap gaps, vsync age, GPU lag, bb/SpringBoard CPU per s and per distinct frame, FLUSHT per pid, VERDICT per
+research 113 s.7); without them "P-G0 lines: none". Per-frame values join a PROCCPU/FLUSHT line to the nearest busy SWEET FPS line within +-1 s. Malformed
+P-G0 lines count as bad_lines=N (printed, never fatal).
+Last line: RESULT: PASS frame-split runs=N score=<distinct/s median, busy, first run>   exit 0
+          RESULT: FAIL frame-split ... (no SWEET FPS lines in a run)                    exit 1
+          RESULT: ERROR ... (bad arguments / missing dir)                               exit 2
+"""
+import argparse, json, math, os, re, statistics, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+TS = r"^(?P<ts>\d+(?:\.\d+)?)\t"
+FPS = re.compile(TS + r".*SWEET FPS: swaps (\d+) distinct (\d+) max_gap_ms (\d+)")
+PERF = re.compile(TS + r".*SWEET PERF: gpu_jobs (\d+) busy_ms (\d+) max_job_us (\d+) submit_wait_ms (\d+) cpu_busy_pct (\d+)")
+PACE = re.compile(TS + r".*SWEET PACE: swaps (\d+) gap_ms .*since_vsync_ms avg (\d+) max (\d+)")
+# P-G0 lines (kernel patch 0186 printf formats; userland gli_table.c sweet_ft_line). Prefixes (host ts, "[ kernel_s]", "|backboardd| ") are skipped by ".*".
+OTS = r"^(?:(?P<ts>\d+(?:\.\d+)?)\t)?"
+# Later kernel patches append ` name value` pairs to both lines (SWAPT: busy_us wait_us call1 calll done; PROCCPU: pf_pid pf_us, patch 0247): TAIL accepts them, so the
+# 0186 fields keep parsing (boot resident-065552-b5: 12097 SWAPT + 717 PROCCPU lines were all counted bad_lines by the exact-end patterns).
+TAIL = r"(?: [a-z_0-9]+ -?\d+)*\s*$"
+SWAPT = re.compile(OTS + r".*SWEET SWAPT: n (\d+) now (\d+) vsync (\d+) prev (\d+) gpu_seq (\d+|-) gpu_done (\d+|-)" + TAIL)
+PROCCPU = re.compile(OTS + r".*SWEET PROCCPU: bb_pid (-?\d+) bb_us (\d+) sb_pid (-?\d+) sb_us (\d+)" + TAIL)
+FLUSHT = re.compile(OTS + r".*SWEETGL: FLUSHT pid (-?\d+) sec (\d+) flush (\d+) flush_in_us (\d+) flush_max_us (\d+) finish (\d+) finish_in_us (\d+) finish_max_us (\d+) last_exit_ns (\d+)\s*$")
+# known non-data variants (counted, not bad)
+SWAPT_VAR = re.compile(r"SWEET SWAPT: (gpu seq unavailable \(|cap reached \d+\s*$)")
+PROCCPU_VAR = re.compile(r"SWEET PROCCPU: \w+ (not found|pid -?\d+ \(was -?\d+\)( not running)?|pid -?\d+ task_info failed \(-?\d+\))\s*$")   # pid-change lines: patch 0247 (Preferences), 0341 (backboardd, SpringBoard)
+FLUSHT_VAR = re.compile(r"SWEETGL: FLUSHT unavailable: ")
+CA_WAIT_CPU_MS = 15.0     # research 113 s.7 decision rule
+CA_WAIT_PERIOD_MS = 60.0
+CA_CPU_MS = 40.0
+BUSY_SWAPS = 12
+JOIN_MIN_DISTINCT = 8
+JOIN_WINDOW_S = 1.0
+
+
+class Bad(Exception):
+    pass
+
+
+def resolve(arg):
+    if os.path.isdir(arg):
+        return arg
+    base = os.environ.get("RUNS_ROOT") or REPO
+    d = os.path.join(base, "logs", "runs", arg)
+    if os.path.isdir(d):
+        return d
+    raise Bad("no such run dir or label: %s" % arg)
+
+
+def parse_pg0(ln, g):
+    """Classify one line that mentions a P-G0 kind; returns True when the line was one of them (counted in g)."""
+    for key, rx, var in (("swapt", SWAPT, SWAPT_VAR), ("proccpu", PROCCPU, PROCCPU_VAR), ("flusht", FLUSHT, FLUSHT_VAR)):
+        tag = {"swapt": "SWEET SWAPT:", "proccpu": "SWEET PROCCPU:", "flusht": "SWEETGL: FLUSHT"}[key]
+        if tag not in ln:
+            continue
+        m = rx.search(ln)
+        if m:
+            ts = float(m.group("ts")) if m.group("ts") else None
+            v = m.groups()[1:]
+            if key == "swapt":
+                n, now, vs, prev, sq, dn = v
+                g["swapt"].append((ts, int(now), int(vs), int(prev), None if sq == "-" else int(sq), None if dn == "-" else int(dn), int(n)))
+            elif ts is None:
+                g["bad"] += 1      # cannot be joined to SWEET FPS without a host time
+            elif key == "proccpu":
+                g["proccpu"].append((ts,) + tuple(int(x) for x in v))
+            else:
+                g["flusht"].append((ts,) + tuple(int(x) for x in v))
+        elif var.search(ln):
+            g["variants"][key] += 1
+            if key == "swapt" and "cap reached" in ln:
+                g["cap"] = True
+        else:
+            g["bad"] += 1
+        return True
+    return False
+
+
+def parse(path):
+    fps, perf, pace = [], [], []
+    g = {"swapt": [], "proccpu": [], "flusht": [], "bad": 0, "cap": False, "variants": {"swapt": 0, "proccpu": 0, "flusht": 0}}
+    with open(path, errors="replace") as f:
+        for ln in f:
+            if "SWEET" not in ln:
+                continue
+            if "SWEET SWAPT:" in ln or "SWEET PROCCPU:" in ln or "SWEETGL: FLUSHT" in ln:
+                parse_pg0(ln, g)
+                continue
+            m = FPS.search(ln)
+            if m:
+                fps.append((float(m.group("ts")),) + tuple(int(x) for x in m.groups()[1:])); continue
+            m = PERF.search(ln)
+            if m:
+                perf.append((float(m.group("ts")),) + tuple(int(x) for x in m.groups()[1:])); continue
+            m = PACE.search(ln)
+            if m:
+                pace.append((float(m.group("ts")),) + tuple(int(x) for x in m.groups()[1:]))
+    return fps, perf, pace, g
+
+
+def med(v):
+    return statistics.median(v) if v else None
+
+
+def mean(v):
+    return statistics.fmean(v) if v else None
+
+
+def pct(v, q):
+    """Nearest-rank percentile."""
+    if not v:
+        return None
+    v = sorted(v)
+    return v[max(0, math.ceil(q * len(v)) - 1)]
+
+
+def nearest_fps(busy, ts):
+    """Nearest busy FPS line (distinct > 0) within JOIN_WINDOW_S of host time ts, or None."""
+    if ts is None or not busy:
+        return None
+    r = min(busy, key=lambda q: abs(q[0] - ts))
+    return r if abs(r[0] - ts) <= JOIN_WINDOW_S else None
+
+
+def dist(v):
+    return {"n": len(v), "median": rnd(med(v)), "p90": rnd(pct(v, 0.9)), "max": rnd(max(v)) if v else None}
+
+
+def analyse_pg0(fps, g):
+    sw, pc, ft = g["swapt"], g["proccpu"], g["flusht"]
+    o = {"p_g0": bool(sw or pc or ft or g["bad"] or any(g["variants"].values())), "bad_lines": g["bad"],
+         "swapt_lines": len(sw), "proccpu_lines": len(pc), "flusht_lines": len(ft), "swapt_cap_reached": g["cap"],
+         "variant_lines": dict(g["variants"])}
+    busy = [r for r in fps if r[1] >= BUSY_SWAPS and r[2] > 0]
+    # (1) swap gaps and age of the previous vsync at the swap (ns -> ms); prev 0 / vsync 0 = none yet, now < prev/vsync = skipped
+    gaps = [(s[1] - s[3]) / 1e6 for s in sw if s[3] > 0 and s[1] >= s[3]]
+    ages = [(s[1] - s[2]) / 1e6 for s in sw if s[2] > 0 and s[1] >= s[2]]
+    # n continuity: a jump n != prev+1 is a dropped log line (usb/UDP), not a missing swap; n <= prev is a restart (reboot-like)
+    ngaps = nmiss = nreset = 0
+    for a, b in zip(sw, sw[1:]):
+        if b[6] <= a[6]:
+            nreset += 1
+        elif b[6] != a[6] + 1:
+            ngaps += 1; nmiss += b[6] - a[6] - 1
+    o["swapt_n_gaps"], o["swapt_n_missing"], o["swapt_n_resets"] = ngaps, nmiss, nreset
+    o["swap_gap_ms"] = dist(gaps)
+    o["swap_vsync_age_ms"] = dist(ages)
+    # (2) GPU jobs outstanding at swap (unlocked peek can be one job stale: a negative difference counts as 0 and is reported)
+    seq = [s for s in sw if s[4] is not None and s[5] is not None]
+    outs = [max(0, s[4] - s[5]) for s in seq]
+    o["gpu_lag"] = {"swaps_with_seq": len(seq), "swaps_without_seq": len(sw) - len(seq), "negative": sum(1 for s in seq if s[4] < s[5]),
+                    "outstanding_median": med(outs), "outstanding_max": max(outs) if outs else None,
+                    "fraction_outstanding_gt0": rnd(sum(1 for x in outs if x > 0) / len(outs), 3) if outs else None}
+    # (3) process CPU: diff of cumulative us between consecutive lines; pid change / pid < 0 / counter going backwards = no value for that pair
+    cpu, restarts = [], 0
+    for a, b in zip(pc, pc[1:]):
+        dt = b[0] - a[0]
+        d = {}
+        for name, ip, iu in (("bb", 1, 2), ("sb", 3, 4)):
+            if a[ip] != b[ip]:
+                restarts += 1
+            elif a[ip] >= 0 and b[iu] >= a[iu]:
+                d[name] = (b[iu] - a[iu]) / 1000.0     # ms of CPU in this interval
+        f = nearest_fps(busy, b[0])
+        cpu.append((dt if dt > 0 else 1.0, d, f))
+    per_s = {n: [d[n] / dt for dt, d, f in cpu if n in d] for n in ("bb", "sb")}
+    per_f = {n: [d[n] / f[2] for dt, d, f in cpu if n in d and f] for n in ("bb", "sb")}
+    both_f = [(d["bb"] + d["sb"]) / f[2] for dt, d, f in cpu if "bb" in d and "sb" in d and f]
+    o["proccpu"] = {"intervals": len(cpu), "pid_changes": restarts,
+                    "bb_ms_per_s": dist(per_s["bb"]), "sb_ms_per_s": dist(per_s["sb"]),
+                    "bb_ms_per_frame": dist(per_f["bb"]), "sb_ms_per_frame": dist(per_f["sb"]), "bb_plus_sb_ms_per_frame": dist(both_f)}
+    # (4) FLUSHT per pid: each line is one 1 s window
+    fl = {}
+    for t in ft:
+        fl.setdefault(t[1], []).append(t)
+    o["flusht"] = {}
+    for pid, rows in sorted(fl.items()):
+        share = [(r[4] + r[7]) / 1e6 for r in rows]
+        pf, fin = [], []
+        for r in rows:
+            f = nearest_fps(busy, r[0])
+            if f:
+                pf.append((r[4] + r[7]) / 1000.0 / f[2]); fin.append(r[6] / f[2])
+        o["flusht"][str(pid)] = {"windows": len(rows), "in_flush_share_per_s": dist(share), "in_flush_ms_per_frame": dist(pf),
+                                 "finish_per_frame": dist(fin), "joined": len(pf)}
+    # (5) decision rule (research 113 s.7)
+    period = [1000.0 / r[2] for r in busy]
+    cpu_f, per_m = med(both_f), med(period)
+    if not busy:
+        v = "n/a (missing busy SWEET FPS seconds)"
+    elif not both_f:
+        v = "n/a (missing PROCCPU bb+sb pairs joined to busy SWEET FPS)"
+    elif cpu_f < CA_WAIT_CPU_MS and per_m > CA_WAIT_PERIOD_MS:
+        v = "ca-wait"
+    elif cpu_f > CA_CPU_MS:
+        v = "ca-cpu"
+    else:
+        v = "inconclusive (bb+sb cpu/frame median %.1f ms, distinct period median %.1f ms)" % (cpu_f, per_m)
+    o["verdict"] = v
+    o["verdict_inputs"] = {"bb_plus_sb_ms_per_frame_median": rnd(cpu_f), "distinct_period_ms_median": rnd(per_m)}
+    return o
+
+
+def rnd(x, n=2):
+    return None if x is None else round(x, n)
+
+
+def analyse(fps, perf, pace, g, join):
+    busy = [r for r in fps if r[1] >= BUSY_SWAPS and r[2] > 0]
+    idle = [r for r in fps if r[1] < BUSY_SWAPS]
+    sw = [r[1] for r in busy]; di = [r[2] for r in busy]; gp = [r[3] for r in busy]
+    out = {
+        "fps_lines": len(fps), "perf_lines": len(perf), "pace_lines": len(pace),
+        "busy_s": len(busy), "idle_s": len(idle), "other_s": len(fps) - len(busy) - len(idle),
+        "busy_swaps_median": med(sw), "busy_swaps_max": max(sw) if sw else None,
+        "busy_distinct_median": med(di), "busy_distinct_mean": rnd(mean(di)), "busy_distinct_max": max(di) if di else None,
+        "distinct_per_swap_ratio_of_sums": rnd(sum(di) / sum(sw), 3) if sw else None,
+        "distinct_per_swap_median_of_ratios": rnd(med([d / s for s, d in zip(sw, di)]), 3) if sw else None,
+        "busy_worst_gap_ms_median": med(gp),
+        "idle_swaps_median": med([r[1] for r in idle]), "idle_distinct_median": med([r[2] for r in idle]),
+        "pace_busy_since_vsync_avg_median": med([p[2] for p in pace if p[1] >= BUSY_SWAPS]) if pace else None,
+    }
+    if join:
+        pairs = []
+        for r in busy:
+            if r[2] < JOIN_MIN_DISTINCT or not perf:
+                continue
+            p = min(perf, key=lambda q: abs(q[0] - r[0]))
+            if abs(p[0] - r[0]) <= JOIN_WINDOW_S:
+                pairs.append((r, p))
+        j = {"seconds": len(pairs)}
+        for name, idx in (("jobs", 1), ("gpu_busy_ms", 2), ("submit_wait_ms", 4)):
+            ps = [p[idx] / r[2] for r, p in pairs]
+            j[name + "_per_frame_per_sec_median"] = rnd(med(ps))
+            m = med([r[2] for r, p in pairs])
+            j[name + "_per_frame_of_medians"] = rnd(med([p[idx] for r, p in pairs]) / m) if pairs else None
+            j[name + "_per_frame_of_sums"] = rnd(sum(p[idx] for r, p in pairs) / sum(r[2] for r, p in pairs)) if pairs else None
+        j["cpu_busy_pct_median"] = med([p[5] for r, p in pairs]) if pairs else None
+        dm = med([r[2] for r, p in pairs])
+        j["distinct_median_joined"] = dm
+        j["frame_ms"] = rnd(1000.0 / dm, 1) if dm else None
+        out["join"] = j
+    out["pg0"] = analyse_pg0(fps, g)
+    return out
+
+
+def na(v):
+    return "n/a" if v is None else (("%g" % v) if isinstance(v, float) else str(v))
+
+
+def d3(d):
+    return "median %s p90 %s max %s (n=%d)" % (na(d["median"]), na(d["p90"]), na(d["max"]), d["n"])
+
+
+def render_pg0(o):
+    if not o["p_g0"]:
+        return ["  P-G0 lines: none"]
+    L = ["  P-G0 split: SWAPT %d PROCCPU %d FLUSHT %d lines, variants %s, cap reached %s, bad_lines=%d" % (
+        o["swapt_lines"], o["proccpu_lines"], o["flusht_lines"], o["variant_lines"], o["swapt_cap_reached"], o["bad_lines"])]
+    L.append("    swapt_n_gaps=%d swapt_n_missing=%d swapt_n_resets=%d" % (o["swapt_n_gaps"], o["swapt_n_missing"], o["swapt_n_resets"]))
+    L.append("    swap->swap gap ms: %s" % d3(o["swap_gap_ms"]))
+    L.append("    swap age since vsync ms (now-vsync): %s" % d3(o["swap_vsync_age_ms"]))
+    g = o["gpu_lag"]
+    L.append("    GPU jobs outstanding at swap (seq-done): median %s max %s, fraction >0: %s (swaps with seq %d, without %d, stale-negative %d)" % (
+        na(g["outstanding_median"]), na(g["outstanding_max"]), na(g["fraction_outstanding_gt0"]), g["swaps_with_seq"], g["swaps_without_seq"], g["negative"]))
+    c = o["proccpu"]
+    L.append("    PROCCPU intervals %d, pid changes (restarts, no value) %d" % (c["intervals"], c["pid_changes"]))
+    for k, t in (("bb_ms_per_s", "backboardd CPU ms/s"), ("sb_ms_per_s", "SpringBoard CPU ms/s"), ("bb_ms_per_frame", "backboardd CPU ms/distinct frame"),
+                 ("sb_ms_per_frame", "SpringBoard CPU ms/distinct frame"), ("bb_plus_sb_ms_per_frame", "bb+sb CPU ms/distinct frame")):
+        L.append("      %-34s %s" % (t, d3(c[k])))
+    if not o["flusht"]:
+        L.append("    FLUSHT: n/a (no data lines)")
+    for pid, f in o["flusht"].items():
+        L.append("    FLUSHT pid %s: %d windows; in-flush share/s %s; in-flush ms/frame %s; finish/frame %s (joined %d)" % (
+            pid, f["windows"], d3(f["in_flush_share_per_s"]), d3(f["in_flush_ms_per_frame"]), d3(f["finish_per_frame"]), f["joined"]))
+    L.append("    VERDICT: %s" % o["verdict"])
+    return L
+
+
+def render(label, o, join):
+    L = ["== %s" % label]
+    if not o["fps_lines"]:
+        return L + ["  no SWEET FPS lines"] + render_pg0(o["pg0"])
+    L.append("  FPS lines %d  PERF lines %d  PACE lines %d" % (o["fps_lines"], o["perf_lines"], o["pace_lines"]))
+    L.append("  busy s %s  idle s %s  other s (swaps>=12, distinct 0) %s" % (o["busy_s"], o["idle_s"], o["other_s"]))
+    L.append("  busy swaps/s: median %s max %s" % (na(o["busy_swaps_median"]), na(o["busy_swaps_max"])))
+    L.append("  busy distinct/s: median %s mean %s max %s" % (na(o["busy_distinct_median"]), na(o["busy_distinct_mean"]), na(o["busy_distinct_max"])))
+    L.append("  distinct/swaps: ratio-of-sums %s, median-of-ratios %s" % (na(o["distinct_per_swap_ratio_of_sums"]), na(o["distinct_per_swap_median_of_ratios"])))
+    L.append("  busy worst-gap median: %s ms" % na(o["busy_worst_gap_ms_median"]))
+    L.append("  idle: swaps/s median %s, distinct/s median %s" % (na(o["idle_swaps_median"]), na(o["idle_distinct_median"])))
+    L.append("  PACE busy since_vsync avg (median over seconds): %s ms" % na(o["pace_busy_since_vsync_avg_median"]))
+    if join:
+        j = o["join"]
+        L.append("  join PERF (+-1 s, distinct>=8): %d seconds" % j["seconds"])
+        if j["seconds"]:
+            for k, t in (("jobs", "jobs/frame"), ("gpu_busy_ms", "GPU busy ms/frame"), ("submit_wait_ms", "submit wait ms/frame")):
+                L.append("    %-20s per-sec %s  of-medians %s  of-sums %s" % (t, na(j[k + "_per_frame_per_sec_median"]), na(j[k + "_per_frame_of_medians"]), na(j[k + "_per_frame_of_sums"])))
+            L.append("    cpu_busy_pct median %s  distinct median %s  per-frame %s ms (=1000/distinct median)" % (na(j["cpu_busy_pct_median"]), na(j["distinct_median_joined"]), na(j["frame_ms"])))
+        else:
+            L.append("    n/a (no PERF line joined)")
+    return L + render_pg0(o["pg0"])
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="frame-split")
+    p.error = lambda m: (_ for _ in ()).throw(Bad(m))
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--join-perf", action="store_true")
+    p.add_argument("runs", nargs="+")
+    try:
+        a = p.parse_args(argv)
+        dirs = [resolve(r) for r in a.runs]
+    except Bad as e:
+        print("usage error: %s\nRESULT: ERROR frame-split bad arguments" % e)
+        return 2
+    except SystemExit as e:
+        if e.code in (0, None):
+            return 0
+        print("RESULT: ERROR frame-split bad arguments")
+        return 2
+    res, text, empty = [], [], []
+    for d in dirs:
+        log = next((os.path.join(d, n) for n in ("usbnet.log", "merged.log") if os.path.isfile(os.path.join(d, n))), None)
+        if not log:
+            print("usage error: no usbnet.log or merged.log in %s\nRESULT: ERROR frame-split missing log" % d)
+            return 2
+        o = analyse(*parse(log), a.join_perf)
+        o["run"] = os.path.basename(os.path.abspath(d))
+        res.append(o)
+        text += render(o["run"], o, a.join_perf)
+        if not o["fps_lines"]:
+            empty.append(o["run"])
+    if a.json:
+        print(json.dumps(res, indent=1, sort_keys=True))
+    print("\n".join(text))
+    pg0 = "yes" if any(r["pg0"]["p_g0"] for r in res) else "no"
+    if empty:
+        print("RESULT: FAIL frame-split runs=%d no SWEET FPS lines in: %s p_g0=%s" % (len(res), ", ".join(empty), pg0))
+        return 1
+    print("RESULT: PASS frame-split runs=%d score=%s p_g0=%s" % (len(res), na(res[0]["busy_distinct_median"]), pg0))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

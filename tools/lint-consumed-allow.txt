@@ -1,0 +1,7 @@
+# tools/lint-consumed allowlist (user R48 row 2): packed tags with no consumer or gap log in shim/*.c|h|cpp or the added lines of xnu/patches/*.patch.
+# One `packer  tag  hits=N  sha=HEX8  reason` per line (tag without trailing padding; reason >= 10 chars; `#` and blank lines ignored). N PINS the number of literals
+# of the tag in the packer code and HEX8 the fingerprint of the lines that hold them (tools/lint-consumed --list prints both): a changed packing site fails
+# (ALLOW-GREW / ALLOW-SHRUNK / ALLOW-CHANGED, AP-300). A row whose tag is consumed or
+# gap-logged now is ALLOW-STALE and fails: remove the row with the fix. Changing a pin needs a review of the new packing line.
+tools/mkpayload.py  RAMDisk  hits=1  sha=89fcfc31  read by stock XNU, not by a PixOS patch: IOFindBSDRoot getProperty("RAMDisk") at iokit/bsddev/IOKitBSDInit.cpp:753 [read from source, xnu-pristine]; patch 0117:91 cites the same lookup
+tools/pack_wlanfw.py  WLANFWB1  hits=1  sha=50966385  container magic compared byte by byte against a char array, not a quoted literal: xnu/patches/0128-sweet-wlan-fwcheck.patch:125 magic[8] = { 'W','L','A','N','F','W','B','1' } and :132 buf[i] != magic[i] in swf_parse [read from source]

@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""allon-snapcheck: pixel-rule checker for the ALL-ON oracle 4/5 panel snapshots (Settings > Wi-Fi / Bluetooth): prints 'ALLON SNAP wifi|bluetooth ok|bad: ...'; called by tools/allon-score --snap (ALL-ON T-23)
+
+  tools/allon-snapcheck wifi|bluetooth PANEL.raw [--png OUT.png] [--need-statusbar]
+  tools/allon-snapcheck --self-test      runs tools/test_allon_snapcheck.py (synthetic panels, every part positive + negative)
+
+PANEL.raw = one kernel panel readback (`fcapctl panel FILE`, patch 0276; 32 B 'SPNL' header or 80 B ring slot, then BGRA rows, 1080x2400 on bluejay;
+tools/panel2png converts it). Output = ONE line, exit 0 / 1 (2 = bad usage):
+  ALLON SNAP <kind> ok: <what was seen>
+  ALLON SNAP <kind> bad: <what is missing>[; alert on top][ | seen: <parts that were found>]
+No OCR: every rule is a measured pixel rule on the fixed iOS Settings layout (coordinates below are 1080x2400 px, scaled for other sizes). Calibrated
+2026-11-12 on 11 real panels (4 Wi-Fi with checkmark, 4 without, 3 Bluetooth; table in the commit message / tools/test_allon_snapcheck.py docstring):
+  page      title ink width (dark px bbox, y 140-230, x 300-940): Wi-Fi 121 (100-145), Bluetooth 224 (200-250); AND the switch-label ink width
+            (y 370-470, x 40-780): Wi-Fi 116 (95-140), Bluetooth 211 (190-235)
+  switch    green blob (g > r+60, g > b+40) >= 3500 px at x 800-1060, y 360-480 (ON = 7200 px; OFF is grey, 0 px); dimmed pages stay green
+  wifi row  the row directly under the switch (y 500-620): name ink (dark px, x 140-760) >= 400 AND blue (i) icon (x 930-1060) >= 300 = a joined/known
+            network sits there; the blue checkmark at its left (x 30-150) >= 150 blue px (b > r+90, b > g+30; real checkmark = 505 px)
+            information only: lock + signal glyph (dark ink x 760-940, 1386 px when drawn) and any ink in the status-bar Wi-Fi spot (x 560-975, y 5-80:
+            0 px on every real panel so far, even the checkmark one) = reported, required only with --need-statusbar
+  bluetooth MY DEVICES: a card (>= 80 % of x 300-600, y 745-860 brighter than the page background by 8) holds a device row, the grey status text
+            (neutral px, spread <= 14, x 480-930, y 760-850) spans 245 px (220-270) and ends at x 880-930 = the word 'Connected' (Not Connected / Connecting
+            are wider or shorter); the header ink (x 40-500, y 650-725) is 226 wide (214-240) = 'MY DEVICES'
+  alert     the page background (y 100) is dimmed (luminance <= 215, normal 243) AND >= 50 % of the alert box (x 14-86 %, y 42-59 %, GEOM alert-loc of
+            tools/nav-classify) is brighter than that background by 25 = 'alert on top'; dimmed without the box = 'dimmed overlay on top'. Both are bad
+            (the alert covers the proof). A human tools/allon-score DIR/<name>.verdict still overrides this checker there.
+Last line = the ALLON SNAP line."""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import os, struct, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MAGICS = (struct.unpack("<I", b"SPNL")[0], struct.unpack("<I", b"SPNH")[0])
+W0, H0 = 1080, 2400
+
+dark = lambda r, g, b: r < 110 and g < 110 and b < 110
+blue = lambda r, g, b: b > r + 90 and b > g + 30
+green = lambda r, g, b: g > r + 60 and g > b + 40
+
+
+def load(path):
+    """RGB PIL image of one panel readback; ValueError with the reason when it is not one."""
+    from PIL import Image
+    d = open(path, "rb").read()
+    if len(d) < 32:
+        raise ValueError("%s too short (%d B)" % (path, len(d)))
+    mg, w, h = struct.unpack_from("<3I", d, 0)
+    hdr = len(d) - w * h * 4
+    if mg not in MAGICS or w == 0 or h == 0 or hdr not in (32, 80):
+        raise ValueError("%s: not a panel readback (magic 0x%08x, %dx%d, header %d B)" % (path, mg, w, h, hdr))
+    return Image.frombuffer("RGBA", (w, h), d[hdr:], "raw", "BGRA", 0, 1).convert("RGB")
+
+
+class Panel:
+    def __init__(self, im):
+        self.im, self.sx, self.sy = im, im.width / W0, im.height / H0
+        self.area = self.sx * self.sy
+
+    def box(self, b):
+        return (int(b[0] * self.sx), int(b[1] * self.sy), int(b[2] * self.sx), int(b[3] * self.sy))
+
+    def scan(self, b, pred):
+        """(count, x0, x1, y0, y1) of the pixels of the 1080x2400-coordinate box b that satisfy pred; bbox in 1080x2400 px; count scaled to 1080x2400."""
+        x0, y0, x1, y1 = self.box(b)
+        c = self.im.crop((x0, y0, x1, y1))
+        w, h = c.size
+        d = c.tobytes()
+        n, bx0, bx1, by0, by1 = 0, w, -1, h, -1
+        for y in range(h):
+            row = d[y * w * 3:(y + 1) * w * 3]
+            for x in range(w):
+                if pred(row[3 * x], row[3 * x + 1], row[3 * x + 2]):
+                    n += 1
+                    bx0, bx1, by0, by1 = min(bx0, x), max(bx1, x), min(by0, y), max(by1, y)
+        if not n:
+            return (0, 0, 0, 0, 0)
+        return (round(n / self.area), round((bx0 + x0) / self.sx), round((bx1 + x0) / self.sx), round((by0 + y0) / self.sy), round((by1 + y0) / self.sy))
+
+    def lum(self, x, y):
+        r, g, b = self.im.getpixel((min(int(x * self.sx), self.im.width - 1), min(int(y * self.sy), self.im.height - 1)))
+        return (299 * r + 587 * g + 114 * b) // 1000
+
+    def frac_brighter(self, b, ref, delta):
+        x0, y0, x1, y1 = self.box(b)
+        d = self.im.crop((x0, y0, x1, y1)).convert("L").tobytes()
+        return sum(1 for v in d if v >= ref + delta) / max(1, len(d))
+
+
+def width(m):
+    return m[2] - m[1] + 1 if m[0] else 0
+
+
+def page_of(p):
+    """('wifi'|'bluetooth'|None, text): which Settings page the title + switch label ink widths describe."""
+    tw = width(p.scan((300, 140, 940, 230), dark))
+    lw = width(p.scan((40, 370, 780, 470), dark))
+    for kind, (t0, t1), (l0, l1) in (("wifi", (100, 145), (95, 140)), ("bluetooth", (200, 250), (190, 235))):
+        if t0 <= tw <= t1 and l0 <= lw <= l1:
+            return kind, "title ink %d px, label ink %d px" % (tw, lw)
+    return None, "title ink %d px, label ink %d px (Wi-Fi 100-145 / 95-140, Bluetooth 200-250 / 190-235)" % (tw, lw)
+
+
+def alert_of(p):
+    """'alert on top' | 'dimmed overlay on top' | None."""
+    bgl = sorted(p.lum(x, 100) for x in (300, 540, 780))[1]
+    if bgl > 215:
+        return None
+    if p.frac_brighter((.14 * W0, .42 * H0, .86 * W0, .59 * H0), bgl, 25) >= .5:
+        return "alert on top"
+    return "dimmed overlay on top"
+
+
+def check_wifi(p, need_sb):
+    seen, miss = [], []
+    kind, t = page_of(p)
+    if kind != "wifi":
+        miss.append("page is not Settings > Wi-Fi (%s%s)" % (t, "; it is Settings > Bluetooth" if kind == "bluetooth" else ""))
+        return seen, miss
+    seen.append("title Wi-Fi")
+    sw = p.scan((800, 360, 1060, 480), green)
+    (seen if sw[0] >= 3500 else miss).append("Wi-Fi switch ON (green %d px)" % sw[0] if sw[0] >= 3500 else "Wi-Fi switch not ON (green %d px, need >= 3500)" % sw[0])
+    name = p.scan((140, 500, 760, 620), dark)[0]
+    info = p.scan((930, 500, 1060, 620), blue)[0]
+    chk = p.scan((30, 500, 150, 620), blue)[0]
+    if name >= 400 and info >= 300:
+        seen.append("joined-network row under the switch")
+        (seen if chk >= 150 else miss).append("blue checkmark at its left (%d px)" % chk if chk >= 150 else "checkmark MISSING at the left of the joined row (%d blue px, need >= 150)" % chk)
+        seen.append("lock+signal glyph %s" % ("drawn" if p.scan((760, 500, 940, 620), dark)[0] >= 300 else "not drawn (info)"))
+    else:
+        miss.append("no joined-network row directly under the switch (name ink %d px / (i) icon %d px)" % (name, info))
+    sb = p.scan((560, 5, 975, 80), lambda r, g, b: r < 150)[0]
+    if sb >= 40:
+        seen.append("status-bar Wi-Fi icon present (%d px)" % sb)
+    elif need_sb:
+        miss.append("status-bar Wi-Fi icon missing (%d px in x 560-975, y 5-80)" % sb)
+    else:
+        seen.append("status-bar Wi-Fi icon absent (info only, not required: absent on every real panel so far)")
+    return seen, miss
+
+
+def check_bt(p, need_sb):
+    seen, miss = [], []
+    kind, t = page_of(p)
+    if kind != "bluetooth":
+        miss.append("page is not Settings > Bluetooth (%s%s)" % (t, "; it is Settings > Wi-Fi" if kind == "wifi" else ""))
+        return seen, miss
+    seen.append("title Bluetooth")
+    sw = p.scan((800, 360, 1060, 480), green)
+    (seen if sw[0] >= 3500 else miss).append("Bluetooth switch ON (green %d px)" % sw[0] if sw[0] >= 3500 else "Bluetooth switch not ON (green %d px, need >= 3500)" % sw[0])
+    bgl = sorted(p.lum(x, 100) for x in (300, 540, 780))[1]
+    if p.frac_brighter((300, 745, 600, 860), bgl, 8) < .8:
+        miss.append("no MY DEVICES row card under the switch text (no device paired/known)")
+        return seen, miss
+    hd = width(p.scan((40, 650, 500, 725), lambda r, g, b: max(r, g, b) - min(r, g, b) <= 14 and r < 180))
+    (seen if 214 <= hd <= 240 else miss).append("MY DEVICES header (ink %d px)" % hd if 214 <= hd <= 240 else "MY DEVICES header missing (header ink %d px, need 214-240)" % hd)
+    cardl = p.lum(400, 760)
+    st = p.scan((480, 760, 930, 850), lambda r, g, b: max(r, g, b) - min(r, g, b) <= 14 and (299 * r + 587 * g + 114 * b) // 1000 < cardl - 50)
+    sw_, right = width(st), st[2]
+    if 220 <= sw_ <= 270 and 880 <= right <= 930:
+        seen.append("device row status text 'Connected' (grey ink %d px wide, right edge x %d)" % (sw_, right))
+    else:
+        miss.append("device row says no 'Connected' (grey status ink %d px wide, right edge x %d; Connected = 220-270 px, edge 880-930)" % (sw_, right))
+    return seen, miss
+
+
+def verdict(kind, path, need_sb=False):
+    try:
+        p = Panel(load(path))
+    except (OSError, ValueError) as e:
+        return False, "panel unreadable: %s" % e
+    seen, miss = (check_wifi if kind == "wifi" else check_bt)(p, need_sb)
+    al = alert_of(p)
+    if al:
+        miss.append(al)
+    if miss:
+        return False, "; ".join(miss) + (" | seen: " + "; ".join(seen) if seen else "")
+    return True, "; ".join(seen)
+
+
+def main(argv):
+    if "--self-test" in argv:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "test_allon_snapcheck.py")], capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "")
+        print("RESULT: %s allon-snapcheck self-test" % ("PASS" if r.returncode == 0 else "FAIL"))
+        return r.returncode
+    args = [a for a in argv if a != "--need-statusbar"]
+    png = None
+    if "--png" in args:
+        i = args.index("--png")
+        if i + 1 >= len(args):
+            print("usage: allon-snapcheck wifi|bluetooth PANEL.raw [--png OUT.png] [--need-statusbar]"); return 2
+        png = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 2 or args[0] not in ("wifi", "bluetooth"):
+        print("usage: allon-snapcheck wifi|bluetooth PANEL.raw [--png OUT.png] [--need-statusbar]"); return 2
+    kind, path = args
+    ok, text = verdict(kind, path, "--need-statusbar" in argv)
+    if png:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "panel2png"), path, png], capture_output=True, text=True)
+        if r.returncode != 0:
+            text += " [png not written: %s]" % ((r.stdout.strip().splitlines() or ["?"])[-1][:120])
+    print("ALLON SNAP %s %s: %s" % (kind, "ok" if ok else "bad", text))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

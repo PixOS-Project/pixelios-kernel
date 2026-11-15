@@ -1,0 +1,43 @@
+SWEET vsync interval histogram (patch 0148, boot-arg sweetpace=1, default off; G-10): once per second `SWEET VSYNC: n N <12:a <20:b <25:c <40:d >=40:e max_ms M` = intervals between the emulated vsync callbacks (timer armed for 16.667 ms). Intervals near 33 ms would mean timer coalescing / idle wake latency quantizes CoreAnimation to ~30 fps (g61: 42% of the swap gaps are 25-40 ms). Read-only, no hardware access.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -285,6 +285,39 @@
+ 	{
+ 		uint64_t vns;
+ 		absolutetime_to_nanoseconds(now, &vns);
++		/*
++		 * Patch 0148 (boot-arg sweetpace=1): histogram of the intervals between our emulated vsync callbacks, one line per second
++		 * `SWEET VSYNC: n <12:a <20:b <25:c <40:d >=40:e max_ms M`. The IOTimerEventSource is armed for 16.667 ms; many intervals near 33 ms would
++		 * mean timer coalescing/idle wake-up latency is what quantizes CoreAnimation to ~30 fps. Read-only.
++		 */
++		static int vs_on = -1;
++		if (vs_on < 0) {
++			int v = 0;
++			vs_on = (PE_parse_boot_argn("sweetpace", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		}
++		if (vs_on) {
++			static uint64_t last_v, sec_v, max_v;
++			static uint32_t vb[5], vn;
++			if (last_v != 0) {
++				uint64_t g = (vns - last_v) / 1000000;
++				vb[g < 12 ? 0 : g < 20 ? 1 : g < 25 ? 2 : g < 40 ? 3 : 4]++;
++				vn++;
++				if (g > max_v) {
++					max_v = g;
++				}
++			}
++			last_v = vns;
++			if (sec_v == 0) {
++				sec_v = vns;
++			}
++			if (vns - sec_v >= 1000000000ull) {
++				IOLog("SWEET VSYNC: n %u <12:%u <20:%u <25:%u <40:%u >=40:%u max_ms %u\n", vn, vb[0], vb[1], vb[2], vb[3], vb[4], (uint32_t)max_v);
++				memset(vb, 0, sizeof vb);
++				vn = 0;
++				max_v = 0;
++				sec_v = vns;
++			}
++		}
+ 		sweet_fb_last_vsync_ns = vns;
+ 	}
+ 	uint64_t count = ++fb->fVsyncCount;

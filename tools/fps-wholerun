@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""fps-wholerun: whole-run fps score of a nav/bench run (ALL-ON T-54, user 2026-11-12 ~22:2xZ "it is like best case scenario always").
+
+  tools/fps-wholerun RUN_DIR|usbnet.log [--json OUT] [--span-from REGEX --span-to REGEX]
+  tools/fps-wholerun --self-test
+
+Unlike tools/gpu-fps-bench (fps only inside each action's animation span; latency, trickle, ambient frames and app-idle set aside), every
+second of the run counts:
+  span        = 'SWEET NAV: HEAVY start' .. 'HEAVY done' when present, else first 'SWEET NAV: ACTION <a> begin' .. last 'ACTION <a> end'
+                (or --span-from/--span-to: first line matching each)
+  drawn frame = a SWEET SWAPT present with > 4 GPU jobs since the previous present (gpu-fps-bench's rule: an unchanged present costs 2-4 jobs)
+  pooled      = drawn frames in the span / span seconds
+  step        = an action name; its time = every begin .. the next begin (the last one .. span end), its fps = its frames / its time;
+                slowest = the lowest step fps (steps with >= 0.5 s in total)
+  worst_1s    = the fewest drawn frames in any 1 s window [t, t+1) inside the span (t on a 50 ms grid)
+  gaps100     = intervals > 100 ms between consecutive drawn frames, span edges included; longest_gap_ms = the longest one
+Bars (GOAL-LOWCLK, user 2026-11-13 "about 50 fps"; was ALL-ON O3 55 / 50): pooled >= 50 and slowest >= 45 -> PASS; worst_1s and gaps100 are reported (a bar for them is the user's).
+No SWAPT lines -> 'SWEET FPS' 1 s bins (distinct4k when present, else distinct) as the frame source: pooled = their sum / span, worst_1s = the
+lowest bin, gaps100 = bins whose max_gap_ms > 100 (a LOWER bound, said in the result: source=fpsline).
+Last line: RESULT: PASS|FAIL fps-wholerun pooled=P slowest=S(step) worst_1s=W gaps100=G longest_gap_ms=L frames=N span_s=T source=swapt|fpsline"""
+if __import__("sys").argv[1:2] in (["-h"], ["--help"]):  # T-7dff:help: usage before any import or side effect
+    print("usage: " + __file__.rsplit("/", 1)[-1] + "\n" + (__doc__ or "").strip()); raise SystemExit(0)
+import json, os, re, sys
+
+JOBS_DRAWN = 4
+GAP_MS = 100.0
+BAR_POOLED, BAR_SLOWEST = 50.0, 45.0
+CAP = re.compile(r"SWEET SWAPT: cap reached (\d+)")
+MIN_STEP_S = 0.5
+ACT = re.compile(r"SWEET NAV: ACTION (\S+) (begin|inputend|end) rep (\d+) now (\d+)")
+SWT = re.compile(r"SWEET SWAPT: n (\d+) now (\d+) vsync (\d+) prev (\d+) gpu_seq (\d+)")
+FPS = re.compile(r"SWEET FPS: swaps (\d+) distinct (\d+) max_gap_ms (\d+)(?: distinct4k (\d+))?")
+TS = re.compile(r"\[\s*([\d.]+)\]")
+
+
+def load(lines, span_from=None, span_to=None):
+    acts, swaps, bins, last, marks = [], [], [], None, {}
+    for l in lines:
+        m = SWT.search(l)
+        if m:
+            now, seq = int(m.group(2)) / 1e9, int(m.group(5))
+            if last is not None and seq - last > JOBS_DRAWN:
+                swaps.append(now)
+            last = seq
+            continue
+        m = CAP.search(l)
+        if m:
+            t = TS.search(l)
+            if t and "cap" not in marks:
+                marks["cap"] = float(t.group(1))
+            continue
+        m = ACT.search(l)
+        if m:
+            acts.append((int(m.group(4)) / 1e9, m.group(1), m.group(2)))
+            continue
+        t = TS.search(l)
+        m = FPS.search(l)
+        if m and t:
+            d = int(m.group(4)) if m.group(4) is not None else int(m.group(2))
+            bins.append((float(t.group(1)), d, int(m.group(3))))
+            continue
+        for k, rx in (("from", span_from), ("to", span_to)):
+            if rx and t and k not in marks and re.search(rx, l):
+                marks[k] = float(t.group(1))
+    return acts, sorted(swaps), bins, marks
+
+
+def score(acts, swaps, bins, marks):
+    begins = sorted((t, a) for t, a, k in acts if k == "begin")
+    ends = sorted(t for t, a, k in acts if k == "end")
+    t0 = marks.get("from", begins[0][0] if begins else None)
+    t1 = marks.get("to", ends[-1] if ends else None)
+    if t0 is None or t1 is None or t1 <= t0:
+        return None, "no span (no SWEET NAV: ACTION begin/end markers or --span-from/--span-to lines)"
+    cap = marks.get("cap")
+    capped = None
+    if swaps and cap is not None and t0 < cap < t1:   # no SWAPT rows after the cap: score only the part that has rows (tracker L-14)
+        capped = (cap - t0, t1 - cap)
+        t1 = cap
+    span = t1 - t0
+    steps = {}
+    for i, (b, a) in enumerate(begins):
+        if not t0 <= b < t1:
+            continue
+        e = min(begins[i + 1][0] if i + 1 < len(begins) else t1, t1)
+        steps.setdefault(a, [0.0, 0])[0] += e - b
+    if swaps:
+        fr = [x for x in swaps if t0 <= x < t1]
+        for i, (b, a) in enumerate(begins):
+            if t0 <= b < t1:
+                e = min(begins[i + 1][0] if i + 1 < len(begins) else t1, t1)
+                steps[a][1] += sum(1 for x in fr if b <= x < e)
+        pooled = len(fr) / span
+        edges = [t0] + fr + [t1]
+        gaps = [(y - x) * 1000.0 for x, y in zip(edges, edges[1:])]
+        worst, j, k, t = None, 0, 0, t0
+        while t + 1.0 <= t1 + 1e-9:
+            while j < len(fr) and fr[j] < t:
+                j += 1
+            while k < len(fr) and fr[k] < t + 1.0:
+                k += 1
+            worst = (k - j) if worst is None else min(worst, k - j)
+            t += 0.05
+        src, nfr, g100, longest = "swapt", len(fr), sum(1 for g in gaps if g > GAP_MS), max(gaps)
+    elif bins:
+        bb = [x for x in bins if t0 < x[0] <= t1]   # a bin line closes the second that ends at its stamp
+        if not bb:
+            return None, "no SWEET SWAPT and no SWEET FPS line inside the span"
+        for i, (b, a) in enumerate(begins):
+            if t0 <= b < t1:
+                e = min(begins[i + 1][0] if i + 1 < len(begins) else t1, t1)
+                steps[a][1] += sum(x[1] * max(0.0, min(e, x[0]) - max(b, x[0] - 1.0)) for x in bb)
+        nfr = sum(x[1] for x in bb)
+        pooled = nfr / span
+        worst = min(x[1] for x in bb) if span >= 1.0 else None
+        src, g100, longest = "fpsline", sum(1 for x in bb if x[2] > GAP_MS), max(x[2] for x in bb)
+    else:
+        return None, "no SWEET SWAPT and no SWEET FPS lines (needs the frame witness)"
+    rows = {a: (fr_ / tt if tt > 0 else 0.0, tt, fr_) for a, (tt, fr_) in steps.items()}
+    cand = [(v[0], a) for a, v in rows.items() if v[1] >= MIN_STEP_S]
+    slow = min(cand) if cand else (0.0, "-")
+    return dict(capped=capped, pooled=pooled, slowest=slow[0], slowest_step=slow[1], worst_1s=worst, gaps100=g100, longest_gap_ms=longest, frames=nfr,
+                span_s=span, source=src, steps={a: dict(fps=v[0], time_s=v[1], frames=v[2]) for a, v in rows.items()}), None
+
+
+def verdict(r):
+    ok = r["pooled"] >= BAR_POOLED and r["slowest"] >= BAR_SLOWEST and not r.get("capped")
+    cap = (" capped_at_s=%.0f unscored_s=%.0f" % r["capped"]) if r.get("capped") else ""
+    return ("RESULT: %s fps-wholerun pooled=%.1f slowest=%.1f(%s) worst_1s=%s gaps100=%d longest_gap_ms=%d frames=%d span_s=%.1f source=%s%s"
+            % ("PASS" if ok else "FAIL", r["pooled"], r["slowest"], r["slowest_step"], "-" if r["worst_1s"] is None else "%d" % r["worst_1s"],
+               r["gaps100"], r["longest_gap_ms"], r["frames"], r["span_s"], r["source"],
+               " (gaps100 = 1 s bins with a gap > 100 ms: lower bound)" if r["source"] == "fpsline" else "") + cap), ok
+
+
+def run(lines, out, jout=None, span_from=None, span_to=None):
+    r, why = score(*load(lines, span_from, span_to))
+    if r is None:
+        out("RESULT: FAIL fps-wholerun %s" % why)
+        return 1
+    out("fps-wholerun: every second of the span counts (no busy-window selection); bars pooled >= %.0f, slowest >= %.0f" % (BAR_POOLED, BAR_SLOWEST))
+    out("%-22s %7s %7s %7s" % ("step", "fps", "time_s", "frames"))
+    for a, v in sorted(r["steps"].items(), key=lambda kv: kv[1]["fps"]):
+        out("%-22s %7.1f %7.1f %7d" % (a, v["fps"], v["time_s"], v["frames"]))
+    if jout:
+        json.dump(r, open(jout, "w"), indent=1)
+    if r.get("capped"):
+        out("SWEET GAP: fps-wholerun: SWAPT rows hit their cap %.0f s into the span; span cut there, %.0f s unscored; a capped run never PASSes (tracker L-14)" % r["capped"])
+    line, ok = verdict(r)
+    out(line)
+    return 0 if ok else 1
+
+
+def synth(fps_by_step, step_s=2.0, reps=2, hole=None):
+    """log lines: actions back to back, drawn frames at the given rate (6 GPU jobs each) plus an unchanged present (2 jobs) between them;
+    hole = (start_s, len_s): no frame in that interval"""
+    L, t, seq, n = [], 100.0, 0, 0
+    for r in range(reps):
+        for a, f in fps_by_step:
+            L.append("[%10.3f] |pixnav| SWEET NAV: ACTION %s begin rep %d now %d" % (t, a, r, int(t * 1e9)))
+            k = 0
+            while f and k < int(step_s * f):
+                x = t + k / f
+                if not (hole and hole[0] <= x - 100.0 < hole[0] + hole[1]):
+                    seq += 6
+                    n += 1
+                    L.append("[%10.3f] SWEET SWAPT: n %d now %d vsync 0 prev 0 gpu_seq %d gpu_done %d busy_us 1" % (x, n, int(x * 1e9), seq, seq))
+                    seq += 2
+                    n += 1
+                    L.append("[%10.3f] SWEET SWAPT: n %d now %d vsync 0 prev 0 gpu_seq %d gpu_done %d busy_us 1" % (x + 0.001, n, int((x + 0.001) * 1e9), seq, seq))
+                k += 1
+            t += step_s
+            L.append("[%10.3f] |pixnav| SWEET NAV: ACTION %s end rep %d now %d" % (t - 0.001, a, r, int((t - 0.001) * 1e9)))
+    return L
+
+
+def self_test():
+    fails = 0
+    def chk(name, cond, info=""):
+        nonlocal fails
+        fails += not cond
+        print("%s %s %s" % ("ok  " if cond else "FAIL", name, info))
+    out = []
+    rc = run(synth([("a", 60), ("b", 60)]), out.append)
+    chk("steady 60 fps passes", rc == 0 and re.search(r"pooled=(59\.[5-9]|60\.0)", out[-1]) and "gaps100=0" in out[-1], out[-1])
+    out = []
+    rc = run(synth([("a", 60), ("b", 40)]), out.append)
+    chk("slow step fails on slowest", rc == 1 and "slowest=40.0(b)" in out[-1], out[-1])
+    out = []
+    rc = run(synth([("a", 60), ("idle", 0)]), out.append)   # the old nav's idle seconds count against pooled (no busy-window selection)
+    chk("idle time counts", rc == 1 and re.search(r"pooled=(29\.[5-9]|30\.0)", out[-1]) and "worst_1s=0" in out[-1], out[-1])
+    out = []
+    rc = run(synth([("a", 60), ("b", 60)], hole=(1.0, 0.5)), out.append)
+    chk("a 500 ms hole = one gap > 100 ms and a short worst window", rc == 1 or "gaps100=1" in out[-1], out[-1])
+    chk("hole worst_1s", "worst_1s=30" in out[-1] or "worst_1s=29" in out[-1] or "worst_1s=31" in out[-1], out[-1])
+    out = []
+    bins = ["[%10.3f] SWEET FPS: swaps 60 distinct 30 max_gap_ms %d distinct4k 50 small_chg 0" % (100.0 + i, 150 if i == 2 else 20) for i in range(1, 5)]
+    rc = run(["[%10.3f] |pixnav| SWEET NAV: ACTION a begin rep 0 now %d" % (100.0, 100 * 10 ** 9)] + bins +
+             ["[%10.3f] |pixnav| SWEET NAV: ACTION a end rep 0 now %d" % (104.0, 104 * 10 ** 9)], out.append)
+    chk("fpsline fallback uses distinct4k", "pooled=50.0" in out[-1] and "source=fpsline" in out[-1] and "gaps100=1" in out[-1], out[-1])
+    out = []
+    L = synth([("a", 60), ("b", 60)])
+    L = L[:len(L) // 2] + ["[%10.3f] SWEET SWAPT: cap reached 36000" % 101.0]
+    rc = run(L + ["[%10.3f] |pixnav| SWEET NAV: ACTION b end rep 9 now %d" % (108.0, 108 * 10 ** 9)], out.append)
+    chk("cap line cuts the span and never passes", rc == 1 and "capped_at_s=" in out[-1] and any("SWEET GAP" in x for x in out)
+        and re.search(r"pooled=(5[89]\.\d|60\.0)", out[-1]), out[-1])
+    out = []
+    rc = run(synth([("a", 56), ("b", 48)]), out.append)
+    chk("bars 50 / 45", rc == 0, out[-1])
+    out = []
+    rc = run(["nothing here"], out.append)
+    chk("no span fails loudly", rc == 1 and "no span" in out[-1], out[-1])
+    print("RESULT: %s fps-wholerun self-test failed=%d" % ("PASS" if not fails else "FAIL", fails))
+    return 1 if fails else 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    if not argv:
+        print("RESULT: FAIL fps-wholerun needs RUN_DIR or usbnet.log (see --help)")
+        return 2
+    p = argv[0]
+    if os.path.isdir(p):
+        p = os.path.join(p, "usbnet.log")
+    if not os.path.isfile(p):
+        print("RESULT: FAIL fps-wholerun %s: no such log" % p)
+        return 2
+    opt = lambda k: argv[argv.index(k) + 1] if k in argv and argv.index(k) + 1 < len(argv) else None
+    with open(p, "rb") as f:
+        lines = [x.decode("utf-8", "replace") for x in f]
+    sf, st = opt("--span-from"), opt("--span-to")
+    if sf is None and st is None and any("SWEET NAV: HEAVY start" in l for l in lines):   # a heavy bench: its own span by default
+        sf, st = "SWEET NAV: HEAVY start", "SWEET NAV: HEAVY done"
+        print("fps-wholerun: heavy bench found: span = HEAVY start .. HEAVY done")
+    return run(lines, print, opt("--json"), sf, st)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -247,10 +247,11 @@ static void precheck_cases(void)
 			a1[i] ^= 1u << b;
 			CHECK(swl_pre_link(1u, 0x11u, a0, a1) == 4);
 		}
-	CHECK(swl_pre_ep(0x00100002u, 0x60000004u, 0) == 0 && swl_pre_ep(0xFFFF0002u, 0x60000004u, 0) == 0);
-	CHECK(swl_pre_ep(0x00000000u, 0x60000004u, 0) == 5 && swl_pre_ep(0x00000006u, 0x60000004u, 0) == 5 && swl_pre_ep(0x00000003u, 0x60000004u, 0) == 5 &&
-	      swl_pre_ep(0x00000102u, 0x60000004u, 0) == 5);
-	CHECK(swl_pre_ep(2u, 0x60000000u, 0) == 6 && swl_pre_ep(2u, 0x60000004u, 1u) == 6 && swl_pre_ep(2u, 0x60001004u, 0) == 6 && swl_pre_ep(2u, 0u, 0) == 6);
+	CHECK(swl_pre_ep(0x00100002u, 0x60000004u, 0, 0x0002u) == 0 && swl_pre_ep(0xFFFF0002u, 0x60000004u, 0, 0x0002u) == 0);
+	CHECK(swl_pre_ep(0x00000000u, 0x60000004u, 0, 0x0002u) == 5 && swl_pre_ep(0x00000006u, 0x60000004u, 0, 0x0002u) == 5 && swl_pre_ep(0x00000003u, 0x60000004u, 0, 0x0002u) == 5 &&
+	      swl_pre_ep(0x00000102u, 0x60000004u, 0, 0x0002u) == 5);
+	CHECK(swl_pre_ep(2u, 0x60000000u, 0, 0x0002u) == 6 && swl_pre_ep(2u, 0x60000004u, 1u, 0x0002u) == 6 && swl_pre_ep(2u, 0x60001004u, 0, 0x0002u) == 6 && swl_pre_ep(2u, 0u, 0, 0x0002u) == 6);
+	CHECK(swl_pre_ep(0x00000006u, 0x60000004u, 0, 0x0006u) == 0 && swl_pre_ep(0x00000002u, 0x60000004u, 0, 0x0006u) == 5);
 }
 
 int main(void)

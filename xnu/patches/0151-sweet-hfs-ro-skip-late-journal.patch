@@ -1,0 +1,17 @@
+SWEET: a read-only HFS mount (rd=usbroot0 rootrw=0) skips hfs_late_journal_init, which would write the journal header and fail with EROFS on the USB root (research 55). The ro-journaled branch that follows then mounts without a journal. Unbuilt and untested on hardware.
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -734,7 +734,12 @@
+ 	//
+ 	if (   (vcb->vcbAtrb & kHFSVolumeJournaledMask)
+ 		&& (SWAP_BE32(vhp->lastMountedVersion) != kHFSJMountVersion)
+-		&& (hfsmp->jnl == NULL)) {
++		&& (hfsmp->jnl == NULL)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* SWEET: a read-only mount (usbroot0, rootrw=0) must not create/write the journal; it takes the ro branch below (research 55) */
++		&& !(hfsmp->hfs_flags & HFS_READ_ONLY)
++#endif
++		) {
+ 
+ 		retval = hfs_late_journal_init(hfsmp, vhp, args);
+ 		if (retval != 0) {

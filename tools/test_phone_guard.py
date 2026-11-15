@@ -13,6 +13,7 @@ DENY = ["fastboot flash userdata x.img", "fastboot boot x.img", "adb reboot boot
         "if true; then fastboot flash a b; fi", "for c in reboot; do fastboot $c; done", "{ fastboot flash a; }", "! fastboot oem x",
         "bash -c \"fastboot flash a b\"", "sh -c 'adb reboot bootloader'", "eval \"fastboot erase x\"", "/usr/bin/env fastboot flash a",
         "sudo -u me fastboot flash a", "env -u X fastboot flash a", "setsid fastboot boot x", "adb shell rm -rf /data", "adb install x.apk"]
+# phone-guard guards WRITES only: the readiness queries below pass HERE, but agent-guard E24 denies them on an agent line (review phone-converge-r38-r1 F4); use `tools/phone state`.
 ALLOW = ["tools/fboot.sh --expect xnu a.img", "tools/xrun --kernel k", "fastboot devices", "fastboot getvar product", "adb devices -l",
          "adb get-state", "timeout 15 fastboot getvar unlocked", "grep fastboot docs/AUTOMATION.md", "echo adb reboot", "git commit -m 'fastboot flash'",
          "tools/phone goto fastboot", "ls | wc -l", "python3 tools/phone state",

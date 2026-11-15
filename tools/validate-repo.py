@@ -32,6 +32,7 @@ def bad(header, findings):
 
 
 NAME_RE = re.compile(r"^(\d{4})-(.+)\.patch$")
+DIFF_LINE_RE = re.compile(r"^(--- |diff --git |Index: )", re.M)
 # a number is held when a branch has the patch file OR a reservation (`claim`/`next`) covers it ("(not committed anywhere)   RESERVED by ...")
 HELD_RE = re.compile(r"^(\d{4})  (?:\1-\S+\.patch |\(not committed anywhere\)\s+RESERVED )")
 
@@ -77,14 +78,14 @@ def check_patches():
         try:
             size = os.path.getsize(p)
             with open(p, "rb") as fh:
-                head = fh.read(2048).decode("utf-8", "ignore")
+                head = fh.read().decode("utf-8", "ignore")   # whole file: a patch may open with a long prose header (0173 has 3 KB before its first diff line)
         except OSError as e:
             findings.append("%s: unreadable: %s" % (n, e))
             continue
         if size == 0:
             findings.append("%s: empty file" % n)
-        elif not ("--- " in head or "diff " in head or "Index:" in head):
-            findings.append("%s: no diff header in first 2048 bytes" % n)
+        elif not DIFF_LINE_RE.search(head):
+            findings.append("%s: no diff header line (--- , diff --git or Index:) anywhere in the file" % n)
     for num, lst in sorted(bynum.items()):
         if len(lst) > 1:
             findings.append("duplicate number %04d: %s" % (num, ", ".join(lst)))
@@ -178,6 +179,16 @@ def main():
         lambda: check_sh(args.verbose),
         lambda: run_child("tool-proposal register",
                           [sys.executable, os.path.join(TOOLS, "tool-proposals"), "validate"]),
+        lambda: run_child("tool census",
+                          [sys.executable, os.path.join(TOOLS, "tool-census"), "--check"]),
+        lambda: run_child("C style ratchet (docs/STYLE-C.md)",
+                          [sys.executable, os.path.join(TOOLS, "lint-c"), "--style"]),
+        lambda: run_child("size limits, new or changed files (R29)",
+                          [sys.executable, os.path.join(TOOLS, "lint-size"), "--check"]),
+        lambda: run_child("bootargs-known.txt vs xnu/patches",
+                          [sys.executable, os.path.join(TOOLS, "run-preflight"), "--gen-bootargs", "--check", "--patches-only"]),
+        lambda: run_child("ufsphy_tables.h vs spec",
+                          [sys.executable, os.path.join(TOOLS, "gen-ufsphy-tables.py"), "--check"]),
         lambda: run_child("README gate",
                           [sys.executable, "-B", os.path.join(TOOLS, "check-readme.py"), ROOT]),
     ]

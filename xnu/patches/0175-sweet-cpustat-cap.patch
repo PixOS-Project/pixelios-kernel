@@ -1,0 +1,186 @@
+SWEET CPUSTAT row cap fix (patch 0175, AP-173, B-A6): pid 1 and every process named in sweetcpuwatch print their 'CPUSTAT p' row on every full sample, whatever their CPU and outside the CS_MAX_LINES 200 cap; rows the cap drops are counted on 'CPUSTAT truncated N rows', processes whose task_info fails on 'CPUSTAT skipped N procs' (a watched one also on 'CPUSTAT p <pid> <name> task_info failed'); the parsed list is printed once ('CPUSTAT watching N names from "..."'); a sweetcpuwatch name that is empty, too long or over the limit, or a list that gives no name, is a 'SWEET GAP: CPUSTAT' line instead of being dropped silently (review cpustat-cap-r1 F2/F3). CS_WATCH_MAX 4 -> 8, watch buffer 128 -> 256 B, default watch list adds launchd,mediaserverd. The sample body moves into cs_sample() and the list parse into cs_parse_watch() (host test tools/test_cpustat_c.py compiles them). Read-only diagnostics, no register access. Not run on hardware.
+
+diff --git a/bsd/dev/sweet_cpustat.c b/bsd/dev/sweet_cpustat.c
+index ad13207..d52e65e 100644
+--- a/bsd/dev/sweet_cpustat.c
++++ b/bsd/dev/sweet_cpustat.c
+@@ -4,8 +4,14 @@
+  * Boot-arg sweetcpustat=N (seconds, default 60, 0 = off). Every N seconds one kernel thread prints
+  *   CPUSTAT --- up <ms> ms | ufs ios <n> cmds <n> KiB <n> busy <ms> lockwait <ms> maxcmd <us> (cumulative since boot)
+  *   CPUSTAT p <pid> <name> user <ms> sys <ms>        (cumulative CPU of every process with >= 100 ms)
+- * and every 5 s it checks the processes named in boot-arg sweetcpuwatch (default
+- * "com.apple.migrationpluginwrapper,com.apple.datamigrator") and prints
++ *   CPUSTAT truncated <n> rows (cap <CS_MAX_LINES>; watched rows not capped)   (only when rows were dropped)
++ * Patch 0175 (AP-173): pid 1 and every process named in sweetcpuwatch get their CPUSTAT p row on every full sample,
++ * whatever their CPU and outside the CS_MAX_LINES cap; the cap now counts and reports what it drops, and a process
++ * whose task_info fails is counted on a "CPUSTAT skipped" line (a watched one also gets "CPUSTAT p <pid> <name> task_info
++ * failed"). The parsed watch list is printed once ("CPUSTAT watching N names"); a name that does not fit, or an empty list,
++ * is a SWEET GAP line.
++ * Every 5 s it checks the processes named in boot-arg sweetcpuwatch (default
++ * "com.apple.migrationpluginwrapper,com.apple.datamigrator,launchd,mediaserverd", at most CS_WATCH_MAX names) and prints
+  *   CPUSTAT watch <name> live <n> at <ms> ms           (only when the count of live processes with that name changes)
+  * so the end of the migration is logged to 5 s. Deltas between two samples are computed on the host.
+  * UFS counters are kept by sweet_ufs_strategy (sweet_ufs.c) under its lock; reads here are unlocked (diagnostic only).
+@@ -28,14 +34,14 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ void sweet_cpustat_start(void);
+ 
+-#define CS_WATCH_MAX 4
++#define CS_WATCH_MAX 8
+ #define CS_MAX_LINES 200
+ 
+ static char cs_watch_names[CS_WATCH_MAX][2 * MAXCOMLEN + 1];
+ static int cs_watch_n;
+ static int cs_watch_live[CS_WATCH_MAX], cs_watch_seen[CS_WATCH_MAX];
+ static bool cs_full;
+-static int cs_lines;
++static int cs_lines, cs_dropped, cs_skipped;
+ static uint64_t cs_tot_user, cs_tot_sys, cs_tot_n;
+ 
+ static uint64_t
+@@ -59,9 +65,11 @@ cs_proc(proc_t p, __unused void *arg)
+ {
+ 	const char *name = proc_best_name(p);     /* p_name, 32 chars; proc_name() would give the 16-char p_comm */
+ 	int pid = proc_pid(p);
++	bool watched = (pid == 1);
+ 	for (int i = 0; i < cs_watch_n; i++) {
+ 		if (strncmp(name, cs_watch_names[i], sizeof(cs_watch_names[i])) == 0) {
+ 			cs_watch_seen[i]++;
++			watched = true;
+ 		}
+ 	}
+ 	if (cs_full) {
+@@ -73,20 +81,87 @@ cs_proc(proc_t p, __unused void *arg)
+ 			cs_tot_user += u;
+ 			cs_tot_sys += s;
+ 			cs_tot_n++;
+-			if (u + s >= 100 && cs_lines < CS_MAX_LINES) {
++			if (watched) {
++				printf("CPUSTAT p %d %s user %llu sys %llu\n", pid, name, u, s);
++			} else if (u + s >= 100 && cs_lines < CS_MAX_LINES) {
+ 				printf("CPUSTAT p %d %s user %llu sys %llu\n", pid, name, u, s);
+ 				cs_lines++;
++			} else if (u + s >= 100) {
++				cs_dropped++;
++			}
++		} else {
++			cs_skipped++;
++			if (watched) {
++				printf("CPUSTAT p %d %s task_info failed\n", pid, name);
+ 			}
+ 		}
+ 	}
+ 	return PROC_RETURNED;
+ }
+ 
++/* Fill cs_watch_names from a comma list; every name that is empty, too long or over CS_WATCH_MAX is a loud GAP (rule 8). */
++static void
++cs_parse_watch(char *watch)
++{
++	for (char *t = watch; *t;) {
++		char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == 0 || tl >= sizeof(cs_watch_names[0]) || cs_watch_n >= CS_WATCH_MAX) {
++			printf("SWEET GAP: CPUSTAT sweetcpuwatch name %d (len %lu) not watched (%s; max %d names of < %lu chars)\n",
++			    cs_watch_n, (unsigned long)tl, cs_watch_n >= CS_WATCH_MAX ? "list full" : "bad length", CS_WATCH_MAX,
++			    (unsigned long)sizeof(cs_watch_names[0]));
++		} else {
++			strlcpy(cs_watch_names[cs_watch_n], t, tl + 1);
++			cs_watch_n++;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	if (cs_watch_n == 0) {
++		printf("SWEET GAP: CPUSTAT sweetcpuwatch \"%s\" gives no name: only pid 1 is printed outside the cap\n", watch);
++	} else {
++		printf("CPUSTAT watching %d names from \"%s\" (max %d)\n", cs_watch_n, watch, CS_WATCH_MAX);
++	}
++}
++
++/* One 5 s tick; full = also the per-process CPU table. */
++static void
++cs_sample(bool full, uint64_t now)
++{
++	cs_full = full;
++	cs_lines = cs_dropped = cs_skipped = 0;
++	cs_tot_user = cs_tot_sys = cs_tot_n = 0;
++	bzero(cs_watch_seen, sizeof(cs_watch_seen));
++	if (cs_full) {
++		printf("CPUSTAT --- up %llu ms | ufs ios %llu cmds %llu KiB %llu busy %llu ms lockwait %llu ms maxcmd %llu us\n",
++		    now, sweet_ufs_stat[0], sweet_ufs_stat[1], sweet_ufs_stat[2] >> 10,
++		    cs_ms(sweet_ufs_stat[3]), cs_ms(sweet_ufs_stat[4]), cs_us(sweet_ufs_stat[5]));
++	}
++	proc_iterate(PROC_ALLPROCLIST, cs_proc, NULL, NULL, NULL);
++	if (cs_full) {
++		if (cs_dropped) {
++			printf("CPUSTAT truncated %d rows (cap %d; watched rows not capped)\n", cs_dropped, CS_MAX_LINES);
++		}
++		if (cs_skipped) {
++			printf("CPUSTAT skipped %d procs (no task or task_info failed; not in total)\n", cs_skipped);
++		}
++		printf("CPUSTAT total procs %llu user %llu ms sys %llu ms (all processes; kernel_task included, idle not)\n", cs_tot_n, cs_tot_user, cs_tot_sys);
++	}
++	for (int i = 0; i < cs_watch_n; i++) {
++		if (cs_watch_seen[i] != cs_watch_live[i]) {
++			printf("CPUSTAT watch %s live %d at %llu ms\n", cs_watch_names[i], cs_watch_seen[i], now);
++			cs_watch_live[i] = cs_watch_seen[i];
++		}
++	}
++}
++
+ static void
+ cs_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static int chan;
+-	char watch[128] = "com.apple.migrationpluginwrapper,com.apple.datamigrator";
++	char watch[256] = "com.apple.migrationpluginwrapper,com.apple.datamigrator,launchd,mediaserverd";
+ 	uint32_t period = 60;
+ 	int tick = 0;
+ 
+@@ -98,41 +173,11 @@ cs_thread(__unused void *arg, __unused wait_result_t wr)
+ 		period = 3600;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetcpuwatch", watch, sizeof(watch));
+-	for (char *t = watch; *t && cs_watch_n < CS_WATCH_MAX;) {
+-		char *end = strchr(t, ',');
+-		size_t tl = end ? (size_t)(end - t) : strlen(t);
+-		if (tl > 0 && tl < sizeof(cs_watch_names[0])) {
+-			strlcpy(cs_watch_names[cs_watch_n], t, tl + 1);
+-			cs_watch_n++;
+-		}
+-		if (!end) {
+-			break;
+-		}
+-		t = end + 1;
+-	}
++	cs_parse_watch(watch);
+ 	(void)tsleep(&chan, PZERO, "sweetcpu", 20 * hz);
+ 	for (;; tick++) {
+ 		uint32_t every = (period + 4) / 5;
+-		cs_full = (tick % every) == 0;
+-		cs_lines = 0;
+-		cs_tot_user = cs_tot_sys = cs_tot_n = 0;
+-		bzero(cs_watch_seen, sizeof(cs_watch_seen));
+-		uint64_t now = cs_ms(mach_absolute_time());
+-		if (cs_full) {
+-			printf("CPUSTAT --- up %llu ms | ufs ios %llu cmds %llu KiB %llu busy %llu ms lockwait %llu ms maxcmd %llu us\n",
+-			    now, sweet_ufs_stat[0], sweet_ufs_stat[1], sweet_ufs_stat[2] >> 10,
+-			    cs_ms(sweet_ufs_stat[3]), cs_ms(sweet_ufs_stat[4]), cs_us(sweet_ufs_stat[5]));
+-		}
+-		proc_iterate(PROC_ALLPROCLIST, cs_proc, NULL, NULL, NULL);
+-		if (cs_full) {
+-			printf("CPUSTAT total procs %llu user %llu ms sys %llu ms (all processes; kernel_task included, idle not)\n", cs_tot_n, cs_tot_user, cs_tot_sys);
+-		}
+-		for (int i = 0; i < cs_watch_n; i++) {
+-			if (cs_watch_seen[i] != cs_watch_live[i]) {
+-				printf("CPUSTAT watch %s live %d at %llu ms\n", cs_watch_names[i], cs_watch_seen[i], now);
+-				cs_watch_live[i] = cs_watch_seen[i];
+-			}
+-		}
++		cs_sample((tick % every) == 0, cs_ms(mach_absolute_time()));
+ 		(void)tsleep(&chan, PZERO, "sweetcpu", 5 * hz);
+ 	}
+ }

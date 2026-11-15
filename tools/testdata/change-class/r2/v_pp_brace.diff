@@ -1,0 +1,15 @@
+diff --git a/shim/x.c b/shim/x.c
+--- a/shim/x.c
++++ b/shim/x.c
+@@ -1,5 +1,13 @@
+ 	if (on) {
++#ifdef NEVER_X
++	if (x) {
++#endif
++	}
+ 		write32(a, 1);
++	{
++#ifdef NEVER_X
++	}
++#endif
+ 	}
